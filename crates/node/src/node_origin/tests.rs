@@ -142,9 +142,9 @@ fn region_penalty_only_for_same_region_slow_peer() {
     assert!(!region_latency_penalty_applies(Some("DE"), "", 5000));
 }
 
-/// The failure-class `reason` (#966) the `open_channel` kernel attaches to
+/// The failure-class `reason` (#966) the `open_pool` kernel attaches to
 /// the `anyhow` error chain must survive the additional `.context(...)`
-/// layers `open_and_persist` / `open_or_reuse_pool` wrap around it —
+/// layers `run_open` / `open_or_reuse_pool` wrap around it —
 /// `record_pool_open_failure`'s `downcast_ref` walks the whole chain, so
 /// the metric label is recovered regardless of how deep the reason sits.
 #[test]
@@ -163,7 +163,7 @@ fn failure_reason_survives_context_wrapping() {
         let err = anyhow::anyhow!("openPool send failed: transport down")
             .context(reason)
             .context("submit openPool")
-            .context("persist newly-opened buyer pool");
+            .context("persist opened buyer pool");
         let recovered = err.downcast_ref::<PoolOpenFailureReason>().copied();
         assert_eq!(
             recovered,
@@ -175,7 +175,7 @@ fn failure_reason_survives_context_wrapping() {
     // An error with no attached reason (e.g. a pure store fault) downcasts
     // to `None`, so the helper logs `unclassified` and only the unlabeled
     // total moves.
-    let storeless = anyhow::anyhow!("redb write failed").context("persist buyer channel");
+    let storeless = anyhow::anyhow!("redb write failed").context("persist opened buyer pool");
     assert!(storeless.downcast_ref::<PoolOpenFailureReason>().is_none());
 }
 

@@ -891,12 +891,13 @@ impl ClientHandler {
                 }
                 // Node-to-node cache-miss pull-through (#831). Fronting upstream
                 // USDC egress is privileged: gate it on the request PROVING
-                // ownership of the named pool — a verified client binding
-                // (`verified_client`) whose address is the pool's authorized
-                // signer. Pool *existence* cannot gate spend (pool ids are
-                // public on-chain via `PoolOpened`, so any leech could name
-                // one); only proven ownership can. An unbound request, or one
-                // for a pool it does not own, gets a plain `NotFound` and
+                // voucher authority in the named pool — a verified client
+                // binding (`verified_client`) whose address signs a known lane
+                // of that pool (`pull_authorized`). Pool *existence* cannot gate
+                // spend (pool ids are public on-chain via `PoolOpened`, so any
+                // leech could name one); only proven lane authority can. An
+                // unbound request, or one with no lane in that pool, gets a
+                // plain `NotFound` and
                 // cannot make this node spend — closing the proxy-abuse /
                 // griefing vector where an unpaid client drains the buyer
                 // deposit. (Multi-hop node→node pulls therefore require the
@@ -919,8 +920,8 @@ impl ClientHandler {
                 // the own-origin spine and the local tier front the operator's own
                 // origin egress, and the peer spine and the buffered tier front real
                 // upstream USDC. All are gated
-                // on channel OWNERSHIP (`pull_authorized`) and none on solvency,
-                // so before this floor a dust-deposit channel could name N absent
+                // on lane AUTHORITY (`pull_authorized`) and none on solvency,
+                // so without this floor a dust-deposit pool could name N absent
                 // hashes, make the node pay for each, and be refused afterwards by
                 // the serve-path gate — the attacker gains nothing, but the
                 // operator still pays. Refuse here instead, before any of it.
@@ -1145,7 +1146,7 @@ impl ClientHandler {
                 // serve its own content, and — when node→node IS enabled — prefers
                 // the local origin over the paid peer window path for a whole-blob
                 // request the operator can satisfy itself. Gated on the SAME proven
-                // channel ownership as the paid paths (`pull_authorized`): an S3
+                // lane authority as the paid paths (`pull_authorized`): an S3
                 // origin has egress cost, and the following delivery is billed
                 // per-voucher. A local miss leaves the blob absent and falls through
                 // to the node→node branches below, unchanged.

@@ -653,10 +653,11 @@ revenue flat while requests arrive; `decdn fetch` against this node returns
   `rate(decdn_serve_stream_rejected_insufficient_deposit_total[10m]) > 0.1` for
   15 minutes. A raw rate, not a ratio: the exporter has no serve-attempt counter
   to divide by.
-- The node's own throttled `warn!` ("refusing paying clients: remaining channel
-  deposit below the reserved cost"), at most one per 5 minutes, carrying the
-  channel id, the remaining headroom, the amount reserved, and how many refusals it
-  suppressed since the last line. Raise the log level to `debug` for one line per
+- The node's own throttled `warn!` ("refusing paying clients: pool's refundable
+  remaining deposit below the reserved cost"), at most one per 5 minutes, carrying
+  the pool id (`pool_id`), the remaining headroom (`headroom`), the amount reserved
+  (`ceiling`), and how many refusals it suppressed since the last line
+  (`suppressed`). Raise the log level to `debug` for one line per
   refusal — that one also carries the hash.
 - `decdn_serve_stream_rejected_signer_floor_at_cap_total`, the sibling counter for
   a refusal where the pool is solvent but ONE capability signer has filled its share
@@ -676,7 +677,7 @@ alone cannot tell the first two apart — this is why the log line exists:
 1. **Clients genuinely running dry.** Their remaining deposit cannot cover one
    credit window. Nothing is wrong with this node. Expect a low background rate.
 2. **This node's chain watcher is lagging an on-chain top-up.** The seller's view
-   of a channel's deposit is only raised by observing `ChannelToppedUp`, so a
+   of a pool's deposit is only raised by observing `PoolToppedUp`, so a
    client that just topped up is refused until the watcher catches up. Funded
    clients are being turned away and will route elsewhere.
 
@@ -696,9 +697,9 @@ alone cannot tell the first two apart — this is why the log line exists:
 
 A fourth, rarer cause: the operator's own
 `blockchain.buyer_working_deposit_micro_usdc` is too small for the *upstream*
-rate, in which case this node is the one being refused. (The node opens
-node-to-node channels at the working deposit and the low-water refill tops them
-back up on reuse. When no upstream serves a pull at the current deposit, the
+rate, in which case this node is the one being refused. (The node opens its
+buyer pool at the working deposit and the low-water refill tops it back up on
+reuse. When no upstream serves a pull at the current deposit, the
 fill runs one funding recovery step, which `decdn_node_pull_recovery_step_total`
 counts; see
 [ADR 003 § Funding recovery](../adr/003-payments.md#funding-recovery).) Look for
@@ -707,10 +708,13 @@ counts; see
 
 **Remediate:**
 
-1. Distinguish the two causes. Take a pool id from the `warn!` line and compare
-   the node's view against the chain: `decdn node pools` reports the deposit the
-   node believes, and `PaymentPool.getPool(poolId)` reports the truth. A
-   disagreement is cause (2).
+1. Distinguish the two causes. Take `pool_id` and `headroom` from the `warn!`
+   line: `headroom` is the pool's remaining deposit as the node sees it, less the
+   refundable floor `M` (`blockchain.pool_min_remaining_deposit_micro_usdc`). Read
+   `PaymentPool.getPool(poolId)` on-chain (for example with `cast call`) and
+   compute `deposit − totalRedeemed − M`. If that exceeds
+   `headroom` — typically after a recent `PoolToppedUp` — the node's view is
+   stale: cause (2).
 2. For cause (2), check watcher liveness —
    `decdn_settlement_watcher_last_tick_timestamp_seconds` should advance every
    `blockchain.event_poll_interval_ms`. A stalled watcher usually means the RPC

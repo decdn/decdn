@@ -1135,7 +1135,7 @@ pub struct DecdnMetrics {
     /// `pool_open_failures_*_total` family below (#966) breaks the
     /// `openPool`-tx failures out by cause so an operator can tell a
     /// misconfiguration (`insufficient_deposit`) from infrastructure
-    /// (`rpc_error`). It also covers store, watermark-read and capability-signing
+    /// (`rpc_error`). It also covers store, open-task and capability-signing
     /// causes the by-reason family does not, so the two are not expected to sum equal.
     ///
     /// **One failure moves this counter once.** A site increments it if and only
@@ -2568,8 +2568,8 @@ impl Metrics {
     /// `reason`. Pairs with the structured `reason` field on the `warn!`/`debug!`
     /// in [`crate::node_origin`]. Distinct from
     /// [`Self::node_pull_pool_open_failure`], the unlabeled total (which also
-    /// counts store, watermark-read and capability-signing causes that never reach
-    /// the `openPool` tx).
+    /// counts store, open-task and capability-signing causes that never reach the
+    /// `openPool` tx).
     pub fn pool_open_failure_by_reason(&self, reason: PoolOpenFailureReason) {
         match reason {
             PoolOpenFailureReason::InsufficientDeposit => {

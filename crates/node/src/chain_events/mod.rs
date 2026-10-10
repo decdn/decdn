@@ -33,10 +33,9 @@
 //! because the sinks holding an authoritative on-chain enumeration source
 //! re-read it and self-heal. The one without one is where an orphan sticks:
 //! settlement's pool projection (`PoolProjection::record_opened`) — an orphaned
-//! `PoolOpened` leaves a phantom pool in memory until the next restart, and the
-//! on-chain `redeem` is the backstop for anything served against it. It predates
-//! #1227 and is unchanged by it — deleting an always-zero field cannot alter what
-//! a lag never did.
+//! `PoolOpened` leaves a phantom pool in memory until the next restart. A `redeem`
+//! against a pool that does not exist pays nothing, so the node goes unpaid for
+//! anything it serves against the phantom.
 //!
 //! For the settlement watcher specifically, a lag also carries a concrete cost,
 //! which is what makes zero an active choice there rather than an inherited one:
@@ -97,23 +96,18 @@ pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// **Every** chain read on a watcher's path routes through here: the loop's own
 /// `get_logs`, `shared_head`'s `get_block_number`, and each follow-up RPC a
 /// [`resumable_watcher::LogSink`] issues from `apply` / `on_tick_complete`
-/// (`getOrigins`, `nodeIdOf`, `get_block`, `isHashBlacklistedForOperator`).
-/// This is not automatic — the loop cannot see a sink's own reads, so a *new*
-/// sink read that does not wrap itself here reintroduces the wedge this exists
+/// (for example the registry's `nodeIdOf`, the fee-shares `getShares`, and the
+/// slash and blacklist re-enumeration reads). This is not automatic — the loop
+/// cannot see a sink's own reads, so a *new* sink read that does not wrap itself
+/// here reintroduces the wedge this exists
 /// to prevent: the alloy HTTP provider has no request timeout, so a provider
 /// that holds the connection open and never responds stalls the tick forever,
 /// with no backoff, no metric, and no graceful-shutdown path.
 ///
 /// This helper guarantees only that a call is *bounded*. What a timeout **means**
-/// is the call site's decision, and each documents its own — the two watcher shapes
-/// being fail-the-tick-and-back-off (origin's `getOrigins`) and
-/// degrade-and-continue (`slash`'s `get_block`, the registry's `nodeIdOf`,
-/// origin's `nodeIdOf`). The serve-admission reads in `ResolvingPoolView`
-/// (`getPool`, `getAuthorization`) refuse the request.
-///
-/// `nodeIdOf` is the same read at two sites under one policy: the registry and
-/// origin both count-and-skip because their projections self-heal on the
-/// operator's next event.
+/// is the call site's decision, and each documents its own. The serve-admission
+/// reads in `ResolvingPoolView` (`getPool`, `getAuthorization`) refuse the
+/// request.
 ///
 /// Takes `IntoFuture`, not `Future`, so an alloy `.call()` (which returns an
 /// `EthCall`, not a future) can be wrapped directly rather than each caller

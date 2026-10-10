@@ -92,12 +92,12 @@ pub const PULL_THROUGH_OUTER_SLACK: Duration =
 ///
 /// The `openPool` runs in a detached task that owns the tx, so a
 /// caller that stops waiting costs nothing: the open continues, the pool lands,
-/// and the next pull to that provider reuses it. What the caller buys by waiting is
+/// and the next pull, to any provider, reuses it. What the caller buys by waiting is
 /// only the chance to use the pool on *this* pull. That makes a short budget the
 /// right trade — a cache miss must fall through to another candidate in seconds,
 /// while an `openPool` may legitimately need minutes to mine on a slow L2.
 ///
-/// Deliberately much smaller than `cache.node_pull_timeout_sec`: the channel open, the
+/// Deliberately much smaller than `cache.node_pull_timeout_sec`: the pool open, the
 /// stream open, and the streaming stage are SEQUENTIAL stages of one candidate attempt,
 /// and [`outer_pull_deadline`] has to cover all three for every candidate.
 pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
@@ -118,7 +118,7 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 ///
 /// THREE sequential bounded stages:
 ///
-/// 1. the **channel open** — [`CHANNEL_OPEN_CALLER_BUDGET`] (#1143); then
+/// 1. the **pool open** — [`CHANNEL_OPEN_CALLER_BUDGET`] (#1143); then
 /// 2. the **stream open** — connect → handshake → verified `StreamResponse`,
 ///    bounded by `per_candidate` (#1134); then
 /// 3. **streaming**, which for a peer that opens honestly and then goes SILENT costs
@@ -130,7 +130,7 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 ///
 /// Every stage has to be a term here. Budgeting only `per_candidate` would let a cold
 /// cache against a slow L2 burn the whole deadline on candidates #1 and #2 and never
-/// dial #3. Covering the channel open but not the stall window would leave the same hole
+/// dial #3. Covering the pool open but not the stall window would leave the same hole
 /// for a peer that goes silent mid-stream instead of failing to open — and a worse one,
 /// because `stall` is operator-tunable: at `node_pull_stall_window_sec = 120` a single
 /// silent candidate outlasts a two-term deadline on its own. Taking `stall` as an

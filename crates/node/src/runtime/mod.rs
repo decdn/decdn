@@ -504,22 +504,21 @@ async fn build_infra(
     );
     // The one redb-backed store implements the voucher-state trait (for the
     // handler + #527 replay guard), the pending-settle trait (for the on-chain
-    // settlement sweep, PR #743 review), and the buyer-channel trait (#744).
+    // settlement sweep, PR #743 review), and the buyer-pool trait (#744).
     // Derive trait-object handles from the single concrete store so every write
     // family shares one open store and one fsync discipline (each family commits
     // on its own per-family redb file); `concrete_channel_store` stays bound for
     // the buyer handle built further below.
     let channel_state_store: Arc<dyn PoolStateStore> = concrete_channel_store.clone();
-    // Debounce the scan-checkpoint writes (#784, keyed in #1092): each persisted
-    // watcher (settlement `PoolOpened`, origin `Origin`) advances its cursor
-    // once per completed `eth_getLogs` window — on the live tail, once per poll
-    // tick with new confirmed blocks — and the directly-durable store fsyncs on
-    // each. The persisted value is only a *floor* for the resume backfill
+    // Debounce the scan-checkpoint writes (#784, keyed in #1092): the settlement
+    // watcher, the only watcher that persists a cursor (`CheckpointKey::PoolOpened`),
+    // advances it once per completed `eth_getLogs` window — on the live tail, once
+    // per poll tick with new confirmed blocks — and the directly-durable store
+    // fsyncs on each. The persisted value is only a *floor* for the resume backfill
     // (`resolve_persisted_start` rewinds it by the reorg margin; the sinks are
-    // idempotent), so coarsening the write cadence is safe — and the one key
-    // still persisted (settlement) is force-flushed on graceful shutdown by its
-    // own service, so steady-state progress is not lost. The origin directory
-    // stopped persisting a cursor in #1504; it enumerates on every boot.
+    // idempotent), so coarsening the write cadence is safe — and the settlement
+    // service force-flushes its key on graceful shutdown, so steady-state progress
+    // is not lost.
     // Wrapping here (the wiring layer) keeps the domain trait and the disk store
     // free of the debounce policy.
     let watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore> = Arc::new(
@@ -1644,10 +1643,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // insufficient gas) must not block the node's core seller function. Log and
     // continue with the buyer path disabled (and thus pull-through disabled).
     // Simple nonce management, for the reason given on the seller
-    // `wallet_provider` above (#904). It matters most here: `reclaim` can revert
-    // when its chain-head deadline pre-check races the deadline or the head read
-    // fails, and the next sweep retries it, so a reverting send must not leak a
-    // cached nonce and wedge the buyer lane. This provider is shared across
+    // `wallet_provider` above (#904). It matters most here: `reclaim` can revert —
+    // the sweep submits it optimistically when its chain-head read fails, and
+    // `reclaim` is permissionless, so another caller can land first — and the next
+    // sweep re-evaluates the pool, so a reverting send must not leak a cached nonce
+    // and wedge the buyer lane. This provider is shared across
     // `approve`/`openPool`/`topUp`/`reclaim` and the reclaim sweep runs
     // concurrently with opens, so correctness relies on `SimpleNonceManager`
     // re-reading the pending nonce each send (a transient racing collision just
