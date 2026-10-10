@@ -710,7 +710,7 @@ impl ClientHandler {
         // `live_reservation += reserved` increment run under ONE `pool_floor` lock, so
         // two concurrent admissions on a near-exhausted pool cannot both pass. A
         // pool-floor refusal reports `InsufficientDeposit` → wire
-        // `StreamError::Unfunded`: this gate runs past the lane-ownership proof,
+        // `StreamError::Unfunded`: this gate runs past the lane-authority proof,
         // so its audience is the proven requester, and the class counts toward
         // its funding recovery.
         //
@@ -849,13 +849,13 @@ impl ClientHandler {
                 }
                 hit_size = Some(size);
             } else {
-                // The shed gate runs before the channel-ownership refusal below,
+                // The shed gate runs before the lane-authority refusal below,
                 // so an unbound / unknown-lane request can transiently hold a
                 // `ShedSlot` until that refusal returns it. This is bounded by
                 // the `ConnectionLimiter` global + per-source caps and is
                 // self-limiting: once the node is pressured, further such
                 // requests shed right here without acquiring a slot at all.
-                // Keeping the gate here — ahead of channel-ownership and any
+                // Keeping the gate here — ahead of lane authority and any
                 // fill — preserves "shed before committing serve resources /
                 // before any origin spend".
                 //
@@ -891,15 +891,15 @@ impl ClientHandler {
                 }
                 // Node-to-node cache-miss pull-through (#831). Fronting upstream
                 // USDC egress is privileged: gate it on the request PROVING
-                // ownership of the named channel — a verified client binding
-                // (`verified_client`) whose address is the channel's authorized
-                // client. Channel *existence* cannot gate spend (channel ids are
-                // public on-chain via `ChannelOpened`, so any leech could name
-                // one); only proven ownership can. An unbound request, or one
-                // for a channel it does not own, gets a plain `NotFound` and
-                // cannot make this node spend — closing the proxy-abuse /
-                // griefing vector where an unpaid client drains the buyer
-                // deposit. (Multi-hop node→node pulls therefore require the
+                // voucher authority in the named pool — a verified client
+                // binding (`verified_client`) whose address signs a known lane
+                // of that pool (`pull_authorized`). Pool *existence* cannot gate
+                // spend (pool ids are public on-chain via `PoolOpened`, so any
+                // leech could name one); only proven lane authority can. An
+                // unbound request, or one with no lane in that pool, gets a
+                // plain `NotFound` and cannot make this node spend — closing
+                // the proxy-abuse / griefing vector where an unpaid client
+                // drains the buyer deposit. (Multi-hop node→node pulls therefore require the
                 // downstream requester to send a binding; both the direct-client
                 // `decdn fetch` (#1115) and the node→node requester
                 // (`node_origin`, #1117) now do, so chained pull-through works.)
@@ -919,8 +919,8 @@ impl ClientHandler {
                 // the own-origin spine and the local tier front the operator's own
                 // origin egress, and the peer spine and the buffered tier front real
                 // upstream USDC. All are gated
-                // on channel OWNERSHIP (`pull_authorized`) and none on solvency,
-                // so before this floor a dust-deposit channel could name N absent
+                // on lane AUTHORITY (`pull_authorized`) and none on solvency,
+                // so without this floor a dust-deposit pool could name N absent
                 // hashes, make the node pay for each, and be refused afterwards by
                 // the serve-path gate — the attacker gains nothing, but the
                 // operator still pays. Refuse here instead, before any of it.
@@ -1145,7 +1145,7 @@ impl ClientHandler {
                 // serve its own content, and — when node→node IS enabled — prefers
                 // the local origin over the paid peer window path for a whole-blob
                 // request the operator can satisfy itself. Gated on the SAME proven
-                // channel ownership as the paid paths (`pull_authorized`): an S3
+                // lane authority as the paid paths (`pull_authorized`): an S3
                 // origin has egress cost, and the following delivery is billed
                 // per-voucher. A local miss leaves the blob absent and falls through
                 // to the node→node branches below, unchanged.

@@ -1415,7 +1415,7 @@ impl PeerRunSink<'_> {
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     async fn drive_run_in_span(&self, run: CoveredRun) -> RunOutcome {
         // Cancellation before the lane open (#1506). Each run opens its OWN lane
-        // — `open_or_reuse_pool` can escrow a fresh `openChannel` or fire a proactive
+        // — `open_or_reuse_pool` can escrow a fresh `openPool` or fire a proactive
         // `topUp`, and `bind_upstream_ctx` / `missing_ranges` run before the `drive`
         // `select!` that watches `cancel`. A serve leg that already finished (client
         // gone, shutdown) must not land an on-chain tx for nobody, so stop the loop

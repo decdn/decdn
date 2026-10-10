@@ -1892,9 +1892,10 @@ impl ClientHandler {
 
     /// Register a lane so the voucher path accepts vouchers for it — its
     /// capability handle is registered on-chain and its [`LaneState`] recorded
-    /// in the lane store, then inserted into the live map. Called both from the
-    /// on-chain capability-registration consumer (#327) and from the
-    /// seller-side capability intake on the first voucher of a new lane.
+    /// in the lane store, then inserted into the live map. Called from the
+    /// seller-side capability intake (`intake_capability`) for every
+    /// request that carries a verified capability, so an already-tracked lane is
+    /// registered again whenever its client re-sends the capability.
     ///
     /// **Idempotent:** a re-observed registration for an already-tracked lane is
     /// a no-op — it MUST NOT reset the accepted-voucher watermark and reopen the
