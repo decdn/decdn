@@ -26,9 +26,10 @@
 # The digest is also what makes the `docker` Dependabot ecosystem useful here:
 # it can bump a digest, but it cannot derive a version from `trixie-slim`, so
 # without this pin it would open no PRs at all. For the same reason it never
-# moves the base to the next Debian release; that is a manual edit of this
-# line. This is the multi-arch index digest, so linux/amd64 and linux/arm64
-# both resolve from it.
+# moves the base to the next Debian release. That move is a manual edit of the
+# `FROM` line below, plus the codename in the `upgrade` comment under it and in
+# `.github/dependabot.yml`. This is the multi-arch index digest, so linux/amd64
+# and linux/arm64 both resolve from it.
 FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS base
 
 # `upgrade` applies the security fixes the pinned base predates. Debian

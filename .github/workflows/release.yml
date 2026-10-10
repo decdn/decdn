@@ -352,9 +352,11 @@ jobs:
           # Both Linux targets go through `cross`, never a native build. A
           # native build links against the runner's glibc — ubuntu-latest is
           # 24.04, glibc 2.39 — which is NEWER than Debian 12 (2.36) or RHEL 9
-          # (2.34), so the binary would not run there. `cross` images pin an
-          # old glibc, at or below the 2.31 floor ADR 000 sets, independently
-          # of whatever ubuntu-latest points at next.
+          # (2.34), so the release archives would not run there. The archives,
+          # not the container images, set this requirement: our image base is
+          # newer than either glibc. `cross` images pin an old glibc, at or
+          # below the 2.31 floor ADR 000 sets, independently of whatever
+          # ubuntu-latest points at next.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             builds: decdn-node:decdn-node decdn-cli:decdn
@@ -441,9 +443,9 @@ jobs:
       # matrix, so the condition keys on the target, not on `cross`. A
       # natively-built binary can reference symbols up to GLIBC_2.39 (the
       # runner's) and fails at exec on any older distribution with
-      # "version `GLIBC_2.3x' not found" — Debian 12 (2.36) and RHEL 9 (2.34)
-      # included. Checked here, before the archive exists, so a binary above
-      # the floor never reaches upload-assets or either image.
+      # "version `GLIBC_2.3x' not found". Checked here, before the archive
+      # exists, so a binary above the floor never reaches upload-assets or
+      # either image.
       - name: Check glibc floor
         if: contains(matrix.target, '-linux-gnu')
         shell: bash

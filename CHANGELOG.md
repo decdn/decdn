@@ -2800,6 +2800,10 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Both container images run on Debian 13 (`trixie-slim`, glibc 2.41)
+  (#2409).** The binaries are the same cross-built release archives, so
+  nothing changes for an operator who runs the daemon or CLI as shipped. An
+  image built `FROM` either of ours now inherits trixie's packages and apt 3.
 - **Release: `sign-release.sh` signs with your `@decdn.org` key from `KEYS`
   by default (#2391).** With `DECDN_SIGNING_KEY` unset, the script picks the
   one secret key that can sign, has a live `@decdn.org` uid and is published
@@ -3615,7 +3619,7 @@ since project inception and will roll into the first tagged release.
   the `docker` ecosystem** to bump it. The pin is what makes two builds of the
   same release tag ship identical base layers; it is also what makes the
   Dependabot entry work at all, since Dependabot can update a digest but cannot
-  derive a version from the `bookworm-slim` tag.
+  derive a version from the `trixie-slim` tag.
 - **`publish-crates.sh` refuses to start when more than five crates are new to
   crates.io.** `PublishNew` allows a burst of five and then roughly one per ten
   minutes, and the first release creates ten crates — one run would be
