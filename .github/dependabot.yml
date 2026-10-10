@@ -34,7 +34,7 @@ updates:
 
   # Bumps the Dockerfile's pinned base-image digest. This only works because
   # the FROM line carries an explicit `@sha256:` — Dependabot updates a tag only
-  # when it can parse a version out of it, and `bookworm-slim` gives it nothing,
+  # when it can parse a version out of it, and `trixie-slim` gives it nothing,
   # so with a bare tag this ecosystem would open no PRs at all.
   - package-ecosystem: docker
     directory: /
