@@ -76,7 +76,7 @@ use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::NodeId as DhtNodeId;
 use crate::handlers::client::PROOF_WAIT_CEILING;
 use crate::runtime::QUIC_MAX_IDLE_TIMEOUT;
-use crate::selection::{CHANNEL_OPEN_CALLER_BUDGET, Candidate, MAX_PROVIDER_ATTEMPTS};
+use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, POOL_OPEN_CALLER_BUDGET};
 use decdn_client::{
     PoolContext, PullDeadlines, open_progressive_pull as open_progressive_upstream,
 };
@@ -781,7 +781,7 @@ impl NodeOrigin {
             };
         let ctx = match deps
             .buyer
-            .open_or_reuse_pool(provider_addr, CHANNEL_OPEN_CALLER_BUDGET)
+            .open_or_reuse_pool(provider_addr, POOL_OPEN_CALLER_BUDGET)
             .await
         {
             Ok(ctx) => ctx,
@@ -1458,7 +1458,7 @@ impl PeerRunSink<'_> {
         let ctx = match self
             .deps
             .buyer
-            .open_or_reuse_pool(provider_addr, CHANNEL_OPEN_CALLER_BUDGET)
+            .open_or_reuse_pool(provider_addr, POOL_OPEN_CALLER_BUDGET)
             .await
         {
             Ok(ctx) => ctx,

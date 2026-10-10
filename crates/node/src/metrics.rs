@@ -1384,7 +1384,7 @@ pub struct DecdnMetrics {
     /// # Two distinct causes, one counter
     ///
     /// 1. the node's own chain lane (a slow L2, a stuck nonce) is slower than
-    ///    `CHANNEL_OPEN_CALLER_BUDGET` — the interesting one; and
+    ///    `POOL_OPEN_CALLER_BUDGET` — the interesting one; and
     /// 2. a boot or idle **reconcile** holds the provider's open slot.
     ///
     /// The verdict is the same for both — try the next candidate, score nothing — which

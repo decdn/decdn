@@ -17,7 +17,7 @@
 //!
 //! with `pool_id`, `foreign_payment_pool`, `foreign_chain_id`,
 //! `configured_payment_pool` and `configured_chain_id` fields.
-//! The unit tests in `crates/node/src/buyer_channel.rs` cover that decision
+//! The unit tests in `crates/node/src/buyer_pool.rs` cover that decision
 //! against a mocked transport. This file runs it against two real deployments of
 //! the same contract, so the `sol!` bindings, the config repoint, and the
 //! on-chain enumeration all take part:

@@ -414,14 +414,14 @@ fn resumable_watermark_rejects_a_frontier_the_tip_does_not_prove() -> anyhow::Re
     use alloy::primitives::{Address, B256};
     use alloy::signers::local::PrivateKeySigner;
 
-    let channel_id = B256::repeat_byte(0x11);
+    let pool_id = B256::repeat_byte(0x11);
     let token = Address::repeat_byte(0x22);
     let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
     let our_signer = std::sync::Arc::new(PrivateKeySigner::random());
-    let ctx = resume_test_ctx(channel_id, token, &our_signer, &domain);
+    let ctx = resume_test_ctx(pool_id, token, &our_signer, &domain);
 
     let bundle = metered_bundle(
-        channel_id,
+        pool_id,
         token,
         &our_signer,
         &domain,
@@ -449,14 +449,14 @@ fn resumable_watermark_accepts_a_frontier_the_tip_proves() -> anyhow::Result<()>
     use alloy::primitives::{Address, B256};
     use alloy::signers::local::PrivateKeySigner;
 
-    let channel_id = B256::repeat_byte(0x11);
+    let pool_id = B256::repeat_byte(0x11);
     let token = Address::repeat_byte(0x22);
     let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
     let our_signer = std::sync::Arc::new(PrivateKeySigner::random());
-    let ctx = resume_test_ctx(channel_id, token, &our_signer, &domain);
+    let ctx = resume_test_ctx(pool_id, token, &our_signer, &domain);
 
     let bundle = metered_bundle(
-        channel_id,
+        pool_id,
         token,
         &our_signer,
         &domain,
@@ -489,18 +489,18 @@ fn resumable_watermark_rejects_a_bundle_not_signed_by_our_own_key() -> anyhow::R
     use alloy::primitives::{Address, B256};
     use alloy::signers::local::PrivateKeySigner;
 
-    let channel_id = B256::repeat_byte(0x11);
+    let pool_id = B256::repeat_byte(0x11);
     let token = Address::repeat_byte(0x22);
     let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
     let our_signer = std::sync::Arc::new(PrivateKeySigner::random());
     let attacker_signer = PrivateKeySigner::random();
-    let ctx = resume_test_ctx(channel_id, token, &our_signer, &domain);
+    let ctx = resume_test_ctx(pool_id, token, &our_signer, &domain);
 
     // The upstream (or an attacker impersonating it) signs the SAME tuple with a
     // DIFFERENT key — exactly what a malicious node echoing a fabricated watermark
     // would have to do, since it does not hold our key.
     let bundle = signed_bundle(
-        channel_id,
+        pool_id,
         token,
         &attacker_signer,
         &domain,
@@ -529,17 +529,17 @@ fn resumable_watermark_rejects_a_bundle_with_a_tampered_amount() -> anyhow::Resu
     use alloy::primitives::{Address, B256};
     use alloy::signers::local::PrivateKeySigner;
 
-    let channel_id = B256::repeat_byte(0x11);
+    let pool_id = B256::repeat_byte(0x11);
     let token = Address::repeat_byte(0x22);
     let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
     let our_signer = std::sync::Arc::new(PrivateKeySigner::random());
-    let ctx = resume_test_ctx(channel_id, token, &our_signer, &domain);
+    let ctx = resume_test_ctx(pool_id, token, &our_signer, &domain);
 
     // Genuinely our own signature — but over amount 100, not the 1_000_000 the bundle
     // claims. A node that recorded 100 and echoes 1_000_000 (bug or malice) must not
     // slip through just because SOME real signature accompanies it.
     let mut bundle = signed_bundle(
-        channel_id,
+        pool_id,
         token,
         &our_signer,
         &domain,
@@ -568,14 +568,14 @@ fn resumable_watermark_accepts_a_bundle_genuinely_signed_by_our_own_key() -> any
     use alloy::primitives::{Address, B256};
     use alloy::signers::local::PrivateKeySigner;
 
-    let channel_id = B256::repeat_byte(0x11);
+    let pool_id = B256::repeat_byte(0x11);
     let token = Address::repeat_byte(0x22);
     let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
     let our_signer = std::sync::Arc::new(PrivateKeySigner::random());
-    let ctx = resume_test_ctx(channel_id, token, &our_signer, &domain);
+    let ctx = resume_test_ctx(pool_id, token, &our_signer, &domain);
 
     let bundle = signed_bundle(
-        channel_id,
+        pool_id,
         token,
         &our_signer,
         &domain,

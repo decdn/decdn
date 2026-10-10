@@ -262,7 +262,7 @@ fn build_handler_limited_configured(
 /// that cannot prove ownership of a lane, so every honest paid fetch attaches a
 /// binding signed by the paying key over the connection's node id.
 #[allow(clippy::expect_used)] // signing a fixed binding cannot fail in-test
-fn channel_context(
+fn pool_context(
     client_ep: &Endpoint,
     client_signer: Arc<PrivateKeySigner>,
     deposit: U256,
@@ -305,7 +305,7 @@ fn unbound_context(client_signer: Arc<PrivateKeySigner>, deposit: U256) -> PoolC
 /// closing voucher (two vouchers), the requester hash-verifies the bytes, and
 /// the persisted channel state advances to nonce 2 / full byte count.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()> {
+async fn client_delivery_roundtrip_advances_lane_state() -> anyhow::Result<()> {
     let spans = support::capture_spans();
     let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
@@ -346,7 +346,7 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -463,7 +463,7 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
 
     let warm = WarmConnection::connect(&client_ep, target, Duration::from_secs(20), None).await?;
 
@@ -573,7 +573,7 @@ async fn peer_source_legs_share_one_connection_across_a_refusal() -> anyhow::Res
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let ledger = Arc::new(ctx.new_ledger());
     let ctx = Arc::new(std::sync::Mutex::new(ctx));
     let slash = slash_domain();
@@ -702,7 +702,7 @@ async fn drive_scattered_as_a_restarted_payer() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let ledger = Arc::new(ctx.new_ledger());
     let ctx = Arc::new(std::sync::Mutex::new(ctx));
     let slash = slash_domain();
@@ -848,7 +848,7 @@ async fn restarted_sub_chunk_transfer(earlier: u64) -> anyhow::Result<()> {
         }
     };
     for timestamp_us in 0x7771..0x7771 + earlier {
-        let mut ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+        let mut ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
         if let Some(lane) = store.load_all()?.first() {
             ctx.prior_amount = lane.last_amount();
             ctx.prior_bytes_delivered = lane.last_bytes_delivered();
@@ -858,7 +858,7 @@ async fn restarted_sub_chunk_transfer(earlier: u64) -> anyhow::Result<()> {
     }
 
     // The restarted payer: its watermark is gone.
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let got = fetch(ctx, 0x7770, Duration::from_secs(8)).await?;
     anyhow::ensure!(
         got.as_ref() == payload.as_slice(),
@@ -3675,7 +3675,7 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -3782,7 +3782,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let mut progress = VoucherProgress::default();
 
     let result = stream_fetch_tracked(
@@ -3922,7 +3922,7 @@ async fn accepted_voucher_advances_lane_activity_clock() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -4017,7 +4017,7 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
     let client_node_id = client_sk.public();
     let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -4164,7 +4164,7 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
 
     // Delivery must complete while every receipt `append` is stalled. The outer
     // timeout is the real assertion: an inline-await implementation would hang.
@@ -4257,7 +4257,7 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -4298,7 +4298,7 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
 /// restart at zero — otherwise the node rejects the second voucher as
 /// `AmountRegression`. Validates the `PoolContext.prior_*` resume fields.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_reused_channel_resumes() -> anyhow::Result<()> {
+async fn client_reused_lane_resumes() -> anyhow::Result<()> {
     let payload = vec![0x33u8; 4096];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -4339,7 +4339,7 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     // Stream 1: fresh channel (prior_* = 0).
-    let ctx1 = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx1 = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let got1 = stream_fetch(
         &client_ep,
         target.clone(),
@@ -4372,7 +4372,7 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
     let ctx2 = PoolContext {
         prior_bytes_delivered: s1.last_bytes_delivered(),
         prior_amount: s1.last_amount(),
-        ..channel_context(&client_ep, Arc::clone(&client_signer), deposit)
+        ..pool_context(&client_ep, Arc::clone(&client_signer), deposit)
     };
     let got2 = stream_fetch(
         &client_ep,
@@ -4463,7 +4463,7 @@ async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Resu
 
     // Stream 1: a healthy fetch that advances the node's lane watermark to the
     // full blob. This is the state the node holds when the client crashes.
-    let ctx1 = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx1 = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let got1 = stream_fetch(
         &client_ep,
         target.clone(),
@@ -4499,7 +4499,7 @@ async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Resu
     // the first stale proof the lane headroom cannot pay, not wait for the proof
     // wait to fault. An unhealed stream wedges at the ~1 MiB floor
     // and blows this budget.
-    let ctx2 = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx2 = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let got2 = stream_fetch(
         &client_ep,
         target,
@@ -4577,7 +4577,7 @@ async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     // Stream 1: a healthy fetch that gives the node's lane an accepted watermark.
-    let ctx1 = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx1 = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let got1 = stream_fetch(
         &client_ep,
         target.clone(),
@@ -4599,7 +4599,7 @@ async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
 
     // Stream 2: the client believes it paid one base unit more for many more
     // bytes than the node accepted — every span it signs from there underpays.
-    let mut ctx2 = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let mut ctx2 = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     ctx2.prior_amount = node_lane.0 + U256::from(1u64);
     ctx2.prior_bytes_delivered = node_lane.1 + U256::from(64u64 * 1024 * 1024);
     let got2 = stream_fetch(
@@ -4734,7 +4734,7 @@ async fn a_restarted_payer_beside_a_live_sibling_heals_below_the_anchor() -> any
 
     // The restarted process: a watermark at zero, far below the signed anchor.
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let got = stream_fetch(
         &client_ep,
         target,
@@ -4868,7 +4868,7 @@ async fn resume_under_a_live_chain(above_anchor: u64) -> anyhow::Result<()> {
 
     // The new process: at or just above the signed anchor, short of the chain
     // the node proved.
-    let mut ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let mut ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     ctx.prior_amount = anchor_amount + U256::from(above_anchor);
     ctx.prior_bytes_delivered = anchor_bytes;
     let got = stream_fetch(
@@ -4956,7 +4956,7 @@ async fn an_unadopted_chain_past_the_bundle_is_retired_and_the_pull_completes() 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
-    let mut ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let mut ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     ctx.prior_amount = lane.last_amount();
     ctx.prior_bytes_delivered = lane.last_bytes_delivered();
     let got = stream_fetch(
@@ -5019,7 +5019,7 @@ async fn a_process_that_exits_before_its_last_persist_heals_in_one_rejection() -
 
     // The first process: one ledger across both entries. It persists after
     // the first entry, then exits before the second entry's persist.
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let fetch_shared = |hash: decdn_cache::Hash, ts: u64| {
         stream_fetch_shared(
@@ -5057,7 +5057,7 @@ async fn a_process_that_exits_before_its_last_persist_heals_in_one_rejection() -
     let rejected_before = counter(&metrics, "decdn_serve_stream_voucher_rejected_total")?;
 
     // The next process resumes from the persisted watermark.
-    let mut next = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let mut next = pool_context(&client_ep, Arc::clone(&signer), deposit);
     next.prior_amount = persisted.amount;
     next.prior_bytes_delivered = persisted.bytes;
     let got = stream_fetch(
@@ -5142,7 +5142,7 @@ async fn client_byte_offset_returns_suffix_multi_group() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
 
     // 70 KiB: past the first four 16 KiB groups and NOT group-aligned, so the
     // serve widens down to the 64 KiB boundary and the decoder trims 6 KiB.
@@ -5234,7 +5234,7 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
 
     let offset = 1000u64;
     let got = stream_fetch(
@@ -5319,7 +5319,7 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, client_signer, deposit);
+    let ctx = pool_context(&client_ep, client_signer, deposit);
 
     let err = stream_fetch(
         &client_ep,
@@ -5354,7 +5354,7 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
 /// server's `StreamResponse` (rather than the buyer's error string) proves the
 /// success path was never entered: an `ok: true` would have streamed bytes.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
+async fn client_unknown_lane_is_rejected() -> anyhow::Result<()> {
     let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB — would cross a chunk if served
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -5422,7 +5422,7 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
 /// running out. The deposit sits one base unit under the window's cost at
 /// `RATE_PER_MB`.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()> {
+async fn client_underfunded_pool_is_refused_pre_serve() -> anyhow::Result<()> {
     // 6 MiB: larger than one credit window (the ramp floor).
     let payload = vec![0xABu8; 6 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
@@ -5545,7 +5545,7 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
         spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let got = stream_fetch(
         &client_ep,
         target,
@@ -5709,7 +5709,7 @@ async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyh
 /// the real headroom (5) cannot cover it. The `last_*` fields are private
 /// (#751), so the spent-down watermark is built via `hydrate`.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> {
+async fn client_spent_down_pool_is_refused_pre_serve() -> anyhow::Result<()> {
     let payload = vec![0x5Du8; 1_572_864]; // 1.5 MiB — well under one credit window
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -5967,7 +5967,7 @@ async fn client_store_record_failure_aborts_the_stream() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, client_signer.clone(), deposit);
+    let ctx = pool_context(&client_ep, client_signer.clone(), deposit);
 
     anyhow::ensure!(
         stream_fetch(
@@ -6047,7 +6047,7 @@ async fn fetch_on_a_lane_expiring_at(expiry: u64) -> anyhow::Result<Option<Strin
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, client_signer, deposit);
+    let ctx = pool_context(&client_ep, client_signer, deposit);
 
     let err = stream_fetch(
         &client_ep,
@@ -6085,7 +6085,7 @@ fn unix_now() -> anyhow::Result<u64> {
 /// it is proven, and the fix is a fresh capability (ADR 005 §Open-time refusal
 /// classes).
 #[tokio::test(flavor = "multi_thread")]
-async fn client_expired_channel_is_refused_unfunded() -> anyhow::Result<()> {
+async fn client_expired_capability_is_refused_unfunded() -> anyhow::Result<()> {
     // Unix second `1`: long past, so admission refuses the lane.
     let err = fetch_on_a_lane_expiring_at(1)
         .await?
@@ -6307,7 +6307,7 @@ async fn a_drained_signer_refused_at_admission_is_unfunded() -> anyhow::Result<(
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, Arc::clone(&client_signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let ledger = Arc::new(ctx.new_ledger());
     let ctx = Arc::new(std::sync::Mutex::new(ctx));
     let slash = slash_domain();
@@ -7202,7 +7202,7 @@ async fn buyer_aborts_oversized_small_blob_without_paying() -> anyhow::Result<()
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let mut progress = VoucherProgress::default();
     // Buyer ceiling 4096 < the 8192 bytes that actually arrive → the received
     // bytes trip the cap.
@@ -7257,7 +7257,7 @@ async fn buyer_pays_for_received_bytes_then_aborts_over_ceiling() -> anyhow::Res
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let mut progress = VoucherProgress::default();
     // Ceiling ~2.4 MiB: two 1 MiB payment intervals clear before the cumulative
     // received bytes cross the ceiling and trip the cap.
@@ -7317,7 +7317,7 @@ async fn buyer_rejects_over_ceiling_rate() -> anyhow::Result<()> {
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let mut progress = VoucherProgress::default();
     // Buyer ceiling below the quoted rate → refuse before the first paid interval.
     let buyer_ceiling = RATE_PER_MB - 1;
@@ -7394,7 +7394,7 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let mut progress = VoucherProgress::default();
     // Buyer ceiling == promised size → accepted, full blob delivered.
     let got = stream_fetch_tracked(
@@ -7468,7 +7468,7 @@ async fn a_pull_stopped_at_a_split_pays_what_it_verified_and_the_lane_pulls_on()
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let ledger = Arc::new(ctx.new_ledger());
     let slash = slash_domain();
     let source = PeerSource::new(
@@ -7550,7 +7550,7 @@ async fn gap_scoped_leg_enforces_the_received_byte_ceiling_from_its_own_offset()
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let ledger = Arc::new(ctx.new_ledger());
     let ceiling: u64 = 2_500_000;
     let slash = slash_domain();
@@ -7633,7 +7633,7 @@ async fn buyer_accepts_rate_at_exact_ceiling() -> anyhow::Result<()> {
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let mut progress = VoucherProgress::default();
     let got = stream_fetch_tracked(
         &client_ep,
@@ -7677,7 +7677,7 @@ async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let mut progress = VoucherProgress::default();
     // `ProgressCallback` is `'static`, so the closure owns an `Arc` handle to the
     // shared sink rather than borrowing a stack local.
@@ -7842,7 +7842,7 @@ async fn denylisted_hash_is_refused_even_when_held() -> anyhow::Result<()> {
         spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let err = stream_fetch(
         &client_ep,
         target,
@@ -7899,7 +7899,7 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
         spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let err = stream_fetch(
         &client_ep,
         target,
@@ -7966,7 +7966,7 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
         spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let fetch_ep = client_ep.clone();
     let server_addr = server_eth.address();
     let hash_bytes = *hash.as_bytes();
@@ -8048,7 +8048,7 @@ async fn blacklisted_funder_is_refused_on_a_cache_miss() -> anyhow::Result<()> {
         spawn_handler_server_with_deny(cache, store, deny, funder).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let err = stream_fetch(
         &client_ep,
         target,
@@ -8091,7 +8091,7 @@ async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
         spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, signer, deposit);
+    let ctx = pool_context(&client_ep, signer, deposit);
     let err = stream_fetch(
         &client_ep,
         target,
@@ -8460,7 +8460,7 @@ async fn delegate_signed_vouchers_carry_a_delivery_to_completion() -> anyhow::Re
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     // The requester signs with the DELEGATE — the funder's key never appears.
-    let ctx = channel_context(&client_ep, Arc::clone(&delegate), U256::from(10_000_000u64));
+    let ctx = pool_context(&client_ep, Arc::clone(&delegate), U256::from(10_000_000u64));
     let got = stream_fetch(
         &client_ep,
         target,
@@ -8528,7 +8528,7 @@ async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> a
     .await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, Arc::clone(&delegate), U256::from(10_000_000u64));
+    let ctx = pool_context(&client_ep, Arc::clone(&delegate), U256::from(10_000_000u64));
     let fetch_ep = client_ep.clone();
     let server_addr = server_eth.address();
     let hash_bytes = *hash.as_bytes();
@@ -8634,7 +8634,7 @@ async fn cache_with_two_blobs(
 /// old `client_concurrent_same_channel_accepts_one_voucher` test pinned, where two
 /// un-coordinated streams both signed voucher nonce 1 and only one was accepted.
 #[tokio::test(flavor = "multi_thread")]
-async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
+async fn client_concurrent_same_lane_both_succeed() -> anyhow::Result<()> {
     let payload_a = vec![0x5Au8; 4096];
     let payload_b = vec![0xA5u8; 8192];
     let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
@@ -8645,7 +8645,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     // ONE channel context, ONE shared ledger seeded fresh (all `prior_* == ZERO`),
     // shared across both concurrent pulls via `Arc`.
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let server_addr = server_eth.address();
     let sd = slash_domain();
@@ -8739,7 +8739,7 @@ async fn honest_concurrent_rollovers_draw_no_voucher_rejection() -> anyhow::Resu
         spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let server_addr = server_eth.address();
     let sd = slash_domain();
@@ -8816,7 +8816,7 @@ async fn a_sub_chunk_stream_on_a_live_chain_sends_only_its_closing_voucher() -> 
         spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let sd = slash_domain();
     let fetch = |hash: decdn_cache::Hash, request_id: u64| {
@@ -8915,7 +8915,7 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let ctx = channel_context(&client_ep, client_signer, deposit);
+    let ctx = pool_context(&client_ep, client_signer, deposit);
 
     let err = stream_fetch(
         &client_ep,
@@ -9068,7 +9068,7 @@ impl decdn_cache::Origin for CountingOrigin {
 /// client (the stand-in origin has nothing); the security property is whether
 /// the paid pull was attempted at all.
 #[tokio::test(flavor = "multi_thread")]
-async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()> {
+async fn pull_through_gate_authorizes_only_pool_owner() -> anyhow::Result<()> {
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cache_tmp = tempfile::tempdir()?;
     let cache = CacheEngine::open(
@@ -9334,7 +9334,7 @@ async fn spawn_counting_pull_server(
 /// green — a refusal that came from the fill missing (rather than from the floor)
 /// would bump `cache_miss` instead, and `hits == 0` alone cannot tell them apart.
 #[tokio::test(flavor = "multi_thread")]
-async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
+async fn underfunded_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
     let window_cost = min_payment(HARNESS_FLOOR_BYTES, RATE_PER_MB);
     let deposit = window_cost.saturating_sub(U256::from(1u64));
     let signer = Arc::new(PrivateKeySigner::random());
@@ -9412,11 +9412,11 @@ async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()>
 /// (the check is `<`) and must still reach the pull.
 ///
 /// Without this, raising the floor — or flipping `<` to `<=` — would break
-/// nothing: `underfunded_channel_never_reaches_the_paid_pull` above only pins
+/// nothing: `underfunded_pool_never_reaches_the_paid_pull` above only pins
 /// that an *under*-funded channel is stopped. A floor that also stopped funded
 /// channels would turn a cold fetch into a permanent refusal on every node.
 #[tokio::test(flavor = "multi_thread")]
-async fn funded_channel_still_reaches_the_paid_pull() -> anyhow::Result<()> {
+async fn funded_pool_still_reaches_the_paid_pull() -> anyhow::Result<()> {
     let window_cost = min_payment(HARNESS_FLOOR_BYTES, RATE_PER_MB);
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -9488,7 +9488,7 @@ async fn funded_channel_still_reaches_the_paid_pull() -> anyhow::Result<()> {
 /// this channel drive an origin pull for every absent hash it names, forever,
 /// which is the same drain #1519 closes against a dust channel.
 #[tokio::test(flavor = "multi_thread")]
-async fn spent_out_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
+async fn spent_out_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
     let client = PrivateKeySigner::random();
     let store = Arc::new(MemoryPoolStateStore::new());
     // `last_*` are private (#751), so the spent-down watermark comes from `hydrate`.
@@ -9985,7 +9985,7 @@ async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyh
         spawn_origin_only_server_with_metrics(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     match stream_fetch(
         &client_ep,
@@ -10106,7 +10106,7 @@ async fn origin_only_node_declines_a_foreign_hash() -> anyhow::Result<()> {
         spawn_origin_only_server(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     let res = stream_fetch(
         &client_ep,
@@ -10144,7 +10144,7 @@ async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
         spawn_origin_only_server(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -10189,7 +10189,7 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
     let baseline_fetches = cache_metrics.origin_fetches.get();
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(&client_ep, Arc::clone(&signer), deposit);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     let res = stream_fetch(
         &client_ep,
@@ -10236,8 +10236,7 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
     // under the handler's binding domain — exactly what `pull_authorized` checks.
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx =
-        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
 
     let got = stream_fetch(
         &client_ep,
@@ -10337,8 +10336,7 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx =
-        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
 
     let got = stream_fetch(
         &client_ep,
@@ -10446,8 +10444,7 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx =
-        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
 
     let got = stream_fetch(
         &client_ep,
@@ -10707,8 +10704,7 @@ async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Res
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx =
-        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
 
     let got = stream_fetch(
         &client_ep,
@@ -10802,8 +10798,7 @@ async fn local_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx =
-        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
 
     let got = stream_fetch(
         &client_ep,
@@ -10868,8 +10863,7 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx =
-        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
 
     match stream_fetch(
         &client_ep,
@@ -11082,8 +11076,7 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx =
-        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
     let slash = slash_domain();
     let fetch = || {
         stream_fetch(
@@ -11401,8 +11394,7 @@ async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> any
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx =
-        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
 
     match stream_fetch(
         &client_ep,
@@ -11464,8 +11456,7 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx =
-        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
 
     match stream_fetch(
         &client_ep,
@@ -11532,8 +11523,7 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx =
-        channel_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
 
     match stream_fetch(
         &client_ep,
@@ -12790,7 +12780,7 @@ async fn client_rejects_a_server_that_oversends_past_the_promised_length() -> an
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(
+    let ctx = pool_context(
         &client_ep,
         Arc::new(PrivateKeySigner::random()),
         U256::from(10_000_000u64),
@@ -12845,7 +12835,7 @@ async fn client_rejects_a_frame_that_straddles_the_promised_length() -> anyhow::
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(
+    let ctx = pool_context(
         &client_ep,
         Arc::new(PrivateKeySigner::random()),
         U256::from(10_000_000u64),
@@ -12914,7 +12904,7 @@ async fn client_rejects_hash_mismatched_bytes() -> anyhow::Result<()> {
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(
+    let ctx = pool_context(
         &client_ep,
         Arc::new(PrivateKeySigner::random()),
         U256::from(10_000_000u64),
@@ -12967,7 +12957,7 @@ async fn client_rejects_an_empty_claim_for_a_non_empty_hash() -> anyhow::Result<
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(
+    let ctx = pool_context(
         &client_ep,
         Arc::new(PrivateKeySigner::random()),
         U256::from(10_000_000u64),
@@ -13020,7 +13010,7 @@ async fn fetch_inflated_garbage(frame: usize) -> anyhow::Result<(anyhow::Error, 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     // A deposit that could pay for the whole inflated claim many times over, so
     // the spend bound under test is the verifier's, not the deposit's.
-    let ctx = channel_context(
+    let ctx = pool_context(
         &client_ep,
         Arc::new(PrivateKeySigner::random()),
         U256::from(1_000_000_000u64),
@@ -13138,7 +13128,7 @@ async fn client_pays_for_an_honest_prefix_and_stops_at_the_first_bad_group() -> 
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(
+    let ctx = pool_context(
         &client_ep,
         Arc::new(PrivateKeySigner::random()),
         U256::from(1_000_000_000u64),
@@ -13620,7 +13610,7 @@ async fn client_completes_when_its_send_is_stopped_before_the_closing_voucher() 
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(
+    let ctx = pool_context(
         &client_ep,
         Arc::new(PrivateKeySigner::random()),
         U256::from(10_000_000u64),
@@ -13675,7 +13665,7 @@ async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_clo
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(
+    let ctx = pool_context(
         &client_ep,
         Arc::new(PrivateKeySigner::random()),
         U256::from(10_000_000u64),
@@ -13725,7 +13715,7 @@ async fn fetch_with_frames_in_flight(signal: StopThenSignal) -> anyhow::Result<a
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(
+    let ctx = pool_context(
         &client_ep,
         Arc::new(PrivateKeySigner::random()),
         U256::from(10_000_000u64),
@@ -13878,7 +13868,7 @@ async fn drive_against_stop_send_server(
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = channel_context(
+    let ctx = pool_context(
         &client_ep,
         Arc::new(PrivateKeySigner::random()),
         U256::from(10_000_000u64),

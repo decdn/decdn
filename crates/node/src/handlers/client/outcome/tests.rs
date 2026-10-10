@@ -142,7 +142,7 @@ const fn refusal_is_listed(reason: ServeRejectReason) {
         ServeRejectReason::EvictedSinceProbe
         | ServeRejectReason::CacheMiss
         | ServeRejectReason::InternalError
-        | ServeRejectReason::UnknownChannel
+        | ServeRejectReason::UnknownLane
         | ServeRejectReason::OwnerMismatch
         | ServeRejectReason::InsufficientDeposit
         | ServeRejectReason::PoolUnconfirmed
@@ -172,7 +172,7 @@ fn every_failed_end_counts_on_exactly_one_listed_reason() {
         ServeRejectReason::EvictedSinceProbe,
         ServeRejectReason::CacheMiss,
         ServeRejectReason::InternalError,
-        ServeRejectReason::UnknownChannel,
+        ServeRejectReason::UnknownLane,
         ServeRejectReason::OwnerMismatch,
         ServeRejectReason::InsufficientDeposit,
         ServeRejectReason::PoolUnconfirmed,

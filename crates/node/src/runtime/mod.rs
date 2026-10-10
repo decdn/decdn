@@ -34,7 +34,6 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::admin;
-use crate::channel_store::PersistentPoolStateStore;
 use crate::dht::{DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet};
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::client::{ClientHandler, ClientProtocol, MAX_CLIENT_STREAMS};
@@ -43,6 +42,7 @@ use crate::handlers::probe::{ProbeHandler, StakeLanePolicy as ProbeStakeLanePoli
 use crate::handlers::probe_rate_limit::ProbeRateLimiter;
 use crate::metrics;
 use crate::payment_settlement::PoolSettlementService;
+use crate::pool_store::PersistentPoolStateStore;
 use crate::stop_handle::StopHandle;
 use alloy::network::EthereumWallet;
 use alloy::primitives::U256;
@@ -161,7 +161,7 @@ const FEE_SHARE_BOOT_BUDGET: Duration = Duration::from_mins(1);
 /// client interval. The one consumer still reachable from this node is
 /// `PendingTransactionBuilder::get_receipt`'s heartbeat (alloy-provider
 /// `heart.rs`), which the node awaits in `payment_settlement` and
-/// `buyer_channel` — so this bounds how fast a node awaiting a mined settlement /
+/// `buyer_pool` — so this bounds how fast a node awaiting a mined settlement /
 /// channel tx re-polls for its receipt, and alloy's 250 ms localhost default
 /// would otherwise hammer a dev anvil for the life of every pending tx.
 ///
@@ -392,9 +392,9 @@ struct Infra {
     /// The `PaymentPool` deployment the lane store is stamped with. The voucher
     /// EIP-712 domain is derived from this same value, so the stamp and the
     /// signature domain can never disagree.
-    payment_pool_deployment: crate::channel_store::Deployment,
-    concrete_channel_store: Arc<PersistentPoolStateStore>,
-    channel_state_store: Arc<dyn PoolStateStore>,
+    payment_pool_deployment: crate::pool_store::Deployment,
+    concrete_pool_store: Arc<PersistentPoolStateStore>,
+    pool_state_store: Arc<dyn PoolStateStore>,
     watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
     receipt_sink: Arc<dyn crate::receipt_log::ReceiptSink>,
     /// Stop handle for the background receipt writer: cancelled after the
@@ -459,11 +459,11 @@ async fn build_infra(
     // run it on a blocking thread to avoid stalling the tokio runtime.
     // Failure here MUST abort startup: continuing with a fresh in-memory
     // map silently reopens the replay window the store exists to close.
-    let channel_store_data_dir = cfg.identity.data_dir.clone();
+    let pool_store_data_dir = cfg.identity.data_dir.clone();
     // The store binds to the configured `PaymentPool` deployment and drops the
     // seller-side rows another deployment wrote: pool ids repeat across
     // deployments, so a stale row would shadow a returning buyer's new pool.
-    let channel_store_deployment = crate::channel_store::Deployment {
+    let pool_store_deployment = crate::pool_store::Deployment {
         chain_id: cfg.blockchain.chain_id,
         payment_pool: parse_nonzero_address(
             &cfg.blockchain.payment_pool_address,
@@ -485,7 +485,7 @@ async fn build_infra(
         .context("blockchain.rpc_url is not a valid URL (value redacted; check the config)")?;
     check_deployment_preflight(
         ProviderFactory::new(preflight_rpc_url, Arc::clone(&node_metrics)).shared_head(),
-        channel_store_deployment,
+        pool_store_deployment,
         &BootRetry::new(DEPLOYMENT_PREFLIGHT_BUDGET, Arc::clone(&node_metrics)),
     )
     .await?;
@@ -494,9 +494,9 @@ async fn build_infra(
     // (pending_settle_v1 table, PR #743 review), and the buyer
     // `BuyerPoolStore` (buyer_pool_state_v1 table, #744) — redb forbids a
     // second `Database` handle to the same file, so one shared store owns all.
-    let concrete_channel_store: Arc<PersistentPoolStateStore> = Arc::new(
+    let concrete_pool_store: Arc<PersistentPoolStateStore> = Arc::new(
         tokio::task::spawn_blocking(move || {
-            PersistentPoolStateStore::open(&channel_store_data_dir, channel_store_deployment)
+            PersistentPoolStateStore::open(&pool_store_data_dir, pool_store_deployment)
         })
         .await
         .context("channel state store open task panicked")?
@@ -507,9 +507,9 @@ async fn build_infra(
     // settlement sweep, PR #743 review), and the buyer-pool trait (#744).
     // Derive trait-object handles from the single concrete store so every write
     // family shares one open store and one fsync discipline (each family commits
-    // on its own per-family redb file); `concrete_channel_store` stays bound for
+    // on its own per-family redb file); `concrete_pool_store` stays bound for
     // the buyer handle built further below.
-    let channel_state_store: Arc<dyn PoolStateStore> = concrete_channel_store.clone();
+    let pool_state_store: Arc<dyn PoolStateStore> = concrete_pool_store.clone();
     // Debounce the scan-checkpoint writes (#784, keyed in #1092): the settlement
     // watcher, the only watcher that persists a cursor (`CheckpointKey::PoolOpened`),
     // advances it once per completed `eth_getLogs` window — on the live tail, once
@@ -522,7 +522,7 @@ async fn build_infra(
     // Wrapping here (the wiring layer) keeps the domain trait and the disk store
     // free of the debounce policy.
     let watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore> = Arc::new(
-        crate::payment_settlement::DebouncedCheckpointStore::new(concrete_channel_store.clone()),
+        crate::payment_settlement::DebouncedCheckpointStore::new(concrete_pool_store.clone()),
     );
     // Boot-time smoke test: read every persisted record so startup fails
     // fast on corruption / forward-incompatible schema, well before the
@@ -533,7 +533,7 @@ async fn build_infra(
     // `ClientHandlerDeps` would couple this stage to the handler's internal
     // channel representation. Cost: one extra `load_all` on startup.
     let persisted_count = tokio::task::spawn_blocking({
-        let store = Arc::clone(&channel_state_store);
+        let store = Arc::clone(&pool_state_store);
         move || store.load_all()
     })
     .await
@@ -588,7 +588,7 @@ async fn build_infra(
     // mirror the in-memory voucher watermark to disk every
     // `payment.voucher_commit_interval_ms`. A failed flush retains the dirty set
     // for the next tick; it never blocks delivery.
-    let flush_store = Arc::clone(&channel_state_store);
+    let flush_store = Arc::clone(&pool_state_store);
     let flush_metrics = Arc::clone(&node_metrics);
     let flush_interval =
         std::time::Duration::from_millis(cfg.payment.voucher_commit_interval_ms.max(1));
@@ -694,9 +694,9 @@ async fn build_infra(
         node_metrics,
         secret_key,
         eth_signer,
-        payment_pool_deployment: channel_store_deployment,
-        concrete_channel_store,
-        channel_state_store,
+        payment_pool_deployment: pool_store_deployment,
+        concrete_pool_store,
+        pool_state_store,
         watcher_checkpoint_store,
         receipt_sink,
         receipt_writer,
@@ -1179,7 +1179,7 @@ async fn build_chain_and_handlers(
     // (`infra.payment_pool_deployment` — one parse, one source of truth); the
     // ephemeral-binding domain to the `CapacityBond` deployment
     // (== `capacity_bond_addr`, which holds the NodeId↔address mappings). The
-    // handler hydrates per-channel voucher state from `channel_state_store` so
+    // handler hydrates per-channel voucher state from `pool_state_store` so
     // a restart cannot replay an already-accepted voucher (#527).
     let payment_pool_addr = infra.payment_pool_deployment.payment_pool;
 
@@ -1378,7 +1378,7 @@ async fn build_chain_and_handlers(
         slash_domain: slash_domain.clone(),
         voucher_domain: voucher_domain.clone(),
         bind_domain: bind_domain.clone(),
-        channel_state_store: Arc::clone(&infra.channel_state_store),
+        pool_state_store: Arc::clone(&infra.pool_state_store),
         receipt_sink: Arc::clone(&infra.receipt_sink),
         pool_view: Some(Arc::new(resolving_pool_view) as Arc<dyn crate::pool_view::PoolView>),
         pool_min_remaining_deposit: U256::from(
@@ -1437,7 +1437,7 @@ async fn build_chain_and_handlers(
         wallet_provider,
         payment_pool_addr,
         infra.eth_signer.address(),
-        Arc::clone(&infra.channel_state_store),
+        Arc::clone(&infra.pool_state_store),
         Arc::clone(&infra.watcher_checkpoint_store),
         Arc::clone(&client_handler),
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
@@ -1656,14 +1656,14 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let buyer_wallet_provider = ch
         .providers
         .buyer_wallet((*infra.eth_signer).clone(), ch.event_poll_interval);
-    let buyer_channel_store: Arc<dyn decdn_incentive::BuyerPoolStore> = Arc::new(
-        crate::channel_store::BuyerPoolStoreHandle::new(Arc::clone(&infra.concrete_channel_store)),
+    let buyer_pool_store: Arc<dyn decdn_incentive::BuyerPoolStore> = Arc::new(
+        crate::pool_store::BuyerPoolStoreHandle::new(Arc::clone(&infra.concrete_pool_store)),
     );
     // `admin_v1_pools` reads the SAME store the bootstrap below writes adoptions
     // and top-ups into. It has to be the same handle, not a second open of
     // `buyer.redb`: redb holds a process-exclusive lock on that file for the
     // daemon's lifetime, which is why no CLI can read it from disk (#2078).
-    let buyer_channel_store_for_admin = Arc::clone(&buyer_channel_store);
+    let buyer_pool_store_for_admin = Arc::clone(&buyer_pool_store);
     // The buyer-side PaymentPool bootstrap (whose on-chain round-trips —
     // notably the one-time USDC `approve` receipt — can block for many
     // minutes on a stuck tx, bounded by `APPROVE_RECEIPT_TIMEOUT`) and
@@ -2135,11 +2135,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             biased;
             // A shutdown that races a slow bootstrap unwinds cleanly here.
             _ = &mut buyer_bootstrap_stop_rx => return,
-            res = crate::buyer_channel::BuyerPoolService::bootstrap(
+            res = crate::buyer_pool::BuyerPoolService::bootstrap(
                 buyer_wallet_provider,
                 buyer_deployment,
                 buyer_signer_address,
-                buyer_channel_store,
+                buyer_pool_store,
                 eth_signer_for_buyer,
                 buyer_working_deposit,
                 buyer_ensure_max_approval,
@@ -2190,7 +2190,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     // reads find no origin.
                     origin_directory: origin_directory_c,
                     addr_resolver: Arc::clone(resolver),
-                    buyer: Arc::clone(&service) as Arc<dyn crate::buyer_channel::PoolOpener>,
+                    buyer: Arc::clone(&service) as Arc<dyn crate::buyer_pool::PoolOpener>,
                     self_id: node_origin_self_id,
                     slash_domain: node_origin_slash_domain,
                     bind_domain: node_origin_bind_domain,
@@ -2278,7 +2278,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // service use, plus a read handle over the handler's live lane
         // registry for the last-voucher clock (issue #1733) — read-only here.
         .with_lanes(admin::LaneStatusHandles {
-            pool_store: Arc::clone(&infra.channel_state_store),
+            pool_store: Arc::clone(&infra.pool_state_store),
             lane_activity: ch.client_handler.lane_activity_clock(),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
         })
@@ -2286,7 +2286,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // handle `BuyerPoolService` records into, so the admin surface reports
         // what the daemon believes — the only read path to `buyer.redb` while
         // this process holds redb's exclusive lock on it.
-        .with_buyer_pools(Arc::clone(&buyer_channel_store_for_admin))
+        .with_buyer_pools(Arc::clone(&buyer_pool_store_for_admin))
         // Slash-detection introspection for `admin_v1_slashes` (#1032). Shares
         // the in-memory store the watcher appends to — read-only here.
         .with_slash_detection(admin::SlashStatusHandles {
@@ -2456,7 +2456,7 @@ pub async fn run(
         receipt_writer: infra.receipt_writer,
         warming_creditor: ch.warming_creditor,
         lane_flush_task: infra.lane_flush_task,
-        channel_state_store: infra.channel_state_store,
+        pool_state_store: infra.pool_state_store,
         node_metrics: infra.node_metrics,
         tasks: bg.tasks,
     };
@@ -2500,9 +2500,9 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     /// queued land in the ledger before the runtime returns.
     warming_creditor: StopHandle,
     /// Periodic lane-store flush timer, aborted below after one final durable
-    /// flush of `channel_state_store`.
+    /// flush of `pool_state_store`.
     lane_flush_task: tokio::task::JoinHandle<()>,
-    channel_state_store: Arc<dyn PoolStateStore>,
+    pool_state_store: Arc<dyn PoolStateStore>,
     node_metrics: Arc<metrics::Metrics>,
     tasks: JoinSet<()>,
 }
@@ -2579,7 +2579,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
         receipt_writer,
         warming_creditor,
         lane_flush_task,
-        channel_state_store,
+        pool_state_store,
         node_metrics,
         mut tasks,
     } = handles;
@@ -2732,8 +2732,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // The router has drained and the redeem sweep above already ran, so the
     // in-memory lane state is final; this is the last write before the
     // background flush task is aborted below.
-    let flush_result = match tokio::task::spawn_blocking(move || channel_state_store.flush()).await
-    {
+    let flush_result = match tokio::task::spawn_blocking(move || pool_state_store.flush()).await {
         Ok(result) => result,
         Err(join_err) => Err(decdn_incentive::StoreError::Backend(format!(
             "flush join: {join_err}"
@@ -3674,7 +3673,7 @@ const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
 /// fails if any contract in `contracts/src` other than `PaymentPool` exposes
 /// the selector, deployed or not. Runs BEFORE the lane store opens, because
 /// the store's deployment binding
-/// ([`crate::channel_store::Deployment`]) drops the seller lane state when
+/// ([`crate::pool_store::Deployment`]) drops the seller lane state when
 /// the stamp differs — a typo in either field must abort bring-up while the
 /// store is untouched, not destroy unredeemed lane state on a WARN. The
 /// reads retry transient RPC errors on `retry`; the mismatch verdicts are
@@ -3682,7 +3681,7 @@ const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
 /// from `getRateBounds()` as a permanent contract error, not a retry spin.
 async fn check_deployment_preflight<P: Provider + Clone>(
     provider: P,
-    deployment: crate::channel_store::Deployment,
+    deployment: crate::pool_store::Deployment,
     retry: &BootRetry,
 ) -> anyhow::Result<()> {
     let (rpc_chain_id, code_len) = retry

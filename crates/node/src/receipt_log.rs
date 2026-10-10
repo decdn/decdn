@@ -12,7 +12,7 @@
 //!
 //! There are two layers. [`ReceiptLog`] is the *disk* boundary — a small trait
 //! (mirroring the trait+impl pattern of
-//! [`decdn_incentive::store::PoolStateStore`] / [`crate::channel_store`])
+//! [`decdn_incentive::store::PoolStateStore`] / [`crate::pool_store`])
 //! whose runtime impl is the disk-backed [`JsonlReceiptLog`], appending one JSON
 //! object per line to `<data_dir>/download_receipts.jsonl` (JSON Lines).
 //! [`ReceiptSink`] is the *hot-path* boundary: the paid-delivery path does not
@@ -28,7 +28,7 @@
 //! `write_all`, which lands the bytes in the OS page cache — and does **not**
 //! fsync per record. The receipt log is an *audit* artifact, not the
 //! voucher-replay guard. That guard is the lane watermark in
-//! [`crate::channel_store::PersistentPoolStateStore`], which
+//! [`crate::pool_store::PersistentPoolStateStore`], which
 //! advances **in memory** the moment a voucher or preimage is accepted, reaches
 //! disk on the runtime's periodic lane flush
 //! (`payment.voucher_commit_interval_ms`, 5 s by default), and is flushed again
@@ -97,7 +97,7 @@ use crate::stop_handle::StopHandle;
 const RECEIPT_LOG_FILE: &str = decdn_common::config::RECEIPT_LOG_FILE;
 
 /// On-disk file mode (`0o600` — owner-only read+write). Same defense-in-depth
-/// rationale as [`crate::channel_store`]: `data_dir` is already `0o700`, but the
+/// rationale as [`crate::pool_store`]: `data_dir` is already `0o700`, but the
 /// receipt log can carry per-client delivery metadata, so the file mode is
 /// tightened independently in case the directory ACL is widened out-of-band.
 #[cfg(unix)]
@@ -403,7 +403,7 @@ impl JsonlReceiptLog {
     /// log that is already near the cap rotates on the next append rather than
     /// only after a full cap's worth of fresh writes.
     ///
-    /// Unlike [`crate::channel_store::PersistentPoolStateStore::open`], a
+    /// Unlike [`crate::pool_store::PersistentPoolStateStore::open`], a
     /// failure here is **not** required to abort node bring-up: the receipt log
     /// is an audit artifact, not the #527 replay guard. The runtime decides the
     /// fatality (it currently logs and continues without the audit log).
@@ -571,7 +571,7 @@ fn open_append(path: &Path) -> std::io::Result<File> {
 /// Tighten the on-disk file mode to `0o600`. Idempotent: skips the syscall when
 /// the mode already matches so a read-only mount with the correct mode (e.g.
 /// from a prior boot) does not fail startup. Mirrors
-/// [`crate::channel_store::PersistentPoolStateStore`]'s tightening.
+/// [`crate::pool_store::PersistentPoolStateStore`]'s tightening.
 #[cfg(unix)]
 fn tighten_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;

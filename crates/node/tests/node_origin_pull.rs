@@ -38,7 +38,7 @@ use decdn_incentive::{
     ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
     min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
-use decdn_node::buyer_channel::{OpenReported, PoolOpenPending, PoolOpener};
+use decdn_node::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
@@ -46,9 +46,7 @@ use decdn_node::dht::{
 };
 use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps};
-use decdn_node::selection::{
-    CHANNEL_OPEN_CALLER_BUDGET, MAX_PROVIDER_ATTEMPTS, outer_pull_deadline,
-};
+use decdn_node::selection::{MAX_PROVIDER_ATTEMPTS, POOL_OPEN_CALLER_BUDGET, outer_pull_deadline};
 use decdn_protocol::client::{
     ChunkData, ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt,
     StreamResponse, StreamResponseBody, StreamResponseExt, VoucherRejectReason,
@@ -254,7 +252,7 @@ struct FailingRecordOpener {
 /// caller that walks away — is guarded where the mechanism lives:
 /// `a_caller_that_times_out_leaves_the_open_slot_held` and
 /// `a_second_caller_joins_the_in_flight_open_rather_than_opening_again` in
-/// `crates/node/src/buyer_channel.rs`, plus section A0 of the anvil e2e. Neither
+/// `crates/node/src/buyer_pool.rs`, plus section A0 of the anvil e2e. Neither
 /// `StubOpener` nor `FailingRecordOpener` models any of this.
 #[derive(Debug)]
 struct WedgedOpener {
@@ -2840,7 +2838,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
     // without these two counters the assertions above would pass even if the typed
     // `PoolOpenPending` were never produced — the test would prove nothing about
     // the mechanism it exists for. The split also matters operationally: "pending"
-    // says the node's chain lane is slower than `CHANNEL_OPEN_CALLER_BUDGET`, while
+    // says the node's chain lane is slower than `POOL_OPEN_CALLER_BUDGET`, while
     // "failure" says the tx reverted or the wallet is under-funded.
     assert_counter(&b_metrics, "node_pull_pool_open_pending_total", 2)?;
     assert_counter(&b_metrics, "node_pull_pool_open_failures_total", 0)?;
@@ -2851,7 +2849,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
 
 /// The open outlived the caller's budget and continues in a detached task (#1143).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()> {
+async fn a_wedged_pool_open_does_not_starve_the_candidate_loop() -> Result<()> {
     wedged_open_does_not_starve_the_candidate_loop().await
 }
 
@@ -5304,8 +5302,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
 /// receive loop AND `pull_verdict` unwrapped it back out of the refusal.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
-async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_remedy() -> Result<()>
-{
+async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_lane_remedy() -> Result<()> {
     let payload = vec![0x9Cu8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
@@ -5420,10 +5417,10 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
 /// clock does not allow for, and the loop dies before reaching the last one. This test
 /// covers the stall window; #859 and #1143 cover the stream open and the pool open.
 ///
-/// The existing starvation guard (`a_wedged_channel_open_does_not_starve_the_candidate_loop`)
+/// The existing starvation guard (`a_wedged_pool_open_does_not_starve_the_candidate_loop`)
 /// cannot catch it: its candidates wedge at the pool OPEN, so they never reach the
 /// streaming stage whose budget is in question. Its candidates cost
-/// `CHANNEL_OPEN_CALLER_BUDGET` each; these cost `CHANNEL_OPEN + open + stall`.
+/// `POOL_OPEN_CALLER_BUDGET` each; these cost `CHANNEL_OPEN + open + stall`.
 ///
 /// # What this does and does NOT guard
 ///
@@ -6494,7 +6491,7 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
 /// persisted log advances monotonically — cumulative bytes and amount both double.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
-async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
+async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
     // Two DISTINCT blobs, same size, served by the same provider A. Gap-driven
     // `drive()` re-derives `missing_ranges` from the cache store (#1675), so a
     // second fetch of the SAME blob is already-cached and pulls/pays nothing —
@@ -7256,9 +7253,9 @@ async fn build_node_b(
     a_addr: std::net::SocketAddr,
     a_eth_addr: Address,
     hash: Hash,
-    ab_channel_id: B256,
+    ab_pool_id: B256,
     b_buyer: &Arc<PrivateKeySigner>,
-    leaf_channel_id: B256,
+    leaf_pool_id: B256,
     leaf_eth_addr: Address,
     leaf_deposit: U256,
     max_blob_size_bytes: u64,
@@ -7277,9 +7274,9 @@ async fn build_node_b(
         a_addr,
         a_eth_addr,
         hash,
-        ab_channel_id,
+        ab_pool_id,
         b_buyer,
-        &[(leaf_channel_id, leaf_eth_addr, leaf_eth_addr, leaf_deposit)],
+        &[(leaf_pool_id, leaf_eth_addr, leaf_eth_addr, leaf_deposit)],
         max_blob_size_bytes,
         64,
         None,
@@ -7319,7 +7316,7 @@ async fn build_node_b_with_leaves(
     a_addr: std::net::SocketAddr,
     a_eth_addr: Address,
     hash: Hash,
-    ab_channel_id: B256,
+    ab_pool_id: B256,
     b_buyer: &Arc<PrivateKeySigner>,
     leaves: &[(B256, Address, Address, U256)],
     max_blob_size_bytes: u64,
@@ -7341,7 +7338,7 @@ async fn build_node_b_with_leaves(
         a_addr,
         a_eth_addr,
         hash,
-        ab_channel_id,
+        ab_pool_id,
         b_buyer,
         leaves,
         max_blob_size_bytes,
@@ -7362,7 +7359,7 @@ async fn build_node_b_with_store(
     a_addr: std::net::SocketAddr,
     a_eth_addr: Address,
     hash: Hash,
-    ab_channel_id: B256,
+    ab_pool_id: B256,
     b_buyer: &Arc<PrivateKeySigner>,
     leaves: &[(B256, Address, Address, U256)],
     max_blob_size_bytes: u64,
@@ -7402,7 +7399,7 @@ async fn build_node_b_with_store(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
-        ab_channel_id,
+        ab_pool_id,
         b_buyer,
         &local_rep,
         &b_metrics,
@@ -7429,9 +7426,9 @@ async fn build_node_b_with_store(
     // (the ADR 011 subject, `getPool.owner`) and its deposit (the floor-`M`
     // solvency `remaining`).
     let mut pool_status_map: HashMap<B256, decdn_node::pool_view::PoolStatus> = HashMap::new();
-    for (leaf_channel_id, leaf_funder, leaf_voucher_signer, leaf_deposit) in leaves {
+    for (leaf_pool_id, leaf_funder, leaf_voucher_signer, leaf_deposit) in leaves {
         store_b.record(&LaneState::hydrate(
-            *leaf_channel_id,
+            *leaf_pool_id,
             *leaf_voucher_signer,
             b_eth.address(),
             *leaf_deposit,
@@ -7442,7 +7439,7 @@ async fn build_node_b_with_store(
             decdn_incentive::LaneChain::NONE,
         ))?;
         pool_status_map.insert(
-            *leaf_channel_id,
+            *leaf_pool_id,
             decdn_node::pool_view::PoolStatus {
                 owner: *leaf_funder,
                 remaining: *leaf_deposit,
@@ -7498,7 +7495,7 @@ async fn build_node_b_with_store(
 /// caller needs to build B and run the leaf.
 async fn spawn_node_a(
     payload: &[u8],
-    ab_channel_id: B256,
+    ab_pool_id: B256,
     b_buyer_addr: Address,
 ) -> Result<(
     iroh::PublicKey,
@@ -7508,7 +7505,7 @@ async fn spawn_node_a(
     tokio::task::JoinHandle<()>,
 )> {
     let (a_id, addr_a, a_eth, ep_a, task_a, _metrics) =
-        spawn_node_a_metered(payload, ab_channel_id, b_buyer_addr).await?;
+        spawn_node_a_metered(payload, ab_pool_id, b_buyer_addr).await?;
     Ok((a_id, addr_a, a_eth, ep_a, task_a))
 }
 
@@ -7516,7 +7513,7 @@ async fn spawn_node_a(
 /// streams A served.
 async fn spawn_node_a_metered(
     payload: &[u8],
-    ab_channel_id: B256,
+    ab_pool_id: B256,
     b_buyer_addr: Address,
 ) -> Result<(
     iroh::PublicKey,
@@ -7536,7 +7533,7 @@ async fn spawn_node_a_metered(
     let a_eth = Arc::new(PrivateKeySigner::random());
     let store_a = Arc::new(MemoryPoolStateStore::new());
     store_a.record(&LaneState::hydrate(
-        ab_channel_id,
+        ab_pool_id,
         b_buyer_addr,
         a_eth.address(),
         U256::from(DEPOSIT_MICRO_USDC),
@@ -7654,22 +7651,22 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
 
-    let ab_channel_id = B256::repeat_byte(0xA1);
+    let ab_pool_id = B256::repeat_byte(0xA1);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let leaf_pool_id = B256::repeat_byte(0x1F);
     let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -7686,7 +7683,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -7761,7 +7758,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     // buffered path's join keys. The first leg is the primed handshake pull,
     // opened under `serve_stream` before the pull starts; the later leg opens
     // under the run's span.
-    await_run_outcome(&spans, hash, "filled", a_id, ab_channel_id).await?;
+    await_run_outcome(&spans, hash, "filled", a_id, ab_pool_id).await?;
     let opens = spans.matching("open_progressive_pull", "hash", &hash.to_string());
     let leg_parent = |offset: &str| {
         opens
@@ -7791,22 +7788,22 @@ async fn window_pull_through_handshake_is_the_first_pull_leg() -> Result<()> {
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
 
-    let ab_channel_id = B256::repeat_byte(0xA1);
+    let ab_pool_id = B256::repeat_byte(0xA1);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a, a_metrics) =
-        spawn_node_a_metered(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a_metered(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let leaf_pool_id = B256::repeat_byte(0x1F);
     let (handler_b, b_target, ep_b, _recorded, _cache_b, _b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -7823,7 +7820,7 @@ async fn window_pull_through_handshake_is_the_first_pull_leg() -> Result<()> {
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -7867,22 +7864,22 @@ async fn window_pull_through_completes_a_blob_past_the_ramp_floor() -> Result<()
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload_len).unwrap_or(u64::MAX);
 
-    let ab_channel_id = B256::repeat_byte(0xA3);
+    let ab_pool_id = B256::repeat_byte(0xA3);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x3F);
+    let leaf_pool_id = B256::repeat_byte(0x3F);
     let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -7901,7 +7898,7 @@ async fn window_pull_through_completes_a_blob_past_the_ramp_floor() -> Result<()
             leaf_node_id,
             &leaf_eth,
             b_operator,
-            leaf_channel_id,
+            leaf_pool_id,
             hash,
             RATE,
             None,
@@ -7954,16 +7951,16 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
     let payload = vec![0x6Bu8; 12 * 1024 * 1024];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xA7);
+    let ab_pool_id = B256::repeat_byte(0xA7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     // The leaf funds with `leaf_funder` but signs every voucher (and its client
     // binding) with `leaf_delegate` — the split this test exists to police.
     let leaf_funder = Arc::new(PrivateKeySigner::random());
     let leaf_delegate = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x2F);
+    let leaf_pool_id = B256::repeat_byte(0x2F);
     // Starts empty: the open-time gates (`dispatch.rs`, `pull_authorized`) must
     // admit the request, so the cut-off can only come from the mid-stream check.
     let deny = Arc::new(decdn_node::content_deny::ContentDenylist::empty());
@@ -7973,10 +7970,10 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
             &[(
-                leaf_channel_id,
+                leaf_pool_id,
                 leaf_funder.address(),
                 leaf_delegate.address(),
                 U256::from(DEPOSIT_MICRO_USDC),
@@ -8001,7 +7998,7 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
             leaf_node_id,
             &leaf_signer,
             b_operator,
-            leaf_channel_id,
+            leaf_pool_id,
             hash,
             RATE,
             None,
@@ -8065,23 +8062,23 @@ async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() 
     let payload = vec![0xC1u8; 64 * 1024];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xA1);
+    let ab_pool_id = B256::repeat_byte(0xA1);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let leaf_pool_id = B256::repeat_byte(0x1F);
     let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b_with_leaves(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
             &[(
-                leaf_channel_id,
+                leaf_pool_id,
                 leaf_eth.address(),
                 leaf_eth.address(),
                 U256::from(DEPOSIT_MICRO_USDC),
@@ -8104,7 +8101,7 @@ async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() 
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -8153,7 +8150,7 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
-    let ab_channel_id = B256::repeat_byte(0xA2);
+    let ab_pool_id = B256::repeat_byte(0xA2);
     let b_buyer = Arc::new(PrivateKeySigner::random());
 
     // A answers probes but refuses the paid stream: the honest "I don't have it" answer.
@@ -8172,17 +8169,17 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
     );
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x2F);
+    let leaf_pool_id = B256::repeat_byte(0x2F);
     let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b_with_leaves(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
             &[(
-                leaf_channel_id,
+                leaf_pool_id,
                 leaf_eth.address(),
                 leaf_eth.address(),
                 U256::from(DEPOSIT_MICRO_USDC),
@@ -8204,7 +8201,7 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -8243,22 +8240,22 @@ async fn window_pull_through_serves_and_caches_empty_blob() -> Result<()> {
     let payload: Vec<u8> = Vec::new();
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xA1);
+    let ab_pool_id = B256::repeat_byte(0xA1);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let leaf_pool_id = B256::repeat_byte(0x1F);
     let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -8275,7 +8272,7 @@ async fn window_pull_through_serves_and_caches_empty_blob() -> Result<()> {
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -8333,7 +8330,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
-    let ab_channel_id = B256::repeat_byte(0xA8);
+    let ab_pool_id = B256::repeat_byte(0xA8);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a, received, release) =
         spawn_gated_node_a(&payload).await?;
@@ -8342,25 +8339,25 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     // state.
     let leaf1_eth = Arc::new(PrivateKeySigner::random());
     let leaf2_eth = Arc::new(PrivateKeySigner::random());
-    let leaf1_channel_id = B256::repeat_byte(0x81);
-    let leaf2_channel_id = B256::repeat_byte(0x82);
+    let leaf1_pool_id = B256::repeat_byte(0x81);
+    let leaf2_pool_id = B256::repeat_byte(0x82);
     let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b_with_leaves(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
             &[
                 (
-                    leaf1_channel_id,
+                    leaf1_pool_id,
                     leaf1_eth.address(),
                     leaf1_eth.address(),
                     U256::from(DEPOSIT_MICRO_USDC),
                 ),
                 (
-                    leaf2_channel_id,
+                    leaf2_pool_id,
                     leaf2_eth.address(),
                     leaf2_eth.address(),
                     U256::from(DEPOSIT_MICRO_USDC),
@@ -8388,7 +8385,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
             leaf1_node_id,
             &leaf1_eth_c,
             b_operator,
-            leaf1_channel_id,
+            leaf1_pool_id,
             hash,
             RATE,
             None,
@@ -8434,7 +8431,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
             leaf2_node_id,
             &leaf2_eth_c,
             b_operator,
-            leaf2_channel_id,
+            leaf2_pool_id,
             hash,
             RATE,
             None,
@@ -8529,14 +8526,14 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     let payload = vec![0xC7u8; 4096];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xA9);
+    let ab_pool_id = B256::repeat_byte(0xA9);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a, received, release) =
         spawn_gated_node_a(&payload).await?;
 
     // One lane: one leaf channel, one signer, shared by both concurrent opens.
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x8A);
+    let leaf_pool_id = B256::repeat_byte(0x8A);
     // Exactly one floor's worth of reserved credit-window headroom, plus slack
     // strictly under a second floor. Derived from the payment quantum rather
     // than hard-coded, so it tracks `CHUNK_BYTES` instead of drifting with it.
@@ -8547,10 +8544,10 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
             &[(
-                leaf_channel_id,
+                leaf_pool_id,
                 leaf_eth.address(),
                 leaf_eth.address(),
                 remaining,
@@ -8578,7 +8575,7 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
             leaf1_node_id,
             &leaf1_eth,
             b_operator,
-            leaf_channel_id,
+            leaf_pool_id,
             hash,
             RATE,
             None,
@@ -8623,7 +8620,7 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     let req = StreamRequest {
         hash: *hash.as_bytes(),
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        pool_id: leaf_channel_id.into(),
+        pool_id: leaf_pool_id.into(),
         byte_offset: 0,
         byte_len: 0,
         timestamp_us: 0x9002,
@@ -8688,22 +8685,22 @@ async fn window_pull_through_bounded_unaligned_range_pulls_only_the_span() -> Re
     let hash = Hash::new(&payload);
     let total = u64::try_from(PAYLOAD_LEN)?;
 
-    let ab_channel_id = B256::repeat_byte(0xA9);
+    let ab_pool_id = B256::repeat_byte(0xA9);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x8F);
+    let leaf_pool_id = B256::repeat_byte(0x8F);
     let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -8727,7 +8724,7 @@ async fn window_pull_through_bounded_unaligned_range_pulls_only_the_span() -> Re
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         req_off,
         req_len,
@@ -8798,22 +8795,22 @@ async fn window_pull_through_bounded_miss_seeds_only_the_held_ranges_inside_it()
     );
     let outboard = bytes::Bytes::from(outboard.data);
 
-    let ab_channel_id = B256::repeat_byte(0xAA);
+    let ab_pool_id = B256::repeat_byte(0xAA);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x90);
+    let leaf_pool_id = B256::repeat_byte(0x90);
     let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -8855,7 +8852,7 @@ async fn window_pull_through_bounded_miss_seeds_only_the_held_ranges_inside_it()
             leaf_node_id,
             &leaf_eth,
             b_operator,
-            leaf_channel_id,
+            leaf_pool_id,
             hash,
             req_off,
             req_len,
@@ -8916,22 +8913,22 @@ async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Res
     let payload = vec![0x7Eu8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xA7);
+    let ab_pool_id = B256::repeat_byte(0xA7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x7F);
+    let leaf_pool_id = B256::repeat_byte(0x7F);
     let (handler_b, b_target, ep_b, _recorded, _cache_b, _b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -8952,7 +8949,7 @@ async fn window_pull_through_resumed_offset_is_served_by_the_fused_path() -> Res
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         MB_BYTES,
         0,
@@ -8995,22 +8992,22 @@ async fn window_pull_through_end_past_the_blob_is_served_by_the_fused_path_clamp
     let hash = Hash::new(&payload);
     let total = u64::try_from(PAYLOAD_LEN)?;
 
-    let ab_channel_id = B256::repeat_byte(0xA6);
+    let ab_pool_id = B256::repeat_byte(0xA6);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x76);
+    let leaf_pool_id = B256::repeat_byte(0x76);
     let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -9033,7 +9030,7 @@ async fn window_pull_through_end_past_the_blob_is_served_by_the_fused_path_clamp
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         req_off,
         total,
@@ -9066,22 +9063,22 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
-    let ab_channel_id = B256::repeat_byte(0xA2);
+    let ab_pool_id = B256::repeat_byte(0xA2);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x2F);
+    let leaf_pool_id = B256::repeat_byte(0x2F);
     let (handler_b, b_target, ep_b, recorded, _cache_b, _b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -9098,7 +9095,7 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         Some(1),
@@ -9166,22 +9163,22 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     let payload = vec![0x5Au8; usize::try_from(payload_len)?];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xA9);
+    let ab_pool_id = B256::repeat_byte(0xA9);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x9A);
+    let leaf_pool_id = B256::repeat_byte(0x9A);
     let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -9205,7 +9202,7 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
             leaf_node_id,
             &leaf_eth,
             b_operator,
-            leaf_channel_id,
+            leaf_pool_id,
             hash,
             RATE,
             LeafMode::StopPayingAfter {
@@ -9317,7 +9314,7 @@ async fn window_pull_through_connected_nonpaying_leaf_past_ramp_bounds_upstream_
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     // The leaf's close cancels the pull leg mid-run; the run's span still ends
     // with its outcome and its lane's join keys.
-    await_run_outcome(&spans, hash, "cancelled", a_id, ab_channel_id).await?;
+    await_run_outcome(&spans, hash, "cancelled", a_id, ab_pool_id).await?;
     Ok(())
 }
 
@@ -9333,13 +9330,13 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
     let payload = vec![0x9Eu8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xA3);
+    let ab_pool_id = B256::repeat_byte(0xA3);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x3F);
+    let leaf_pool_id = B256::repeat_byte(0x3F);
     let max_blob_size_bytes = 64 * 1024 * 1024;
     let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
@@ -9347,9 +9344,9 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(5u64),
             max_blob_size_bytes,
@@ -9366,7 +9363,7 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -9736,22 +9733,22 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
     anyhow::ensure!(Hash::new(&served_wrong) != hash, "fixtures must differ");
     let advertised_bytes = u64::try_from(honest.len()).unwrap_or(u64::MAX);
 
-    let ab_channel_id = B256::repeat_byte(0xA6);
+    let ab_pool_id = B256::repeat_byte(0xA6);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
         spawn_lying_node_a(served_wrong, advertised_bytes).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x6F);
+    let leaf_pool_id = B256::repeat_byte(0x6F);
     let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -9775,7 +9772,7 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -9852,21 +9849,21 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
         .ok_or_else(|| anyhow::anyhow!("corruption offset outside the wire"))?;
     *byte ^= 0xFF;
 
-    let ab_channel_id = B256::repeat_byte(0xA7);
+    let ab_pool_id = B256::repeat_byte(0xA7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) = spawn_paced_lying_node_a(wire, total_bytes).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x7A);
+    let leaf_pool_id = B256::repeat_byte(0x7A);
     let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -9886,7 +9883,7 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -9916,7 +9913,7 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     // The corrupt group drops A as a source for the rest of the range.
-    await_run_outcome(&spans, hash, "reassigned", a_id, ab_channel_id).await?;
+    await_run_outcome(&spans, hash, "reassigned", a_id, ab_pool_id).await?;
     Ok(())
 }
 
@@ -10105,22 +10102,22 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
     let payload = vec![0x7Cu8; payload_len];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xA7);
+    let ab_pool_id = B256::repeat_byte(0xA7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x7F);
+    let leaf_pool_id = B256::repeat_byte(0x7F);
     let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -10137,7 +10134,7 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
     )
     .await?;
@@ -10209,22 +10206,22 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
     let payload = vec![0x2Du8; payload_len];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xA8);
+    let ab_pool_id = B256::repeat_byte(0xA8);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x2E);
+    let leaf_pool_id = B256::repeat_byte(0x2E);
     let (handler_b, b_target, ep_b, _recorded, _cache_b, _b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -10240,7 +10237,7 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
         b_target,
         leaf_node_id,
         &leaf_eth,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
     )
     .await?;
@@ -10252,7 +10249,7 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
         &mut leaf.send,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         SLIVER_BYTES,
         amount,
     )
@@ -10304,7 +10301,7 @@ async fn window_pull_through_sliver_voucher_leaves_the_rest_owed() -> Result<()>
                     &mut leaf.send,
                     &leaf_eth,
                     b_operator,
-                    leaf_channel_id,
+                    leaf_pool_id,
                     paid,
                     amount,
                 )
@@ -10342,22 +10339,22 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
     let payload = vec![0x3Eu8; payload_len];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xA9);
+    let ab_pool_id = B256::repeat_byte(0xA9);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x3F);
+    let leaf_pool_id = B256::repeat_byte(0x3F);
     let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -10373,7 +10370,7 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
         b_target,
         leaf_node_id,
         &leaf_eth,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
     )
     .await?;
@@ -10385,7 +10382,7 @@ async fn window_pull_through_sliver_vouchers_exhaust_the_proof_budget() -> Resul
             &mut leaf.send,
             &leaf_eth,
             b_operator,
-            leaf_channel_id,
+            leaf_pool_id,
             n * SLIVER_BYTES,
             amount,
         )
@@ -10421,23 +10418,23 @@ async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon
     let payload = vec![0x4Cu8; payload_len];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xAA);
+    let ab_pool_id = B256::repeat_byte(0xAA);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x4D);
+    let leaf_pool_id = B256::repeat_byte(0x4D);
     let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b_with_store(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
             &[(
-                leaf_channel_id,
+                leaf_pool_id,
                 leaf_eth.address(),
                 leaf_eth.address(),
                 U256::from(DEPOSIT_MICRO_USDC),
@@ -10461,7 +10458,7 @@ async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon
         b_target,
         leaf_node_id,
         &leaf_eth,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
     )
     .await?;
@@ -10469,7 +10466,7 @@ async fn window_pull_through_store_record_failure_is_a_node_fault_not_an_abandon
         &mut leaf.send,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         CHUNK_BYTES,
         min_payment(CHUNK_BYTES, RATE),
     )
@@ -10510,22 +10507,22 @@ async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline
     let payload = vec![0x5Eu8; payload_len];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xAB);
+    let ab_pool_id = B256::repeat_byte(0xAB);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x5F);
+    let leaf_pool_id = B256::repeat_byte(0x5F);
     let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, _b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -10541,7 +10538,7 @@ async fn window_pull_through_leaf_drop_before_paying_is_an_abandon_and_a_decline
         b_target,
         leaf_node_id,
         &leaf_eth,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
     )
     .await?;
@@ -10598,19 +10595,19 @@ async fn window_pull_through_leaf_gone_while_the_pull_owes_the_first_byte_ends_t
         0,
     );
 
-    let ab_channel_id = B256::repeat_byte(0x3C);
+    let ab_pool_id = B256::repeat_byte(0x3C);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x3D);
+    let leaf_pool_id = B256::repeat_byte(0x3D);
     let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, _local_rep, _b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -10626,7 +10623,7 @@ async fn window_pull_through_leaf_gone_while_the_pull_owes_the_first_byte_ends_t
         b_target,
         leaf_node_id,
         &leaf_eth,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
     )
     .await?;
@@ -10672,22 +10669,22 @@ async fn window_pull_through_leaf_drop_after_paying_is_a_serve_abandon() -> Resu
     let payload = vec![0x6Au8; payload_len];
     let hash = Hash::new(&payload);
 
-    let ab_channel_id = B256::repeat_byte(0xAB);
+    let ab_pool_id = B256::repeat_byte(0xAB);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x6B);
+    let leaf_pool_id = B256::repeat_byte(0x6B);
     let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             0,
@@ -10704,7 +10701,7 @@ async fn window_pull_through_leaf_drop_after_paying_is_a_serve_abandon() -> Resu
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         Some(2),
@@ -10744,18 +10741,18 @@ async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Re
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
-    let ab_channel_id = B256::repeat_byte(0xA6);
+    let ab_pool_id = B256::repeat_byte(0xA6);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a) =
-        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a(&payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x6F);
+    let leaf_pool_id = B256::repeat_byte(0x6F);
     // The retry pays on its own lane: the first leaf may have paid B for an
     // interval before the abort, and a fresh pull on that lane would re-sign
     // from zero and be refused as a regression rather than reach the ceiling.
     let retry_eth = Arc::new(PrivateKeySigner::random());
-    let retry_channel_id = B256::repeat_byte(0x70);
+    let retry_pool_id = B256::repeat_byte(0x70);
     // A two-interval ceiling, far below the 4 MiB blob, so the RECEIVED bytes cross
     // it well before the whole blob is pulled. B pays only for verified bytes, one
     // interval at a time, and the frame that crosses the ceiling aborts the pull
@@ -10769,17 +10766,17 @@ async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Re
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
             &[
                 (
-                    leaf_channel_id,
+                    leaf_pool_id,
                     leaf_eth.address(),
                     leaf_eth.address(),
                     U256::from(DEPOSIT_MICRO_USDC),
                 ),
                 (
-                    retry_channel_id,
+                    retry_pool_id,
                     retry_eth.address(),
                     retry_eth.address(),
                     U256::from(DEPOSIT_MICRO_USDC),
@@ -10802,7 +10799,7 @@ async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Re
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -10863,7 +10860,7 @@ async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Re
         retry_node_id,
         &retry_eth,
         b_operator,
-        retry_channel_id,
+        retry_pool_id,
         hash,
         RATE,
         None,
@@ -10902,22 +10899,22 @@ async fn ranged_pull_under_ceiling(
     byte_len: u64,
 ) -> Result<CeilingRun> {
     let hash = Hash::new(payload);
-    let ab_channel_id = B256::repeat_byte(0xC7);
+    let ab_pool_id = B256::repeat_byte(0xC7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (a_id, a_addr, a_eth, ep_a, task_a, a_metrics) =
-        spawn_node_a_metered(payload, ab_channel_id, b_buyer.address()).await?;
+        spawn_node_a_metered(payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x7C);
+    let leaf_pool_id = B256::repeat_byte(0x7C);
     let (handler_b, b_target, ep_b, recorded, _cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b(
             a_id,
             a_addr,
             a_eth.address(),
             hash,
-            ab_channel_id,
+            ab_pool_id,
             &b_buyer,
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
             ceiling,
@@ -10934,7 +10931,7 @@ async fn ranged_pull_under_ceiling(
         leaf_node_id,
         &leaf_eth,
         b_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         byte_offset,
         byte_len,
@@ -11092,7 +11089,7 @@ async fn window_pull_through_over_long_range_on_a_blob_within_the_ceiling_is_ser
 /// ledgers — each capped at one pull's wire bytes — could never reach.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)]
-async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Result<()> {
+async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<()> {
     let payload = vec![0xC1u8; PAYLOAD_LEN];
     let hash = Hash::new(&payload);
     // A second blob of the SAME length: the probe responder quotes one `total_bytes`.
@@ -11254,7 +11251,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     .map_err(|_| {
         anyhow::anyhow!(
             "concurrent ledger pulls hung past {join_budget:?} — likely \
-             CHANNEL_OPEN_CALLER_BUDGET={CHANNEL_OPEN_CALLER_BUDGET:?} expiry under llvm-cov \
+             POOL_OPEN_CALLER_BUDGET={POOL_OPEN_CALLER_BUDGET:?} expiry under llvm-cov \
              contention, not AmountRegression; pending={} timeout={} stalled={} recorded={:?} \
              retired={:?}",
             counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
@@ -11269,7 +11266,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         matches!(&first, OriginFetch::AlreadyAdmitted),
         "first concurrent pull returned {first:?} (expected AlreadyAdmitted); AmountRegression \
          would retire the channel and cap cumulative at one pull's wire bytes, while \
-         CHANNEL_OPEN_CALLER_BUDGET expiry increments node_pull_pool_open_pending_total and \
+         POOL_OPEN_CALLER_BUDGET expiry increments node_pull_pool_open_pending_total and \
          surfaces NotFound — check pending={} timeout={} stalled={} recorded={:?} \
          retired={:?}",
         counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
@@ -11284,7 +11281,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         matches!(&second, OriginFetch::AlreadyAdmitted),
         "second concurrent pull returned {second:?} (expected AlreadyAdmitted); AmountRegression \
          would retire the channel and cap cumulative at one pull's wire bytes, while \
-         CHANNEL_OPEN_CALLER_BUDGET expiry increments node_pull_pool_open_pending_total and \
+         POOL_OPEN_CALLER_BUDGET expiry increments node_pull_pool_open_pending_total and \
          surfaces NotFound — check pending={} timeout={} stalled={} recorded={:?} \
          retired={:?}",
         counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
@@ -14258,7 +14255,7 @@ async fn a_zero_working_deposit_never_funds_a_pull() -> Result<()> {
 /// the deterministic pin of the `delivered_frontier` clamp in
 /// `decdn_client::driver::drive`.
 #[tokio::test(flavor = "multi_thread")]
-async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Result<()> {
+async fn concurrent_pulls_resume_at_their_own_frontier_not_the_lanes() -> Result<()> {
     // Four chunks of content per blob: large enough that each stream's ramped
     // credit window (floored at one chunk plus the verify lag) cannot front the whole payload on
     // credit, so real proofs come due mid-pull.
@@ -15402,7 +15399,7 @@ async fn spawn_holder_on(
 /// Build serving node S: an empty-cache window-paced `ClientHandler` whose
 /// `NodeOrigin` discovers holders through `discovery` (and `probe_cache`, when a
 /// test seeds it), plus each leaf's own lane in S's seller store (`leaves` is
-/// `(channel_id, owner)` per leaf). A focused twin of [`build_node_b_with_leaves`]
+/// `(pool_id, owner)` per leaf). A focused twin of [`build_node_b_with_leaves`]
 /// for the multi-holder ranged pull (that helper hardwires a single provider).
 #[allow(clippy::too_many_arguments)]
 async fn build_serving_node(
@@ -15468,9 +15465,9 @@ async fn build_serving_node(
     std::mem::forget(cache_tmp);
     let store_s = Arc::new(MemoryPoolStateStore::new());
     let mut pool_status_map: HashMap<B256, decdn_node::pool_view::PoolStatus> = HashMap::new();
-    for &(leaf_channel_id, leaf_eth_addr) in leaves {
+    for &(leaf_pool_id, leaf_eth_addr) in leaves {
         store_s.record(&LaneState::hydrate(
-            leaf_channel_id,
+            leaf_pool_id,
             leaf_eth_addr,
             s_eth.address(),
             leaf_deposit,
@@ -15481,7 +15478,7 @@ async fn build_serving_node(
             decdn_incentive::LaneChain::NONE,
         ))?;
         pool_status_map.insert(
-            leaf_channel_id,
+            leaf_pool_id,
             decdn_node::pool_view::PoolStatus {
                 owner: leaf_eth_addr,
                 remaining: leaf_deposit,
@@ -15586,7 +15583,7 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
     );
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let leaf_pool_id = B256::repeat_byte(0x1F);
     let (handler_s, s_target, ep_s, recorded, cache_s, s_operator, s_metrics, _) =
         build_serving_node(
             hash,
@@ -15596,7 +15593,7 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
             PositiveProbeCache::new(),
             addr_map,
             &[(a_id, a_addr), (b_id, b_addr)],
-            &[(leaf_channel_id, leaf_eth.address())],
+            &[(leaf_pool_id, leaf_eth.address())],
             U256::from(DEPOSIT_MICRO_USDC),
         )
         .await?;
@@ -15613,7 +15610,7 @@ async fn two_partial_holders_assemble_over_the_real_paid_path() -> Result<()> {
         leaf_node_id,
         &leaf_eth,
         s_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -15929,7 +15926,7 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
     let addr_map = HashMap::from([(p_dht, p_eth), (o_dht, o_eth)]);
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x2F);
+    let leaf_pool_id = B256::repeat_byte(0x2F);
     let (handler_s, s_target, ep_s, _recorded, cache_s, s_operator, s_metrics, _) =
         build_serving_node(
             hash,
@@ -15939,7 +15936,7 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
             probe_cache,
             addr_map,
             &[(p_id, p_addr), (o_id, o_addr)],
-            &[(leaf_channel_id, leaf_eth.address())],
+            &[(leaf_pool_id, leaf_eth.address())],
             U256::from(DEPOSIT_MICRO_USDC),
         )
         .await?;
@@ -15955,7 +15952,7 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
             leaf_node_id,
             &leaf_eth,
             s_operator,
-            leaf_channel_id,
+            leaf_pool_id,
             hash,
             RATE,
             None,
@@ -15968,7 +15965,7 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
             leaf_node_id,
             &leaf_eth,
             s_operator,
-            leaf_channel_id,
+            leaf_pool_id,
             hash,
             RATE,
             byte_len,
@@ -16214,7 +16211,7 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
     let addr_map = HashMap::from([(f_dht, f_eth), (o_dht, o_eth)]);
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
-    let leaf_channel_id = B256::repeat_byte(0x2E);
+    let leaf_pool_id = B256::repeat_byte(0x2E);
     let (handler_s, s_target, ep_s, _recorded, _cache_s, s_operator, _s_metrics, _) =
         build_serving_node(
             hash,
@@ -16224,7 +16221,7 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
             probe_cache,
             addr_map,
             &[(f_id, f_addr), (o_id, o_addr)],
-            &[(leaf_channel_id, leaf_eth.address())],
+            &[(leaf_pool_id, leaf_eth.address())],
             U256::from(DEPOSIT_MICRO_USDC),
         )
         .await?;
@@ -16244,7 +16241,7 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
         leaf_node_id,
         &leaf_eth,
         s_operator,
-        leaf_channel_id,
+        leaf_pool_id,
         hash,
         RATE,
         None,
@@ -16640,7 +16637,7 @@ async fn sole_coverer_refusal_is_retried(leaves: usize) -> Result<()> {
     // issue names, sharing S's one fill on the hash or opening their own.
     let mut leaf_eps = Vec::new();
     let mut pulls = Vec::new();
-    for (eth, &(channel_id, _)) in leaf_eths.iter().zip(&leaf_lanes) {
+    for (eth, &(pool_id, _)) in leaf_eths.iter().zip(&leaf_lanes) {
         let leaf_sk = fresh_key();
         let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
         let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
@@ -16654,7 +16651,7 @@ async fn sole_coverer_refusal_is_retried(leaves: usize) -> Result<()> {
                 leaf_node_id,
                 &eth,
                 s_operator,
-                channel_id,
+                pool_id,
                 hash,
                 RATE,
                 None,

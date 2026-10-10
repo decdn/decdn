@@ -84,12 +84,12 @@ use decdn_incentive::{
     BuyerPoolStore, KeyedCheckpointStore, MemoryBuyerPoolStore, PoolStateStore,
     bind_node_id_domain, register_node_signing_hash, slash_judge_domain, voucher_domain,
 };
-use decdn_node::buyer_channel::BuyerPoolService;
+use decdn_node::buyer_pool::BuyerPoolService;
 use decdn_node::chain_events::boot_retry::BootRetry;
 use decdn_node::chain_events::shared_head::{HeadSource, SharedHead};
-use decdn_node::channel_store::{Deployment, PersistentPoolStateStore};
 use decdn_node::metrics::Metrics;
 use decdn_node::payment_settlement::PoolSettlementService;
+use decdn_node::pool_store::{Deployment, PersistentPoolStateStore};
 use decdn_protocol::ALPN_CLIENT;
 use iroh::EndpointAddr;
 use tracing_subscriber::Layer;

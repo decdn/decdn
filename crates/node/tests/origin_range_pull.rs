@@ -3196,7 +3196,7 @@ fn spawn_server_concurrent(
 /// is threaded through unchanged (own-origin coalescing does not use it, but the
 /// helper is shared).
 #[allow(clippy::too_many_arguments)]
-async fn handler_two_channels_over_http_origin(
+async fn handler_two_pools_over_http_origin(
     origin_uri: &str,
     owner_pool: B256,
     client_a: Address,
@@ -3322,7 +3322,7 @@ async fn mid_blob_open_behind_a_paying_owners_frontier_attaches() -> anyhow::Res
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
     let provider = server_eth.address();
-    // Built inline rather than via `handler_two_channels_over_http_origin`: the
+    // Built inline rather than via `handler_two_pools_over_http_origin`: the
     // discriminating counter (`fill_not_coalesced`) lives on `CacheMetrics`,
     // which that fixture does not wire.
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -3531,7 +3531,7 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
     let provider = server_eth.address();
     // A generous pull-through deadline so the coalesced waiter WAITS on the
     // in-flight entry (populate) instead of a bare presence check.
-    let (handler, cache, metrics, _cache_tmp) = handler_two_channels_over_http_origin(
+    let (handler, cache, metrics, _cache_tmp) = handler_two_pools_over_http_origin(
         &server.uri(),
         owner_pool,
         owner_eth.address(),
@@ -3706,19 +3706,19 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
         range_vals.push((hex, range_val));
     }
 
-    let channel_a = B256::repeat_byte(0x71);
-    let channel_b = B256::repeat_byte(0x72);
+    let pool_a = B256::repeat_byte(0x71);
+    let pool_b = B256::repeat_byte(0x72);
     let eth_a = Arc::new(PrivateKeySigner::random());
     let eth_b = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
     let provider = server_eth.address();
-    let (handler, cache, metrics, _cache_tmp) = handler_two_channels_over_http_origin(
+    let (handler, cache, metrics, _cache_tmp) = handler_two_pools_over_http_origin(
         &server.uri(),
-        channel_a,
+        pool_a,
         eth_a.address(),
-        channel_b,
+        pool_b,
         eth_b.address(),
         &server_eth,
         server_id,
@@ -3746,7 +3746,7 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
             target_a,
             node_a,
             &first_signer,
-            channel_a,
+            pool_a,
             provider,
             hash_a,
             0,
@@ -3762,7 +3762,7 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
             target_b,
             node_b,
             &second_signer,
-            channel_b,
+            pool_b,
             provider,
             hash_b,
             0,

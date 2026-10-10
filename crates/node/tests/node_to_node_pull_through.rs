@@ -169,7 +169,7 @@ fn seed_lane(
 /// makes this a real two-hop assertion rather than two single hops: a bug that
 /// charged the wrong lane, applied the wrong rate, or leaked B's buyer-role state
 /// into its seller store would change the count or the amount.
-fn assert_channel_advanced(
+fn assert_lane_advanced(
     store: &MemoryPoolStateStore,
     hop: &str,
     lane: LaneKey,
@@ -291,7 +291,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
         pulled.as_ref() == payload.as_slice(),
         "hop 1 bytes mismatch"
     );
-    assert_channel_advanced(&store_a, "A<->B", a_lane, RATE_A)?;
+    assert_lane_advanced(&store_a, "A<->B", a_lane, RATE_A)?;
 
     // --- Step 2: build B's cache from the pulled bytes -------------------
     // Stand-in for the runtime wiring this file leaves out: a real node's
@@ -348,11 +348,11 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     .await?;
     // End-to-end: the blob originated at A and survived both paid hops intact.
     anyhow::ensure!(got.as_ref() == payload.as_slice(), "hop 2 bytes mismatch");
-    assert_channel_advanced(&store_b, "B<->client", b_lane, RATE_B)?;
+    assert_lane_advanced(&store_b, "B<->client", b_lane, RATE_B)?;
 
     // Cross-hop isolation: serving the client (hop 2) must not have touched the
     // A<->B lane. Re-assert A's lane is unchanged at hop-1's accounting.
-    assert_channel_advanced(&store_a, "A<->B after hop 2", a_lane, RATE_A)?;
+    assert_lane_advanced(&store_a, "A<->B after hop 2", a_lane, RATE_A)?;
 
     // `shutdown` reaps both accept loops inside its own deadline, so a panic in
     // either fails the test rather than being silently swallowed — and neither can
@@ -392,7 +392,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
 /// `Ok` — so the downstream node can in turn return an error to its own client.
 /// No voucher is ever signed because no delivery proceeds.
 #[tokio::test(flavor = "multi_thread")]
-async fn upstream_channel_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
+async fn upstream_pool_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
     // Upstream A speaks `cdn/client/v1` but hangs up on every connection instead
     // of serving — the requester sees the channel collapse before any bytes.
     let a_sk = fresh_key();
@@ -468,7 +468,7 @@ async fn upstream_channel_open_failure_pull_fails_cleanly() -> anyhow::Result<()
 /// [`ClientHandler`]: decdn_node::handlers::client::ClientHandler
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Result<()> {
+async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<()> {
     let payload = vec![0x6Du8; PAYLOAD_LEN];
     let hash = decdn_cache::Hash::new(&payload);
     let (cache, hash_b, _cache_tmp) = cache_with_blob(&payload).await?;
@@ -596,7 +596,7 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
         got.as_ref() == payload.as_slice(),
         "honest pull bytes mismatch"
     );
-    assert_channel_advanced(&store, "reused after abort", lane, RATE_B)?;
+    assert_lane_advanced(&store, "reused after abort", lane, RATE_B)?;
 
     shutdown([task_b], [&honest_ep, &ep_b]).await?;
     Ok(())

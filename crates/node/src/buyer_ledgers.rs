@@ -17,7 +17,7 @@
 //!
 //! What made that fatal rather than merely wasteful is that an amount regression is a
 //! terminal verdict: the losing pull's collision wedges the lane until the pool's deposit is
-//! reclaimed at close (see [`crate::buyer_channel`]).
+//! reclaimed at close (see [`crate::buyer_pool`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};

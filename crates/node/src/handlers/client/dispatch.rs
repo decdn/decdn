@@ -1158,7 +1158,7 @@ impl ClientHandler {
                 // (`InternalError`) rather than an empty one (`NotFound`). Every
                 // terminal MISS below therefore takes its reason from
                 // `FillOutcome::miss_reason` (via `MissRefusal::new`) and is sent
-                // through `respond_miss`. (The channel-class refusals — `UnknownChannel`,
+                // through `respond_miss`. (The channel-class refusals — `UnknownLane`,
                 // `InsufficientDeposit` — keep their own reasons: they are
                 // client-attributable and would refuse regardless of origin
                 // health.)
@@ -1348,12 +1348,7 @@ impl ClientHandler {
                 );
             }
             return self
-                .respond_error(
-                    &mut send,
-                    &req,
-                    ServeRejectReason::UnknownChannel,
-                    rate_per_mb,
-                )
+                .respond_error(&mut send, &req, ServeRejectReason::UnknownLane, rate_per_mb)
                 .await;
         };
 

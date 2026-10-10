@@ -1242,7 +1242,7 @@ impl std::fmt::Display for UpstreamRefused {
         // `UpstreamVoucherRejected`: the loopback tests assert
         // `.contains("NotFound")` on this string, and `StreamError` has no
         // `Display`. What renders here is always a WIRE code — never a node-side
-        // `ServeRejectReason` such as `UnknownChannel`, which collapses to
+        // `ServeRejectReason` such as `UnknownLane`, which collapses to
         // `NotFound` before it leaves the server (see `wire_error`). Matching on a
         // reject-reason name would therefore never fire.
         write!(f, "delivery refused: {:?}", self.error())

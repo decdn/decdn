@@ -22,7 +22,7 @@ default = []
 # nextest run` stays fast and needs no `anvil`/`forge` binaries. The e2e
 # spawns `anvil` as a subprocess and shells out to `forge script` — no extra
 # crate deps — and only compiles under this feature. Pulls `decdn-incentive`'s
-# `test-util` for `BuyerChannelTable::insert_raw`, which backs this crate's
+# `test-util` for `BuyerPoolTable::insert_raw`, which backs this crate's
 # `insert_raw_buyer_record` seam (the #763 reconciliation e2e seeds an
 # undecodable row through it).
 anvil-e2e = ["decdn-incentive/test-util"]
@@ -116,7 +116,7 @@ decdn-node = { path = ".", features = ["test-support"] }
 # zero-stall/uncapped deadline shape (#1145 review).
 decdn-client = { workspace = true, features = ["test-util"] }
 # `insert_raw_buyer_record` (`#[cfg(any(test, feature = "anvil-e2e"))]`) delegates
-# to `BuyerChannelTable::insert_raw`, which is `test-util`-gated so a corruption
+# to `BuyerPoolTable::insert_raw`, which is `test-util`-gated so a corruption
 # seeder stays out of the shipped API. A cross-crate `cfg(test)` doesn't
 # propagate, so the lib's own test build needs the feature via a dev-dep — same
 # shape as `decdn-client` above.

@@ -568,7 +568,7 @@ impl ClientHandler {
         // clears the anchor instead — it opens no chain to reveal against.
         anchor.adopt(B256::from(wire.chain_root));
         guard.paid_credited = new_credited;
-        if let Err(e) = self.channel_state_store.record(&guard.state) {
+        if let Err(e) = self.pool_state_store.record(&guard.state) {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
         }
@@ -843,7 +843,7 @@ impl ClientHandler {
         let (new_credited, credited_bytes) =
             credit_advance(guard.paid_credited, owed.remaining(), owed_bytes)?;
         guard.paid_credited = new_credited;
-        if let Err(e) = self.channel_state_store.record(&guard.state) {
+        if let Err(e) = self.pool_state_store.record(&guard.state) {
             drop(guard);
             return Err(anyhow::anyhow!("lane store record failed: {e}"));
         }

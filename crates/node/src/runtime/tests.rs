@@ -1310,13 +1310,13 @@ async fn close_router_finishes_when_every_connection_drains() {
 // ---- deployment preflight (the guard for the irreversible lane-store drop) ----
 
 /// The deployment every preflight test configures.
-const PREFLIGHT_DEPLOYMENT: crate::channel_store::Deployment = crate::channel_store::Deployment {
+const PREFLIGHT_DEPLOYMENT: crate::pool_store::Deployment = crate::pool_store::Deployment {
     chain_id: 421_614,
     payment_pool: alloy::primitives::Address::repeat_byte(0x77),
 };
 
 /// One queued answer for [`preflight_provider`]. The value is JSON, not
-/// raw bytes (unlike `buyer_channel.rs`' `MockCall`), because
+/// raw bytes (unlike `buyer_pool.rs`' `MockCall`), because
 /// `eth_chainId` answers with a quantity.
 enum MockAnswer {
     /// Answer the call with this value.

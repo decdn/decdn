@@ -607,7 +607,7 @@ impl From<FloorRefusal> for ServeRejectReason {
 /// Server-side classification of a `serve_stream` refusal, used to pick the
 /// per-reason reject counter (#876). Finer-grained than the wire `StreamError`,
 /// which carries only the three open-time refusal classes (ADR 005 §Open-time
-/// refusal classes): `CacheMiss`, `UnknownChannel`, and `OwnerMismatch` all
+/// refusal classes): `CacheMiss`, `UnknownLane`, and `OwnerMismatch` all
 /// ship as `NotFound` (to avoid leaking channel existence), but are distinct
 /// here so an operator can, e.g., isolate an unknown-channel abuse campaign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -619,7 +619,7 @@ enum ServeRejectReason {
     /// A fault in this node: a local store fault, or a fill that faulted on
     /// this node's own side. Signed `Declined`, never a false absence.
     InternalError,
-    UnknownChannel,
+    UnknownLane,
     OwnerMismatch,
     /// The pool's on-chain remaining deposit, minus the node's refundable floor
     /// `M`, can no longer cover a credit window (ADR 003 §Pool solvency). It is
@@ -750,7 +750,7 @@ impl ServeRejectReason {
             // unconfirmable pool, and every lane-existence refusal, so none of
             // them can be told apart off the wire.
             Self::CacheMiss
-            | Self::UnknownChannel
+            | Self::UnknownLane
             | Self::OwnerMismatch
             | Self::PoolUnconfirmed
             | Self::PoolClosing { proven: false }
@@ -995,7 +995,7 @@ pub struct ClientHandlerDeps {
     pub bind_domain: Eip712Domain,
     /// Durable per-lane cumulative state. Fences voucher replay across a
     /// restart (ADR 003 §Off-chain voucher state persistence).
-    pub channel_state_store: Arc<dyn PoolStateStore>,
+    pub pool_state_store: Arc<dyn PoolStateStore>,
     /// Non-blocking sink for the served-and-paid audit log. One receipt per
     /// accepted voucher, so a single delivery emits several.
     pub receipt_sink: Arc<dyn ReceiptSink>,
@@ -1144,7 +1144,7 @@ impl ClientHandlerDeps {
         slash_domain: Eip712Domain,
         voucher_domain: Eip712Domain,
         bind_domain: Eip712Domain,
-        channel_state_store: Arc<dyn PoolStateStore>,
+        pool_state_store: Arc<dyn PoolStateStore>,
         receipt_sink: Arc<dyn ReceiptSink>,
         rate_per_mb: u64,
         max_concurrent_streams: usize,
@@ -1162,7 +1162,7 @@ impl ClientHandlerDeps {
             slash_domain,
             voucher_domain,
             bind_domain,
-            channel_state_store,
+            pool_state_store,
             receipt_sink,
             pool_view: None,
             pool_min_remaining_deposit,
@@ -1322,7 +1322,7 @@ pub struct ClientHandler {
     voucher_domain: Eip712Domain,
     /// `CapacityBond` EIP-712 domain for ephemeral `BindNodeId` verification.
     bind_domain: Eip712Domain,
-    channel_state_store: Arc<dyn PoolStateStore>,
+    pool_state_store: Arc<dyn PoolStateStore>,
     /// Refundable minimum-remaining-deposit floor `M` for the floor-M serving
     /// guard (see [`ClientHandlerDeps::pool_min_remaining_deposit`]).
     pool_min_remaining_deposit: U256,
@@ -1519,7 +1519,7 @@ impl ClientHandler {
     pub const ALPN: &'static [u8] = ALPN_CLIENT;
 
     /// Construct the handler from [`ClientHandlerDeps`], hydrating per-channel
-    /// state from the deps' `channel_state_store`.
+    /// state from the deps' `pool_state_store`.
     ///
     /// All optional runtime wiring (settlement redeem hints, pull-through
     /// deadlines, the window/leech providers, …) is supplied on `deps` as
@@ -1533,7 +1533,7 @@ impl ClientHandler {
     /// knowing prior voucher state (the #527 replay guard).
     pub fn new(deps: ClientHandlerDeps) -> anyhow::Result<Self> {
         let map: DashMap<LaneKey, Arc<Mutex<LaneDeliveryState>>> = DashMap::new();
-        for state in deps.channel_state_store.load_all()? {
+        for state in deps.pool_state_store.load_all()? {
             map.insert(
                 state.key(),
                 Arc::new(Mutex::new(LaneDeliveryState::hydrated(state))),
@@ -1559,7 +1559,7 @@ impl ClientHandler {
             slash_domain: deps.slash_domain,
             voucher_domain: deps.voucher_domain,
             bind_domain: deps.bind_domain,
-            channel_state_store: deps.channel_state_store,
+            pool_state_store: deps.pool_state_store,
             pool_min_remaining_deposit: deps.pool_min_remaining_deposit,
             receipt_sink: deps.receipt_sink,
             pool_view: deps.pool_view,
@@ -1916,7 +1916,7 @@ impl ClientHandler {
         // not need one: `PoolStateStore::record` is contractually non-blocking,
         // a buffered insert into the store's in-memory working set, with the
         // periodic lane flush doing the disk work.
-        self.channel_state_store.record(&state)?;
+        self.pool_state_store.record(&state)?;
 
         // Only a REAL insertion (a vacant slot) tunes the lane gauge — the
         // entry guard is atomic, so racing first-streams on one lane still
@@ -1980,7 +1980,7 @@ impl ClientHandler {
             held_expiry = guard.state.expiry,
             "lane clamped to the signer's on-chain registration"
         );
-        if let Err(error) = self.channel_state_store.record(&guard.state) {
+        if let Err(error) = self.pool_state_store.record(&guard.state) {
             tracing::warn!(
                 pool_id = %guard.state.pool_id,
                 signer = %guard.state.signer,
@@ -2007,7 +2007,7 @@ impl ClientHandler {
         if self.lanes.remove(&key).is_some() {
             self.tune_lane_gauge(-1);
         }
-        let store = Arc::clone(&self.channel_state_store);
+        let store = Arc::clone(&self.pool_state_store);
         tokio::task::spawn_blocking(move || store.forget(key))
             .await
             .map_err(|e| StoreError::Backend(format!("forget_lane join: {e}")))?

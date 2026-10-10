@@ -80,8 +80,8 @@ use decdn_reputation::{LocalReputation, Outcome};
 use decdn_incentive::PoolOpenFailureReason;
 use decdn_protocol::client::NO_NAMESPACE;
 
-use crate::buyer_channel::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::buyer_ledgers::BuyerLedgers;
+use crate::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use crate::dht::{
@@ -286,7 +286,7 @@ fn record_pool_open_failure(
 ) -> PullMiss {
     // Not a failure at all: the open ran past our per-candidate budget and is still
     // going in the background (#1143). Meter it apart from real failures — a sustained rate
-    // means this node's chain lane is too slow for `CHANNEL_OPEN_CALLER_BUDGET`, which is a
+    // means this node's chain lane is too slow for `POOL_OPEN_CALLER_BUDGET`, which is a
     // very different diagnosis from a reverting or under-funded open.
     //
     // NOT `node_pull_timeout_sec`. The pool open has its OWN budget;
@@ -404,7 +404,7 @@ pub struct NodeOriginConfig {
     /// handshake, and the signed `StreamResponse`. Bounded work, so a slow one is a stall.
     ///
     /// It does NOT bound the buyer pool open, which is a separate, earlier stage on its
-    /// own budget (`selection::CHANNEL_OPEN_CALLER_BUDGET`, 5 s) — raising this to give a
+    /// own budget (`selection::POOL_OPEN_CALLER_BUDGET`, 5 s) — raising this to give a
     /// slow L2 more room does nothing. That the two are sequential stages is exactly why
     /// `outer_pull_deadline` budgets both, plus the stall window, for every candidate.
     pub pull_timeout: Duration,
@@ -2157,7 +2157,7 @@ async fn pull_from_candidate_in_span(
     let ctx = match deps
         .buyer
         // Same pool-open bound as the window path (#1143) — see there.
-        .open_or_reuse_pool(provider_addr, crate::selection::CHANNEL_OPEN_CALLER_BUDGET)
+        .open_or_reuse_pool(provider_addr, crate::selection::POOL_OPEN_CALLER_BUDGET)
         .await
     {
         Ok(ctx) => ctx,
@@ -2630,7 +2630,7 @@ enum RefusalVerdict {
 /// peer just checked. A `NotFound` *refusal* is not: `ServeRejectReason::wire_error`
 /// deliberately collapses several reject reasons onto the wire `NotFound` so that a probing
 /// client cannot map out other clients' remaining pool balances — and some of them are ours
-/// or transient: our signer's live floor at its cap on that peer, an `UnknownChannel` or an
+/// or transient: our signer's live floor at its cap on that peer, an `UnknownLane` or an
 /// unconfirmed pool (while the upstream's chain watcher catches up), and a load shed. We
 /// cannot tell them apart, and we must not: the collapse is a privacy property.
 ///
@@ -2782,13 +2782,13 @@ enum PullVerdict {
 ///
 /// The cost is this provider for the suppression window; the pool's deposit is untouched and
 /// stays available to every other lane.
-fn wedged_channel(
+fn wedged_lane(
     deps: &NodeOriginDeps,
     pk: PublicKey,
     provider_addr: Address,
     hash_bytes: [u8; 32],
     reason: VoucherRejectReason,
-    channel: Option<B256>,
+    pool_id: Option<B256>,
 ) {
     deps.metrics.node_pull_pool_wedged();
     // Immediate cover: suppress this (peer, hash) for the short refusal TTL so a retry for the
@@ -2804,7 +2804,7 @@ fn wedged_channel(
     // out across every provider), so there is nothing for this call site to choose.
     deps.record_wedged(&pk);
     warn!(
-        %provider_addr, pool_id = ?channel, ?reason,
+        %provider_addr, ?pool_id, ?reason,
         "node-origin: upstream rejected our voucher on terms this lane cannot recover from; \
          suppressing the provider for a bounded window while the pool's own deposit is \
          unaffected (#1122)"
@@ -3124,7 +3124,7 @@ fn record_backpressure_exhausted(
 /// owes the verdict a [`PullMiss`]; dropping it there signs this node's own fault to a
 /// client as an absent blob (#1560).
 ///
-/// `channel` is the buyer pool the pull was paying from, or `None` for the failures that
+/// `pool_id` is the buyer pool the pull was paying from, or `None` for the failures that
 /// happen before there is one to pay from (a pool open that never completed, a local
 /// binding-signature fault). It is `Option` rather than plumbed unconditionally because the
 /// distinction is real: only a pull that presented a voucher can have one rejected, so only
@@ -3136,7 +3136,7 @@ fn classify_pull_failure(
     pk: PublicKey,
     provider_addr: Address,
     hash_bytes: [u8; 32],
-    channel: Option<B256>,
+    pool_id: Option<B256>,
     err: &anyhow::Error,
 ) -> PullVerdict {
     let suppress = |ttl: Option<Duration>| {
@@ -3232,7 +3232,7 @@ fn classify_pull_failure(
         // is invisible, and money is at stake.
         PullVerdict::OurDeadLane(reason) => {
             deps.metrics.node_pull_voucher_rejected();
-            wedged_channel(deps, pk, provider_addr, hash_bytes, reason, channel);
+            wedged_lane(deps, pk, provider_addr, hash_bytes, reason, pool_id);
         }
         // The peer is fine, the fault is our buyer pool: `PoolExhausted` means the deposit we
         // fund the upstream from can no longer cover further credit, cleared by a top-up and a

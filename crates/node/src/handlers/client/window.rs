@@ -112,9 +112,9 @@ impl ClientHandler {
     /// buffered twin the same way), and closing it needs a latch the caller owns rather
     /// than one living inside the future.
     ///
-    /// The channel-class refusals (`UnknownChannel`, `InsufficientDeposit`) keep
+    /// The channel-class refusals (`UnknownLane`, `InsufficientDeposit`) keep
     /// their own reasons: they are client-attributable and would have refused
-    /// regardless of origin health. `UnknownChannel` collapses to `NotFound` so a
+    /// regardless of origin health. `UnknownLane` collapses to `NotFound` so a
     /// prober cannot map out lanes, and `InsufficientDeposit` reaches only a
     /// proven requester as `Unfunded` ([`ServeRejectReason::wire_error`]).
     // The numbered steps (1)–(7) are one ordered sequence whose refusals must all

@@ -443,7 +443,7 @@ fn an_under_fold_rejection_is_a_dead_lane() {
 /// an `OurLocalFault` (which would tar the peer for our own funding gap). A top-up
 /// and retry is the fix, which is exactly what `OurVoucherRetryable` drives.
 #[test]
-fn a_pool_exhaustion_is_a_retryable_topup_not_a_dead_channel() {
+fn a_pool_exhaustion_is_a_retryable_topup_not_a_dead_lane() {
     assert_eq!(
         voucher_verdict(VoucherRejectReason::PoolExhausted, false),
         PullVerdict::OurVoucherRetryable(VoucherRejectReason::PoolExhausted),
@@ -463,7 +463,7 @@ fn only_a_durable_refusal_earns_the_full_suppression_ttl() {
         RefusalVerdict::DurableMiss,
         "Declined is a lasting fact about this (peer, hash)"
     );
-    // `NotFound` is the one that matters. `wire_error` collapses `UnknownChannel`
+    // `NotFound` is the one that matters. `wire_error` collapses `UnknownLane`
     // (the window where the upstream's chain watcher has not yet seen the pool
     // WE just opened) onto it, so pool existence cannot be probed. At the full
     // TTL that blackholes a healthy peer for five minutes over a condition that

@@ -28,7 +28,7 @@ fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
             let stall = Duration::from_secs(stall_secs);
             let outer = outer_pull_deadline(per, stall);
             // One candidate = pool open, then stream open, then a silent stream.
-            let worst_candidate = CHANNEL_OPEN_CALLER_BUDGET
+            let worst_candidate = POOL_OPEN_CALLER_BUDGET
                 .saturating_add(per)
                 .saturating_add(stall);
             let all_candidates = worst_candidate.saturating_mul(attempts);
@@ -94,7 +94,7 @@ fn outer_pull_deadline_handles_edges() {
     let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
     assert_eq!(
         outer_pull_deadline(Duration::ZERO, Duration::ZERO),
-        CHANNEL_OPEN_CALLER_BUDGET.saturating_mul(attempts) + PULL_THROUGH_OUTER_SLACK
+        POOL_OPEN_CALLER_BUDGET.saturating_mul(attempts) + PULL_THROUGH_OUTER_SLACK
     );
     // Saturates to MAX rather than overflowing/panicking — guards against a
     // future switch to non-saturating arithmetic. Checked on each term

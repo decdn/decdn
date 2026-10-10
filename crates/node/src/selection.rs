@@ -100,7 +100,7 @@ pub const PULL_THROUGH_OUTER_SLACK: Duration =
 /// Deliberately much smaller than `cache.node_pull_timeout_sec`: the pool open, the
 /// stream open, and the streaming stage are SEQUENTIAL stages of one candidate attempt,
 /// and [`outer_pull_deadline`] has to cover all three for every candidate.
-pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
+pub const POOL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 
 /// Outer deadline for a node-to-node pull-through, derived from the two configured
 /// per-candidate budgets: the stream-open timeout (`cache.node_pull_timeout_sec`) and
@@ -118,13 +118,13 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 ///
 /// THREE sequential bounded stages:
 ///
-/// 1. the **pool open** — [`CHANNEL_OPEN_CALLER_BUDGET`] (#1143); then
+/// 1. the **pool open** — [`POOL_OPEN_CALLER_BUDGET`] (#1143); then
 /// 2. the **stream open** — connect → handshake → verified `StreamResponse`,
 ///    bounded by `per_candidate` (#1134); then
 /// 3. **streaming**, which for a peer that opens honestly and then goes SILENT costs
 ///    one full throughput-floor window (`stall`) before the pull gives up on it (#1797).
 ///
-/// So the worst case for a candidate is `CHANNEL_OPEN_CALLER_BUDGET + per_candidate + stall`,
+/// So the worst case for a candidate is `POOL_OPEN_CALLER_BUDGET + per_candidate + stall`,
 /// and that is what this must budget `MAX_PROVIDER_ATTEMPTS` of, plus
 /// [`PULL_THROUGH_OUTER_SLACK`] of one-time discovery overhead.
 ///
@@ -154,7 +154,7 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 #[must_use]
 pub fn outer_pull_deadline(per_candidate: Duration, stall: Duration) -> Duration {
     let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
-    CHANNEL_OPEN_CALLER_BUDGET
+    POOL_OPEN_CALLER_BUDGET
         .saturating_add(per_candidate)
         .saturating_add(stall)
         .saturating_mul(attempts)

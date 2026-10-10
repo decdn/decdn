@@ -72,7 +72,7 @@ pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
         ServeRejectReason::EvictedSinceProbe => "evicted_since_probe",
         ServeRejectReason::CacheMiss => "cache_miss",
         ServeRejectReason::InternalError => "internal_error",
-        ServeRejectReason::UnknownChannel => "unknown_lane",
+        ServeRejectReason::UnknownLane => "unknown_lane",
         ServeRejectReason::OwnerMismatch => "owner_mismatch",
         ServeRejectReason::InsufficientDeposit => "insufficient_deposit",
         ServeRejectReason::PoolUnconfirmed => "pool_unconfirmed",
@@ -186,7 +186,7 @@ fn meter_refusal(metrics: &Metrics, reason: ServeRejectReason) {
         }
         ServeRejectReason::CacheMiss => metrics.serve_stream_rejected_cache_miss(),
         ServeRejectReason::InternalError => metrics.serve_stream_rejected_internal_error(),
-        ServeRejectReason::UnknownChannel => {
+        ServeRejectReason::UnknownLane => {
             metrics.serve_stream_rejected_unknown_lane();
         }
         ServeRejectReason::OwnerMismatch => metrics.serve_stream_rejected_owner_mismatch(),

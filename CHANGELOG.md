@@ -1059,7 +1059,7 @@ since project inception and will roll into the first tagged release.
   a false "just-filled blob" warning and refused `InternalError`, so the
   requester routed around a healthy node. The local-origin populate tier
   (#1116) instead filled the blob from the operator's origin and then refused
-  `UnknownChannel`. Every fill tier now takes its answer from the request's one
+  `UnknownLane`. Every fill tier now takes its answer from the request's one
   lane resolution. A request whose lane was unknown when it resolved refuses on
   the `no_lane` path (`NotFound`, counted as `cache_miss`) and runs no fill
   tier.
@@ -2028,7 +2028,7 @@ since project inception and will roll into the first tagged release.
   a fifth daemon store would have been checked by nothing. The list now comes
   from `decdn_common::data_dir::DAEMON_STORE_FILES` plus `CLIENT_BUYER_DB_FILE`,
   the same names the daemon's own store and the client store use. A new
-  `channel_store` test asserts that opening `PersistentPoolStateStore` creates
+  `pool_store` test asserts that opening `PersistentPoolStateStore` creates
   every file in that set and no `.redb` outside it, which turns the premise
   `daemon_marker` — and with it the node-vs-client classification from #2078 —
   rests on into a checked fact.
@@ -2920,7 +2920,7 @@ since project inception and will roll into the first tagged release.
   gate denies rustdoc warnings.
 
 - **`elided_lifetimes_in_paths` and `unreachable_pub` are on.** A type path that
-  borrows now says so — `TableDefinition<'_, …>` across `channel_store`'s eleven
+  borrows now says so — `TableDefinition<'_, …>` across `pool_store`'s eleven
   redb table definitions, `EvictionContext<'_>` in the cache's admission and
   eviction policy traits — so a reader sees the borrow at the call site instead of
   having to look the type up. `unreachable_pub` narrows 46 items that were `pub`
