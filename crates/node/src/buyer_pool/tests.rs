@@ -3088,6 +3088,10 @@ fn open_unresolved(metrics: &Arc<Metrics>) -> u64 {
         .expect("the gauge is exported")
 }
 
+/// The paused-time bound on one [`settle`]: far past any scripted sequence,
+/// which settles within minutes of virtual time.
+const SETTLE_TEST_BOUND: Duration = Duration::from_hours(1);
+
 /// Settle `unconfirmed` against `replies`, asserting every reply was read and
 /// the hold is released.
 async fn settle(
@@ -3100,16 +3104,22 @@ async fn settle(
     let asserter = script(replies);
     let contract = bare_pool_contract(asserter.clone());
     let hold = OpenHold::new();
-    let settled = settle_unconfirmed_open(
-        &contract,
-        store,
-        &open_request(owner),
-        unconfirmed,
-        unconfirmed_error(unconfirmed),
-        &hold,
-        metrics,
+    // The tests run on paused time, so a loop that never settles spins through
+    // virtual time; this bound fails it in seconds of real time.
+    let settled = tokio::time::timeout(
+        SETTLE_TEST_BOUND,
+        settle_unconfirmed_open(
+            &contract,
+            store,
+            &open_request(owner),
+            unconfirmed,
+            unconfirmed_error(unconfirmed),
+            &hold,
+            metrics,
+        ),
     )
-    .await;
+    .await
+    .expect("the open settles within the scripted replies");
     assert!(asserter.read_q().is_empty(), "every scripted read was made");
     assert!(!*hold.held.borrow(), "the hold is released");
     assert_eq!(open_unresolved(metrics), 0, "the gauge is cleared");
@@ -3185,6 +3195,18 @@ async fn an_unconfirmed_open_resolves_by_receipt_then_nonce() {
             "spent at 100",
         ),
         (
+            "an earlier nonce is not confirmed",
+            &one,
+            vec![Reply::NoReceipt, Reply::Block(100), Reply::Nonce(4)],
+            "queued",
+        ),
+        (
+            "hashless, an earlier nonce is not confirmed",
+            &none,
+            vec![Reply::Block(100), Reply::Nonce(4)],
+            "queued",
+        ),
+        (
             "hashless, pending",
             &none,
             vec![Reply::Block(100), Reply::Nonce(5), Reply::Nonce(6)],
@@ -3201,6 +3223,7 @@ async fn an_unconfirmed_open_resolves_by_receipt_then_nonce() {
             OpenResolution::Mined(_) => "mined".to_owned(),
             OpenResolution::NonceSpent { block } => format!("spent at {block}"),
             OpenResolution::Pending => "pending".to_owned(),
+            OpenResolution::Queued => "queued".to_owned(),
             OpenResolution::Vacant => "vacant".to_owned(),
         };
         assert_eq!(got, want, "{name}");
@@ -3293,7 +3316,9 @@ async fn a_vacant_nonce_is_re_sent_at_that_nonce_until_one_open_mines() {
 /// A spent nonce with no receipt in hand asks `getPools` at the block it was
 /// read at, and adopts the pool the open bought. A `getPools` fault, and a
 /// pool whose read faults, are no answer: the slot stays held, and a settle
-/// run never counts as an adoption failure.
+/// run never counts as an adoption failure. Each reconciliation that cannot
+/// answer doubles the wait before the next, so a tick inside that wait reads
+/// the nonce but walks no pools.
 #[tokio::test(start_paused = true)]
 async fn a_spent_nonce_adopts_the_pool_the_open_bought() {
     let owner = Address::repeat_byte(1);
@@ -3306,13 +3331,17 @@ async fn a_spent_nonce_adopts_the_pool_the_open_bought() {
             Reply::NoReceipt,
         ]
     };
+    // 0 s: `getPools` faults, so the next reconciliation waits 5 s.
     let mut replies = spent();
-    // `getPools` faults.
     replies.push(Reply::Fault);
+    // 5 s: `getPools` lists the pool, and its read faults, so the next waits
+    // 10 s.
     replies.extend(spent());
-    // `getPools` lists the pool, and its read faults.
     replies.push(ids_reply(&[pool_id]));
     replies.push(Reply::Fault);
+    // 10 s: inside the wait, so no pool is read.
+    replies.extend(spent());
+    // 15 s: the pool reads.
     replies.extend(spent());
     replies.push(ids_reply(&[pool_id]));
     replies.push(pool_reply(owner, PaymentPool::Status::Open));

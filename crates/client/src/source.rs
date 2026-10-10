@@ -311,12 +311,13 @@ pub trait Funder: Send + Sync {
     ///
     /// # Errors
     ///
-    /// If the on-chain `topUp` or `openPool` fails to submit or reverts: the
-    /// funds did not move. If a `topUp` submit fails in transport or its
-    /// receipt is not obtained, the funds may have moved and the error carries
-    /// [`crate::buyer_pool::TopUpUnconfirmed`]. If a mined transaction cannot be
-    /// credited locally, the funds **are** escrowed and the error names the tx
-    /// ([`crate::buyer_pool::escrowed_but_untracked`]).
+    /// If the on-chain `topUp` or `openPool` is rejected at submit or reverts:
+    /// the funds did not move. If a submit fails in transport or its receipt is
+    /// not obtained, the funds may have moved, and the error carries
+    /// [`crate::buyer_pool::TopUpUnconfirmed`] for a `topUp` or
+    /// [`crate::buyer_pool::OpenUnconfirmed`] for an `openPool`. If a mined
+    /// transaction cannot be credited locally, the funds **are** escrowed and
+    /// the error names the tx ([`crate::buyer_pool::escrowed_but_untracked`]).
     fn recover(&self, remaining: U256) -> SourceFuture<'_, Recovery>;
 
     /// The funder's own view of what the pool has spent across every lane,

@@ -67,9 +67,18 @@ const WATERMARK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the open task re-reads the chain for an `openPool` whose outcome
 /// it did not see ([`settle_unconfirmed_open`]). A tick reads each known
 /// transaction's receipt, the block number, and one or two nonces. Once the
-/// nonce is spent, it also enumerates the owner's pools. The task holds the
-/// open slot until a tick resolves the open.
+/// nonce is spent, a tick also reconciles, which reads `getPools` and one
+/// `getPool` per owned pool. A reconciliation that cannot answer backs the
+/// next one off, up to [`OPEN_RECONCILE_MAX_BACKOFF`]. The task holds the open
+/// slot until a tick resolves the open.
 const OPEN_RESOLVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The longest wait between two reconciliations of an unconfirmed `openPool`
+/// whose nonce is spent ([`Settling`]). A reconciliation reads `getPools` and
+/// one `getPool` per pool the owner has ever opened, so each one that cannot
+/// answer doubles the wait before the next, from [`OPEN_RESOLVE_INTERVAL`] up
+/// to this.
+const OPEN_RECONCILE_MAX_BACKOFF: Duration = Duration::from_mins(5);
 
 /// How often the open task repeats its warning while it holds the open slot
 /// for an unconfirmed `openPool`.
@@ -2592,8 +2601,13 @@ enum OpenResolution {
     },
     /// A pending transaction holds the open's nonce, so the open may still mine.
     Pending,
-    /// This RPC sees no transaction at the open's nonce. The open task re-sends
-    /// at that nonce, so the re-send and the open cannot both mine.
+    /// An earlier nonce of this account is not confirmed, so nothing at the
+    /// open's nonce can mine yet. The pending count stops at the first gap, so
+    /// it cannot say whether a transaction waits at the open's nonce behind it.
+    Queued,
+    /// The account's confirmed nonce is the open's, and this RPC sees no
+    /// transaction at it. The open task re-sends at that nonce, so the re-send
+    /// and the open cannot both mine.
     Vacant,
 }
 
@@ -2610,15 +2624,19 @@ enum OpenResolution {
 ///   same chain state as the nonce. A load-balanced RPC backend that has not
 ///   reached `B` fails the read, and the next tick asks again.
 /// - A pending transaction at the nonce may still mine, so the task waits,
-///   however long that takes, as the receipt wait in [`open_pool`] does.
-/// - A nonce that no transaction holds gets a fresh `openPool` at that same
-///   nonce ([`send_open_pool`]). Two transactions at one nonce cannot both
+///   however long that takes, as the receipt wait in [`open_pool`] does. An
+///   earlier nonce that is not confirmed makes it wait the same way: nothing
+///   at the open's nonce can mine before it.
+/// - A nonce that the account has reached and no transaction holds gets a
+///   fresh `openPool` at that same nonce ([`send_open_pool`]). Two transactions at one nonce cannot both
 ///   mine, so the re-send and a first open that resurfaces escrow at most one
 ///   deposit between them. Releasing the slot instead would let the next open
 ///   read a later pending nonce, and then both could mine.
 ///
 /// A failed read, a failed re-send, and a reconciliation that cannot answer
-/// all wait for the next tick. While the task waits, `hold` makes callers fail
+/// all wait for the next tick. A reconciliation that cannot answer also
+/// doubles the wait before the next one, up to [`OPEN_RECONCILE_MAX_BACKOFF`],
+/// because each one walks every pool the owner has opened. While the task waits, `hold` makes callers fail
 /// fast, and a warning repeats every [`OPEN_UNRESOLVED_WARN_INTERVAL`] with the
 /// elapsed time and the last thing the chain said.
 ///
@@ -2641,11 +2659,14 @@ async fn settle_unconfirmed_open<P: Provider + Clone>(
     metrics: &Arc<Metrics>,
 ) -> Result<Landed> {
     let _held = hold.hold(metrics);
+    let started = tokio::time::Instant::now();
     let mut settling = Settling {
         nonce: unconfirmed.nonce,
         txs: unconfirmed.tx.into_iter().collect(),
         original: sanitize_err_chain(&err),
-        started: tokio::time::Instant::now(),
+        started,
+        next_reconcile: started,
+        reconcile_backoff: OPEN_RESOLVE_INTERVAL,
     };
     warn!(
         nonce = settling.nonce,
@@ -2689,6 +2710,11 @@ struct Settling {
     original: String,
     /// When the settle loop began.
     started: tokio::time::Instant,
+    /// The earliest time the next reconciliation may run.
+    next_reconcile: tokio::time::Instant,
+    /// How long the wait before the next reconciliation grows to after one that
+    /// cannot answer, at most [`OPEN_RECONCILE_MAX_BACKOFF`].
+    reconcile_backoff: Duration,
 }
 
 /// What one settle tick decided.
@@ -2720,6 +2746,9 @@ impl Settling {
         };
         match resolution {
             OpenResolution::Pending => Tick::Wait("a pending transaction holds the nonce".into()),
+            OpenResolution::Queued => {
+                Tick::Wait("an earlier nonce of this account is not confirmed".into())
+            }
             OpenResolution::Vacant => Tick::Wait(self.resend(contract, open).await),
             OpenResolution::Mined(receipt) => {
                 let tx = receipt.transaction_hash;
@@ -2743,6 +2772,14 @@ impl Settling {
                 )
             }
             OpenResolution::NonceSpent { block } => {
+                let now = tokio::time::Instant::now();
+                if now < self.next_reconcile {
+                    return Tick::Wait(format!(
+                        "the nonce is spent at block {block}; the next reconciliation is due in \
+                         {:?}",
+                        self.next_reconcile - now
+                    ));
+                }
                 let run = ReconcileRun::Settle { block };
                 let reconciled = reconcile_with_chain(
                     contract,
@@ -2792,7 +2829,7 @@ impl Settling {
     }
 
     /// Act on what reconciliation found once the nonce is spent at `block`.
-    fn spent(&self, block: u64, reconciled: Reconciled) -> Tick {
+    fn spent(&mut self, block: u64, reconciled: Reconciled) -> Tick {
         let nonce = self.nonce;
         match reconciled {
             Reconciled::Adopted(pool_id) => {
@@ -2834,9 +2871,16 @@ impl Settling {
                 )
                 .context(LocalPullFault)))
             }
-            Reconciled::KeptTracked | Reconciled::Unknown => Tick::Wait(format!(
-                "the nonce is spent at block {block}, but reconciliation could not answer"
-            )),
+            Reconciled::KeptTracked | Reconciled::Unknown => {
+                self.next_reconcile = tokio::time::Instant::now() + self.reconcile_backoff;
+                self.reconcile_backoff = self
+                    .reconcile_backoff
+                    .saturating_mul(2)
+                    .min(OPEN_RECONCILE_MAX_BACKOFF);
+                Tick::Wait(format!(
+                    "the nonce is spent at block {block}, but reconciliation could not answer"
+                ))
+            }
         }
     }
 }
@@ -2873,6 +2917,9 @@ async fn resolve_unconfirmed_open<P: Provider + Clone>(
             return Ok(OpenResolution::Mined(receipt));
         }
         return Ok(OpenResolution::NonceSpent { block });
+    }
+    if confirmed < nonce {
+        return Ok(OpenResolution::Queued);
     }
     let pending = provider
         .get_transaction_count(owner)

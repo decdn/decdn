@@ -1004,8 +1004,9 @@ since project inception and will roll into the first tagged release.
   transaction, and only a receipt or a spent nonce releases it: a receipt
   yields the pool; a nonce spent at block `B` reads `getPools` at `B` and
   adopts the owner's newest solvent pool, or concludes the open escrowed
-  nothing; a nonce no transaction holds gets a fresh `openPool` at that same
-  nonce, so at most one of them mines. While the slot is held, a miss that
+  nothing; a nonce the account has reached and no transaction holds gets a
+  fresh `openPool` at that same nonce, so at most one of them mines. A
+  reconciliation that cannot answer backs the next one off, up to 5 min. While the slot is held, a miss that
   needs a pool fails at once as a local fault, `decdn_buyer_pool_open_unresolved`
   reads 1, and a warning repeats every minute with the elapsed time.
   `openPool` is now sent with an explicit pending nonce, and its unconfirmed
