@@ -1740,7 +1740,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// not an omission:
 ///
 /// - **No discovery / pool open / [`PeerSource`] / [`super::funder::NodeFunder`].** The bytes
-///   are already reachable locally, so there is nothing to dial, no channel to open,
+///   are already reachable locally, so there is nothing to dial, no pool to open,
 ///   and nothing to pay. The source is handed in by the orchestration, already built.
 /// - **No provider scoring.** There is no provider: a fault here is OUR own
 ///   origin, never a peer to score. On a [`drive`] error we meter it as a LOCAL
