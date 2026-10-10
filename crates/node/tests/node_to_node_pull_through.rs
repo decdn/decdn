@@ -383,7 +383,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
 /// closes it, so the requester's connect or first read fails fast (which exact
 /// stage loses the race is timing-dependent; the test pins only that it fails
 /// *fast*, not at the deadline). This is a deterministic, millisecond-fast
-/// stand-in for the "unreachable / channel open
+/// stand-in for the "unreachable / pool open
 /// fails" family — a genuinely dead UDP port works too, but whose failure mode
 /// (ICMP "port unreachable" vs. a silent multi-second handshake timeout) is
 /// environment-dependent and would make the test slow and flaky. The property

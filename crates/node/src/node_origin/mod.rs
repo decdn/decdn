@@ -12,9 +12,9 @@
 //!    with the origin-directory fallback),
 //! 2. probes each candidate for rate + RTT and ranks them by the combined
 //!    local+network reputation score ([`crate::selection::rank_candidates`]),
-//! 3. opens (or reuses) a buyer payment channel to the best candidate and streams
+//! 3. opens (or reuses) the node's buyer pool, pays the best candidate on its lane, and streams
 //!    the whole blob straight into the local cache via the gap-driven
-//!    [`decdn_client::drive`] loop (#1682 — resumable, so a channel that
+//!    [`decdn_client::drive`] loop (#1682 — resumable, so a pool that
 //!    runs dry mid-blob is topped up and the pull continues at the paid frontier;
 //!    no whole-blob buffer is ever held in RAM), falling back through up to
 //!    [`crate::selection::MAX_PROVIDER_ATTEMPTS`] providers,
@@ -32,7 +32,7 @@
 //! # Deferred initialisation
 //!
 //! The engine is constructed early in runtime bring-up — before the endpoint,
-//! DHT, buyer-channel service, and reputation handles `NodeOrigin` depends on
+//! DHT, buyer pool service, and reputation handles `NodeOrigin` depends on
 //! exist — and takes its origin chain only at construction (there is no
 //! `add_origin`). So `NodeOrigin` is built empty, placed in the chain, and its
 //! dependencies are injected later via a write-once [`OnceLock`] (see
@@ -241,11 +241,12 @@ fn classify_pool_open_arm(err: &anyhow::Error) -> PoolOpenArm {
 ///
 /// Two outcomes are NOT failures and return before that: [`PoolOpenPending`] (the
 /// open outlived our budget and continues in the background), and anything the
-/// detached open task has already reported ([`OpenReported`]) — which includes every one of `run_open`'s legs: the
-/// under-slot store re-read, the `openPool` tx, and the `store.record` that persists
-/// it, plus a join fault if the task itself does not run to completion. So the
-/// unlabeled arm below is genuinely a *residual*: an open/reuse failure raised
-/// outside the open task itself.
+/// buyer path has already reported ([`OpenReported`]). That covers every one of
+/// `run_open`'s legs (the under-slot store re-read, the `openPool` tx, and the
+/// `store.record` that persists it, plus a join fault if the task itself does not run
+/// to completion) and every reuse-path leg (the store read, the lane seed, and a pool
+/// opened on-chain but missing from the store). So the unlabeled arm below is
+/// genuinely a *residual*: an open/reuse failure no leg reported.
 ///
 /// Returns the [`PullMiss`] this failure is (#1560), so a pool open that failed because
 /// of a fault in THIS node is not answered to the client as an absent blob. That matters
@@ -338,10 +339,9 @@ fn record_pool_open_failure(
     // DID happen to still be waiting from double-counting it.
     if arm == PoolOpenArm::Reported {
         debug!(%provider_addr, error = %err, "node-origin: buyer pool open failed (reported by the open task)");
-        // Reported by the open path and NOT typed as ours there, so it is one of the legs
-        // that leaves this node able to pay somebody else: a `ContractRevert`, an `RpcError`,
-        // or an expired pool that could not be reclaimed. Another candidate may still
-        // deliver, and if none does, `NotFound` is a true statement about what we could
+        // Reported by the open path and NOT typed as ours there, so it is the leg that
+        // leaves this node able to pay somebody else: a `ContractRevert`. Another
+        // candidate may still deliver, and if none does, `NotFound` is a true statement about what we could
         // obtain. Everything the open path knows to be node-wide arrives marked and returned
         // one arm above — the marker is the contract, not this arm's guesswork.
         return PullMiss::Clean;
@@ -351,12 +351,10 @@ fn record_pool_open_failure(
     if let Some(reason) = reason {
         deps.metrics.pool_open_failure_by_reason(reason);
     }
-    // `warn!`, not `debug!`. Everything the open task raises is `OpenReported` and
-    // returned above, so what reaches here is raised OUTSIDE the task — which makes this
-    // arm node-local faults, not peer behaviour: a store read fault on the reuse fast
-    // path, a poisoned `opens_in_flight` mutex (which wedges every open for the life of
-    // the process), or a pool that opened on-chain and is somehow not live in the
-    // store. None of those are things an operator should have to scrape debug logs to
+    // `warn!`, not `debug!`. Every leg that reports itself is `OpenReported` and
+    // returned above, so what reaches here is a leg nobody reported — which makes this
+    // arm node-local faults, not peer behaviour, such as a capability-signing fault in
+    // `pin_ctx`. None of those are things an operator should have to scrape debug logs to
     // see; at the default `RUST_LOG=info` a `debug!` here meant watching
     // `node_pull_pool_open_failures_total` climb with no line explaining any of it.
     //
@@ -405,7 +403,7 @@ pub struct NodeOriginConfig {
     /// Wall-clock bound on the STREAM-OPEN stage of a single upstream pull: connect,
     /// handshake, and the signed `StreamResponse`. Bounded work, so a slow one is a stall.
     ///
-    /// It does NOT bound the buyer-channel open, which is a separate, earlier stage on its
+    /// It does NOT bound the buyer pool open, which is a separate, earlier stage on its
     /// own budget (`selection::CHANNEL_OPEN_CALLER_BUDGET`, 5 s) — raising this to give a
     /// slow L2 more room does nothing. That the two are sequential stages is exactly why
     /// `outer_pull_deadline` budgets both, plus the stall window, for every candidate.
@@ -553,7 +551,8 @@ pub struct NodeOriginDeps {
     pub origin_directory: Arc<dyn OriginDirectory>,
     /// Resolves a provider `NodeId` to its bonded operator Ethereum address.
     pub addr_resolver: Arc<dyn NodeAddressResolver>,
-    /// Buyer-side payment-channel service (opens/reuses the upstream channel).
+    /// Buyer-side payment-pool service (opens/reuses this node's pool and pins a lane per
+    /// provider).
     pub buyer: Arc<dyn PoolOpener>,
     /// This node's DHT id, the lookup requester.
     pub self_id: DhtNodeId,
@@ -1856,11 +1855,11 @@ fn heat_of(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> u32 {
         .map_or(0, |e| e.estimate(Hash::from(hash_bytes)))
 }
 
-/// Walk the ranked candidates (best-first), opening a channel and pulling from
+/// Walk the ranked candidates (best-first), pinning a lane and pulling from
 /// each until one delivers, bounded by `budget` remaining attempts. Records a
 /// reputation outcome for every candidate that reaches the wire;
 /// candidates skipped earlier for an unresolvable operator address or a local
-/// channel-open failure are intentionally not scored (neither is the provider's
+/// pool-open failure are intentionally not scored (neither is the provider's
 /// fault). `budget` is the fetch-wide [`MAX_PROVIDER_ATTEMPTS`] remainder rather
 /// than the constant itself (see [`PullOutcome`]). Every verified byte counts
 /// toward the fill's funding recovery `gate`.
@@ -2068,7 +2067,7 @@ fn lane_ledger(
 }
 
 /// Attempt a single paid pull from one candidate: resolve its operator address,
-/// open/reuse a buyer channel, and stream the whole blob into `deps.engine` via
+/// open or reuse the node's buyer pool and pin this candidate's lane, and stream the whole blob into `deps.engine` via
 /// the gap-driven [`drive`] loop, recording the reputation outcome. On success
 /// the blob is admitted and durable in the store — no whole-blob buffer is ever
 /// held in RAM (#1682). Returns the [`PullMiss`] this failure is on a miss (try
@@ -2145,7 +2144,7 @@ async fn pull_from_candidate_in_span(
         return Err(PullMiss::Clean);
     };
     // ADR 041 buy-side gate: refuse a candidate quoting above this node's buy ceiling
-    // BEFORE opening a channel. A skip folds into the walk as `BelowMargin`.
+    // BEFORE opening or reusing the pool. A skip folds into the walk as `BelowMargin`.
     let heat = heat_of(deps, hash_bytes);
     let (rate_ceiling, speculative) =
         match economic_ceiling(deps, candidate.node_id.into(), heat, candidate.rate_per_mb) {
@@ -2157,13 +2156,13 @@ async fn pull_from_candidate_in_span(
         };
     let ctx = match deps
         .buyer
-        // Same channel-open bound as the window path (#1143) — see there.
+        // Same pool-open bound as the window path (#1143) — see there.
         .open_or_reuse_pool(provider_addr, crate::selection::CHANNEL_OPEN_CALLER_BUDGET)
         .await
     {
         Ok(ctx) => ctx,
         Err(err) => {
-            // A channel-open failure is OUR payment-side problem, not the
+            // A pool-open failure is OUR payment-side problem, not the
             // provider's fault — don't tar its reputation; just try the next.
             // Whether it is also a fault that must change our WIRE answer is a
             // per-reason question the classifier owns (#1560).
@@ -2203,7 +2202,7 @@ async fn pull_from_candidate_in_span(
     // persist the FINAL watermark AFTER the drive has fully stopped advancing it.
     // Settling from this outer future instead would race the still-running thread and
     // persist a STALE cumulative, wedging the lane exactly as the copy-back did. So
-    // nothing pre-`drive` on this outer future settles: the channel-open, bind, and
+    // nothing pre-`drive` on this outer future settles: the pool-open, bind, and
     // header handshake below issue no voucher.
     // As on the window path: a zero budget is our own misconfiguration, metered as ours.
     // Checked BEFORE the ledger, so a pull that cannot legally run never reaches the

@@ -902,7 +902,7 @@ impl ClientHandler {
                 // drains the buyer deposit. (Multi-hop node→node pulls therefore require the
                 // downstream requester to send a binding; both the direct-client
                 // `decdn fetch` (#1115) and the node→node requester
-                // (`node_origin`, #1117) now do, so chained pull-through works.)
+                // (`node_origin`, #1117) do, so chained pull-through works.)
                 // On a successful fill, fall through to the normal size-gate +
                 // delivery path; otherwise it stays a `NotFound`.
                 //

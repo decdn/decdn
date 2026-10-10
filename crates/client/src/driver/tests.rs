@@ -534,7 +534,7 @@ async fn disjoint_holds_leave_three_gaps() {
 /// `0` and not `base + first-chunk`. `fill_gap`'s per-gap reporter fires only
 /// from inside `ingest_stream` once streaming begins, so without the
 /// pre-stream emit a resumed blob's bar sits at `0` through the pre-fetch
-/// window (discovery, channel open, pool resolve), then jumps to the resume
+/// window (discovery, pool open, pool resolve), then jumps to the resume
 /// point on the first delivered chunk.
 #[tokio::test]
 async fn resume_base_is_reported_before_the_first_chunk() {

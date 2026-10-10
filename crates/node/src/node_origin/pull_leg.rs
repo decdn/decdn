@@ -577,7 +577,7 @@ impl NodeOrigin {
     /// ([`NodeOrigin::refuses_whole_blob`]), which stops longer loops.
     ///
     /// Shares the buffered [`decdn_cache::Origin::fetch`] path's cached-first discover → probe →
-    /// rank pipeline and its open-time candidate fallback, but stops at channel-open +
+    /// rank pipeline and its open-time candidate fallback, but stops at pool-open +
     /// header instead of pulling any bytes.
     ///
     /// # Errors
@@ -740,7 +740,7 @@ impl NodeOrigin {
     /// live pull. Any holder — partial or whole — signs the same whole-blob
     /// geometry, so the caller can commit its `StreamResponse` from whichever
     /// candidate answers first. Classifies every failure into the [`PullMiss`] it
-    /// is. The channel it opens is cached by `open_or_reuse_pool`, so the ranged
+    /// is. The pool it opens is cached by `open_or_reuse_pool`, so the ranged
     /// pull's first lane to this provider reuses it.
     ///
     /// With a `prime` and the candidate's probe-reported size, the handshake opens
@@ -771,7 +771,8 @@ impl NodeOrigin {
             return Err(PullMiss::Clean);
         };
         // ADR 041 buy-side gate: refuse a candidate quoting above this node's buy
-        // ceiling BEFORE opening a channel. A skip folds into the walk as `BelowMargin`.
+        // ceiling BEFORE opening or reusing the pool. A skip folds into the walk as
+        // `BelowMargin`.
         let heat = heat_of(deps, hash_bytes);
         let rate_ceiling =
             match economic_ceiling(deps, candidate.node_id.into(), heat, candidate.rate_per_mb) {
@@ -1461,10 +1462,10 @@ impl PeerRunSink<'_> {
             .await
         {
             Ok(ctx) => ctx,
-            // A channel-open failure is OUR payment-side problem, not the source's
+            // A pool-open failure is OUR payment-side problem, not the source's
             // fault. If it is a node-wide LOCAL fault (a broken buyer key, an
             // unreadable store), no other lane can fix it — terminal. Otherwise it
-            // is per-provider (a revert, an RPC blip): drop this source and re-plan.
+            // is per-provider (a contract revert): drop this source and re-plan.
             Err(err) => {
                 return match record_pool_open_failure(self.deps, provider_addr, &err) {
                     PullMiss::LocalFault | PullMiss::FundingNeeded => {
@@ -1739,8 +1740,8 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// counterparty, so every paid-path axis is absent — and each absence is load-bearing,
 /// not an omission:
 ///
-/// - **No discovery / channel open / [`PeerSource`] / [`super::funder::NodeFunder`].** The bytes
-///   are already reachable locally, so there is nothing to dial, no channel to open,
+/// - **No discovery / pool open / [`PeerSource`] / [`super::funder::NodeFunder`].** The bytes
+///   are already reachable locally, so there is nothing to dial, no pool to open,
 ///   and nothing to pay. The source is handed in by the orchestration, already built.
 /// - **No provider scoring.** There is no provider: a fault here is OUR own
 ///   origin, never a peer to score. On a [`drive`] error we meter it as a LOCAL

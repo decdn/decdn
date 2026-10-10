@@ -12,10 +12,9 @@ fn probe_timeout_matches_the_adr_collection_ceiling() {
 // when early candidates stall.
 //
 // Asserted against the REAL worst case per candidate — all THREE sequential stages
-// (channel open, stream open, one silent streaming window) — not against the
+// (pool open, stream open, one silent streaming window) — not against the
 // formula's own arithmetic. Restated with any stage missing, this test passes while
-// the loop silently cannot reach the last candidate. Both of the deadline's shipped
-// versions were wrong in exactly that way, one stage apart.
+// the loop silently cannot reach the last candidate.
 //
 // `stall` is swept independently of `per` because it is the term an operator can
 // raise on its own: a formula that ignores it looks fine at defaults and starves the
@@ -28,7 +27,7 @@ fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
             let per = Duration::from_secs(per_secs);
             let stall = Duration::from_secs(stall_secs);
             let outer = outer_pull_deadline(per, stall);
-            // One candidate = channel open, then stream open, then a silent stream.
+            // One candidate = pool open, then stream open, then a silent stream.
             let worst_candidate = CHANNEL_OPEN_CALLER_BUDGET
                 .saturating_add(per)
                 .saturating_add(stall);
@@ -36,7 +35,7 @@ fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
             assert!(
                 outer > all_candidates,
                 "outer {outer:?} must exceed {MAX_PROVIDER_ATTEMPTS}×{worst_candidate:?} \
-                 (channel open + stream open + stall), or the loop cannot reach the \
+                 (pool open + stream open + stall), or the loop cannot reach the \
                  last candidate"
             );
             assert_eq!(outer, all_candidates + PULL_THROUGH_OUTER_SLACK);
@@ -88,7 +87,7 @@ fn outer_pull_deadline_at_defaults_is_167_5s() {
 }
 
 // A zero per-candidate budget still yields a positive outer deadline (the
-// channel-open budgets + the slack), and a saturating multiply can't panic on
+// pool-open budgets + the slack), and a saturating multiply can't panic on
 // absurd inputs.
 #[test]
 fn outer_pull_deadline_handles_edges() {

@@ -104,8 +104,7 @@ pub struct NodeCandidate {
     /// iroh endpoint id — dialed via discovery, never needs an explicit addr.
     pub node_id: PublicKey,
     /// The node's Ethereum address — the `--provider-address` discovery derives
-    /// (the channel is opened/reused against it and the `slash_sig` verified
-    /// against it).
+    /// (the lane pays it and the `slash_sig` is verified against it).
     pub eth_address: Address,
     /// The node's self-attested region (ADR 030), used for locality-aware
     /// selection. `None` when the node registered without one, or with a code
@@ -720,7 +719,7 @@ pub struct Probed {
 pub struct WarmingCandidate {
     /// The candidate proxy's iroh id.
     pub node_id: PublicKey,
-    /// Its Ethereum address — the `--provider-address` a warming channel opens
+    /// Its Ethereum address — the `--provider-address` a warming lane pays
     /// and the `slash_sig` is verified against.
     pub eth_address: Address,
     /// Measured round-trip time in milliseconds, from the **live `cdn/probe/v1`

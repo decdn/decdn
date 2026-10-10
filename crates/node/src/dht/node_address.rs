@@ -61,21 +61,9 @@ const LABEL: &str = "ChainNodeAddressDirectory bindings";
 pub trait NodeAddressResolver: Send + Sync + std::fmt::Debug {
     /// The bonded operator address for `node_id`, or `None` if the node is not
     /// currently registered. `None` means the caller MUST NOT attempt a paid
-    /// pull from it — there is no address to open a channel to or to verify the
+    /// pull from it — there is no address to pay or to verify the
     /// `slash_sig` against.
     fn address_of(&self, node_id: &NodeId) -> Option<Address>;
-
-    /// Reverse lookup: a registered [`NodeId`] currently bound to `address`, or
-    /// `None` if no registered node binds it (deregistered / never seen).
-    ///
-    /// The buyer-channel reconcile (#972) keys channels by the provider's
-    /// operator *address* but must dial the provider by `NodeId` to request a
-    /// cooperative-close waiver. An operator may run several nodes under one
-    /// address; any is dialable for this purpose — they share the operator key
-    /// that signs the waiver — so the first match is returned. `None` is the
-    /// "unreachable / gone" signal: the caller leaves the channel for the
-    /// expiry-reclaim sweep rather than dialing.
-    fn node_id_for(&self, address: &Address) -> Option<NodeId>;
 }
 
 /// Static, in-memory [`NodeAddressResolver`] from a known map. Used by tests and
@@ -96,12 +84,6 @@ impl StaticNodeAddressDirectory {
 impl NodeAddressResolver for StaticNodeAddressDirectory {
     fn address_of(&self, node_id: &NodeId) -> Option<Address> {
         self.map.get(node_id).copied()
-    }
-
-    fn node_id_for(&self, address: &Address) -> Option<NodeId> {
-        self.map
-            .iter()
-            .find_map(|(node_id, addr)| (addr == address).then_some(*node_id))
     }
 }
 
@@ -127,18 +109,6 @@ impl ChainNodeAddressDirectory {
 impl NodeAddressResolver for ChainNodeAddressDirectory {
     fn address_of(&self, node_id: &NodeId) -> Option<Address> {
         self.proj.read(|bindings| bindings.get(node_id).copied())
-    }
-
-    fn node_id_for(&self, address: &Address) -> Option<NodeId> {
-        // O(n) scan of the binding set — the reconcile sweep calls this hourly
-        // for a handful of channels, so a reverse index isn't worth maintaining.
-        // Add a reverse map only if a node ever tracks thousands of buyer
-        // channels.
-        self.proj.read(|bindings| {
-            bindings
-                .iter()
-                .find_map(|(node_id, addr)| (addr == address).then_some(*node_id))
-        })
     }
 }
 

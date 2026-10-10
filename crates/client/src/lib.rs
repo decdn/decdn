@@ -209,7 +209,8 @@ pub mod probe;
 /// off the QUIC stream beneath the message decode, and the `ThroughputFloor` that judges
 /// those bytes against a minimum rate over a trailing window.
 mod progress;
-/// Wallet-filled HTTP provider builder for opening/settling payment channels.
+/// Wallet-filled HTTP provider builder for opening, topping up, closing and reclaiming
+/// payment pools.
 pub mod provider;
 /// Client-side [`decdn_bao_range::RangedStore`] backend (#1621): a
 /// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
@@ -994,10 +995,10 @@ impl std::fmt::Display for PullTimeout {
 impl std::error::Error for PullTimeout {}
 
 /// Typed sentinel for the upstream rejecting a voucher we presented mid-stream
-/// (#857) — e.g. a stale nonce (#852), deposit exhaustion, or a wrong-channel
-/// mismatch. This is OUR payment-side fault, not the provider's, so the pull
+/// (#857) — e.g. a cumulative amount regression (#852), deposit exhaustion, or
+/// a wrong pool. This is OUR payment-side fault, not the provider's, so the pull
 /// orchestrator `downcast_ref`s it to skip the candidate WITHOUT recording a
-/// reputation observation (mirroring the buyer channel-open-failure arm). Named
+/// reputation observation (mirroring the buyer pool-open-failure arm). Named
 /// with the `Upstream` prefix to disambiguate from the protocol-level
 /// `StreamError::VoucherRejected` reason enum, whose `reason` it carries verbatim
 /// (the `Copy` `VoucherRejectReason`, not a lossy stringification) so a future
@@ -1827,18 +1828,18 @@ where
 }
 
 /// Like `stream_fetch`, but issues vouchers through a caller-owned shared
-/// [`PoolLedger`] so multiple concurrent pulls on ONE payment channel coordinate.
+/// [`PoolLedger`] so multiple concurrent pulls on ONE pool lane coordinate.
 ///
 /// The bug this fixes: each `stream_fetch`/`stream_fetch_tracked` call seeds its
-/// own voucher state from `ctx.prior_*`, so N concurrent pulls on the same channel
+/// own voucher state from `ctx.prior_*`, so N concurrent pulls on the same lane
 /// each compute the next cumulative `amount` independently and collide — the node
 /// accepts exactly one and rejects the rest as `AmountRegression`. Passing every
 /// concurrent caller the SAME `&Arc<PoolLedger>` (shared across
 /// `tokio::spawn`/`join!`) serializes their voucher issuance through the
 /// ledger's mutex: each issue advances the cumulative `amount`/`bytes_delivered`
-/// in turn, the channel advances monotonically, and all pulls succeed.
+/// in turn, the lane advances monotonically, and all pulls succeed.
 ///
-/// The caller owns the ledger's lifetime and persists what the channel paid from it
+/// The caller owns the ledger's lifetime and persists what the lane paid from it
 /// directly (this entrypoint does not surface a [`VoucherProgress`] — the shared ledger
 /// IS the watermark). Persist via [`PoolLedger::settlement`], NOT `snapshot`:
 /// `snapshot`/`committed` report only ACKED vouchers, so a voucher left in the ack wait

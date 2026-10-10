@@ -24,16 +24,6 @@ fn static_directory_resolves_known_and_misses_unknown() {
     assert_eq!(dir.address_of(&nid(2)), None);
 }
 
-#[test]
-fn static_directory_reverse_resolves_address_and_misses_unknown() {
-    let mut m = HashMap::new();
-    m.insert(nid(1), addr(0xAA));
-    let dir = StaticNodeAddressDirectory::new(m);
-    assert_eq!(dir.node_id_for(&addr(0xAA)), Some(nid(1)));
-    // No node binds this address → unreachable/gone.
-    assert_eq!(dir.node_id_for(&addr(0xBB)), None);
-}
-
 /// `set_binding` inserts and surfaces the address; the size gauge tracks the
 /// growing set, and a same-key overwrite keeps cardinality (and the gauge)
 /// stable while updating the bound address.

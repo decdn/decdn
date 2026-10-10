@@ -659,7 +659,7 @@ where
     reject_empty_claim_for_nonempty_root(total_bytes, hash)?;
 
     // Surface the already-present resume base on the progress bar immediately —
-    // before the pre-fetch window (channel open, first chunk). `fill_gap`'s
+    // before the pre-fetch window (pool open, first chunk). `fill_gap`'s
     // per-gap reporter fires only from inside `ingest_stream` once streaming
     // begins (as `base_present + received`), so without this a resumed blob's bar
     // sits at `0` until the first byte arrives, then jumps to the resume point.

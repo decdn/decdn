@@ -442,6 +442,10 @@ pub struct DecdnMetrics {
     /// node refuses instead, and this counts how often. A sustained rate means
     /// the chain lane or the buyer store is unhealthy and this node is buying
     /// nothing from the affected providers.
+    ///
+    /// Each refusal also moves `decdn_node_pull_pool_open_failures_total` once:
+    /// this counter is the lane-seed share of that total. A buyer-store read
+    /// fault under the seed lock counts here too.
     pub buyer_lane_seed_failures: Counter,
     /// `decdn_buyer_pool_adoption_failures_total`: bootstrap could not tell
     /// whether this node already owns a payment pool on chain, so it left the
@@ -754,16 +758,6 @@ pub struct DecdnMetrics {
     /// rescan's probes rather than the seed's. Operator-visible name:
     /// `decdn_dht_republish_seed_origin_probe_failures_total`.
     pub dht_republish_seed_origin_probe_failures: Counter,
-    /// Accepted vouchers whose nonce skipped one or more values past the
-    /// previously-accepted nonce (`voucher.nonce > last_nonce + 1`), counted
-    /// once per gapped voucher (#747). The voucher is still accepted —
-    /// vouchers are cumulative, so on-chain settlement is unaffected — but a
-    /// non-zero rate flags dropped vouchers (per-voucher deliveries the node
-    /// never billed) or a client resetting/forking its counter (a replay-probe
-    /// signal). The precise skipped-count rides the paired `tracing::warn!` in
-    /// `ChannelState::apply_voucher`. Operator-visible name:
-    /// `decdn_voucher_nonce_gaps_total`.
-    pub voucher_nonce_gaps: Counter,
     /// Redeem hints the voucher-accept path could not enqueue because the
     /// bounded advisory channel was full (`try_send` → `Full`), counted once
     /// per dropped hint (#751). A hint is advisory — the next voucher re-hints
@@ -893,23 +887,23 @@ pub struct DecdnMetrics {
     /// visible name:
     /// `decdn_buyer_pool_store_skipped_undecodable_records_total`.
     pub buyer_pool_store_skipped_undecodable_records: Counter,
-    /// Background low-water top-ups (#1146) that landed: a reused buyer channel
-    /// whose remaining deposit had fallen below its 20% low-water mark was
-    /// re-funded to the working deposit, so sustained miss pulls to that provider
-    /// keep flowing instead of silently stranding on a spent-down channel. The
+    /// Background low-water top-ups (#1146) that landed: the node's buyer pool,
+    /// whose remaining deposit had fallen below its 20% low-water mark, was
+    /// re-funded to the working deposit, so sustained miss pulls to every provider
+    /// keep flowing instead of silently stranding on a spent-down pool. The
     /// healthy signal of the auto-refill path. Operator-visible name:
     /// `decdn_buyer_topup_ok_total`.
     pub buyer_topup_ok: Counter,
     /// Background low-water top-ups (#1146) that did NOT cleanly land: the standing
     /// allowance re-approval failed, the `topUp` submission/receipt errored or
-    /// reverted, OR the `topUp` landed on-chain but the local channel row vanished
+    /// reverted, OR the `topUp` landed on-chain but the local pool row vanished
     /// or rotated during the RPC, or the credit itself faulted (escrowed-but-untracked
     /// — `fund_pool` logs the tx at error! for reconcile). Folding the untracked case in here — rather than
     /// counting it as `buyer_topup_ok` — means an operator alerting on this metric
-    /// sees stranded deposits. The refill is best-effort (the channel is simply left
-    /// un-topped), but a sustained rate means reused channels
-    /// are not being refilled and pull-through to busy providers will degrade as
-    /// their deposits drain (check the gas wallet / RPC / USDC balance). Operator-
+    /// sees stranded deposits. The refill is best-effort (the pool is simply left
+    /// un-topped), but a sustained rate means the node's pool is not being refilled
+    /// and pull-through to every provider degrades as its deposit drains (check the
+    /// gas wallet / RPC / USDC balance). Operator-
     /// visible name: `decdn_buyer_topup_failure_total`.
     pub buyer_topup_failure: Counter,
     /// Lane-store reconciliation the settlement watcher could not apply from a
@@ -1135,8 +1129,10 @@ pub struct DecdnMetrics {
     /// `pool_open_failures_*_total` family below (#966) breaks the
     /// `openPool`-tx failures out by cause so an operator can tell a
     /// misconfiguration (`insufficient_deposit`) from infrastructure
-    /// (`rpc_error`). It also covers store, open-task and capability-signing
-    /// causes the by-reason family does not, so the two are not expected to sum equal.
+    /// (`rpc_error`). It also covers store, open-task, capability-signing and
+    /// lane-seed causes the by-reason family does not, so the two are not
+    /// expected to sum equal. `decdn_buyer_lane_seed_failures_total` breaks the
+    /// lane-seed refusals out.
     ///
     /// **One failure moves this counter once.** A site increments it if and only
     /// if it marks the error `OpenReported`, which is what stops the classifier
@@ -1179,7 +1175,7 @@ pub struct DecdnMetrics {
     /// `decdn_node_pull_too_large_total` (#840): the bytes received from a
     /// selected upstream crossed this node's `max_blob_size` ceiling, so the buyer
     /// aborted the pull (#1895). The upstream's `total_bytes` claim plays no part.
-    /// Like a channel-open failure this is a buyer-side policy decision, NOT
+    /// Like a pool-open failure this is a buyer-side policy decision, NOT
     /// necessarily provider misbehavior (the provider may legitimately serve
     /// larger blobs to nodes with a higher ceiling), so it does not tar the
     /// provider's reputation. A sustained rate
@@ -1224,7 +1220,7 @@ pub struct DecdnMetrics {
     /// [`ServeEconomicsRegime`].
     pub serve_economics_refused_amortized: Counter,
     /// `decdn_node_pull_timeout_total` (#857): a buyer→upstream pull hit one of this node's
-    /// own deadlines. Like a channel-open failure this is a buyer-side condition (a possibly
+    /// own deadlines. Like a pool-open failure this is a buyer-side condition (a possibly
     /// mis-sized local budget), NOT evidence the provider is unreachable, so it does NOT tar
     /// the provider's local reputation. Distinct from `node_pull_through_timeouts` (the
     /// delivery handler's own serving deadline).
@@ -1359,8 +1355,8 @@ pub struct DecdnMetrics {
     pub node_pull_stalled: Counter,
     /// `decdn_node_pull_local_fault_total` (#1145 review): a pull failed for a reason
     /// that is OURS — a broken signer, an encode fault, a bad range computation, an
-    /// unusable deadline config, a buyer channel open this node's own state defeated
-    /// (an unreadable or unwritable channel store, a poisoned open lock, a panicked open
+    /// unusable deadline config, a buyer pool open this node's own state defeated
+    /// (an unreadable or unwritable buyer pool store, a poisoned open lock, a panicked open
     /// task, a wallet that cannot fund a deposit; #1560), or a cache store that cannot
     /// take the pulled bytes (a full or read-only disk, a cache code bug; #2286) — and
     /// the upstream was exonerated.
@@ -1376,7 +1372,7 @@ pub struct DecdnMetrics {
     /// candidate and fails identically on all of them. Read the rate, not the absolute,
     /// and do not infer the number of affected requests from it.
     pub node_pull_local_fault: Counter,
-    /// `decdn_node_pull_pool_open_pending_total` (#1143): a buyer channel open
+    /// `decdn_node_pull_pool_open_pending_total` (#1143): a buyer pool open
     /// was still in flight when the per-candidate budget expired, so the pull moved
     /// to the next candidate while the open continued in the background.
     ///
@@ -1397,28 +1393,29 @@ pub struct DecdnMetrics {
     /// sustained rate as a chain-lane signal only once it outlives a restart.
     pub node_pull_pool_open_pending: Counter,
     /// `decdn_node_pull_progress_persist_failures_total` (#852): a pull paid ≥1
-    /// voucher but persisting the buyer channel's resume watermark
-    /// (`record_progress`) failed. The bytes were delivered, but the channel's
-    /// stored `nonce`/`bytes`/`amount` now lags what the upstream accepted — the
-    /// next reuse of this channel will re-sign a stale voucher and be rejected. A
-    /// non-zero count means a provider is at risk of becoming unusable until
-    /// channel rotation.
+    /// voucher but persisting the buyer lane's resume watermark
+    /// (`record_progress`) failed. The bytes were delivered, but the lane's
+    /// stored `bytes`/`amount` now lags what the upstream accepted. The next
+    /// reuse of this lane signs from that stale anchor; the upstream rejects it
+    /// with its watermark bundle and the ledger reseeds from that, so each reuse
+    /// costs one rejected voucher. A sustained rate means the buyer store is
+    /// failing writes.
     pub node_pull_progress_persist_failures: Counter,
     /// `decdn_node_pull_progress_dropped_total` (#1145 review): a pull paid ≥1
-    /// voucher, but by the time the watermark was written the provider's slot had
+    /// voucher, but by the time the watermark was written the node's pool had
     /// been replaced by a newer open — so the write was skipped rather than clobber
     /// the replacement, and that voucher's progress is gone.
     ///
     /// Sibling of `node_pull_progress_persist_failures_total`, which only counts the
     /// `Err` path; this is the `Ok`-but-dropped path, which is otherwise invisible.
-    /// The rare benign case is a channel rotating mid-pull. A *sustained* rate means
-    /// a `channel_id`-plumbing bug, and every tick is real USDC whose watermark was
+    /// The rare benign case is a pool replaced mid-pull. A *sustained* rate means
+    /// a `pool_id`-plumbing bug, and every tick is real USDC whose watermark was
     /// discarded — so this is the counter to alert on, not just to look at.
     pub node_pull_progress_dropped: Counter,
     /// `decdn_node_pull_progress_superseded_total` (#1145 review): a pull's watermark write was
-    /// REGRESSED because a CONCURRENT pull on the same shared channel ledger had already
+    /// REGRESSED because a CONCURRENT pull on the same shared lane ledger had already
     /// persisted a higher (correct) watermark. Benign and EXPECTED under the shared
-    /// `BuyerLedgers` — concurrent pulls on one channel are routine — because the monotonic
+    /// `BuyerLedgers` — concurrent pulls on one lane are routine — because the monotonic
     /// store keeps the winner's higher value, so no voucher is lost. Split from
     /// `node_pull_progress_persist_failures_total` (a real store-write failure that leaves the
     /// watermark lagging) so ordinary settle races do not drown out a genuine persist fault.
@@ -2568,8 +2565,8 @@ impl Metrics {
     /// `reason`. Pairs with the structured `reason` field on the `warn!`/`debug!`
     /// in [`crate::node_origin`]. Distinct from
     /// [`Self::node_pull_pool_open_failure`], the unlabeled total (which also
-    /// counts store, open-task and capability-signing causes that never reach the
-    /// `openPool` tx).
+    /// counts store, open-task, capability-signing and lane-seed causes that never
+    /// reach the `openPool` tx).
     pub fn pool_open_failure_by_reason(&self, reason: PoolOpenFailureReason) {
         match reason {
             PoolOpenFailureReason::InsufficientDeposit => {
@@ -2942,11 +2939,6 @@ recorders! {
     /// `decdn_probe_hold_slots_max`). Called once at runtime bring-up.
     probe_hold_slots_max(max: usize) => probe_hold_slots_max.set(sat(max));
 
-    /// An accepted voucher skipped one or more nonce values past
-    /// `last_nonce + 1` (#747). Counted once per gapped voucher; the precise
-    /// skip count rides the paired `tracing::warn!` in `apply_voucher`.
-    voucher_nonce_gap => voucher_nonce_gaps.inc();
-
     /// A redeem hint was dropped because the bounded advisory channel was full
     /// (`try_send` → `Full`, #751). Advisory, so a few drops are benign; a
     /// sustained rate means the redeemer is not keeping up with fan-out.
@@ -3021,7 +3013,7 @@ recorders! {
     buyer_pool_store_skipped_undecodable_records(count: usize)
         => buyer_pool_store_skipped_undecodable_records.inc_by(u64::try_from(count).unwrap_or(u64::MAX));
 
-    /// A background low-water top-up (#1146) landed: a reused buyer channel below
+    /// A background low-water top-up (#1146) landed: a reused buyer pool below
     /// its 20% low-water mark was re-funded to the working deposit. Pairs with the
     /// `info!` in `spawn_refill_if_low`.
     buyer_topup_ok => buyer_topup_ok.inc();
@@ -3029,9 +3021,9 @@ recorders! {
     /// A background low-water top-up (#1146) did not cleanly land — the allowance
     /// re-approval or the `topUp` submit/receipt errored or reverted, OR the `topUp`
     /// landed on-chain but the local row vanished/rotated during the RPC
-    /// (`DepositOutcome::UnknownProvider` / `ChannelMismatch`, i.e. escrowed-but-
+    /// (`DepositOutcome::UnknownPool` / `PoolMismatch`, i.e. escrowed-but-
     /// untracked). Folding the untracked case in here keeps stranded deposits
-    /// visible on this counter. Best-effort, so the channel is left un-topped; pairs
+    /// visible on this counter. Best-effort, so the pool is left un-topped; pairs
     /// with the `warn!` (or `top_up`'s own error!/warn!) around the call in
     /// `spawn_refill_if_low`.
     buyer_topup_failure => buyer_topup_failure.inc();
@@ -3117,7 +3109,7 @@ recorders! {
     /// latency ceiling, so it took the local reputation penalty (#1177).
     node_region_latency_penalty => node_region_latency_penalty.inc();
 
-    /// A buyer channel open/reuse failed before a pull could start (#831).
+    /// A buyer pool open/reuse failed before a pull could start (#831).
     node_pull_pool_open_failure => node_pull_pool_open_failures.inc();
 
     /// A selected upstream claimed a `total_bytes` above this node's
@@ -3375,19 +3367,19 @@ recorders! {
     /// about the network; any sustained rate means this node cannot complete a pull.
     node_pull_local_fault => node_pull_local_fault.inc();
 
-    /// A buyer channel open outlived the per-candidate budget (#1143). The open
+    /// A buyer pool open outlived the per-candidate budget (#1143). The open
     /// continues in the background; the pull moves on. No reputation effect.
     node_pull_pool_open_pending => node_pull_pool_open_pending.inc();
 
-    /// A pull paid ≥1 voucher but persisting the buyer channel resume watermark
-    /// failed (#852); the channel's stored progress now lags the upstream.
+    /// A pull paid ≥1 voucher but persisting the buyer lane resume watermark
+    /// failed (#852); the lane's stored progress now lags the upstream.
     node_pull_progress_persist_failure => node_pull_progress_persist_failures.inc();
 
-    /// A paid voucher's watermark was DROPPED because the provider's channel slot had
-    /// been replaced by a newer open before the write landed (#1145 review).
+    /// A paid voucher's watermark was DROPPED because the node's pool had been
+    /// replaced by a newer open before the write landed (#1145 review).
     node_pull_progress_dropped => node_pull_progress_dropped.inc();
 
-    /// A concurrent settle on the shared channel ledger persisted a higher watermark first, so
+    /// A concurrent settle on the shared lane ledger persisted a higher watermark first, so
     /// this write was superseded (benign under `BuyerLedgers`; #1145 review).
     node_pull_progress_superseded => node_pull_progress_superseded.inc();
 

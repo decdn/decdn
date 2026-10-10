@@ -328,9 +328,9 @@ pub struct ResolvedCache {
     /// probe handler's hot path is unchanged for the default.
     pub stake_lane_reserved_holds: usize,
     /// Enable node-to-node paid cache-miss pull-through (#831). Default
-    /// `false`. When `true` and the buyer-channel service bootstrapped, the
+    /// `false`. When `true` and the buyer pool service bootstrapped, the
     /// runtime provisions the `NodeOrigin` and the client handler triggers a
-    /// pull on a miss (behind a valid client channel). `cache.*` is
+    /// pull on a miss (behind a pull-authorized client lane). `cache.*` is
     /// restart-required, so this is read once at bring-up.
     pub node_to_node_pull_through_enabled: bool,
     /// When `false`, the node serves and seeds only content its own backend

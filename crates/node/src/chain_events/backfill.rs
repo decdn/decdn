@@ -14,10 +14,12 @@ use std::num::NonZeroU64;
 
 /// How many blocks the persisted scan checkpoint is rewound before the
 /// resume backfill (#751), absorbing a shallow reorg between the last scanned
-/// block and the next boot: a `PoolOpened` re-mined at a slightly different
-/// height after a reorg is still inside the rescanned window.
-/// `PoolProjection::record_opened` is absolute and so idempotent, so the only
-/// cost of the margin is a few extra blocks of `eth_getLogs`. Sized for the
+/// block and the next boot: a `PoolRedeemed` or `PoolReclaimed` re-mined at a
+/// slightly different height after a reorg is still inside the rescanned
+/// window. Those are the folds with durable effects — the paid watermark on the
+/// lane row, and the forgotten lanes. Both folds are absolute (set the paid
+/// cumulative, drop the pool's lanes) and so idempotent, so the only cost of
+/// the margin is a few extra blocks of `eth_getLogs`. Sized for the
 /// shallow reorgs of an Arbitrum-Sepolia-class L2.
 ///
 /// The rewind applies only where a *durable* cursor is resumed — a

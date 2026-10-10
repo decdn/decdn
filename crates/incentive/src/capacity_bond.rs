@@ -346,9 +346,9 @@ mod sol_types {
             /// Atomically deletes the old `nodeId → address` mapping (bumping
             /// its `registrationNonce`) and writes the new one, so the operator
             /// is never un-slashable mid-rotation. The bond, `declaredMbps`,
-            /// `firstBondedAt`, and every open payment channel survive
-            /// untouched — all of them key on the Ethereum address, which does
-            /// not change.
+            /// `firstBondedAt`, and every open lane paying this operator
+            /// survive untouched — all of them key on the Ethereum address,
+            /// which does not change.
             ///
             /// `bindingSignature` covers `BindNodeId(nodeId,
             /// bindingNonce[msg.sender])` — the terms-free typehash, NOT

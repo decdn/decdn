@@ -720,7 +720,7 @@ counts; see
    `blockchain.event_poll_interval_ms`. A stalled watcher usually means the RPC
    endpoint is unreachable or rate-limiting; see [RPC unreachable](#rpc-unreachable).
 3. For cause (1), no action. If the rate is high because many clients open dust
-   pools deliberately, note that the refusal now happens *before* any fill
+   pools deliberately, note that the refusal happens *before* any fill
    (#1519), so it costs this node nothing beyond the signature.
 4. Do not raise a deposit floor to "fix" this. `PaymentPool.minDeposit` ships
    dormant at 0 and is governance-set

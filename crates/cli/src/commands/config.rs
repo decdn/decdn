@@ -876,13 +876,13 @@ const CLIENT_CONFIG: &str = r#"# deCDN client configuration — fetch-only consu
 # CLI flags override values in this file.
 
 [identity]
-# data_dir = "~/.decdn/client"       # holds the eth keystore and the buyer-channel store
+# data_dir = "~/.decdn/client"       # holds the eth keystore and the buyer pool store
 
 [blockchain]
 # rpc_url = ""                       # REQUIRED: JSON-RPC URL for the payment chain
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # eth_keystore = "~/.decdn/client/keystore.json"   # defaults to <data_dir>/keystore.json; create with `decdn key-gen --output-dir ~/.decdn/client`
-# payment_pool_address = ""          # REQUIRED: 0x-prefixed hex; pool the client opens payment channels through
+# payment_pool_address = ""          # REQUIRED: 0x-prefixed hex; PaymentPool contract the client opens its pool on
 # usdc_address = ""                  # USDC settlement token deposits spend
 # buyer_working_deposit_micro_usdc = 10000000  # deposit when OPENING a pool and refill target; must be > 0; default 10 USDC
 # buyer_max_approve = false          # exact deposit-sized USDC approvals (client default); true opts into an unlimited standing approval
@@ -1025,7 +1025,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # node_to_node_pull_through_enabled = false # paid cache-miss pull from upstream nodes (#831, ADR 001/022); OFF by default
 # relay_foreign_namespaces = true          # relay content this node's own backend does not hold (#1759); default is role-derived — origin-only (false) when a [cache.origin]/[[cache.origins]] backend is configured, relay (true) when none is; set explicitly to override
 # node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
-# node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the channel open, which has its own 5s budget. The overall pull-through deadline is derived from this, the channel-open budget, and the stall window, so every ranked upstream can be tried before falling back (#831, #859)
+# node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the pool open, which has its own 5s budget. The overall pull-through deadline is derived from this, the pool-open budget, and the stall window, so every ranked upstream can be tried before falling back (#831, #859)
 # node_pull_stall_window_sec = 20          # per-upstream THROUGHPUT-FLOOR window while streaming (#1797); bytes are counted off the stream sub-frame, so it trips only when throughput falls below the floor — not on a large blob or a big frame. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (167.5s at defaults); also the head start of each own-origin range-pull read's time budget (ADR 037)
 # node_pull_min_throughput_bps = 4096      # minimum sustained upstream throughput (bytes/sec) over node_pull_stall_window_sec (#1797); catches a slow-drip wedge. 0 = idle detection only (one byte per window). The abort is requester-local and does not score the upstream's reputation; also the average throughput each own-origin range-pull read ({H}.obao4 or one data window) must sustain after that head start, 0 = those reads unbounded
 # eviction_policy = "lru"                  # ADR 040: "lru" or "tinylfu"; restart-required
