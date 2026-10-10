@@ -615,7 +615,7 @@ async fn build_infra(
 
     // Node-to-node pull-through origin (#831, ADR 001/022). Constructed empty up
     // front so it can be appended to the cache's origin chain here; its
-    // dependencies (DHT, buyer channel, reputation handles) don't exist yet and
+    // dependencies (DHT, buyer pool, reputation handles) don't exist yet and
     // are injected via `provision` once bring-up completes (below). When the
     // feature is off it is never created and never enters the chain. The handle
     // is retained to provision later.
@@ -1277,7 +1277,7 @@ async fn build_chain_and_handlers(
         // so an outer deadline equal to the per-candidate timeout would cancel the
         // fetch the instant candidate #1 stalls, before the `MAX_PROVIDER_ATTEMPTS`
         // fallback loop ever reaches candidates #2..N (#859). `outer_pull_deadline`
-        // budgets all three of each candidate's sequential stages — channel open,
+        // budgets all three of each candidate's sequential stages — pool open,
         // stream open, and one silent-streaming window — plus one-time discovery
         // slack. Whether the pull can actually succeed additionally depends on the
         // `NodeOrigin` being provisioned; an unprovisioned origin just makes the

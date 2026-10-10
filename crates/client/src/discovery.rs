@@ -720,7 +720,7 @@ pub struct Probed {
 pub struct WarmingCandidate {
     /// The candidate proxy's iroh id.
     pub node_id: PublicKey,
-    /// Its Ethereum address — the `--provider-address` a warming channel opens
+    /// Its Ethereum address — the `--provider-address` a warming lane pays
     /// and the `slash_sig` is verified against.
     pub eth_address: Address,
     /// Measured round-trip time in milliseconds, from the **live `cdn/probe/v1`

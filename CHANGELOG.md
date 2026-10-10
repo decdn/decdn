@@ -28,6 +28,12 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Buyer metrics (#2405).** A lane-seed refusal now moves
+  `decdn_node_pull_pool_open_failures_total` once, beside
+  `decdn_buyer_lane_seed_failures_total`, so the open-failure total counts
+  every cause. An alert on the total also fires on seed refusals.
+  `decdn_voucher_nonce_gaps_total` is removed: vouchers carry no nonce, and
+  nothing emitted it.
 - **The `decdn` CLI ships as a container image, and the `decdn-node` image
   carries it too (#2398).** A release publishes two images, built as two stages of
   one `Dockerfile` from the same signed Linux archives:

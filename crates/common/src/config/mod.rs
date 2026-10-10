@@ -429,15 +429,15 @@ pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
 /// `StreamResponse`. Matches the integration-test budget; a slow upstream is abandoned
 /// for the next ranked candidate at this deadline.
 ///
-/// It does NOT cover the buyer-channel open, which precedes it on its own 5 s budget
+/// It does NOT cover the buyer pool open, which precedes it on its own 5 s budget
 /// (`CHANNEL_OPEN_CALLER_BUDGET`), nor the streaming that follows it, which is bounded by
 /// the throughput floor ([`DEFAULT_NODE_PULL_STALL_WINDOW_SEC`]). All three are sequential
 /// stages of ONE candidate attempt, and the node derives the overall pull-through deadline
-/// as `MAX_PROVIDER_ATTEMPTS × (channel open + this + window) + a fixed discovery allowance`,
+/// as `MAX_PROVIDER_ATTEMPTS × (pool open + this + window) + a fixed discovery allowance`,
 /// so the fallback loop can reach every ranked candidate before the serving path gives up
 /// (#859).
 ///
-/// Raising this to give a slow L2 more room does nothing: that is the channel open, on the
+/// Raising this to give a slow L2 more room does nothing: that is the pool open, on the
 /// budget named above.
 pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 /// Default THROUGHPUT-FLOOR window (seconds) on the streaming stage of an upstream pull
@@ -2680,7 +2680,7 @@ fn parse_hash_list(
 /// [`crate::address::parse_nonzero_address`] — that helper's zero-address hint
 /// ("set it to the deployed contract address") is wrong advice for a denylist of
 /// operator accounts (see the note on that fn). The zero address is still
-/// rejected — it can never own a payment channel, and accepting it would let a
+/// rejected — it can never own a payment pool, and accepting it would let a
 /// stray empty string sit in the denylist reading as a real entry — but with an
 /// operator-appropriate message.
 pub fn parse_denied_origins(

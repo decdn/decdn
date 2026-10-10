@@ -46,6 +46,19 @@ pub(crate) struct Checkpoint {
     pub(crate) key: CheckpointKey,
 }
 
+/// Where a [`CursorStart::FromCheckpoint`] watcher starts on a first-ever boot,
+/// when no cursor has ever been persisted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ColdStart {
+    /// Start at **head**: nothing predates this node, so there is no history
+    /// worth replaying. The settlement watcher — no `PoolRedeemed` toward this
+    /// node can predate the node itself. A pool opened before the head anchor
+    /// emits no `PoolOpened` the watcher sees; it reaches the projection through
+    /// the admit-path `getPool` read
+    /// ([`ResolvingPoolView`](crate::payment_settlement::ResolvingPoolView)).
+    Head,
+}
+
 /// How the **first** tick derives its scan floor, and whether the cursor is
 /// persisted forward.
 ///
@@ -54,16 +67,6 @@ pub(crate) struct Checkpoint {
 /// that resumes from a checkpoint cannot be configured without one, and a
 /// watcher that re-derives its floor from head cannot declare a margin or window
 /// it never reads.
-/// Where a [`CursorStart::FromCheckpoint`] watcher starts on a first-ever boot,
-/// when no cursor has ever been persisted.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ColdStart {
-    /// Start at **head**: nothing predates this node, so there is no history
-    /// worth replaying. The settlement watcher — no `PoolRedeemed` toward this
-    /// node can predate the node itself.
-    Head,
-}
-
 pub(crate) enum CursorStart {
     /// Start at an explicit block — a bootstrap snapshot block, already covered
     /// by an out-of-band enumeration. Bypasses floor derivation entirely and

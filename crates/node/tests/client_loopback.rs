@@ -2397,7 +2397,7 @@ async fn idle_fixture_with_two_blobs(
 }
 
 /// Wire an idle-close handler around a pre-populated cache without duplicating
-/// the loopback endpoint and payment-channel setup.
+/// the loopback endpoint and payment pool setup.
 async fn idle_fixture_with_cache(
     cache: CacheEngine,
     blobs: Vec<IdleBlob>,

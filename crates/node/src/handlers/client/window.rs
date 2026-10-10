@@ -226,7 +226,7 @@ impl ClientHandler {
         // (3) Learn the blob geometry. PEEK the in-flight fill registry first: if a
         // live pull for this hash already runs, it already knows `total_bytes` from
         // its own header handshake, so this miss can coalesce onto it and SKIP the
-        // expensive discovery + channel-open + header handshake (`open_pull_leg`)
+        // expensive discovery + pool-open + header handshake (`open_pull_leg`)
         // entirely. The peek is ADVISORY — the authoritative own-vs-attach decision
         // stays in the atomic `claim_fill` below. A concurrent last observer can
         // retire the peeked session between the peek and the claim, so `claim_fill`

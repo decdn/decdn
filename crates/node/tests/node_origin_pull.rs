@@ -3,12 +3,12 @@
 //! `node_to_node_pull_through.rs` composes the protocol halves by hand because
 //! the runtime orchestration did not exist. This binary drives the real
 //! orchestration: a [`NodeOrigin`], provisioned with discovery (origin
-//! directory), a `NodeId → address` resolver, a buyer-channel opener, and the
+//! directory), a `NodeId → address` resolver, a buyer pool opener, and the
 //! reputation handles, on a single `Origin::fetch` call:
 //!
 //! 1. discovers upstream A (DHT lookup is empty → origin-directory fallback),
 //! 2. probes A over `cdn/probe/v1` for rate/RTT and ranks it,
-//! 3. opens a buyer channel (stubbed — no chain) and pulls over `cdn/client/v1`,
+//! 3. opens a buyer pool (stubbed — no chain) and pulls over `cdn/client/v1`,
 //! 4. returns the hash-verified bytes AND records the delivery outcome into the
 //!    local score + the observation buffer (the outbound-report feed, ADR 008).
 //!
@@ -128,7 +128,7 @@ impl decdn_node::pool_view::PoolView for StubPoolView {
     }
 }
 
-/// A buyer-channel opener that stands in for the chain-backed
+/// A buyer pool opener that stands in for the chain-backed
 /// `BuyerPoolService`, so the test exercises the pull without a chain.
 ///
 /// It also models the #852 persistence loop: [`PoolOpener::record_progress`]
@@ -247,7 +247,7 @@ struct FailingRecordOpener {
 /// that a pending open is metered, scores no reputation, and falls through to the
 /// next candidate. Returning the real sentinel (rather than a bare string) is what
 /// makes it reach `record_pool_open_failure`'s pending arm and its counter
-/// instead of the generic channel-open-failure arm.
+/// instead of the generic pool-open-failure arm.
 ///
 /// The singleflight ITSELF — the caller's bound, and the open slot surviving a
 /// caller that walks away — is guarded where the mechanism lives:
@@ -257,7 +257,7 @@ struct FailingRecordOpener {
 /// `StubOpener` nor `FailingRecordOpener` models any of this.
 #[derive(Debug)]
 struct WedgedOpener {
-    /// Every provider whose channel open wedges. A set, not a single address, so a
+    /// Every provider whose pool open wedges. A set, not a single address, so a
     /// test can wedge enough candidates to prove the loop still reaches the LAST
     /// one `MAX_PROVIDER_ATTEMPTS` allows.
     wedged: HashSet<Address>,
@@ -495,7 +495,7 @@ fn spawn_a_probe_counting_server(
 }
 
 /// Build B's `NodeOrigin` with stubbed discovery (`providers` for `hash` via the
-/// origin directory), a static `addr_map` resolver, a fixed-channel opener, and
+/// origin directory), a static `addr_map` resolver, a fixed-pool opener, and
 /// real reputation/metrics handles. Tests vary `providers`/`addr_map` to drive
 /// the discovery / resolution / probe / pull branches.
 ///
@@ -961,7 +961,7 @@ async fn build_origin_with_discovery(
 /// same for all — the score reduces to `rate_per_mb` alone and the order is
 /// load-independent. Equal-rate candidates (the stallers) still tie, and the ranker's geo
 /// / RNG tie-break decides their MUTUAL order, but a distinctly pricier fallback lands in
-/// its own higher-score group and stays strictly last regardless. The real channel-open +
+/// its own higher-score group and stays strictly last regardless. The real pool-open +
 /// stream fallthrough these tests exercise is untouched — only probe+rank is bypassed.
 ///
 /// `ranked` lists `(provider, quoted rate)`. On a cache hit `cached_candidates` does NOT
@@ -2607,15 +2607,14 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     Ok(())
 }
 
-/// A wedged CHANNEL OPEN must not starve the candidate fallback loop (#1143).
+/// A wedged POOL OPEN must not starve the candidate fallback loop (#1143).
 ///
 /// This is the stage #1141/#1142 did *not* bound. Those fixed the stall once a
-/// candidate accepts a QUIC connection; `open_or_reuse_pool` runs BEFORE that,
-/// and was unbounded on both the buffered and window paths — so a candidate whose
-/// on-chain open wedges (an unresponsive RPC endpoint, an `openPool` tx that
-/// never mines) consumed the caller's entire outer deadline, candidates #2..N were
-/// never reached, and the serve path refused a blob the honest fallback held. The
-/// old `PULL_THROUGH_OUTER_SLACK` doc conceded exactly this.
+/// candidate accepts a QUIC connection; `open_or_reuse_pool` runs BEFORE that, on
+/// both the buffered and window paths. Unbounded, a candidate whose on-chain open
+/// wedges (an unresponsive RPC endpoint, an `openPool` tx that never mines)
+/// consumes the caller's entire outer deadline, candidates #2..N are never
+/// reached, and the serve path refuses a blob the honest fallback holds.
 ///
 /// The wedged provider here never even gets dialled, so no server is spawned for it
 /// — the hazard is entirely in the buyer's chain lane, which is also why it must
@@ -2684,7 +2683,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
     );
 
     // --- Nodes W1 and W2: quote a CHEAPER rate so they rank ahead of A, answer
-    //     probes honestly, and hold the blob — but their channel opens wedge. They
+    //     probes honestly, and hold the blob — but their pool opens wedge. They
     //     are perfectly good providers; our chain lane to them is what is broken.
     //
     //     TWO of them, not one, and that is the point: `MAX_PROVIDER_ATTEMPTS` is 3,
@@ -2754,7 +2753,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
         voucher_domain: voucher_dom(),
         attempted: Arc::clone(&attempted),
     }) as Arc<dyn PoolOpener>;
-    // Generous: this fixture wedges at the CHANNEL-OPEN stage, so the streaming
+    // Generous: this fixture wedges at the POOL-OPEN stage, so the streaming
     // inactivity bound must never be what ends a candidate here. It still has to be a
     // real value — it is a term of the outer deadline.
     let stall_budget = Duration::from_secs(20);
@@ -2837,7 +2836,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
     // Both wedged candidates took the PENDING arm of `record_pool_open_failure`,
-    // not the generic channel-open-failure arm. Both arms record no reputation, so
+    // not the generic pool-open-failure arm. Both arms record no reputation, so
     // without these two counters the assertions above would pass even if the typed
     // `PoolOpenPending` were never produced — the test would prove nothing about
     // the mechanism it exists for. The split also matters operationally: "pending"
@@ -5323,16 +5322,16 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
 }
 
 /// #1145 review — the deadline formula must budget the STALL stage, or a peer that goes
-/// silent mid-stream starves the fallback loop exactly as an unbudgeted channel open would.
+/// silent mid-stream starves the fallback loop exactly as an unbudgeted pool open would.
 ///
 /// This is the third time the same hole has been dug. A candidate costs three sequential
-/// stages — channel open, stream open, then streaming — and each time a stage was left out
+/// stages — pool open, stream open, then streaming — and each time a stage was left out
 /// of `outer_pull_deadline`, early candidates burned a budget the outer clock had not
 /// allowed for and the loop died before reaching the last one. #859 was the missing stream
-/// open; #1143 was the missing channel open; this is the missing stall window.
+/// open; #1143 was the missing pool open; this is the missing stall window.
 ///
 /// The existing starvation guard (`a_wedged_channel_open_does_not_starve_the_candidate_loop`)
-/// cannot catch it: its candidates wedge at the channel OPEN, so they never reach the
+/// cannot catch it: its candidates wedge at the pool OPEN, so they never reach the
 /// streaming stage whose budget is in question. Its candidates cost
 /// `CHANNEL_OPEN_CALLER_BUDGET` each; these cost `CHANNEL_OPEN + open + stall`.
 ///
@@ -6395,7 +6394,7 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
 }
 
 /// The #852 regression: a second cache-miss pull to the same provider **reuses**
-/// the buyer channel and resumes from the persisted voucher watermark, so it signs
+/// the buyer lane and resumes from the persisted voucher watermark, so it signs
 /// cumulative amounts that continue past the first pull's rather than restarting at
 /// zero, and the upstream accepts them.
 ///
@@ -7199,9 +7198,9 @@ async fn build_node_b(
     .await
 }
 
-/// Like [`build_node_b`] but registers an arbitrary set of leaf channels in B's
+/// Like [`build_node_b`] but registers an arbitrary set of leaf lanes in B's
 /// store, so a test can drive multiple concurrent leaf requests against the same
-/// node B (each leaf needs its own channel to avoid sharing voucher state). The
+/// node B (each leaf needs its own lane to avoid sharing voucher state). The
 /// single-leaf [`build_node_b`] is a thin wrapper over this.
 ///
 /// `engine_max_blob_mb` caps B's cache-engine store (`CacheEngine::open`'s
@@ -7626,7 +7625,7 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
         cache_b.has(hash).await?,
         "B must promote the teed blob on a complete delivery"
     );
-    // B's buyer channel to A advanced under the DECOUPLED window-paced cadence (#1621),
+    // B's buyer lane to A advanced under the DECOUPLED window-paced cadence (#1621),
     // which is not a single-open shape: the pull leg opens the blob in more than one
     // span, because the window pause at the frontier (proven above) forces a second
     // upstream open, each with its OWN voucher accounting starting fresh at that open
@@ -8249,7 +8248,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     let (a_id, a_addr, a_eth, ep_a, task_a, received, release) =
         spawn_gated_node_a(&payload).await?;
 
-    // Two distinct leaf channels so the two concurrent serves do not share voucher
+    // Two distinct leaf lanes so the two concurrent serves do not share voucher
     // state.
     let leaf1_eth = Arc::new(PrivateKeySigner::random());
     let leaf2_eth = Arc::new(PrivateKeySigner::random());
@@ -11148,10 +11147,10 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     });
 
     // The two misses race, exactly as two cache misses for different blobs do.
-    // Bound the join so a hung channel-open leaves a clear verdict instead of the
+    // Bound the join so a hung pool-open leaves a clear verdict instead of the
     // opaque nextest `slow-timeout` kill (#1826). The bound is a diagnostic, not a
     // performance assertion: it sits far enough above the honest cost of two
-    // channel opens under `cargo llvm-cov` contention that a slow-but-correct run
+    // pool opens under `cargo llvm-cov` contention that a slow-but-correct run
     // still passes, and far enough below this binary's `60s x 3` nextest cap that
     // the named verdict is what CI reports.
     let join_budget = Duration::from_mins(1);

@@ -1450,22 +1450,89 @@ async fn a_never_paid_lane_is_left_at_zero() {
 #[tokio::test]
 async fn an_unreadable_watermark_refuses_the_pull_as_a_local_fault() {
     let owner = Address::repeat_byte(1);
-    let signer = signer();
-    let state = BuyerPoolState::new(
-        PoolId::from([7u8; 32]),
-        DEPLOYMENT,
-        owner,
-        Address::repeat_byte(2),
-        U256::from(10_000_000u64),
-    );
+    let state = seedable_row(owner);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    store.record(&state).unwrap();
     // No queued response: the mocked transport errors the `getWatermark`.
-    let service = mocked_service(Vec::new(), store, Arc::clone(&signer), owner);
+    let service = mocked_service(Vec::new(), store, signer(), owner);
 
     let err = service
         .reseed_lane_from_chain(state, Address::repeat_byte(3))
         .await
         .expect_err("an unreadable watermark must refuse, not resume from zero");
+    assert_seed_refusal(&err, &service.metrics, "read the lane's on-chain watermark");
+}
+
+/// A row that vanishes while its lane waits to seed refuses the pull: seeding
+/// it would pay against a pool the store no longer records.
+#[tokio::test]
+async fn a_vanished_row_refuses_the_pull_as_a_local_fault() {
+    let owner = Address::repeat_byte(1);
+    let state = seedable_row(owner);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    let service = mocked_service(Vec::new(), store, signer(), owner);
+
+    let err = service
+        .reseed_lane_from_chain(state, Address::repeat_byte(3))
+        .await
+        .expect_err("a vanished row must refuse, not seed an untracked pool");
+    assert_seed_refusal(
+        &err,
+        &service.metrics,
+        "vanished before its lane could be seeded",
+    );
+}
+
+/// A seed the store cannot persist refuses the pull: an unpersisted seed
+/// leaves the lane to resume from zero on the next pull.
+#[tokio::test]
+async fn a_failed_seed_persist_refuses_the_pull_as_a_local_fault() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::repeat_byte(1);
+    let state = seedable_row(owner);
+    let inner = MemoryBuyerPoolStore::new();
+    inner.record(&state).unwrap();
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(WriteOnlyFault(inner));
+    let watermark = PaymentPool::Lane {
+        amount: 191_205,
+        bytesDelivered: 4_096,
+    };
+    let service = mocked_service(vec![watermark.abi_encode().into()], store, signer(), owner);
+
+    let err = service
+        .reseed_lane_from_chain(state, Address::repeat_byte(3))
+        .await
+        .expect_err("an unpersisted seed must refuse, not resume from zero");
+    assert_seed_refusal(
+        &err,
+        &service.metrics,
+        "persist the lane's on-chain watermark",
+    );
+}
+
+/// A pool row with no lane progress, so a reseed reaches the chain.
+fn seedable_row(owner: Address) -> BuyerPoolState {
+    BuyerPoolState::new(
+        PoolId::from([7u8; 32]),
+        DEPLOYMENT,
+        owner,
+        Address::repeat_byte(2),
+        U256::from(10_000_000u64),
+    )
+}
+
+/// Assert `err` is the seed leg named by `leg`, refused as this node's own
+/// fault and reported at the raising site.
+///
+/// `OpenReported` tells the classifier the failure is already metered, so the
+/// site must have moved the open-failure total once, beside the by-cause
+/// lane-seed counter.
+fn assert_seed_refusal(err: &anyhow::Error, metrics: &Metrics, leg: &str) {
+    assert!(
+        format!("{err:#}").contains(leg),
+        "expected the `{leg}` leg, got: {err:#}"
+    );
     assert!(
         err.downcast_ref::<LocalPullFault>().is_some(),
         "the refusal is this node's fault, not the upstream's"
@@ -1474,6 +1541,16 @@ async fn an_unreadable_watermark_refuses_the_pull_as_a_local_fault() {
         err.downcast_ref::<OpenReported>().is_some(),
         "the raising site reports it, so the classifier must not restate it"
     );
+    let text = metrics.encode().expect("encode metrics");
+    for name in [
+        "decdn_node_pull_pool_open_failures_total",
+        "decdn_buyer_lane_seed_failures_total",
+    ] {
+        assert!(
+            text.lines().any(|l| l == format!("{name} 1")),
+            "{name} must read 1 after one seed refusal"
+        );
+    }
 }
 
 /// A `BuyerPoolStore` whose every read and write faults, for the legs
@@ -1621,8 +1698,9 @@ async fn reconcile_counts_an_unreadable_store_and_adopts_nothing() {
     );
 }
 
-/// A store whose reads answer normally and whose `record` faults: the
-/// escrowed-but-unpersisted leg, which `MemoryBuyerPoolStore` cannot express.
+/// A store whose reads answer normally and whose `record` and `seed_progress`
+/// fault: the escrowed-but-unpersisted and unpersisted-seed legs, which
+/// `MemoryBuyerPoolStore` cannot express.
 #[derive(Debug)]
 struct WriteOnlyFault(MemoryBuyerPoolStore);
 impl BuyerPoolStore for WriteOnlyFault {
@@ -1676,13 +1754,13 @@ impl BuyerPoolStore for WriteOnlyFault {
     }
     fn seed_progress(
         &self,
-        owner: Address,
-        pool_id: PoolId,
-        lane: LaneKey,
-        bytes: U256,
-        amount: U256,
+        _owner: Address,
+        _pool_id: PoolId,
+        _lane: LaneKey,
+        _bytes: U256,
+        _amount: U256,
     ) -> std::result::Result<AdvanceOutcome, StoreError> {
-        self.0.seed_progress(owner, pool_id, lane, bytes, amount)
+        Err(StoreError::Backend("disk full".into()))
     }
     fn add_deposit(
         &self,

@@ -803,7 +803,7 @@ async fn run_sweep_worker(
         // than unwinding through this worker. The worker then takes its
         // normal release path, which consumes a queued request instead of
         // discarding it. Same join-and-branch pattern as the runtime,
-        // admin, and buyer-channel layers (`Cargo.toml`'s
+        // admin, and buyer pool layers (`Cargo.toml`'s
         // `panic = "unwind"` note).
         let mut walk = tokio::spawn({
             let cache = cache.clone();

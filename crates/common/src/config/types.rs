@@ -578,7 +578,7 @@ pub struct CacheConfig {
     pub stake_lane_reserved_holds: Option<u64>,
     /// Enable node-to-node paid cache-miss pull-through (#831, ADR 001/022).
     /// Absent / `false` (the default) → a cache miss serves `NotFound` as
-    /// before. When `true` *and* the buyer-channel service bootstrapped, a
+    /// before. When `true` *and* the buyer pool service bootstrapped, a
     /// miss triggers DHT provider discovery → probe → ranked paid pull from an
     /// upstream node, which populates the cache and is then served. OFF by
     /// default for the initial network: enabling it makes the node front USDC
@@ -602,13 +602,13 @@ pub struct CacheConfig {
     pub node_pull_probe_fanout: Option<usize>,
     /// Wall-clock timeout in seconds for the STREAM-OPEN stage of a single upstream pull
     /// on a node-to-node miss (#831) — connect, handshake, and the
-    /// signed `StreamResponse`. It does NOT bound the buyer-channel open, which precedes
+    /// signed `StreamResponse`. It does NOT bound the buyer pool open, which precedes
     /// it on its own 5 s budget. Absent =>
     /// [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`] (20). Bounds how long a
     /// miss blocks the serving path on one upstream before falling through to
     /// the next ranked candidate (or `NotFound`). This is the *per-upstream*
     /// budget; the overall pull-through deadline is derived as roughly
-    /// `MAX_PROVIDER_ATTEMPTS × (channel open + it + stall)` plus a fixed discovery
+    /// `MAX_PROVIDER_ATTEMPTS × (pool open + it + stall)` plus a fixed discovery
     /// allowance, so the fallback loop reaches every ranked candidate (#859).
     ///
     /// It does NOT bound the streaming stage (#1134) — that is

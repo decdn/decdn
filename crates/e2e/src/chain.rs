@@ -823,7 +823,7 @@ impl ChainFixture {
     /// the node's. `usdc` need only cover the buyer deposit
     /// (`blockchain.buyer_working_deposit_micro_usdc`, default 10 USDC) plus any
     /// recovery top-up back toward it; mint generously so a multi-interval pull
-    /// never starves the channel.
+    /// never starves the pool.
     pub async fn fund_node_as_buyer(
         &self,
         operator_addr: Address,

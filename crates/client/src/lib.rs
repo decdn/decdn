@@ -209,7 +209,7 @@ pub mod probe;
 /// off the QUIC stream beneath the message decode, and the `ThroughputFloor` that judges
 /// those bytes against a minimum rate over a trailing window.
 mod progress;
-/// Wallet-filled HTTP provider builder for opening/settling payment channels.
+/// Wallet-filled HTTP provider builder for opening/settling payment pools.
 pub mod provider;
 /// Client-side [`decdn_bao_range::RangedStore`] backend (#1621): a
 /// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
@@ -997,7 +997,7 @@ impl std::error::Error for PullTimeout {}
 /// (#857) — e.g. a stale nonce (#852), deposit exhaustion, or a wrong-channel
 /// mismatch. This is OUR payment-side fault, not the provider's, so the pull
 /// orchestrator `downcast_ref`s it to skip the candidate WITHOUT recording a
-/// reputation observation (mirroring the buyer channel-open-failure arm). Named
+/// reputation observation (mirroring the buyer pool-open-failure arm). Named
 /// with the `Upstream` prefix to disambiguate from the protocol-level
 /// `StreamError::VoucherRejected` reason enum, whose `reason` it carries verbatim
 /// (the `Copy` `VoucherRejectReason`, not a lossy stringification) so a future
@@ -1827,7 +1827,7 @@ where
 }
 
 /// Like `stream_fetch`, but issues vouchers through a caller-owned shared
-/// [`PoolLedger`] so multiple concurrent pulls on ONE payment channel coordinate.
+/// [`PoolLedger`] so multiple concurrent pulls on ONE payment pool coordinate.
 ///
 /// The bug this fixes: each `stream_fetch`/`stream_fetch_tracked` call seeds its
 /// own voucher state from `ctx.prior_*`, so N concurrent pulls on the same channel

@@ -346,7 +346,7 @@ mod sol_types {
             /// Atomically deletes the old `nodeId → address` mapping (bumping
             /// its `registrationNonce`) and writes the new one, so the operator
             /// is never un-slashable mid-rotation. The bond, `declaredMbps`,
-            /// `firstBondedAt`, and every open payment channel survive
+            /// `firstBondedAt`, and every open payment pool survive
             /// untouched — all of them key on the Ethereum address, which does
             /// not change.
             ///

@@ -577,7 +577,7 @@ impl NodeOrigin {
     /// ([`NodeOrigin::refuses_whole_blob`]), which stops longer loops.
     ///
     /// Shares the buffered [`decdn_cache::Origin::fetch`] path's cached-first discover → probe →
-    /// rank pipeline and its open-time candidate fallback, but stops at channel-open +
+    /// rank pipeline and its open-time candidate fallback, but stops at pool-open +
     /// header instead of pulling any bytes.
     ///
     /// # Errors
@@ -1461,7 +1461,7 @@ impl PeerRunSink<'_> {
             .await
         {
             Ok(ctx) => ctx,
-            // A channel-open failure is OUR payment-side problem, not the source's
+            // A pool-open failure is OUR payment-side problem, not the source's
             // fault. If it is a node-wide LOCAL fault (a broken buyer key, an
             // unreadable store), no other lane can fix it — terminal. Otherwise it
             // is per-provider (a revert, an RPC blip): drop this source and re-plan.
@@ -1739,7 +1739,7 @@ fn local_bookkeeping_ctx() -> PoolContext {
 /// counterparty, so every paid-path axis is absent — and each absence is load-bearing,
 /// not an omission:
 ///
-/// - **No discovery / channel open / [`PeerSource`] / [`super::funder::NodeFunder`].** The bytes
+/// - **No discovery / pool open / [`PeerSource`] / [`super::funder::NodeFunder`].** The bytes
 ///   are already reachable locally, so there is nothing to dial, no channel to open,
 ///   and nothing to pay. The source is handed in by the orchestration, already built.
 /// - **No provider scoring.** There is no provider: a fault here is OUR own

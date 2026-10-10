@@ -985,6 +985,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             .context("re-read the buyer pool before seeding a lane")?;
         row.ok_or_else(|| {
             self.metrics.buyer_lane_seed_failure();
+            self.metrics.node_pull_pool_open_failure();
             warn!(
                 %pool_id,
                 "the buyer pool row vanished while a lane waited to seed; refusing the pull"
@@ -999,6 +1000,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// the refusal [`Self::reseed_lane_from_chain`] returns for it.
     fn unread_watermark(&self, lane: LaneKey, shown: &str, err: anyhow::Error) -> anyhow::Error {
         self.metrics.buyer_lane_seed_failure();
+        self.metrics.node_pull_pool_open_failure();
         error!(
             pool_id = %lane.pool_id, provider_addr = %lane.provider, error = %shown,
             "could not read this lane's on-chain watermark; refusing the pull rather than \
@@ -1105,6 +1107,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             }
             Err(err) => {
                 self.metrics.buyer_lane_seed_failure();
+                self.metrics.node_pull_pool_open_failure();
                 error!(
                     pool_id = %lane.pool_id, provider_addr = %lane.provider,
                     error = %format_args!("{err:#}"),

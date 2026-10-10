@@ -186,7 +186,7 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
     pub keystore_password_file: Option<PathBuf>,
 
-    /// Data dir holding the persistent buyer-channel store (and the default
+    /// Data dir holding the persistent buyer pool store (and the default
     /// keystore). Overrides `identity.data_dir`; when unset defaults to the
     /// client-scoped `~/.decdn/client` (not the node-shaped `~/.decdn`).
     #[arg(long, value_name = "PATH")]
