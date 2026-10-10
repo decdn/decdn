@@ -1001,12 +1001,17 @@ since project inception and will roll into the first tagged release.
   failed, or its submit failed in transport, the open task freed the open
   slot and the next cache miss sent a second `openPool` while the first could
   still mine. The open task now keeps the slot until the chain resolves the
-  transaction: a receipt yields the pool, a spent nonce asks `getPools` and
-  adopts the pool that appeared, and a nonce no transaction holds lets the
-  next open go ahead on that same nonce. `openPool` is now sent with an
-  explicit pending nonce, and its unconfirmed error carries the hash and
-  nonce (`OpenUnconfirmed`). `decdn fetch` and `bundle pull` treat that
-  error as fatal to the command, as for an unconfirmed `topUp`.
+  transaction, and only a receipt or a spent nonce releases it: a receipt
+  yields the pool; a nonce spent at block `B` reads `getPools` at `B` and
+  adopts the owner's newest solvent pool, or concludes the open escrowed
+  nothing; a nonce no transaction holds gets a fresh `openPool` at that same
+  nonce, so at most one of them mines. While the slot is held, a miss that
+  needs a pool fails at once as a local fault, `decdn_buyer_pool_open_unresolved`
+  reads 1, and a warning repeats every minute with the elapsed time.
+  `openPool` is now sent with an explicit pending nonce, and its unconfirmed
+  error carries the hash and nonce (`OpenUnconfirmed`). `decdn fetch` and
+  `bundle pull` treat that error as fatal to the command, as for an
+  unconfirmed `topUp`.
 - **`decdn fetch` / `bundle pull` steal a slow leg's tail by pull-through
   (#2348).** A lane could steal only inside a range's covered suffix, so a
   range whose last block only one lane covered ran on that lane to the end,

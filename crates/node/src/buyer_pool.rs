@@ -31,12 +31,12 @@ use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::eips::BlockId;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
-use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
+use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools_at};
 use decdn_incentive::{
     AdvanceOutcome, BuyerPoolState, BuyerPoolStore, Deployment, LaneKey, PoolId,
     PoolOpenFailureReason,
@@ -49,7 +49,7 @@ use crate::metrics::Metrics;
 use decdn_client::buyer_pool::{
     LOW_WATER_DIVISOR, OpenUnconfirmed, OpenedPool, PoolNotOpen, ProgressWrite, ToppedUpPool,
     ensure_allowance, grade_deposit_credit, open_pool, opened_from_receipt, pool_accepts_funds,
-    refill_amount, self_owned_lane_ctx, top_up as pool_top_up, topped_up_effect,
+    refill_amount, self_owned_lane_ctx, send_open_pool, top_up as pool_top_up, topped_up_effect,
 };
 use decdn_client::{LocalPullFault, PoolContext, PoolReplaced, Recovery};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
@@ -65,9 +65,20 @@ const RECLAIM_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 const WATERMARK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the open task re-reads the chain for an `openPool` whose outcome
-/// it did not observe ([`settle_unconfirmed_open`]). Each read is at most four
-/// RPC calls, and the task holds the open slot until one of them answers.
+/// it did not see ([`settle_unconfirmed_open`]). A tick reads each known
+/// transaction's receipt, the block number, and one or two nonces. Once the
+/// nonce is spent, it also enumerates the owner's pools. The task holds the
+/// open slot until a tick resolves the open.
 const OPEN_RESOLVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the open task repeats its warning while it holds the open slot
+/// for an unconfirmed `openPool`.
+const OPEN_UNRESOLVED_WARN_INTERVAL: Duration = Duration::from_mins(1);
+
+/// The most `openPool` transactions at one nonce whose receipts the open task
+/// reads. A re-send past it forgets the oldest; a forgotten one that mines
+/// still resolves through its spent nonce and `getPools`.
+const MAX_OPEN_TXS: usize = 4;
 
 /// A lane's seed queue: the lock the streams seeding one lane take in turn, and
 /// the watermark read the first of them made, for the lane it read. The rest
@@ -103,7 +114,6 @@ impl Drop for SeedTurn<'_> {
     }
 }
 
-/// Expiry stamped on the self-owned capability the buyer signs for its own key.
 /// Typed sentinel: the caller's `open_or_reuse_pool` budget elapsed while the
 /// pool open is still in flight. The open **keeps going** in a detached task; the
 /// caller retries the next candidate and a later miss reuses the pool once it
@@ -632,8 +642,13 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     working_deposit: U256,
     /// The single in-flight `openPool`, if one is running (#1143). A concurrent
     /// [`Self::open_or_reuse_pool`] that arrives mid-open JOINS it rather than
-    /// escrowing a second deposit. `None` when no open is running.
+    /// escrowing a second deposit. `None` when no open is running. The open
+    /// counts as running until its outcome is known, including while
+    /// [`settle_unconfirmed_open`] waits on an unconfirmed `openPool` (#2415).
     open_in_flight: Arc<Mutex<Option<SharedOpen>>>,
+    /// Whether the running open waits on an unconfirmed `openPool`, so callers
+    /// fail fast instead of joining it.
+    open_hold: OpenHold,
     /// The single in-flight funding `topUp`, if one is running (#1146/#1530). Both
     /// the proactive low-water refill and the funding recovery top-up dedup here,
     /// so the two legs racing on the one pool cannot double-escrow one shortfall. The
@@ -698,15 +713,23 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         let load = store.load_all().context("hydrate persisted buyer pools")?;
         metrics.buyer_pool_store_skipped_undecodable_records(load.skipped.len());
 
-        let adopted =
-            reconcile_owned_pool(&contract, deployment, &store, owner, token, &metrics).await;
+        let reconciled = reconcile_with_chain(
+            &contract,
+            deployment,
+            &store,
+            owner,
+            token,
+            ReconcileRun::Bootstrap,
+            &metrics,
+        )
+        .await;
         info!(
             %payment_pool_addr,
             chain_id = deployment.chain_id,
             %token,
             %owner,
             tracked = load.pools.len(),
-            adopted,
+            ?reconciled,
             "BuyerPoolService bootstrap complete"
         );
 
@@ -730,6 +753,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             owner,
             working_deposit,
             open_in_flight: Arc::new(Mutex::new(None)),
+            open_hold: OpenHold::new(),
             topup_in_flight: Arc::new(Mutex::new(None)),
             seed_slots: Mutex::new(HashMap::new()),
             metrics,
@@ -795,12 +819,23 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// escrow a deposit against a pool nobody tracks, so the open is never
     /// cancelled, only stopped-waiting-on. The next miss reuses it once it lands.
     ///
+    /// # Unconfirmed opens (#2415)
+    ///
+    /// An `openPool` whose submit or receipt failed may still mine, so the open
+    /// task holds the slot until the chain resolves it. That can take as long
+    /// as the chain takes, and no pool opens meanwhile, so a caller that finds
+    /// the slot held, or sees it become held while it waits, fails at once
+    /// instead of waiting out `budget`.
+    ///
     /// # Errors
     ///
     /// [`PoolOpenPending`] when `budget` expires with the open still running.
-    /// Otherwise: store errors, any failure of the `openPool` transaction (submit,
-    /// revert, or receipt — carrying a [`decdn_incentive::PoolOpenFailureReason`]
-    /// the caller can `downcast_ref`), or a capability-signing fault.
+    /// A node-wide [`LocalPullFault`] while the open slot is held for an
+    /// unconfirmed `openPool`. Otherwise: store errors, any failure of the
+    /// `openPool` transaction (submit or revert — carrying a
+    /// [`decdn_incentive::PoolOpenFailureReason`] the caller can `downcast_ref`
+    /// — or, for an unconfirmed one, the chain's answer that it escrowed
+    /// nothing), or a capability-signing fault.
     pub async fn open_or_reuse_pool(
         &self,
         provider_addr: Address,
@@ -817,15 +852,23 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         }
 
         let open = self.join_or_spawn_open(None);
+        let joined = async {
+            tokio::select! {
+                biased;
+                outcome = open => Some(outcome),
+                () = self.open_hold.wait_held() => None,
+            }
+        };
 
-        match tokio::time::timeout(budget, open).await {
+        match tokio::time::timeout(budget, joined).await {
             // Still running. The task owns the tx; hand the caller a typed "not
             // yet" so it can move to the next candidate.
             Err(_) => Err(anyhow::Error::new(PoolOpenPending { waited: budget })),
-            Ok(Err(err)) => Err(rehydrate_open_error(&err)),
+            Ok(None) => Err(self.held_open_error()),
+            Ok(Some(Err(err))) => Err(rehydrate_open_error(&err)),
             // The task persisted the pool before it signalled, so re-reading the
             // store is how we collect the result — the same read a later reuse does.
-            Ok(Ok(())) => {
+            Ok(Some(Ok(()))) => {
                 let state = self.reuse_or_report()?.ok_or_else(|| {
                     self.metrics.node_pull_pool_open_failure();
                     error!(
@@ -1247,6 +1290,19 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         (shared, TopUpClaim::Spawned)
     }
 
+    /// The error a caller gets while the open slot is held for an unconfirmed
+    /// `openPool`: no provider can be paid from a new pool until the chain
+    /// resolves it, so it is node-wide ([`LocalPullFault`]). Metered and marked
+    /// [`OpenReported`] here; the open task's own warning says what it waits on,
+    /// so this logs at `debug`.
+    fn held_open_error(&self) -> anyhow::Error {
+        self.metrics.node_pull_pool_open_failure();
+        debug!("the buyer pool open is held for an unconfirmed openPool; refusing at once");
+        anyhow::Error::new(OpenHeld)
+            .context(OpenReported)
+            .context(LocalPullFault)
+    }
+
     /// Join the in-flight `openPool`, or spawn one. The one pool the node owns is
     /// opened at most once; concurrent misses join the single running open.
     /// `replacing` names a tracked pool that no longer accepts funds: the open
@@ -1266,23 +1322,24 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
 
         let contract = self.contract.clone();
         let store = Arc::clone(&self.store);
-        let signer = Arc::clone(&self.signer);
-        let deployment = self.deployment;
-        let token = self.token;
-        let owner = self.owner;
-        // The shared pool is fully withdrawable, so open at the working deposit.
-        let deposit = self.working_deposit;
+        let open = OpenRequest {
+            signer: Arc::clone(&self.signer),
+            deployment: self.deployment,
+            token: self.token,
+            owner: self.owner,
+            // The shared pool is fully withdrawable, so open at the working deposit.
+            deposit: self.working_deposit,
+        };
+        let hold = self.open_hold.clone();
         let metrics = Arc::clone(&self.metrics);
         let guard = SlotGuard {
             slot: Arc::clone(&self.open_in_flight),
         };
         let task = tokio::spawn(async move {
             let _guard = guard;
-            run_open(
-                &contract, &store, signer, deployment, token, owner, deposit, replacing, &metrics,
-            )
-            .await
-            .map_err(Arc::new)
+            run_open(&contract, &store, open, replacing, &hold, &metrics)
+                .await
+                .map_err(Arc::new)
         });
         let join_metrics = Arc::clone(&self.metrics);
         let fut: BoxFuture<'static, OpenOutcome> = Box::pin(async move {
@@ -1527,11 +1584,16 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     ///
     /// # Errors
     ///
-    /// The open fails, or the store still tracks `closed` after it.
+    /// The open fails, the open slot is held for an unconfirmed `openPool`
+    /// ([`Self::held_open_error`]), or the store still tracks `closed` after it.
     async fn open_replacement(&self, closed: PoolId) -> Result<PoolId> {
-        self.join_or_spawn_open(Some(closed))
-            .await
-            .map_err(|err| rehydrate_open_error(&err))?;
+        tokio::select! {
+            biased;
+            outcome = self.join_or_spawn_open(Some(closed)) => {
+                outcome.map_err(|err| rehydrate_open_error(&err))?;
+            }
+            () = self.open_hold.wait_held() => return Err(self.held_open_error()),
+        }
         let state = self
             .reuse_or_report()?
             .with_context(|| "the replacement buyer pool is not in the store")?;
@@ -1687,35 +1749,74 @@ impl<P: Provider + Clone + 'static> PoolOpener for BuyerPoolService<P> {
     }
 }
 
-/// [`reconcile_with_chain`] reduced to whether a pool was adopted, which is all
-/// bootstrap needs: every other answer leaves the first miss to the lazy open.
-async fn reconcile_owned_pool<P: Provider + Clone>(
-    contract: &PaymentPool::PaymentPoolInstance<P>,
-    deployment: Deployment,
-    store: &Arc<dyn BuyerPoolStore>,
-    owner: Address,
-    token: Address,
-    metrics: &Arc<Metrics>,
-) -> bool {
-    reconcile_with_chain(contract, deployment, store, owner, token, metrics).await
-        == Reconciled::Adopted
+/// Log at `warn` on a bootstrap reconciliation and at `debug` inside the open
+/// task's settle loop, which retries every tick and reports the wait itself.
+macro_rules! warn_at_bootstrap {
+    ($run:expr, $($arg:tt)+) => {
+        if $run.is_bootstrap() {
+            warn!($($arg)+);
+        } else {
+            debug!($($arg)+);
+        }
+    };
+}
+
+/// Where a reconciliation runs. It decides the block the chain is read at and
+/// how a failure is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileRun {
+    /// Bootstrap, once per process, at the latest block. A failure leaves the
+    /// first miss to the lazy open, so it meters
+    /// `decdn_buyer_pool_adoption_failures_total` and warns.
+    Bootstrap,
+    /// The open task, for an unconfirmed `openPool` whose nonce the chain shows
+    /// spent at `block` ([`settle_unconfirmed_open`]). Every pool read is
+    /// pinned to `block`. A failure retries on the next tick and opens nothing,
+    /// so it meters nothing and logs at `debug`; the open task's own warning
+    /// reports the wait.
+    Settle {
+        /// The block at which the open's nonce reads as spent.
+        block: u64,
+    },
+}
+
+impl ReconcileRun {
+    /// The block every pool read of this run uses.
+    const fn at(self) -> BlockId {
+        match self {
+            Self::Bootstrap => BlockId::latest(),
+            Self::Settle { block } => BlockId::number(block),
+        }
+    }
+
+    /// Whether this is the bootstrap run.
+    const fn is_bootstrap(self) -> bool {
+        matches!(self, Self::Bootstrap)
+    }
 }
 
 /// What [`reconcile_with_chain`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reconciled {
-    /// A pool was adopted and its row recorded.
-    Adopted,
-    /// The chain and the store both answered, and no pool was adopted: the
-    /// store keeps the pool it tracks, or this owner holds no solvent open pool.
-    NotAdopted,
-    /// The store or the chain could not answer, or the adopted row could not be
-    /// recorded. A pool may exist that this pass did not see or keep.
+    /// The owner's newest solvent open pool was adopted and its row recorded.
+    Adopted(PoolId),
+    /// The store's tracked pool reads `Open`, so it stays in use and nothing
+    /// is adopted. This says nothing about any other pool the owner holds.
+    KeptTracked,
+    /// Both the store and the chain answered: no tracked pool is open, and the
+    /// owner holds no solvent open pool to adopt.
+    NoneHeld,
+    /// The store or the chain could not answer. A pool may exist that this
+    /// pass did not see.
     Unknown,
+    /// A pool to adopt exists, but its row could not be recorded. Its deposit
+    /// is escrowed and this node does not track it.
+    Unrecorded(PoolId),
 }
 
-/// Adopt the pool this `owner` already holds on-chain when the local store has
-/// no row for it.
+/// Adopt the pool this `owner` already holds on-chain when the local store
+/// tracks no open pool on this deployment, after dropping a tracked row that
+/// belongs to another deployment or reads as no longer open.
 ///
 /// The buyer store is the node's only record that it owns a pool, and ADR 003
 /// §`node→node` is unambiguous about what that record is for: "A pool is opened
@@ -1727,7 +1828,8 @@ enum Reconciled {
 /// with its own escrow sitting idle on-chain (#2072).
 ///
 /// `getPools` is the chain's answer to the question the store could not, so ask
-/// it before opening anything. The newest `Open` pool wins: pools are
+/// it before opening anything, and after an open whose outcome was not seen.
+/// The newest solvent `Open` pool wins: pools are
 /// enumerated oldest-first and a later one is the one a previous adoption cycle
 /// would have been using.
 ///
@@ -1739,20 +1841,22 @@ enum Reconciled {
 /// permanently silent.
 ///
 /// Adopting is deliberately softer than the rest of bootstrap. A failure here
-/// leaves the store untouched and returns [`Reconciled::Unknown`], which
-/// bootstrap reads as "nothing adopted", so the first miss falls
-/// through to the ordinary lazy open — an RPC blip while enumerating must not
-/// disable buying for the life of the process the way a failed approval does.
+/// adopts nothing and returns [`Reconciled::Unknown`] (a stale or foreign row
+/// it already dropped stays dropped), so the first miss falls through to the
+/// ordinary lazy open — an RPC blip while enumerating must not disable buying
+/// for the life of the process the way a failed approval does.
 ///
-/// The open task runs this too, when an `openPool` whose receipt it never read
-/// has spent its nonce ([`settle_unconfirmed_open`]). There the three answers
-/// matter: only [`Reconciled::NotAdopted`] says that no pool appeared.
+/// The open task runs this too, when an `openPool` whose outcome it did not
+/// see has spent its nonce ([`settle_unconfirmed_open`]). `run` pins every pool
+/// read to the block where the nonce reads as spent, so "no pool appeared"
+/// ([`Reconciled::NoneHeld`]) is an answer about the same chain state.
 async fn reconcile_with_chain<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     deployment: Deployment,
     store: &Arc<dyn BuyerPoolStore>,
     owner: Address,
     token: Address,
+    run: ReconcileRun,
     metrics: &Arc<Metrics>,
 ) -> Reconciled {
     // Resolve every verdict here, at the one point that can act on each, so the
@@ -1764,9 +1868,11 @@ async fn reconcile_with_chain<P: Provider + Clone>(
     // `Foreign` is matched ahead of `AlreadyTracked` by the guard on the arm,
     // not by position; swapping them would compile and silently restore the
     // collision.
-    let tracked: Option<PoolId> = match adoption_applies(store, owner, deployment) {
+    let tracked: Option<PoolId> = match adoption_applies(store, owner, deployment, run) {
         AdoptionCheck::Unknown => {
-            metrics.buyer_pool_adoption_failure();
+            if run.is_bootstrap() {
+                metrics.buyer_pool_adoption_failure();
+            }
             return Reconciled::Unknown;
         }
         AdoptionCheck::Applies => None,
@@ -1779,14 +1885,14 @@ async fn reconcile_with_chain<P: Provider + Clone>(
         AdoptionCheck::AlreadyTracked(pool_id) => Some(pool_id),
     };
 
-    let Some(pools) = enumerate_open_pools(contract, owner, tracked.is_none(), metrics).await
+    let Some(pools) = enumerate_open_pools(contract, owner, tracked.is_none(), run, metrics).await
     else {
         return Reconciled::Unknown;
     };
 
     let candidate = match tracked {
-        Some(pool_id) => match reconcile_tracked(&pools, store, owner, pool_id) {
-            TrackedOutcome::Keep => return Reconciled::NotAdopted,
+        Some(pool_id) => match reconcile_tracked(&pools, store, owner, pool_id, run) {
+            TrackedOutcome::Keep => return Reconciled::KeptTracked,
             TrackedOutcome::Undecided => return Reconciled::Unknown,
             TrackedOutcome::Replace(candidate) => candidate,
         },
@@ -1796,7 +1902,7 @@ async fn reconcile_with_chain<P: Provider + Clone>(
     let Some((pool_id, pool)) = candidate else {
         // A pool whose read faulted may be the one an adoption would take.
         return if pools.unreadable.is_empty() {
-            Reconciled::NotAdopted
+            Reconciled::NoneHeld
         } else {
             Reconciled::Unknown
         };
@@ -1812,13 +1918,15 @@ async fn reconcile_with_chain<P: Provider + Clone>(
         U256::from(pool.totalRedeemed),
     );
     if let Err(err) = store.record(&state) {
-        metrics.buyer_pool_adoption_failure();
+        if run.is_bootstrap() {
+            metrics.buyer_pool_adoption_failure();
+        }
         warn!(
             %pool_id,
             error = %format_args!("{err:#}"),
             "could not persist the adopted pool; this node does not track it"
         );
-        return Reconciled::Unknown;
+        return Reconciled::Unrecorded(pool_id);
     }
     report_stranded_pools(&pools.recoverable_beside(pool_id), pools.unreadable.len());
     info!(
@@ -1827,7 +1935,7 @@ async fn reconcile_with_chain<P: Provider + Clone>(
         remaining = pool.deposit.saturating_sub(pool.totalRedeemed),
         "adopted this node's existing on-chain payment pool; not opening a second one"
     );
-    Reconciled::Adopted
+    Reconciled::Adopted(pool_id)
 }
 
 /// Every pool this `owner` holds on chain with its state, or `None` when the
@@ -1838,22 +1946,30 @@ async fn reconcile_with_chain<P: Provider + Clone>(
 /// deposit the store does not track sits unnoticed: nothing else ever asks the
 /// chain what this owner holds, so nothing ever names it (#2078).
 ///
-/// `adopting` decides how a failure is reported, and the distinction matters:
-/// `decdn_buyer_pool_adoption_failures_total` means "could not tell whether it
-/// already owned a pool and is about to open a second one", which is what the
-/// runbook reads it as. A sweep that could not run beside an already-tracked
-/// pool was never going to adopt anything, so it warns instead of counting.
+/// `adopting` decides how a bootstrap failure is reported, and the distinction
+/// matters: `decdn_buyer_pool_adoption_failures_total` means "could not tell
+/// whether it already owned a pool and is about to open a second one", which is
+/// what the runbook reads it as. A sweep that could not run beside an
+/// already-tracked pool was never going to adopt anything, so it warns instead
+/// of counting. A settle run opens nothing on a failure, so it never counts.
+// Each `warn_at_bootstrap!` arm expands to two tracing calls, which is all the
+// complexity the lint counts here.
+#[allow(clippy::cognitive_complexity)]
 async fn enumerate_open_pools<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
     adopting: bool,
+    run: ReconcileRun,
     metrics: &Arc<Metrics>,
 ) -> Option<OwnedPools> {
-    let ids = match enumerate_owned_pools(contract, owner).await {
+    let ids = match enumerate_owned_pools_at(contract, owner, run.at()).await {
         Ok(ids) => ids,
         Err(err) if adopting => {
-            metrics.buyer_pool_adoption_failure();
-            warn!(
+            if run.is_bootstrap() {
+                metrics.buyer_pool_adoption_failure();
+            }
+            warn_at_bootstrap!(
+                run,
                 error = %sanitize_err_chain(&err),
                 "could not enumerate this node's on-chain pools; a pool it already owns \
                  stays unadopted and the next miss opens a fresh one"
@@ -1861,22 +1977,23 @@ async fn enumerate_open_pools<P: Provider + Clone>(
             return None;
         }
         Err(err) => {
-            warn!(
+            warn_at_bootstrap!(
+                run,
                 error = %sanitize_err_chain(&err),
                 "could not enumerate this node's on-chain pools; a deposit stranded beside \
-                 the pool it is using would go unreported this boot"
+                 the pool it is using would go unreported this pass"
             );
             return None;
         }
     };
-    Some(OwnedPools::walk(contract, ids).await)
+    Some(OwnedPools::walk(contract, ids, run).await)
 }
 
 /// What reconciliation should do about the pool the store already tracks.
 enum TrackedOutcome {
-    /// Keep the row and adopt nothing this boot: the chain lists it as open.
+    /// Keep the row and adopt nothing this pass: the chain lists it as open.
     Keep,
-    /// Keep the row and adopt nothing this boot, without knowing whether the
+    /// Keep the row and adopt nothing this pass, without knowing whether the
     /// pool is still open: its read faulted, or its stale row would not drop.
     Undecided,
     /// The row is gone; adopt this candidate, if any.
@@ -1895,6 +2012,7 @@ fn reconcile_tracked(
     store: &Arc<dyn BuyerPoolStore>,
     owner: Address,
     pool_id: PoolId,
+    run: ReconcileRun,
 ) -> TrackedOutcome {
     match pools.tracked_status(pool_id) {
         // In use. Everything else this owner holds open is stranded, including
@@ -1904,11 +2022,12 @@ fn reconcile_tracked(
             TrackedOutcome::Keep
         }
         TrackedStatus::Unknown => {
-            warn!(
+            warn_at_bootstrap!(
+                run,
                 %pool_id,
                 "could not read the tracked buyer pool's on-chain status; keeping the row. A \
                  pool this node owns must not be dropped because one read failed — the next \
-                 bootstrap asks again"
+                 reconciliation asks again"
             );
             TrackedOutcome::Undecided
         }
@@ -2062,6 +2181,7 @@ fn adoption_applies(
     store: &Arc<dyn BuyerPoolStore>,
     owner: Address,
     deployment: Deployment,
+    run: ReconcileRun,
 ) -> AdoptionCheck {
     match store.get_by_owner(owner) {
         Ok(None) => AdoptionCheck::Applies,
@@ -2071,7 +2191,8 @@ fn adoption_applies(
         },
         Ok(Some(state)) => AdoptionCheck::AlreadyTracked(state.pool_id),
         Err(err) => {
-            warn!(
+            warn_at_bootstrap!(
+                run,
                 error = %format_args!("{err:#}"),
                 "buyer pool store read failed before on-chain reconciliation; \
                  skipping adoption and leaving the open path to report it"
@@ -2082,7 +2203,7 @@ fn adoption_applies(
 }
 
 /// Name the open pools this node holds and is not using, so their deposits are
-/// recoverable. `unreadable` is how many pools could not be read this boot;
+/// recoverable. `unreadable` is how many pools could not be read this pass;
 /// a non-zero count means the list below may be short.
 ///
 /// Nothing else reports which ids they are: adoption takes one pool and the rest
@@ -2096,7 +2217,7 @@ fn report_stranded_pools(stranded: &[PoolId], unreadable: usize) {
         if unreadable > 0 {
             warn!(
                 unreadable,
-                "could not read every pool this node owns, so this boot cannot say whether it \
+                "could not read every pool this node owns, so this pass cannot say whether it \
                  holds a stranded deposit; the absence of a stranded-pool warning is not \
                  evidence there is none"
             );
@@ -2149,21 +2270,24 @@ impl OwnedPools {
     /// been using, and the earlier ones are what the cycle stranded. A pool
     /// whose state cannot be read is recorded as unreadable rather than
     /// failing the walk — one unreadable pool must not hide a live one behind
-    /// it, and must not be mistaken for a closed one either.
+    /// it, and must not be mistaken for a closed one either. Every read uses
+    /// `run`'s block.
     async fn walk<P: Provider + Clone>(
         contract: &PaymentPool::PaymentPoolInstance<P>,
         ids: Vec<PoolId>,
+        run: ReconcileRun,
     ) -> Self {
         let mut read = Vec::new();
         let mut unreadable = Vec::new();
         for pool_id in ids.into_iter().rev() {
-            match contract.getPool(pool_id).call().await {
+            match contract.getPool(pool_id).call().block(run.at()).await {
                 Ok(pool) => read.push((pool_id, pool)),
                 Err(err) => {
-                    warn!(
+                    warn_at_bootstrap!(
+                        run,
                         %pool_id,
                         error = %sanitize_error_sources(&err),
-                        "could not read an owned pool's state; this boot cannot say whether it \
+                        "could not read an owned pool's state; this pass cannot say whether it \
                          is open, so it is neither adopted nor reported as stranded"
                     );
                     unreadable.push(pool_id);
@@ -2238,21 +2362,17 @@ impl OwnedPools {
 /// count as that landed pool. Detached, so every failure leg reports for itself:
 /// by the time it fails there may be nobody waiting to observe the `Err`.
 ///
-/// An `openPool` whose outcome the task did not observe ([`OpenUnconfirmed`])
-/// keeps the task, and so the open slot, until the chain resolves it
+/// An `openPool` whose outcome the task did not see ([`OpenUnconfirmed`]) keeps
+/// the task, and so the open slot, until the chain resolves it
 /// ([`settle_unconfirmed_open`]). Releasing the slot earlier lets the next miss
 /// escrow a second deposit beside one that may still mine (#2415).
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::cognitive_complexity)]
 async fn run_open<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn BuyerPoolStore>,
-    signer: Arc<PrivateKeySigner>,
-    deployment: Deployment,
-    token: Address,
-    owner: Address,
-    deposit: U256,
+    open: OpenRequest,
     replacing: Option<PoolId>,
+    hold: &OpenHold,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     // Re-check under the slot: a previous open for this owner may have persisted
@@ -2260,8 +2380,8 @@ async fn run_open<P: Provider + Clone>(
     // this deployment counts: a foreign row that bootstrap could not drop is
     // invisible to the fast path too, so treating it as live would skip the open
     // on every pull.
-    match store.get_by_owner(owner) {
-        Ok(Some(state)) if state.is_on(deployment) && Some(state.pool_id) != replacing => {
+    match store.get_by_owner(open.owner) {
+        Ok(Some(state)) if state.is_on(open.deployment) && Some(state.pool_id) != replacing => {
             debug!("a live buyer pool appeared while claiming the open slot; not opening a second");
             return Ok(());
         }
@@ -2296,35 +2416,28 @@ async fn run_open<P: Provider + Clone>(
     // `ContractRevert` stays unmarked: it is deterministic on-chain state (a paused
     // contract, a future revert reason), it is metered by reason, and it does not say
     // this node is unable to pay — another candidate may still deliver.
-    let opened = match open_pool(
+    let landed = match open_pool(
         contract,
-        Arc::clone(&signer),
-        deployment,
-        token,
-        owner,
-        deposit,
+        Arc::clone(&open.signer),
+        open.deployment,
+        open.token,
+        open.owner,
+        open.deposit,
     )
     .await
     {
-        Ok(opened) => Ok(Some(opened)),
+        Ok(opened) => Ok(Landed::Opened(Box::new(opened))),
         Err(err) => match err.downcast_ref::<OpenUnconfirmed>().copied() {
             Some(unconfirmed) => {
-                let open = OpenRequest {
-                    signer,
-                    deployment,
-                    token,
-                    owner,
-                    deposit,
-                };
-                settle_unconfirmed_open(contract, store, &open, unconfirmed, err, metrics).await
+                settle_unconfirmed_open(contract, store, &open, unconfirmed, err, hold, metrics)
+                    .await
             }
             None => Err(err),
         },
     };
-    let opened = match opened {
-        Ok(Some(opened)) => opened,
-        // The open mined and reconciliation adopted it; it logged the adoption.
-        Ok(None) => return Ok(()),
+    let opened = match landed {
+        Ok(Landed::Opened(opened)) => opened,
+        Ok(Landed::Adopted) => return Ok(()),
         Err(err) => {
             error!(error = %sanitize_err_chain(&err), "buyer pool open failed");
             metrics.node_pull_pool_open_failure();
@@ -2362,12 +2475,12 @@ async fn run_open<P: Provider + Clone>(
             .context(OpenReported)
             .context(LocalPullFault);
     }
-    info!(pool_id = %opened.state.pool_id, %deposit, "opened buyer payment pool");
+    info!(pool_id = %opened.state.pool_id, deposit = %open.deposit, "opened buyer payment pool");
     Ok(())
 }
 
-/// The `openPool` an open task sent: what [`opened_from_receipt`] needs to
-/// rebuild its result from a receipt read later.
+/// The `openPool` an open task sends: what [`open_pool`] sends, and what
+/// [`opened_from_receipt`] needs to rebuild its result from a receipt read later.
 struct OpenRequest {
     signer: Arc<PrivateKeySigner>,
     deployment: Deployment,
@@ -2376,121 +2489,356 @@ struct OpenRequest {
     deposit: U256,
 }
 
-/// What the chain says about an `openPool` whose outcome the open task did not
-/// observe.
+/// What an open task's `openPool` produced, split by who records the row.
+#[derive(Debug)]
+enum Landed {
+    /// A pool for [`run_open`] to record: a fresh open, or an unconfirmed one
+    /// whose receipt arrived later.
+    Opened(Box<OpenedPool>),
+    /// Reconciliation adopted the owner's newest solvent pool and recorded its
+    /// row. It is this open's pool if the open escrowed.
+    Adopted,
+}
+
+/// Whether the open task holds the open slot for an `openPool` whose outcome
+/// it has not seen ([`settle_unconfirmed_open`]).
+///
+/// That wait can last as long as the chain takes to resolve the open, and no
+/// pool opens meanwhile, so a caller that finds the slot held fails at once as
+/// this node's own fault ([`BuyerPoolService::held_open_error`]) instead of
+/// waiting out its budget on every candidate.
+#[derive(Clone)]
+struct OpenHold {
+    held: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl OpenHold {
+    /// A hold that is not held.
+    fn new() -> Self {
+        Self {
+            held: Arc::new(tokio::sync::watch::channel(false).0),
+        }
+    }
+
+    /// Mark the slot held until the returned guard drops, and publish it on
+    /// `decdn_buyer_pool_open_unresolved`.
+    fn hold(&self, metrics: &Arc<Metrics>) -> HeldGuard {
+        self.held.send_replace(true);
+        metrics.set_buyer_pool_open_unresolved(true);
+        HeldGuard {
+            held: Arc::clone(&self.held),
+            metrics: Arc::clone(metrics),
+        }
+    }
+
+    /// Resolve once the slot is held, at once if it is held now.
+    async fn wait_held(&self) {
+        let mut held = self.held.subscribe();
+        if held.wait_for(|held| *held).await.is_err() {
+            // `self` keeps the sender alive, so this is unreachable; never
+            // resolving is the answer that cannot fail a caller by mistake.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Clears an [`OpenHold`] when the settle loop ends on any path, including an
+/// abort of the open task.
+struct HeldGuard {
+    held: Arc<tokio::sync::watch::Sender<bool>>,
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for HeldGuard {
+    fn drop(&mut self) {
+        self.held.send_replace(false);
+        self.metrics.set_buyer_pool_open_unresolved(false);
+    }
+}
+
+/// Typed marker: the open slot is held for an `openPool` whose outcome the
+/// chain has not resolved, so this node opens no pool until it does.
+#[derive(Debug)]
+struct OpenHeld;
+
+impl std::fmt::Display for OpenHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the buyer pool open is held for an unconfirmed openPool; this node opens no pool \
+             until the chain resolves it",
+        )
+    }
+}
+
+impl std::error::Error for OpenHeld {}
+
+/// What one chain read says about an `openPool` whose outcome the open task
+/// did not see.
 #[derive(Debug)]
 enum OpenResolution {
-    /// The transaction mined; this is its receipt, which may record a revert.
+    /// A transaction sent at the open's nonce mined; this is its receipt, which
+    /// may record a revert.
     Mined(Box<alloy::rpc::types::TransactionReceipt>),
-    /// The account's confirmed nonce has passed the open's nonce, and no receipt
-    /// is in hand. The open has mined or never will, so `getPools` answers
-    /// whether it escrowed.
-    NonceSpent,
-    /// No transaction holds the open's nonce: the open is not in flight. The
-    /// next open reads the same pending nonce, so the two cannot both mine.
+    /// The account's nonce at `block` has passed the open's, and no receipt is
+    /// in hand. The open has mined or never will, so `getPools` at `block`
+    /// answers whether it escrowed.
+    NonceSpent {
+        /// The block the nonce was read at.
+        block: u64,
+    },
+    /// A pending transaction holds the open's nonce, so the open may still mine.
+    Pending,
+    /// This RPC sees no transaction at the open's nonce. The open task re-sends
+    /// at that nonce, so the re-send and the open cannot both mine.
     Vacant,
 }
 
-/// Keep the open slot until the chain resolves `unconfirmed`, then report what
-/// the open bought: `Some` a pool to record, `None` a pool reconciliation
-/// already adopted, or the original error `err` when nothing escrowed.
+/// Hold the open slot until the chain resolves `unconfirmed`, then report what
+/// the open produced.
 ///
-/// The nonce decides, not a timer. Once the account's confirmed nonce passes
-/// the open's, the open has mined or never will. A receipt in hand is the
-/// open's own record. Without one, the hash is unknown or a lagging RPC
-/// backend has not served it, and [`reconcile_with_chain`] asks `getPools`.
-/// While the nonce is unconfirmed and a pending transaction holds it, the open
-/// may still mine, so the task waits, however long that takes, as the
-/// receipt wait in [`open_pool`] does. A nonce that nothing holds is
-/// [`OpenResolution::Vacant`]: the next open is sent with that same nonce, so
-/// it and a resurfacing first open cannot both mine.
+/// The slot is released only once a receipt is in hand or the open's nonce is
+/// spent. A timer never decides:
 ///
-/// A failed read, or a reconciliation that cannot answer, waits for the next
-/// tick. Neither is evidence that nothing escrowed.
+/// - A receipt for any `openPool` sent at the nonce is the open's own record.
+/// - A nonce the chain shows spent at block `B`, with no receipt in hand, means
+///   the open has mined or never will. [`reconcile_with_chain`] then reads
+///   `getPools` at `B`, so "adopted" and "holds no pool" are answers about the
+///   same chain state as the nonce. A load-balanced RPC backend that has not
+///   reached `B` fails the read, and the next tick asks again.
+/// - A pending transaction at the nonce may still mine, so the task waits,
+///   however long that takes, as the receipt wait in [`open_pool`] does.
+/// - A nonce that no transaction holds gets a fresh `openPool` at that same
+///   nonce ([`send_open_pool`]). Two transactions at one nonce cannot both
+///   mine, so the re-send and a first open that resurfaces escrow at most one
+///   deposit between them. Releasing the slot instead would let the next open
+///   read a later pending nonce, and then both could mine.
+///
+/// A failed read, a failed re-send, and a reconciliation that cannot answer
+/// all wait for the next tick. While the task waits, `hold` makes callers fail
+/// fast, and a warning repeats every [`OPEN_UNRESOLVED_WARN_INTERVAL`] with the
+/// elapsed time and the last thing the chain said.
 ///
 /// # Errors
 ///
-/// `err`, with context, when the open did not escrow. A mined revert or a
-/// receipt with no `PoolOpened` event, as [`opened_from_receipt`] reports.
+/// - The open escrowed nothing: its nonce is spent and the owner holds no
+///   open pool. The error is a fresh [`PoolOpenFailureReason::RpcError`]
+///   without the [`OpenUnconfirmed`] marker, because the outcome is known.
+/// - A pool to adopt exists but its row could not be recorded: the deposit is
+///   escrowed and untracked, marked [`LocalPullFault`].
+/// - The [`opened_from_receipt`] error for a mined receipt: a revert, a
+///   missing `PoolOpened` event (escrowed but untracked), or a signing fault.
 async fn settle_unconfirmed_open<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn BuyerPoolStore>,
     open: &OpenRequest,
     unconfirmed: OpenUnconfirmed,
     err: anyhow::Error,
+    hold: &OpenHold,
     metrics: &Arc<Metrics>,
-) -> Result<Option<OpenedPool>> {
-    let nonce = unconfirmed.nonce;
+) -> Result<Landed> {
+    let _held = hold.hold(metrics);
+    let mut settling = Settling {
+        nonce: unconfirmed.nonce,
+        txs: unconfirmed.tx.into_iter().collect(),
+        original: sanitize_err_chain(&err),
+        started: tokio::time::Instant::now(),
+    };
     warn!(
-        tx = ?unconfirmed.tx,
-        nonce,
-        error = %sanitize_err_chain(&err),
+        nonce = settling.nonce,
+        txs = ?settling.txs,
+        error = %settling.original,
         "openPool outcome unknown; holding the open slot until the chain resolves it, so \
          no second deposit escrows beside it"
     );
     let mut ticker = tokio::time::interval(OPEN_RESOLVE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_warned = settling.started;
+    let mut last_seen = String::from("no chain read has answered yet");
     loop {
         ticker.tick().await;
-        let resolution = match resolve_unconfirmed_open(contract, open.owner, unconfirmed).await {
-            Ok(Some(resolution)) => resolution,
-            Ok(None) => continue,
-            Err(read_err) => {
-                debug!(
-                    nonce,
-                    error = %sanitize_err_chain(&read_err),
-                    "could not read the unconfirmed openPool's state; retrying"
-                );
-                continue;
+        if last_warned.elapsed() >= OPEN_UNRESOLVED_WARN_INTERVAL {
+            last_warned = tokio::time::Instant::now();
+            warn!(
+                nonce = settling.nonce,
+                txs = ?settling.txs,
+                elapsed = ?settling.started.elapsed(),
+                last = %last_seen,
+                "still holding the open slot for an unconfirmed openPool; this node opens no \
+                 buyer pool until the chain resolves it"
+            );
+        }
+        match settling.tick(contract, store, open, metrics).await {
+            Tick::Wait(seen) => last_seen = seen,
+            Tick::Done(landed) => return landed,
+        }
+    }
+}
+
+/// The open task's state while it settles an unconfirmed `openPool`.
+struct Settling {
+    /// The nonce every `openPool` of this open is sent at.
+    nonce: u64,
+    /// The `openPool` transactions known at `nonce`, oldest first, at most
+    /// [`MAX_OPEN_TXS`].
+    txs: Vec<TxHash>,
+    /// The error that left the open unconfirmed, sanitized for logs.
+    original: String,
+    /// When the settle loop began.
+    started: tokio::time::Instant,
+}
+
+/// What one settle tick decided.
+enum Tick {
+    /// Keep waiting; this is what the chain said.
+    Wait(String),
+    /// The open is resolved.
+    Done(Result<Landed>),
+}
+
+impl Settling {
+    /// Read the chain once and act on what it says.
+    async fn tick<P: Provider + Clone>(
+        &mut self,
+        contract: &PaymentPool::PaymentPoolInstance<P>,
+        store: &Arc<dyn BuyerPoolStore>,
+        open: &OpenRequest,
+        metrics: &Arc<Metrics>,
+    ) -> Tick {
+        let resolution = match resolve_unconfirmed_open(contract, open.owner, self.nonce, &self.txs)
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(err) => {
+                let seen = format!("a chain read failed: {}", sanitize_err_chain(&err));
+                debug!(nonce = self.nonce, last = %seen, "could not read the unconfirmed openPool's state");
+                return Tick::Wait(seen);
             }
         };
         match resolution {
+            OpenResolution::Pending => Tick::Wait("a pending transaction holds the nonce".into()),
+            OpenResolution::Vacant => Tick::Wait(self.resend(contract, open).await),
             OpenResolution::Mined(receipt) => {
-                let tx = unconfirmed.tx.unwrap_or(receipt.transaction_hash);
-                return opened_from_receipt(
-                    &receipt,
-                    tx,
-                    Arc::clone(&open.signer),
-                    open.deployment,
-                    open.token,
-                    open.owner,
-                    open.deposit,
+                let tx = receipt.transaction_hash;
+                info!(
+                    nonce = self.nonce,
+                    %tx,
+                    elapsed = ?self.started.elapsed(),
+                    "unconfirmed openPool resolved: a transaction at its nonce mined"
+                );
+                Tick::Done(
+                    opened_from_receipt(
+                        &receipt,
+                        tx,
+                        Arc::clone(&open.signer),
+                        open.deployment,
+                        open.token,
+                        open.owner,
+                        open.deposit,
+                    )
+                    .map(|opened| Landed::Opened(Box::new(opened))),
                 )
-                .map(Some);
             }
-            OpenResolution::Vacant => {
-                return Err(err.context(format!(
-                    "no transaction holds the openPool nonce {nonce}; the open is not in \
-                     flight and escrowed nothing"
-                )));
-            }
-            OpenResolution::NonceSpent => {
-                match reconcile_with_chain(
+            OpenResolution::NonceSpent { block } => {
+                let run = ReconcileRun::Settle { block };
+                let reconciled = reconcile_with_chain(
                     contract,
                     open.deployment,
                     store,
                     open.owner,
                     open.token,
+                    run,
                     metrics,
                 )
-                .await
-                {
-                    Reconciled::Adopted => return Ok(None),
-                    Reconciled::NotAdopted => {
-                        return Err(err.context(format!(
-                            "the openPool nonce {nonce} is spent and this owner holds no new \
-                             pool; the open escrowed nothing"
-                        )));
-                    }
-                    Reconciled::Unknown => {}
-                }
+                .await;
+                self.spent(block, reconciled)
             }
+        }
+    }
+
+    /// Send a fresh `openPool` at the nonce no transaction holds, and say what
+    /// happened.
+    async fn resend<P: Provider + Clone>(
+        &mut self,
+        contract: &PaymentPool::PaymentPoolInstance<P>,
+        open: &OpenRequest,
+    ) -> String {
+        match send_open_pool(contract, open.owner, open.deposit, self.nonce).await {
+            Ok(tx) => {
+                info!(
+                    nonce = self.nonce,
+                    %tx,
+                    "no transaction holds the unconfirmed openPool's nonce; re-sent openPool \
+                     at that nonce"
+                );
+                if self.txs.len() >= MAX_OPEN_TXS {
+                    self.txs.remove(0);
+                }
+                self.txs.push(tx);
+                format!("re-sent openPool at the nonce as {tx}")
+            }
+            Err(err) => {
+                let seen = format!(
+                    "no transaction holds the nonce, and the re-send failed: {}",
+                    sanitize_err_chain(&err)
+                );
+                debug!(nonce = self.nonce, last = %seen, "could not re-send the openPool");
+                seen
+            }
+        }
+    }
+
+    /// Act on what reconciliation found once the nonce is spent at `block`.
+    fn spent(&self, block: u64, reconciled: Reconciled) -> Tick {
+        let nonce = self.nonce;
+        match reconciled {
+            Reconciled::Adopted(pool_id) => {
+                info!(
+                    nonce,
+                    block,
+                    %pool_id,
+                    elapsed = ?self.started.elapsed(),
+                    "unconfirmed openPool resolved: its nonce is spent, and the owner's newest \
+                     solvent pool is adopted"
+                );
+                Tick::Done(Ok(Landed::Adopted))
+            }
+            Reconciled::NoneHeld => {
+                info!(
+                    nonce,
+                    block,
+                    elapsed = ?self.started.elapsed(),
+                    "unconfirmed openPool resolved: its nonce is spent and the owner holds no \
+                     open pool, so it escrowed nothing"
+                );
+                Tick::Done(Err(anyhow::anyhow!(
+                    "the openPool nonce {nonce} is spent at block {block} and this owner holds \
+                     no open pool there, so the open escrowed nothing: {}",
+                    self.original
+                )
+                .context(PoolOpenFailureReason::RpcError)))
+            }
+            Reconciled::Unrecorded(pool_id) => {
+                error!(
+                    nonce,
+                    %pool_id,
+                    "the pool an unconfirmed openPool resolved to could not be recorded; the \
+                     deposit is escrowed but UNTRACKED"
+                );
+                Tick::Done(Err(anyhow::anyhow!(
+                    "buyer pool {pool_id} could not be recorded after an unconfirmed openPool; \
+                     the deposit is escrowed but untracked"
+                )
+                .context(LocalPullFault)))
+            }
+            Reconciled::KeptTracked | Reconciled::Unknown => Tick::Wait(format!(
+                "the nonce is spent at block {block}, but reconciliation could not answer"
+            )),
         }
     }
 }
 
-/// One read of the chain for an unconfirmed `openPool`: its resolution, or
-/// `None` while a pending transaction still holds its nonce.
+/// One read of the chain for an unconfirmed `openPool` at `nonce`, whose known
+/// transactions are `txs`.
 ///
 /// # Errors
 ///
@@ -2498,42 +2846,62 @@ async fn settle_unconfirmed_open<P: Provider + Clone>(
 async fn resolve_unconfirmed_open<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
-    unconfirmed: OpenUnconfirmed,
-) -> Result<Option<OpenResolution>> {
+    nonce: u64,
+    txs: &[TxHash],
+) -> Result<OpenResolution> {
     let provider = contract.provider();
-    let receipt = async |tx| {
-        provider
-            .get_transaction_receipt(tx)
-            .await
-            .context("read the openPool receipt")
-    };
-    if let Some(tx) = unconfirmed.tx
-        && let Some(found) = receipt(tx).await?
-    {
-        return Ok(Some(OpenResolution::Mined(Box::new(found))));
+    if let Some(receipt) = first_receipt(provider, txs).await? {
+        return Ok(OpenResolution::Mined(receipt));
     }
+    let block = provider
+        .get_block_number()
+        .await
+        .context("read the block number")?;
     let confirmed = provider
         .get_transaction_count(owner)
-        .latest()
+        .number(block)
         .await
         .context("read the confirmed nonce")?;
-    if confirmed > unconfirmed.nonce {
-        // The open may have mined between the first receipt read and the nonce
-        // read, so read the receipt again before handing the question to
-        // `getPools`.
-        if let Some(tx) = unconfirmed.tx
-            && let Some(found) = receipt(tx).await?
-        {
-            return Ok(Some(OpenResolution::Mined(Box::new(found))));
+    if confirmed > nonce {
+        // A transaction may have mined between the first receipt read and the
+        // nonce read, so read the receipts again before asking `getPools`.
+        if let Some(receipt) = first_receipt(provider, txs).await? {
+            return Ok(OpenResolution::Mined(receipt));
         }
-        return Ok(Some(OpenResolution::NonceSpent));
+        return Ok(OpenResolution::NonceSpent { block });
     }
     let pending = provider
         .get_transaction_count(owner)
         .pending()
         .await
         .context("read the pending nonce")?;
-    Ok((pending <= unconfirmed.nonce).then_some(OpenResolution::Vacant))
+    Ok(if pending > nonce {
+        OpenResolution::Pending
+    } else {
+        OpenResolution::Vacant
+    })
+}
+
+/// The first receipt found among `txs`, which share one nonce, so at most one
+/// of them can have mined.
+///
+/// # Errors
+///
+/// A receipt read failed.
+async fn first_receipt<P: Provider>(
+    provider: &P,
+    txs: &[TxHash],
+) -> Result<Option<Box<alloy::rpc::types::TransactionReceipt>>> {
+    for &tx in txs {
+        if let Some(receipt) = provider
+            .get_transaction_receipt(tx)
+            .await
+            .context("read an openPool receipt")?
+        {
+            return Ok(Some(Box::new(receipt)));
+        }
+    }
+    Ok(None)
 }
 
 /// Background reclaim sweep: complete the grace-window `reclaim` of the node's

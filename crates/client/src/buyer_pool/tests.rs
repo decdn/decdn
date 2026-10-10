@@ -1,7 +1,7 @@
 use super::{
     AllowanceShortfall, LOW_WATER_DIVISOR, OpenUnconfirmed, PaymentPool, TopUpUnconfirmed,
     approval_floor, approve_decision, escrowed_but_untracked, grade_deposit_credit,
-    issue_self_capability, open_pool, pool_accepts_funds, refill_amount, top_up,
+    issue_self_capability, open_pool, pool_accepts_funds, refill_amount, send_open_pool, top_up,
 };
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, TxHash, U256};
@@ -127,6 +127,33 @@ async fn a_transport_failed_open_pool_submit_is_unconfirmed_with_its_nonce() {
     assert_eq!(
         err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
         Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
+    );
+}
+
+/// A re-sent `openPool` returns its hash without waiting for a receipt, and
+/// a rejected one carries no [`OpenUnconfirmed`]: the caller already holds the
+/// nonce it re-sent at.
+#[tokio::test]
+async fn send_open_pool_returns_the_hash_without_a_receipt_wait() {
+    let hash = B256::repeat_byte(0xcd);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&hash);
+    asserter.push_failure_msg("nonce too low");
+    let contract = mocked_pool(asserter.clone());
+    let owner = Address::repeat_byte(0x22);
+    let deposit = U256::from(1_000u64);
+    assert_eq!(
+        send_open_pool(&contract, owner, deposit, 5).await.unwrap(),
+        hash
+    );
+    let err = send_open_pool(&contract, owner, deposit, 5)
+        .await
+        .unwrap_err();
+    assert!(err.downcast_ref::<OpenUnconfirmed>().is_none(), "{err:#}");
+    assert!(format!("{err:#}").contains("nonce 5"), "{err:#}");
+    assert!(
+        asserter.read_q().is_empty(),
+        "one send each, no receipt read"
     );
 }
 

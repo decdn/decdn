@@ -32,6 +32,27 @@ fn metrics() -> Arc<Metrics> {
     Arc::new(Metrics::new())
 }
 
+/// [`reconcile_with_chain`] as bootstrap runs it.
+async fn bootstrap_reconcile<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    deployment: Deployment,
+    store: &Arc<dyn BuyerPoolStore>,
+    owner: Address,
+    token: Address,
+    metrics: &Arc<Metrics>,
+) -> Reconciled {
+    reconcile_with_chain(
+        contract,
+        deployment,
+        store,
+        owner,
+        token,
+        ReconcileRun::Bootstrap,
+        metrics,
+    )
+    .await
+}
+
 /// An on-chain pool row in the state `getPool` returns it in.
 fn onchain_pool(owner: Address, status: PaymentPool::Status, deposit: u64) -> PaymentPool::Pool {
     PaymentPool::Pool {
@@ -135,7 +156,12 @@ async fn a_chain_read_warning_does_not_log_the_rpc_url() -> anyhow::Result<()> {
         .finish();
     let walked = {
         let _guard = tracing::subscriber::set_default(subscriber);
-        OwnedPools::walk(&contract, vec![PoolId::from([0xAA; 32])]).await
+        OwnedPools::walk(
+            &contract,
+            vec![PoolId::from([0xAA; 32])],
+            ReconcileRun::Bootstrap,
+        )
+        .await
     };
     assert_eq!(walked.unreadable.len(), 1);
 
@@ -174,7 +200,10 @@ async fn reconcile_adopts_the_newest_open_pool() {
     ]);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
 
-    assert!(reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await);
+    assert_eq!(
+        bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
+        Reconciled::Adopted(newer)
+    );
     let adopted = store.get_by_owner(owner).unwrap().expect("row recorded");
     assert_eq!(adopted.pool_id, newer);
     assert_eq!(adopted.deposit, U256::from(10_000_000u64));
@@ -199,7 +228,10 @@ async fn an_adopted_drained_pool_keeps_its_redeemed_spend_and_refills() {
         drained.abi_encode().into(),
     ]);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
-    assert!(reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await);
+    assert!(matches!(
+        bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
+        Reconciled::Adopted(_)
+    ));
     let row = store.get_by_owner(owner).unwrap().expect("row recorded");
     assert_eq!(row.redeemed_elsewhere(), U256::from(9_500_000u64));
     assert_eq!(row.pool_spend(), U256::from(9_500_000u64));
@@ -287,7 +319,10 @@ async fn reconcile_drops_a_row_from(foreign: Deployment) {
             .into(),
     ]);
 
-    assert!(reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await);
+    assert!(matches!(
+        bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
+        Reconciled::Adopted(_)
+    ));
 
     let row = store.get_by_owner(owner).unwrap().expect("row recorded");
     assert_eq!(
@@ -305,7 +340,7 @@ async fn reconcile_drops_a_row_from(foreign: Deployment) {
 /// The drop stands on its own, with nothing to adopt behind it.
 ///
 /// This is the case that makes `forget_if_pool` load-bearing. When the live
-/// contract lists no adoptable pool, `reconcile_owned_pool` returns before
+/// contract lists no adoptable pool, `reconcile_with_chain` returns before
 /// it records anything, so the foreign row survives unless the drop removed
 /// it — and `reuse_or_report` would then hand it to the next pull. In the
 /// sibling test above the enumeration happens to return the same colliding
@@ -352,8 +387,8 @@ async fn a_foreign_row_is_dropped_with_nothing_to_adopt(deployment: Deployment) 
     // This contract knows no pool for this owner, so nothing is adoptable.
     let contract = mocked_pool_contract(vec![Vec::<PoolId>::new().abi_encode().into()]);
 
-    assert!(
-        !reconcile_owned_pool(
+    assert_eq!(
+        bootstrap_reconcile(
             &contract,
             DEPLOYMENT,
             &store,
@@ -362,6 +397,7 @@ async fn a_foreign_row_is_dropped_with_nothing_to_adopt(deployment: Deployment) 
             &metrics()
         )
         .await,
+        Reconciled::NoneHeld,
         "nothing to adopt, so the reconcile reports no adoption"
     );
     assert!(
@@ -390,7 +426,7 @@ fn adoption_tracks_a_row_on_the_configured_deployment() {
         .expect("seed the local row");
 
     assert_eq!(
-        adoption_applies(&store, owner, DEPLOYMENT),
+        adoption_applies(&store, owner, DEPLOYMENT, ReconcileRun::Bootstrap),
         AdoptionCheck::AlreadyTracked(pool_id),
         "a row on the configured PaymentPool is tracked, never foreign"
     );
@@ -415,7 +451,7 @@ fn adoption_treats_a_row_on_the_same_address_on_another_chain_as_foreign() {
         .expect("seed the local row");
 
     assert_eq!(
-        adoption_applies(&store, owner, DEPLOYMENT),
+        adoption_applies(&store, owner, DEPLOYMENT, ReconcileRun::Bootstrap),
         AdoptionCheck::Foreign {
             pool_id,
             was_on: OTHER_CHAIN,
@@ -445,8 +481,8 @@ async fn reconcile_skips_a_closing_pool_for_the_open_one_behind_it() {
     ]);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
 
-    assert!(
-        reconcile_owned_pool(
+    assert_eq!(
+        bootstrap_reconcile(
             &contract,
             DEPLOYMENT,
             &store,
@@ -454,7 +490,8 @@ async fn reconcile_skips_a_closing_pool_for_the_open_one_behind_it() {
             Address::repeat_byte(2),
             &metrics()
         )
-        .await
+        .await,
+        Reconciled::Adopted(open)
     );
     assert_eq!(store.get_by_owner(owner).unwrap().unwrap().pool_id, open);
 }
@@ -469,8 +506,8 @@ async fn reconcile_adopts_nothing_when_the_owner_holds_no_pool() {
     let contract = mocked_pool_contract(vec![Vec::<PoolId>::new().abi_encode().into()]);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
 
-    assert!(
-        !reconcile_owned_pool(
+    assert_eq!(
+        bootstrap_reconcile(
             &contract,
             DEPLOYMENT,
             &store,
@@ -478,7 +515,8 @@ async fn reconcile_adopts_nothing_when_the_owner_holds_no_pool() {
             Address::repeat_byte(2),
             &metrics()
         )
-        .await
+        .await,
+        Reconciled::NoneHeld
     );
     assert!(store.get_by_owner(owner).unwrap().is_none());
 }
@@ -527,7 +565,10 @@ async fn reconcile_is_a_no_op_when_the_store_already_tracks_a_pool() {
         ))
         .unwrap();
 
-    assert!(!reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await);
+    assert_eq!(
+        bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
+        Reconciled::KeptTracked
+    );
     assert_eq!(
         store.get_by_owner(owner).unwrap().unwrap().pool_id,
         existing
@@ -632,7 +673,10 @@ async fn reconcile_sweeps_for_stranded_pools_when_the_store_is_intact() {
         .unwrap();
 
     let metrics = metrics();
-    assert!(!reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics).await);
+    assert_eq!(
+        bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics).await,
+        Reconciled::KeptTracked
+    );
     // Nothing adopted: the tracked row is untouched.
     assert_eq!(
         store.get_by_owner(owner).unwrap().unwrap().pool_id,
@@ -691,8 +735,9 @@ async fn a_tracked_pool_the_chain_has_closed_is_dropped_and_replaced() {
         ))
         .unwrap();
 
-    assert!(
-        reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
+    assert_eq!(
+        bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
+        Reconciled::Adopted(live),
         "a stale row must not block adoption of a pool this owner really holds"
     );
     assert_eq!(
@@ -742,7 +787,10 @@ async fn a_tracked_pool_whose_status_read_failed_keeps_its_row() {
         ))
         .unwrap();
 
-    assert!(!reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await);
+    assert_eq!(
+        bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
+        Reconciled::Unknown
+    );
     assert_eq!(
         store.get_by_owner(owner).unwrap().unwrap().pool_id,
         tracked,
@@ -788,7 +836,10 @@ async fn a_tracked_pool_the_chain_does_not_list_keeps_its_row() {
         ))
         .unwrap();
 
-    assert!(!reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await);
+    assert_eq!(
+        bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
+        Reconciled::Unknown
+    );
     assert_eq!(
         store.get_by_owner(owner).unwrap().unwrap().pool_id,
         tracked,
@@ -825,7 +876,10 @@ async fn a_stale_row_is_dropped_even_when_no_other_pool_is_open() {
         ))
         .unwrap();
 
-    assert!(!reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await);
+    assert_eq!(
+        bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics()).await,
+        Reconciled::NoneHeld
+    );
     assert!(
         store.get_by_owner(owner).unwrap().is_none(),
         "the row must be gone so the next miss opens a fresh pool"
@@ -855,7 +909,10 @@ async fn a_failed_stranded_sweep_is_not_counted_as_an_adoption_failure() {
         .unwrap();
 
     let metrics = metrics();
-    assert!(!reconcile_owned_pool(&contract, DEPLOYMENT, &store, owner, token, &metrics).await);
+    assert_eq!(
+        bootstrap_reconcile(&contract, DEPLOYMENT, &store, owner, token, &metrics).await,
+        Reconciled::Unknown
+    );
     assert_eq!(
         adoption_failures(&metrics),
         0,
@@ -897,6 +954,7 @@ fn mocked_service_on<P: Provider + Clone + 'static>(
         owner,
         working_deposit: U256::from(10_000_000u64),
         open_in_flight: Arc::new(Mutex::new(None)),
+        open_hold: OpenHold::new(),
         topup_in_flight: Arc::new(Mutex::new(None)),
         seed_slots: Mutex::new(HashMap::new()),
         metrics: Arc::new(Metrics::new()),
@@ -1096,13 +1154,10 @@ async fn the_open_recheck_ignores_a_row_from_another_deployment() {
         let result = run_open(
             &contract,
             &store,
-            Arc::new(PrivateKeySigner::random()),
-            DEPLOYMENT,
-            Address::repeat_byte(2),
-            owner,
-            U256::from(10_000_000u64),
+            open_request(owner),
             None,
-            &Arc::new(Metrics::new()),
+            &OpenHold::new(),
+            &metrics(),
         )
         .await;
         if opens {
@@ -1140,13 +1195,10 @@ async fn a_replacement_open_runs_past_the_closed_pool_it_replaces() {
     let result = run_open(
         &contract,
         &store,
-        Arc::new(PrivateKeySigner::random()),
-        DEPLOYMENT,
-        Address::repeat_byte(2),
-        owner,
-        U256::from(10_000_000u64),
+        open_request(owner),
         Some(closed),
-        &Arc::new(Metrics::new()),
+        &OpenHold::new(),
+        &metrics(),
     )
     .await;
     assert!(result.is_err(), "the replacement open reached the chain");
@@ -1723,8 +1775,8 @@ async fn reconcile_skips_a_fully_redeemed_pool() {
     ]);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
 
-    assert!(
-        reconcile_owned_pool(
+    assert_eq!(
+        bootstrap_reconcile(
             &contract,
             DEPLOYMENT,
             &store,
@@ -1732,7 +1784,8 @@ async fn reconcile_skips_a_fully_redeemed_pool() {
             Address::repeat_byte(2),
             &metrics()
         )
-        .await
+        .await,
+        Reconciled::Adopted(solvent)
     );
     assert_eq!(store.get_by_owner(owner).unwrap().unwrap().pool_id, solvent);
 }
@@ -1750,11 +1803,11 @@ async fn reconcile_counts_an_unreadable_store_and_adopts_nothing() {
     let contract = mocked_pool_contract(Vec::new());
 
     assert_eq!(
-        adoption_applies(&store, owner, DEPLOYMENT),
+        adoption_applies(&store, owner, DEPLOYMENT, ReconcileRun::Bootstrap),
         AdoptionCheck::Unknown
     );
-    assert!(
-        !reconcile_owned_pool(
+    assert_eq!(
+        bootstrap_reconcile(
             &contract,
             DEPLOYMENT,
             &store,
@@ -1762,7 +1815,8 @@ async fn reconcile_counts_an_unreadable_store_and_adopts_nothing() {
             Address::repeat_byte(2),
             &metrics
         )
-        .await
+        .await,
+        Reconciled::Unknown
     );
     assert_eq!(
         adoption_failures(&metrics),
@@ -1964,8 +2018,8 @@ async fn reconcile_refuses_when_a_foreign_row_cannot_be_dropped() {
     // a row it could not drop.
     let contract = mocked_pool_contract(Vec::new());
 
-    assert!(
-        !reconcile_owned_pool(
+    assert_eq!(
+        bootstrap_reconcile(
             &contract,
             DEPLOYMENT,
             &store,
@@ -1973,7 +2027,8 @@ async fn reconcile_refuses_when_a_foreign_row_cannot_be_dropped() {
             Address::repeat_byte(2),
             &metrics
         )
-        .await
+        .await,
+        Reconciled::Unknown
     );
     assert_eq!(
         adoption_failures(&metrics),
@@ -2008,8 +2063,8 @@ async fn reconcile_counts_a_failed_persist() {
             .into(),
     ]);
 
-    assert!(
-        !reconcile_owned_pool(
+    assert!(matches!(
+        bootstrap_reconcile(
             &contract,
             DEPLOYMENT,
             &store,
@@ -2017,8 +2072,9 @@ async fn reconcile_counts_a_failed_persist() {
             Address::repeat_byte(2),
             &metrics
         )
-        .await
-    );
+        .await,
+        Reconciled::Unrecorded(_)
+    ));
     assert_eq!(adoption_failures(&metrics), 1);
 }
 
@@ -2045,8 +2101,8 @@ async fn reconcile_leaves_the_store_untouched_when_the_chain_is_unreachable() {
     let contract = mocked_pool_contract(Vec::new());
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
 
-    assert!(
-        !reconcile_owned_pool(
+    assert_eq!(
+        bootstrap_reconcile(
             &contract,
             DEPLOYMENT,
             &store,
@@ -2054,7 +2110,8 @@ async fn reconcile_leaves_the_store_untouched_when_the_chain_is_unreachable() {
             Address::repeat_byte(2),
             &metrics()
         )
-        .await
+        .await,
+        Reconciled::Unknown
     );
     assert!(store.get_by_owner(owner).unwrap().is_none());
 }
@@ -2589,6 +2646,7 @@ fn recovery_service(
         owner,
         working_deposit: U256::from(10_000_000u64),
         open_in_flight: Arc::new(Mutex::new(None)),
+        open_hold: OpenHold::new(),
         topup_in_flight: Arc::new(Mutex::new(None)),
         seed_slots: Mutex::new(HashMap::new()),
         metrics: Arc::new(Metrics::new()),
@@ -2870,41 +2928,60 @@ enum Reply {
     NoReceipt,
     /// `eth_getTransactionReceipt` finds this receipt.
     Receipt(Box<alloy::rpc::types::TransactionReceipt>),
+    /// `eth_blockNumber` answers this block.
+    Block(u64),
     /// `eth_getTransactionCount` answers this nonce.
     Nonce(u64),
+    /// `eth_sendTransaction` answers this hash.
+    Sent(TxHash),
     /// An `eth_call` answers this payload.
     Call(alloy::primitives::Bytes),
     /// The call faults, as a transient RPC error does.
     Fault,
 }
 
-/// An [`Asserter`](alloy::providers::mock::Asserter) that answers `replies` in
-/// order.
-fn script(replies: Vec<Reply>) -> alloy::providers::mock::Asserter {
-    let asserter = alloy::providers::mock::Asserter::new();
+/// Push `replies` onto `asserter`, in order.
+fn push(asserter: &alloy::providers::mock::Asserter, replies: Vec<Reply>) {
     for reply in replies {
         match reply {
             Reply::NoReceipt => asserter.push_success(&serde_json::Value::Null),
             Reply::Receipt(receipt) => asserter.push_success(&receipt),
-            Reply::Nonce(nonce) => asserter.push_success(&U256::from(nonce)),
+            Reply::Block(number) | Reply::Nonce(number) => {
+                asserter.push_success(&U256::from(number));
+            }
+            Reply::Sent(tx) => asserter.push_success(&tx),
             Reply::Call(bytes) => asserter.push_success(&bytes),
             Reply::Fault => asserter.push_failure_msg("transient rpc fault"),
         }
     }
+}
+
+/// An [`Asserter`](alloy::providers::mock::Asserter) that answers `replies` in
+/// order.
+fn script(replies: Vec<Reply>) -> alloy::providers::mock::Asserter {
+    let asserter = alloy::providers::mock::Asserter::new();
+    push(&asserter, replies);
     asserter
 }
 
-/// The hash of the `openPool` whose outcome the open task did not observe.
-fn open_tx() -> alloy::primitives::TxHash {
-    alloy::primitives::TxHash::repeat_byte(0xAB)
+/// The hash of the `openPool` whose outcome the open task did not see.
+fn open_tx() -> TxHash {
+    TxHash::repeat_byte(0xAB)
 }
 
-/// A mined `openPool` receipt whose `PoolOpened` log credits `deposit` to
-/// `pool_id`.
+/// The hash of the `openPool` the open task re-sends at the same nonce.
+fn resent_tx() -> TxHash {
+    TxHash::repeat_byte(0xCD)
+}
+
+/// A mined `openPool` receipt for `tx` whose `PoolOpened` log credits
+/// `deposit` to `pool_id`, with the given execution `status`.
 fn opened_receipt(
+    tx: TxHash,
     pool_id: PoolId,
     owner: Address,
     deposit: u64,
+    status: bool,
 ) -> Box<alloy::rpc::types::TransactionReceipt> {
     use alloy::sol_types::SolEvent;
 
@@ -2929,13 +3006,13 @@ fn opened_receipt(
     Box::new(alloy::rpc::types::TransactionReceipt {
         inner: alloy::consensus::ReceiptEnvelope::Eip1559(alloy::consensus::ReceiptWithBloom {
             receipt: alloy::consensus::Receipt {
-                status: alloy::consensus::Eip658Value::Eip658(true),
+                status: alloy::consensus::Eip658Value::Eip658(status),
                 cumulative_gas_used: 0,
-                logs: vec![log],
+                logs: if status { vec![log] } else { Vec::new() },
             },
             logs_bloom: alloy::primitives::Bloom::ZERO,
         }),
-        transaction_hash: open_tx(),
+        transaction_hash: tx,
         transaction_index: Some(0),
         block_hash: None,
         block_number: None,
@@ -2949,7 +3026,7 @@ fn opened_receipt(
     })
 }
 
-/// The open an unconfirmed-open test sent.
+/// The open a test's open task sends.
 fn open_request(owner: Address) -> OpenRequest {
     OpenRequest {
         signer: signer(),
@@ -2967,121 +3044,183 @@ fn unconfirmed_error(unconfirmed: OpenUnconfirmed) -> anyhow::Error {
         .context(PoolOpenFailureReason::RpcError)
 }
 
-/// The hashed open sent with nonce 5.
-const HASHED: fn() -> OpenUnconfirmed = || OpenUnconfirmed {
-    tx: Some(open_tx()),
-    nonce: 5,
-};
+/// The open whose receipt read failed, sent with nonce 5.
+fn hashed() -> OpenUnconfirmed {
+    OpenUnconfirmed {
+        tx: Some(open_tx()),
+        nonce: 5,
+    }
+}
 
-/// Settle `unconfirmed` against `replies`, asserting every reply was read.
+/// The pool an open task records, or `None` when reconciliation adopted one.
+fn opened_pool(landed: Landed) -> Option<Box<OpenedPool>> {
+    match landed {
+        Landed::Opened(opened) => Some(opened),
+        Landed::Adopted => None,
+    }
+}
+
+/// The current value of `decdn_buyer_pool_open_unresolved`.
+fn open_unresolved(metrics: &Arc<Metrics>) -> u64 {
+    let text = metrics.encode().expect("encode metrics");
+    text.lines()
+        .find_map(|l| {
+            l.strip_prefix("decdn_buyer_pool_open_unresolved")?
+                .strip_prefix(' ')?
+                .parse::<u64>()
+                .ok()
+        })
+        .expect("the gauge is exported")
+}
+
+/// Settle `unconfirmed` against `replies`, asserting every reply was read and
+/// the hold is released.
 async fn settle(
     replies: Vec<Reply>,
     unconfirmed: OpenUnconfirmed,
     store: &Arc<dyn BuyerPoolStore>,
     owner: Address,
-) -> Result<Option<OpenedPool>> {
+    metrics: &Arc<Metrics>,
+) -> Result<Landed> {
     let asserter = script(replies);
     let contract = bare_pool_contract(asserter.clone());
+    let hold = OpenHold::new();
     let settled = settle_unconfirmed_open(
         &contract,
         store,
         &open_request(owner),
         unconfirmed,
         unconfirmed_error(unconfirmed),
-        &metrics(),
+        &hold,
+        metrics,
     )
     .await;
     assert!(asserter.read_q().is_empty(), "every scripted read was made");
+    assert!(!*hold.held.borrow(), "the hold is released");
+    assert_eq!(open_unresolved(metrics), 0, "the gauge is cleared");
     settled
 }
 
-/// One chain read classifies an unconfirmed open by its receipt, then the
-/// account's confirmed nonce, then its pending nonce.
+/// One chain read classifies an unconfirmed open by its receipts, then the
+/// account's nonce at one block, then its pending nonce.
 #[tokio::test]
 async fn an_unconfirmed_open_resolves_by_receipt_then_nonce() {
     let owner = Address::repeat_byte(1);
-    let hashless = OpenUnconfirmed { tx: None, nonce: 5 };
-    let receipt = || Reply::Receipt(opened_receipt(PoolId::from([0xBB; 32]), owner, 1));
+    let id = PoolId::from([0xBB; 32]);
+    let receipt = |tx| Reply::Receipt(opened_receipt(tx, id, owner, 1, true));
+    let one = vec![open_tx()];
+    let two = vec![open_tx(), resent_tx()];
+    let none = Vec::new();
     let cases = vec![
-        ("mined", HASHED(), vec![receipt()], Some("mined")),
+        ("mined", &one, vec![receipt(open_tx())], "mined"),
         (
-            "in flight",
-            HASHED(),
-            vec![Reply::NoReceipt, Reply::Nonce(5), Reply::Nonce(6)],
-            None,
+            "the re-send mined",
+            &two,
+            vec![Reply::NoReceipt, receipt(resent_tx())],
+            "mined",
+        ),
+        (
+            "pending",
+            &one,
+            vec![
+                Reply::NoReceipt,
+                Reply::Block(100),
+                Reply::Nonce(5),
+                Reply::Nonce(6),
+            ],
+            "pending",
         ),
         (
             "nonce spent",
-            HASHED(),
-            vec![Reply::NoReceipt, Reply::Nonce(6), Reply::NoReceipt],
-            Some("spent"),
+            &one,
+            vec![
+                Reply::NoReceipt,
+                Reply::Block(100),
+                Reply::Nonce(6),
+                Reply::NoReceipt,
+            ],
+            "spent at 100",
         ),
         (
             "mined between the reads",
-            HASHED(),
-            vec![Reply::NoReceipt, Reply::Nonce(6), receipt()],
-            Some("mined"),
+            &one,
+            vec![
+                Reply::NoReceipt,
+                Reply::Block(100),
+                Reply::Nonce(6),
+                receipt(open_tx()),
+            ],
+            "mined",
         ),
         (
             "vacant",
-            HASHED(),
-            vec![Reply::NoReceipt, Reply::Nonce(5), Reply::Nonce(5)],
-            Some("vacant"),
+            &one,
+            vec![
+                Reply::NoReceipt,
+                Reply::Block(100),
+                Reply::Nonce(5),
+                Reply::Nonce(5),
+            ],
+            "vacant",
         ),
         (
             "hashless, nonce spent",
-            hashless,
-            vec![Reply::Nonce(6)],
-            Some("spent"),
+            &none,
+            vec![Reply::Block(100), Reply::Nonce(6)],
+            "spent at 100",
         ),
         (
-            "hashless, in flight",
-            hashless,
-            vec![Reply::Nonce(5), Reply::Nonce(6)],
-            None,
+            "hashless, pending",
+            &none,
+            vec![Reply::Block(100), Reply::Nonce(5), Reply::Nonce(6)],
+            "pending",
         ),
     ];
-    for (name, unconfirmed, replies, want) in cases {
+    for (name, txs, replies, want) in cases {
         let asserter = script(replies);
         let contract = bare_pool_contract(asserter.clone());
-        let got = resolve_unconfirmed_open(&contract, owner, unconfirmed)
+        let got = match resolve_unconfirmed_open(&contract, owner, 5, txs)
             .await
             .expect(name)
-            .map(|resolution| match resolution {
-                OpenResolution::Mined(_) => "mined",
-                OpenResolution::NonceSpent => "spent",
-                OpenResolution::Vacant => "vacant",
-            });
+        {
+            OpenResolution::Mined(_) => "mined".to_owned(),
+            OpenResolution::NonceSpent { block } => format!("spent at {block}"),
+            OpenResolution::Pending => "pending".to_owned(),
+            OpenResolution::Vacant => "vacant".to_owned(),
+        };
         assert_eq!(got, want, "{name}");
         assert!(asserter.read_q().is_empty(), "{name}: every read was made");
     }
 }
 
 /// The issue's check: an open whose receipt read failed holds until its
-/// transaction mines, then yields the pool that transaction bought.
+/// transaction mines, then yields the pool that transaction bought. A read
+/// that faults on the way is no evidence either way.
 #[tokio::test(start_paused = true)]
 async fn an_unconfirmed_open_waits_out_its_pending_tx_and_takes_the_mined_pool() {
     let owner = Address::repeat_byte(1);
     let pool_id = PoolId::from([0xBB; 32]);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
-    let opened = settle(
+    let landed = settle(
         vec![
             // First tick: still pending.
             Reply::NoReceipt,
+            Reply::Block(100),
             Reply::Nonce(5),
             Reply::Nonce(6),
-            // Second tick: a read faults, which is no evidence either way.
+            // Second tick: a read faults.
             Reply::Fault,
             // Third tick: mined.
-            Reply::Receipt(opened_receipt(pool_id, owner, 9_000_000)),
+            Reply::Receipt(opened_receipt(open_tx(), pool_id, owner, 9_000_000, true)),
         ],
-        HASHED(),
+        hashed(),
         &store,
         owner,
+        &metrics(),
     )
     .await
-    .expect("the mined open settles")
-    .expect("the receipt names the pool");
+    .expect("the mined open settles");
+    let opened = opened_pool(landed).expect("the receipt names the pool");
     assert_eq!(opened.state.pool_id, pool_id);
     assert_eq!(
         opened.state.deposit,
@@ -3091,100 +3230,328 @@ async fn an_unconfirmed_open_waits_out_its_pending_tx_and_takes_the_mined_pool()
     assert_eq!(opened.tx, open_tx());
 }
 
-/// A spent nonce with no receipt in hand asks `getPools`, and adopts the pool
-/// the open bought.
+/// A nonce no transaction holds is re-sent at that same nonce, never
+/// released: the next open would read a later pending nonce, and then both
+/// could mine. A failed re-send waits for the next tick, and the re-send's
+/// receipt settles the open.
+#[tokio::test(start_paused = true)]
+async fn a_vacant_nonce_is_re_sent_at_that_nonce_until_one_open_mines() {
+    let owner = Address::repeat_byte(1);
+    let pool_id = PoolId::from([0xBB; 32]);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    let landed = settle(
+        vec![
+            // First tick: vacant, and the re-send fails.
+            Reply::NoReceipt,
+            Reply::Block(100),
+            Reply::Nonce(5),
+            Reply::Nonce(5),
+            Reply::Fault,
+            // Second tick: vacant, and the re-send goes out.
+            Reply::NoReceipt,
+            Reply::Block(101),
+            Reply::Nonce(5),
+            Reply::Nonce(5),
+            Reply::Sent(resent_tx()),
+            // Third tick: the first open has no receipt; the re-send mined.
+            Reply::NoReceipt,
+            Reply::Receipt(opened_receipt(
+                resent_tx(),
+                pool_id,
+                owner,
+                10_000_000,
+                true,
+            )),
+        ],
+        hashed(),
+        &store,
+        owner,
+        &metrics(),
+    )
+    .await
+    .expect("the re-sent open settles");
+    let opened = opened_pool(landed).expect("the re-send's receipt names the pool");
+    assert_eq!(opened.state.pool_id, pool_id);
+    assert_eq!(opened.tx, resent_tx());
+}
+
+/// A spent nonce with no receipt in hand asks `getPools` at the block it was
+/// read at, and adopts the pool the open bought. A `getPools` fault, and a
+/// pool whose read faults, are no answer: the slot stays held, and a settle
+/// run never counts as an adoption failure.
 #[tokio::test(start_paused = true)]
 async fn a_spent_nonce_adopts_the_pool_the_open_bought() {
     use alloy::sol_types::SolValue;
 
     let owner = Address::repeat_byte(1);
     let pool_id = PoolId::from([0xBB; 32]);
-    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
-    let settled = settle(
+    let pool = || {
+        Reply::Call(
+            onchain_pool(owner, PaymentPool::Status::Open, 10_000_000)
+                .abi_encode()
+                .into(),
+        )
+    };
+    let spent = || {
         vec![
             Reply::NoReceipt,
+            Reply::Block(100),
             Reply::Nonce(6),
             Reply::NoReceipt,
-            // `getPools` faults: no answer, so wait for the next tick.
+        ]
+    };
+    let mut replies = spent();
+    // `getPools` faults.
+    replies.push(Reply::Fault);
+    replies.extend(spent());
+    // `getPools` lists the pool, and its read faults.
+    replies.push(Reply::Call(vec![pool_id].abi_encode().into()));
+    replies.push(Reply::Fault);
+    replies.extend(spent());
+    replies.push(Reply::Call(vec![pool_id].abi_encode().into()));
+    replies.push(pool());
+
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    let metrics = metrics();
+    let landed = settle(replies, hashed(), &store, owner, &metrics)
+        .await
+        .expect("the adoption settles the open");
+    assert!(matches!(landed, Landed::Adopted), "{landed:?}");
+    assert_eq!(
+        store.get_by_owner(owner).unwrap().map(|row| row.pool_id),
+        Some(pool_id)
+    );
+    assert_eq!(adoption_failures(&metrics), 0);
+}
+
+/// A replacement open settles through reconciliation too. The store tracks
+/// the closed pool it replaces; reconciliation drops that row and adopts the
+/// new pool. A faulted read of the closed pool keeps the slot held, because a
+/// pool this node owns must not be dropped on one failed read.
+#[tokio::test(start_paused = true)]
+async fn a_replacement_open_settles_onto_the_new_pool() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::repeat_byte(1);
+    let closed = PoolId::from([0xAA; 32]);
+    let opened = PoolId::from([0xBB; 32]);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    store
+        .record(&BuyerPoolState::new(
+            closed,
+            DEPLOYMENT,
+            owner,
+            Address::repeat_byte(2),
+            U256::from(10_000_000u64),
+        ))
+        .expect("seed the closed pool's row");
+    let ids = || Reply::Call(vec![closed, opened].abi_encode().into());
+    let new_pool = || {
+        Reply::Call(
+            onchain_pool(owner, PaymentPool::Status::Open, 10_000_000)
+                .abi_encode()
+                .into(),
+        )
+    };
+    let closing = Reply::Call(
+        onchain_pool(owner, PaymentPool::Status::Closing, 10_000_000)
+            .abi_encode()
+            .into(),
+    );
+    let landed = settle(
+        vec![
+            // First tick: the walk reads the new pool, and the closed one faults.
+            Reply::NoReceipt,
+            Reply::Block(100),
+            Reply::Nonce(6),
+            Reply::NoReceipt,
+            ids(),
+            new_pool(),
             Reply::Fault,
+            // Second tick: the closed pool reads `Closing`.
             Reply::NoReceipt,
+            Reply::Block(100),
             Reply::Nonce(6),
             Reply::NoReceipt,
-            Reply::Call(vec![pool_id].abi_encode().into()),
+            ids(),
+            new_pool(),
+            closing,
+        ],
+        hashed(),
+        &store,
+        owner,
+        &metrics(),
+    )
+    .await
+    .expect("the replacement settles");
+    assert!(matches!(landed, Landed::Adopted), "{landed:?}");
+    assert_eq!(
+        store.get_by_owner(owner).unwrap().map(|row| row.pool_id),
+        Some(opened)
+    );
+}
+
+/// A spent nonce with no pool on chain means the open escrowed nothing. The
+/// error is a fresh RPC fault, so the caller's classification is unchanged,
+/// and it no longer carries [`OpenUnconfirmed`], because the outcome is known.
+#[tokio::test(start_paused = true)]
+async fn an_open_that_escrowed_nothing_fails_as_a_resolved_rpc_fault() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::repeat_byte(1);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    let err = settle(
+        vec![
+            Reply::NoReceipt,
+            Reply::Block(100),
+            Reply::Nonce(6),
+            Reply::NoReceipt,
+            Reply::Call(Vec::<PoolId>::new().abi_encode().into()),
+        ],
+        hashed(),
+        &store,
+        owner,
+        &metrics(),
+    )
+    .await
+    .expect_err("nothing escrowed");
+    assert_eq!(
+        err.downcast_ref::<PoolOpenFailureReason>(),
+        Some(&PoolOpenFailureReason::RpcError),
+        "{err:#}"
+    );
+    assert!(err.downcast_ref::<OpenUnconfirmed>().is_none(), "{err:#}");
+    assert!(store.get_by_owner(owner).unwrap().is_none());
+}
+
+/// A mined open that reverted escrowed nothing, and says so by its own
+/// receipt: the error is a contract revert, and no `getPools` read is made.
+#[tokio::test(start_paused = true)]
+async fn a_reverted_unconfirmed_open_fails_as_a_contract_revert() {
+    let owner = Address::repeat_byte(1);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    let err = settle(
+        vec![Reply::Receipt(opened_receipt(
+            open_tx(),
+            PoolId::from([0xBB; 32]),
+            owner,
+            10_000_000,
+            false,
+        ))],
+        hashed(),
+        &store,
+        owner,
+        &metrics(),
+    )
+    .await
+    .expect_err("the open reverted");
+    assert_eq!(
+        err.downcast_ref::<PoolOpenFailureReason>(),
+        Some(&PoolOpenFailureReason::ContractRevert),
+        "{err:#}"
+    );
+    assert!(store.get_by_owner(owner).unwrap().is_none());
+}
+
+/// A pool the open resolved to that cannot be recorded is escrowed and
+/// untracked: the open fails as a local fault instead of waiting for a row
+/// it cannot write.
+#[tokio::test(start_paused = true)]
+async fn an_unrecordable_adopted_pool_fails_as_escrowed_but_untracked() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::repeat_byte(1);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(WriteOnlyFault(
+        MemoryBuyerPoolStore::new(),
+        SeedAnswer::Fault,
+    ));
+    let err = settle(
+        vec![
+            Reply::NoReceipt,
+            Reply::Block(100),
+            Reply::Nonce(6),
+            Reply::NoReceipt,
+            Reply::Call(vec![PoolId::from([0xBB; 32])].abi_encode().into()),
             Reply::Call(
                 onchain_pool(owner, PaymentPool::Status::Open, 10_000_000)
                     .abi_encode()
                     .into(),
             ),
         ],
-        HASHED(),
+        hashed(),
         &store,
         owner,
+        &metrics(),
     )
     .await
-    .expect("the adoption settles the open");
-    assert!(settled.is_none(), "reconciliation recorded the pool itself");
-    assert_eq!(
-        store.get_by_owner(owner).unwrap().map(|row| row.pool_id),
-        Some(pool_id)
+    .expect_err("the row cannot be written");
+    assert!(err.downcast_ref::<LocalPullFault>().is_some(), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("escrowed but untracked"),
+        "{err:#}"
     );
 }
 
-/// A spent nonce with no new pool on chain, and a nonce nothing holds, both
-/// mean the open escrowed nothing: the error stays an RPC fault, so the
-/// caller's classification is unchanged and the next miss opens afresh.
-#[tokio::test(start_paused = true)]
-async fn an_open_that_escrowed_nothing_fails_as_an_rpc_fault() {
+/// A tracked pool the chain shows closed, whose row will not drop, leaves
+/// reconciliation undecided rather than "nothing adopted": the node must not
+/// open a second pool beside a row it could not clear.
+#[tokio::test]
+async fn a_stale_row_that_will_not_drop_is_undecided() {
     use alloy::sol_types::SolValue;
 
     let owner = Address::repeat_byte(1);
-    for (name, replies) in [
-        (
-            "nonce spent, no pool",
-            vec![
-                Reply::NoReceipt,
-                Reply::Nonce(6),
-                Reply::NoReceipt,
-                Reply::Call(Vec::<PoolId>::new().abi_encode().into()),
-            ],
-        ),
-        (
-            "vacant",
-            vec![Reply::NoReceipt, Reply::Nonce(5), Reply::Nonce(5)],
-        ),
-    ] {
-        let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
-        let err = settle(replies, HASHED(), &store, owner)
-            .await
-            .expect_err(name);
-        assert_eq!(
-            err.downcast_ref::<PoolOpenFailureReason>(),
-            Some(&PoolOpenFailureReason::RpcError),
-            "{name}: {err:#}"
-        );
-        assert!(store.get_by_owner(owner).unwrap().is_none(), "{name}");
-    }
+    let tracked = PoolId::from([0xAA; 32]);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(ForgetFault(MemoryBuyerPoolStore::new()));
+    store
+        .record(&BuyerPoolState::new(
+            tracked,
+            DEPLOYMENT,
+            owner,
+            Address::repeat_byte(2),
+            U256::from(10_000_000u64),
+        ))
+        .expect("seed the row");
+    let contract = mocked_pool_contract(vec![
+        vec![tracked].abi_encode().into(),
+        onchain_pool(owner, PaymentPool::Status::Closed, 10_000_000)
+            .abi_encode()
+            .into(),
+    ]);
+    assert_eq!(
+        bootstrap_reconcile(
+            &contract,
+            DEPLOYMENT,
+            &store,
+            owner,
+            Address::repeat_byte(2),
+            &metrics()
+        )
+        .await,
+        Reconciled::Unknown
+    );
 }
 
-/// While the open's outcome is unknown the open slot stays held, so a later
-/// miss joins the running open instead of sending a second `openPool`
-/// (#2415). Every read past the send faults, so the outcome never resolves.
+/// While the open's outcome is unknown the open slot stays held, and a miss
+/// fails at once as a local fault instead of joining the open or sending a
+/// second `openPool` (#2415). Every read past the send faults, so the outcome
+/// never resolves.
 #[tokio::test(start_paused = true)]
-async fn an_unconfirmed_open_holds_the_open_slot() {
+async fn an_unconfirmed_open_holds_the_open_slot_and_misses_fail_fast() {
     let owner = Address::repeat_byte(1);
-    let asserter = script(vec![Reply::Nonce(5)]);
-    asserter.push_success(&open_tx());
+    let asserter = script(vec![Reply::Nonce(5), Reply::Sent(open_tx())]);
     let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
     let svc = mocked_service_on(bare_pool_contract(asserter.clone()), store, signer(), owner);
     let provider = Address::repeat_byte(3);
+    let budget = Duration::from_secs(30);
 
+    let started = tokio::time::Instant::now();
     let first = svc
-        .open_or_reuse_pool(provider, Duration::from_secs(1))
+        .open_or_reuse_pool(provider, budget)
         .await
         .expect_err("the open cannot resolve");
     assert!(
-        first.downcast_ref::<PoolOpenPending>().is_some(),
-        "{first:#}"
+        started.elapsed() < budget,
+        "the miss fails when the slot becomes held, not when its budget runs out"
     );
     assert!(asserter.read_q().is_empty(), "the open was sent");
 
@@ -3193,14 +3560,77 @@ async fn an_unconfirmed_open_holds_the_open_slot() {
         svc.open_in_flight.lock().unwrap().is_some(),
         "the open task still holds the slot"
     );
-    // A second open would fail at once on its nonce read; joining the held
-    // open runs out the budget instead.
+    assert_eq!(open_unresolved(&svc.metrics), 1);
     let second = svc
-        .open_or_reuse_pool(provider, Duration::from_secs(1))
+        .open_or_reuse_pool(provider, budget)
         .await
         .expect_err("the open cannot resolve");
+    for err in [first, second] {
+        assert!(err.downcast_ref::<OpenHeld>().is_some(), "{err:#}");
+        assert!(err.downcast_ref::<LocalPullFault>().is_some(), "{err:#}");
+        assert!(err.downcast_ref::<OpenReported>().is_some(), "{err:#}");
+    }
+}
+
+/// End to end: an `openPool` submit that fails in transport holds the slot,
+/// misses fail fast meanwhile, and once the chain shows the nonce spent the
+/// open adopts the pool that appeared, releases the slot, and the store
+/// tracks the pool — with no second `openPool` sent.
+///
+/// The transport failure leaves no hash, so no receipt wait starts, and no
+/// background block poller competes for the scripted replies.
+#[tokio::test(start_paused = true)]
+async fn a_transport_failed_open_adopts_its_pool_once_the_nonce_is_spent() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::repeat_byte(1);
+    let pool_id = PoolId::from([0xBB; 32]);
+    // The nonce read answers; the send then over-calls the queue and fails in
+    // transport, which may have broadcast.
+    let asserter = script(vec![Reply::Nonce(5)]);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    let svc = mocked_service_on(
+        bare_pool_contract(asserter.clone()),
+        Arc::clone(&store),
+        signer(),
+        owner,
+    );
+    let provider = Address::repeat_byte(3);
+
+    let err = svc
+        .open_or_reuse_pool(provider, Duration::from_secs(30))
+        .await
+        .expect_err("the open is unconfirmed");
+    assert!(err.downcast_ref::<OpenHeld>().is_some(), "{err:#}");
+
+    push(
+        &asserter,
+        vec![
+            Reply::Block(100),
+            Reply::Nonce(6),
+            Reply::Call(vec![pool_id].abi_encode().into()),
+            Reply::Call(
+                onchain_pool(owner, PaymentPool::Status::Open, 10_000_000)
+                    .abi_encode()
+                    .into(),
+            ),
+        ],
+    );
+    tokio::time::sleep(OPEN_RESOLVE_INTERVAL * 2).await;
+
     assert!(
-        second.downcast_ref::<PoolOpenPending>().is_some(),
-        "{second:#}"
+        asserter.read_q().is_empty(),
+        "the settle loop read the chain"
+    );
+    assert!(
+        svc.open_in_flight.lock().unwrap().is_none(),
+        "the open task released the slot"
+    );
+    assert!(!*svc.open_hold.held.borrow(), "the hold is released");
+    assert_eq!(open_unresolved(&svc.metrics), 0);
+    assert_eq!(
+        store.get_by_owner(owner).unwrap().map(|row| row.pool_id),
+        Some(pool_id),
+        "the adopted pool is tracked, so the next miss reuses it"
     );
 }

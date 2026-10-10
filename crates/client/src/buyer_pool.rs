@@ -442,7 +442,8 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 ///
 /// # Errors
 ///
-/// Fails on `openPool` submit/receipt, a reverted tx, a missing `PoolOpened`
+/// Fails on the pending-nonce read (nothing sent, so no [`OpenUnconfirmed`]),
+/// `openPool` submit/receipt, a reverted tx, a missing `PoolOpened`
 /// event in the receipt logs, or a capability-signing error. The classified
 /// failure legs attach a [`PoolOpenFailureReason`] into the `anyhow` error chain
 /// (recover it with `err.downcast_ref::<PoolOpenFailureReason>()`) so a caller
@@ -679,23 +680,62 @@ impl std::fmt::Display for OpenUnconfirmed {
         match self.tx {
             Some(tx) => write!(
                 f,
-                "openPool tx {tx} (nonce {}) was broadcast but its receipt was not read, so it \
-                 may have mined; resolve it before opening again, because a second open \
-                 escrows a second deposit",
-                self.nonce
+                "openPool tx {tx} (nonce {n}) was broadcast but its receipt was not read, so it \
+                 may have mined and escrowed the deposit. An open sent before the tx confirms \
+                 or the account's nonce passes {n} escrows a second deposit; `decdn pool list` \
+                 shows the pools this account holds",
+                n = self.nonce
             ),
             None => write!(
                 f,
-                "openPool submit (nonce {}) failed in transport, so the RPC node may have \
-                 broadcast it and it may mine; resolve it against the account's nonce before \
-                 opening again, because a second open escrows a second deposit",
-                self.nonce
+                "openPool submit (nonce {n}) failed in transport, so the RPC node may have \
+                 broadcast it and it may mine. An open sent before the account's nonce passes \
+                 {n} escrows a second deposit; `decdn pool list` shows the pools this account \
+                 holds",
+                n = self.nonce
             ),
         }
     }
 }
 
 impl std::error::Error for OpenUnconfirmed {}
+
+/// Send `openPool(deposit)` from `owner` at exactly `nonce`, and return its
+/// hash without waiting for a receipt.
+///
+/// A caller resolving an [`OpenUnconfirmed`] whose nonce no transaction holds
+/// re-sends with that same nonce. Two transactions at one nonce cannot both
+/// mine, so the re-send and a first open that resurfaces escrow at most one
+/// deposit between them. A receipt wait here would never end if the other
+/// transaction took the nonce, so the caller reads receipts itself.
+///
+/// # Errors
+///
+/// The deposit overflows `uint64`, or the send fails. A send failure carries a
+/// [`PoolOpenFailureReason`] classified from its revert data.
+pub async fn send_open_pool<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
+    deposit: U256,
+    nonce: u64,
+) -> Result<TxHash> {
+    let amount = to_pool_u64(deposit, "deposit")?;
+    match contract
+        .openPool(amount)
+        .from(owner)
+        .nonce(nonce)
+        .send()
+        .await
+    {
+        Ok(pending) => Ok(*pending.tx_hash()),
+        Err(err) => {
+            let reason = PoolOpenFailureReason::classify_revert_data(err.as_revert_data().as_ref());
+            Err(anyhow::Error::new(err)
+                .context(format!("re-send openPool at nonce {nonce}"))
+                .context(reason))
+        }
+    }
+}
 
 /// Typed marker attached to a `top_up` submit error whose revert is an
 /// `ERC20InsufficientAllowance` shortfall: the `PaymentPool`'s standing USDC
@@ -723,7 +763,7 @@ impl std::error::Error for AllowanceShortfall {}
 /// moved while no local record credits it. A caller must not treat it as
 /// "nothing escrowed"; the acquire loop classifies it as fatal to the command
 /// ([`crate::Fault::Fatal`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopUpUnconfirmed {
     /// The broadcast `topUp` transaction, which an operator reconciles
     /// against. `None` when the submit failed in transport: the RPC node may
