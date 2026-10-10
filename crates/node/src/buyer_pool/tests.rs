@@ -2793,9 +2793,9 @@ async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()>
     ))?;
 
     // Filler-free, so `send()` is the one `eth_sendTransaction`: `getPool`
-    // reads a closed-out pool, the chain-head read faults (the sweep attempts
-    // the reclaim anyway), the send returns `hash`, and the empty queue then
-    // faults the receipt read.
+    // reads a `Closing` pool whose dispute deadline has passed, the chain-head
+    // read faults (the sweep attempts the reclaim anyway), the send returns
+    // `hash`, and the empty queue then faults the receipt read.
     let mut closing = onchain_pool(owner, PaymentPool::Status::Closing, 10_000_000);
     closing.disputeDeadline = 1;
     let asserter = Asserter::new();
@@ -2835,5 +2835,7 @@ async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()>
             .any(|l| l == "decdn_buyer_reclaim_failures_total 1"),
         "{exported}"
     );
+    // The reclaim may still mine, so the row stays for the next sweep.
+    assert!(store.get_by_owner(owner)?.is_some(), "the row survives");
     Ok(())
 }

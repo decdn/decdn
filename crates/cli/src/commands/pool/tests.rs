@@ -811,3 +811,13 @@ async fn an_unreadable_reclaim_receipt_names_the_tx() {
         "{err:#}"
     );
 }
+
+/// A mined reclaim revert names its tx; an estimation-time revert broadcast
+/// nothing and names none.
+#[test]
+fn reclaim_reverted_names_only_a_mined_tx() {
+    let pool_id = B256::repeat_byte(0x33);
+    let hash = B256::repeat_byte(0xab);
+    assert!(reclaim_reverted(pool_id, Some(hash)).contains(&format!("(tx {hash:#x})")));
+    assert!(!reclaim_reverted(pool_id, None).contains("(tx "));
+}

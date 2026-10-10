@@ -603,7 +603,7 @@ where
             // One note for both the success line and the failure, so the two
             // cannot drift into different instructions for the same deadline.
             let reclaim_note = format!("run `decdn pool reclaim --pool {pool_id}` {deadline_note}");
-            store.forget_after_close(owner, pool_id, receipt.transaction_hash, &reclaim_note)?;
+            store.forget_after_close(owner, pool_id, tx, &reclaim_note)?;
             Ok(reclaim_note)
         }
         TxOutcome::Reverted => anyhow::bail!(

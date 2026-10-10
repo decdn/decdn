@@ -402,9 +402,9 @@ pub async fn ensure_allowance<P: Provider + Clone>(
                  (tx {approve_tx}; may still mine later)"
             )
         })?
-        .context("await USDC approve receipt")?;
+        .with_context(|| format!("await USDC approve receipt (tx {approve_tx:#x})"))?;
     if !receipt.status() {
-        anyhow::bail!("USDC approve transaction reverted");
+        anyhow::bail!("USDC approve transaction reverted (tx {approve_tx:#x})");
     }
     info!(
         %token,
@@ -464,9 +464,11 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// owner's open slot for exactly as long as this future runs (#1143).
 ///
 /// The wait ends early only when the receipt read itself fails. That error
-/// names the broadcast tx, which may still mine and escrow the deposit, and is
-/// classified [`PoolOpenFailureReason::RpcError`]; reconciling it before another
-/// open is the caller's responsibility.
+/// names the broadcast tx, which may still mine and escrow the deposit. The
+/// error is classified [`PoolOpenFailureReason::RpcError`]. Reconciling the tx
+/// before another open is the caller's responsibility. The broadcast is also
+/// logged at `info` before the wait, so a caller that drops this future still
+/// leaves the hash in the log.
 pub async fn open_pool<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     signer: Arc<PrivateKeySigner>,
@@ -502,6 +504,7 @@ pub async fn open_pool<P: Provider + Clone>(
     // Capture the hash before `get_receipt` consumes `pending`: past this point
     // the deposit may escrow, so a receipt failure names the tx to reconcile.
     let tx = *pending.tx_hash();
+    info!(%tx, %owner, %deposit, "openPool broadcast; awaiting its receipt");
 
     // Unbounded by design — see the `# The receipt wait is deliberately UNBOUNDED`
     // section above.
@@ -837,7 +840,7 @@ pub async fn top_up<P: Provider + Clone>(
             })
     })?;
     if !receipt.status() {
-        anyhow::bail!("topUp reverted for pool {pool_id}");
+        anyhow::bail!("topUp reverted for pool {pool_id} (tx {tx:#x})");
     }
     // Filtered on the emitting address, not just the topic: `topUp` transfers
     // BEFORE it emits, so a token with a transfer hook could plant a forged

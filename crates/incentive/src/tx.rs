@@ -1,7 +1,7 @@
 //! One place to submit a transaction and resolve its outcome (#1355).
 //!
-//! Every on-chain write in this workspace needs the same three steps — send,
-//! await the receipt, fail on a revert — and the tx hash must be read before
+//! Every production on-chain write needs the same three steps — send, await
+//! the receipt, fail on a revert — and the tx hash must be read before
 //! `get_receipt()` consumes the pending handle. A receipt that cannot be fetched
 //! leaves the transaction's fate unknown: it may still mine, and re-sending it
 //! is what causes duplicate spends. That is the one failure mode where the
@@ -14,8 +14,9 @@
 //! the pair so they can word a revert as a likely race: a concurrent close by
 //! the same owner, or a concurrent permissionless reclaim. Like this module,
 //! they read the tx hash before the receipt wait, so a receipt-read error names
-//! the transaction. A send/receipt pair that reads the hash after the receipt
-//! wait is a bug.
+//! the transaction. In production code, a send/receipt pair that reads the hash
+//! after the receipt wait is a bug. The `decdn-e2e` fixtures are exempt: a
+//! failed fixture tx fails the test, and no operator reconciles it.
 
 use alloy::contract::{CallBuilder, CallDecoder, Error as ContractError};
 use alloy::primitives::B256;
