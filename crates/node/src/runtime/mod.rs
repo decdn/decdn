@@ -162,7 +162,7 @@ const FEE_SHARE_BOOT_BUDGET: Duration = Duration::from_mins(1);
 /// `PendingTransactionBuilder::get_receipt`'s heartbeat (alloy-provider
 /// `heart.rs`), which the node awaits in `payment_settlement` and
 /// `buyer_pool` — so this bounds how fast a node awaiting a mined settlement /
-/// channel tx re-polls for its receipt, and alloy's 250 ms localhost default
+/// pool tx re-polls for its receipt, and alloy's 250 ms localhost default
 /// would otherwise hammer a dev anvil for the life of every pending tx.
 ///
 /// `set_poll_interval` uses interior mutability, so this applies to the
@@ -499,8 +499,8 @@ async fn build_infra(
             PersistentPoolStateStore::open(&pool_store_data_dir, pool_store_deployment)
         })
         .await
-        .context("channel state store open task panicked")?
-        .context("failed to open channel state store (issue #527 voucher replay guard)")?,
+        .context("pool state store open task panicked")?
+        .context("failed to open pool state store (issue #527 voucher replay guard)")?,
     );
     // The one redb-backed store implements the voucher-state trait (for the
     // handler + #527 replay guard), the pending-settle trait (for the on-chain
@@ -527,26 +527,26 @@ async fn build_infra(
     // Boot-time smoke test: read every persisted record so startup fails
     // fast on corruption / forward-incompatible schema, well before the
     // `cdn/client/v1` handler is constructed further down the bring-up.
-    // That handler calls `load_all` again to bootstrap its in-memory channel
+    // That handler calls `load_all` again to bootstrap its in-memory lane
     // map — the duplicate read is by design. Infra bring-up hands the handler
     // the *store*, not a snapshot: a pre-built map threaded through
     // `ClientHandlerDeps` would couple this stage to the handler's internal
-    // channel representation. Cost: one extra `load_all` on startup.
+    // lane representation. Cost: one extra `load_all` on startup.
     let persisted_count = tokio::task::spawn_blocking({
         let store = Arc::clone(&pool_state_store);
         move || store.load_all()
     })
     .await
-    .context("channel state store load task panicked")?
-    .context("failed to hydrate persisted channel state")?
+    .context("pool state store load task panicked")?
+    .context("failed to hydrate persisted lane state")?
     .len();
     tracing::info!(
-        channels = persisted_count,
-        "channel state store ready (issue #527 replay guard active)",
+        lanes = persisted_count,
+        "pool state store ready (issue #527 replay guard active)",
     );
 
     // Open the append-only download-receipt audit log (issue #248). Unlike the
-    // channel store, a failure here is NON-fatal: the receipt log is an audit
+    // pool state store, a failure here is NON-fatal: the receipt log is an audit
     // artifact (revenue reconciliation, dispute evidence), not the replay
     // guard, so the node still serves paid delivery — falling back to a
     // discard-only log — rather than refusing to start. The open does a small
@@ -1179,7 +1179,7 @@ async fn build_chain_and_handlers(
     // (`infra.payment_pool_deployment` — one parse, one source of truth); the
     // ephemeral-binding domain to the `CapacityBond` deployment
     // (== `capacity_bond_addr`, which holds the NodeId↔address mappings). The
-    // handler hydrates per-channel voucher state from `pool_state_store` so
+    // handler hydrates per-lane voucher state from `pool_state_store` so
     // a restart cannot replay an already-accepted voucher (#527).
     let payment_pool_addr = infra.payment_pool_deployment.payment_pool;
 
@@ -1250,7 +1250,7 @@ async fn build_chain_and_handlers(
     // INDEPENDENT of `node_to_node_pull_through_enabled`: a cache-only operator must
     // be able to reactively serve content it holds in its OWN fs/http/s3 origin, and
     // — with node→node on — that local origin is preferred over the paid peer window
-    // path. The handler still gates it on proven channel ownership
+    // path. The handler still gates it on proven lane authority
     // (`pull_authorized`), so it fronts no free egress, and `populate_local` never
     // consults the paid `Peer` node→node origin. The node→node
     // window/buffered/governor/gate paths below stay flag-gated.
@@ -1626,7 +1626,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     started_at: std::time::Instant,
 ) -> anyhow::Result<Background> {
     // On-chain buyer-side service (#744). When this node pulls content from an
-    // upstream provider on a cache miss it pays via the same channel mechanism,
+    // upstream provider on a cache miss it pays via the same pool mechanism,
     // acting as the client: a separate wallet-filled provider signs `approve` /
     // `openPool` / `topUp` / `closePool` / `reclaim`. It shares the persistent
     // store (a distinct `buyer_pool_state_v1` table in `buyer.redb`) and re-derives
@@ -2200,7 +2200,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     metrics: node_metrics_for_origin,
                     registry_regions: registry_regions_c,
                     config: node_origin_config,
-                    // One voucher ledger per provider channel, shared by every concurrent
+                    // One voucher ledger per provider lane, shared by every concurrent
                     // pull on it (#1145 review). Built here, at the single place the pull
                     // paths' deps are assembled, so both paths necessarily share it —
                     // which is the point: a per-pull ledger makes concurrent pulls collide

@@ -146,8 +146,8 @@ pub struct LegNoProgress {
     /// The store's delivered frontier in the gap when the leg opened. The pass
     /// after the leg found it no further on.
     pub delivered_frontier: u64,
-    /// The channel ledger's committed WIRE bytes since the leg opened. The ledger
-    /// is shared, so this counts concurrent pulls on the same channel too. With no
+    /// The lane ledger's committed WIRE bytes since the leg opened. The ledger
+    /// is shared, so this counts concurrent pulls on the same lane too. With no
     /// concurrent pull, enough wire to cover the leg's first chunk group points at
     /// the store (it did not keep what was paid for), and zero points at the
     /// ledger or the upstream (the leg's payment was never recorded).
@@ -283,13 +283,13 @@ pub trait PacingWait: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
-/// Read the channel context's current deposit through the shared handle. A tiny
+/// Read the pool context's current deposit through the shared handle. A tiny
 /// helper so the driver never holds the lock across an `.await` — it locks,
 /// copies the `U256`, and drops the guard.
 fn locked_deposit(ctx: &Mutex<PoolContext>) -> anyhow::Result<U256> {
     Ok(ctx
         .lock()
-        .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+        .map_err(|_| anyhow::anyhow!("pool context lock poisoned"))?
         .deposit)
 }
 
@@ -983,7 +983,7 @@ where
 
     // Paid-frontier anchor (PER-LEG, not per-gap). A "leg" is one contiguous
     // delivery from one successful open. `leg_anchor` records `(content offset the
-    // leg opened at, channel-cumulative committed WIRE bytes at that moment)`. It
+    // leg opened at, lane-cumulative committed WIRE bytes at that moment)`. It
     // is re-anchored on every successful open (to the previous paid frontier) and
     // on a reseed (to the healed delivered frontier), and PERSISTS across passes
     // so a resumed leg prices the paid frontier against the previous leg's own
@@ -1082,7 +1082,7 @@ where
         // a gap is done — and may resume — only at bytes that are BOTH paid AND
         // present, tracking the MIN of the two. `content_paid_frontier` prices ONE
         // leg's paid wire, but the `PoolLedger` is SHARED by every concurrent pull on
-        // the channel (`BuyerLedgers`), so a concurrent pull's acked vouchers inflate
+        // the lane (`BuyerLedgers`), so a concurrent pull's acked vouchers inflate
         // `committed.bytes` — and thus `paid_wire_this_leg` — past what THIS leg
         // delivered. Left unclamped, that overshoot makes `paid_cleared` report the
         // gap `Done` (or trips the `paid_frontier >= gap_end` spin-guard in the Draw
@@ -1322,7 +1322,7 @@ where
                     let watermark = {
                         let guard = ctx
                             .lock()
-                            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?;
+                            .map_err(|_| anyhow::anyhow!("pool context lock poisoned"))?;
                         rejection_watermark(&err, &guard)
                     };
 

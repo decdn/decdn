@@ -11,13 +11,12 @@
 //! Lives in `decdn-incentive` rather than the CLI so every on-chain write in
 //! this crate shares one send/receipt path.
 //!
-//! One caller is deliberately NOT migrated: `cli::commands::channel`'s
-//! `submit_close` / `submit_settle` / `submit_reclaim` classify a revert as an
-//! expected *outcome* (`TxOutcome::Reverted`, an `Ok`) rather than an error,
-//! because a channel that someone else already closed is a normal race, not a
-//! failure. Routing them through here would turn that into a hard error. Any
-//! other hand-rolled send/receipt pair is a bug — it will lose the hash on a
-//! receipt timeout.
+//! `cli::commands::pool`'s `close_and_forget` / `reclaim_and_forget` hand-roll
+//! the pair instead: they fold an estimation-time revert and a reverted receipt
+//! into one pool-specific error (`TxOutcome::Reverted`), because a pool that
+//! someone else already closed is a normal race. Their receipt-read error names
+//! no transaction, so a receipt timeout there loses the hash too. Any other
+//! hand-rolled send/receipt pair is a bug for the same reason.
 
 use alloy::contract::{CallBuilder, CallDecoder, Error as ContractError};
 use alloy::primitives::B256;

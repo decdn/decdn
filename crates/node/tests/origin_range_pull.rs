@@ -1164,7 +1164,7 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
     conn.close(0u32.into(), b"done");
 
     // Pin the EXACT reject path: the wire `StreamError` collapses to `NotFound`
-    // (shared with cache-miss / unknown-channel), so only the per-reason counter
+    // (shared with cache-miss / unknown-lane), so only the per-reason counter
     // proves the range-not-satisfiable gate fired rather than some other refusal.
     anyhow::ensure!(
         counter_value(
@@ -1279,7 +1279,7 @@ fn parse_byte_range(h: &str) -> Option<(u64, u64)> {
 /// asserts the dispatch selection reaches `serve_via_backend_origin` — the
 /// `decdn_local_outboard_serves_total` tier counter fires once — and that the
 /// client receives a coherent, hash-verifying whole-blob delivery. There is no
-/// upstream, channel, or payment on the ingest side; the client still pays the
+/// upstream, pool, or payment on the ingest side; the client still pays the
 /// downstream vouchers exactly as any paid delivery.
 #[tokio::test(flavor = "multi_thread")]
 async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Result<()> {
@@ -3190,9 +3190,9 @@ fn spawn_server_concurrent(
 }
 
 /// Build a `ClientHandler` over an `HttpOrigin` with TWO independently-funded
-/// channels (one per concurrent client). Two channels (not one) so each of the two
-/// concurrent deliveries has its own monotonic voucher accounting; the fill
-/// registry keys coalescing on the HASH, not the channel. The pull-through deadline
+/// pools (one per concurrent client). Two pools (not one) so each of the two
+/// concurrent deliveries has its own lane with monotonic voucher accounting; the
+/// fill registry keys coalescing on the HASH, not the lane. The pull-through deadline
 /// is threaded through unchanged (own-origin coalescing does not use it, but the
 /// helper is shared).
 #[allow(clippy::too_many_arguments)]
@@ -3256,7 +3256,7 @@ async fn handler_two_pools_over_http_origin(
 /// own-origin saving — while running TWO live serve legs rather than parking the
 /// second request until the first completes. The proof is on the ORIGIN side:
 /// exactly ONE ranged `206` data GET reaches the backend (not two), and BOTH
-/// clients receive the whole blob byte-exact on their own channels. The own-origin
+/// clients receive the whole blob byte-exact on their own lanes. The own-origin
 /// serve tier therefore fires TWICE (both legs genuinely serve via the
 /// backend-origin path), not once.
 ///
@@ -3519,8 +3519,8 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
         .mount(&server)
         .await;
 
-    // Two clients, two independently-funded channels: coalescing keys on the hash,
-    // and separate channels keep each delivery's vouchers monotonic.
+    // Two clients, two independently-funded pools: coalescing keys on the hash,
+    // and separate lanes keep each delivery's vouchers monotonic.
     let owner_pool = B256::repeat_byte(0x61);
     let waiter_pool = B256::repeat_byte(0x62);
     let owner_eth = Arc::new(PrivateKeySigner::random());

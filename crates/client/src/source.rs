@@ -357,7 +357,7 @@ fn micros_now() -> u64 {
 /// [`Funder`]: funding recovery is the acquire loop's concern, not the source's.
 ///
 /// Borrows its `endpoint`/`slash_domain` (the driver, which owns these for the
-/// whole fetch, outlives every `open`/`finish` call), but holds the channel
+/// whole fetch, outlives every `open`/`finish` call), but holds the pool
 /// context behind a SHARED `Arc<Mutex<PoolContext>>` rather than a `&'a`
 /// borrow. That shared handle is what resolves the #1608 borrow conflict: the
 /// acquire loop mutates the context (crediting a funding recovery step's new
@@ -407,7 +407,7 @@ impl std::fmt::Debug for PeerSource<'_> {
 
 impl<'a> PeerSource<'a> {
     /// Build a source for one gap-driven fetch against `target`, paid out of
-    /// `ledger` over `ctx`'s channel. `namespace_id`, `max_rate_per_mb`, and
+    /// `ledger` over `ctx`'s lane. `namespace_id`, `max_rate_per_mb`, and
     /// `deadlines` are the same buyer-side policy knobs
     /// [`crate::open_progressive_pull`] takes directly — see its docs.
     /// `max_blob_size_bytes` is the received-byte ceiling (#1895) the driver reads
@@ -503,7 +503,7 @@ impl<'a> PeerSource<'a> {
         let ctx = {
             self.ctx
                 .lock()
-                .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                .map_err(|_| anyhow::anyhow!("pool context lock poisoned"))?
                 .clone()
         };
         if let Some(connections) = &self.connections {
@@ -1041,7 +1041,7 @@ mod doubles {
                 entry.2 = Some(tokio::time::Instant::now());
             }
             let Some(ledger) = &self.ledger else {
-                // Unpaid double: no channel, nothing to drain, no watermark.
+                // Unpaid double: no lane, nothing to drain, no watermark.
                 return Ok(VoucherProgress::default());
             };
             if wire > 0 {

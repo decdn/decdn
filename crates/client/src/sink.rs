@@ -195,7 +195,7 @@ pub(crate) fn classify_decode_error(err: DecodeError) -> anyhow::Error {
 /// `total_bytes`-byte blob (#1497).
 ///
 /// Vouchers pay for **wire** bytes — bao-encoded content PLUS interleaved proof
-/// (ADR 038 §Payment metering) — so `paid_wire` (the channel-cumulative bytes an
+/// (ADR 038 §Payment metering) — so `paid_wire` (the lane-cumulative bytes an
 /// ACCEPTED voucher covered, minus this stream's baseline) is a WIRE quantity.
 /// Resuming at `fetch_start + paid_wire` would treat it as a CONTENT offset and,
 /// since wire ≥ content, overshoot the true content paid-frontier: the content

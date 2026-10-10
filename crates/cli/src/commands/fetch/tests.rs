@@ -1712,7 +1712,7 @@ fn lane_wm(pool: u8, provider: u8, prior: u64, bytes: u64, amount: u64) -> LaneW
 
 /// Each lane's watermark is persisted under ITS OWN `LaneKey` and carries ITS
 /// OWN cumulative. Crossing the two — lane A's amount under lane B's key —
-/// strands both channels, and nothing else in the fetch path would notice.
+/// strands both lanes, and nothing else in the fetch path would notice.
 #[test]
 fn multi_lane_watermarks_pair_each_lane_with_its_own_key() {
     let signer = Address::repeat_byte(0x5E);

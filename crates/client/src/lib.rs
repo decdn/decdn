@@ -545,7 +545,7 @@ impl PoolContext {
 /// Sign an ADR 005 ephemeral client identity binding: an EIP-712
 /// `BindNodeId(nodeId, nonce = 0)` attestation over the requester's OWN iroh
 /// `NodeId`, signed with the buyer key. The serving node recovers the signer via
-/// `ecrecover` (`verify_binding`) and checks it owns the named channel before
+/// `ecrecover` (`verify_binding`) and checks it owns the named lane before
 /// honoring a cache-miss origin pull (`pull_authorized`, ADR 003 §Off-Chain
 /// Ephemeral Binding). Used by the CLI client fetch (#1115) and by node-to-node
 /// pulls, where `node_origin` binds its upstream requests so an upstream can
@@ -1325,8 +1325,8 @@ impl std::error::Error for PullStalled {}
 /// So attaching this marker at a NEW site changes serve-path refusals, not just scoring.
 /// Attach it when the failure means *this node* cannot serve anyone — a broken signer, an
 /// unreadable or unwritable store, a poisoned lock, an unfunded wallet. Do NOT attach it to
-/// a condition that is specific to one peer, one channel, or one blob, however much it is
-/// "our side" of the exchange: a wedged channel to a single provider is ours and is still a
+/// a condition that is specific to one peer, one lane, or one blob, however much it is
+/// "our side" of the exchange: a wedged lane to a single provider is ours and is still a
 /// clean miss, because the node can serve every other request perfectly well.
 ///
 /// It is a marker, so it composes: `.context(LocalPullFault)` on any error.
@@ -1584,7 +1584,7 @@ impl PullDeadlines {
 /// `expected_signer` is the delivering node's Ethereum address, used to verify
 /// the response `slash_sig`. `byte_offset` resumes a partial fetch. Use
 /// [`stream_fetch_tracked`] instead if you need to persist the voucher watermark
-/// the channel reached (#852); this convenience wrapper discards it.
+/// the lane reached (#852); this convenience wrapper discards it.
 ///
 /// TEST-ONLY, like the whole `stream_fetch*` family: gated behind the `test-util`
 /// feature alongside [`PullDeadlines::whole_transfer`], the single-deadline shape
@@ -1681,7 +1681,7 @@ pub async fn stream_fetch_on(
     .await
 }
 
-/// Like `stream_fetch`, but reports the channel's acked voucher watermark via
+/// Like `stream_fetch`, but reports the lane's acked voucher watermark via
 /// the `progress` out-param so the caller can persist what it paid (#852).
 ///
 /// `progress` is an out-param: on return it holds the cumulative
@@ -1771,8 +1771,8 @@ pub async fn stream_fetch_tracked_with_progress(
     progress: &mut VoucherProgress,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Bytes> {
-    // One-shot ledger seeded from the channel's prior cumulative state. A single
-    // (non-shared) pull owns its ledger; concurrent shared-channel pulls use
+    // One-shot ledger seeded from the lane's prior cumulative state. A single
+    // (non-shared) pull owns its ledger; concurrent shared-lane pulls use
     // `stream_fetch_shared` with a caller-owned ledger instead.
     let ledger = Arc::new(ctx.new_ledger());
     let result = with_hard_cap(
@@ -1875,7 +1875,7 @@ pub async fn stream_fetch_shared(
             slash_domain,
             expected_signer,
             hash,
-            // Shared-channel pulls model the daemon as buyer on a node-to-node
+            // Shared-lane pulls model the daemon as buyer on a node-to-node
             // fill; the requester already discovered the holder, so no namespace.
             decdn_protocol::client::NO_NAMESPACE,
             byte_offset,
@@ -1884,7 +1884,7 @@ pub async fn stream_fetch_shared(
             max_rate_per_mb,
             deadlines,
             ledger,
-            // Shared concurrent pulls interleave many blobs on one channel; a
+            // Shared concurrent pulls interleave many blobs on one lane; a
             // single unified byte-progress readout would be meaningless, so this
             // path never reports progress.
             None,
@@ -1985,7 +1985,7 @@ async fn open_stream(
             timestamp_us,
         };
         // Two-phase encode (ADR 005): attach the client identity binding when the
-        // context carries one, so the serving node can prove channel ownership and
+        // context carries one, so the serving node can prove lane authority and
         // authorize a cache-miss origin pull (#1115). Absent ⇒ no ext bytes: the
         // base frame alone (unbound node-to-node / registered-client path).
         let ext = client_binding_ext(ctx);
@@ -2033,11 +2033,11 @@ pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 /// `bundle.bytes_delivered` is deliberately NOT used as the retry's wire
 /// `byte_offset`, even though that is what makes a `WatermarkBundle` look
 /// resumable at a glance. The two are different axes: `bytes_delivered` is
-/// the CHANNEL's cumulative payment counter (used to reconstruct each
+/// the LANE's cumulative payment counter (used to reconstruct each
 /// voucher's EIP-712 `bytesDelivered`, ADR 005 — [`Voucher`] carries no such
 /// field on the wire), not a position within THIS blob's byte range. A
-/// channel can fund many blobs; jumping the wire offset ahead to the
-/// channel's cumulative would, for a caller that requested `byte_offset == 0`,
+/// lane can pay for many blobs; jumping the wire offset ahead to the
+/// lane's cumulative would, for a caller that requested `byte_offset == 0`,
 /// silently return a TRUNCATED tail instead of the full blob the caller is
 /// relying on getting back. The bytes already decoded in the failed attempt
 /// were dropped with it, so there is nothing to legitimately splice a jump
@@ -2402,7 +2402,7 @@ pub(crate) fn voucher_signed_by(
 ///
 /// Both halves of the bundle are folded into money a resuming signer signs, so both have to be
 /// evidence. The anchor half is the client's own signature ([`voucher_signed_by`]; see its doc
-/// for why acting on an unverified watermark is a channel-draining hole rather than a robustness
+/// for why acting on an unverified watermark is a pool-draining hole rather than a robustness
 /// nicety). The chain half carries no signature at all, which is what makes the tip check the
 /// only thing standing between an inflated `verified_index` and a client that signs it.
 pub(crate) fn resumable_watermark<'a>(
@@ -2911,8 +2911,8 @@ pub struct UpstreamPull {
     send: SendStream,
     recv: RecvStream,
     ctx: PoolContext,
-    /// The channel's voucher ledger, SHARED with every other concurrent pull on this
-    /// channel (#1145 review). Not a per-pull one-shot: that made two concurrent pulls
+    /// The lane's voucher ledger, SHARED with every other concurrent pull on this
+    /// lane (#1145 review). Not a per-pull one-shot: that made two concurrent pulls
     /// each compute the same next cumulative `amount` independently and collide
     /// (`AmountRegression`).
     ledger: Arc<PoolLedger>,
@@ -2999,8 +2999,8 @@ impl std::fmt::Debug for UpstreamPull {
 /// [`UpstreamPull`] carries into every streaming read; `deadlines.hard_cap` is not consulted
 /// here (the caller owns the streaming lifetime on this path).
 ///
-/// `ledger` is the CHANNEL's voucher ledger, not this pull's: pass the same
-/// `Arc<PoolLedger>` to every concurrent pull on one channel, or they will each
+/// `ledger` is the LANE's voucher ledger, not this pull's: pass the same
+/// `Arc<PoolLedger>` to every concurrent pull on one lane, or they will each
 /// compute the same next cumulative `amount` independently and collide
 /// (`AmountRegression`, #1145 review). The caller reads what to
 /// persist from it — including after a drop — via [`PoolLedger::settlement`].
@@ -3355,7 +3355,7 @@ impl UpstreamPull {
     }
 
     /// Send one voucher for `delta_bytes` newly verified since the last voucher,
-    /// through the CHANNEL's ledger — shared with every other concurrent pull on it, so
+    /// through the LANE's ledger — shared with every other concurrent pull on it, so
     /// their vouchers are serialized into strict cumulative-amount order rather than
     /// colliding. Sends optimistically (#1484): the ack is
     /// read back by [`Self::next_chunk`] / [`Self::finish`], not awaited here.
@@ -3873,8 +3873,8 @@ impl Drop for UpstreamPull {
     /// them ran; it only takes effect on a dropped-without-finalize path.
     ///
     /// It tears down the transport and nothing else, and that is sufficient: the
-    /// acked watermark lives in the channel's [`PoolLedger`], which OUTLIVES the
-    /// pull (it is shared with the other pulls on the channel), not in a field of
+    /// acked watermark lives in the lane's [`PoolLedger`], which OUTLIVES the
+    /// pull (it is shared with the other pulls on the lane), not in a field of
     /// this struct. A dropped pull's caller reads it with [`PoolLedger::settlement`]
     /// and persists it — `node_origin` does exactly that from its own `Drop` guard
     /// (#1145 review).

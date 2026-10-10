@@ -81,7 +81,7 @@ impl ClientHandler {
     /// while the serve leg streams the filling cache to the paying client, pacing the
     /// upstream spend by the downstream's vouchers so per-request speculative
     /// exposure is bounded to the ramped credit window (#1669) rather than the
-    /// whole blob. The caller has already proven channel ownership. The request may
+    /// whole blob. The caller has already proven lane authority. The request may
     /// be whole-blob, bounded, or resumed: the serve leg clamps delivery to
     /// `[byte_offset, end)` and the pull leg fills only that span's missing chunk
     /// groups.
@@ -101,7 +101,7 @@ impl ClientHandler {
     /// The no-openable-provider exit adds a SECOND source of that fault: the pull's
     /// own [`PullMiss`](crate::node_origin::PullMiss), which says whether the
     /// candidate walk failed on a fault in THIS node — a buyer key that cannot
-    /// sign, a deadline config that cannot run, a channel store it cannot read
+    /// sign, a deadline config that cannot run, a pool store it cannot read
     /// (#1560). The two are OR'd, because they are the same claim from different
     /// tiers: this node, not the content, is why the request cannot be answered.
     ///
@@ -112,7 +112,7 @@ impl ClientHandler {
     /// buffered twin the same way), and closing it needs a latch the caller owns rather
     /// than one living inside the future.
     ///
-    /// The channel-class refusals (`UnknownLane`, `InsufficientDeposit`) keep
+    /// The lane-class refusals (`UnknownLane`, `InsufficientDeposit`) keep
     /// their own reasons: they are client-attributable and would have refused
     /// regardless of origin health. `UnknownLane` collapses to `NotFound` so a
     /// prober cannot map out lanes, and `InsufficientDeposit` reaches only a
@@ -369,7 +369,7 @@ impl ClientHandler {
         // decide whether this miss OWNS a fresh pull for `hash` or ATTACHES as an
         // observer to a live one. Two concurrent same-hash misses whose starts sit
         // at or behind the live fill's paid frontier therefore share ONE upstream
-        // pull (no double spend, #305) while each keeps its own per-channel voucher
+        // pull (no double spend, #305) while each keeps its own per-lane voucher
         // stream; a request AHEAD of that frontier owns its own pull instead
         // (#2062 — attaching would starve it behind the other client's payments),
         // at the cost of fetching the overlap not yet in the store twice
@@ -631,7 +631,7 @@ impl ClientHandler {
     /// stripped. The local pull leg fetches + verifies + stores each missing range
     /// straight out of this node's origin ([`decdn_cache::CacheEngine::origin_range_wire`]
     /// behind a [`crate::node_origin::BackendSource`]) while the serve leg streams
-    /// the filling cache to the paying client; there is no counterparty, no channel,
+    /// the filling cache to the paying client; there is no counterparty, no lane,
     /// and no payment on the ingest side, so no discovery, no `PeerSource`, no
     /// `NodeFunder`, and no upstream counterparty.
     ///
@@ -641,7 +641,7 @@ impl ClientHandler {
     /// request may be whole-blob, bounded, or resumed: the serve leg clamps delivery
     /// to `[byte_offset, end)` and the local pull leg fills only that span's missing
     /// chunk groups, so a bounded request pulls exactly its aligned span from
-    /// origin. The caller has proven channel ownership (`pull_authorized`).
+    /// origin. The caller has proven lane authority (`pull_authorized`).
     /// Terminal: consumes `send`/`recv`.
     ///
     /// Like the peer twin, this claims the fill itself (`CacheEngine::claim_fill`)

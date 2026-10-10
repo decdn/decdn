@@ -15,11 +15,11 @@
 //!
 //! **Boundary (deliberately not covered here).** The runtime orchestration is
 //! out of scope for this file. The cache-engine hook that, on a miss, discovers
-//! a provider, opens the upstream channel, pulls, and populates the cache is
+//! a provider, opens the upstream pool, pulls, and populates the cache is
 //! `decdn_node::node_origin::NodeOrigin`, which `runtime/mod.rs` constructs
 //! and provisions when `cache.node_to_node_pull_through_enabled` is set;
 //! `node_origin_pull.rs` is the suite that covers it. This file instead drives
-//! the two protocol hops by hand: hop 1 opens the channel and pulls, and step 2
+//! the two protocol hops by hand: hop 1 opens the pool and pulls, and step 2
 //! populates B's cache. Of those, the cache population is the awkward one: the
 //! engine's public ingest paths are origin pull-through and the serve-miss pull
 //! leg (`CacheEngine::claim_fill`), and the latter wants a bao verified stream
@@ -97,7 +97,7 @@ fn slash_domain() -> Eip712Domain {
 }
 
 /// The fixed EIP-712 domains shared by both hops' handlers. The hops are
-/// distinguished by per-node identities and channel ids, not by domain.
+/// distinguished by per-node identities and pool ids, not by domain.
 fn hop_domains() -> HandlerDomains {
     HandlerDomains {
         slash: slash_domain(),
@@ -227,7 +227,7 @@ fn build_server(
 }
 
 /// End-to-end two-hop paid pull-through: A → B (paid pull), then B → client
-/// (paid serve). Bytes survive both hops and both off-chain channels advance.
+/// (paid serve). Bytes survive both hops and both off-chain lanes advance.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     // Position-varying, not a constant fill: a vectored write that permuted chunks
@@ -376,7 +376,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
 // binaries can share them; only the test-specific `lying_upstream` is local.
 // ===========================================================================
 
-/// Sad path: opening the upstream delivery channel fails (#746).
+/// Sad path: opening the upstream delivery stream fails (#746).
 ///
 /// We model an unusable upstream as one that is reachable at the transport but
 /// refuses to serve: its accept loop takes the QUIC connection and immediately
@@ -394,7 +394,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn upstream_pool_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
     // Upstream A speaks `cdn/client/v1` but hangs up on every connection instead
-    // of serving — the requester sees the channel collapse before any bytes.
+    // of serving — the requester sees the connection collapse before any bytes.
     let a_sk = fresh_key();
     let a_id = a_sk.public();
     let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -435,11 +435,11 @@ async fn upstream_pool_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
     // Pin the failure to a *fast* transport collapse (connect / open_bi / first
     // read), not the deadline backstop: an error carrying "timed out" would mean
     // the requester hung to the 10s limit instead of surfacing the refused
-    // channel — the "never a hang past the deadline" half of the contract, and
+    // connection — the "never a hang past the deadline" half of the contract, and
     // the discriminator that stops this passing for the wrong reason.
     anyhow::ensure!(
         !err.to_string().contains("timed out"),
-        "pull should fail fast on the collapsed channel, not hang to the deadline: {err}"
+        "pull should fail fast on the collapsed connection, not hang to the deadline: {err}"
     );
 
     // Join rather than abort, so a panic inside the fake upstream surfaces here
@@ -458,11 +458,11 @@ async fn upstream_pool_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
 /// connection before paying any voucher. Two properties must hold:
 ///
 /// 1. The aborted pull advances **nothing** — B accepts no voucher, so the
-///    channel stays at nonce 0. No payment is fabricated for un-acked bytes and
+///    lane stays at nonce 0. No payment is fabricated for un-acked bytes and
 ///    no half-open delivery is committed to the store.
-/// 2. The channel is **not wedged**: a subsequent honest pull on the *same*
-///    channel completes and advances it normally, proving the mid-stream abort
-///    left behind no poisoned per-channel lock or dangling delivery state (the
+/// 2. The lane is **not wedged**: a subsequent honest pull on the *same*
+///    lane completes and advances it normally, proving the mid-stream abort
+///    left behind no poisoned per-lane lock or dangling delivery state (the
 ///    serial accept loop, in particular, must recover to serve the next client).
 ///
 /// [`ClientHandler`]: decdn_node::handlers::client::ClientHandler

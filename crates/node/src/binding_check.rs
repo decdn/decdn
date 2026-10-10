@@ -5,7 +5,7 @@
 //! the daemon happens to serve under. A node whose `node.secret` was replaced
 //! without a matching `bindNodeId` therefore keeps serving and keeps getting
 //! paid while its bond is unreachable — it is unslashable. Nothing else in the
-//! runtime notices: the node is healthy, its channels settle, and its peers
+//! runtime notices: the node is healthy, its lanes settle, and its peers
 //! simply stop routing to an id no longer in the staker set, which reads like
 //! ordinary churn.
 //!

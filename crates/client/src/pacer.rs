@@ -94,7 +94,7 @@ pub struct PaceState {
     pub cleared_bytes: u64,
     /// Total content bytes the caller requested.
     pub requested_bytes: u64,
-    /// Spendable deposit left on the channel: `deposit - committed.amount`.
+    /// Spendable deposit left in the pool: `deposit - committed.amount`.
     pub remaining_deposit: U256,
     /// Cost of the next voucher at the upstream's quoted rate/cadence
     /// (`ceil(interval_bytes * rate_per_mb / MiB)`), priced by the driver from the

@@ -726,7 +726,7 @@ fn write_tx_line(w: &mut impl io::Write, key: &str, tx: Option<&B256>) -> io::Re
 /// `node::format_age`, which renders elapsed time; kept local (and dependency
 /// free — the CLI's dependency set pulls in no `chrono`/`humantime`) because the
 /// unbonding window is the only place the CLI *formats* a future duration;
-/// `channel` reports its dispute deadline as a raw timestamp.
+/// `pool` reports its dispute deadline as a raw timestamp.
 pub(crate) fn format_remaining(secs: u64) -> String {
     const MIN: u64 = 60;
     const HOUR: u64 = 60 * MIN;

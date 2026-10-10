@@ -3416,7 +3416,7 @@ where
                 .iter()
             {
                 ctx.lock()
-                    .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                    .map_err(|_| anyhow::anyhow!("pool context lock poisoned"))?
                     .deposit = new_deposit;
             }
             deposit_tx.send_replace(new_deposit);
@@ -3463,7 +3463,7 @@ where
     // where the last run left off; each lane folds in its own leg deltas.
     let base_present = ranges_content_len(&store.present_ranges().await?, first_bound);
     let progress_agg = AtomicU64::new(base_present);
-    // Surface the resume base on the bar before any lane opens a channel.
+    // Surface the resume base on the bar before any lane opens a leg.
     if let Some(cb) = env.on_progress {
         cb(base_present, first_bound);
     }

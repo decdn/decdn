@@ -24,7 +24,7 @@ pub fn parse_address(value: &str, label: &str) -> anyhow::Result<Address> {
 /// on-chain revert at call time, so reject it here with a clear, labelled error.
 ///
 /// Use this for **every contract address** parsed from a flag/config: the CLI's
-/// `resolve` / `fetch` / `channel` / `setup` sites (#1153/#1213), the daemon's
+/// `resolve` / `fetch` / `pool` / `setup` sites (#1153/#1213), the daemon's
 /// runtime bring-up sites (#1219), and the swap-venue addresses in
 /// `decdn-incentive` (#1213). Account/EOA addresses (`--provider-address`,
 /// `operator`) deliberately stay on [`parse_address`] — the "never a real

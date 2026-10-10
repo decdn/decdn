@@ -141,7 +141,7 @@ async fn run_streams() -> anyhow::Result<()> {
     );
 
     // Prove the tee landed: a second fetch (by a fresh, differently-funded
-    // client, so nothing about the first buyer's channel/voucher state can
+    // client, so nothing about the first buyer's lane/voucher state can
     // mask the answer) must still succeed and be byte-correct, and must NOT
     // bump the stream-while-store counter again — the blob is now served from
     // the node's own cache store, not re-streamed from origin.
@@ -272,7 +272,7 @@ async fn run_corrupt_outboard() -> anyhow::Result<()> {
     // both the data object and the corrupt outboard, so a second fetch has no
     // origin left to stream from; it can only succeed if the node kept a copy
     // of the partial, unverified bytes. A fresh client keeps the first buyer's
-    // channel state from masking the answer.
+    // lane state from masking the answer.
     let data_path = node.origin_root().join(shard).join(hex.as_str());
     std::fs::remove_file(&data_path).context("remove seeded origin data object")?;
     std::fs::remove_file(&outboard_path).context("remove corrupted origin outboard")?;

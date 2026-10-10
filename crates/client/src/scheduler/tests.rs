@@ -303,7 +303,7 @@ async fn progress_positions_are_monotonic_across_lanes() -> anyhow::Result<()> {
 }
 
 /// A resumed fetch surfaces the already-present base on the bar BEFORE any
-/// lane opens a channel: the first reported position is the held prefix's
+/// lane opens a leg: the first reported position is the held prefix's
 /// content length, not `0`.
 #[tokio::test]
 async fn resume_base_is_reported_before_the_first_chunk() -> anyhow::Result<()> {
@@ -364,7 +364,7 @@ async fn resume_base_is_reported_before_the_first_chunk() -> anyhow::Result<()> 
         first,
         (base_present, total),
         "the first reported position must be the resume base, emitted before \
-         any lane opens a channel"
+         any lane opens a leg"
     );
     Ok(())
 }

@@ -376,7 +376,7 @@ async fn node_deregistered_removes_from_both() {
 
 /// The highest-value test in this module. Ejection flips `isActive` ONLY —
 /// the binding must survive, because the operator may still be owed payment
-/// on an open channel. A reflexive "union the arms" merge would drop it here.
+/// on an open lane. A reflexive "union the arms" merge would drop it here.
 #[tokio::test]
 async fn node_auto_ejected_deactivates_but_keeps_the_binding() {
     let (mut s, active, bindings, _op, _regions, _m) = sink(ok_reads(), true);
@@ -649,7 +649,7 @@ async fn reinstated_resolves_via_node_id_of_and_leaves_bindings_untouched() {
 ///
 /// `nodeIdOf` reports `active: false` here, matching what the event implies;
 /// the binding survives, because an ejected operator may still be owed
-/// payment on an open channel.
+/// payment on an open lane.
 #[tokio::test]
 async fn ejected_by_blacklist_deactivates_but_keeps_the_binding() {
     let (mut s, active, bindings, _op, _regions, _m) =

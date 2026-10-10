@@ -32,7 +32,7 @@ fn an_unprovisioned_origin_refuses_no_whole_blob_request() {
 }
 
 /// The wedge is a FIXED [`WEDGED_PROVIDER_SUPPRESSION_SECS`] window measured from the
-/// rejection, not a channel deadline — the buyer pool is shared across every provider and
+/// rejection, not a lane deadline — the buyer pool is shared across every provider and
 /// carries no per-provider expiry to key one on. Round-trips the write and the read halves
 /// so the horizon's DERIVATION is pinned, not just its comparison: nothing else in the
 /// workspace distinguishes 3600s from any other future instant, because both integration

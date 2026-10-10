@@ -287,7 +287,7 @@ async fn run_rotation() -> anyhow::Result<()> {
     .await?
     .context(
         "vouchers signed against the pre-rotation identity never settled on-chain — rotation \
-         must not strand a channel the operator already earned on",
+         must not strand a lane the operator already earned on",
     )?;
     assert!(
         served >= content_bytes && served <= wire_bytes,

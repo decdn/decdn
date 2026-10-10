@@ -608,8 +608,8 @@ impl From<FloorRefusal> for ServeRejectReason {
 /// per-reason reject counter (#876). Finer-grained than the wire `StreamError`,
 /// which carries only the three open-time refusal classes (ADR 005 §Open-time
 /// refusal classes): `CacheMiss`, `UnknownLane`, and `OwnerMismatch` all
-/// ship as `NotFound` (to avoid leaking channel existence), but are distinct
-/// here so an operator can, e.g., isolate an unknown-channel abuse campaign.
+/// ship as `NotFound` (to avoid leaking lane existence), but are distinct
+/// here so an operator can, e.g., isolate an unknown-lane abuse campaign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeRejectReason {
     /// The node withdrew the blob after a probe: an operator evict or a
@@ -703,7 +703,7 @@ enum ServeRejectReason {
     /// two are deliberately one and the same on the wire, see
     /// [`Self::wire_error`].
     ChainHashDenied,
-    /// The channel's funding address is on the origin blacklist — the operator's
+    /// The pool's funding address is on the origin blacklist — the operator's
     /// local `denied_origins` or the on-chain one (ADR 011 §On Blacklist Event).
     OriginDenied,
     /// The origin-only policy (#1759, `cache.relay_foreign_namespaces = false`)
@@ -830,7 +830,7 @@ enum FillOutcome {
     /// - TRANSIENT: the operator's origin is 5xx-ing or its store is briefly unhappy.
     ///   Passes on its own.
     /// - PERMANENT: this node's buyer side cannot pay at all — a broken signer, an
-    ///   unusable deadline config, a channel store it cannot read (#1560). The node-origin
+    ///   unusable deadline config, a pool store it cannot read (#1560). The node-origin
     ///   surfaces these as `OriginPullError::Permanent`, which the engine collapses into
     ///   `CacheError::OriginError` like any other origin failure. It recurs on every
     ///   request for EVERY hash until an operator intervenes.
@@ -1390,18 +1390,18 @@ pub struct ClientHandler {
     /// Node-to-node cache-miss pull-through deadline (#831), set at construction
     /// via [`ClientHandlerDeps`]. `None` (the default — feature off, and in
     /// tests) disables pull-through: a cache miss returns `NotFound`. When
-    /// `Some`, a miss *from a request that proves ownership of the named channel*
+    /// `Some`, a miss *from a request that proves authority over the named lane*
     /// (see [`Self::pull_authorized`]) triggers `cache.populate` (the engine's
     /// `NodeOrigin` discovers, pays, pulls, and fills the store), bounded by this
-    /// deadline so a slow upstream can't pin the delivery path. Proven channel
-    /// ownership — not mere channel existence, which is public — is the
-    /// anti-proxy-abuse gate: a client without an owned channel cannot make this
+    /// deadline so a slow upstream can't pin the delivery path. Proven lane
+    /// authority — not mere pool existence, which is public — is the
+    /// anti-proxy-abuse gate: a client without authority over a lane cannot make this
     /// node front upstream egress.
     pull_through: Option<Duration>,
     /// Reactive LOCAL-origin pull-through deadline (#1116), set at construction
     /// via [`ClientHandlerDeps`] whenever `[cache.origin]` is configured —
     /// INDEPENDENT of `node_to_node_pull_through_enabled`. When `Some`, a cache
-    /// miss on a proven-owned channel first tries to fill from the node's OWN
+    /// miss on a proven-authorized lane first tries to fill from the node's OWN
     /// fs/http/s3 origin (`CacheEngine::populate_local`, which never touches the
     /// paid `Peer` origin), so a cache-only operator can reactively serve its own
     /// content and a local origin is preferred over the paid peer window path.
@@ -1410,7 +1410,7 @@ pub struct ClientHandler {
     local_populate: Option<Duration>,
     /// Window-paced node→node pull-through provider (#856), set at construction
     /// via [`ClientHandlerDeps`]. When `Some` (alongside `pull_through`), a cache
-    /// miss for an offset-0 request that proves channel ownership is served by
+    /// miss for an offset-0 request that proves lane authority is served by
     /// fusing a progressive upstream pull with downstream delivery — forwarding
     /// each chunk to the paying client and teeing it into the cache — so
     /// per-request speculative exposure is bounded to the ramped credit window
@@ -1447,7 +1447,7 @@ pub struct ClientHandler {
     max_concurrent_streams: usize,
     /// Throttle for the insufficient-deposit refusal `warn!` (#1520). Unkeyed:
     /// the aggregate answers the triage question — "one client ran dry" versus
-    /// "I am refusing everyone" — and the per-channel detail lives in the
+    /// "I am refusing everyone" — and the per-lane detail lives in the
     /// `debug!` beside it and in the counter.
     deposit_refusal_warn: WarnThrottle,
     /// The same window for the per-signer LIVE-cap arm. Kept separate from the
@@ -1518,7 +1518,7 @@ impl ClientHandler {
     /// delivery protocol for both client-to-node and node-to-node transfers.
     pub const ALPN: &'static [u8] = ALPN_CLIENT;
 
-    /// Construct the handler from [`ClientHandlerDeps`], hydrating per-channel
+    /// Construct the handler from [`ClientHandlerDeps`], hydrating per-lane
     /// state from the deps' `pool_state_store`.
     ///
     /// All optional runtime wiring (settlement redeem hints, pull-through
@@ -1528,7 +1528,7 @@ impl ClientHandler {
     ///
     /// # Errors
     ///
-    /// Propagates a [`decdn_incentive::StoreError`] if the persisted channel
+    /// Propagates a [`decdn_incentive::StoreError`] if the persisted lane
     /// state cannot be loaded — the node must not serve paid delivery without
     /// knowing prior voucher state (the #527 replay guard).
     pub fn new(deps: ClientHandlerDeps) -> anyhow::Result<Self> {
@@ -2452,7 +2452,7 @@ impl ClientHandler {
     /// blacklist, or an eviction; a funder via either origin list.
     ///
     /// Cheap enough for a per-MB call: three atomic loads and a hash-set probe
-    /// each, against a boundary that already takes a channel lock and a network
+    /// each, against a boundary that already takes a lane lock and a network
     /// round trip to collect a voucher.
     pub(super) fn takedown_landed(&self, hash: Hash, funder: Option<Address>) -> bool {
         self.cache.refuses(hash)

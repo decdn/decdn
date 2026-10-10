@@ -69,7 +69,7 @@ fn content_paid_frontier_never_over_maps_and_is_tight() {
 ///
 /// `content_paid_frontier` inverts the wire cost of ONE contiguous delivery
 /// starting at `fetch_start`. Its caller derives `paid_wire` from a
-/// CHANNEL-cumulative watermark, so if the `(fetch_start, baseline)` pair is
+/// LANE-cumulative watermark, so if the `(fetch_start, baseline)` pair is
 /// not re-anchored when a new leg begins, the second call is handed the SUM of
 /// two independent bao range encodings against the first leg's start offset.
 ///

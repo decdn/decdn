@@ -2,7 +2,7 @@
 //! (`appendix-operator-key-rotation.md` § EOA → EOA migration).
 //!
 //! There is no rebinding API for the on-chain address. The address *is* the
-//! stake owner — bond, channels, `firstBondedAt`, and the node binding all key
+//! stake owner — bond, pools, `firstBondedAt`, and the node binding all key
 //! on it — so rotating it means moving the whole identity: deregister, request
 //! unbonding, wait out the full window, withdraw, then re-bond and re-register
 //! from the new address. That is five transactions spread across days, not one

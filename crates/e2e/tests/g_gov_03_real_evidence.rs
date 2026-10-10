@@ -131,8 +131,8 @@ async fn run() -> anyhow::Result<()> {
     let client = ClientFixture::new(&chain).await?;
     let node_id = B256::from_slice(node.node_id().as_bytes());
 
-    // A real session: opens + funds a channel and warms `hash`, so the node has
-    // observed the channel AND holds the blob — both preconditions for it to sign
+    // A real session: opens + funds a pool and warms `hash`, so the node has
+    // observed the lane AND holds the blob — both preconditions for it to sign
     // a real `ok: true` delivery response below.
     let (session, _) = client.open_session(&chain, &node, hash).await?;
 

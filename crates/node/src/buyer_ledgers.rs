@@ -6,7 +6,7 @@
 //! lane, so N concurrent pulls with N ledgers all sign the next cumulative voucher
 //! from the same baseline and collide — the node accepts exactly one and rejects
 //! the rest as an amount regression. `open_progressive_pull` therefore takes the
-//! CHANNEL's `Arc<PoolLedger>`, never a per-pull one.
+//! LANE's `Arc<PoolLedger>`, never a per-pull one.
 //!
 //! Both node pull paths built a FRESH ledger per pull and so broke that contract (#1145
 //! review). It is reachable at the defaults, on an ordinary node doing nothing unusual: the

@@ -143,15 +143,6 @@ struct StubOpener {
     voucher_domain: Eip712Domain,
     /// `record_progress` calls in order — the test's view of what was persisted.
     recorded: Arc<Mutex<Vec<ProgressEntry>>>,
-    /// `retire_channel` calls in order — the test's view of which channels were
-    /// rotated out after an upstream said they could never pay again (#1145 review).
-    ///
-    /// Retirement is modelled, not just logged: once a provider's channel is retired,
-    /// `open_or_reuse_pool` stops resuming from its persisted watermark and hands
-    /// back a fresh (zeroed) context, which is what the store-backed service does once
-    /// the row is gone. A test can therefore tell a channel that was *recorded* as
-    /// retired from one that actually stopped being reused.
-    retired: Arc<Mutex<Vec<(Address, B256)>>>,
 }
 
 #[async_trait]
@@ -161,18 +152,6 @@ impl PoolOpener for StubOpener {
         provider_addr: Address,
         _budget: Duration,
     ) -> Result<PoolContext> {
-        // A retired channel is GONE: the store row was dropped, so there is nothing to
-        // resume from and the next open starts clean. Modelling this is what lets a test
-        // distinguish "we retired the channel" from "we retired it and then resumed the
-        // dead watermark anyway", which would wedge the fresh lane exactly as the
-        // retired one is (#1145 review).
-        let was_retired = self
-            .retired
-            .lock()
-            .map_err(|_| anyhow::anyhow!("retired lock poisoned"))?
-            .iter()
-            .any(|(provider, _)| *provider == provider_addr);
-
         let recorded = self
             .recorded
             .lock()
@@ -183,7 +162,6 @@ impl PoolOpener for StubOpener {
             .iter()
             .rev()
             .find(|(provider, ..)| *provider == provider_addr)
-            .filter(|_| !was_retired)
             .map_or((U256::ZERO, U256::ZERO), |(_, b, a)| (*b, *a));
         Ok(PoolContext {
             pool_id: self.pool_id,
@@ -222,7 +200,7 @@ impl PoolOpener for StubOpener {
     }
 }
 
-/// An opener that hands back a fresh-channel context but whose `record_progress`
+/// An opener that hands back a fresh-lane context but whose `record_progress`
 /// always fails — models a store-write failure on the persist path so a test can
 /// assert the pull still delivers the paid-for bytes (#852: a persist failure
 /// must not fail the pull, only surface via the metric + warn).
@@ -616,7 +594,6 @@ fn stub_opener(
         signer: Arc::clone(signer),
         voucher_domain: voucher_dom(),
         recorded: Arc::clone(&recorded),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     (buyer, recorded)
 }
@@ -644,7 +621,6 @@ async fn provisioned_origin_with_ceiling(
         signer: Arc::clone(buyer_signer),
         voucher_domain: voucher_dom(),
         recorded,
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     build_origin_with_timeout(
         ep_b,
@@ -1260,7 +1236,7 @@ async fn cache_with_fs_origin_only(
 /// in its own filesystem origin — so A can serve only by REACTIVELY pulling its
 /// origin, which A's `pull_authorized` gate allows solely because B now attaches
 /// an ADR 005 client identity binding (over B's OWN node id, signed with the
-/// channel's buyer key). B receiving the bytes, and A's origin fetching exactly
+/// lane's buyer key). B receiving the bytes, and A's origin fetching exactly
 /// once, proves the binding propagated across the hop and authorized the chained
 /// pull. Without the binding, A refuses with `NotFound`.
 #[tokio::test(flavor = "multi_thread")]
@@ -1299,7 +1275,7 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         binding: binding_dom(),
     };
     // A reactively serves its OWN origin on a miss (#1116) — the chained pull B
-    // triggers. `pull_authorized` still gates it on B proving channel ownership.
+    // triggers. `pull_authorized` still gates it on B proving lane ownership.
     let handler_a = build_handler_full_configured(
         a_id,
         &a_eth,
@@ -1498,7 +1474,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     assert_counter(&b_metrics, "probe_collection_latency_seconds_count", 1)?;
     assert_counter(&b_metrics, "node_pull_first_byte_seconds_count", 1)?;
 
-    // #852: the buyer persisted the channel's voucher watermark after the pull.
+    // #852: the buyer persisted the lane's voucher watermark after the pull.
     // Under ADR 038 the pull meters WIRE bytes (the bao stream: content +
     // interleaved proof), so the closing watermark carries nonce 2, the
     // bao-encoded size, and the cumulative amount rounded up per the rate.
@@ -1646,7 +1622,6 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::clone(&recorded),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let mut dir = HashMap::new();
     dir.insert(U256::ZERO, providers.clone());
@@ -1977,7 +1952,7 @@ fn spawn_a_gated_server(
 
 /// Spin up a gated honest upstream A holding `payload`. Same return shape as
 /// [`spawn_lying_node_a`] plus the `received` / `release` gate handles. No
-/// channel store is needed — the hand-rolled server acks the buyer's voucher
+/// pool-state store is needed — the hand-rolled server acks the buyer's voucher
 /// directly.
 async fn spawn_gated_node_a(
     payload: &[u8],
@@ -2535,7 +2510,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::clone(&recorded),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     // The staller quotes the cheaper `STALL_RATE` so it ranks ahead of A (`RATE`).
     // Order is PINNED via a seeded probe cache: RTT is a multiplicative ranker term, so
@@ -3303,7 +3277,7 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
 }
 
 /// Drive one voucher rejection end-to-end and hand back what the node did about it:
-/// the channels it retired, and its metrics.
+/// its metrics and local reputation, plus the upstream's id and the pool id.
 ///
 /// A shared fixture because the interesting thing about `VoucherRejectReason` is that
 /// its variants must produce DIFFERENT behaviour, and the only honest way to show that
@@ -3315,13 +3289,7 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
 async fn pull_against_a_voucher_rejecting_upstream_n(
     reason: VoucherRejectReason,
     fetches: usize,
-) -> Result<(
-    Arc<Mutex<Vec<(Address, B256)>>>,
-    Arc<Metrics>,
-    Arc<LocalReputation>,
-    iroh::PublicKey,
-    B256,
-)> {
+) -> Result<(Arc<Metrics>, Arc<LocalReputation>, iroh::PublicKey, B256)> {
     let payload = vec![0x33u8; 4096];
     let hash = Hash::new(&payload);
     let pool_id = B256::repeat_byte(0xC7);
@@ -3358,14 +3326,12 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let retired = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::clone(&retired),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -3386,8 +3352,8 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
     // split is the fix: `BadSignature`/`WrongSigner` mean the upstream could not
     // verify a signature WE produced, so they are a fault in this node and must not
     // be answered as a `NotFound` about the content. Every other reason is a
-    // statement about one channel, which leaves the blob's availability untouched —
-    // those stay a clean miss.
+    // statement about one pool or lane, which leaves the blob's availability
+    // untouched — those stay a clean miss.
     let is_our_signer = matches!(
         reason,
         VoucherRejectReason::BadSignature | VoucherRejectReason::WrongSigner
@@ -3414,19 +3380,13 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
     }
 
     shutdown([task_a], [&ep_b, &ep_a]).await?;
-    Ok((retired, b_metrics, local_rep, a_id, pool_id))
+    Ok((b_metrics, local_rep, a_id, pool_id))
 }
 
 /// The single-fetch shape, which is what most of these tests want.
 async fn pull_against_a_voucher_rejecting_upstream(
     reason: VoucherRejectReason,
-) -> Result<(
-    Arc<Mutex<Vec<(Address, B256)>>>,
-    Arc<Metrics>,
-    Arc<LocalReputation>,
-    iroh::PublicKey,
-    B256,
-)> {
+) -> Result<(Arc<Metrics>, Arc<LocalReputation>, iroh::PublicKey, B256)> {
     pull_against_a_voucher_rejecting_upstream_n(reason, 1).await
 }
 
@@ -3443,24 +3403,15 @@ async fn pull_against_a_voucher_rejecting_upstream(
 /// `LocalPullFault`, so a node whose signer was broken reported a `debug!` about
 /// vouchers and left `node_pull_local_fault_total` at zero.
 ///
-/// Retiring the channel would be the wrong remedy here and the test says so: the channel
-/// is fine. Rotating it would burn gas on a fresh channel that the same broken key would
-/// fail against just as fast.
+/// The test checks both halves: the rejection is metered as a local fault, not a voucher
+/// rejection, and the provider's score stays neutral because it was right to refuse.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one() -> Result<()> {
-    let (retired, metrics, local_rep, a_id, _) =
+    let (metrics, local_rep, a_id, _) =
         pull_against_a_voucher_rejecting_upstream(VoucherRejectReason::BadSignature).await?;
 
     assert_counter(&metrics, "node_pull_local_fault_total", 1)?;
     assert_counter(&metrics, "node_pull_voucher_rejected_total", 0)?;
-    anyhow::ensure!(
-        retired
-            .lock()
-            .map_err(|_| anyhow::anyhow!("retired lock poisoned"))?
-            .is_empty(),
-        "a signature the upstream cannot verify says nothing about the channel — rotating it \
-         would burn gas on a fresh channel the same broken key fails against just as fast"
-    );
     // And still not the provider's fault: it was right to reject what we sent.
     assert_counter(&metrics, "node_pull_unreachable_total", 0)?;
     anyhow::ensure!(
@@ -3526,7 +3477,6 @@ async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
@@ -3697,7 +3647,6 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, engine, _engine_tmp) = build_origin_seeded_ranking(
         &ep_b,
@@ -4274,7 +4223,6 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::clone(&recorded),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -4647,7 +4595,6 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -4757,7 +4704,6 @@ async fn node_origin_mid_stream_silence_does_not_score_stalled_upstream() -> Res
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -4876,7 +4822,6 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -5003,7 +4948,6 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -5118,7 +5062,6 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -5227,7 +5170,6 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let mut addr_map = HashMap::new();
     addr_map.insert(a_dht, a_eth.address());
@@ -5245,7 +5187,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     )
     .await;
 
-    // Pull 1 (hash1): A wedges its channel. One wedge event.
+    // Pull 1 (hash1): A wedges its lane. One wedge event.
     let got1 = tokio::time::timeout(
         Duration::from_secs(30),
         Origin::fetch(&origin, hash1, u64::MAX),
@@ -5279,7 +5221,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
 }
 
 /// #1145 review — a `VoucherRejected` arriving MID-STREAM is the same event as one arriving
-/// in reply to a voucher, and must get the same channel remedy.
+/// in reply to a voucher, and must get the same lane remedy.
 ///
 /// The fix above (typing the mid-stream `StreamError`) created this hole one arm over. Since
 /// #1484 the receive loop reads every voucher reply through one handler
@@ -5288,9 +5230,9 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
 /// to be a split between the blocking ack wait and the mid-stream receive sites. Before that
 /// unification a `VoucherRejected` that did not arrive in a voucher round trip reached
 /// `classify_refusal`, was ruled `OurFault` —
-/// score nothing, suppress nothing, *do* nothing — and skipped the entire channel remedy.
+/// score nothing, suppress nothing, *do* nothing — and skipped the entire lane remedy.
 ///
-/// The consequence is the one the drained-lane test exists to prevent, reached by another
+/// The consequence is the one the drained-pool test exists to prevent, reached by another
 /// road: without the wedge the next miss re-selects the same provider, and this node
 /// re-presents a voucher it cannot honour on every pull — logging a `debug!` invisible at the
 /// default `RUST_LOG=info`.
@@ -5312,7 +5254,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_lane_remed
     let a_eth = Arc::new(PrivateKeySigner::random());
     let (ep_a, addr_a) =
         local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
-    // `Unfunded` OUTSIDE a voucher round trip: the same code the drained-channel
+    // `Unfunded` OUTSIDE a voucher round trip: the same code the drained-pool
     // test drives through the ack wait, arriving on the other road.
     let task_a = spawn_a_mid_stream_error_server(
         ep_a.clone(),
@@ -5343,14 +5285,12 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_lane_remed
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
-    let retired: Arc<Mutex<Vec<(Address, B256)>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
         pool_id: B256::repeat_byte(0x9C),
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::clone(&retired),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -5383,19 +5323,10 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_lane_remed
     // The remedy ran: this is reachable only if the receive loop kept the wire code AND
     // `pull_verdict` routed it to `voucher_verdict` rather than leaving it a bare refusal.
     // With the bug, it is `node_pull_refused_total` that ticks and this stays 0 — the
-    // channel is left in the store to be handed back on every subsequent miss.
+    // lane is left in the store to be handed back on every subsequent miss.
     assert_counter(&b_metrics, "node_pull_pool_wedged_total", 1)?;
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 1)?;
     assert_counter(&b_metrics, "node_pull_refused_total", 0)?;
-
-    // The row survives — the deposit is still escrowed (see the drained-channel test).
-    anyhow::ensure!(
-        retired
-            .lock()
-            .map_err(|_| anyhow::anyhow!("retired lock poisoned"))?
-            .is_empty(),
-        "an `Unfunded` channel must keep its row so the deposit can be reclaimed"
-    );
 
     // Our payment fault, not the peer's: it is not scored.
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
@@ -5420,7 +5351,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_lane_remed
 /// The existing starvation guard (`a_wedged_pool_open_does_not_starve_the_candidate_loop`)
 /// cannot catch it: its candidates wedge at the pool OPEN, so they never reach the
 /// streaming stage whose budget is in question. Its candidates cost
-/// `POOL_OPEN_CALLER_BUDGET` each; these cost `CHANNEL_OPEN + open + stall`.
+/// `POOL_OPEN_CALLER_BUDGET` each; these cost `POOL_OPEN_CALLER_BUDGET + open + stall`.
 ///
 /// # What this does and does NOT guard
 ///
@@ -5569,7 +5500,6 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
     // Both silent candidates quote the cheaper `STALL_RATE`, so they rank ahead of A
@@ -5708,7 +5638,6 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -5773,7 +5702,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
 /// answering node exactly as hard for truthfully saying it lacks a blob as for
 /// being dead in its local reputation score. (`NotFound` is
 /// NODE-scoped, not blob-scoped: seven `ServeRejectReason`s collapse onto it so
-/// channel existence cannot be probed, so it is not even reliable evidence about
+/// lane existence cannot be probed, so it is not even reliable evidence about
 /// the blob.)
 ///
 /// The `client_loopback` refusal test is NOT a guard for this: it asserts the
@@ -5803,8 +5732,8 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     let n_id = n_sk.public();
     let n_eth = Arc::new(PrivateKeySigner::random());
     let store_n = Arc::new(MemoryPoolStateStore::new());
-    // A funded, known channel — so the refusal is unambiguously "no blob" and not
-    // an unknown-channel rejection wearing the same collapsed wire code.
+    // A funded pool and a known lane — so the refusal is unambiguously "no blob" and
+    // not an unknown-lane rejection wearing the same collapsed wire code.
     store_n.record(&LaneState::hydrate(
         pool_id,
         b_buyer.address(),
@@ -5908,7 +5837,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     // Seeded ranking: a live loopback probe can time N slower than A by more than
     // their 2× rate gap, and A ranked first never asks N at all (#2268).
@@ -6057,7 +5985,6 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_with_negative_cache(
         &ep_b,
@@ -6101,9 +6028,9 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
 /// The two refusal suppressions must have DIFFERENT lifetimes, and this is the only test
 /// that can tell (#1145 review).
 ///
-/// `84c09dc` split them for a concrete reason: at the full 5-minute TTL, "a deposit that ran
-/// dry for one pull — or the pre-observation window right after we open a channel —
-/// blackholed a perfectly healthy upstream for five minutes". A `NotFound` refusal is not
+/// `84c09dc` split them for a concrete reason: at the full 5-minute TTL, a deposit that ran
+/// dry for one pull — or the pre-observation window right after we open a pool —
+/// blackholes a perfectly healthy upstream for five minutes. A `NotFound` refusal is not
 /// even attributable to the peer (`ServeRejectReason::wire_error` collapses seven reasons
 /// onto it, three of them ours), so it gets `REFUSAL_SUPPRESSION_TTL` — 30 s, long enough to
 /// stop a retry burst re-probing a peer that just said no, short enough not to blackhole it.
@@ -6497,7 +6424,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
     // second fetch of the SAME blob is already-cached and pulls/pays nothing —
     // that would starve this test of the second pull the #852 watermark-reuse
     // invariant needs. Two distinct hashes force both fetches to actually pull,
-    // so both advance the shared channel's watermark.
+    // so both advance the shared lane's watermark.
     let payload1 = vec![0xABu8; PAYLOAD_LEN];
     let payload2 = vec![0xCDu8; PAYLOAD_LEN];
     let hash1 = Hash::new(&payload1);
@@ -6578,7 +6505,6 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::clone(&recorded),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, engine, _engine_tmp) = build_origin_multi_hash(
         &ep_b,
@@ -6594,7 +6520,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
     )
     .await;
 
-    // First pull (hash1): opens the channel against A, pays for its wire bytes, and
+    // First pull (hash1): opens the pool against A, pays for its wire bytes, and
     // persists the watermark.
     let first_fetch = Origin::fetch(&origin, hash1, u64::MAX)
         .await
@@ -6610,7 +6536,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
     );
 
     // Second pull (hash2, a DISTINCT blob not yet cached): REUSES the same
-    // channel, resumes from the persisted watermark, and the upstream accepts
+    // lane, resumes from the persisted watermark, and the upstream accepts
     // the continued cumulative amounts — this is the bug's fix. Fetching a distinct hash
     // (rather than re-fetching hash1) is what forces this leg to actually pull:
     // `drive()` re-derives `missing_ranges` from the cache store, so re-fetching
@@ -6633,7 +6559,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
     // than resetting: cumulative bytes and amount both double.
     // Under ADR 038 the pull meters WIRE bytes (bao: content + interleaved proof),
     // so each fetch contributes its bao-encoded size and per-fetch amount, and the
-    // reused channel carries them forward (#852).
+    // reused lane carries them forward (#852).
     let expected_wire =
         decdn_cache::range_pull::bao_encoded_size(total_bytes, &bao_tree::ChunkRanges::all());
     let expected_amount = U256::from(expected_wire)
@@ -6659,7 +6585,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
 /// A failure to persist the voucher watermark (#852) must NOT fail the pull — the
 /// bytes are already delivered and paid for — but it must surface via the
 /// `node_pull_progress_persist_failures` counter so an operator can see the
-/// channel is now at risk of stale-voucher rejection on its next reuse.
+/// lane is now at risk of stale-voucher rejection on its next reuse.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<()> {
@@ -7245,7 +7171,7 @@ async fn leaf_paced_pull_mode(
 }
 
 /// Build node B: an empty-cache `ClientHandler` with the window-paced provider
-/// (pointing at upstream `providers`) and the leaf's channel registered. Returns
+/// (pointing at upstream `providers`) and the leaf's lane registered. Returns
 /// the handler, B's dial target, B's endpoint, and the buyer-progress log.
 #[allow(clippy::too_many_arguments)]
 async fn build_node_b(
@@ -7410,7 +7336,7 @@ async fn build_node_b_with_store(
     )
     .await;
 
-    // B's empty cache (the tee fills it) and the leaf's channel in B's store.
+    // B's empty cache (the tee fills it) and the leaf's lane in B's store.
     let cache_tmp = tempfile::tempdir()?;
     let cache_b =
         decdn_cache::CacheEngine::open(cache_tmp.path(), vec![], engine_max_blob_mb).await?;
@@ -7937,7 +7863,7 @@ async fn window_pull_through_completes_a_blob_past_the_ramp_floor() -> Result<()
 /// which reads the funder ONCE at the top of the serve and re-consults it after
 /// every accepted voucher — was guarded by a comment and nothing else.
 ///
-/// Here the leaf's channel is funded by one address and signed by a DIFFERENT,
+/// Here the leaf's pool is funded by one address and its lane signed by a DIFFERENT,
 /// never-blacklisted delegate. Nothing is denied at open time, so the request is
 /// admitted, B starts fusing the upstream pull with downstream delivery, and only
 /// then does the FUNDER go on the deny-set. If the re-check were re-keyed onto
@@ -8310,7 +8236,7 @@ async fn window_pull_through_serves_and_caches_empty_blob() -> Result<()> {
 /// request becomes the `claim_fill` Owner and pulls from A; the second is an
 /// Attach observer that serves from the shared `FillSession` concurrently rather
 /// than opening a second upstream pull — which would double-spend real USDC on
-/// the B↔A channel. The cache-level coalescing primitive is unit-tested
+/// the B↔A lane. The cache-level coalescing primitive is unit-tested
 /// (`engine.rs`); this pins the handler-side consequence at the layer that
 /// actually spends.
 ///
@@ -8498,8 +8424,8 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
 /// is a proven lane owner — before it
 /// ever opens a second upstream pull.
 ///
-/// Both leaves share ONE lane — same `pool_id` (the gated upstream's channel id
-/// reused as the leaf channel) and same signer, dialed over two independent
+/// Both leaves share ONE lane — same `pool_id` (the gated upstream's pool id
+/// reused as the leaf pool) and same signer, dialed over two independent
 /// connections, mirroring two concurrent client streams on one payment lane.
 /// A whole-blob miss reserves a full floor before it spends upstream, so
 /// `remaining` covers `min_payment(floor, RATE)` with a little slack (`floor` =
@@ -8531,7 +8457,7 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     let (a_id, a_addr, a_eth, ep_a, task_a, received, release) =
         spawn_gated_node_a(&payload).await?;
 
-    // One lane: one leaf channel, one signer, shared by both concurrent opens.
+    // One lane: one leaf pool, one signer, shared by both concurrent opens.
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_pool_id = B256::repeat_byte(0x8A);
     // Exactly one floor's worth of reserved credit-window headroom, plus slack
@@ -9056,7 +8982,7 @@ async fn window_pull_through_end_past_the_blob_is_served_by_the_fused_path_clamp
 
 #[tokio::test(flavor = "multi_thread")]
 async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<()> {
-    // The #856 attack: a leaf that owns a channel requests a large blob, takes
+    // The #856 attack: a leaf that owns a lane requests a large blob, takes
     // the first interval, acks one voucher, then drops. B must stop pulling — its
     // upstream spend is bounded to ~one window, NOT the whole blob.
     let payload = vec![0x4Du8; PAYLOAD_LEN];
@@ -9372,7 +9298,7 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
     .is_err();
     anyhow::ensure!(
         refused,
-        "an underfunded channel must be refused (signed NotFound), not served"
+        "an underfunded pool must be refused (signed NotFound), not served"
     );
     // No upstream pull was attempted: nothing persisted, nothing cached.
     anyhow::ensure!(
@@ -11068,19 +10994,19 @@ async fn window_pull_through_over_long_range_on_a_blob_within_the_ceiling_is_ser
 /// Nothing exotic is staged here. Node B misses two DIFFERENT blobs at once and both rank
 /// the same provider first, which is what an ordinary node on a tens-of-nodes network does
 /// all day: the cache engine coalesces in-flight pulls BY HASH, so distinct hashes run
-/// concurrent `NodeOrigin::fetch` calls, and both take the channel-REUSE fast path and read
-/// the same `prior_amount`.
+/// concurrent `NodeOrigin::fetch` calls, and both take the pool-REUSE fast path and read
+/// the same lane `prior_amount`.
 ///
 /// With a ledger each, both pulls sign from that same `prior_amount`, so their cumulative
 /// amounts collide. Node A — the real `ClientHandler`, enforcing real cumulative
 /// monotonicity — accepts the first and rejects the second `AmountRegression`, so one of
 /// these two fetches comes back empty. An empty fetch is bad on its own; what makes it a
 /// money bug is that `AmountRegression` is TERMINAL once the bounded watermark-resume
-/// attempts are spent — it wedges the channel (the row is kept for the reclaim sweep, but
+/// attempts are spent — it wedges the lane (the row is kept for the reclaim sweep, but
 /// the provider is suppressed and the loser's ledger desyncs) — so a collision the shared
-/// ledger prevents would otherwise strand the deposit. Hence the assertions beyond "both
-/// blobs arrived": nothing is retired, and the recorded cumulative carries EVERY voucher of
-/// both pulls on one monotonic sequence.
+/// ledger prevents would otherwise strand the deposit. Hence the assertion beyond "both
+/// blobs arrived": the recorded cumulative carries EVERY voucher of both pulls on one
+/// monotonic sequence.
 ///
 /// The client sends vouchers optimistically and each pull persists the shared ledger's
 /// SETTLE-HIGH watermark (#1484), so both `record_progress` calls report the fully advanced
@@ -11168,14 +11094,12 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
     let (providers, addr_map) = one_provider(a_dht, a_eth.address());
 
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
-    let retired: Arc<Mutex<Vec<(Address, B256)>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
         pool_id,
         deposit: U256::from(DEPOSIT_MICRO_USDC),
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::clone(&recorded),
-        retired: Arc::clone(&retired),
     }) as Arc<dyn PoolOpener>;
 
     let (engine, _engine_tmp) = throwaway_engine().await?;
@@ -11252,43 +11176,37 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
         anyhow::anyhow!(
             "concurrent ledger pulls hung past {join_budget:?} — likely \
              POOL_OPEN_CALLER_BUDGET={POOL_OPEN_CALLER_BUDGET:?} expiry under llvm-cov \
-             contention, not AmountRegression; pending={} timeout={} stalled={} recorded={:?} \
-             retired={:?}",
+             contention, not AmountRegression; pending={} timeout={} stalled={} recorded={:?}",
             counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
             counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
             counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
-            recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone()),
-            retired.lock().map_or_else(|_| Vec::new(), |v| v.clone())
+            recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone())
         )
     })?;
     let first = first.map_err(|e| anyhow::anyhow!("first concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
         matches!(&first, OriginFetch::AlreadyAdmitted),
         "first concurrent pull returned {first:?} (expected AlreadyAdmitted); AmountRegression \
-         would retire the channel and cap cumulative at one pull's wire bytes, while \
+         would wedge the lane and cap cumulative at one pull's wire bytes, while \
          POOL_OPEN_CALLER_BUDGET expiry increments node_pull_pool_open_pending_total and \
-         surfaces NotFound — check pending={} timeout={} stalled={} recorded={:?} \
-         retired={:?}",
+         surfaces NotFound — check pending={} timeout={} stalled={} recorded={:?}",
         counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
         counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
         counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
-        recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone()),
-        retired.lock().map_or_else(|_| Vec::new(), |v| v.clone())
+        recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone())
     );
     let got1 = engine.get(hash).await?;
     let second = second.map_err(|e| anyhow::anyhow!("second concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
         matches!(&second, OriginFetch::AlreadyAdmitted),
         "second concurrent pull returned {second:?} (expected AlreadyAdmitted); AmountRegression \
-         would retire the channel and cap cumulative at one pull's wire bytes, while \
+         would wedge the lane and cap cumulative at one pull's wire bytes, while \
          POOL_OPEN_CALLER_BUDGET expiry increments node_pull_pool_open_pending_total and \
-         surfaces NotFound — check pending={} timeout={} stalled={} recorded={:?} \
-         retired={:?}",
+         surfaces NotFound — check pending={} timeout={} stalled={} recorded={:?}",
         counter_value(&b_metrics, "node_pull_pool_open_pending_total").unwrap_or(0),
         counter_value(&b_metrics, "node_pull_timeout_total").unwrap_or(0),
         counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
-        recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone()),
-        retired.lock().map_or_else(|_| Vec::new(), |v| v.clone())
+        recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone())
     );
     let got2 = engine.get(hash2).await?;
     anyhow::ensure!(got1.as_ref() == payload.as_slice(), "blob 1 bytes mismatch");
@@ -11297,21 +11215,13 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
         "blob 2 bytes mismatch"
     );
 
-    // The collision's real cost: `AmountRegression` is a terminal verdict, so the losing
-    // pull would RETIRE the channel the winner is still streaming on.
-    let retired_now = retired.lock().expect("retired lock").clone();
-    anyhow::ensure!(
-        retired_now.is_empty(),
-        "no channel may be retired here — both pulls paid honestly on a live channel, got {retired_now:?}"
-    );
-
     // Both pulls draw from ONE shared pool ledger, so their cumulative
     // watermark is a single monotonic sequence covering the wire bytes of both
     // 1.5 MiB pulls. Both settlements persist the shared settle-high watermark,
     // so the sharing shows up as the recorded cumulative reaching the COMBINED
     // two-pull wire total. Two separate ledgers would each cap at one pull's wire
-    // bytes and collide on the first voucher — which the empty-result / retire
-    // checks above already catch.
+    // bytes and collide on the first voucher — which the empty-result checks above
+    // already catch.
     let single_wire =
         decdn_cache::range_pull::bao_encoded_size(total_bytes, &bao_tree::ChunkRanges::all());
     let combined_wire = U256::from(single_wire).saturating_mul(U256::from(2u64));
@@ -11558,7 +11468,6 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         signer: b_buyer2,
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     // A 300ms positive-cache TTL: short enough that a real sleep past it is not a
     // test-suite hazard, unlike the production 15s (anchored on `Instant`, so
@@ -11729,7 +11638,6 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
     let (origin, _engine, _engine_tmp) = build_origin_with_negative_cache(
@@ -11907,7 +11815,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
     let (origin, engine, _engine_tmp) = build_origin_with_negative_cache(
@@ -12175,7 +12082,6 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -12321,7 +12227,6 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, _engine, _engine_tmp) = build_origin_with_timeout(
         &ep_b,
@@ -12407,11 +12312,11 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
 /// `node_origin_a_wedged_provider_is_skipped_for_other_hashes` guards this filter at
 /// `probe_and_rank` (the cold chokepoint); this test guards it at the other chokepoint. The
 /// negative-cache-interaction test above cannot: a wedge also negative-caches the SAME
-/// (peer, hash) for 30s, so for the hash that wedged the channel the negative branch
+/// (peer, hash) for 30s, so for the hash that wedged the lane the negative branch
 /// short-circuits and the wedged branch is dead code to it. The hole needs a hash the
-/// provider was cached for BEFORE its channel wedged on a different one — exactly what a
+/// provider was cached for BEFORE its lane wedged on a different one — exactly what a
 /// popular blob inside its 15s TTL looks like when some other pull discovers the dead
-/// channel.
+/// lane.
 ///
 /// Provider A is cached for hash2 (fetch #1, where healthy H outranks it and delivers),
 /// then wedges on a pull for hash1 (fetch #2: A rejects the closing voucher with
@@ -12538,7 +12443,6 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, engine, _engine_tmp) = build_origin_multi_hash(
         &ep_b,
@@ -12614,7 +12518,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     // filters, is dialled, and fails fast. A must NOT be the fallback: it is
     // wedged, and (A, hash2) was never negative-cached, so a regressed
     // `provider_is_wedged` branch in `cached_candidates` re-selects it here and
-    // opens a stream against a channel that cannot pay.
+    // opens a stream against a lane that cannot pay.
     let third = tokio::time::timeout(
         Duration::from_secs(30),
         Origin::fetch(&origin, hash2, u64::MAX),
@@ -12889,7 +12793,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
 
     // Provisioned inline (the shared builders hardcode `ConfigStakerSet` /
@@ -13229,7 +13132,7 @@ async fn serve_with_deposit_ceiling(
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
     // Route on the requested hash, so one server can hold several blobs — the
-    // concurrent-pulls regression test needs two pulls on ONE channel.
+    // concurrent-pulls regression test needs two pulls on ONE lane.
     let payload: &[u8] = payloads
         .iter()
         .find(|p| *Hash::new(p.as_slice()).as_bytes() == req.hash)
@@ -13531,7 +13434,7 @@ impl TopUpFixture {
 /// How one recovery-top-up scenario is wired.
 #[derive(Debug, Clone, Copy)]
 struct TopUpSetup {
-    /// What the buyer's channel starts with.
+    /// What the buyer's pool starts with.
     initial_micro_usdc: u64,
     /// The working deposit a recovery step tops up toward; `0` turns funding off.
     working_micro_usdc: u64,
@@ -13562,14 +13465,14 @@ impl TopUpSetup {
     }
 }
 
-/// Stand up one deposit-capped upstream and a buyer whose channel starts at
+/// Stand up one deposit-capped upstream and a buyer whose pool starts at
 /// `setup.initial_micro_usdc` and graduates to `setup.working_micro_usdc`.
 async fn top_up_fixture(payload: Arc<Vec<u8>>, setup: TopUpSetup) -> Result<TopUpFixture> {
     top_up_fixture_multi(vec![payload], setup).await
 }
 
 /// [`top_up_fixture`] over several SAME-LENGTH blobs on one provider (and thus one
-/// channel), for the concurrent-pulls regression test.
+/// lane), for the concurrent-pulls regression test.
 async fn top_up_fixture_multi(
     payloads: Vec<Arc<Vec<u8>>>,
     setup: TopUpSetup,
@@ -13693,7 +13596,7 @@ fn multi_interval_payload() -> Arc<Vec<u8>> {
     )
 }
 
-/// The headline case: a single node→node pull larger than the channel's working
+/// The headline case: a single node→node pull larger than the pool's working
 /// deposit now completes, by funding the shortfall and resuming — the whole point
 /// of #1530.
 ///
@@ -13866,7 +13769,7 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
 
 /// The money assertion: resuming after a top-up must not re-buy the prefix.
 ///
-/// The persisted watermark is channel-cumulative WIRE bytes, so the whole pull's
+/// The persisted watermark is lane-cumulative WIRE bytes, so the whole pull's
 /// spend is directly comparable to what ONE bao encoding of the blob costs. A naive
 /// `byte_offset = 0` restart bills roughly twice that, and fails the upper bound
 /// loudly.
@@ -13946,7 +13849,7 @@ async fn the_resumed_leg_does_not_re_pay_for_delivered_bytes() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_crying_poverty_gets_one_recovery_step_and_no_more() -> Result<()> {
     let payload = multi_interval_payload();
-    // The buyer's channel is funded far beyond the whole blob, so nothing the upstream
+    // The buyer's pool is funded far beyond the whole blob, so nothing the upstream
     // can say about our deposit is true, but its ceiling is set to refuse the very
     // first voucher anyway.
     let fixture = top_up_fixture(
@@ -14235,12 +14138,12 @@ async fn a_zero_working_deposit_never_funds_a_pull() -> Result<()> {
     Ok(())
 }
 
-/// Two CONCURRENT pulls on one channel, one of them resuming across a top-up: the
+/// Two CONCURRENT pulls on one lane, one of them resuming across a top-up: the
 /// resume frontier must never overshoot the bytes that pull actually decoded
 /// (#1600 review).
 ///
-/// The frontier is derived from the CHANNEL's cumulative wire watermark, and the
-/// ledger is shared with every concurrent pull on the channel (`BuyerLedgers`) — so
+/// The frontier is derived from the LANE's cumulative wire watermark, and the
+/// ledger is shared with every concurrent pull on the lane (`BuyerLedgers`) — so
 /// the other pull's acked vouchers inflate the delta. Uncapped, the inflated
 /// frontier maps PAST the exhausted pull's decoded bytes; its `truncate` is then a
 /// no-op (truncate never grows) and the resumed leg splices at the wrong position,
@@ -14608,7 +14511,6 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::clone(&recorded),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, engine, _engine_tmp) = build_origin_economics(
         &ep_b,
@@ -14863,7 +14765,6 @@ async fn attack_b_attempt(
         signer: Arc::clone(&b_buyer),
         voucher_domain: voucher_dom(),
         recorded: Arc::new(Mutex::new(Vec::new())),
-        retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn PoolOpener>;
     let (origin, engine, _engine_tmp) = build_origin_economics(
         &ep_b,

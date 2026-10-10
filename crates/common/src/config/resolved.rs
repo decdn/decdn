@@ -141,7 +141,7 @@ pub struct ResolvedBlockchain {
     /// - alloy's pending-transaction receipt heartbeat, applied to every provider
     ///   via the node's `with_poll_interval` (`client().set_poll_interval`) and
     ///   consumed by `PendingTransactionBuilder::get_receipt` when the node awaits
-    ///   a mined settlement / channel tx. This is also what overrides alloy's
+    ///   a mined settlement / pool tx. This is also what overrides alloy's
     ///   localhost-detected 250 ms default.
     ///
     /// Defaults to 7000 ms (`DEFAULT_EVENT_POLL_INTERVAL_MS`); the resolver
@@ -803,7 +803,7 @@ pub struct ResolvedContent {
     /// are both hash sets meaning opposite things, and confusing them would pin
     /// content the operator was ordered to remove.
     pub denied_hashes: DeniedHashes,
-    /// Operator addresses whose channels are refused. Unioned with the on-chain
+    /// Operator addresses whose pools are refused. Unioned with the on-chain
     /// origin blacklist at the gate, so the wire refusal cannot distinguish a
     /// local entry from a governance one (ADR 011 §`StreamRequest` Response).
     pub denied_origins: HashSet<Address>,
