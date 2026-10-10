@@ -759,3 +759,65 @@ async fn an_unreachable_rpc_warns_and_still_issues() {
         .await
         .expect("offline issuance is valid by design — an unreachable RPC must not fail it");
 }
+
+/// A `PaymentPool` on a filler-free provider that answers the
+/// `eth_sendTransaction` with `hash` and then fails every call, so
+/// `get_receipt` cannot read the receipt of a broadcast tx.
+fn pool_whose_receipt_is_unreadable(
+    hash: B256,
+) -> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone> {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&hash);
+    PaymentPool::new(
+        Address::repeat_byte(0x01),
+        alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter),
+    )
+}
+
+/// A `closePool` whose receipt cannot be read may still be in flight, so the
+/// error names its tx hash (#2413).
+#[tokio::test]
+async fn an_unreadable_close_receipt_names_the_tx() {
+    let hash = B256::repeat_byte(0xab);
+    let err = close_and_forget(
+        &pool_whose_receipt_is_unreadable(hash),
+        LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+        Address::repeat_byte(0x22),
+        B256::repeat_byte(0x33),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains(&format!("{hash:#x}")),
+        "{err:#}"
+    );
+}
+
+/// A `reclaim` whose receipt cannot be read may still be in flight, so the
+/// error names its tx hash (#2413).
+#[tokio::test]
+async fn an_unreadable_reclaim_receipt_names_the_tx() {
+    let hash = B256::repeat_byte(0xab);
+    let err = reclaim_and_forget(
+        &pool_whose_receipt_is_unreadable(hash),
+        LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+        Address::repeat_byte(0x22),
+        B256::repeat_byte(0x33),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains(&format!("{hash:#x}")),
+        "{err:#}"
+    );
+}
+
+/// A mined reclaim revert names its tx; an estimation-time revert broadcast
+/// nothing and names none.
+#[test]
+fn reclaim_reverted_names_only_a_mined_tx() {
+    let pool_id = B256::repeat_byte(0x33);
+    let hash = B256::repeat_byte(0xab);
+    assert!(reclaim_reverted(pool_id, Some(hash)).contains(&format!("(tx {hash:#x})")));
+    assert!(!reclaim_reverted(pool_id, None).contains("(tx "));
+}

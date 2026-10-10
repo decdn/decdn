@@ -1,21 +1,22 @@
 //! One place to submit a transaction and resolve its outcome (#1355).
 //!
-//! Every on-chain write in this workspace needs the same three steps — send,
-//! await the receipt, fail on a revert — and every hand-rolled copy of them got
-//! the same detail wrong: the tx hash was read *after* `get_receipt()`, so a
-//! receipt that could not be fetched left the caller with an error naming no
-//! transaction at all. That is the one failure mode where the operator most
-//! needs the hash, because the transaction is in flight and re-sending it is
-//! what causes duplicate spends.
+//! Every production on-chain write needs the same three steps — send, await
+//! the receipt, fail on a revert — and the tx hash must be read before
+//! `get_receipt()` consumes the pending handle. A receipt that cannot be fetched
+//! leaves the transaction's fate unknown: it may still mine, and re-sending it
+//! is what causes duplicate spends. That is the one failure mode where the
+//! operator most needs the hash, so the error must name it.
 //!
 //! Lives in `decdn-incentive` rather than the CLI so every on-chain write in
 //! this crate shares one send/receipt path.
 //!
 //! `cli::commands::pool`'s `close_and_forget` / `reclaim_and_forget` hand-roll
 //! the pair so they can word a revert as a likely race: a concurrent close by
-//! the same owner, or a concurrent permissionless reclaim. Their receipt-read
-//! error names no transaction, so a receipt timeout there loses the hash
-//! (#2413). Any other hand-rolled send/receipt pair is a bug for that reason.
+//! the same owner, or a concurrent permissionless reclaim. Like this module,
+//! they read the tx hash before the receipt wait, so a receipt-read error names
+//! the transaction. In production code, a send/receipt pair that reads the hash
+//! after the receipt wait is a bug. The `decdn-e2e` fixtures are exempt: a
+//! failed fixture tx fails the test, and no operator reconciles it.
 
 use alloy::contract::{CallBuilder, CallDecoder, Error as ContractError};
 use alloy::primitives::B256;

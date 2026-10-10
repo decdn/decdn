@@ -575,10 +575,15 @@ where
         }
         Err(e) => return Err(anyhow::Error::new(e).context("closePool send failed")),
     };
-    let receipt = pending
-        .get_receipt()
-        .await
-        .map_err(|e| anyhow::Error::new(e).context("closePool receipt failed"))?;
+    // Read before `get_receipt` consumes `pending`: an unreadable receipt leaves
+    // the tx's fate unknown, and the hash is the operator's only handle on it.
+    let tx = *pending.tx_hash();
+    let receipt = pending.get_receipt().await.map_err(|e| {
+        anyhow::Error::new(e).context(format!(
+            "closePool sent (tx {tx:#x}) but the receipt could not be fetched; it may still \
+             mine — check the tx before re-running"
+        ))
+    })?;
 
     match receipt_outcome(receipt.status()) {
         TxOutcome::Landed => {
@@ -598,12 +603,12 @@ where
             // One note for both the success line and the failure, so the two
             // cannot drift into different instructions for the same deadline.
             let reclaim_note = format!("run `decdn pool reclaim --pool {pool_id}` {deadline_note}");
-            store.forget_after_close(owner, pool_id, receipt.transaction_hash, &reclaim_note)?;
+            store.forget_after_close(owner, pool_id, tx, &reclaim_note)?;
             Ok(reclaim_note)
         }
         TxOutcome::Reverted => anyhow::bail!(
-            "closePool reverted on-chain for pool {pool_id} (it may have raced a concurrent \
-             close)"
+            "closePool reverted on-chain for pool {pool_id} (tx {tx:#x}; it may have raced a \
+             concurrent close)"
         ),
     }
 }
@@ -630,29 +635,40 @@ where
 {
     let pending = match contract.reclaim(pool_id).send().await {
         Ok(pending) => pending,
-        Err(e) if e.as_revert_data().is_some() => anyhow::bail!(reclaim_reverted(pool_id)),
+        Err(e) if e.as_revert_data().is_some() => {
+            anyhow::bail!(reclaim_reverted(pool_id, None))
+        }
         Err(e) => return Err(anyhow::Error::new(e).context("reclaim send failed")),
     };
-    let receipt = pending
-        .get_receipt()
-        .await
-        .map_err(|e| anyhow::Error::new(e).context("reclaim receipt failed"))?;
+    // Read before `get_receipt` consumes `pending`: an unreadable receipt leaves
+    // the tx's fate unknown, and the hash is the operator's only handle on it.
+    let tx = *pending.tx_hash();
+    let receipt = pending.get_receipt().await.map_err(|e| {
+        anyhow::Error::new(e).context(format!(
+            "reclaim sent (tx {tx:#x}) but the receipt could not be fetched; it may still \
+             mine — check the tx before re-running"
+        ))
+    })?;
 
     match receipt_outcome(receipt.status()) {
         TxOutcome::Landed => {
             store.forget_after_reclaim(owner, pool_id);
             Ok(())
         }
-        TxOutcome::Reverted => anyhow::bail!(reclaim_reverted(pool_id)),
+        TxOutcome::Reverted => anyhow::bail!(reclaim_reverted(pool_id, Some(tx))),
     }
 }
 
-/// The error for a `reclaim` the chain rejected after the pre-check passed. One message for the estimation-time and receipt-time reverts, so the
-/// two cannot drift apart.
-fn reclaim_reverted(pool_id: PoolId) -> String {
+/// The error for a `reclaim` the chain rejected after the pre-check passed. One
+/// message for the estimation-time and receipt-time reverts, so the two cannot
+/// drift apart. `tx` is the mined revert's hash; an estimation-time revert
+/// broadcast nothing and has none.
+fn reclaim_reverted(pool_id: PoolId, tx: Option<TxHash>) -> String {
+    let tx_note = tx.map_or_else(String::new, |tx| format!(" (tx {tx:#x})"));
     format!(
-        "reclaim reverted on-chain for pool {pool_id} after the pre-check passed (most likely \
-         a concurrent reclaim; the USDC refund transfer to the owner can also revert)"
+        "reclaim reverted on-chain for pool {pool_id}{tx_note} after the pre-check passed \
+         (most likely a concurrent reclaim; the USDC refund transfer to the owner can also \
+         revert)"
     )
 }
 
