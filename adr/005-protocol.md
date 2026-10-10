@@ -449,7 +449,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 - The delivery protocol is self-enforcing — payment and data flow are coupled by design
 - `byte_offset` in `StreamRequest` makes failover transparent; the requester resumes without restarting the stream
 - QUIC stream multiplexing allows concurrent blob requests to the same node without additional connection overhead — one handshake cost regardless of how many blobs are fetched
-- A shared `pool_id` across concurrent streams amortizes on-chain channel costs: one channel per (client, node) pair regardless of request volume
+- A shared `pool_id` across concurrent streams amortizes the on-chain open and deposit cost. The owner opens one pool, regardless of request volume or the number of nodes it pays. Each node redeems its own `(pool_id, signer, provider)` lane
 
 ### Negative
 

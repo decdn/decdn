@@ -2640,7 +2640,7 @@ since project inception and will roll into the first tagged release.
   *ours* — a buyer key that cannot sign the ADR 005 client binding, a voucher
   signature the upstream cannot verify (`BadSignature` / `WrongSigner`), an
   unusable `cache.node_pull_timeout_sec` / `cache.node_pull_stall_timeout_sec`
-  budget, or a buyer-channel store this node cannot read — the serve path
+  budget, or a buyer pool store this node cannot read — the serve path
   collapsed it onto the same clean `NotFound` as "no provider had it". The
   failure was metered honestly all along
   (`decdn_node_pull_local_fault_total`, "any sustained rate is an emergency"),
@@ -2653,14 +2653,14 @@ since project inception and will roll into the first tagged release.
   already maps through `CacheError::OriginError` → `FillOutcome::HardFault` →
   `ServeRejectReason::InternalError`, and the window-paced path folds it into
   the same `fault_seen` latch the reactive local-origin tier has used since
-  #1129. Buyer channel-open failures are attributed at the site that raises them
+  #1129. Buyer pool-open failures are attributed at the site that raises them
   rather than guessed at by the caller: a poisoned open lock, an unreadable
-  channel store, a store write that leaves a deposit untracked, a panicked open
+  pool store, a store write that leaves a deposit untracked, a panicked open
   task, and a wallet that cannot fund a deposit all refuse, while a pending open,
-  a reconcile-held slot, an unreclaimable expired channel, a per-provider on-chain
+  a reconcile-held slot, an unreclaimable expired pool, a per-provider on-chain
   revert, and a transient RPC fault stay clean misses.
   - Scope is deliberately narrow: only a local fault changes the wire code. A
-    wedged or settled *channel* to one provider still answers `NotFound` — it is
+    wedged or settled *lane* to one provider still answers `NotFound` — it is
     not evidence this node is broken for every client and every blob, and it
     already has its own remedy. So does an `OriginBlacklisted` refusal, which is
     node-wide but is a governance policy state rather than an unexpected failure,
@@ -3054,7 +3054,7 @@ since project inception and will roll into the first tagged release.
   documented as the deliberate exception (its values share one aggregate and one
   budget axis; they pointedly do not share an alert, which is why the alert
   filters to `reason="exhausted"`); `dispatch_rejected_*`,
-  `probe_rate_limit_rejected_*`, `channel_open_failures_*` and the gossip
+  `probe_rate_limit_rejected_*`, `pool_open_failures_*` and the gossip
   rejection counters stay siblings. **No metric is renamed.** The
   observability appendix is corrected accordingly: it documented
   `decdn_gossip_messages_rejected_total{reason="clock_skew"}`, a labeled name
@@ -3168,7 +3168,7 @@ since project inception and will roll into the first tagged release.
   dashboards querying the old names go blank. Note this makes
   `probe_hold_unavailable` the one labeled counter in `decdn-node`; the other
   reason-style splits (`dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
-  `channel_open_failures_*`) remain sibling counters for now.
+  `pool_open_failures_*`) remain sibling counters for now.
 
 - **The `decdn_node_address_watcher_*` metrics are removed (#1231).** Gone:
   `decdn_node_address_watcher_restarts_total` and

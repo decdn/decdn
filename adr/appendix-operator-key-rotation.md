@@ -155,7 +155,7 @@ After migration, the Safe holds TOKEN and executes `register` / `openPool` / `cl
 
 The cheap path — the on-chain Safe address does not change. It applies to an operator who moved the on-chain identity to a Safe for cold-path custody ([§ EOA → Safe migration (one-time, optional)](#eoa--safe-migration-one-time-optional)); the Safe still cannot serve traffic (constraint above).
 
-Replace an owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)` (1-of-1), or a standard owner swap via the multisig owners (2-of-3). The Safe address is unchanged; bond, channels, `firstBondedAt`, and `age_ramp` progress all carry over. No iroh-side action needed, and no protocol-level action needed.
+Replace an owner via `Safe.swapOwner(prevOwner, oldOwner, newOwner)` (1-of-1), or a standard owner swap via the multisig owners (2-of-3). The Safe address is unchanged; bond, pools, `firstBondedAt`, and `age_ramp` progress all carry over. No iroh-side action needed, and no protocol-level action needed.
 
 ## Rotating both the iroh and Ethereum keys
 
@@ -180,7 +180,7 @@ Exception: **emergency compromise of the Ethereum key.** Run [§ Ethereum signin
 
 ## What this runbook does not cover
 
-- **Client-side iroh-key rotation.** See [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model), inline "Key rotation": open client→node channels survive client iroh-key rotation (keyed by the client's Ethereum address), mirroring the operator-side carry-over in [§ iroh node-key rotation only](#iroh-node-key-rotation-only).
+- **Client-side iroh-key rotation.** See [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model), inline "Key rotation": open client pools and their client→node lanes survive client iroh-key rotation (keyed by Ethereum addresses, not by NodeId), mirroring the operator-side carry-over in [§ iroh node-key rotation only](#iroh-node-key-rotation-only).
 - **Hot-signing alternatives.** Hardware-wallet and HSM-backed voucher signing are infeasible per [ADR 012 § Consequences](012-client.md#consequences) — 2–5s confirmation latencies cannot keep pace with stream-open, rollover, and close signatures, nor with the per-response `slash_sig`. On the buyer side the pool already authorizes capped, expiring signers off-chain by owner-signed capability ([ADR 003 § PaymentPool](003-payments.md#paymentpool)), which covers delegation without new contract surface and, unlike an immutable pin, carries native revocation via `expiry`. On the operator side, separating a hot serving key from Safe-custodied funds is unimplemented; the shape a future design would take is an EOA delegation mirroring that same capability, not an ERC-1271 session key ([ADR 024 § Unimplemented — Operator Custody While Serving](024-account-abstraction.md#unimplemented--operator-custody-while-serving)).
 - **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: alert peer operators out-of-band and rotate before any further wire-level signature under the compromised key. There is no protocol-funded incident reserve (the `SafetyReserve` was retired — see [ADR 026 § Incident recourse](026-tokenomics.md#incident-recourse-no-standing-reserve)); any discretionary restitution for losses is a DAO Treasury governance matter.
 

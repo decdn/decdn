@@ -360,7 +360,7 @@ After all contracts are deployed, the deployer must execute these transactions b
 3. **Grant `ROUTER_CALLER_ROLE` on FeeRouter to PaymentPool:**
 
    ```solidity
-   feeRouter.grantRole(ROUTER_CALLER_ROLE, address(paymentChannel));
+   feeRouter.grantRole(ROUTER_CALLER_ROLE, address(paymentPool));
    ```
 
    This authorizes `PaymentPool.redeem` to invoke `FeeRouter.routeSettlement(operator, bytesDelivered, amount)`. Without this grant the redemption path reverts.
@@ -615,7 +615,7 @@ All role-based access uses OpenZeppelin `AccessControl`. `DEFAULT_ADMIN_ROLE` is
 
 #### Additive contract surface
 
-New top-level contracts integrate with the launch-time set via standard `AccessControl` role grants — governance can grant new roles or revoke existing ones via the standard 7-day vote + 48-hour timelock path, without contract changes, state migration, or redeploy of the existing contracts. The launch-time interface surface (function signatures and events on `PaymentPool`, `FeeRouter`, `SlashAppeal`, `CapacityBond`, `BuybackBurner`, `SlashJudge`) is treated as stable for cross-contract integration. The pledge is scoped to what is deployed: it binds from the launch deployment onward, and signature changes ahead of that deployment — where no integrator and no live channel exists to break — are ordinary design work, not breaks of it. Concretely: `openPool` is permissionless, the escrow-on-slash settle hooks on `CapacityBond` are `SLASH_APPEAL_ROLE`-gated, TOKEN is `ERC20Burnable` (per [ADR 026 § Supply and distribution](026-tokenomics.md#supply-and-distribution)), and no contract is locked to a specific set of integrators. Future contract surfaces deploy as additive top-level contracts, not as upgrades or migrations of the launch set.
+New top-level contracts integrate with the launch-time set via standard `AccessControl` role grants — governance can grant new roles or revoke existing ones via the standard 7-day vote + 48-hour timelock path, without contract changes, state migration, or redeploy of the existing contracts. The launch-time interface surface (function signatures and events on `PaymentPool`, `FeeRouter`, `SlashAppeal`, `CapacityBond`, `BuybackBurner`, `SlashJudge`) is treated as stable for cross-contract integration. The pledge is scoped to what is deployed: it binds from the launch deployment onward, and signature changes ahead of that deployment — where no integrator and no live pool exists to break — are ordinary design work, not breaks of it. Concretely: `openPool` is permissionless, the escrow-on-slash settle hooks on `CapacityBond` are `SLASH_APPEAL_ROLE`-gated, TOKEN is `ERC20Burnable` (per [ADR 026 § Supply and distribution](026-tokenomics.md#supply-and-distribution)), and no contract is locked to a specific set of integrators. Future contract surfaces deploy as additive top-level contracts, not as upgrades or migrations of the launch set.
 
 #### Role Assignments
 
@@ -817,7 +817,7 @@ The contract surface is identical at launch and at steady state — every contra
 
 - Must be kept in sync as other ADRs evolve — any change to contract interfaces in ADRs 003, 009, 011, 014, or 026 requires updating this document
 - Does not cover off-chain interaction patterns (voucher exchange, probing, DHT discovery) — those remain in their respective ADRs
-- Five contracts custody funds — `CapacityBond` (operator bonds + slash escrow), `PaymentPool` (USDC channel deposits), `SlashAppeal` (slash-appeal bonds), `SlashJudge` (challenge bonds), and `BuybackBurner` (USDC held between buybacks) — alongside the transient-only `FeeRouter` and the treasury-custodian `TimelockController`, so the audit must cover value flow across the whole surface rather than one or two escrow contracts
+- Five contracts custody funds — `CapacityBond` (operator bonds + slash escrow), `PaymentPool` (USDC pool deposits), `SlashAppeal` (slash-appeal bonds), `SlashJudge` (challenge bonds), and `BuybackBurner` (USDC held between buybacks) — alongside the transient-only `FeeRouter` and the treasury-custodian `TimelockController`, so the audit must cover value flow across the whole surface rather than one or two escrow contracts
 
 ## References
 
