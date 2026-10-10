@@ -740,7 +740,7 @@ impl NodeOrigin {
     /// live pull. Any holder — partial or whole — signs the same whole-blob
     /// geometry, so the caller can commit its `StreamResponse` from whichever
     /// candidate answers first. Classifies every failure into the [`PullMiss`] it
-    /// is. The channel it opens is cached by `open_or_reuse_pool`, so the ranged
+    /// is. The pool it opens is cached by `open_or_reuse_pool`, so the ranged
     /// pull's first lane to this provider reuses it.
     ///
     /// With a `prime` and the candidate's probe-reported size, the handshake opens
@@ -771,7 +771,8 @@ impl NodeOrigin {
             return Err(PullMiss::Clean);
         };
         // ADR 041 buy-side gate: refuse a candidate quoting above this node's buy
-        // ceiling BEFORE opening a channel. A skip folds into the walk as `BelowMargin`.
+        // ceiling BEFORE opening or reusing the pool. A skip folds into the walk as
+        // `BelowMargin`.
         let heat = heat_of(deps, hash_bytes);
         let rate_ceiling =
             match economic_ceiling(deps, candidate.node_id.into(), heat, candidate.rate_per_mb) {
@@ -1464,7 +1465,7 @@ impl PeerRunSink<'_> {
             // A pool-open failure is OUR payment-side problem, not the source's
             // fault. If it is a node-wide LOCAL fault (a broken buyer key, an
             // unreadable store), no other lane can fix it — terminal. Otherwise it
-            // is per-provider (a revert, an RPC blip): drop this source and re-plan.
+            // is per-provider (a contract revert): drop this source and re-plan.
             Err(err) => {
                 return match record_pool_open_failure(self.deps, provider_addr, &err) {
                     PullMiss::LocalFault | PullMiss::FundingNeeded => {

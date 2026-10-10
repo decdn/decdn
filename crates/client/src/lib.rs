@@ -209,7 +209,8 @@ pub mod probe;
 /// off the QUIC stream beneath the message decode, and the `ThroughputFloor` that judges
 /// those bytes against a minimum rate over a trailing window.
 mod progress;
-/// Wallet-filled HTTP provider builder for opening/settling payment pools.
+/// Wallet-filled HTTP provider builder for opening, topping up, closing and reclaiming
+/// payment pools.
 pub mod provider;
 /// Client-side [`decdn_bao_range::RangedStore`] backend (#1621): a
 /// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
@@ -1838,7 +1839,7 @@ where
 /// ledger's mutex: each issue advances the cumulative `amount`/`bytes_delivered`
 /// in turn, the lane advances monotonically, and all pulls succeed.
 ///
-/// The caller owns the ledger's lifetime and persists what the channel paid from it
+/// The caller owns the ledger's lifetime and persists what the lane paid from it
 /// directly (this entrypoint does not surface a [`VoucherProgress`] — the shared ledger
 /// IS the watermark). Persist via [`PoolLedger::settlement`], NOT `snapshot`:
 /// `snapshot`/`committed` report only ACKED vouchers, so a voucher left in the ack wait

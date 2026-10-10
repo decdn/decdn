@@ -52,9 +52,10 @@ pub(crate) struct Checkpoint {
 pub(crate) enum ColdStart {
     /// Start at **head**: nothing predates this node, so there is no history
     /// worth replaying. The settlement watcher — no `PoolRedeemed` toward this
-    /// node can predate the node itself. A pool opened before the head anchor
-    /// emits no `PoolOpened` the watcher sees; it reaches the projection through
-    /// the admit-path `getPool` read
+    /// node can predate the node itself. The pool projection is in-memory, so a
+    /// pool whose `PoolOpened` lies below the scan floor (before the head anchor
+    /// here, or below the rewound checkpoint on a restart) reaches it through the
+    /// admit-path `getPool` read
     /// ([`ResolvingPoolView`](crate::payment_settlement::ResolvingPoolView)).
     Head,
 }

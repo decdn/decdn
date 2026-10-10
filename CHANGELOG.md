@@ -32,6 +32,10 @@ since project inception and will roll into the first tagged release.
   `decdn_node_pull_pool_open_failures_total` once, beside
   `decdn_buyer_lane_seed_failures_total`, so the open-failure total counts
   every cause. A dashboard or alert that reads the total now sees seed refusals.
+  A buyer row that vanishes while a lane seed is persisted now refuses the pull
+  and counts as a seed refusal; the pull no longer pays against a pool the store
+  does not record. A store read fault under the seed lock also counts in
+  `decdn_buyer_lane_seed_failures_total`.
   `decdn_voucher_nonce_gaps_total` is removed: vouchers carry no nonce, and
   nothing emitted it.
 - **The `decdn` CLI ships as a container image, and the `decdn-node` image

@@ -980,36 +980,42 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// pays from now. A row that has gone refuses the pull: seeding or pinning
     /// a pool the store no longer tracks pays against a pool nothing records.
     fn reread_before_seed(&self, pool_id: PoolId) -> Result<BuyerPoolState> {
+        // `reuse_or_report` meters the open-failure total for a store fault; the
+        // refused seed is this counter's share of it.
         let row = self
             .reuse_or_report()
+            .inspect_err(|_| self.metrics.buyer_lane_seed_failure())
             .context("re-read the buyer pool before seeding a lane")?;
         row.ok_or_else(|| {
-            self.metrics.buyer_lane_seed_failure();
-            self.metrics.node_pull_pool_open_failure();
             warn!(
                 %pool_id,
                 "the buyer pool row vanished while a lane waited to seed; refusing the pull"
             );
-            anyhow::anyhow!("buyer pool {pool_id} vanished before its lane could be seeded")
-                .context(OpenReported)
-                .context(LocalPullFault)
+            self.refuse_seed(anyhow::anyhow!(
+                "buyer pool {pool_id} vanished before its lane could be seeded"
+            ))
         })
+    }
+
+    /// Meter a lane-seed refusal and mark it as this node's own, already-reported
+    /// fault. Every seed leg that refuses a pull ends here, so each refusal moves
+    /// the lane-seed counter and the open-failure total exactly once.
+    fn refuse_seed(&self, err: anyhow::Error) -> anyhow::Error {
+        self.metrics.buyer_lane_seed_failure();
+        self.metrics.node_pull_pool_open_failure();
+        err.context(OpenReported).context(LocalPullFault)
     }
 
     /// Meter and log a `getWatermark` read that failed or timed out, and build
     /// the refusal [`Self::reseed_lane_from_chain`] returns for it.
     fn unread_watermark(&self, lane: LaneKey, shown: &str, err: anyhow::Error) -> anyhow::Error {
-        self.metrics.buyer_lane_seed_failure();
-        self.metrics.node_pull_pool_open_failure();
         error!(
             pool_id = %lane.pool_id, provider_addr = %lane.provider, error = %shown,
             "could not read this lane's on-chain watermark; refusing the pull rather than \
              resuming the lane from zero, which would strand it below the watermark \
              permanently"
         );
-        err.context("read the lane's on-chain watermark")
-            .context(OpenReported)
-            .context(LocalPullFault)
+        self.refuse_seed(err.context("read the lane's on-chain watermark"))
     }
 
     /// The state to pin once a lane seed is committed: the freshly-read row when
@@ -1071,14 +1077,20 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// [`Self::reseed_lane_from_chain`] so the read, the decision and the write
     /// each stay legible on their own.
     ///
-    /// An outcome other than `Advanced` is not an error: `seed_progress` is
-    /// monotone, so a committed row already at or beyond the seed is the answer
-    /// the caller wanted. Only a store fault fails, because that leaves the lane
-    /// unpriced.
+    /// `Regressed` is not an error: `seed_progress` is monotone, so a committed
+    /// row already at or beyond the seed is the answer the caller wanted.
+    /// `PoolMismatch` is not an error either: a newer pool replaced the row, and
+    /// the caller pins the replacement. A store fault fails, because it leaves
+    /// the lane unpriced. `UnknownPool` fails too, for the reason
+    /// [`Self::reread_before_seed`] refuses a vanished row: the pull would pay
+    /// against a pool the store no longer records.
     ///
     /// # Errors
     ///
-    /// The buyer store could not commit the seed.
+    /// The buyer store could not commit the seed, or the row is gone.
+    // One flat arm per store outcome, each with its own log line; splitting the
+    // match would scatter one decision.
+    #[allow(clippy::cognitive_complexity)]
     fn persist_lane_seed(&self, lane: LaneKey, onchain: &PaymentPool::Lane) -> Result<()> {
         match self.store.seed_progress(
             self.owner,
@@ -1098,26 +1110,42 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
                 );
                 Ok(())
             }
-            Ok(other) => {
+            Ok(AdvanceOutcome::Regressed(err)) => {
                 debug!(
-                    pool_id = %lane.pool_id, provider_addr = %lane.provider, ?other,
-                    "lane seed from chain did not advance the committed row"
+                    pool_id = %lane.pool_id, provider_addr = %lane.provider, error = %err,
+                    "the committed lane is already at or beyond the chain watermark"
                 );
                 Ok(())
             }
+            Ok(AdvanceOutcome::PoolMismatch) => {
+                info!(
+                    pool_id = %lane.pool_id, provider_addr = %lane.provider,
+                    "a newer pool replaced the buyer row while a lane seeded; pinning the \
+                     replacement"
+                );
+                Ok(())
+            }
+            Ok(AdvanceOutcome::UnknownPool) => {
+                warn!(
+                    pool_id = %lane.pool_id, provider_addr = %lane.provider,
+                    "the buyer pool row vanished while a lane seed was persisted; refusing \
+                     the pull"
+                );
+                Err(self.refuse_seed(anyhow::anyhow!(
+                    "buyer pool {} vanished before its lane seed could be persisted",
+                    lane.pool_id
+                )))
+            }
             Err(err) => {
-                self.metrics.buyer_lane_seed_failure();
-                self.metrics.node_pull_pool_open_failure();
                 error!(
                     pool_id = %lane.pool_id, provider_addr = %lane.provider,
                     error = %format_args!("{err:#}"),
                     "could not persist a lane seed; refusing the pull rather than resuming \
                      the lane from zero"
                 );
-                Err(anyhow::Error::new(err)
-                    .context("persist the lane's on-chain watermark")
-                    .context(OpenReported)
-                    .context(LocalPullFault))
+                Err(self.refuse_seed(
+                    anyhow::Error::new(err).context("persist the lane's on-chain watermark"),
+                ))
             }
         }
     }

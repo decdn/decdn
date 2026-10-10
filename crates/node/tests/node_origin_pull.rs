@@ -30,6 +30,7 @@ use decdn_cache::origin::{FilesystemOrigin, Origin, OriginFetch};
 use decdn_cache::{
     CacheEngine, CacheMetrics, CircuitBreakerPolicy, Hash, PinnedHashes, RetryPolicy,
 };
+use decdn_client::LocalPullFault;
 use decdn_client::probe::probe_once;
 use decdn_client::{PoolContext, Recovery};
 use decdn_incentive::{
@@ -37,7 +38,7 @@ use decdn_incentive::{
     ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash,
     min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
-use decdn_node::buyer_channel::{PoolOpenPending, PoolOpener};
+use decdn_node::buyer_channel::{OpenReported, PoolOpenPending, PoolOpener};
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
@@ -2609,9 +2610,8 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
 
 /// A wedged POOL OPEN must not starve the candidate fallback loop (#1143).
 ///
-/// This is the stage #1141/#1142 did *not* bound. Those fixed the stall once a
-/// candidate accepts a QUIC connection; `open_or_reuse_pool` runs BEFORE that, on
-/// both the buffered and window paths. Unbounded, a candidate whose on-chain open
+/// The stall bounds apply once a candidate accepts a QUIC connection;
+/// `open_or_reuse_pool` runs BEFORE that, on both the buffered and window paths. Unbounded, a candidate whose on-chain open
 /// wedges (an unresponsive RPC endpoint, an `openPool` tx that never mines)
 /// consumes the caller's entire outer deadline, candidates #2..N are never
 /// reached, and the serve path refuses a blob the honest fallback holds.
@@ -2853,6 +2853,97 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wedged_channel_open_does_not_starve_the_candidate_loop() -> Result<()> {
     wedged_open_does_not_starve_the_candidate_loop().await
+}
+
+/// A [`PoolOpener`] whose every open fails with an error its raising site has
+/// already reported: marked [`OpenReported`], and [`LocalPullFault`] too when
+/// `local` is set. It meters nothing itself, so every count the test reads came
+/// from the classifier in `record_pool_open_failure`.
+#[derive(Debug)]
+struct ReportedFailureOpener {
+    local: bool,
+}
+
+#[async_trait]
+impl PoolOpener for ReportedFailureOpener {
+    async fn open_or_reuse_pool(
+        &self,
+        _provider_addr: Address,
+        _budget: Duration,
+    ) -> Result<PoolContext> {
+        let err = anyhow::anyhow!("open failed and was reported at its raising site")
+            .context(OpenReported);
+        Err(if self.local {
+            err.context(LocalPullFault)
+        } else {
+            err
+        })
+    }
+
+    fn record_progress(
+        &self,
+        _provider_addr: Address,
+        _pool_id: B256,
+        _write: decdn_client::buyer_pool::ProgressWrite,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Pull one blob from one seeded candidate whose pool open fails with an
+/// already-reported error, and return the node's metrics.
+async fn pull_through_a_reported_open_failure(local: bool) -> Result<Arc<Metrics>> {
+    let hash = Hash::new(b"reported open failure");
+    let provider_id = fresh_key().public();
+    let provider_dht = DhtNodeId::from_bytes(*provider_id.as_bytes());
+    let b_sk = fresh_key();
+    let b_dht = DhtNodeId::from_bytes(*b_sk.public().as_bytes());
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let addr_map = HashMap::from([(provider_dht, PrivateKeySigner::random().address())]);
+    let (origin, _engine, _engine_tmp) = build_origin_seeded_ranking(
+        &ep_b,
+        b_dht,
+        hash,
+        Arc::new(ReportedFailureOpener { local }) as Arc<dyn PoolOpener>,
+        &local_rep,
+        &b_metrics,
+        &[(provider_dht, RATE)],
+        addr_map,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let fetched = Origin::fetch(&origin, hash, u64::MAX).await;
+    anyhow::ensure!(
+        !matches!(fetched, Ok(OriginFetch::AlreadyAdmitted)),
+        "a pull whose only pool open failed cannot deliver"
+    );
+    ep_b.close().await;
+    Ok(b_metrics)
+}
+
+/// The classifier does not restate a failure its raising site already
+/// metered: a node-wide fault (`OpenReported` + `LocalPullFault`) moves the
+/// local-fault counter and leaves the open-failure total alone (#2072).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reported_local_open_fault_is_not_metered_again() -> Result<()> {
+    let metrics = pull_through_a_reported_open_failure(true).await?;
+    assert_counter(&metrics, "node_pull_pool_open_failures_total", 0)?;
+    assert_counter(&metrics, "node_pull_local_fault_total", 1)?;
+    Ok(())
+}
+
+/// A reported per-provider failure (`OpenReported` alone) is not metered again
+/// either, and is not a local fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reported_open_failure_is_not_metered_again() -> Result<()> {
+    let metrics = pull_through_a_reported_open_failure(false).await?;
+    assert_counter(&metrics, "node_pull_pool_open_failures_total", 0)?;
+    assert_counter(&metrics, "node_pull_local_fault_total", 0)?;
+    Ok(())
 }
 
 /// A miss with no discoverable provider degrades to a clean `NotFound`, records
@@ -5324,11 +5415,10 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
 /// #1145 review — the deadline formula must budget the STALL stage, or a peer that goes
 /// silent mid-stream starves the fallback loop exactly as an unbudgeted pool open would.
 ///
-/// This is the third time the same hole has been dug. A candidate costs three sequential
-/// stages — pool open, stream open, then streaming — and each time a stage was left out
-/// of `outer_pull_deadline`, early candidates burned a budget the outer clock had not
-/// allowed for and the loop died before reaching the last one. #859 was the missing stream
-/// open; #1143 was the missing pool open; this is the missing stall window.
+/// A candidate costs three sequential stages — pool open, stream open, then streaming.
+/// A stage left out of `outer_pull_deadline` lets early candidates burn a budget the outer
+/// clock does not allow for, and the loop dies before reaching the last one. This test
+/// covers the stall window; #859 and #1143 cover the stream open and the pool open.
 ///
 /// The existing starvation guard (`a_wedged_channel_open_does_not_starve_the_candidate_loop`)
 /// cannot catch it: its candidates wedge at the pool OPEN, so they never reach the

@@ -14,8 +14,7 @@ fn probe_timeout_matches_the_adr_collection_ceiling() {
 // Asserted against the REAL worst case per candidate — all THREE sequential stages
 // (pool open, stream open, one silent streaming window) — not against the
 // formula's own arithmetic. Restated with any stage missing, this test passes while
-// the loop silently cannot reach the last candidate. Both of the deadline's shipped
-// versions were wrong in exactly that way, one stage apart.
+// the loop silently cannot reach the last candidate.
 //
 // `stall` is swept independently of `per` because it is the term an operator can
 // raise on its own: a formula that ignores it looks fine at defaults and starves the

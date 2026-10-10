@@ -6,8 +6,8 @@
 //! [`is_permanent_rpc_error`](crate::provider::is_permanent_rpc_error)).
 //!
 //! It lives in the SDK so any client of the `cdn/client/v1` data plane — not
-//! just the `decdn` CLI bin crate — can build the signing provider it opens and
-//! settles payment pools with. The daemon's boot chain reads and the
+//! just the `decdn` CLI bin crate — can build the signing provider it opens, tops
+//! up, closes and reclaims payment pools with. The daemon's boot chain reads and the
 //! client's registry discovery classify a typed chain error with the same
 //! classifier.
 

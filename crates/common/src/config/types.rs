@@ -577,8 +577,8 @@ pub struct CacheConfig {
     /// no end-client probe takes a hold slot, regardless of current usage.
     pub stake_lane_reserved_holds: Option<u64>,
     /// Enable node-to-node paid cache-miss pull-through (#831, ADR 001/022).
-    /// Absent / `false` (the default) → a cache miss serves `NotFound` as
-    /// before. When `true` *and* the buyer pool service bootstrapped, a
+    /// Absent / `false` (the default) → a cache miss serves `NotFound`.
+    /// When `true` *and* the buyer pool service bootstrapped, a
     /// miss triggers DHT provider discovery → probe → ranked paid pull from an
     /// upstream node, which populates the cache and is then served. OFF by
     /// default for the initial network: enabling it makes the node front USDC

@@ -444,7 +444,8 @@ pub struct DecdnMetrics {
     /// nothing from the affected providers.
     ///
     /// Each refusal also moves `decdn_node_pull_pool_open_failures_total` once:
-    /// this counter is the lane-seed share of that total.
+    /// this counter is the lane-seed share of that total. A buyer-store read
+    /// fault under the seed lock counts here too.
     pub buyer_lane_seed_failures: Counter,
     /// `decdn_buyer_pool_adoption_failures_total`: bootstrap could not tell
     /// whether this node already owns a payment pool on chain, so it left the
@@ -886,9 +887,9 @@ pub struct DecdnMetrics {
     /// visible name:
     /// `decdn_buyer_pool_store_skipped_undecodable_records_total`.
     pub buyer_pool_store_skipped_undecodable_records: Counter,
-    /// Background low-water top-ups (#1146) that landed: a reused buyer pool
-    /// whose remaining deposit had fallen below its 20% low-water mark was
-    /// re-funded to the working deposit, so sustained miss pulls to that provider
+    /// Background low-water top-ups (#1146) that landed: the node's buyer pool,
+    /// whose remaining deposit had fallen below its 20% low-water mark, was
+    /// re-funded to the working deposit, so sustained miss pulls to every provider
     /// keep flowing instead of silently stranding on a spent-down pool. The
     /// healthy signal of the auto-refill path. Operator-visible name:
     /// `decdn_buyer_topup_ok_total`.
@@ -900,9 +901,9 @@ pub struct DecdnMetrics {
     /// — `fund_pool` logs the tx at error! for reconcile). Folding the untracked case in here — rather than
     /// counting it as `buyer_topup_ok` — means an operator alerting on this metric
     /// sees stranded deposits. The refill is best-effort (the pool is simply left
-    /// un-topped), but a sustained rate means reused pools
-    /// are not being refilled and pull-through to busy providers will degrade as
-    /// their deposits drain (check the gas wallet / RPC / USDC balance). Operator-
+    /// un-topped), but a sustained rate means the node's pool is not being refilled
+    /// and pull-through to every provider degrades as its deposit drains (check the
+    /// gas wallet / RPC / USDC balance). Operator-
     /// visible name: `decdn_buyer_topup_failure_total`.
     pub buyer_topup_failure: Counter,
     /// Lane-store reconciliation the settlement watcher could not apply from a
@@ -1394,26 +1395,27 @@ pub struct DecdnMetrics {
     /// `decdn_node_pull_progress_persist_failures_total` (#852): a pull paid ≥1
     /// voucher but persisting the buyer lane's resume watermark
     /// (`record_progress`) failed. The bytes were delivered, but the lane's
-    /// stored `bytes`/`amount` now lags what the upstream accepted — the next
-    /// reuse of this lane will re-sign a stale voucher and be rejected. A
-    /// non-zero count means a provider is at risk of becoming unusable until
-    /// the pool rotates.
+    /// stored `bytes`/`amount` now lags what the upstream accepted. The next
+    /// reuse of this lane signs from that stale anchor; the upstream rejects it
+    /// with its watermark bundle and the ledger reseeds from that, so each reuse
+    /// costs one rejected voucher. A sustained rate means the buyer store is
+    /// failing writes.
     pub node_pull_progress_persist_failures: Counter,
     /// `decdn_node_pull_progress_dropped_total` (#1145 review): a pull paid ≥1
-    /// voucher, but by the time the watermark was written the provider's slot had
+    /// voucher, but by the time the watermark was written the node's pool had
     /// been replaced by a newer open — so the write was skipped rather than clobber
     /// the replacement, and that voucher's progress is gone.
     ///
     /// Sibling of `node_pull_progress_persist_failures_total`, which only counts the
     /// `Err` path; this is the `Ok`-but-dropped path, which is otherwise invisible.
-    /// The rare benign case is a channel rotating mid-pull. A *sustained* rate means
-    /// a `channel_id`-plumbing bug, and every tick is real USDC whose watermark was
+    /// The rare benign case is a pool replaced mid-pull. A *sustained* rate means
+    /// a `pool_id`-plumbing bug, and every tick is real USDC whose watermark was
     /// discarded — so this is the counter to alert on, not just to look at.
     pub node_pull_progress_dropped: Counter,
     /// `decdn_node_pull_progress_superseded_total` (#1145 review): a pull's watermark write was
-    /// REGRESSED because a CONCURRENT pull on the same shared channel ledger had already
+    /// REGRESSED because a CONCURRENT pull on the same shared lane ledger had already
     /// persisted a higher (correct) watermark. Benign and EXPECTED under the shared
-    /// `BuyerLedgers` — concurrent pulls on one channel are routine — because the monotonic
+    /// `BuyerLedgers` — concurrent pulls on one lane are routine — because the monotonic
     /// store keeps the winner's higher value, so no voucher is lost. Split from
     /// `node_pull_progress_persist_failures_total` (a real store-write failure that leaves the
     /// watermark lagging) so ordinary settle races do not drown out a genuine persist fault.
@@ -2563,8 +2565,8 @@ impl Metrics {
     /// `reason`. Pairs with the structured `reason` field on the `warn!`/`debug!`
     /// in [`crate::node_origin`]. Distinct from
     /// [`Self::node_pull_pool_open_failure`], the unlabeled total (which also
-    /// counts store, open-task and capability-signing causes that never reach the
-    /// `openPool` tx).
+    /// counts store, open-task, capability-signing and lane-seed causes that never
+    /// reach the `openPool` tx).
     pub fn pool_open_failure_by_reason(&self, reason: PoolOpenFailureReason) {
         match reason {
             PoolOpenFailureReason::InsufficientDeposit => {
@@ -3373,11 +3375,11 @@ recorders! {
     /// failed (#852); the lane's stored progress now lags the upstream.
     node_pull_progress_persist_failure => node_pull_progress_persist_failures.inc();
 
-    /// A paid voucher's watermark was DROPPED because the provider's channel slot had
-    /// been replaced by a newer open before the write landed (#1145 review).
+    /// A paid voucher's watermark was DROPPED because the node's pool had been
+    /// replaced by a newer open before the write landed (#1145 review).
     node_pull_progress_dropped => node_pull_progress_dropped.inc();
 
-    /// A concurrent settle on the shared channel ledger persisted a higher watermark first, so
+    /// A concurrent settle on the shared lane ledger persisted a higher watermark first, so
     /// this write was superseded (benign under `BuyerLedgers`; #1145 review).
     node_pull_progress_superseded => node_pull_progress_superseded.inc();
 
