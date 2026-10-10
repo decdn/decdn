@@ -774,8 +774,8 @@ fn pool_whose_receipt_is_unreadable(
     )
 }
 
-/// A `closePool` whose receipt cannot be read is in flight, so the error names
-/// its tx hash (#2413).
+/// A `closePool` whose receipt cannot be read may still be in flight, so the
+/// error names its tx hash (#2413).
 #[tokio::test]
 async fn an_unreadable_close_receipt_names_the_tx() {
     let hash = B256::repeat_byte(0xab);
@@ -793,8 +793,8 @@ async fn an_unreadable_close_receipt_names_the_tx() {
     );
 }
 
-/// A `reclaim` whose receipt cannot be read is in flight, so the error names
-/// its tx hash (#2413).
+/// A `reclaim` whose receipt cannot be read may still be in flight, so the
+/// error names its tx hash (#2413).
 #[tokio::test]
 async fn an_unreadable_reclaim_receipt_names_the_tx() {
     let hash = B256::repeat_byte(0xab);

@@ -2426,11 +2426,11 @@ async fn reclaim_once<P: Provider + Clone>(
                     // still reads healthy, so meter it like the sibling arms
                     // instead of dropping out of the sweep silently.
                     if let Err(err) = store.forget_if_pool(owner, state.pool_id) {
-                        warn!(pool_id = %state.pool_id, error = %err, "reclaim sweep: forget after reclaim failed");
+                        warn!(pool_id = %state.pool_id, %tx, error = %err, "reclaim sweep: forget after reclaim failed");
                         metrics.buyer_reclaim_failure();
                         return;
                     }
-                    info!(pool_id = %state.pool_id, "reclaimed the buyer pool residual and dropped the row");
+                    info!(pool_id = %state.pool_id, %tx, "reclaimed the buyer pool residual and dropped the row");
                 }
                 Ok(_) => {
                     warn!(pool_id = %state.pool_id, %tx, "reclaim sweep: reclaim reverted");

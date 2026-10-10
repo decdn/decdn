@@ -2771,3 +2771,69 @@ async fn a_full_closing_pool_is_replaced() {
     );
     assert!(asserter.read_q().is_empty(), "the estimate ran");
 }
+
+/// A sweep `reclaim` whose receipt cannot be read may still mine, so the
+/// warning names its tx hash and the failure is metered (#2413).
+#[tokio::test]
+async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()> {
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::repeat_byte(1);
+    let pool_id = PoolId::from([0xAA; 32]);
+    let hash = alloy::primitives::B256::repeat_byte(0xab);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    store.record(&BuyerPoolState::new(
+        pool_id,
+        DEPLOYMENT,
+        owner,
+        Address::repeat_byte(2),
+        U256::from(10_000_000u64),
+    ))?;
+
+    // Filler-free, so `send()` is the one `eth_sendTransaction`: `getPool`
+    // reads a closed-out pool, the chain-head read faults (the sweep attempts
+    // the reclaim anyway), the send returns `hash`, and the empty queue then
+    // faults the receipt read.
+    let mut closing = onchain_pool(owner, PaymentPool::Status::Closing, 10_000_000);
+    closing.disputeDeadline = 1;
+    let asserter = Asserter::new();
+    asserter.push_success(&alloy::primitives::Bytes::from(closing.abi_encode()));
+    asserter.push_failure_msg("transient rpc fault");
+    asserter.push_success(&hash);
+    let contract = PaymentPool::new(
+        Address::ZERO,
+        ProviderBuilder::default().connect_mocked_client(asserter),
+    );
+
+    let metrics = metrics();
+    let log = CapturedLog::default();
+    let sink = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        reclaim_once(&contract, &store, owner, &metrics).await;
+    }
+
+    let text = String::from_utf8(
+        log.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )?;
+    assert!(text.contains("reclaim receipt failed"), "{text}");
+    assert!(text.contains(&format!("{hash:#x}")), "{text}");
+    let exported = metrics.encode()?;
+    assert!(
+        exported
+            .lines()
+            .any(|l| l == "decdn_buyer_reclaim_failures_total 1"),
+        "{exported}"
+    );
+    Ok(())
+}

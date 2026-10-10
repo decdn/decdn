@@ -68,7 +68,7 @@ async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
 }
 
 /// An `openPool` whose receipt cannot be read may still escrow its deposit, so
-/// the error names its tx hash and stays classified as an RPC fault (#2413).
+/// the error names its tx hash and is classified as an RPC fault (#2413).
 #[tokio::test]
 async fn an_unreadable_open_pool_receipt_names_the_tx() {
     let hash = B256::repeat_byte(0xab);

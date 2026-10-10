@@ -462,6 +462,11 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// going to mine. So while an `openPool` is outstanding, the only safe thing is
 /// to keep waiting; the node calls this inside a detached task that holds the
 /// owner's open slot for exactly as long as this future runs (#1143).
+///
+/// The wait ends early only when the receipt read itself fails. That error
+/// names the broadcast tx, which may still mine and escrow the deposit, and is
+/// classified [`PoolOpenFailureReason::RpcError`]; reconciling it before another
+/// open is the caller's responsibility.
 pub async fn open_pool<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     signer: Arc<PrivateKeySigner>,
@@ -496,14 +501,14 @@ pub async fn open_pool<P: Provider + Clone>(
     };
     // Capture the hash before `get_receipt` consumes `pending`: past this point
     // the deposit may escrow, so a receipt failure names the tx to reconcile.
+    let tx = *pending.tx_hash();
+
     // Unbounded by design — see the `# The receipt wait is deliberately UNBOUNDED`
     // section above.
-    let tx = *pending.tx_hash();
     let receipt = pending.get_receipt().await.map_err(|err| {
         anyhow::Error::new(err)
             .context(format!(
-                "await openPool receipt (tx {tx:#x}; may still mine — do not open another pool \
-                 until it resolves)"
+                "await openPool receipt (tx {tx:#x}; it may still mine and escrow the deposit)"
             ))
             .context(PoolOpenFailureReason::RpcError)
     })?;
@@ -511,11 +516,11 @@ pub async fn open_pool<P: Provider + Clone>(
         // A mined revert: the reason is not recoverable from the receipt (no
         // trace), so it folds into `ContractRevert`.
         return Err(anyhow::anyhow!(
-            "openPool reverted (owner {owner}, deposit {deposit}); check USDC balance/allowance"
+            "openPool reverted (tx {tx:#x}, owner {owner}, deposit {deposit}); check USDC \
+             balance/allowance"
         )
         .context(PoolOpenFailureReason::ContractRevert));
     }
-    let tx = receipt.transaction_hash;
 
     let Some(opened) = receipt
         .inner
