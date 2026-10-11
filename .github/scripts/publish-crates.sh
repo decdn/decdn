@@ -17,10 +17,11 @@
 #   DECDN_ALLOW_RATE_LIMIT set to 1 to publish more than 5 brand-new crates in
 #                          one run — only once crates.io has raised this repo's
 #                          publish-new limit (see the check below)
-#   DECDN_SKIP_SPONSORD_BUMP set to 1/true/yes to not open decdn/sponsord's
+#   DECDN_SKIP_DEVOPS_BUMP set to 1/true/yes to not open decdn/devops's
 #                          decdn bump PR after the upload (0/false/no or unset
 #                          opens it; any other value stops the script before
 #                          the upload)
+#   DECDN_SKIP_SPONSORD_BUMP the same, for decdn/sponsord's decdn bump PR
 #
 # Unlike sign-release.sh this is NOT freely re-runnable: a crates.io version is
 # immutable and can never be replaced or re-uploaded (only yanked, which does not
@@ -48,8 +49,12 @@ enabled() {
   esac
 }
 
-# Parsed here, before anything is uploaded: the section that reads it runs
+# Parsed here, before anything is uploaded: the section that reads them runs
 # after the publish and must not exit non-zero.
+SKIP_DEVOPS_BUMP=""
+if enabled DECDN_SKIP_DEVOPS_BUMP "${DECDN_SKIP_DEVOPS_BUMP:-}"; then
+  SKIP_DEVOPS_BUMP=1
+fi
 SKIP_SPONSORD_BUMP=""
 if enabled DECDN_SKIP_SPONSORD_BUMP "${DECDN_SKIP_SPONSORD_BUMP:-}"; then
   SKIP_SPONSORD_BUMP=1
@@ -102,17 +107,17 @@ fi
 # your own keyring only proves you can read a signature you already trust.
 KEYS_HOME=$(mktemp -d)
 chmod 700 "$KEYS_HOME"
-# Single EXIT trap for the whole script. WORKTREE and SPONSORD_DIR start empty
+# Single EXIT trap for the whole script. WORKTREE and BUMP_DIRS start empty
 # here and are assigned only from this script's own mktemp, so a value of
 # either inherited from the environment is never removed. WORKTREE is a git
 # worktree, so it must be removed through git rather than with rm, or the
 # parent repo keeps a dangling administrative entry.
 WORKTREE=""
-SPONSORD_DIR=""
+BUMP_DIRS=()
 cleanup() {
-  local rc=$? err
+  local rc=$? err dir
   rm -rf "$KEYS_HOME"
-  if [[ -n "$SPONSORD_DIR" ]]; then rm -rf "$SPONSORD_DIR"; fi
+  for dir in "${BUMP_DIRS[@]}"; do rm -rf "$dir"; done
   # -d, not -n: WORKTREE is assigned before `git worktree add` runs, so on an
   # add failure the path does not exist and removing it would print a warning
   # on top of the real error.
@@ -422,85 +427,107 @@ fi
 
 # ---- downstream ------------------------------------------------------------
 
-# decdn/sponsord pins decdn at a release tag. Its open-decdn-bump.sh, run from
-# a fresh clone of sponsord's main, opens the PR that moves the pin to this
-# release: it commits as your git identity, pushes with your git credentials
-# for github.com and opens the PR with your gh login. It checks crates.io up to
-# 10 times, a minute apart, and exits 3 if the release is still not served, so
-# it runs even when a crate above is not served yet. Its cargo is yours, so
-# rustup selects the toolchain sponsord's rust-toolchain.toml names. A run with
-# DECDN_REPO set to anything but decdn/decdn, such as a fork or a test run,
-# opens nothing.
+# Two repositories pin decdn at a release tag, and each carries the script that
+# opens the PR moving its pin to this release: decdn/devops (the role, chart,
+# Compose and onramp pins; the digests come from the release's signed assets)
+# and decdn/sponsord (the crate pins; it checks crates.io up to 10 times, a
+# minute apart, and exits 3 if the release is still not served, so it runs even
+# when a crate above is not served yet). devops goes first, so sponsord's wait
+# does not hold it up. devops pins vX.Y.Z releases only, so a pre-release opens
+# no devops PR.
+# Each script runs from a fresh clone of its repo's main: it commits as your git
+# identity, pushes with your git credentials for github.com and opens the PR
+# with your gh login. sponsord's uses your cargo, so rustup selects the
+# toolchain sponsord's rust-toolchain.toml names. A run with DECDN_REPO set to
+# anything but decdn/decdn, such as a fork or a test run, opens nothing.
 #
-# This runs sponsord's main as you, so it trusts that branch the way running
-# the script by hand would. sponsord's ruleset requires a PR with one approving
-# review for a change to main, though org admins can bypass it. The registry
+# This runs each repo's main as you, so it trusts that branch the way running
+# the script by hand would. Both repos' rulesets require a PR with one approving
+# review for a change to main, though org admins can bypass them. The registry
 # tokens cargo reads from the environment (CARGO_REGISTRY_TOKEN,
 # CARGO_REGISTRIES_<NAME>_TOKEN) are unset first. Every other variable stays
 # set, and every file you can read, such as ~/.cargo/credentials.toml, stays
-# readable to it. Skip the step with DECDN_SKIP_SPONSORD_BUMP=1 to run the
-# script and its helpers from a checkout you have reviewed.
+# readable to it. Skip a step with DECDN_SKIP_DEVOPS_BUMP=1 or
+# DECDN_SKIP_SPONSORD_BUMP=1 to run that script and its helpers from a checkout
+# you have reviewed.
 #
 # Every failure here is a warning with the command to run later; none of them
 # changes the exit code.
-BUMP_HINT="(cd <a decdn/sponsord checkout> && .github/scripts/open-decdn-bump.sh $TAG)"
-BUMP_SCRIPT=.github/scripts/open-decdn-bump.sh
-if [[ -n "$SKIP_SPONSORD_BUMP" ]]; then
+
+# open_bump <name> <owner/repo> <script> <skip>: run <repo>'s <script> <tag>
+# from a temporary clone, unless <skip> is set.
+open_bump() {
+  local name="$1" repo="$2" script="$3" skip="$4" dir rc=0
+  local hint="(cd <a $repo checkout> && $script $TAG)"
   echo
-  echo "==> Skipping sponsord's decdn bump (DECDN_SKIP_SPONSORD_BUMP is set)"
-elif [[ "$REPO" != "decdn/decdn" ]]; then
-  echo
-  echo "==> Skipping sponsord's decdn bump ($REPO is not decdn/decdn)"
+  if [[ -n "$skip" ]]; then
+    echo "==> Skipping ${name}'s decdn bump (DECDN_SKIP_${name^^}_BUMP is set)"
+    return
+  fi
+  if [[ "$REPO" != "decdn/decdn" ]]; then
+    echo "==> Skipping ${name}'s decdn bump ($REPO is not decdn/decdn)"
+    return
+  fi
+  echo "==> Opening ${name}'s decdn bump PR"
+  if ! dir=$(mktemp -d); then
+    echo "warning: could not create a temporary directory for $repo." >&2
+    echo "Open the bump PR with:" >&2
+    echo "  $hint" >&2
+    return
+  fi
+  BUMP_DIRS+=("$dir")
+  if ! gh repo clone "$repo" "$dir" -- --quiet; then
+    echo "warning: could not clone $repo. Open the bump PR with:" >&2
+    echo "  $hint" >&2
+    return
+  fi
+  if [[ ! -x "$dir/$script" ]]; then
+    echo "warning: $repo main has no executable $script;" >&2
+    echo "open the bump PR by hand (see that repo's decdn bump checklist)." >&2
+    return
+  fi
+  # A script can wait minutes. Ctrl-C stops it (the subshell takes the default
+  # SIGINT action) but not this shell, which still prints the command to run
+  # later and exits 0.
+  trap ':' INT
+  (
+    unset CARGO_REGISTRY_TOKEN
+    while read -r var; do
+      [[ "$var" == CARGO_REGISTRIES_*_TOKEN ]] && unset "$var"
+    done < <(compgen -e)
+    cd "$dir" && "./$script" "$TAG"
+  ) || rc=$?
+  trap - INT
+  case "$rc" in
+    0) ;;
+    3)
+      # sponsord's: the crates.io wait ran out.
+      echo "warning: crates.io does not serve $TAG yet, so ${name}'s bump PR is not open." >&2
+      echo "Open it later with:" >&2
+      echo "  $hint" >&2
+      ;;
+    130)
+      echo "warning: ${name}'s bump was interrupted; no PR is open unless its output" >&2
+      echo "above ends with \"==> Opened <url>\". Open it later with:" >&2
+      echo "  $hint" >&2
+      ;;
+    *)
+      echo "warning: ${name}'s $script exited $rc. If its output above includes" >&2
+      echo "\"==> Opened <url>\", the PR is open but needs work, which its output and" >&2
+      echo "its body name: push the fix to that PR's branch. Otherwise no PR is open;" >&2
+      echo "once the cause above is fixed, open it with:" >&2
+      echo "  $hint" >&2
+      ;;
+  esac
+}
+
+if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  open_bump devops decdn/devops scripts/open-decdn-bump.sh "$SKIP_DEVOPS_BUMP"
 else
   echo
-  echo "==> Opening sponsord's decdn bump PR"
-  rc=0
-  if ! SPONSORD_DIR=$(mktemp -d); then
-    SPONSORD_DIR=""
-    echo "warning: could not create a temporary directory for decdn/sponsord." >&2
-    echo "Open the bump PR with:" >&2
-    echo "  $BUMP_HINT" >&2
-  elif ! gh repo clone decdn/sponsord "$SPONSORD_DIR" -- --quiet; then
-    echo "warning: could not clone decdn/sponsord. Open the bump PR with:" >&2
-    echo "  $BUMP_HINT" >&2
-  elif [[ ! -x "$SPONSORD_DIR/$BUMP_SCRIPT" ]]; then
-    echo "warning: decdn/sponsord main has no executable $BUMP_SCRIPT;" >&2
-    echo "open the bump PR by hand (sponsord RELEASING.md § Pinning decdn)." >&2
-  else
-    # The script can wait minutes for crates.io. Ctrl-C stops it (the subshell
-    # takes the default SIGINT action) but not this shell, which still prints
-    # the command to run later and exits 0.
-    trap ':' INT
-    (
-      unset CARGO_REGISTRY_TOKEN
-      while read -r var; do
-        [[ "$var" == CARGO_REGISTRIES_*_TOKEN ]] && unset "$var"
-      done < <(compgen -e)
-      cd "$SPONSORD_DIR" && "./$BUMP_SCRIPT" "$TAG"
-    ) || rc=$?
-    trap - INT
-    case "$rc" in
-      0) ;;
-      3)
-        echo "warning: crates.io does not serve $TAG yet, so sponsord's bump PR is not open." >&2
-        echo "Open it later with:" >&2
-        echo "  $BUMP_HINT" >&2
-        ;;
-      130)
-        echo "warning: sponsord's bump was interrupted; no PR is open unless its output" >&2
-        echo "above ends with \"==> Opened <url>\". Open it later with:" >&2
-        echo "  $BUMP_HINT" >&2
-        ;;
-      *)
-        echo "warning: sponsord's $BUMP_SCRIPT exited $rc. If its output above ends with" >&2
-        echo "\"==> Opened <url>\", the PR is open but its new lock does not check out:" >&2
-        echo "push the fix to that PR's branch. Otherwise no PR is open; once the cause" >&2
-        echo "above is fixed, open it with:" >&2
-        echo "  $BUMP_HINT" >&2
-        ;;
-    esac
-  fi
+  echo "==> Skipping devops's decdn bump ($TAG is a pre-release)"
 fi
+open_bump sponsord decdn/sponsord .github/scripts/open-decdn-bump.sh "$SKIP_SPONSORD_BUMP"
 
 echo
 echo "Published ${#CRATES[@]} crates at $VERSION."

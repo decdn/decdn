@@ -255,22 +255,34 @@ signatures and the container images are all already published and stand on
 their own; crates.io is an additional distribution channel, so the recovery is
 to finish the remaining crates, not to re-cut the version.
 
-Last, the script opens the PR that pins
-[decdn/sponsord](https://github.com/decdn/sponsord) to this release: it clones
-sponsord into a temporary directory and runs its
-`.github/scripts/open-decdn-bump.sh <tag>`. That script waits up to about ten
-minutes for crates.io to serve the release, commits as your git identity,
-pushes with your git credentials for github.com, and opens the PR with your
-`gh` login. It needs push access to decdn/sponsord, Python 3.11+, and, over
-https, a git credential helper such as `gh auth setup-git`; it uses your cargo,
-so rustup selects sponsord's pinned toolchain.
+Last, the script opens the PRs that pin the two downstream repositories to
+this release. For each, it clones the repository into a temporary directory
+and runs its bump script with the tag:
 
-When it fails, or you press Ctrl-C while it waits, the script prints the
-command to run later from a sponsord checkout; it never fails the publish. It
-runs sponsord's `main` as you, without the cargo registry tokens in the
-environment. sponsord's ruleset requires a reviewed PR for a change to `main`,
-but org admins can bypass it. To run the script and its helpers from a
-checkout you have reviewed instead, set `DECDN_SKIP_SPONSORD_BUMP=1`.
+- [decdn/devops](https://github.com/decdn/devops):
+  `scripts/open-decdn-bump.sh <tag>` moves the Ansible role, Helm chart,
+  Compose and onramp pins. It takes the `SHA256SUMS` and `decdn-node` image
+  digests from the release's assets once their signatures verify against its
+  vendored `KEYS`, regenerates its mirrors from the tag, and lists in the PR
+  body what a reviewer still has to do. It needs Python 3.9+, gpg and
+  `sha256sum`, and opens nothing for a pre-release.
+- [decdn/sponsord](https://github.com/decdn/sponsord):
+  `.github/scripts/open-decdn-bump.sh <tag>` moves the crate pins. It waits up
+  to about ten minutes for crates.io to serve the release, and needs Python
+  3.11+; it uses your cargo, so rustup selects sponsord's pinned toolchain.
+
+Both commit as your git identity, push with your git credentials for
+github.com, and open the PR with your `gh` login. They need push access to
+their repository and, over https, a git credential helper such as
+`gh auth setup-git`.
+
+When one fails, or you press Ctrl-C while it runs, the script prints the
+command to run later from a checkout of that repository; it never fails the
+publish. It runs each repository's `main` as you, without the cargo registry
+tokens in the environment. Both rulesets require a reviewed PR for a change to
+`main`, but org admins can bypass them. To run a bump script and its helpers
+from a checkout you have reviewed instead, set `DECDN_SKIP_DEVOPS_BUMP=1` or
+`DECDN_SKIP_SPONSORD_BUMP=1`.
 
 ### Crate ownership
 
