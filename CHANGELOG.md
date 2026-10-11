@@ -3271,7 +3271,7 @@ since project inception and will roll into the first tagged release.
 ### Added
 
 - **Release: `publish-crates.sh` opens devops' and sponsord's decdn bump PRs
-  (#2399).** After the upload, the script clones decdn/devops and then
+  (#2399, #2421).** After the upload, the script clones decdn/devops and then
   decdn/sponsord into temporary directories and runs each one's
   `open-decdn-bump.sh <tag>`, which opens the PR that pins that repository to
   the new release with the maintainer's `gh` login. devops' PR moves the
