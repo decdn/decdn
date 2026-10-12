@@ -368,6 +368,9 @@ impl ProgressWrite {
 /// # Errors
 ///
 /// Fails on the allowance read, the `approve` submission, or a reverted approve.
+/// A submission that fails in transport
+/// ([`decdn_incentive::tx::send_broadcast_unknown`]) says the `approve` may have
+/// been broadcast.
 pub async fn ensure_allowance<P: Provider + Clone>(
     provider: &P,
     token: Address,
@@ -385,11 +388,20 @@ pub async fn ensure_allowance<P: Provider + Clone>(
         debug!(%current, "USDC allowance already sufficient; skipping approve");
         return Ok(());
     };
-    let pending = erc20
-        .approve(spender, approve_value)
-        .send()
-        .await
-        .context("submit USDC approve")?;
+    let pending = match erc20.approve(spender, approve_value).send().await {
+        Ok(pending) => pending,
+        Err(err) => {
+            // A transport failure may have reached the node and broadcast the
+            // `approve` before the response was lost, with no hash returned.
+            let note = if decdn_incentive::tx::send_broadcast_unknown(&err) {
+                ": the request may have reached the node and broadcast the transaction — \
+                 check this signer's pending and mined transactions before re-running"
+            } else {
+                ""
+            };
+            return Err(anyhow::Error::new(err).context(format!("submit USDC approve{note}")));
+        }
+    };
     // Capture the hash before `get_receipt` consumes `pending`, so a timeout
     // error names the broadcast tx an operator needs to look up (it stays in the
     // mempool and may still mine after we give up).

@@ -557,8 +557,9 @@ fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Errors when the send is rejected, the receipt cannot be read, the tx
-/// reverted, or the local row-clear faulted after a landed close.
+/// Errors when the send fails (an error that leaves the broadcast unknown says
+/// so; see `send_failed`), the receipt cannot be read, the tx reverted, or the
+/// local row-clear faulted after a landed close.
 async fn close_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -573,7 +574,7 @@ where
         Err(e) if e.as_revert_data().is_some() => {
             anyhow::bail!("closePool reverted on-chain for pool {pool_id}")
         }
-        Err(e) => return Err(anyhow::Error::new(e).context("closePool send failed")),
+        Err(e) => return Err(send_failed(e, "closePool")),
     };
     // Read before `get_receipt` consumes `pending`: an unreadable receipt leaves
     // the tx's fate unknown, and the hash is the operator's only handle on it.
@@ -621,9 +622,10 @@ where
 ///
 /// # Errors
 ///
-/// Errors when the send is rejected, the receipt cannot be read, or the tx
-/// reverted after the pre-check passed (see `reclaim_reverted`). A failed local
-/// row-clear only warns — the refund itself landed.
+/// Errors when the send fails (an error that leaves the broadcast unknown says
+/// so; see `send_failed`), the receipt cannot be read, or the tx reverted after
+/// the pre-check passed (see `reclaim_reverted`). A failed local row-clear only
+/// warns — the refund itself landed.
 async fn reclaim_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -638,7 +640,7 @@ where
         Err(e) if e.as_revert_data().is_some() => {
             anyhow::bail!(reclaim_reverted(pool_id, None))
         }
-        Err(e) => return Err(anyhow::Error::new(e).context("reclaim send failed")),
+        Err(e) => return Err(send_failed(e, "reclaim")),
     };
     // Read before `get_receipt` consumes `pending`: an unreadable receipt leaves
     // the tx's fate unknown, and the hash is the operator's only handle on it.
@@ -670,6 +672,22 @@ fn reclaim_reverted(pool_id: PoolId, tx: Option<TxHash>) -> String {
          (most likely a concurrent reclaim; the USDC refund transfer to the owner can also \
          revert)"
     )
+}
+
+/// The error for a `closePool` / `reclaim` send that failed with no revert
+/// data. When `send_broadcast_unknown` holds (a timeout, a reset, an HTTP 5xx,
+/// an unreadable response), the tx may have broadcast before its response was
+/// lost and no hash came back, so the note sends the operator to this signer's
+/// own transactions. Any other failure (a JSON-RPC rejection, an HTTP 4xx, a
+/// local fault) broadcast nothing and gets no note (#1577).
+fn send_failed(err: alloy::contract::Error, label: &str) -> anyhow::Error {
+    let note = if decdn_incentive::tx::send_broadcast_unknown(&err) {
+        ": the request may have reached the node and broadcast the transaction — check this \
+         signer's pending and mined transactions before re-running"
+    } else {
+        ""
+    };
+    anyhow::Error::new(err).context(format!("{label} send failed{note}"))
 }
 
 /// `decdn pool close`: start the grace-window close on a pool the caller owns
