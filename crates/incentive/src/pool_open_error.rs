@@ -1,4 +1,5 @@
-//! Failure-class taxonomy for the buyer-side `openPool` path (#966).
+//! `PaymentPool` revert decoding: the failure-class taxonomy for the
+//! buyer-side `openPool` path (#966) and the pool-lifecycle reverts.
 //!
 //! The buyer `open_pool` kernel (`decdn-client`) can fail three ways
 //! that an operator must triage differently:
@@ -36,6 +37,9 @@
 //! in the older `Error(string)` style carries no custom-error selector, so its
 //! message is matched for the same shortfall — an under-funded wallet reads as
 //! `InsufficientDeposit` whichever revert style the deployed USDC uses.
+//!
+//! The module also decodes `topUp`'s `PoolNotOpen` ([`is_pool_not_open`]) and
+//! the `closePool` / `reclaim` reverts ([`PoolLifecycleRevert`]).
 
 use alloy::primitives::Bytes;
 use alloy::sol;
@@ -71,9 +75,21 @@ sol! {
     /// low) for the `PaymentPool` spender.
     error ERC20InsufficientAllowance(address spender, uint256 allowance, uint256 needed);
 
-    /// `PaymentPool.topUp` (and `assignCapability`) reverts this when the pool
-    /// is `Closing` or `Closed`. Declared here only for its 4-byte selector.
+    /// `PaymentPool.topUp` and `closePool` revert this when the pool is
+    /// `Closing` or `Closed`. Declared here only for its 4-byte selector.
     error PoolNotOpen();
+
+    /// `PaymentPool.topUp` and `closePool` revert this when the caller is not
+    /// the pool owner. Declared here only for its 4-byte selector.
+    error NotPoolOwner();
+
+    /// `PaymentPool.reclaim` reverts this when the pool is not `Closing`.
+    /// Declared here only for its 4-byte selector.
+    error PoolNotClosing();
+
+    /// `PaymentPool.reclaim` reverts this before the pool's dispute deadline.
+    /// Declared here only for its 4-byte selector.
+    error GraceWindowActive();
 }
 
 /// Which class of failure aborted a buyer `openPool` attempt (#966). Carried
@@ -213,13 +229,55 @@ pub fn is_erc20_allowance_shortfall(revert_data: Option<&Bytes>) -> bool {
     })
 }
 
+/// A `PaymentPool` pool-lifecycle revert that `closePool` or `reclaim` can
+/// raise. Decoding the selector names the cause, so a caller does not have to
+/// guess it from the call that failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolLifecycleRevert {
+    /// The pool is `Closing` or `Closed` (`closePool`).
+    PoolNotOpen,
+    /// The caller does not own the pool (`closePool`).
+    NotPoolOwner,
+    /// The pool is not `Closing` (`reclaim`).
+    PoolNotClosing,
+    /// The chain time is before the pool's dispute deadline (`reclaim`).
+    GraceWindowActive,
+}
+
+impl PoolLifecycleRevert {
+    /// Decode the leading 4-byte selector of a `PaymentPool` revert. Returns
+    /// `None` for no data, a payload shorter than a selector, or any other
+    /// selector. Pass alloy's `Error::as_revert_data()`.
+    #[must_use]
+    pub fn decode(revert_data: Option<&Bytes>) -> Option<Self> {
+        let selector = revert_data?.get(..4)?;
+        [
+            (PoolNotOpen::SELECTOR, Self::PoolNotOpen),
+            (NotPoolOwner::SELECTOR, Self::NotPoolOwner),
+            (PoolNotClosing::SELECTOR, Self::PoolNotClosing),
+            (GraceWindowActive::SELECTOR, Self::GraceWindowActive),
+        ]
+        .into_iter()
+        .find_map(|(known, revert)| (selector == known).then_some(revert))
+    }
+
+    /// The Solidity error signature, e.g. `PoolNotOpen()`.
+    #[must_use]
+    pub const fn signature(self) -> &'static str {
+        match self {
+            Self::PoolNotOpen => PoolNotOpen::SIGNATURE,
+            Self::NotPoolOwner => NotPoolOwner::SIGNATURE,
+            Self::PoolNotClosing => PoolNotClosing::SIGNATURE,
+            Self::GraceWindowActive => GraceWindowActive::SIGNATURE,
+        }
+    }
+}
+
 /// Whether a `topUp` revert is `PoolNotOpen`: the pool is `Closing` or
 /// `Closed` and accepts no funds. Pass alloy's `Error::as_revert_data()`.
 #[must_use]
 pub fn is_pool_not_open(revert_data: Option<&Bytes>) -> bool {
-    revert_data
-        .and_then(|data| data.get(..4))
-        .is_some_and(|selector| selector == PoolNotOpen::SELECTOR)
+    PoolLifecycleRevert::decode(revert_data) == Some(PoolLifecycleRevert::PoolNotOpen)
 }
 
 #[cfg(test)]

@@ -85,7 +85,9 @@ pub use lane::{
     FoldAxis, LaneChain, LaneKey, LaneState, PoolError, PoolId, PreimageApplied, RedeemClaim,
     VoucherApplied,
 };
-pub use pool_open_error::{PoolOpenFailureReason, is_erc20_allowance_shortfall, is_pool_not_open};
+pub use pool_open_error::{
+    PoolLifecycleRevert, PoolOpenFailureReason, is_erc20_allowance_shortfall, is_pool_not_open,
+};
 pub use probe_sig::{
     PROBE_RESPONSE_TYPEHASH, ProbeSlashData, ProbeSlashError, SLASH_JUDGE_DOMAIN_NAME,
     SLASH_JUDGE_DOMAIN_VERSION, slash_judge_domain,

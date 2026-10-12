@@ -190,3 +190,28 @@ fn labels_are_the_documented_reason_tokens() {
     );
     assert_eq!(PoolOpenFailureReason::RpcError.as_label(), "rpc_error");
 }
+
+#[test]
+fn pool_lifecycle_reverts_decode_by_selector() {
+    let decode = |data: Vec<u8>| PoolLifecycleRevert::decode(Some(&Bytes::from(data)));
+    assert_eq!(
+        decode(PoolNotOpen {}.abi_encode()),
+        Some(PoolLifecycleRevert::PoolNotOpen)
+    );
+    assert_eq!(
+        decode(NotPoolOwner {}.abi_encode()),
+        Some(PoolLifecycleRevert::NotPoolOwner)
+    );
+    assert_eq!(
+        decode(PoolNotClosing {}.abi_encode()),
+        Some(PoolLifecycleRevert::PoolNotClosing)
+    );
+    assert_eq!(
+        decode(GraceWindowActive {}.abi_encode()),
+        Some(PoolLifecycleRevert::GraceWindowActive)
+    );
+    // Another selector, a payload shorter than a selector, and no data at all.
+    assert_eq!(decode(ZeroAmount {}.abi_encode()), None);
+    assert_eq!(decode(vec![0x01, 0x02]), None);
+    assert_eq!(PoolLifecycleRevert::decode(None), None);
+}
