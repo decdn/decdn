@@ -1541,6 +1541,12 @@ async fn run_delta_update() -> anyhow::Result<()> {
          skipped (unbilled) and b.bin's shared leading chunk is spliced from disk, not \
          re-downloaded: got {paid_v2}"
     );
+    // The report's `paid_bytes` is counted from the same vouchers the lane
+    // persisted, so it matches the billed delta exactly.
+    anyhow::ensure!(
+        report2["paid_bytes"].as_u64() == Some(paid_v2),
+        "second pull must report the bytes it paid for ({paid_v2}): {report2}"
+    );
 
     // (5) The changed file on disk now hashes to the NEW manifest hash.
     let got_a2 = std::fs::read(out_dir.join("a.bin")).context("read a.bin (second pull)")?;
@@ -1681,6 +1687,10 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
          {wire_dup}"
     );
     anyhow::ensure!(
+        report1["paid_bytes"].as_u64() == Some(paid1),
+        "first pull must report the bytes it paid for ({paid1}): {report1}"
+    );
+    anyhow::ensure!(
         report1["fetched"].as_u64() == Some(1),
         "first pull must fetch game1/lib/dup.bin fresh: {report1}"
     );
@@ -1758,6 +1768,10 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
 
     // (3) Zero bytes billed on the lane for the second pull: the shared file
     // is materialized from disk, never fetched or paid for.
+    anyhow::ensure!(
+        report2["paid_bytes"].as_u64() == Some(0),
+        "second pull must report zero paid bytes: {report2}"
+    );
     anyhow::ensure!(
         paid2 == 0,
         "second pull must bill ZERO bytes — dup.bin is deduped from the on-disk game1 copy, not \

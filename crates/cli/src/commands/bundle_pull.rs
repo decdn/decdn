@@ -451,6 +451,12 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// of a blob. `downloaded` is a content-size tally, not an exact on-wire
 /// measurement: it excludes bao proof overhead.
 ///
+/// `paid_bytes` is the bytes this run's vouchers and hash-chain reveals paid
+/// for, summed over every lane. It is counted from payment, not from sizes, so
+/// it is wire bytes and includes the bao proof overhead (a clean pull pays a
+/// little more than `downloaded`). A byte paid for twice, or paid for and then
+/// dropped after a lane fault, counts each time it is paid.
+///
 /// `resumed_bytes` is the content bytes of a `.partial` prefix that an earlier,
 /// interrupted run fetched and paid for, which this run resumed rather than
 /// fetched again. It is never part of `downloaded`. A byte that this run also
@@ -485,6 +491,9 @@ struct PullReport {
     excluded: u64,
     failed: u64,
     downloaded: u64,
+    /// Wire bytes this run's vouchers and hash-chain reveals paid for, over
+    /// every lane.
+    paid_bytes: u64,
     reconstructed: u64,
     spliced_bytes: u64,
     hints_ignored: u64,
@@ -1086,9 +1095,12 @@ fn report(rep: &BundleReport, excluded: u64, output: &Path, json: bool) -> anyho
         println!("{line}");
     } else {
         println!("{}", counts_line(&summary));
-        // `downloaded X → reconstructed Y` only when dedup made them differ;
-        // otherwise a single `downloaded X`.
-        println!("{}", transfer_line(rep.downloaded, rep.reconstructed));
+        // `downloaded X (paid P) → reconstructed Y`: the arrow half only when
+        // dedup made the two differ, the paid part whenever there is any.
+        println!(
+            "{}",
+            transfer_line(rep.downloaded, rep.paid_bytes, rep.reconstructed)
+        );
         // The bytes earlier, interrupted runs fetched and this run resumed, shown
         // only when a run resumed any: they are in neither total above.
         if rep.resumed_bytes > 0 {
@@ -1137,6 +1149,7 @@ fn pull_report(rep: &BundleReport, excluded: u64, output: &Path) -> PullReport {
         excluded,
         failed: rep.failed,
         downloaded: rep.downloaded,
+        paid_bytes: rep.paid_bytes,
         reconstructed: rep.reconstructed,
         spliced_bytes: rep.spliced_bytes,
         hints_ignored: rep.hints_ignored,
@@ -1280,19 +1293,24 @@ fn human_bytes(n: u64) -> String {
     format!("{value:.1} {label}")
 }
 
-/// The end-of-pull transfer line. When dedup saved a transfer the two totals
-/// differ and both are shown with an arrow; otherwise a single `downloaded X`
-/// (the `→ reconstructed` half is omitted rather than repeating the same figure).
-fn transfer_line(downloaded: u64, reconstructed: u64) -> String {
-    if downloaded == reconstructed {
-        format!("downloaded {}", human_bytes(downloaded))
+/// The end-of-pull transfer line. `downloaded X` carries the wire bytes the
+/// run paid for as `(paid P)`, left out only when the run neither downloaded
+/// nor paid anything. The two never quite match: `paid` includes the bao proof
+/// overhead. When dedup saved a transfer, `downloaded` and `reconstructed`
+/// differ and both are shown with an arrow; otherwise the `→ reconstructed`
+/// half is omitted rather than repeating the same figure.
+fn transfer_line(downloaded: u64, paid: u64, reconstructed: u64) -> String {
+    let paid = if downloaded > 0 || paid > 0 {
+        format!(" (paid {})", human_bytes(paid))
     } else {
-        format!(
-            "downloaded {} → reconstructed {}",
-            human_bytes(downloaded),
-            human_bytes(reconstructed)
-        )
-    }
+        String::new()
+    };
+    let rebuilt = if downloaded == reconstructed {
+        String::new()
+    } else {
+        format!(" → reconstructed {}", human_bytes(reconstructed))
+    };
+    format!("downloaded {}{paid}{rebuilt}", human_bytes(downloaded))
 }
 
 #[cfg(test)]

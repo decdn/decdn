@@ -1590,14 +1590,21 @@ impl<P: Provider + Clone> PullCtx<P> {
         // advisory, so a flush failure is logged (inside the flush) and never
         // fails the pull.
         let saved = skip_cache::load(out_root);
+        // The lanes outlive one pull (a manifest fetch or an earlier pull of
+        // this puller drew on them), so this pull's payment is what the
+        // lanes' paid bytes grew by while it ran.
+        let paid_before = self.ledgers.paid_bytes();
         let mut run = self
             .pull_all(entries, out_root, overwrite, saved, cancel)
             .await;
+        let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
         let replaced = replaced_pool(&run);
         if let Some(new) = replaced {
             if let Some(observer) = &self.observer {
                 observer.pool_replaced(&new);
             }
+            // The fresh registry starts at zero, so the second pass's lanes
+            // add their whole total.
             self.ledgers = LaneLedgers::new();
             self.funding = RunFunding::default();
             self.recovery.start_next_pass();
@@ -1606,6 +1613,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 .pull_all(entries, out_root, overwrite, saved, cancel)
                 .await;
             run = merge_passes(run, second);
+            paid = paid.saturating_add(self.ledgers.paid_bytes());
         }
         let PullRun {
             outcomes,
@@ -1625,7 +1633,8 @@ impl<P: Provider + Clone> PullCtx<P> {
         warnings.extend(self.funding.shortfall());
         // Every entry has joined, so the shared dedup counters are now stable.
         let dedup = self.dedup_stats.take();
-        let report = bundle_report(&outcomes, transfer, dedup, warnings);
+        let mut report = bundle_report(&outcomes, transfer, dedup, warnings);
+        report.paid_bytes = u64::try_from(paid).unwrap_or(u64::MAX);
         let end = if interrupted {
             BundleEnd::Interrupted
         } else {

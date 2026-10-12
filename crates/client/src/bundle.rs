@@ -419,8 +419,9 @@ pub enum BundleEnd {
     Stopped(anyhow::Error),
 }
 
-/// What a bundle pull did. Counts are per entry; byte totals are content
-/// bytes and leave out the bao proof overhead.
+/// What a bundle pull did. Counts are per entry. Every byte total but
+/// [`Self::paid_bytes`] is content bytes and leaves out the bao proof
+/// overhead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BundleReport {
@@ -437,8 +438,15 @@ pub struct BundleReport {
     pub reused: u64,
     /// The size of those blobs, once each.
     pub reused_bytes: u64,
-    /// The content bytes this pull fetched and paid for.
+    /// The content bytes this pull fetched and paid for, from entry sizes: a
+    /// blob counts once, less what it spliced or resumed.
     pub downloaded: u64,
+    /// The lane bytes this pull's vouchers and hash-chain reveals paid for,
+    /// summed over every lane ([`crate::PoolLedger::paid_bytes`]). These are
+    /// wire bytes, so they include the bao proof overhead. A byte paid for
+    /// twice, or paid for and then dropped after a lane fault, counts each
+    /// time, so a figure well above `downloaded` shows wasted payment.
+    pub paid_bytes: u64,
     /// The bytes written to disk: every landed copy of every blob.
     pub reconstructed: u64,
     /// The bytes of `.partial` prefixes earlier pulls fetched, which this pull

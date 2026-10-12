@@ -64,6 +64,20 @@ impl LaneLedgers {
             .fold(U256::ZERO, U256::saturating_add)
     }
 
+    /// Σ over every registered lane of the bytes its ledger paid for since its
+    /// seed ([`PoolLedger::paid_bytes`]): what this run paid for, in lane
+    /// (wire) bytes. A lane built after a registry swap is not in this one.
+    #[must_use]
+    pub fn paid_bytes(&self) -> U256 {
+        let map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.values()
+            .map(|h| h.ledger.paid_bytes())
+            .fold(U256::ZERO, U256::saturating_add)
+    }
+
     /// Σ over every registered lane `signer` signs of what it committed past
     /// its recorded prior: what the run signed under `signer`'s capability
     /// beyond the application's local records. The handles are cloned out
