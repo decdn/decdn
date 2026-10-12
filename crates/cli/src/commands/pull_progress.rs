@@ -287,8 +287,8 @@ impl PullProgress {
     /// the extra span the bar fills. Their sum is the blob's whole size. The bar's
     /// download progress also folds into the total bar's download meter.
     ///
-    /// When disabled the returned [`FileBar`] is silent and its
-    /// [`FileBar::callback`] is `None`, so the fetch path runs byte-bar-free.
+    /// When disabled the returned [`FileBar`] is silent: it has no delivery
+    /// callback, and ignores every report.
     pub(crate) fn file_bar(
         &self,
         label: &str,
@@ -454,12 +454,6 @@ impl FileBar {
         }
     }
 
-    /// The delivery callback to hand the fetch path, or `None` when disabled (the
-    /// fetch path then runs byte-bar-free).
-    pub(crate) fn callback(&self) -> Option<&ProgressCallback> {
-        self.cb.as_deref()
-    }
-
     /// Show the `discovering…` phase (probing holders before any byte arrives).
     pub(crate) fn set_discovering(&self) {
         if let Some(p) = &self.phase {
@@ -474,21 +468,39 @@ impl FileBar {
             p.pending();
         }
     }
+}
 
-    /// Enter the `reconstructing…` verify and return a progress reporter to feed the
-    /// running byte count of the whole-file hash into, so the bar keeps moving
-    /// through the verify instead of freezing. `None` when disabled — the hash then
-    /// runs without a progress callback.
-    pub(crate) fn reconstruct_reporter(&self) -> Option<Box<dyn Fn(u64) + Send + Sync>> {
-        let p = self.phase.as_ref()?;
-        p.start_reconstructing();
-        let bar = p.bar.clone();
-        Some(Box::new(move |hashed: u64| bar.set_position(hashed)))
+/// A file bar follows one blob of a [`decdn_client::bundle::BundlePuller`]
+/// pull.
+impl decdn_client::bundle::FileObserver for FileBar {
+    fn delivered(&self, received: u64, expected: u64) {
+        if let Some(cb) = &self.cb {
+            cb(received, expected);
+        }
     }
 
-    /// Clear the bar once the file's pull settles (success or failure).
-    pub(crate) fn finish(self) {
-        if let Some(p) = self.phase {
+    fn discovering(&self) {
+        self.set_discovering();
+    }
+
+    fn pending(&self) {
+        self.set_pending();
+    }
+
+    fn reconstructing(&self) {
+        if let Some(p) = &self.phase {
+            p.start_reconstructing();
+        }
+    }
+
+    fn hashed(&self, bytes: u64) {
+        if let Some(p) = &self.phase {
+            p.bar.set_position(bytes);
+        }
+    }
+
+    fn finished(&self) {
+        if let Some(p) = &self.phase {
             p.bar.finish_and_clear();
         }
     }

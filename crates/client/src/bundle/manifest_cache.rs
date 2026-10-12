@@ -62,12 +62,12 @@ pub(crate) fn load(out_root: &Path, hash: [u8; 32]) -> anyhow::Result<Option<Vec
 }
 
 /// Cache `bytes` (a verified bundle manifest with content address `hash`) under
-/// `out_root`. Best-effort and advisory: a filesystem error prints a warning and
-/// is swallowed, because a pull must not fail over a cache write.
-pub(crate) fn store(out_root: &Path, hash: [u8; 32], bytes: &[u8]) {
-    if let Err(e) = try_store(out_root, hash, bytes) {
-        eprintln!("warning: bundle manifest cache not written: {e:#}");
-    }
+/// `out_root`. Best-effort and advisory: a filesystem error becomes the
+/// returned warning line, because a pull must not fail over a cache write.
+pub(crate) fn store(out_root: &Path, hash: [u8; 32], bytes: &[u8]) -> Option<String> {
+    try_store(out_root, hash, bytes)
+        .err()
+        .map(|e| format!("bundle manifest cache not written: {e:#}"))
 }
 
 /// The fallible core of [`store`]: create the cache directory and write the
@@ -82,7 +82,7 @@ fn try_store(out_root: &Path, hash: [u8; 32], bytes: &[u8]) -> anyhow::Result<()
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let shown = dest.display();
-    let mut tmp = super::fetch::temp_in_parent(&dest).with_context(|| format!("stage {shown}"))?;
+    let mut tmp = super::engine::temp_in_parent(&dest).with_context(|| format!("stage {shown}"))?;
     std::io::Write::write_all(tmp.as_file_mut(), bytes)
         .with_context(|| format!("write {shown}"))?;
     tmp.as_file()
