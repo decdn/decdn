@@ -1003,6 +1003,13 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: Windows builds embed the canonical operator terms.** A Windows
+  checkout converted `crates/cli/TERMS.md` to CRLF, so `decdn.exe` hashed
+  different bytes and `decdn node register` failed with an operator terms
+  mismatch against the network's `currentTermsHash`. `.gitattributes` now
+  keeps `TERMS.md` byte-exact, and the build fails if the embedded terms
+  contain a carriage return.
+
 - **A delegated client records its lane watermarks (#2435).** A client that
   pays under a `dcap1` capability on a pool another owner funds owns no pool
   row, so every lane watermark write it made was dropped with a warning. Its
