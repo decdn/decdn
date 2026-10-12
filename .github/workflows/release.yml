@@ -9,7 +9,7 @@ name: Release
 # This workflow builds and stages; it does not sign and it does not publish.
 # The GitHub Release is created as a *draft* and both container image manifests
 # are pushed untagged, so no NAME a user would pull resolves to anything before a
-# maintainer has signed it with .github/scripts/sign-release.sh. (A manifest
+# maintainer has signed it with scripts/sign-release.sh. (A manifest
 # is still fetchable by its digest — untagged is not unreachable — but no tag
 # points at unsigned bytes, and the digest is not advertised anywhere a user
 # would look.) There is no signing key in Actions secrets.

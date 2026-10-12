@@ -295,11 +295,13 @@ jobs:
               - '.markdownlint.yaml'
               - '.github/workflows/ci.yml'
             scripts:
-              # Gates `ci-tooling-tests` (the pytest suite under
-              # .github/scripts/tests). The helpers and their regression tests
-              # live under .github/scripts/; a PR that touches no scripts has
-              # nothing for that job to verify.
+              # Gates `ci-tooling-tests` (the pytest suites under
+              # .github/scripts/tests and scripts/tests). CI helpers live under
+              # .github/scripts/, maintainer-run release scripts under scripts/,
+              # each beside its regression tests; a PR that touches no scripts
+              # has nothing for that job to verify.
               - '.github/scripts/**'
+              - 'scripts/**'
               - '.github/workflows/ci.yml'
             docker:
               # Gates `docker-build`. Must live in THIS filter, not the
@@ -1171,8 +1173,8 @@ jobs:
     name: CI tooling tests
     runs-on: ubuntu-latest
     needs: changes
-    # Gated on the `scripts` filter: this only exercises .github/scripts/, so a
-    # PR that touches none has nothing to verify here. Not in ci-success.needs
+    # Gated on the `scripts` filter: this only exercises .github/scripts/ and
+    # scripts/, so a PR that touches neither has nothing to verify here. Not in ci-success.needs
     # (non-blocking by design), so a skip needs no allowed-skips entry.
     if: needs.changes.outputs.scripts == 'true' || github.event_name != 'pull_request'
     steps:
@@ -1183,7 +1185,7 @@ jobs:
       - name: Test CI tooling
         run: |
           python3 -m pip install 'pytest==8.*' 'pyyaml==6.*'
-          python3 -m pytest .github/scripts/tests -q
+          python3 -m pytest .github/scripts/tests scripts/tests -q
 
   # Guards what `cargo publish` will do on release day. Both checks exist
   # because a crates.io version can never be replaced: by the time the real

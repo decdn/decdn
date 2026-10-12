@@ -10,8 +10,8 @@ A release is therefore three commands with a CI build between the first two:
 cargo release patch --execute              # cut, sign and push the tag
                                            # (the FIRST release is `minor`: 0.0.0 -> 0.1.0)
 # ...wait for the tag-push run to finish...
-.github/scripts/sign-release.sh v0.1.2     # verify, sign, publish, tag images
-.github/scripts/publish-crates.sh v0.1.2   # publish the crates to crates.io
+scripts/sign-release.sh v0.1.2             # verify, sign, publish, tag images
+scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
 ```
 
 ## One-time setup
@@ -159,7 +159,7 @@ unsigned bytes.
 Once the run is green:
 
 ```bash
-.github/scripts/sign-release.sh v0.1.2
+scripts/sign-release.sh v0.1.2
 ```
 
 It resolves your signing key to a fingerprint — `DECDN_SIGNING_KEY` if set,
@@ -219,7 +219,7 @@ can inspect the bytes rather than re-downloading several hundred megabytes.
 Last, once the GitHub Release is out of draft:
 
 ```bash
-.github/scripts/publish-crates.sh v0.1.2
+scripts/publish-crates.sh v0.1.2
 ```
 
 It verifies the tag against `KEYS` and against `origin` the way
@@ -267,7 +267,7 @@ and runs its bump script with the tag:
   body what a reviewer still has to do. It needs Python 3.9+, gpg and
   `sha256sum`, and opens nothing for a pre-release.
 - [decdn/sponsord](https://github.com/decdn/sponsord):
-  `.github/scripts/open-decdn-bump.sh <tag>` moves the crate pins. It waits up
+  `scripts/open-decdn-bump.sh <tag>` moves the crate pins. It waits up
   to about ten minutes for crates.io to serve the release, and needs Python
   3.11+; it uses your cargo, so rustup selects sponsord's pinned toolchain.
 
