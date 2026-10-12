@@ -31,7 +31,9 @@ use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::{ReadOnlyBuyerPoolStore, RedbBuyerPoolStore};
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
-use decdn_incentive::{Capability, CapabilityGrant, Deployment, PoolId, voucher_domain};
+use decdn_incentive::{
+    Capability, CapabilityGrant, Deployment, PoolId, PoolLifecycleRevert, voucher_domain,
+};
 use serde::Serialize;
 
 use decdn_client::provider;
@@ -557,9 +559,10 @@ fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Errors when the send fails (an error that leaves the broadcast unknown says
-/// so; see `send_failed`), the receipt cannot be read, the tx reverted, or the
-/// local row-clear faulted after a landed close.
+/// Errors when gas estimation rejects the call (see `send_reverted`), the send
+/// fails (an error that leaves the broadcast unknown says so; see
+/// `send_failed`), the receipt cannot be read, the tx reverted, or the local
+/// row-clear faulted after a landed close.
 async fn close_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -572,7 +575,7 @@ where
     let pending = match contract.closePool(pool_id).send().await {
         Ok(pending) => pending,
         Err(e) if e.as_revert_data().is_some() => {
-            anyhow::bail!("closePool reverted on-chain for pool {pool_id}")
+            return Err(send_reverted(e, "closePool", pool_id, None));
         }
         Err(e) => return Err(send_failed(e, "closePool")),
     };
@@ -622,9 +625,10 @@ where
 ///
 /// # Errors
 ///
-/// Errors when the send fails (an error that leaves the broadcast unknown says
-/// so; see `send_failed`), the receipt cannot be read, or the tx reverted after
-/// the pre-check passed (see `reclaim_reverted`). A failed local row-clear only
+/// Errors when gas estimation rejects the call (see `send_reverted`), the send
+/// fails (an error that leaves the broadcast unknown says so; see
+/// `send_failed`), the receipt cannot be read, or the tx reverted after the
+/// pre-check passed (see `reclaim_reverted`). A failed local row-clear only
 /// warns — the refund itself landed.
 async fn reclaim_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -638,7 +642,12 @@ where
     let pending = match contract.reclaim(pool_id).send().await {
         Ok(pending) => pending,
         Err(e) if e.as_revert_data().is_some() => {
-            anyhow::bail!(reclaim_reverted(pool_id, None))
+            return Err(send_reverted(
+                e,
+                "reclaim",
+                pool_id,
+                Some(RECLAIM_UNKNOWN_REVERT),
+            ));
         }
         Err(e) => return Err(send_failed(e, "reclaim")),
     };
@@ -657,21 +666,61 @@ where
             store.forget_after_reclaim(owner, pool_id);
             Ok(())
         }
-        TxOutcome::Reverted => anyhow::bail!(reclaim_reverted(pool_id, Some(tx))),
+        TxOutcome::Reverted => anyhow::bail!(reclaim_reverted(pool_id, tx)),
     }
 }
 
-/// The error for a `reclaim` the chain rejected after the pre-check passed. One
-/// message for the estimation-time and receipt-time reverts, so the two cannot
-/// drift apart. `tx` is the mined revert's hash; an estimation-time revert
-/// broadcast nothing and has none.
-fn reclaim_reverted(pool_id: PoolId, tx: Option<TxHash>) -> String {
-    let tx_note = tx.map_or_else(String::new, |tx| format!(" (tx {tx:#x})"));
+/// The guessed cause of a mined `reclaim` revert. A receipt carries no revert
+/// data, so nothing narrows the cause.
+const RECLAIM_REVERT_GUESS: &str =
+    "most likely a concurrent reclaim; the USDC refund transfer to the owner can also revert";
+
+/// The cause of a `reclaim` that gas estimation rejects with no known
+/// `PaymentPool` error. A concurrent reclaim reverts `PoolNotClosing`, which
+/// decodes, so the remaining revert in `reclaim` is the refund transfer.
+const RECLAIM_UNKNOWN_REVERT: &str = "not a PaymentPool lifecycle error; most likely the USDC \
+                                      refund transfer to the owner reverted";
+
+/// The error for a mined `reclaim` (tx `tx`) that reverted after the pre-check
+/// passed. A receipt carries no revert data, so the cause is a guess.
+fn reclaim_reverted(pool_id: PoolId, tx: TxHash) -> String {
     format!(
-        "reclaim reverted on-chain for pool {pool_id}{tx_note} after the pre-check passed \
-         (most likely a concurrent reclaim; the USDC refund transfer to the owner can also \
-         revert)"
+        "reclaim reverted on-chain for pool {pool_id} (tx {tx:#x}) after the pre-check passed \
+         ({RECLAIM_REVERT_GUESS})"
     )
+}
+
+/// The error for a `closePool` / `reclaim` send that carries revert data. Gas
+/// estimation rejected the call, so nothing was broadcast. A known
+/// `PaymentPool` selector names the cause; any other selector falls back to
+/// `unknown_cause`, when the caller has one. The source error keeps the raw
+/// revert data and any `Error(string)` reason either way.
+fn send_reverted(
+    err: alloy::contract::Error,
+    label: &str,
+    pool_id: PoolId,
+    unknown_cause: Option<&str>,
+) -> anyhow::Error {
+    let cause = match PoolLifecycleRevert::decode(err.as_revert_data().as_ref()) {
+        Some(revert) => {
+            let hint = match revert {
+                PoolLifecycleRevert::PoolNotOpen => {
+                    "the pool is no longer Open; it may have raced a concurrent close"
+                }
+                PoolLifecycleRevert::NotPoolOwner => "this keystore does not own the pool",
+                PoolLifecycleRevert::PoolNotClosing => {
+                    "the pool is not Closing; most likely a concurrent reclaim already closed it"
+                }
+                PoolLifecycleRevert::GraceWindowActive => "the dispute window has not elapsed yet",
+            };
+            format!(": {} — {hint}", revert.signature())
+        }
+        None => unknown_cause.map_or_else(String::new, |cause| format!(" ({cause})")),
+    };
+    anyhow::Error::new(err).context(format!(
+        "{label} would revert for pool {pool_id}{cause} (rejected at gas estimation; nothing was \
+         sent)"
+    ))
 }
 
 /// The error for a `closePool` / `reclaim` send that failed with no revert

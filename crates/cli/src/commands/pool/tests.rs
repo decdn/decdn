@@ -897,12 +897,137 @@ async fn a_rejected_reclaim_send_does_not_warn() {
     assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
 }
 
-/// A mined reclaim revert names its tx; an estimation-time revert broadcast
-/// nothing and names none.
+/// A mined reclaim revert names its tx.
 #[test]
-fn reclaim_reverted_names_only_a_mined_tx() {
-    let pool_id = B256::repeat_byte(0x33);
+fn reclaim_reverted_names_the_mined_tx() {
     let hash = B256::repeat_byte(0xab);
-    assert!(reclaim_reverted(pool_id, Some(hash)).contains(&format!("(tx {hash:#x})")));
-    assert!(!reclaim_reverted(pool_id, None).contains("(tx "));
+    let msg = reclaim_reverted(B256::repeat_byte(0x33), hash);
+    assert!(msg.contains(&format!("(tx {hash:#x})")), "{msg}");
+    assert!(msg.contains(RECLAIM_REVERT_GUESS), "{msg}");
+}
+
+/// An RPC that answers the filler-free `eth_sendTransaction` with revert data
+/// `selector`, standing in for the `eth_estimateGas` rejection a filled
+/// provider gets for a call that would revert.
+fn reverting_with(selector: [u8; 4]) -> alloy::providers::mock::Asserter {
+    let data = format!("\"{}\"", alloy::primitives::hex::encode_prefixed(selector));
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure(alloy_json_rpc::ErrorPayload {
+        code: 3,
+        message: "execution reverted".into(),
+        data: Some(serde_json::value::RawValue::from_string(data).unwrap()),
+    });
+    asserter
+}
+
+/// Assert that `msg` reports a send that gas estimation rejected: nothing was
+/// sent, so it says neither "on-chain" nor that the tx may have broadcast.
+fn assert_rejected_before_send(msg: &str, label: &str) {
+    assert!(
+        msg.contains(&format!("{label} would revert for pool")),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("rejected at gas estimation; nothing was sent"),
+        "{msg}"
+    );
+    assert!(!msg.contains("on-chain"), "{msg}");
+    assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
+}
+
+/// A `closePool` gas estimation that reverts `PoolNotOpen` names the error and
+/// the likely concurrent close, and says nothing was sent (#2426).
+#[tokio::test]
+async fn a_close_estimation_revert_names_pool_not_open() {
+    use alloy::sol_types::SolError;
+    use decdn_incentive::pool_open_error::PoolNotOpen;
+    let msg = format!(
+        "{:#}",
+        close_on(reverting_with(PoolNotOpen::SELECTOR)).await
+    );
+    assert_rejected_before_send(&msg, "closePool");
+    assert!(
+        msg.contains("PoolNotOpen() — the pool is no longer Open"),
+        "{msg}"
+    );
+    assert!(msg.contains("concurrent close"), "{msg}");
+}
+
+/// A `closePool` gas estimation that reverts `NotPoolOwner` names the error.
+#[tokio::test]
+async fn a_close_estimation_revert_names_not_pool_owner() {
+    use alloy::sol_types::SolError;
+    use decdn_incentive::pool_open_error::NotPoolOwner;
+    let msg = format!(
+        "{:#}",
+        close_on(reverting_with(NotPoolOwner::SELECTOR)).await
+    );
+    assert_rejected_before_send(&msg, "closePool");
+    assert!(
+        msg.contains("NotPoolOwner() — this keystore does not own the pool"),
+        "{msg}"
+    );
+}
+
+/// A `reclaim` gas estimation that reverts `PoolNotClosing` names the error
+/// in place of the generic guess (#2426).
+#[tokio::test]
+async fn a_reclaim_estimation_revert_names_pool_not_closing() {
+    use alloy::sol_types::SolError;
+    use decdn_incentive::pool_open_error::PoolNotClosing;
+    let msg = format!(
+        "{:#}",
+        reclaim_on(reverting_with(PoolNotClosing::SELECTOR)).await
+    );
+    assert_rejected_before_send(&msg, "reclaim");
+    assert!(
+        msg.contains("PoolNotClosing() — the pool is not Closing"),
+        "{msg}"
+    );
+    assert!(!msg.contains(RECLAIM_REVERT_GUESS), "{msg}");
+}
+
+/// A `reclaim` gas estimation that reverts `GraceWindowActive` names the error.
+#[tokio::test]
+async fn a_reclaim_estimation_revert_names_grace_window_active() {
+    use alloy::sol_types::SolError;
+    use decdn_incentive::pool_open_error::GraceWindowActive;
+    let msg = format!(
+        "{:#}",
+        reclaim_on(reverting_with(GraceWindowActive::SELECTOR)).await
+    );
+    assert_rejected_before_send(&msg, "reclaim");
+    assert!(
+        msg.contains("GraceWindowActive() — the dispute window has not elapsed"),
+        "{msg}"
+    );
+}
+
+/// A `reclaim` gas estimation that reverts with an unknown selector points at
+/// the refund transfer, not a concurrent reclaim (which reverts
+/// `PoolNotClosing`), and keeps the raw revert data from the source error.
+#[tokio::test]
+async fn a_reclaim_estimation_revert_with_an_unknown_selector_blames_the_refund() {
+    let msg = format!(
+        "{:#}",
+        reclaim_on(reverting_with([0xde, 0xad, 0xbe, 0xef])).await
+    );
+    assert_rejected_before_send(&msg, "reclaim");
+    assert!(msg.contains(RECLAIM_UNKNOWN_REVERT), "{msg}");
+    assert!(!msg.contains("concurrent reclaim"), "{msg}");
+    assert!(msg.contains("0xdeadbeef"), "{msg}");
+}
+
+/// A `closePool` gas estimation that reverts with an unknown selector names no
+/// cause and keeps the raw revert data from the source error.
+#[tokio::test]
+async fn a_close_estimation_revert_with_an_unknown_selector_keeps_the_revert_data() {
+    let msg = format!(
+        "{:#}",
+        close_on(reverting_with([0xde, 0xad, 0xbe, 0xef])).await
+    );
+    assert_rejected_before_send(&msg, "closePool");
+    assert!(!msg.contains(RECLAIM_UNKNOWN_REVERT), "{msg}");
+    assert!(!msg.contains(RECLAIM_REVERT_GUESS), "{msg}");
+    assert!(msg.contains("0xdeadbeef"), "{msg}");
 }

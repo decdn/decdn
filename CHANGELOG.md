@@ -996,6 +996,14 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **`decdn pool close` and `pool reclaim` name the revert that gas estimation
+  rejects, and no longer call it on-chain (#2426, #2417).** A `closePool` or
+  `reclaim` that would revert fails at gas estimation, before anything is
+  sent. The error now says so, names the `PaymentPool` error
+  (`PoolNotOpen()`, `NotPoolOwner()`, `PoolNotClosing()`,
+  `GraceWindowActive()`) with its likely cause, and keeps the raw revert data.
+  A `reclaim` estimation revert with any other selector points at the USDC
+  refund transfer to the owner.
 - **`decdn pool close`, `pool reclaim`, and the USDC `approve` warn when a
   failed send may have broadcast (#2416).** A `closePool`, `reclaim`, or
   `approve` send that fails in transport (a timeout, a connection reset, an HTTP
