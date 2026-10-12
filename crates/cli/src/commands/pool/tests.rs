@@ -667,19 +667,50 @@ fn batch_result_is_ok_unless_something_failed() {
     let clean = BatchTally {
         acted: 3,
         skipped: 2,
-        failed: 0,
+        ..BatchTally::default()
     };
     assert!(batch_result(&clean, "reclaim").is_ok());
     // Any failure is a nonzero exit, and the verb reaches the message.
     let broke = BatchTally {
         acted: 1,
-        skipped: 0,
         failed: 2,
+        ..BatchTally::default()
     };
     let err = batch_result(&broke, "close").unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains('2'), "the failure count must show: {msg}");
-    assert!(msg.contains("close"), "the verb must show: {msg}");
+    assert!(msg.contains("2 pool(s) failed to close"), "{msg}");
+    assert!(!msg.contains("may have broadcast"), "{msg}");
+}
+
+/// A pool whose tx may still mine is not reported as a definite failure, but
+/// it still exits nonzero and tells the operator to check before a re-run.
+#[test]
+fn batch_result_names_unconfirmed_pools_apart_from_failed_ones() {
+    let unconfirmed = BatchTally {
+        unconfirmed: 1,
+        ..BatchTally::default()
+    };
+    let msg = batch_result(&unconfirmed, "reclaim")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("1 pool(s) may have broadcast a reclaim"),
+        "{msg}"
+    );
+    assert!(msg.contains("before re-running"), "{msg}");
+    assert!(!msg.contains("failed"), "{msg}");
+
+    let both = BatchTally {
+        failed: 2,
+        unconfirmed: 3,
+        ..BatchTally::default()
+    };
+    let msg = batch_result(&both, "close").unwrap_err().to_string();
+    assert!(msg.contains("2 pool(s) failed to close"), "{msg}");
+    assert!(
+        msg.contains("3 pool(s) may have broadcast a close"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -799,6 +830,13 @@ async fn an_unreadable_close_receipt_names_the_tx() {
         format!("{err:#}").contains(&format!("{hash:#x}")),
         "{err:#}"
     );
+    assert_eq!(
+        err.downcast_ref::<TxUnconfirmed>(),
+        Some(&TxUnconfirmed {
+            label: "closePool",
+            tx: Some(hash)
+        })
+    );
 }
 
 /// A `reclaim` whose receipt cannot be read may still be in flight, so the
@@ -817,6 +855,13 @@ async fn an_unreadable_reclaim_receipt_names_the_tx() {
     assert!(
         format!("{err:#}").contains(&format!("{hash:#x}")),
         "{err:#}"
+    );
+    assert_eq!(
+        err.downcast_ref::<TxUnconfirmed>(),
+        Some(&TxUnconfirmed {
+            label: "reclaim",
+            tx: Some(hash)
+        })
     );
 }
 
@@ -851,10 +896,15 @@ async fn reclaim_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error
 /// hash returned, so the error warns before the operator re-runs (#2416).
 #[tokio::test]
 async fn a_transport_failed_close_send_warns_it_may_have_broadcast() {
-    let msg = format!(
-        "{:#}",
-        close_on(alloy::providers::mock::Asserter::new()).await
+    let err = close_on(alloy::providers::mock::Asserter::new()).await;
+    assert_eq!(
+        err.downcast_ref::<TxUnconfirmed>(),
+        Some(&TxUnconfirmed {
+            label: "closePool",
+            tx: None
+        })
     );
+    let msg = format!("{err:#}");
     assert!(msg.contains("closePool send failed"), "{msg}");
     assert!(msg.contains(MAYBE_BROADCAST), "{msg}");
     // The failure is the send itself, not a fill-stage read before it.
@@ -867,7 +917,9 @@ async fn a_transport_failed_close_send_warns_it_may_have_broadcast() {
 async fn a_rejected_close_send_does_not_warn() {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_failure_msg("insufficient funds for gas");
-    let msg = format!("{:#}", close_on(asserter).await);
+    let err = close_on(asserter).await;
+    assert!(err.downcast_ref::<TxUnconfirmed>().is_none(), "{err:#}");
+    let msg = format!("{err:#}");
     assert!(msg.contains("closePool send failed"), "{msg}");
     assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
 }
@@ -876,10 +928,15 @@ async fn a_rejected_close_send_does_not_warn() {
 /// hash returned, so the error warns before the operator re-runs (#2416).
 #[tokio::test]
 async fn a_transport_failed_reclaim_send_warns_it_may_have_broadcast() {
-    let msg = format!(
-        "{:#}",
-        reclaim_on(alloy::providers::mock::Asserter::new()).await
+    let err = reclaim_on(alloy::providers::mock::Asserter::new()).await;
+    assert_eq!(
+        err.downcast_ref::<TxUnconfirmed>(),
+        Some(&TxUnconfirmed {
+            label: "reclaim",
+            tx: None
+        })
     );
+    let msg = format!("{err:#}");
     assert!(msg.contains("reclaim send failed"), "{msg}");
     assert!(msg.contains(MAYBE_BROADCAST), "{msg}");
     // The failure is the send itself, not a fill-stage read before it.
@@ -892,9 +949,55 @@ async fn a_transport_failed_reclaim_send_warns_it_may_have_broadcast() {
 async fn a_rejected_reclaim_send_does_not_warn() {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_failure_msg("insufficient funds for gas");
-    let msg = format!("{:#}", reclaim_on(asserter).await);
+    let err = reclaim_on(asserter).await;
+    assert!(err.downcast_ref::<TxUnconfirmed>().is_none(), "{err:#}");
+    let msg = format!("{err:#}");
     assert!(msg.contains("reclaim send failed"), "{msg}");
     assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
+}
+
+/// `close --all` over two `Open` pools: the RPC node rejects the first
+/// `closePool`, and the second fails in transport. The sweep reports the first
+/// as failed and the second as unconfirmed, not as two failures (#2427).
+#[tokio::test]
+async fn close_all_counts_a_transport_failed_send_as_unconfirmed() {
+    use alloy::sol_types::SolCall;
+
+    let owner = Address::repeat_byte(0x22);
+    let open = PaymentPool::Pool {
+        owner,
+        status: PaymentPool::Status::Open,
+        disputeDeadline: 0,
+        deposit: 1_000_000,
+        totalRedeemed: 0,
+    };
+    let get_pool =
+        alloy::primitives::Bytes::from(PaymentPool::getPoolCall::abi_encode_returns(&open));
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&alloy::primitives::Bytes::from(
+        PaymentPool::getPoolsCall::abi_encode_returns(&vec![
+            B256::repeat_byte(0x33),
+            B256::repeat_byte(0x44),
+        ]),
+    ));
+    asserter.push_success(&get_pool);
+    asserter.push_failure_msg("insufficient funds for gas");
+    asserter.push_success(&get_pool);
+    // The queue is now empty, so the second `closePool` fails in transport.
+
+    let err = close_all(
+        &pool_on(asserter),
+        LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+        owner,
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("1 pool(s) failed to close"), "{msg}");
+    assert!(
+        msg.contains("1 pool(s) may have broadcast a close"),
+        "{msg}"
+    );
 }
 
 /// A mined reclaim revert names its tx.

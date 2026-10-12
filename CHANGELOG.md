@@ -1012,6 +1012,13 @@ since project inception and will roll into the first tagged release.
   and mined transactions before re-running. The `approve` runs from `pool
   open`, `pool top-up`, `fetch`, and the daemon's buyer funding. A send the RPC
   node rejects outright carries no warning.
+- **`decdn pool close --all` and `pool reclaim --all` count a transaction
+  that may still mine as unconfirmed, not failed (#2427).** A send that fails
+  in transport, or a broadcast tx whose receipt cannot be read, now adds to an
+  `unconfirmed` count in the summary line. The final error names that count
+  apart from the failed one and tells the operator to check this signer's
+  pending and mined transactions before re-running. The exit code stays
+  nonzero.
 - **The daemon no longer escrows a second pool deposit after an `openPool`
   whose outcome it did not see (#2415).** When the `openPool` receipt read
   failed, or its submit failed in transport, the open task freed the open
