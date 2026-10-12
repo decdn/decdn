@@ -38,7 +38,7 @@ fn chain_adoption_is_refused_in_a_node_data_dir() {
     let client = tempfile::tempdir().unwrap();
     let client_key = client.path().join("keystore.json");
     assert_eq!(
-        ChainAdoption::for_buy(client.path(), &client_key).unwrap(),
+        chain_adoption_for_buy(client.path(), &client_key).unwrap(),
         ChainAdoption::Allowed
     );
 
@@ -46,7 +46,7 @@ fn chain_adoption_is_refused_in_a_node_data_dir() {
     std::fs::write(node.path().join("lanes.redb"), b"x").unwrap();
     assert!(!node.path().join("buyer.redb").exists());
     assert_eq!(
-        ChainAdoption::for_buy(node.path(), &node.path().join("keystore.json")).unwrap(),
+        chain_adoption_for_buy(node.path(), &node.path().join("keystore.json")).unwrap(),
         ChainAdoption::Refused,
         "a node dir must refuse adoption even with its buyer store gone"
     );
@@ -63,7 +63,7 @@ fn chain_adoption_is_refused_for_a_node_operator_key_used_from_a_client_dir() {
     let node = tempfile::tempdir().unwrap();
     std::fs::write(node.path().join("lanes.redb"), b"x").unwrap();
     assert_eq!(
-        ChainAdoption::for_buy(client.path(), &node.path().join("keystore.json")).unwrap(),
+        chain_adoption_for_buy(client.path(), &node.path().join("keystore.json")).unwrap(),
         ChainAdoption::Refused,
         "a client dir must not adopt the daemon's pool through its operator key"
     );
@@ -232,5 +232,5 @@ fn an_unknown_owner_fails_closed() {
             "{err:#}"
         );
     }
-    assert!(ChainAdoption::for_buy(dir.path(), &not_a_dir.join("keystore.json")).is_err());
+    assert!(chain_adoption_for_buy(dir.path(), &not_a_dir.join("keystore.json")).is_err());
 }

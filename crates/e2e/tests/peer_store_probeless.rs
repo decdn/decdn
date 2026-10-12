@@ -302,7 +302,7 @@ async fn run() -> anyhow::Result<()> {
 }
 
 /// Wall-clock seconds since the Unix epoch, saturating to 0 rather than
-/// panicking on a clock before the epoch (mirrors the CLI's own `now_secs_cli`).
+/// panicking on a clock before the epoch (mirrors `decdn_client::targets::now_secs`).
 fn now_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

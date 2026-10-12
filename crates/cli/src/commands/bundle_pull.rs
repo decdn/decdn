@@ -80,7 +80,7 @@ use anyhow::{Context as _, anyhow, bail};
 use decdn_common::cli::{BundlePullArgs, ClientFetchArgs};
 use decdn_common::config::load_file_config;
 use decdn_common::redact::sanitize_err_chain;
-use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
+use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::eth_identity::{PasswordUse, load_signer};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{slash_judge_domain, voucher_domain};
@@ -95,18 +95,25 @@ use super::chain_ctx;
 use super::fetch;
 use super::interrupt::{Interrupt, Interrupted};
 use super::manifest::build_glob_set;
-use super::ordered_writes::OrderedWrites;
 use super::pull_progress::{self, PullProgress};
 use decdn_bao_range::CHUNK_GROUP_BYTES;
 use decdn_client::discovery::{self, NodeCandidate};
 use decdn_client::endpoint as client_endpoint;
+use decdn_client::funding::RunFunding;
+use decdn_client::lane_sources::LaneSources;
+use decdn_client::lanes::{LaneDeps, STALL_WINDOW, SettleOnDrop};
+use decdn_client::ordered_writes::OrderedWrites;
 use decdn_client::provider;
+use decdn_client::session::{DepositPolicy, DiscoveryOptions};
+use decdn_client::stream_cap::LaneStreamCap;
+use decdn_client::targets::{
+    ProbeOpts, ProbeRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
+    probe_and_order, resolve_target_node,
+};
 use decdn_client::{
     ClientRangedStore, Connections, DownloadTarget, Downloader, LaneLedgers, PeerHealth,
     PoolReplaced, ProgressCallback, ProgressClock, PullDeadlines, RecoveryGate, StopPolicy,
 };
-
-use super::cli_sources::CliSources;
 
 type FetchTarget = (PublicKey, Address);
 
@@ -1312,26 +1319,30 @@ impl Transfer {
 /// them qualify ([`cached_registry`]), and the run issues no
 /// `getRegisteredNodes`. Otherwise the registry is read once. A cached list that
 /// runs out of holders falls back to a live read through the in-run
-/// rediscovery ([`CliSources`](super::cli_sources)).
+/// rediscovery ([`LaneSources`]).
 async fn discover_candidates(
     chain: &fetch::ResolvedChain,
     common: &ClientFetchArgs,
 ) -> anyhow::Result<Vec<discovery::NodeCandidate>> {
-    let capacity_bond = chain.capacity_bond.ok_or_else(|| {
+    let capacity_bond = chain.config.capacity_bond.ok_or_else(|| {
         anyhow!(
             "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
              blockchain.capacity_bond_address), or pass --node-id to pull from one node"
         )
     })?;
     if !common.rediscover
-        && let Some(cached) = cached_registry(&chain.data_dir, fetch::now_secs_cli())
+        && let Some(cached) = cached_registry(&chain.site.data_dir, now_secs())
     {
         return Ok(cached);
     }
     let registry_cap = common.discovery_cap();
-    let bootstrap =
-        discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir, registry_cap)
-            .await?;
+    let bootstrap = discovery::bootstrap_nodes(
+        &chain.config.rpc_url,
+        capacity_bond,
+        &chain.site.data_dir,
+        registry_cap,
+    )
+    .await?;
     // See `fetch::discover_provider`: the degraded bootstrap paths reach the
     // operator through the return value; surface it here at `warn`.
     if let Some(warning) = bootstrap.warning() {
@@ -1353,7 +1364,7 @@ async fn discover_candidates(
 fn cached_registry(data_dir: &Path, now_secs: u64) -> Option<Vec<NodeCandidate>> {
     let store = decdn_client::PeerStore::open(data_dir);
     let cfg = decdn_client::StoreConfig::default();
-    let cached = fetch::identity_fresh_candidates(&store, &cfg, now_secs);
+    let cached = identity_fresh_candidates(&store, &cfg, now_secs);
     (cached.len() >= cfg.min_fresh_candidates).then_some(cached)
 }
 
@@ -1490,8 +1501,8 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // password prompt: a node's data dir is a buy target only when the
     // operator named it (#2082).
     // Shared, so a lane's watermark write runs off the runtime thread.
-    let store = Arc::new(open_client_store_for_buy(
-        &chain.data_dir,
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(open_client_store_for_buy(
+        &chain.site.data_dir,
         chain.data_dir_source,
         "pull",
     )?);
@@ -1527,7 +1538,7 @@ async fn pull_over(
     args: &BundlePullArgs,
     chain: &fetch::ResolvedChain,
     grant: Option<decdn_incentive::CapabilityGrant>,
-    (store, writes): (&Arc<RedbBuyerPoolStore>, &OrderedWrites),
+    (store, writes): (&Arc<dyn BuyerPoolStore>, &OrderedWrites),
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     (filter, filters_given): (&EntryFilter, bool),
@@ -1543,10 +1554,11 @@ async fn pull_over(
     } = resolve_selection(common, chain).await?;
 
     // Chain plumbing for the pull loop, built once from the resolved signer.
-    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
-    let contract = PaymentPool::new(chain.payment_pool, rpc.clone());
-    let voucher_dom = voucher_domain(chain.chain_id, chain.payment_pool);
-    let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let config = &chain.config;
+    let rpc = provider::build_provider(&config.rpc_url, &signer)?;
+    let contract = PaymentPool::new(config.payment_pool, rpc.clone());
+    let voucher_dom = voucher_domain(config.chain_id, config.payment_pool);
+    let slash_dom = slash_judge_domain(config.chain_id, config.slash_judge);
     let token = contract
         .usdc()
         .call()
@@ -1572,10 +1584,12 @@ async fn pull_over(
         explicit,
         registry,
         common,
+        discovery: fetch::discovery_options(common)?,
+        deposit: chain.deposit_policy(grant.is_some())?,
         namespace_id,
         grant,
         ledgers: LaneLedgers::new(),
-        funding: fetch::RunFunding::default(),
+        funding: RunFunding::default(),
         recovery: Arc::new(RecoveryGate::new()),
         dedup_stats: DedupStats::default(),
         open_lock: tokio::sync::Mutex::new(()),
@@ -1599,7 +1613,7 @@ async fn pull_over(
     pull_manifest(ctx, args, filter, filters_given, local_manifest).await
 }
 
-/// Print the run's wallet-shortfall warning ([`fetch::RunFunding::shortfall`]),
+/// Print the run's wallet-shortfall warning ([`RunFunding::shortfall`]),
 /// if it has one, for a run that ends before its summary.
 fn warn_shortfall<P: Provider + Clone>(ctx: &PullCtx<'_, P>) {
     if let Some(shortfall) = ctx.funding.shortfall() {
@@ -1674,7 +1688,7 @@ async fn pull_manifest<P: Provider + Clone>(
     if let Some(new) = replaced {
         eprintln!("note: {new}");
         ctx.ledgers = LaneLedgers::new();
-        ctx.funding = fetch::RunFunding::default();
+        ctx.funding = RunFunding::default();
         ctx.recovery.start_next_pass();
         let saved = bundle_manifest::load(&args.output);
         let second = ctx
@@ -2008,286 +2022,6 @@ where
     None
 }
 
-/// Per-provider cap on concurrent streams to one `(pool, signer, provider)`
-/// lane. A lane has one shared [`LaneLedgers`] voucher watermark; concurrent
-/// streams on the same lane draw on it together, and the serving node credits
-/// each stream's delivered bytes from that shared watermark fairly — a slower
-/// stream, whose reveal for its own chunk can land below a faster sibling's
-/// frontier, is paid from the lane headroom the sibling opened rather than
-/// stalled. So same-lane concurrency is safe; this only bounds how many streams
-/// touch a given provider at once. `--max-lane-streams` sets the cap (default 4):
-/// a `Semaphore(N)` admits N concurrent same-lane streams, and N == 1 runs a
-/// single ordered voucher sequence per lane. Cross-lane parallelism (distinct
-/// providers) is never bounded here — only by `--jobs`.
-pub(crate) struct LaneStreamCap {
-    /// Per-provider streams, created on first use. The `tokio::sync::Mutex`
-    /// guards the map so the cap is `Sync` and shareable across the entry futures.
-    map: tokio::sync::Mutex<HashMap<Address, Arc<ProviderStreams>>>,
-    /// Concurrent-stream permits per provider (at least 1). At 1 a `Semaphore(1)`
-    /// serializes same-lane streams exactly like a mutex.
-    n: usize,
-    /// The id the next lane's [`ExtraPermits`] gets.
-    next_lane: AtomicU64,
-}
-
-impl LaneStreamCap {
-    /// A cap admitting `n` concurrent streams per provider (clamped to at least 1).
-    pub(crate) fn new(n: usize) -> Self {
-        Self {
-            map: tokio::sync::Mutex::new(HashMap::new()),
-            n: n.max(1),
-            next_lane: AtomicU64::new(0),
-        }
-    }
-
-    /// The per-provider streams, created on first use.
-    async fn streams(&self, provider: Address) -> Arc<ProviderStreams> {
-        let mut map = self.map.lock().await;
-        Arc::clone(
-            map.entry(provider)
-                .or_insert_with(|| Arc::new(ProviderStreams::new(self.n))),
-        )
-    }
-
-    /// One stream permit for `provider` if one is free now, else `None`. It
-    /// never waits, so a caller that already holds another provider's permit
-    /// cannot deadlock against a sibling that holds this one. It does not
-    /// look at the provider's claims ([`ExtraPermits::grant`]): a lane's first
-    /// stream takes any free permit, and a lane that finds none backs off and
-    /// holds nothing.
-    pub(crate) async fn try_permit(
-        &self,
-        provider: Address,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.streams(provider).await.semaphore)
-            .try_acquire_owned()
-            .ok()
-    }
-
-    /// How a lane to `provider` takes a stream beyond its lease
-    /// ([`decdn_client::LaneWiden`]): an extra stream for a queued range no
-    /// idle lane takes, or the stream it starts again on. `grow` takes only
-    /// a permit of `provider` that is free now and never waits, and `release`
-    /// gives one back. The lane's first stream holds its permit as its lease,
-    /// so the extra streams fit in the rest of the cap. At a cap of 3 or more,
-    /// an extra stream never takes the provider's last free permit, so a
-    /// sibling entry's first stream to `provider` can still open; the extra
-    /// stream holds its permit for a whole range. A smaller cap has no room
-    /// for both, and an extra stream takes any free permit. The acquire gives
-    /// the lease back when the lane's own worker ends, and the lane starts
-    /// again only on a permit `grow` takes; that start may take the last
-    /// permit that no claim holds back.
-    ///
-    /// A lane that `grow` refuses claims the provider's next free permit,
-    /// ahead of every later `grow` ask, and a lane that runs no stream goes
-    /// ahead of the claims of lanes that run one ([`ProviderStreams::take`],
-    /// #2341). A lane's first stream ([`Self::try_permit`]) still takes any
-    /// free permit.
-    pub(crate) async fn widen(&self, provider: Address) -> decdn_client::LaneWiden {
-        let extras = Arc::new(self.extra_permits(provider).await);
-        let released = Arc::clone(&extras);
-        decdn_client::LaneWiden::new(
-            move |kind| extras.grant(kind),
-            move || released.release_one(),
-        )
-    }
-
-    /// A new lane's grants of `provider`'s permits beside its lease, under a
-    /// lane id no other lane of this cap has.
-    async fn extra_permits(&self, provider: Address) -> ExtraPermits {
-        ExtraPermits {
-            streams: self.streams(provider).await,
-            keep: self.extra_keep(),
-            lane: self.next_lane.fetch_add(1, Ordering::Relaxed),
-            held: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    /// The free permits of a provider an extra stream leaves for a sibling
-    /// entry's first stream: one at a cap of 3 or more, where the lease, an
-    /// extra stream and the kept permit fit, and none below.
-    const fn extra_keep(&self) -> usize {
-        if self.n > 2 { 1 } else { 0 }
-    }
-}
-
-/// How long a lane's claim on a provider's next free permit holds without a
-/// new ask. The acquire asks a refused `grow` again within
-/// [`decdn_client::GROWTH_RETRY`] while it still wants the stream, and each
-/// ask renews the claim. So a lane that still waits keeps its claim, and the
-/// claim of a lane that stopped asking, such as one whose own worker took
-/// the range, ends soon after. A lane whose node refused its extra streams
-/// is not asked while it waits out that refusal, so its claim lapses too:
-/// the node would refuse the stream anyway.
-const CLAIM_TTL: std::time::Duration = decdn_client::GROWTH_RETRY.saturating_mul(3);
-
-/// One provider's stream permits and the claims of the lanes that wait for
-/// one.
-struct ProviderStreams {
-    /// The provider's per-lane stream semaphore.
-    semaphore: Arc<tokio::sync::Semaphore>,
-    /// The lanes [`Self::take`] refused, at most one claim per lane, in the
-    /// order they first claimed. A renewal keeps a lane's place.
-    claims: std::sync::Mutex<Vec<Claim>>,
-}
-
-/// A lane's claim on its provider's next free permit.
-struct Claim {
-    /// The claiming lane's [`ExtraPermits::lane`].
-    lane: u64,
-    /// The free permits the lane's last ask leaves after its own.
-    keep: usize,
-    /// Whether the lane ran no stream at its last ask.
-    bare: bool,
-    /// When the lane last asked.
-    at: tokio::time::Instant,
-}
-
-impl ProviderStreams {
-    /// `n` permits and no claims.
-    fn new(n: usize) -> Self {
-        Self {
-            semaphore: Arc::new(tokio::sync::Semaphore::new(n)),
-            claims: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    /// A permit for `lane` if one is free now that no claim holds back,
-    /// never waiting. `keep` is the free permits the ask leaves after its
-    /// own, and `bare` says the lane runs no stream.
-    ///
-    /// Each claim ahead of `lane`'s own, or every claim when it has none,
-    /// holds back one free permit, and the largest `keep` among the ask and
-    /// those claims stays free after them. A bare ask counts only the bare
-    /// claims ahead, so a lane that runs no stream goes ahead of a lane that
-    /// waits for one more: every lane gets its first stream before any lane
-    /// gets a second. So a lane that asks the instant a permit frees, such
-    /// as one whose short legs restart beside its extra streams, cannot take
-    /// it from a lane that asks only once per growth pass (#2341).
-    ///
-    /// A refused ask claims the next free permit, or renews the lane's claim
-    /// in its place. A grant ends the claim. Claims older than [`CLAIM_TTL`]
-    /// do not count. Every entry is polled on one task and this never
-    /// awaits, so no sibling takes a permit between the count and the take.
-    fn take(
-        &self,
-        lane: u64,
-        keep: usize,
-        bare: bool,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let now = tokio::time::Instant::now();
-        let mut claims = self.claims.lock().unwrap_or_else(PoisonError::into_inner);
-        claims.retain(|claim| now.saturating_duration_since(claim.at) < CLAIM_TTL);
-        let own = claims.iter().position(|claim| claim.lane == lane);
-        let (ahead, kept) = claims
-            .get(..own.unwrap_or(claims.len()))
-            .unwrap_or_default()
-            .iter()
-            .filter(|claim| !bare || claim.bare)
-            .fold((0_usize, keep), |(n, kept), claim| {
-                (n.saturating_add(1), kept.max(claim.keep))
-            });
-        if self.semaphore.available_permits() <= ahead.saturating_add(kept) {
-            let claim = Claim {
-                lane,
-                keep,
-                bare,
-                at: now,
-            };
-            match own.and_then(|i| claims.get_mut(i)) {
-                Some(renewed) => *renewed = claim,
-                None => claims.push(claim),
-            }
-            return None;
-        }
-        match Arc::clone(&self.semaphore).try_acquire_owned() {
-            Ok(permit) => {
-                if let Some(i) = own {
-                    claims.remove(i);
-                }
-                Some(permit)
-            }
-            Err(tokio::sync::TryAcquireError::NoPermits) => None,
-            Err(tokio::sync::TryAcquireError::Closed) => {
-                // Nothing closes the semaphore: a closed one grants no
-                // stream, and says so.
-                tracing::warn!("a lane's stream semaphore is closed; it grants no extra stream");
-                None
-            }
-        }
-    }
-
-    /// End `lane`'s claim, if it has one.
-    fn forget(&self, lane: u64) {
-        self.claims
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|claim| claim.lane != lane);
-    }
-}
-
-/// The stream permits one lane holds beside its lease: its extra streams',
-/// and its own stream's once it starts again without the lease
-/// ([`LaneStreamCap::widen`]).
-struct ExtraPermits {
-    /// The provider's permits and claims.
-    streams: Arc<ProviderStreams>,
-    /// The free permits an extra stream leaves for a sibling entry's first
-    /// stream.
-    keep: usize,
-    /// The lane's id in its provider's claims.
-    lane: u64,
-    /// The permits granted and not yet given back.
-    held: std::sync::Mutex<Vec<tokio::sync::OwnedSemaphorePermit>>,
-}
-
-impl ExtraPermits {
-    /// Take one permit if it is free now and no claim holds it back
-    /// ([`ProviderStreams::take`]), never waiting, and return whether one
-    /// was taken. An extra stream leaves `keep` free permits for a sibling
-    /// entry's first stream; a restart may take the last one. The acquire
-    /// asks a restart only once the lane's lease is given back, so a lane
-    /// that asks one and holds no grant runs no stream.
-    fn grant(&self, kind: decdn_client::GrowFor) -> bool {
-        let (keep, bare) = match kind {
-            decdn_client::GrowFor::Restart => (0, self.lock_held().is_empty()),
-            decdn_client::GrowFor::Extra => (self.keep, false),
-        };
-        let Some(permit) = self.streams.take(self.lane, keep, bare) else {
-            return false;
-        };
-        self.lock_held().push(permit);
-        true
-    }
-
-    /// Give back one held permit. The acquire gives back only what `grant`
-    /// granted, so a call with none held breaks that rule: it does nothing
-    /// and says so.
-    fn release_one(&self) {
-        let permit = self.lock_held().pop();
-        debug_assert!(
-            permit.is_some(),
-            "a stream was given back that was never granted"
-        );
-        if permit.is_none() {
-            tracing::warn!("a lane gave back a stream permit it does not hold");
-        }
-        drop(permit);
-    }
-
-    /// The held permits, locked.
-    fn lock_held(&self) -> std::sync::MutexGuard<'_, Vec<tokio::sync::OwnedSemaphorePermit>> {
-        self.held.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-impl Drop for ExtraPermits {
-    /// An ended lane claims nothing.
-    fn drop(&mut self) {
-        self.streams.forget(self.lane);
-    }
-}
-
 /// The run's `--jobs` cap ([`PullCtx::gate`]): its permits, and the admission
 /// queue a new group's first permit waits in.
 ///
@@ -2384,11 +2118,11 @@ impl<'g> FetchSlot<'g> {
 /// in-flight entry future, and every entry must be polled on one task, as
 /// `buffer_unordered` does: each entry reads its lanes' ledgers and queues
 /// their watermark writes with no await between
-/// ([`fetch::queue_face_watermarks`]), and only one task keeps another entry's
+/// ([`decdn_client::lanes`]), and only one task keeps another entry's
 /// read from falling between them.
 struct PullCtx<'a, P: Provider + Clone> {
     endpoint: &'a Endpoint,
-    store: &'a Arc<RedbBuyerPoolStore>,
+    store: &'a Arc<dyn BuyerPoolStore>,
     contract: &'a PaymentPool::PaymentPoolInstance<P>,
     rpc: &'a P,
     signer: &'a Arc<PrivateKeySigner>,
@@ -2406,6 +2140,10 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// `explicit` pins the node.
     registry: Option<Vec<NodeCandidate>>,
     common: &'a ClientFetchArgs,
+    /// How every entry finds its holders, from `common`.
+    discovery: DiscoveryOptions,
+    /// How the run funds its pool.
+    deposit: DepositPolicy,
     /// Delegated capability adopted for every entry (`--capability`), or `None`
     /// for the self-owned pool path. When `Some`, every entry presents this
     /// owner-signed grant instead of opening/reusing the caller's own pool, and
@@ -2421,9 +2159,9 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// issuer, so concurrent same-lane fetches never race the cumulative
     /// watermark.
     ledgers: LaneLedgers,
-    /// The run's funding facts ([`fetch::RunFunding`]): the pool's spend
+    /// The run's funding facts ([`RunFunding`]): the pool's spend
     /// outside the run's lanes, and a wallet too short of USDC to top it up.
-    funding: fetch::RunFunding,
+    funding: RunFunding,
     /// The run's funding recovery gate (ADR 003 § Funding recovery). A bundle
     /// pull is one fetch for every entry, so its entries share one progress
     /// rule, and so does the pass that runs the remaining entries again
@@ -2450,7 +2188,7 @@ struct PullCtx<'a, P: Provider + Clone> {
     gate: JobGate,
     /// Per-provider cap on concurrent same-lane streams (`--max-lane-streams`,
     /// default 4). Every lane an entry's fetch builds holds one of its
-    /// provider's permits, taken without waiting ([`CliSources`]). Bounds only
+    /// provider's permits, taken without waiting ([`LaneSources`]). Bounds only
     /// per-provider concurrency; `--jobs` still bounds cross-lane parallelism.
     lane_cap: LaneStreamCap,
     /// The command-wide holder health every entry's fetch records into, so a
@@ -2477,9 +2215,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// The shared lane deps, assembled from `PullCtx`'s borrowed chain
     /// plumbing plus this run's per-fetch budgets — the same shape `decdn fetch`
     /// builds, for every fetch of an entry ([`Self::acquire_entry`]).
-    fn drive_deps(&self, max_blob_bytes: u64) -> anyhow::Result<fetch::DriveFetchDeps<'_, P>> {
-        Ok(fetch::DriveFetchDeps {
-            timings: None,
+    fn drive_deps(&self, max_blob_bytes: u64) -> anyhow::Result<LaneDeps<'_, P>> {
+        Ok(LaneDeps {
+            marks: None,
             endpoint: self.endpoint,
             store: self.store,
             contract: self.contract,
@@ -2487,7 +2225,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             slash_dom: self.slash_dom,
             self_address: self.self_address,
             token: self.token,
-            chain: self.chain,
+            chain: &self.chain.config,
+            site: &self.chain.site,
+            deposit: self.deposit,
             // Bundle-level `--namespace` (ADR 002): routes any cache-miss origin
             // pull to that namespace's authorized origins. Applies uniformly to the
             // manifest blob and every entry — all funnel through here.
@@ -2499,7 +2239,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // budget bounds both stages. The pull carries no overall wall-clock cap —
             // `drive` never consults one — so it completes for any blob size as long
             // as the upstream keeps feeding it bytes.
-            deadlines: PullDeadlines::new(fetch::STALL_WINDOW, fetch::STALL_WINDOW, 0)?,
+            deadlines: PullDeadlines::new(STALL_WINDOW, STALL_WINDOW, 0)?,
             connections: &self.connections,
             writes: self.writes,
             funding: &self.funding,
@@ -2529,28 +2269,25 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// entry's own registry sample (proxy-warming non-holders first when they
     /// help, then holders nearest RTT first). An entry resolves them once and
     /// every fetch of the entry reuses them. A resolution that fails for any
-    /// reason but the configuration ([`fetch::holders_or_none`]) starts the
+    /// reason but the configuration ([`holders_or_none`]) starts the
     /// entry with no holder, and its acquire loop discovers them.
-    async fn entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<fetch::ResolvedTargets> {
-        fetch::holders_or_none(self.resolve_entry_targets(hash).await)
+    async fn entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
+        holders_or_none(self.resolve_entry_targets(hash).await)
     }
 
     /// [`Self::entry_targets`] before a failure is sorted into a configuration
     /// fault or an empty start.
-    async fn resolve_entry_targets(
-        &self,
-        hash: [u8; 32],
-    ) -> anyhow::Result<fetch::ResolvedTargets> {
+    async fn resolve_entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
         if self.explicit.is_some() {
-            return fetch::resolve_target_node(
-                self.common,
-                self.chain,
+            return resolve_target_node(
+                &self.discovery,
+                (&self.chain.config, &self.chain.site),
                 self.endpoint,
                 self.relays,
                 hash,
-                fetch::ProbeOpts {
-                    timings: None,
-                    round: fetch::ProbeRound::Stream,
+                ProbeOpts {
+                    marks: None,
+                    round: ProbeRound::Stream,
                 },
             )
             .await;
@@ -2558,14 +2295,14 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // The entry's round streams: its fetch starts at the first verified
         // holder, and the holders that answer later join it.
         let candidates = self.entry_candidates()?;
-        fetch::probe_and_order(
+        probe_and_order(
             self.endpoint,
             &candidates,
             self.relays.first(),
             hash,
-            fetch::ProxyWarmingParams::from_args(self.common),
+            self.discovery.proxy_warming,
             self.slash_dom,
-            fetch::ProbeRound::Stream,
+            ProbeRound::Stream,
         )
         .await
     }
@@ -2597,7 +2334,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// then fetched and paid again.
     async fn acquire_entry(
         &self,
-        targets: &fetch::ResolvedTargets,
+        targets: &ResolvedTargets,
         hash: [u8; 32],
         staging: &Path,
         total: Option<u64>,
@@ -2606,9 +2343,9 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     ) -> anyhow::Result<bool> {
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
         let deps = self.drive_deps(max_blob_bytes)?;
-        let sources = CliSources::new(
+        let sources = LaneSources::new(
             &deps,
-            self.common,
+            &self.discovery,
             self.relays,
             self.grant.as_ref(),
             self.signer,
@@ -2621,7 +2358,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let holders = sources.holders_from(targets);
         // A fetch dropped by Ctrl-C, or by a sibling's command-wide fault,
         // queues every lane's vouchers for recording too.
-        let on_drop = fetch::SettleOnDrop::new(|| sources.persist_watermarks_detached());
+        let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
             // The manifest's size is the entry's first claim; without one, the
             // probe's hint or a header-only open gives it.
@@ -2661,7 +2398,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         .await;
         on_drop.disarm();
         sources.persist_watermarks().await;
-        result.map_err(|err| sources.annotate(err))
+        result.map_err(|err| fetch::annotate(err, &sources))
     }
 
     /// This entry's probe candidates: a fresh sample of the run's registry read
@@ -2671,7 +2408,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             .registry
             .as_deref()
             .ok_or_else(|| anyhow!("no discovery candidates available"))?;
-        Ok(entry_candidates(registry, self.chain.region.as_deref()))
+        Ok(entry_candidates(
+            registry,
+            self.chain.site.region.as_deref(),
+        ))
     }
 
     /// Fetch one blob fully into memory — used only for the bundle manifest
@@ -3468,7 +3208,7 @@ trait RangeDriver {
 /// re-drive of the whole blob.
 struct AcquireRangeDriver<'a, 'g, P: Provider + Clone> {
     ctx: &'a PullCtx<'a, P>,
-    targets: &'a fetch::ResolvedTargets,
+    targets: &'a ResolvedTargets,
     hash: [u8; 32],
     staging: &'a Path,
     /// The manifest's size: the entry's first size claim.

@@ -178,23 +178,34 @@ pub mod driver;
 /// One-shot client `Endpoint` construction: relay + discovery resolution for
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
 pub mod endpoint;
+// Hidden engine seams with `//!` docs in their own files: how a paid fetch
+// finds holders, builds and funds its lanes, and records what they paid. The
+// `decdn` CLI drives them; they carry no stability promise.
 /// What a failed lane, lane build, or discovery means for the acquire loop
 /// (ADR 039 § Failure handling: reassign-only tail): a pure classifier over
 /// `anyhow::Error`.
 #[doc(hidden)]
 pub mod fault;
 mod first_open;
+#[doc(hidden)]
+pub mod funding;
 /// Command-wide health of each provider (ADR 039 § Failure handling:
 /// reassign-only tail): cooling backoff on a delivery fault, parking on an
 /// unaffordable price.
 #[doc(hidden)]
 pub mod health;
+#[doc(hidden)]
+pub mod lane_sources;
+#[doc(hidden)]
+pub mod lanes;
 mod ledger;
 /// Run-scoped registry of live per-lane voucher ledgers:
 /// [`ledgers::LaneLedgers`] maps each `(pool_id, signer, provider)` lane to
 /// the one [`ledgers::LaneHandle`] every concurrent fetch on that lane shares.
 #[doc(hidden)]
 pub mod ledgers;
+#[doc(hidden)]
+pub mod ordered_writes;
 /// The pure pacing axis (#1608): [`pacer::Pacer`] / [`pacer::BudgetPacer`] decide
 /// draw / wait / done / refuse for the gap-driven driver, with no I/O.
 #[doc(hidden)]
@@ -226,14 +237,20 @@ mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (ADR 039 § Dynamic segmentation and tail-stealing): no I/O, no async.
 mod segment;
+#[doc(hidden)]
+pub mod session;
 /// When a command gives up (ADR 039 § Failure handling: reassign-only tail):
 /// the progress clock and the stop policy that watches it.
 pub mod stop;
+#[doc(hidden)]
+pub mod stream_cap;
 /// The `Streamer` consumption face (#1848): stream one blob's verified,
 /// contiguous front to a consumer as it arrives, paced by consumption and bounded
 /// to one read-ahead window ahead of the read cursor. A fetch-like single-blob
 /// face over the same engine, with no chunk dedup.
 pub mod streamer;
+#[doc(hidden)]
+pub mod targets;
 // Docs live in `sink.rs` as `//!`. Deliberately NOT documented here as well:
 // rustdoc resolves intra-doc links on a `mod` item in THIS file's scope, so the
 // module's own links (`content_paid_frontier`, …) would go unresolved

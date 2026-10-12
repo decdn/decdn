@@ -138,6 +138,21 @@ impl FetchTimings {
     }
 }
 
+/// The SDK reports the marks it reaches inside discovery and lane building.
+impl decdn_client::session::FetchMarks for FetchTimings {
+    fn probe_started(&self) {
+        self.mark(Mark::ProbeStart);
+    }
+
+    fn lane_built(&self) {
+        self.mark(Mark::Lane);
+    }
+
+    fn holder_joined(&self) {
+        Self::holder_joined(self);
+    }
+}
+
 /// `d` in whole milliseconds, saturating at `u64::MAX`.
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)

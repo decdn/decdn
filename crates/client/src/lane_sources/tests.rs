@@ -1,7 +1,6 @@
-use super::{PeerEvent, holders_from, lane_lease, with_top_up_hint};
-use crate::commands::bundle_pull::LaneStreamCap;
-use alloy::primitives::{Address, B256, U256};
-use decdn_client::NoAffordableSource;
+use super::{PeerEvent, holders_from, lane_lease};
+use crate::stream_cap::LaneStreamCap;
+use alloy::primitives::Address;
 
 /// Two entries of one command file records for the same node through the
 /// command's ordered writes: entry A's first open, then entry B's fault.
@@ -10,8 +9,8 @@ use decdn_client::NoAffordableSource;
 async fn an_open_and_a_later_fault_from_two_entries_land_in_order() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let node_id = iroh::SecretKey::from_bytes(&[3; 32]).public();
-    decdn_client::PeerStore::open(dir.path()).upsert_identity(
-        &decdn_client::discovery::NodeCandidate {
+    crate::PeerStore::open(dir.path()).upsert_identity(
+        &crate::discovery::NodeCandidate {
             node_id,
             eth_address: Address::repeat_byte(3),
             region_hint: None,
@@ -19,14 +18,14 @@ async fn an_open_and_a_later_fault_from_two_entries_land_in_order() -> anyhow::R
         },
         1_000,
     )?;
-    let writes = crate::commands::ordered_writes::OrderedWrites::default();
+    let writes = crate::ordered_writes::OrderedWrites::default();
     let (release, hold) = std::sync::mpsc::channel::<()>();
     writes.queue(move || {
         let _ = hold.recv();
     });
     // Each entry opens its own store handle, as each entry's sources do.
-    let entry_a = decdn_client::PeerStore::open(dir.path());
-    let entry_b = decdn_client::PeerStore::open(dir.path());
+    let entry_a = crate::PeerStore::open(dir.path());
+    let entry_b = crate::PeerStore::open(dir.path());
     writes.queue(move || {
         PeerEvent::Open {
             node_id,
@@ -47,7 +46,7 @@ async fn an_open_and_a_later_fault_from_two_entries_land_in_order() -> anyhow::R
         writes.queue_awaitable(|| ()),
     )
     .await??;
-    let landed = decdn_client::PeerStore::open(dir.path())
+    let landed = crate::PeerStore::open(dir.path())
         .get(&node_id)
         .ok_or_else(|| anyhow::anyhow!("the record is missing"))?;
     assert_eq!(landed.rate_per_mb, Some(4));
@@ -111,42 +110,23 @@ async fn only_the_answering_lane_keeps_its_permit() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A self-owned pool no provider's voucher fits names the top-up command
-/// with the pool id; any other error passes through.
-#[test]
-fn a_self_owned_pool_no_voucher_fits_names_the_top_up_command() {
-    let pool = B256::repeat_byte(7);
-    let err = anyhow::Error::new(NoAffordableSource {
-        deposit: U256::from(5u32),
-    });
-    let hinted = format!("{:#}", with_top_up_hint(err, Some(pool)));
-    assert!(
-        hinted.contains(&format!(
-            "decdn pool top-up --pool {pool} --amount-micro-usdc"
-        )),
-        "{hinted}"
-    );
-    let other = with_top_up_hint(anyhow::anyhow!("reset"), Some(pool));
-    assert_eq!(other.to_string(), "reset");
-}
-
 /// Two nodes of one operator yield one holder: the nearer one by rank.
 #[test]
 fn one_operator_yields_one_holder_the_nearer_by_rank() {
-    let node = |seed: u8| decdn_client::discovery::NodeCandidate {
+    let node = |seed: u8| crate::discovery::NodeCandidate {
         node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
         eth_address: Address::repeat_byte(0xAA),
         region_hint: None,
         multiaddrs: alloy::primitives::Bytes::new(),
     };
     let (near, far) = (node(1), node(2));
-    let targets = crate::commands::fetch::ResolvedTargets {
+    let targets = crate::targets::ResolvedTargets {
         candidates: vec![near.clone(), far],
         coverage_by_node: std::collections::HashMap::new(),
         probed_samples: Vec::new(),
         pinned: false,
         size_hint: None,
-        late: crate::commands::fetch::LateSlot::default(),
+        late: crate::targets::LateSlot::default(),
     };
     let mut nodes = std::collections::HashMap::new();
     let holders = holders_from(&targets, &mut nodes);
@@ -164,7 +144,7 @@ fn one_operator_yields_one_holder_the_nearer_by_rank() {
 
 #[test]
 fn holders_carry_coverage_and_rtt_and_index_their_nodes() {
-    let (targets, a, b) = crate::commands::fetch::tests_support::two_holder_targets();
+    let (targets, a, b) = crate::targets::tests_support::two_holder_targets();
     let mut nodes = std::collections::HashMap::new();
     let holders = holders_from(&targets, &mut nodes);
     assert_eq!(holders.len(), 2);
@@ -186,18 +166,18 @@ fn holders_carry_coverage_and_rtt_and_index_their_nodes() {
     assert!(holders.iter().all(|h| h.probed_holder));
 }
 
-fn warming(enabled: bool) -> crate::commands::fetch::ProxyWarmingParams {
-    crate::commands::fetch::ProxyWarmingParams {
+fn warming(enabled: bool) -> crate::session::ProxyWarmingParams {
+    crate::session::ProxyWarmingParams {
         enabled,
         rtt_threshold_ms: 150.0,
         margin_ms: 30.0,
     }
 }
 
-fn late_non_holder(seed: u8, rtt_ms: f64) -> crate::commands::fetch::ProbeOutcome {
+fn late_non_holder(seed: u8, rtt_ms: f64) -> crate::targets::ProbeOutcome {
     let node_id = iroh::SecretKey::from_bytes(&[seed; 32]).public();
-    crate::commands::fetch::ProbeOutcome::NonHolder(
-        decdn_client::discovery::WarmingCandidate {
+    crate::targets::ProbeOutcome::NonHolder(
+        crate::discovery::WarmingCandidate {
             node_id,
             eth_address: Address::repeat_byte(seed),
             rtt_ms,
@@ -207,11 +187,11 @@ fn late_non_holder(seed: u8, rtt_ms: f64) -> crate::commands::fetch::ProbeOutcom
     )
 }
 
-fn late_holder(seed: u8, rtt_ms: f64) -> crate::commands::fetch::ProbeOutcome {
+fn late_holder(seed: u8, rtt_ms: f64) -> crate::targets::ProbeOutcome {
     let node_id = iroh::SecretKey::from_bytes(&[seed; 32]).public();
-    crate::commands::fetch::ProbeOutcome::Holder(
-        decdn_client::discovery::Probed {
-            candidate: decdn_client::discovery::NodeCandidate {
+    crate::targets::ProbeOutcome::Holder(
+        crate::discovery::Probed {
+            candidate: crate::discovery::NodeCandidate {
                 node_id,
                 eth_address: Address::repeat_byte(seed),
                 region_hint: None,
@@ -251,7 +231,7 @@ fn late_join_applies_the_warming_rule() {
 #[test]
 fn a_late_node_joins_only_for_a_new_operator() -> anyhow::Result<()> {
     use super::{LateJoin, admit_late};
-    let near = decdn_client::discovery::NodeCandidate {
+    let near = crate::discovery::NodeCandidate {
         node_id: iroh::SecretKey::from_bytes(&[9; 32]).public(),
         eth_address: Address::repeat_byte(4),
         region_hint: None,
@@ -283,7 +263,7 @@ fn a_late_node_joins_only_for_a_new_operator() -> anyhow::Result<()> {
 #[test]
 fn late_join_ignores_failed_outcomes() {
     use super::late_join;
-    use crate::commands::fetch::ProbeOutcome;
+    use crate::targets::ProbeOutcome;
     let mut best = 400.0;
     for outcome in [
         ProbeOutcome::Unreachable,
@@ -299,21 +279,20 @@ fn late_join_ignores_failed_outcomes() {
 /// the node the operator's next lane build dials.
 #[test]
 fn a_rediscovery_refreshes_an_operators_node() {
-    let node = |seed: u8| decdn_client::discovery::NodeCandidate {
+    let node = |seed: u8| crate::discovery::NodeCandidate {
         node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
         eth_address: Address::repeat_byte(0xAA),
         region_hint: None,
         multiaddrs: alloy::primitives::Bytes::new(),
     };
-    let targets =
-        |n: decdn_client::discovery::NodeCandidate| crate::commands::fetch::ResolvedTargets {
-            candidates: vec![n],
-            coverage_by_node: std::collections::HashMap::new(),
-            probed_samples: Vec::new(),
-            pinned: false,
-            size_hint: None,
-            late: crate::commands::fetch::LateSlot::default(),
-        };
+    let targets = |n: crate::discovery::NodeCandidate| crate::targets::ResolvedTargets {
+        candidates: vec![n],
+        coverage_by_node: std::collections::HashMap::new(),
+        probed_samples: Vec::new(),
+        pinned: false,
+        size_hint: None,
+        late: crate::targets::LateSlot::default(),
+    };
     let mut nodes = std::collections::HashMap::new();
     holders_from(&targets(node(1)), &mut nodes);
     holders_from(&targets(node(2)), &mut nodes);
@@ -324,9 +303,7 @@ fn a_rediscovery_refreshes_an_operators_node() {
 }
 
 /// The first claim of `targets`, counting the header-only opens it makes.
-async fn claim_of(
-    targets: &crate::commands::fetch::ResolvedTargets,
-) -> anyhow::Result<(u64, usize)> {
+async fn claim_of(targets: &crate::targets::ResolvedTargets) -> anyhow::Result<(u64, usize)> {
     let opens = std::sync::atomic::AtomicUsize::new(0);
     let mut nodes = std::collections::HashMap::new();
     let holders = holders_from(targets, &mut nodes);
@@ -351,7 +328,7 @@ async fn claim_of(
 #[tokio::test]
 async fn the_first_claim_comes_from_the_probe_hint_without_a_whole_blob_open() -> anyhow::Result<()>
 {
-    let (targets, _, _) = crate::commands::fetch::tests_support::two_holder_targets();
+    let (targets, _, _) = crate::targets::tests_support::two_holder_targets();
     let hint = targets
         .size_hint
         .ok_or_else(|| anyhow::anyhow!("the fixture's probe gives a hint"))?;
@@ -363,7 +340,7 @@ async fn the_first_claim_comes_from_the_probe_hint_without_a_whole_blob_open() -
 /// pull for the header's size.
 #[tokio::test]
 async fn a_pinned_node_without_a_hint_opens_for_the_header() -> anyhow::Result<()> {
-    let (mut targets, _, _) = crate::commands::fetch::tests_support::two_holder_targets();
+    let (mut targets, _, _) = crate::targets::tests_support::two_holder_targets();
     targets.pinned = true;
     targets.size_hint = None;
     assert_eq!(claim_of(&targets).await?, (7, 1));
@@ -374,7 +351,7 @@ async fn a_pinned_node_without_a_hint_opens_for_the_header() -> anyhow::Result<(
 /// absent.
 #[test]
 fn a_pinned_node_is_a_probed_holder() {
-    let (mut targets, _, _) = crate::commands::fetch::tests_support::two_holder_targets();
+    let (mut targets, _, _) = crate::targets::tests_support::two_holder_targets();
     targets.coverage_by_node.clear();
     let mut nodes = std::collections::HashMap::new();
     assert!(

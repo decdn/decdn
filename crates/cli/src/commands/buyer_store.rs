@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
+use decdn_client::session::ChainAdoption;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 
 /// Which buyer store a resolved `data_dir` belongs to.
@@ -69,58 +70,41 @@ pub(crate) fn client_buyer_db(data_dir: &Path) -> PathBuf {
     data_dir.join(decdn_common::data_dir::CLIENT_BUYER_DB_FILE)
 }
 
-/// Whether a buy may adopt a pool its wallet already owns on chain, when the
-/// client store has no row for it.
+/// Whether a buy whose client store lives in `data_dir` and which signs with
+/// the keystore at `keystore` may adopt a pool its wallet already owns on
+/// chain ([`ChainAdoption`]).
 ///
-/// Adoption assumes the wallet has one buyer: the newest live pool it owns is
-/// taken to be this client's own. A wallet shared with another buyer breaks
-/// that, because adopting the other buyer's pool puts a second, independent
-/// voucher series on its lanes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ChainAdoption {
-    /// Neither the store nor the key belongs to a node, so the wallet's pools
-    /// are this client's own and a lost row is recovered from chain rather than
-    /// escrowing a second deposit.
-    Allowed,
-    /// The store or the key belongs to a `decdn-node` daemon, so the wallet is
-    /// the node's operator and its newest live pool is the one the daemon is
-    /// paying from. The buy opens its own pool instead.
-    Refused,
-}
-
-impl ChainAdoption {
-    /// The rule for a buy whose client store lives in `data_dir` and which
-    /// signs with the keystore at `keystore`.
-    ///
-    /// Both are checked, because they resolve independently: `--data-dir`
-    /// (#2082) puts a client store in a node's dir, and `--keystore` or
-    /// `blockchain.eth_keystore` points a client dir at a node's operator key.
-    /// Either way the wallet is the daemon's. The keystore is judged by the
-    /// directory that holds it, read against the same daemon markers as
-    /// [`classify_buyer_store`].
-    ///
-    /// This recognises a key that lives in a node's data dir. It cannot
-    /// recognise one copied out of it, or a wallet two clients share — nothing
-    /// local distinguishes those from a wallet with one buyer.
-    ///
-    /// # Errors
-    ///
-    /// Errors when either directory's owner cannot be told, because a stat of
-    /// one of its daemon markers failed for a reason other than `NotFound`.
-    pub(crate) fn for_buy(data_dir: &Path, keystore: &Path) -> anyhow::Result<Self> {
-        let node_owned = |dir: &Path| -> anyhow::Result<bool> {
-            Ok(matches!(
-                classify_buyer_store(dir)?,
-                BuyerStoreOwner::Node { .. }
-            ))
-        };
-        let key_dir = keystore.parent().unwrap_or(Path::new(""));
-        Ok(if node_owned(data_dir)? || node_owned(key_dir)? {
-            Self::Refused
-        } else {
-            Self::Allowed
-        })
-    }
+/// Both are checked, because they resolve independently: `--data-dir`
+/// (#2082) puts a client store in a node's dir, and `--keystore` or
+/// `blockchain.eth_keystore` points a client dir at a node's operator key.
+/// Either way the wallet is the daemon's. The keystore is judged by the
+/// directory that holds it, read against the same daemon markers as
+/// [`classify_buyer_store`].
+///
+/// This recognises a key that lives in a node's data dir. It cannot
+/// recognise one copied out of it, or a wallet two clients share — nothing
+/// local distinguishes those from a wallet with one buyer.
+///
+/// # Errors
+///
+/// Errors when either directory's owner cannot be told, because a stat of
+/// one of its daemon markers failed for a reason other than `NotFound`.
+pub(crate) fn chain_adoption_for_buy(
+    data_dir: &Path,
+    keystore: &Path,
+) -> anyhow::Result<ChainAdoption> {
+    let node_owned = |dir: &Path| -> anyhow::Result<bool> {
+        Ok(matches!(
+            classify_buyer_store(dir)?,
+            BuyerStoreOwner::Node { .. }
+        ))
+    };
+    let key_dir = keystore.parent().unwrap_or(Path::new(""));
+    Ok(if node_owned(data_dir)? || node_owned(key_dir)? {
+        ChainAdoption::Refused
+    } else {
+        ChainAdoption::Allowed
+    })
 }
 
 /// Classify `data_dir` by whether a `decdn-node` daemon owns it.

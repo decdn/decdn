@@ -22,7 +22,7 @@
 //! The funding recovery step (ADR 003 § Funding recovery) goes through the
 //! injected [`Funder`] trait so the acquire loop and `PeerSource` stay
 //! chain-handle-agnostic: each deployment supplies its own implementation (the
-//! CLI's `CliFunder`, the node's `NodeFunder`) rather than the loop naming a
+//! self-owned pool's `PoolFunder`, the node's `NodeFunder`) rather than the loop naming a
 //! contract instance directly.
 
 use std::sync::atomic::AtomicU64;
@@ -288,7 +288,7 @@ pub enum Recovery {
 }
 
 /// The injected funding recovery seam (ADR 003 § Funding recovery). Wraps the
-/// deployment's funding path (the CLI's `CliFunder` and the node's
+/// deployment's funding path (a self-owned pool's `PoolFunder` and the node's
 /// `NodeFunder`, each over its own chain handle), so the acquire loop and
 /// [`BlobSource`] never name a contract instance.
 ///
