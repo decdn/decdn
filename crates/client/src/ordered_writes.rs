@@ -31,7 +31,7 @@ use std::time::Duration;
 
 /// How long a command waits, before it returns, for the writes it queued
 /// ([`OrderedWrites::settle`]).
-pub(crate) const WRITE_DRAIN: Duration = Duration::from_secs(30);
+pub const WRITE_DRAIN: Duration = Duration::from_secs(30);
 
 /// One queued write.
 type Write = Box<dyn FnOnce() + Send>;
@@ -39,8 +39,14 @@ type Write = Box<dyn FnOnce() + Send>;
 /// A command-wide queue of blocking writes, run in queue order. Cloning shares
 /// the queue.
 #[derive(Clone, Default)]
-pub(crate) struct OrderedWrites {
+pub struct OrderedWrites {
     inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for OrderedWrites {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrderedWrites").finish_non_exhaustive()
+    }
 }
 
 #[derive(Default)]
@@ -106,7 +112,7 @@ impl OrderedWrites {
     /// one on the blocking pool. Outside a Tokio runtime, or when a runtime
     /// that is shutting down drops the new worker, the queue drains on this
     /// thread before this returns.
-    pub(crate) fn queue(&self, write: impl FnOnce() + Send + 'static) {
+    pub fn queue(&self, write: impl FnOnce() + Send + 'static) {
         let start = {
             let mut state = self.inner.lock();
             state.queue.push_back(Box::new(write));
@@ -126,7 +132,7 @@ impl OrderedWrites {
     /// with its result once it ran. The write is queued before this returns,
     /// so its place in the order is fixed at the call, not at the first poll.
     /// The receiver fails if the write panicked.
-    pub(crate) fn queue_awaitable<T: Send + 'static>(
+    pub fn queue_awaitable<T: Send + 'static>(
         &self,
         write: impl FnOnce() -> T + Send + 'static,
     ) -> tokio::sync::oneshot::Receiver<T> {
@@ -142,7 +148,7 @@ impl OrderedWrites {
     /// run. A command calls this before it returns, on the interrupted path
     /// too, so a drop guard's watermark write is durable before the process
     /// exits.
-    pub(crate) async fn settle(&self) {
+    pub async fn settle(&self) {
         let barrier = self.queue_awaitable(|| ());
         match tokio::time::timeout(WRITE_DRAIN, barrier).await {
             Ok(Ok(())) => {}

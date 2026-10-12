@@ -70,6 +70,9 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# A mocked chain answers a revert with a JSON-RPC `ErrorPayload`, which `alloy`
+# does not re-export (the funding recovery tests).
+alloy-json-rpc = { workspace = true }
 decdn-bao-range = { workspace = true, features = ["test-util"] }
 # The examples keep the buyer's pool and lane records in the same redb store
 # `decdn fetch` uses, and print their warnings through a subscriber.

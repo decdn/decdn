@@ -2840,6 +2840,14 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **`decdn-client`: the paid fetch's network leg lives in the SDK (#2429).**
+  Holder discovery and probing, lane building, pool open-or-reuse and refill,
+  the funding recovery step, watermark persistence and the per-provider
+  stream cap move from the `decdn` CLI into hidden `decdn-client` modules
+  (`session`, `targets`, `lanes`, `funding`, `lane_sources`, `stream_cap`,
+  `ordered_writes`). `decdn fetch` and `decdn bundle pull` drive them, and
+  behave as before. The lanes take any `BuyerPoolStore`, so the client needs
+  no `redb` feature. The public API does not change.
 - **Release: `sign-release.sh` and `publish-crates.sh` live in `scripts/`.**
   Run them as `scripts/sign-release.sh <tag>` and
   `scripts/publish-crates.sh <tag>`. `.github/scripts/` keeps only what

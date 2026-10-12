@@ -1,4 +1,8 @@
 use super::*;
+use alloy::primitives::Bytes;
+use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
+
+use crate::Cumulative;
 use alloy::providers::ProviderBuilder;
 use alloy::providers::mock::Asserter;
 use alloy::sol_types::SolValue;
@@ -84,9 +88,11 @@ async fn run_in(
         PROVIDER,
         signer.address(),
         DEPLOYMENT,
-        U256::from(WORKING),
-        false,
-        adoption,
+        DepositPolicy {
+            working_deposit: U256::from(WORKING),
+            max_approve: false,
+            adoption,
+        },
     )
     .await;
     (result, asserter.read_q().is_empty())
@@ -969,7 +975,7 @@ async fn the_cli_funder_reads_the_run_funding() {
         &ledger_at(0),
     );
     funding.note_pool(B256::repeat_byte(0xEE));
-    let funder = CliFunder {
+    let funder = PoolFunder {
         contract: &contract,
         rpc: &rpc,
         store: &store,
@@ -997,7 +1003,7 @@ async fn the_cli_funder_reads_the_run_funding() {
     );
     assert!(err.downcast_ref::<WalletShortfall>().is_some(), "{err:#}");
 
-    let delegated = CliFunder {
+    let delegated = PoolFunder {
         working_deposit: U256::ZERO,
         ..funder
     };
@@ -1021,7 +1027,7 @@ async fn step_on_a_full_pool(asserter: Asserter) -> anyhow::Result<Recovery> {
     let contract = PaymentPool::new(PP, rpc.clone());
     let funding = RunFunding::default();
     funding.note_pool(id);
-    let funder = CliFunder {
+    let funder = PoolFunder {
         contract: &contract,
         rpc: &rpc,
         store: &store,

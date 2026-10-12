@@ -1,11 +1,12 @@
-//! The CLI's [`SourceProvider`]: where `decdn fetch` and `bundle pull` find a
-//! blob's holders and build their paid lanes.
+//! The [`SourceProvider`] a paid fetch runs its acquire loop over: where
+//! `decdn fetch` and every entry of a `bundle pull` find a blob's holders and
+//! build their paid lanes.
 //!
-//! Discovery is the CLI's own ([`fetch::resolve_target_node`]); a lane is one
-//! provider's pool lane ([`fetch::build_multi_lane`]). The provider records
-//! each built lane's watermark handle, so the command persists what every lane
-//! paid once the fetch ends, and files each delivery fault in the peer store
-//! the next run's fast path reads.
+//! Discovery is [`resolve_target_node`]; a lane is one provider's pool lane
+//! (`build_multi_lane`). The provider records each built lane's watermark
+//! handle, so the command persists what every lane paid once the fetch ends,
+//! and files each delivery fault in the peer store the next run's fast path
+//! reads.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -13,30 +14,34 @@ use std::sync::{Arc, Mutex, PoisonError};
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
-use decdn_client::discovery::NodeCandidate;
-use decdn_client::source::{SourceFuture, SourceStream};
-use decdn_client::{
-    CredentialSlot, Holder, LaneLease, LaneLedgers, NoAffordableSource, PeerHealth, PeerSource,
-    PoolContext, RecoveryGate, SourceProvider, SourceSet, StopPolicy, StreamCandidate, first_open,
-};
-use decdn_common::cli;
-use decdn_incentive::buyer_pool::BuyerPoolStore as _;
 use decdn_incentive::{CapabilityGrant, PoolId};
 use iroh::RelayUrl;
 
-use super::bundle_pull::LaneStreamCap;
-use super::fetch::{
-    self, CliFunder, DriveFetchDeps, FaceLaneHandle, LateProbes, ProbeOutcome, ProxyWarmingParams,
-    ResolvedTargets,
+use crate::discovery::NodeCandidate;
+use crate::funding::PoolFunder;
+use crate::lanes::{
+    FaceLaneHandle, LaneDeps, build_multi_lane, lane_target, queue_face_watermarks,
+};
+use crate::session::{DiscoveryOptions, ProxyWarmingParams};
+use crate::source::{SourceFuture, SourceStream};
+use crate::stream_cap::LaneStreamCap;
+use crate::targets::{
+    LateProbes, ProbeOpts, ProbeOutcome, ProbeRound, ResolvedTargets, now_secs,
+    resolve_target_node, spawn_harvest,
+};
+use crate::{
+    CredentialSlot, Holder, LaneLease, LaneLedgers, PeerHealth, PeerSource, PoolContext,
+    RecoveryGate, SourceProvider, SourceSet, StopPolicy, StreamCandidate, first_open,
 };
 
-/// A fetch's first size claim ([`CliSources::first_claim`]): a hint the fetch
+/// A fetch's first size claim ([`LaneSources::first_claim`]): a hint the fetch
 /// grows or shrinks as verified bytes land.
-pub(crate) struct FirstClaim {
+#[derive(Debug)]
+pub struct FirstClaim {
     /// The claimed size.
-    pub(crate) total_bytes: u64,
+    pub total_bytes: u64,
     /// Every holder known when the claim was made.
-    pub(crate) holders: Vec<Holder>,
+    pub holders: Vec<Holder>,
 }
 
 /// `hint` as the first claim over `holders`, or, with no hint, what `open`
@@ -64,9 +69,9 @@ where
 }
 
 /// The [`SourceProvider`] a CLI fetch runs its acquire loop over.
-pub(crate) struct CliSources<'a, P> {
-    deps: &'a DriveFetchDeps<'a, P>,
-    common: &'a cli::ClientFetchArgs,
+pub struct LaneSources<'a, P> {
+    deps: &'a LaneDeps<'a, P>,
+    discovery: &'a DiscoveryOptions,
     relays: &'a [RelayUrl],
     grant: Option<&'a CapabilityGrant>,
     signer: &'a Arc<PrivateKeySigner>,
@@ -88,7 +93,7 @@ pub(crate) struct CliSources<'a, P> {
     recovery: &'a Arc<RecoveryGate>,
     /// Every holder's node, keyed by its on-chain provider address.
     nodes: Mutex<HashMap<Address, NodeCandidate>>,
-    peer_store: decdn_client::PeerStore,
+    peer_store: crate::PeerStore,
     /// Every built lane's watermark handle, in build order.
     handles: Mutex<Vec<FaceLaneHandle>>,
     /// The lane that answered the first open, handed to the fetch's first
@@ -103,15 +108,24 @@ pub(crate) struct CliSources<'a, P> {
     late: Mutex<Option<LateProbes>>,
 }
 
-impl<'a, P> CliSources<'a, P>
+impl<P> std::fmt::Debug for LaneSources<'_, P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaneSources")
+            .field("delegated", &self.grant.is_some())
+            .field("relays", &self.relays.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a, P> LaneSources<'a, P>
 where
     P: alloy::providers::Provider + Clone,
 {
     /// A provider over the fetch's shared `deps`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        deps: &'a DriveFetchDeps<'a, P>,
-        common: &'a cli::ClientFetchArgs,
+    pub fn new(
+        deps: &'a LaneDeps<'a, P>,
+        discovery: &'a DiscoveryOptions,
         relays: &'a [RelayUrl],
         grant: Option<&'a CapabilityGrant>,
         signer: &'a Arc<PrivateKeySigner>,
@@ -123,7 +137,7 @@ where
     ) -> Self {
         Self {
             deps,
-            common,
+            discovery,
             relays,
             grant,
             signer,
@@ -133,7 +147,7 @@ where
             lane_cap,
             recovery,
             nodes: Mutex::new(HashMap::new()),
-            peer_store: decdn_client::PeerStore::open(&deps.chain.data_dir),
+            peer_store: crate::PeerStore::open(&deps.site.data_dir),
             handles: Mutex::new(Vec::new()),
             parked: Mutex::new(HashMap::new()),
             size_hint: Mutex::new(None),
@@ -144,7 +158,7 @@ where
     /// The holders `targets` names, indexing each one's node for `connect`.
     /// A probe's size hint is kept for [`Self::first_claim`], and a streamed
     /// round's pending probes for [`SourceProvider::arrivals`].
-    pub(crate) fn holders_from(&self, targets: &ResolvedTargets) -> Vec<Holder> {
+    pub fn holders_from(&self, targets: &ResolvedTargets) -> Vec<Holder> {
         if let Some(hint) = targets.size_hint {
             *self
                 .size_hint
@@ -161,8 +175,8 @@ where
     /// `None` when the join's operator is already in the set.
     fn register_late(&self, join: LateJoin) -> Option<Holder> {
         let holder = admit_late(&mut self.lock_nodes(), join)?;
-        if let Some(timings) = self.deps.timings {
-            timings.holder_joined();
+        if let Some(marks) = self.deps.marks {
+            marks.holder_joined();
         }
         Some(holder)
     }
@@ -170,18 +184,18 @@ where
     /// The funder a fetch over these sources runs its funding recovery step
     /// through: the pool the run's first built lane pays from. A delegated fetch has
     /// a zero working deposit, so its step has no funding path.
-    pub(crate) fn funder(&self) -> CliFunder<'_, P> {
-        CliFunder {
+    pub fn funder(&self) -> PoolFunder<'_, P> {
+        PoolFunder {
             contract: self.deps.contract,
             rpc: self.deps.rpc,
-            store: self.deps.store,
+            store: self.deps.store.as_ref(),
             owner: self.deps.self_address,
             signer: self.signer,
             deployment: self.deps.chain.deployment(),
             token: self.deps.token,
             payment_pool_addr: self.deps.chain.payment_pool,
-            working_deposit: self.deps.chain.working_deposit,
-            max_approve: self.deps.chain.max_approve,
+            working_deposit: self.deps.deposit.working_deposit,
+            max_approve: self.deps.deposit.max_approve,
             funding: self.deps.funding,
         }
     }
@@ -189,15 +203,15 @@ where
     /// A delegated fetch's credential slot: the grant's capability for the
     /// delegate key every lane signs with. The CLI swaps in no new credential,
     /// so the slot waits for none, and an exhausted candidate set ends at
-    /// once with a typed [`decdn_client::FundingNeeded`]. `None` for a fetch
+    /// once with a typed [`crate::FundingNeeded`]. `None` for a fetch
     /// that pays from its own pool.
-    pub(crate) fn credentials(&self) -> Option<CredentialSlot> {
+    pub fn credentials(&self) -> Option<CredentialSlot> {
         let grant = self.grant?;
         // A grant that does not decode fails the lane build first, which
         // names the fault; without a slot the fetch still ends funding needed.
         let capability = grant.to_signed_capability().ok()?;
         // The command checked the loaded key against the grant before any
-        // lane was built ([`super::fetch::ensure_delegate_signer`]).
+        // lane was built ([`crate::funding::build_delegated_pool_ctx`]).
         let slot = CredentialSlot::new(Arc::clone(self.signer), capability)
             .ok()?
             .with_swap_wait(std::time::Duration::ZERO);
@@ -230,7 +244,7 @@ where
     }
 
     /// The fetch's funding recovery gate.
-    pub(crate) const fn recovery(&self) -> &Arc<RecoveryGate> {
+    pub const fn recovery(&self) -> &Arc<RecoveryGate> {
         self.recovery
     }
 
@@ -249,7 +263,7 @@ where
     /// # Errors
     ///
     /// Any error [`first_open`] returns.
-    pub(crate) async fn first_claim(
+    pub async fn first_claim(
         &self,
         hash: [u8; 32],
         holders: Vec<Holder>,
@@ -311,8 +325,8 @@ where
     }
 
     /// Persist every built lane's voucher watermark, and return once the
-    /// writes land ([`fetch::queue_face_watermarks`]).
-    pub(crate) async fn persist_watermarks(&self) {
+    /// writes land ([`queue_face_watermarks`]).
+    pub async fn persist_watermarks(&self) {
         if self.queue_watermarks().await.is_ok() {
             return;
         }
@@ -336,15 +350,15 @@ where
 
     /// Persist every built lane's voucher watermark without waiting for the
     /// writes: the settle a dropped fetch runs from its drop guard.
-    pub(crate) fn persist_watermarks_detached(&self) {
+    pub fn persist_watermarks_detached(&self) {
         drop(self.queue_watermarks());
     }
 
     /// Read every built lane's watermark from its ledger now, and queue the
-    /// writes in that order ([`fetch::queue_face_watermarks`]).
+    /// writes in that order ([`queue_face_watermarks`]).
     fn queue_watermarks(&self) -> tokio::sync::oneshot::Receiver<()> {
         let handles = self.handles.lock().unwrap_or_else(PoisonError::into_inner);
-        fetch::queue_face_watermarks(
+        queue_face_watermarks(
             self.deps.writes,
             self.deps.store,
             self.deps.self_address,
@@ -352,26 +366,24 @@ where
         )
     }
 
-    /// Reconnect `err` to what the user can do about it: an unbound or
-    /// underfunded cache miss ([`fetch::annotate_unbound_cache_miss`]), and a
-    /// pool no provider's voucher fits — the owner-side remedy on a delegated
-    /// pool ([`fetch::annotate_delegated_exhaustion`]), else the top-up
-    /// command.
-    pub(crate) fn annotate(&self, err: anyhow::Error) -> anyhow::Error {
-        let first_ctx = self
-            .handles
+    /// The context of the first lane built, which a caller reads to explain
+    /// a refusal; `None` before any lane is built.
+    pub fn first_lane_ctx(&self) -> Option<Arc<Mutex<PoolContext>>> {
+        self.handles
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .first()
-            .map(|h| Arc::clone(&h.ctx));
-        let err = match first_ctx {
-            Some(ctx) => annotate_with(err, &ctx),
-            None => err,
-        };
-        if self.grant.is_some() {
-            return fetch::annotate_delegated_exhaustion(err);
-        }
-        with_top_up_hint(err, self.deps.funding.pool_id())
+            .map(|h| Arc::clone(&h.ctx))
+    }
+
+    /// The pool the run's lanes pay from, once a lane is built.
+    pub fn pool_id(&self) -> Option<PoolId> {
+        self.deps.funding.pool_id()
+    }
+
+    /// Whether the fetch pays from a delegated pool under a capability.
+    pub const fn is_delegated(&self) -> bool {
+        self.grant.is_some()
     }
 
     /// File a lane's first answer in the peer store: its quoted rate, with the
@@ -440,8 +452,9 @@ where
             .get(&holder.provider)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no known node for provider {}", holder.provider))?;
-        let target = fetch::lane_target(&candidate, self.common.addr, self.relays);
-        let lane = fetch::build_multi_lane(
+        let addr = self.discovery.pinned.and_then(|pinned| pinned.addr);
+        let target = lane_target(&candidate, addr, self.relays);
+        let lane = build_multi_lane(
             self.deps,
             self.grant,
             self.signer,
@@ -510,26 +523,7 @@ fn keep_answering<L>(
         .and_then(|(provider, lane)| Arc::try_unwrap(lane).ok().map(|lane| (provider, lane)))
 }
 
-/// Name the top-up command on a self-owned pool no provider's voucher fits.
-fn with_top_up_hint(err: anyhow::Error, pool_id: Option<PoolId>) -> anyhow::Error {
-    if err.downcast_ref::<NoAffordableSource>().is_none() {
-        return err;
-    }
-    let pool = pool_id.map_or_else(|| "<pool id>".to_string(), |id| id.to_string());
-    err.context(format!(
-        "top up with: decdn pool top-up --pool {pool} --amount-micro-usdc <MICRO_USDC>"
-    ))
-}
-
-/// [`fetch::annotate_unbound_cache_miss`] against the lane context `ctx`.
-fn annotate_with(err: anyhow::Error, ctx: &Mutex<PoolContext>) -> anyhow::Error {
-    match ctx.lock() {
-        Ok(guard) => fetch::annotate_unbound_cache_miss(err, &guard),
-        Err(_) => err,
-    }
-}
-
-impl<'a, P> SourceProvider for CliSources<'a, P>
+impl<'a, P> SourceProvider for LaneSources<'a, P>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -539,15 +533,15 @@ where
         Box::pin(async move {
             // A fresh look: skip the peer store's fast path. A rediscovery
             // settles its round and drops the tail.
-            let mut args = self.common.clone();
-            args.rediscover = true;
-            let probe = fetch::ProbeOpts {
-                timings: None,
-                round: fetch::ProbeRound::Settle,
+            let mut opts = self.discovery.clone();
+            opts.rediscover = true;
+            let probe = ProbeOpts {
+                marks: None,
+                round: ProbeRound::Settle,
             };
-            let targets = fetch::resolve_target_node(
-                &args,
-                self.deps.chain,
+            let targets = resolve_target_node(
+                &opts,
+                (self.deps.chain, self.deps.site),
                 self.deps.endpoint,
                 self.relays,
                 hash,
@@ -573,7 +567,7 @@ where
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()?;
-        let dir = self.deps.chain.data_dir.clone();
+        let dir = self.deps.site.data_dir.clone();
         Some(Box::pin(futures_util::stream::unfold(
             (tail, best_holder_rtt_ms, Vec::new()),
             move |(mut tail, mut best, mut samples)| {
@@ -590,7 +584,7 @@ where
                         }
                     }
                     if !samples.is_empty() {
-                        drop(fetch::spawn_harvest(&dir, Vec::new(), samples));
+                        drop(spawn_harvest(&dir, Vec::new(), samples));
                     }
                     None
                 }
@@ -611,7 +605,7 @@ where
         };
         self.file(PeerEvent::Failure {
             node_id,
-            at_secs: fetch::now_secs_cli(),
+            at_secs: now_secs(),
         });
     }
 }
@@ -634,7 +628,7 @@ enum PeerEvent {
 impl PeerEvent {
     /// Write this record to `store`. A refused write is logged at debug: the
     /// peer store is a hint for the next run's selection, not this fetch's.
-    fn write(self, store: &decdn_client::PeerStore) {
+    fn write(self, store: &crate::PeerStore) {
         match self {
             Self::Open {
                 node_id,
@@ -662,15 +656,15 @@ impl PeerEvent {
 /// A late probe answer that joins the running fetch.
 pub(crate) enum LateJoin {
     /// A verified holder.
-    Holder(decdn_client::discovery::Probed),
+    Holder(crate::discovery::Probed),
     /// A verified non-holder the warming rule picks as a proxy.
-    Proxy(decdn_client::discovery::WarmingCandidate),
+    Proxy(crate::discovery::WarmingCandidate),
 }
 
 /// Whether a late probe `outcome` joins the running fetch. A verified holder
 /// always joins and lowers `best_holder_rtt_ms`. A verified non-holder joins
 /// as a proxy when the warming rule
-/// ([`decdn_client::discovery::proxy_warming_order`]) picks it against the best
+/// ([`crate::discovery::proxy_warming_order`]) picks it against the best
 /// holder known so far. Nothing else joins.
 pub(crate) fn late_join(
     outcome: ProbeOutcome,
@@ -684,7 +678,7 @@ pub(crate) fn late_join(
         }
         ProbeOutcome::NonHolder(candidate, _) => {
             let picked = warming.enabled
-                && !decdn_client::discovery::proxy_warming_order(
+                && !crate::discovery::proxy_warming_order(
                     *best_holder_rtt_ms,
                     warming.rtt_threshold_ms,
                     warming.margin_ms,
@@ -744,7 +738,7 @@ pub(crate) fn admit_late(
 
 /// The holders `targets` names, in its order, one per operator: a candidate
 /// whose on-chain provider already has a holder is skipped, so the nearer
-/// node by rank wins (the rule of [`decdn_client::discovery::admit_sources`]).
+/// node by rank wins (the rule of [`crate::discovery::admit_sources`]).
 /// Each holder carries its probed coverage (`None`, a full holder, when
 /// nothing was measured) and its probed RTT, or its rank in the order when it
 /// was not probed. A candidate with measured coverage, and a pinned
