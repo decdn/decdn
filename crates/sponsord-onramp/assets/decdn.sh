@@ -9,6 +9,10 @@
 # onramp's sponsor:
 #   curl -fsSL <onramp>/decdn.sh | sh -s -- pull b3:<hash> [-o <dir>] [--namespace <id>]
 #
+# Without arguments, it only installs decdn into ~/.local/bin and checks that
+# the directory is on PATH, printing how to add it when it is not:
+#   curl -fsSL <onramp>/decdn.sh | sh
+#
 # Each download gets a throwaway key under ~/.decdn/sponsored/downloads/<hash>/
 # and a capability for it, issued once the person passes the gate in the
 # browser. A failed download keeps both, so re-running the same command
@@ -164,6 +168,28 @@ fetch_bin() {
   chmod +x "${dir}/${bin}"
   mv -f "${dir}/${bin}" "${BINDIR}/${bin}"
   echo "$stamp" >"$marker"
+}
+
+# path_hint: when BINDIR is not on PATH, print the line that adds it for the
+# user's login shell. The script leaves shell startup files to the user.
+path_hint() {
+  case ":${PATH}:" in
+    *":${BINDIR}:"*) return 0 ;;
+  esac
+  case "${SHELL:-}" in
+    */zsh) add="echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc" ;;
+    */bash)
+      rc=~/.bashrc
+      [ "$(uname -s)" != Darwin ] || rc=~/.bash_profile
+      add="echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ${rc}"
+      ;;
+    */fish) add="fish_add_path ~/.local/bin" ;;
+    *) add="echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.profile" ;;
+  esac
+  echo ""
+  echo "${BINDIR} is not on your PATH. To run decdn directly, add it with:"
+  echo "  ${add}"
+  echo "then open a new terminal."
 }
 
 # open_browser <url>: best effort, and only with a person at the terminal.
@@ -356,14 +382,10 @@ main() {
     pull "$hash" "$output" "$namespace"
     return 0
   fi
-
   echo ""
-  echo "decdn is ready. Download a bundle with:"
+  echo "decdn is installed at ${DECDN}. Download a bundle with:"
   echo "  curl -fsSL ${ONRAMP_URL}/decdn.sh | sh -s -- pull b3:<hash> [-o <dir>] [--namespace <id>]"
-  case ":${PATH}:" in
-    *":${BINDIR}:"*) ;;
-    *) echo "(add ${BINDIR} to your PATH to run decdn directly)" ;;
-  esac
+  path_hint
 }
 
 main "$@"

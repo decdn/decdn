@@ -1,6 +1,7 @@
 //! `assets/decdn.sh` as the onramp serves it, run for real against that
 //! onramp over HTTP (fake daemon and gate), `file://` releases and a stub
-//! `decdn`: the install skips binaries already at the pin, and `pull` passes
+//! `decdn`: the install skips binaries already at the pin, it says how to
+//! put `~/.local/bin` on PATH when it is missing, and `pull` passes
 //! the gate once per download, resumes a failed one without it, replaces a
 //! capability near expiry, and refuses a second run of the same download.
 
@@ -204,7 +205,7 @@ async fn a_second_run_with_the_same_pin_downloads_nothing() {
     let fx = Fixture::new("same_pin").await;
     let first = fx.run_ok(&[], &[]).await;
     assert!(first.contains("Installing decdn v0.1.0"), "{first}");
-    assert!(first.contains("decdn is ready"), "{first}");
+    assert!(first.contains("decdn is installed at"), "{first}");
     assert!(fx.bin("decdn").exists() && fx.marker("decdn").exists());
 
     // With the releases gone, any download would fail the run.
@@ -240,6 +241,39 @@ async fn a_changed_pin_reinstalls() {
     fs::write(fx.marker("decdn"), "00 x86_64-unknown-linux-gnu\n").unwrap();
     let out = fx.run_ok(&[], &[]).await;
     assert!(out.contains("Installing decdn v0.1.0"), "{out}");
+}
+
+#[tokio::test]
+async fn install_suggests_adding_the_bin_dir_to_path_only_when_missing() {
+    let fx = Fixture::new("install").await;
+    let bin_dir = fx.bin("");
+    let bin_dir = bin_dir.to_str().unwrap().trim_end_matches('/');
+    let system = std::env::var("PATH").unwrap();
+
+    let out = fx
+        .run_ok(&[], &[("PATH", &system), ("SHELL", "/bin/zsh")])
+        .await;
+    assert!(
+        out.contains(&format!("decdn is installed at {bin_dir}/decdn.")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("{bin_dir} is not on your PATH")),
+        "{out}"
+    );
+    assert!(
+        out.contains(r#"echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc"#),
+        "{out}"
+    );
+    assert!(fx.bin("decdn").exists());
+    assert!(fx.calls().is_empty(), "{:?}", fx.calls());
+
+    let out = fx.run_ok(&[], &[("SHELL", "/usr/bin/fish")]).await;
+    assert!(out.contains("fish_add_path ~/.local/bin"), "{out}");
+
+    let on_path = format!("{bin_dir}:{system}");
+    let out = fx.run_ok(&[], &[("PATH", &on_path)]).await;
+    assert!(!out.contains("not on your PATH"), "{out}");
 }
 
 #[tokio::test]

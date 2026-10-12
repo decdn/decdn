@@ -23,6 +23,22 @@ release's `SHA256SUMS` against the pinned digest and the archive against
 `SHA256SUMS`. A marker in `~/.decdn/installer/` records what is installed,
 so a later run with the same pin downloads nothing.
 
+To install `decdn` without pulling a bundle:
+
+```bash
+curl -fsSL https://<onramp>/decdn.sh | sh
+```
+
+```powershell
+irm https://<onramp>/decdn.ps1 | iex
+```
+
+On Windows the script adds `%LOCALAPPDATA%\decdn\bin` to the user's `Path`
+on every run. On macOS and Linux it leaves shell startup files alone: when
+`~/.local/bin` is not on `PATH`, it prints the line that adds it for the
+user's shell (`~/.zshrc`, `~/.bashrc` or `~/.bash_profile`, `fish_add_path`,
+or `~/.profile`).
+
 ## `pull <hash> [-o <dir>] [--namespace <id>]`
 
 1. Opens `~/.decdn/sponsored/downloads/<hash>/` and makes a throwaway key
