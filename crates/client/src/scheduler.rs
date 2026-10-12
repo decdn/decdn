@@ -364,6 +364,11 @@ pub struct AcquireEnv<'a, Pc, F> {
     /// bound never grows past it: a blob that holds bytes past it ends the
     /// acquire with [`crate::BlobTooLarge`].
     pub max_blob_bytes: u64,
+    /// Work the caller's run still plans past this acquire, in content bytes,
+    /// or `None` when this acquire is the whole run. A delegated fetch prices
+    /// the running-low signal on the larger of this and its own missing
+    /// bytes, so every entry of a bundle pull reports one bundle-wide need.
+    pub outstanding: Option<&'a AtomicU64>,
 }
 
 impl<Pc, F> std::fmt::Debug for AcquireEnv<'_, Pc, F> {
@@ -3195,7 +3200,8 @@ pub(crate) fn key_spend<S>(
 
 /// The local view of `slot`'s current capability against the work left
 /// ([`CredentialView`]): everything signed under its key ([`key_spend`]),
-/// and the missing bytes of `ranges` at the highest quote.
+/// and the missing bytes of `ranges` at the highest quote, or the run's
+/// `outstanding` work when that is larger.
 ///
 /// # Errors
 ///
@@ -3205,7 +3211,7 @@ async fn credential_view<St, S>(
     store: &St,
     ranges: &[(u64, u64)],
     lanes: &[Arc<StreamCandidate<S>>],
-    ledgers: Option<&LaneLedgers>,
+    (ledgers, outstanding): (Option<&LaneLedgers>, Option<&AtomicU64>),
     quotes: &QuoteMax,
 ) -> anyhow::Result<CredentialView>
 where
@@ -3213,7 +3219,9 @@ where
 {
     let credential = slot.current();
     let spent_by_key = key_spend(slot, lanes, ledgers);
-    let remaining = ranges_content_len(&missing_chunks(store, ranges).await?, store.total_bytes());
+    let own = ranges_content_len(&missing_chunks(store, ranges).await?, store.total_bytes());
+    // A bundle prices the work of the whole run, not of this entry alone.
+    let remaining = outstanding.map_or(own, |run| own.max(run.load(Ordering::Relaxed)));
     Ok(CredentialView::of(
         &credential,
         spent_by_key,
@@ -3626,7 +3634,14 @@ where
                 ready.retain(|(_, lane)| !slot.is_stale(&lane.ctx));
                 health.clear_unaffordable();
                 capability_refused = false;
-                let view = credential_view(slot, store, &want.ranges, &started.0, env.ledgers, &quotes)
+                let view = credential_view(
+                    slot,
+                    store,
+                    &want.ranges,
+                    &started.0,
+                    (env.ledgers, env.outstanding),
+                    &quotes,
+                )
                     .await?;
                 slot.report(view.event());
             }
@@ -3843,7 +3858,7 @@ where
                             store,
                             &want.ranges,
                             &started.0,
-                            env.ledgers,
+                            (env.ledgers, env.outstanding),
                             &quotes,
                         )
                         .await?;
@@ -4084,7 +4099,7 @@ where
                             store,
                             &want.ranges,
                             &started.0,
-                            env.ledgers,
+                            (env.ledgers, env.outstanding),
                             &quotes,
                         )
                         .await?;

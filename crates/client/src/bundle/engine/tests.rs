@@ -3672,3 +3672,29 @@ fn dedup_counters_are_per_pull() {
     let second = stats.take();
     assert_eq!((second.spliced_bytes, second.hints_ignored), (0, 0));
 }
+
+/// A group's share of the run's outstanding work goes as its bytes land,
+/// never past its plan, and whatever is left goes when the group settles.
+#[test]
+fn a_work_share_takes_its_bytes_off_the_run() {
+    let outstanding = Arc::new(AtomicU64::new(1_000));
+    let share = WorkShare::new(Arc::clone(&outstanding), 300);
+    share.delivered(100);
+    assert_eq!(outstanding.load(Ordering::Relaxed), 900);
+    // Every fetch reports its whole position, so a repeat takes nothing more.
+    share.delivered(100);
+    assert_eq!(outstanding.load(Ordering::Relaxed), 900);
+    // Bytes past the plan take nothing past it.
+    share.delivered(500);
+    assert_eq!(outstanding.load(Ordering::Relaxed), 700);
+    drop(share);
+    assert_eq!(outstanding.load(Ordering::Relaxed), 700);
+
+    let unfetched = WorkShare::new(Arc::clone(&outstanding), 200);
+    drop(unfetched);
+    assert_eq!(
+        outstanding.load(Ordering::Relaxed),
+        500,
+        "a group that settles without fetching plans no more work"
+    );
+}

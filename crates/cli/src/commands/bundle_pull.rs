@@ -15,12 +15,12 @@ use std::sync::{Arc, OnceLock};
 
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context as _, anyhow, bail};
+use decdn_client::PoolReplaced;
 use decdn_client::bundle::{
     BundleEnd, BundleManifest, BundleObserver, BundlePuller, BundleReport, EntryLanded,
     FaultContext, FaultHints, FileObserver, Funding, ManifestEntry, STAGING_DIR, select_nodes,
 };
 use decdn_client::endpoint as client_endpoint;
-use decdn_client::{CredentialSlot, PoolReplaced};
 use decdn_common::cli::BundlePullArgs;
 use decdn_common::config::load_file_config;
 use decdn_incentive::CapabilityGrant;
@@ -515,34 +515,6 @@ fn load_buyer_signer(chain: &fetch::ResolvedChain) -> anyhow::Result<Arc<Private
     Ok(Arc::new(load_signer(&chain.keystore, &password)?))
 }
 
-/// The credential slot of a delegated pull (`--capability`): the grant's
-/// capability for the loaded delegate key. The CLI swaps in no new
-/// credential, so the slot waits for none, and an exhausted capability ends
-/// the pull at once with a typed [`decdn_client::FundingNeeded`].
-///
-/// # Errors
-///
-/// The grant's owner signature is malformed, or the loaded key is not the
-/// signer the capability authorizes: the client can sign vouchers only as
-/// that key, and a node would refuse every one as `WrongSigner`.
-fn delegated_slot(
-    grant: &CapabilityGrant,
-    signer: Arc<PrivateKeySigner>,
-) -> anyhow::Result<CredentialSlot> {
-    let capability = grant
-        .to_signed_capability()
-        .map_err(|e| anyhow!("capability token carries a malformed owner signature: {e}"))?;
-    let slot = CredentialSlot::new(signer, capability).map_err(|mismatch| {
-        let (authorized, loaded) = (mismatch.capability_signer, mismatch.key);
-        anyhow!(
-            "this capability authorizes signer {authorized}, but the loaded key is {loaded} — \
-             load the delegate keystore the pool owner assigned (--keystore / \
-             blockchain.eth_keystore), or ask for a capability issued to {loaded}"
-        )
-    })?;
-    Ok(slot.with_swap_wait(std::time::Duration::ZERO))
-}
-
 /// Entry point for `decdn bundle pull`.
 pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     // Validate the flag combination first — BEFORE the dry-run short-circuit — so a
@@ -661,7 +633,7 @@ async fn pull_over(
             deposit: chain.deposit_policy(false)?,
         },
         Some(grant) => Funding::Delegated {
-            slot: delegated_slot(grant, signer)?,
+            slot: fetch::delegated_slot(grant, signer)?,
         },
     };
 

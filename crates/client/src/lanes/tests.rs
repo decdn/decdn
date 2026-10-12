@@ -338,6 +338,7 @@ fn duplicate_lane_handles_commit_once_from_the_lowest_baseline() {
     let handle = |ledger: &Arc<PoolLedger>, provider: u8, prior: u64| FaceLaneHandle {
         pool_id: PoolId::repeat_byte(1),
         provider: Address::repeat_byte(provider),
+        signer: Address::repeat_byte(0x5E),
         prior_amount: U256::from(prior),
         ledger: Arc::clone(ledger),
         ctx: Arc::new(Mutex::new(ctx_with(None))),
@@ -355,7 +356,7 @@ fn duplicate_lane_handles_commit_once_from_the_lowest_baseline() {
         handle(&other, 0xB2, 0),
         handle(&shared, 0xA1, 70),
     ];
-    let writes = face_watermark_writes(Address::repeat_byte(0x5E), &handles);
+    let writes = face_watermark_writes(&handles);
     let providers: Vec<Address> = writes.iter().map(|(lane, _)| lane.provider).collect();
     assert_eq!(
         providers,
@@ -487,7 +488,7 @@ fn multi_lane_watermarks_carry_the_rebase_anchor() {
     };
     let mut lane = lane_wm(1, 0xA1, 200, 100, 70);
     lane.rebase_anchor = Some(anchor);
-    let out = super::multi_lane_watermarks(Address::repeat_byte(0x5E), &[lane]);
+    let out = super::multi_lane_watermarks(&[lane]);
     assert_eq!(out[0].1.rebase_anchor(), Some(anchor));
     assert_eq!(out[0].1.totals(), (U256::from(100u64), U256::from(70u64)));
 }
@@ -497,6 +498,7 @@ fn multi_lane_watermarks_carry_the_rebase_anchor() {
 fn lane_wm(pool: u8, provider: u8, prior: u64, bytes: u64, amount: u64) -> LaneWatermark {
     LaneWatermark {
         pool_id: PoolId::repeat_byte(pool),
+        signer: Address::repeat_byte(0x5E),
         provider: Address::repeat_byte(provider),
         prior_amount: U256::from(prior),
         settlement: Cumulative {
@@ -509,12 +511,16 @@ fn lane_wm(pool: u8, provider: u8, prior: u64, bytes: u64, amount: u64) -> LaneW
 
 /// Each lane's watermark is persisted under ITS OWN `LaneKey` and carries ITS
 /// OWN cumulative. Crossing the two — lane A's amount under lane B's key —
-/// strands both lanes, and nothing else in the fetch path would notice.
+/// strands both lanes, and nothing else in the fetch path would notice. A
+/// lane built after a credential swap signs under the new key, and its
+/// watermark is keyed on that key.
 #[test]
 fn multi_lane_watermarks_pair_each_lane_with_its_own_key() {
     let signer = Address::repeat_byte(0x5E);
-    let lanes = [lane_wm(1, 0xA1, 0, 100, 200), lane_wm(1, 0xB2, 0, 300, 400)];
-    let out = super::multi_lane_watermarks(signer, &lanes);
+    let swapped = Address::repeat_byte(0x6F);
+    let mut lanes = [lane_wm(1, 0xA1, 0, 100, 200), lane_wm(1, 0xB2, 0, 300, 400)];
+    lanes[1].signer = swapped;
+    let out = super::multi_lane_watermarks(&lanes);
     assert_eq!(out.len(), 2);
 
     assert_eq!(out[0].0.provider, Address::repeat_byte(0xA1));
@@ -527,6 +533,10 @@ fn multi_lane_watermarks_pair_each_lane_with_its_own_key() {
     );
 
     assert_eq!(out[1].0.provider, Address::repeat_byte(0xB2));
+    assert_eq!(
+        out[1].0.signer, swapped,
+        "lane B is keyed on its own signer"
+    );
     assert_eq!(
         out[1].1.advanced(),
         Some((U256::from(300u64), U256::from(400u64))),
@@ -543,11 +553,10 @@ fn multi_lane_watermarks_pair_each_lane_with_its_own_key() {
 /// regression.
 #[test]
 fn multi_lane_watermarks_settle_high_even_when_the_fetch_succeeded() {
-    let signer = Address::repeat_byte(0x5E);
     // The armed cumulative sits ABOVE what was acked — the dropped-leg
     // shape. Settling at `committed` would persist the lower one.
     let lanes = [lane_wm(1, 0xA1, 0, 300, 400)];
-    let out = super::multi_lane_watermarks(signer, &lanes);
+    let out = super::multi_lane_watermarks(&lanes);
     assert_eq!(
         out[0].1.advanced(),
         Some((U256::from(300u64), U256::from(400u64))),
@@ -559,9 +568,8 @@ fn multi_lane_watermarks_settle_high_even_when_the_fetch_succeeded() {
 /// `persist_watermark` returns early rather than writing a no-op row.
 #[test]
 fn multi_lane_watermarks_report_no_advance_for_an_untouched_lane() {
-    let signer = Address::repeat_byte(0x5E);
     let lanes = [lane_wm(1, 0xA1, 200, 0, 200)];
-    let out = super::multi_lane_watermarks(signer, &lanes);
+    let out = super::multi_lane_watermarks(&lanes);
     assert_eq!(
         out[0].1.advanced(),
         None,

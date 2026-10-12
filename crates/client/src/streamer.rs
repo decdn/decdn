@@ -315,6 +315,7 @@ where
         ledgers: None,
         pacing: Some(&pacing),
         max_blob_bytes,
+        outstanding: None,
     };
     let result = acquire(
         AcquireTarget {

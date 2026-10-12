@@ -2840,6 +2840,17 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **`decdn-client`: a delegated fetch or bundle pull takes a credential swap
+  mid-run (#2429).** Every lane reads the `CredentialSlot`'s current key and
+  capability when it is built, so a credential the application swaps in takes
+  over at the next voucher boundary. Before, lanes signed under the key the
+  fetch started with. A fetch shares one slot across all its lanes, and a
+  bundle pull shares it across all its entries. The slot records a swapped-in
+  key's earlier spend from the buyer store. A bundle pull prices `RunningLow`
+  on the bundle's undelivered download, so the signal fires before the bundle
+  stalls. `decdn fetch` and `decdn bundle pull` swap in no credential and
+  behave as before. The `bundle` example swaps one in on `RunningLow`.
+
 - **`decdn-client`: the paid fetch's network leg lives in the SDK (#2429).**
   Holder discovery and probing, lane building, pool open-or-reuse and refill,
   the funding recovery step, watermark persistence and the per-provider

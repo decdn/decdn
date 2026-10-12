@@ -91,7 +91,7 @@ use super::{
 use crate::discovery::{self, NodeCandidate};
 use crate::funding::RunFunding;
 use crate::lane_sources::LaneSources;
-use crate::lanes::{LaneDeps, STALL_WINDOW, SettleOnDrop};
+use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
 use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PullSite};
 use crate::stream_cap::LaneStreamCap;
@@ -100,8 +100,9 @@ use crate::targets::{
     probe_and_order, resolve_target_node,
 };
 use crate::{
-    ClientRangedStore, Connections, DownloadTarget, Downloader, FundingNeeded, LaneLedgers,
-    PeerHealth, PoolReplaced, ProgressCallback, PullDeadlines, RecoveryGate, StopPolicy,
+    ClientRangedStore, Connections, CredentialSlot, DownloadTarget, Downloader, FundingNeeded,
+    LaneLedgers, PeerHealth, PoolReplaced, ProgressCallback, PullDeadlines, RecoveryGate,
+    StopPolicy,
 };
 
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
@@ -1191,12 +1192,12 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     pub(super) max_blob_bytes: u64,
     /// How the run funds its pool.
     pub(super) deposit: DepositPolicy,
-    /// Delegated capability adopted for every entry, or `None`
-    /// for the self-owned pool path. When `Some`, every entry presents this
-    /// owner-signed grant instead of opening/reusing the caller's own pool, and
-    /// a funding recovery step has no funding path (the delegate owns no pool
+    /// The delegated credential slot every entry's lanes sign under, read
+    /// at each lane build so a swapped-in credential takes over at the next
+    /// voucher boundary; `None` for the self-owned pool path. With a slot, a
+    /// funding recovery step has no funding path (the delegate owns no pool
     /// to fund).
-    pub(super) grant: Option<decdn_incentive::CapabilityGrant>,
+    pub(super) slot: Option<CredentialSlot>,
     /// Bundle-level namespace id (ADR 002) applied to every paid pull in the run —
     /// the namespace as a big-endian `uint256`; `NO_NAMESPACE` when the
     /// caller names none.
@@ -1251,6 +1252,9 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     /// and the manifest fetch, so the pull gives up only once no entry has
     /// landed a verified byte for the whole limit.
     pub(super) stop: StopPolicy,
+    /// The run's undelivered planned download, in content bytes, which a
+    /// delegated pull prices its running-low signal on ([`WorkShare`]).
+    pub(super) outstanding: Arc<AtomicU64>,
     /// Where the run reports its progress; `None` reports nothing.
     pub(super) observer: Option<Arc<dyn BundleObserver>>,
     /// What explains a failed fetch to the caller's user; `None` leaves every
@@ -1394,8 +1398,10 @@ impl<P: Provider + Clone> PullCtx<P> {
             &deps,
             &self.discovery,
             &self.relays,
-            self.grant.as_ref(),
-            &self.signer,
+            match &self.slot {
+                Some(slot) => LanePayer::Delegated(slot),
+                None => LanePayer::Owned(&self.signer),
+            },
             &self.voucher_dom,
             Some(&self.open_lock),
             Some(&self.ledgers),
@@ -1424,7 +1430,8 @@ impl<P: Provider + Clone> PullCtx<P> {
                 .health(Arc::clone(&self.health))
                 .recovery(Arc::clone(&self.recovery))
                 .max_lanes(self.discovery.max_sources)
-                .max_blob_bytes(max_blob_bytes);
+                .max_blob_bytes(max_blob_bytes)
+                .outstanding_work(Arc::clone(&self.outstanding));
             if let Some(slot) = sources.credentials() {
                 downloader = downloader.credentials(slot);
             }
@@ -1513,13 +1520,13 @@ impl<P: Provider + Clone> PullCtx<P> {
     ) -> BundleOutcome {
         // The run's total meters its **download** — the bytes actually fetched
         // after shared-chunk dedup — beside the whole on-disk content size.
+        let fetch_plan = build_fetch_plan(entries);
+        let planned = download_bytes(entries, &fetch_plan);
         if let Some(observer) = &self.observer {
-            let fetch_plan = build_fetch_plan(entries);
-            observer.run_started(
-                download_bytes(entries, &fetch_plan),
-                total_content_bytes(entries),
-            );
+            observer.run_started(planned, total_content_bytes(entries));
         }
+        self.outstanding
+            .store(planned.unwrap_or(0), Ordering::Relaxed);
         // Loaded once per pass: the pre-pass skip decisions consult it, and it
         // seeds the incremental skip-cache flush inside `pull_all` — a run's
         // completed files are folded onto this prior and rewritten as the pull
@@ -1539,6 +1546,8 @@ impl<P: Provider + Clone> PullCtx<P> {
             self.ledgers = LaneLedgers::new();
             self.funding = RunFunding::default();
             self.recovery.start_next_pass();
+            self.outstanding
+                .store(planned.unwrap_or(0), Ordering::Relaxed);
             let saved = skip_cache::load(out_root);
             let second = self
                 .pull_all(entries, out_root, overwrite, saved, cancel)
@@ -1891,7 +1900,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // The byte-delivery callback drives the file bar's download and the total
         // bar's download meter; the `file` handle also carries the phase transitions
         // (discovering / pending / reconstructing) the byte callback cannot express.
-        let progress = file.and_then(|f| f.callback());
+        let progress = file.map(FileBar::callback);
         // An already-finalized `<hex>` staging blob — a prior run promoted it, or
         // this run finalized it and crashed in the promote-to-materialize window —
         // is the complete blob, BLAKE3-verified when it was promoted. Materialize
@@ -2016,6 +2025,20 @@ impl<P: Provider + Clone> PullCtx<P> {
         Ok(EntryBytes::dedup(total, outcome))
     }
 
+    /// The group's share of the run's outstanding work: its planned download,
+    /// which stays outstanding until it lands or the group settles, whichever
+    /// way it settles. Returns the share with the blob's planned download and
+    /// reconstruct bytes ([`blob_download_reconstruct`]).
+    fn work_share(
+        &self,
+        group: &HashGroup<'_>,
+        fetch_plan: &FetchPlan,
+    ) -> (Arc<WorkShare>, u64, u64) {
+        let (download, reconstruct) = blob_download_reconstruct(group, fetch_plan, &HashMap::new());
+        let share = Arc::new(WorkShare::new(Arc::clone(&self.outstanding), download));
+        (share, download, reconstruct)
+    }
+
     /// Fetch the blob shared by one hash-group and write it under `out_root` at
     /// each entry's path. The blob is fetched — and paid for — **once**; the first
     /// writable destination receives the materialized bytes and every other is a
@@ -2032,9 +2055,11 @@ impl<P: Provider + Clone> PullCtx<P> {
         fetch_plan: &FetchPlan,
         disk: &DiskState,
     ) -> GroupRun {
+        let (share, download_bytes_of_blob, reconstruct_bytes_of_blob) =
+            self.work_share(&group, fetch_plan);
         // The group's shared hash is carried explicitly; parse it once, and a bad
-        // hash fails every path in the group. Then wait for the group's the jobs cap
-        // slot: every group of the run is in flight at once, and this is the cap.
+        // hash fails every path in the group. Then wait for the group's jobs slot:
+        // every group of the run is in flight at once, and this is the cap.
         let slot = match parse_hash(group.hash) {
             Ok(h) => FetchSlot::acquire(&self.gate).await.map(|slot| (h, slot)),
             Err(e) => Err(e),
@@ -2130,11 +2155,12 @@ impl<P: Provider + Clone> PullCtx<P> {
         // static plan against the run's fetch plan (an empty donor index — the
         // fresh-pull split), matching the header's download total.
         let paths: Vec<String> = group.entries.iter().map(|e| e.path.clone()).collect();
-        let (download_bytes_of_blob, reconstruct_bytes_of_blob) =
-            blob_download_reconstruct(&group, fetch_plan, &HashMap::new());
-        let file_bar = FileBar::of(self.observer.as_ref().map(|observer| {
-            observer.file_started(&paths, download_bytes_of_blob, reconstruct_bytes_of_blob)
-        }));
+        let file_bar = FileBar::of(
+            self.observer.as_ref().map(|observer| {
+                observer.file_started(&paths, download_bytes_of_blob, reconstruct_bytes_of_blob)
+            }),
+            share,
+        );
         let fetched = self
             .pull_entry(
                 hash,
@@ -2209,28 +2235,75 @@ impl<P: Provider + Clone> PullCtx<P> {
     }
 }
 
-/// One hash group's progress handle: the caller's [`FileObserver`] and the
-/// delivery callback that feeds it. Silent when the run has no observer: no
-/// callback reaches the fetch path, and the whole-file hash runs without a
-/// reporter.
+/// One hash group's share of the run's outstanding work: its planned
+/// download bytes, taken off the run's total as they land, and whatever is
+/// left once the group settles, however it settles. A delegated pull prices
+/// its running-low signal on that total ([`crate::Downloader::outstanding_work`]).
+struct WorkShare {
+    /// The run's outstanding work, in content bytes.
+    outstanding: Arc<AtomicU64>,
+    /// The group's planned download bytes.
+    planned: u64,
+    /// The planned bytes already taken off `outstanding`.
+    taken: AtomicU64,
+}
+
+impl WorkShare {
+    /// A share of `planned` bytes of `outstanding`.
+    const fn new(outstanding: Arc<AtomicU64>, planned: u64) -> Self {
+        Self {
+            outstanding,
+            planned,
+            taken: AtomicU64::new(0),
+        }
+    }
+
+    /// The group's fetch has delivered `received` bytes: take what is new,
+    /// up to the group's plan, off the run's total.
+    fn delivered(&self, received: u64) {
+        let capped = received.min(self.planned);
+        let before = self.taken.fetch_max(capped, Ordering::Relaxed);
+        if capped > before {
+            let gone = capped - before;
+            self.outstanding
+                .update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.saturating_sub(gone)
+                });
+        }
+    }
+}
+
+impl Drop for WorkShare {
+    /// A settled group plans no more work.
+    fn drop(&mut self) {
+        self.delivered(self.planned);
+    }
+}
+
+/// One hash group's progress handle: the caller's [`FileObserver`], the
+/// group's [`WorkShare`], and the delivery callback that feeds both. With no
+/// observer the whole-file hash runs without a reporter.
 pub(super) struct FileBar {
     file: Option<Arc<dyn FileObserver>>,
-    cb: Option<Box<ProgressCallback>>,
+    cb: Box<ProgressCallback>,
 }
 
 impl FileBar {
-    /// The handle over `file`, or a silent one.
-    fn of(file: Option<Arc<dyn FileObserver>>) -> Self {
-        let cb = file.clone().map(|file| {
-            Box::new(move |received: u64, expected: u64| file.delivered(received, expected))
-                as Box<ProgressCallback>
-        });
+    /// The handle over `file` and `share`.
+    fn of(file: Option<Arc<dyn FileObserver>>, share: Arc<WorkShare>) -> Self {
+        let observer = file.clone();
+        let cb = Box::new(move |received: u64, expected: u64| {
+            share.delivered(received);
+            if let Some(file) = &observer {
+                file.delivered(received, expected);
+            }
+        }) as Box<ProgressCallback>;
         Self { file, cb }
     }
 
-    /// The delivery callback to hand the fetch path, or `None` when silent.
-    fn callback(&self) -> Option<&ProgressCallback> {
-        self.cb.as_deref()
+    /// The delivery callback to hand the fetch path.
+    fn callback(&self) -> &ProgressCallback {
+        self.cb.as_ref()
     }
 
     /// Report that the entry probes its holders before any byte arrives.
