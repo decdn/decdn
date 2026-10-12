@@ -956,34 +956,74 @@ async fn a_rejected_reclaim_send_does_not_warn() {
     assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
 }
 
-/// `close --all` over two `Open` pools: the RPC node rejects the first
-/// `closePool`, and the second fails in transport. The sweep reports the first
-/// as failed and the second as unconfirmed, not as two failures (#2427).
-#[tokio::test]
-async fn close_all_counts_a_transport_failed_send_as_unconfirmed() {
+/// `record_error` counts an error that carries [`TxUnconfirmed`] as
+/// unconfirmed, and any other error as failed.
+#[test]
+fn record_error_splits_unconfirmed_from_failed() {
+    let mut tally = BatchTally::default();
+    let rejected = anyhow::anyhow!("insufficient funds").context("closePool send failed");
+    assert!(!tally.record_error(&rejected));
+    let unconfirmed = anyhow::anyhow!("timed out").context(TxUnconfirmed {
+        label: "closePool",
+        tx: None,
+    });
+    assert!(tally.record_error(&unconfirmed));
+    assert!(tally.record_error(&unconfirmed));
+    assert_eq!(
+        tally,
+        BatchTally {
+            failed: 1,
+            unconfirmed: 2,
+            ..BatchTally::default()
+        }
+    );
+}
+
+/// The `getPools` answer for `n` owned pools, as one page.
+fn owned_pools(n: u8) -> alloy::primitives::Bytes {
     use alloy::sol_types::SolCall;
 
-    let owner = Address::repeat_byte(0x22);
-    let open = PaymentPool::Pool {
+    let ids: Vec<PoolId> = (1..=n).map(B256::repeat_byte).collect();
+    PaymentPool::getPoolsCall::abi_encode_returns(&ids).into()
+}
+
+/// The `getPool` answer for a pool `owner` holds in `status`.
+fn pool_in(owner: Address, status: PaymentPool::Status) -> alloy::primitives::Bytes {
+    use alloy::sol_types::SolCall;
+
+    PaymentPool::getPoolCall::abi_encode_returns(&PaymentPool::Pool {
         owner,
-        status: PaymentPool::Status::Open,
+        status,
         disputeDeadline: 0,
         deposit: 1_000_000,
         totalRedeemed: 0,
-    };
-    let get_pool =
-        alloy::primitives::Bytes::from(PaymentPool::getPoolCall::abi_encode_returns(&open));
+    })
+    .into()
+}
+
+/// Queue a sweep over three pools in `status`: the RPC node rejects the first
+/// two sends, and the third fails in transport because the queue runs out.
+/// The counts are asymmetric, so a swapped classification changes them.
+fn two_rejected_then_one_lost(
+    asserter: &alloy::providers::mock::Asserter,
+    owner: Address,
+    status: PaymentPool::Status,
+) {
+    for _ in 0..2 {
+        asserter.push_success(&pool_in(owner, status));
+        asserter.push_failure_msg("insufficient funds for gas");
+    }
+    asserter.push_success(&pool_in(owner, status));
+}
+
+/// `close --all` reports a rejected `closePool` as failed and a transport-failed
+/// one as unconfirmed, not as a failure (#2427).
+#[tokio::test]
+async fn close_all_counts_a_transport_failed_send_as_unconfirmed() {
+    let owner = Address::repeat_byte(0x22);
     let asserter = alloy::providers::mock::Asserter::new();
-    asserter.push_success(&alloy::primitives::Bytes::from(
-        PaymentPool::getPoolsCall::abi_encode_returns(&vec![
-            B256::repeat_byte(0x33),
-            B256::repeat_byte(0x44),
-        ]),
-    ));
-    asserter.push_success(&get_pool);
-    asserter.push_failure_msg("insufficient funds for gas");
-    asserter.push_success(&get_pool);
-    // The queue is now empty, so the second `closePool` fails in transport.
+    asserter.push_success(&owned_pools(3));
+    two_rejected_then_one_lost(&asserter, owner, PaymentPool::Status::Open);
 
     let err = close_all(
         &pool_on(asserter),
@@ -993,9 +1033,38 @@ async fn close_all_counts_a_transport_failed_send_as_unconfirmed() {
     .await
     .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("1 pool(s) failed to close"), "{msg}");
+    assert!(msg.contains("2 pool(s) failed to close"), "{msg}");
     assert!(
         msg.contains("1 pool(s) may have broadcast a close"),
+        "{msg}"
+    );
+}
+
+/// `reclaim --all` reports a rejected `reclaim` as failed and a
+/// transport-failed one as unconfirmed, not as a failure (#2427).
+#[tokio::test]
+async fn reclaim_all_counts_a_transport_failed_send_as_unconfirmed() {
+    let owner = Address::repeat_byte(0x22);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&owned_pools(3));
+    // The head block `reclaim_all` reads once before the loop. Every pool's
+    // dispute deadline is 0, so each one is reclaimable.
+    let mut head = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+    head.header.inner.timestamp = 1_000;
+    asserter.push_success(&head);
+    two_rejected_then_one_lost(&asserter, owner, PaymentPool::Status::Closing);
+
+    let err = reclaim_all(
+        &pool_on(asserter),
+        LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+        owner,
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("2 pool(s) failed to reclaim"), "{msg}");
+    assert!(
+        msg.contains("1 pool(s) may have broadcast a reclaim"),
         "{msg}"
     );
 }
