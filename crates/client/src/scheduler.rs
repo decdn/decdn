@@ -132,7 +132,9 @@ use tokio::time::Instant;
 use crate::coverage_plan::{
     SourceCoverage, covered_part, covered_suffix_start, covers_byte_range, spread_segments,
 };
-use crate::credential::{CredentialSlot, CredentialView, FundingNeeded, QuoteMax, unix_now};
+use crate::credential::{
+    CredentialSlot, CredentialView, FundingNeeded, QuoteMax, RunDemand, unix_now,
+};
 use crate::driver::{
     DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool, UnitProgress, WaitReason,
     contiguous_byte_ranges, fill_gap, ranges_content_len,
@@ -364,6 +366,12 @@ pub struct AcquireEnv<'a, Pc, F> {
     /// bound never grows past it: a blob that holds bytes past it ends the
     /// acquire with [`crate::BlobTooLarge`].
     pub max_blob_bytes: u64,
+    /// What the caller's run still needs, or `None` when this acquire is
+    /// the whole run. A delegated fetch prices the running-low signal on the
+    /// larger of the run's planned work and its own missing bytes, at the
+    /// highest quote any lane of the run got, so every entry of a bundle pull
+    /// reports one bundle-wide need. Its lanes' quotes fold into the run's.
+    pub run: Option<&'a RunDemand>,
 }
 
 impl<Pc, F> std::fmt::Debug for AcquireEnv<'_, Pc, F> {
@@ -3195,7 +3203,8 @@ pub(crate) fn key_spend<S>(
 
 /// The local view of `slot`'s current capability against the work left
 /// ([`CredentialView`]): everything signed under its key ([`key_spend`]),
-/// and the missing bytes of `ranges` at the highest quote.
+/// and the missing bytes of `ranges` at the highest quote, or the run's
+/// `run`'s planned work when that is larger.
 ///
 /// # Errors
 ///
@@ -3205,7 +3214,7 @@ async fn credential_view<St, S>(
     store: &St,
     ranges: &[(u64, u64)],
     lanes: &[Arc<StreamCandidate<S>>],
-    ledgers: Option<&LaneLedgers>,
+    (ledgers, run): (Option<&LaneLedgers>, Option<&RunDemand>),
     quotes: &QuoteMax,
 ) -> anyhow::Result<CredentialView>
 where
@@ -3213,7 +3222,9 @@ where
 {
     let credential = slot.current();
     let spent_by_key = key_spend(slot, lanes, ledgers);
-    let remaining = ranges_content_len(&missing_chunks(store, ranges).await?, store.total_bytes());
+    let own = ranges_content_len(&missing_chunks(store, ranges).await?, store.total_bytes());
+    // A bundle prices the work of the whole run, not of this entry alone.
+    let remaining = run.map_or(own, |run| own.max(run.outstanding()));
     Ok(CredentialView::of(
         &credential,
         spent_by_key,
@@ -3449,10 +3460,12 @@ where
     };
     // The highest rate and voucher interval any lane was quoted: the price of
     // the work left, for a delegated fetch's running-low signal.
-    let quotes = QuoteMax::default();
+    // A run's fetches share the run's quotes.
+    let local_quotes = QuoteMax::default();
+    let quotes = env.run.map_or(&local_quotes, |run| &run.quotes);
     let pool = SharedPool {
         spent: &spent,
-        quotes: Some(&quotes),
+        quotes: Some(quotes),
     };
     // The credential generation the loop's lanes were built under, and
     // whether a node refused the capability itself since then.
@@ -3626,7 +3639,14 @@ where
                 ready.retain(|(_, lane)| !slot.is_stale(&lane.ctx));
                 health.clear_unaffordable();
                 capability_refused = false;
-                let view = credential_view(slot, store, &want.ranges, &started.0, env.ledgers, &quotes)
+                let view = credential_view(
+                    slot,
+                    store,
+                    &want.ranges,
+                    &started.0,
+                    (env.ledgers, env.run),
+                    quotes,
+                )
                     .await?;
                 slot.report(view.event());
             }
@@ -3843,8 +3863,8 @@ where
                             store,
                             &want.ranges,
                             &started.0,
-                            env.ledgers,
-                            &quotes,
+                            (env.ledgers, env.run),
+                            quotes,
                         )
                         .await?;
                         slot.report(view.event());
@@ -4084,8 +4104,8 @@ where
                             store,
                             &want.ranges,
                             &started.0,
-                            env.ledgers,
-                            &quotes,
+                            (env.ledgers, env.run),
+                            quotes,
                         )
                         .await?;
                         slot.report(view.event());

@@ -551,3 +551,28 @@ fn a_self_owned_pool_no_voucher_fits_names_the_top_up_command() {
     let other = with_top_up_hint(anyhow::anyhow!("reset"), Some(pool));
     assert_eq!(other.to_string(), "reset");
 }
+
+/// A delegated command's slot refuses a loaded key the capability does not
+/// authorize, naming both addresses and the remedy: every voucher it signed
+/// would be refused as `WrongSigner`.
+#[test]
+fn a_delegated_slot_rejects_a_key_the_capability_does_not_name() {
+    let delegate = PrivateKeySigner::random();
+    let capability = decdn_incentive::Capability {
+        signer: delegate.address(),
+        spending_cap: 1_000,
+        pool_id: B256::repeat_byte(0x11),
+        expiry: u64::MAX,
+    }
+    .sign(&delegate, &bind_node_id_domain(1, Address::ZERO))
+    .unwrap();
+    let grant = CapabilityGrant::from_signed_capability(&capability);
+    assert!(delegated_slot(&grant, Arc::new(delegate.clone())).is_ok());
+
+    let other = PrivateKeySigner::random();
+    let err = delegated_slot(&grant, Arc::new(other.clone())).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains(&delegate.address().to_string()), "{msg}");
+    assert!(msg.contains(&other.address().to_string()), "{msg}");
+    assert!(msg.contains("load the delegate keystore"), "{msg}");
+}

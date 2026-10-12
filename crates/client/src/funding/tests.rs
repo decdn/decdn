@@ -59,24 +59,3 @@ fn cached_pool_token_uses_persisted_row_and_skips_rpc() -> anyhow::Result<()> {
     }
     Ok(())
 }
-
-/// The delegated signer gate accepts the authorized key and rejects any
-/// other, naming both addresses so the operator can see the mismatch.
-#[test]
-fn ensure_delegate_signer_matches_or_rejects() {
-    let key = Address::repeat_byte(0xa1);
-    assert!(super::ensure_delegate_signer(key, key).is_ok());
-
-    let other = Address::repeat_byte(0xb2);
-    let err = super::ensure_delegate_signer(other, key)
-        .expect_err("a non-authorized key must be rejected");
-    let msg = err.to_string();
-    assert!(
-        msg.contains(&key.to_string()),
-        "names the authorized signer: {msg}"
-    );
-    assert!(
-        msg.contains(&other.to_string()),
-        "names the loaded key: {msg}"
-    );
-}

@@ -24,8 +24,8 @@ use crate::funding::{RunFunding, build_ctx_for_fetch};
 use crate::ordered_writes::OrderedWrites;
 use crate::session::{ChainConfig, DepositPolicy, FetchMarks, PullSite};
 use crate::{
-    Connections, Cumulative, LaneHandle, LaneLedgers, PeerSource, PoolContext, PoolLedger,
-    PullDeadlines, VoucherProgress,
+    Connections, CredentialSlot, Cumulative, LaneHandle, LaneLedgers, PeerSource, PoolContext,
+    PoolLedger, PullDeadlines, VoucherProgress,
 };
 
 /// Settles a drive that is dropped before it returns, as a Ctrl-C does.
@@ -124,6 +124,16 @@ fn persist_watermark(
 /// loop's lane watchdog ([`crate::LANE_WATCHDOG`]) covers a lane that
 /// makes slow progress.
 pub const STALL_WINDOW: Duration = Duration::from_secs(30);
+
+/// What a lane's vouchers sign under.
+#[derive(Debug, Clone, Copy)]
+pub enum LanePayer<'a> {
+    /// The buyer's own pool, signed by its owner key.
+    Owned(&'a Arc<PrivateKeySigner>),
+    /// A pool another owner funds, signed under the slot's credential as it is
+    /// when the lane is built.
+    Delegated(&'a CredentialSlot),
+}
 
 /// Shared pull/funding deps every lane of one fetch borrows for its lifetime
 /// (`build_multi_lane`). A `decdn fetch` and every entry of a `bundle pull`
@@ -238,6 +248,8 @@ fn lane_ledger(
 /// a [`FaceLaneHandle`] on the same `ctx`/`ledger` for the watermark.
 pub(crate) struct MultiLane<'a> {
     pub(crate) provider: Address,
+    /// The key the lane's vouchers sign under.
+    pub(crate) signer: Address,
     pub(crate) pool_id: PoolId,
     /// The lane's persisted prior amount — the baseline
     /// [`persist_watermark`] computes the advance against.
@@ -291,8 +303,7 @@ pub(crate) fn lane_target(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_multi_lane<'a, P>(
     deps: &LaneDeps<'a, P>,
-    grant: Option<&CapabilityGrant>,
-    signer: &Arc<PrivateKeySigner>,
+    payer: LanePayer<'_>,
     voucher_dom: &Eip712Domain,
     provider: Address,
     target: EndpointAddr,
@@ -302,6 +313,16 @@ pub(crate) async fn build_multi_lane<'a, P>(
 where
     P: alloy::providers::Provider + Clone,
 {
+    // A delegated lane signs under the slot's credential as it is now: a lane
+    // built after a swap signs under the new key and capability.
+    let (signer, grant) = match payer {
+        LanePayer::Owned(signer) => (Arc::clone(signer), None),
+        LanePayer::Delegated(slot) => {
+            let credential = slot.current();
+            let grant = CapabilityGrant::from_signed_capability(&credential.capability);
+            (credential.signer, Some(grant))
+        }
+    };
     let (ctx, spend) = {
         // Bundle pull funnels every entry — and every lane of a multi-source
         // entry — through the one shared `PaymentPool` deposit, so the
@@ -309,17 +330,17 @@ where
         // opens nothing on-chain (`build_delegated_pool_ctx` adopts the owner's
         // pool), so it skips the guard: holding the bundle-wide lock there
         // would serialize unrelated fetches for no mutual-exclusion win.
-        let _open_guard = match (open_lock, grant) {
+        let _open_guard = match (open_lock, &grant) {
             (Some(lock), None) => Some(lock.lock().await),
             _ => None,
         };
-        build_ctx_for_fetch(deps, grant, signer, voucher_dom, provider).await?
+        build_ctx_for_fetch(deps, grant.as_ref(), &signer, voucher_dom, provider).await?
     };
     let pool_id = ctx.pool_id;
     let prior_amount = ctx.prior_amount;
     let lane = LaneKey {
         pool_id,
-        signer: deps.self_address,
+        signer: signer.address(),
         provider,
     };
     // The lane's ledger + context, seeded from its persisted `(signer,
@@ -345,6 +366,7 @@ where
     }
     Ok(MultiLane {
         provider,
+        signer: lane.signer,
         pool_id,
         prior_amount,
         ctx,
@@ -387,6 +409,8 @@ fn lane_source<'a, P>(
 pub(crate) struct FaceLaneHandle {
     pub(crate) pool_id: PoolId,
     pub(crate) provider: Address,
+    /// The key the lane's vouchers sign under: its lane's `signer`.
+    pub(crate) signer: Address,
     pub(crate) prior_amount: U256,
     pub(crate) ledger: Arc<PoolLedger>,
     /// The lane's buyer context, read to annotate an unbound cache miss.
@@ -418,6 +442,7 @@ fn stream_lane_watermarks(lanes: &[FaceLaneHandle]) -> Vec<LaneWatermark> {
         .into_iter()
         .map(|(l, prior_amount)| LaneWatermark {
             pool_id: l.pool_id,
+            signer: l.signer,
             provider: l.provider,
             prior_amount,
             // Taken before the settlement read, so the settlement is at or above it.
@@ -433,8 +458,8 @@ type LaneWrite = (LaneKey, VoucherProgress);
 /// The watermark write every face lane calls for, read from the retained
 /// handles now — the same settle-at-armed-cumulative rule the file path
 /// applies, one write per lane ledger.
-fn face_watermark_writes(self_address: Address, handles: &[FaceLaneHandle]) -> Vec<LaneWrite> {
-    multi_lane_watermarks(self_address, &stream_lane_watermarks(handles))
+fn face_watermark_writes(handles: &[FaceLaneHandle]) -> Vec<LaneWrite> {
+    multi_lane_watermarks(&stream_lane_watermarks(handles))
 }
 
 /// Apply every write in `writes`. Blocking: each write that moves the row is a
@@ -473,12 +498,7 @@ pub(crate) fn queue_face_watermarks(
     self_address: Address,
     handles: &[FaceLaneHandle],
 ) -> tokio::sync::oneshot::Receiver<()> {
-    queue_watermark_writes(
-        writes,
-        store,
-        self_address,
-        face_watermark_writes(self_address, handles),
-    )
+    queue_watermark_writes(writes, store, self_address, face_watermark_writes(handles))
 }
 
 /// Queue `lane_writes` on `writes` ([`queue_face_watermarks`]).
@@ -497,6 +517,8 @@ fn queue_watermark_writes(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LaneWatermark {
     pool_id: PoolId,
+    /// The key the lane's vouchers sign under.
+    signer: Address,
     provider: Address,
     /// The lane's persisted prior amount — the baseline the advance is computed
     /// against.
@@ -524,17 +546,14 @@ struct LaneWatermark {
 ///
 /// Settling high costs nothing on the clean path: with nothing armed,
 /// `settlement()` equals `committed()`.
-fn multi_lane_watermarks(
-    signer: Address,
-    lanes: &[LaneWatermark],
-) -> Vec<(LaneKey, VoucherProgress)> {
+fn multi_lane_watermarks(lanes: &[LaneWatermark]) -> Vec<(LaneKey, VoucherProgress)> {
     lanes
         .iter()
         .map(|l| {
             (
                 LaneKey {
                     pool_id: l.pool_id,
-                    signer,
+                    signer: l.signer,
                     provider: l.provider,
                 },
                 VoucherProgress::from_cumulative(l.settlement, l.prior_amount)

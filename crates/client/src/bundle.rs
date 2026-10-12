@@ -34,7 +34,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context as _, bail};
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{CapabilityGrant, slash_judge_domain, voucher_domain};
+use decdn_incentive::{slash_judge_domain, voucher_domain};
 use iroh::{Endpoint, RelayUrl};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -48,7 +48,7 @@ use crate::session::{
 use crate::stream_cap::LaneStreamCap;
 use crate::{
     Connections, CredentialSlot, FundingNeeded, LaneLedgers, PeerHealth, PoolReplaced,
-    ProgressClock, RecoveryGate, StopPolicy,
+    ProgressClock, RecoveryGate, RunDemand, StopPolicy,
 };
 
 mod engine;
@@ -670,18 +670,18 @@ impl BundlePullerBuilder {
     /// The RPC URL is malformed, the capability does not decode, or the
     /// `PaymentPool` token read fails.
     pub async fn build(self) -> anyhow::Result<BundlePuller> {
-        let (signer, grant, deposit) = match self.funding {
+        let (signer, slot, deposit) = match self.funding {
             Funding::SelfOwned { signer, deposit } => (signer, None, deposit),
             Funding::Delegated { slot } => {
-                let credential = slot.current();
-                let grant = CapabilityGrant::from_signed_capability(&credential.capability);
-                // A delegate owns no pool, so it funds and adopts none.
+                // A delegate owns no pool, so it funds and adopts none. Its
+                // lanes sign under the slot's credential as each is built; the
+                // provider below sends no transaction.
                 let deposit = DepositPolicy {
                     working_deposit: U256::ZERO,
                     max_approve: false,
                     adoption: ChainAdoption::Refused,
                 };
-                (credential.signer, Some(grant), deposit)
+                (slot.current().signer, Some(slot), deposit)
             }
         };
         let rpc = crate::provider::build_provider(&self.chain.rpc_url, &signer)?.erased();
@@ -710,7 +710,7 @@ impl BundlePullerBuilder {
             max_rate_per_mb: self.max_rate_per_mb,
             max_blob_bytes: self.max_blob_bytes,
             deposit,
-            grant,
+            slot,
             namespace_id: namespace_id(self.namespace),
             ledgers: LaneLedgers::new(),
             funding: RunFunding::default(),
@@ -728,6 +728,7 @@ impl BundlePullerBuilder {
                 self.give_up_after,
                 Arc::new(ProgressClock::new()),
             ),
+            demand: Arc::new(RunDemand::default()),
             observer: self.observer,
             hints: self.hints,
         };

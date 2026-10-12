@@ -2,9 +2,10 @@
 //! them per megabyte from a USDC payment pool, and verify every byte against
 //! its BLAKE3 hash as it arrives.
 //!
-//! The `decdn` CLI's `fetch` and `bundle pull` are built on this crate. So is
-//! the node's own cache-miss pull: a node that misses in its cache is a paying
-//! client of the node upstream of it.
+//! The `decdn` CLI's `fetch` and `bundle pull` are built on this crate, and
+//! `bundle pull` is a thin caller of [`bundle::BundlePuller`]. So is the node's
+//! own cache-miss pull: a node that misses in its cache is a paying client of
+//! the node upstream of it.
 //!
 //! # Choose an entry point
 //!
@@ -12,13 +13,17 @@
 //! |---|---|
 //! | Save one blob, or a set of blobs, to files as fast as possible, and resume a partial download | [`Downloader`] |
 //! | Read one blob in order, and pay only for what your reader reaches | [`Streamer`] |
+//! | Pull a whole bundle manifest into a directory, with discovery, funding, resume and dedup handled | [`bundle::BundlePuller`] |
 //!
 //! The [`Downloader`] stripes a blob
 //! across every holder at once, and writes each verified range at its offset in
 //! a `.partial` file beside the destination. A rerun fetches only the ranges
 //! that file does not hold yet. The [`Streamer`] fetches at most one read-ahead
 //! window ([`PullConfig::read_ahead_bytes`]) ahead of its reader, so a reader
-//! that stops early stops the spend within that window.
+//! that stops early stops the spend within that window. The
+//! [`bundle::BundlePuller`] runs every step below for you over one pool: it
+//! takes the chain ([`session::ChainConfig`]), a buyer-pool store, and a
+//! [`bundle::Funding`], and records each lane's payment itself.
 //!
 //! # Before you fetch
 //!
@@ -294,7 +299,7 @@ pub use connection::WarmConnection;
 #[doc(hidden)]
 pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 #[doc(hidden)]
-pub use credential::QuoteMax;
+pub use credential::{QuoteMax, RunDemand};
 #[doc(hidden)]
 pub use decdn_bao_range::RangedStore;
 #[doc(hidden)]

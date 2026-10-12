@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use alloy::primitives::U256;
 use decdn_client::funding::{RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, LaneSources};
-use decdn_client::lanes::{LaneDeps, STALL_WINDOW, SettleOnDrop};
+use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use decdn_client::session::{
     ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, ProxyWarmingParams,
     PullSite,
@@ -47,9 +47,9 @@ use decdn_client::targets::{
     ProbeOpts, ProbeRound, ResolveConfigFault, holders_or_none, resolve_target_node,
 };
 use decdn_client::{
-    Connections, DownloadTarget, Downloader, Holder, NoAffordableSource, NoCache, NoSourceHasBlob,
-    PeerHealth, PoolContext, PoolReplaced, ProgressClock, PullConfig, PullDeadlines, RecoveryGate,
-    StopPolicy, Streamer, UpstreamRefused, UpstreamVoucherRejected,
+    Connections, CredentialSlot, DownloadTarget, Downloader, Holder, NoAffordableSource, NoCache,
+    NoSourceHasBlob, PeerHealth, PoolContext, PoolReplaced, ProgressClock, PullConfig,
+    PullDeadlines, RecoveryGate, StopPolicy, Streamer, UpstreamRefused, UpstreamVoucherRejected,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -641,6 +641,12 @@ async fn fetch_over(
     );
     let health = Arc::new(PeerHealth::default());
     let deposit = chain.deposit_policy(grant.is_some())?;
+    // A delegated fetch signs under one credential slot for the whole command,
+    // both passes included.
+    let slot = grant
+        .as_ref()
+        .map(|grant| delegated_slot(grant, Arc::clone(&signer)))
+        .transpose()?;
     // One funding recovery state for the whole fetch, both passes included.
     let recovery = Arc::new(RecoveryGate::new());
     // Set once a funding recovery step replaced the pool: the second pass then
@@ -679,8 +685,10 @@ async fn fetch_over(
             &deps,
             &discovery,
             relays,
-            grant.as_ref(),
-            &signer,
+            match &slot {
+                Some(slot) => LanePayer::Delegated(slot),
+                None => LanePayer::Owned(&signer),
+            },
             &voucher_dom,
             Some(&open_lock),
             None,
@@ -1274,6 +1282,34 @@ fn print_fetch_summary(content_bytes: u64, meter: &DeliveryMeter, output: &Path)
         }
         _ => println!("fetched {content_bytes} bytes -> {}", output.display()),
     }
+}
+
+/// The credential slot of a delegated pull (`--capability`): the grant's
+/// capability for the loaded delegate key. The CLI swaps in no new
+/// credential, so the slot waits for none, and an exhausted capability ends
+/// the command at once with a typed [`decdn_client::FundingNeeded`].
+///
+/// # Errors
+///
+/// The grant's owner signature is malformed, or the loaded key is not the
+/// signer the capability authorizes: the client can sign vouchers only as
+/// that key, and a node would refuse every one as `WrongSigner`.
+pub(crate) fn delegated_slot(
+    grant: &CapabilityGrant,
+    signer: Arc<alloy::signers::local::PrivateKeySigner>,
+) -> anyhow::Result<CredentialSlot> {
+    let capability = grant.to_signed_capability().map_err(|e| {
+        anyhow::anyhow!("capability token carries a malformed owner signature: {e}")
+    })?;
+    let slot = CredentialSlot::new(signer, capability).map_err(|mismatch| {
+        let (authorized, loaded) = (mismatch.capability_signer, mismatch.key);
+        anyhow::anyhow!(
+            "this capability authorizes signer {authorized}, but the loaded key is {loaded} — \
+             load the delegate keystore the pool owner assigned (--keystore / \
+             blockchain.eth_keystore), or ask for a capability issued to {loaded}"
+        )
+    })?;
+    Ok(slot.with_swap_wait(std::time::Duration::ZERO))
 }
 
 /// Resolve the delegated `--capability`/`--capability-file` token into a

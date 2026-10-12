@@ -9,7 +9,8 @@
 
 **Date:** 2026-05-07 — **Status:** Accepted (`decdn origin import`
 generates manifests and `bundle pull` consumes them; both ship).
-**Touches:** `decdn` CLI, content publishing workflow.
+**Touches:** `decdn` CLI, `decdn-client` bundle API, content publishing
+workflow.
 
 ## Context
 
@@ -238,6 +239,22 @@ manifest bytes, so it changes the bundle hash and every downstream pull
 sees the folder.
 
 ## Pull
+
+The pull engine is `decdn_client::bundle::BundlePuller` in the client SDK.
+`decdn bundle pull` is one caller of it, and an application that embeds
+deCDN is another. The engine takes typed inputs: the chain, the local data
+directory, a buyer-pool store, and the funding source. The funding source is
+the buyer's own pool, or a delegated `CredentialSlot` that the application
+owns. The engine reports progress to an observer, stops when a cancel token
+fires, and returns a typed outcome. The rules below apply to every caller.
+The flags name the CLI's form of each input.
+
+With a delegated slot, every lane reads the slot's current credential when
+the engine builds the lane. The application can swap a new key and capability
+into the slot during the pull. The swap applies as
+[ADR 039 § Client SDK funding signal](039-multi-source-parallel-fetch.md#client-sdk-funding-signal)
+describes. The running-low signal prices the work that the whole bundle has
+left, not the work of one entry. The CLI swaps in no new credential.
 
 `decdn bundle pull` reads a manifest — from a local file (`-i`) or by
 fetching its own blob hash first (`--hash`, mutually exclusive) — and

@@ -9,18 +9,18 @@
 //! reads.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
-use alloy::signers::local::PrivateKeySigner;
-use decdn_incentive::{CapabilityGrant, PoolId};
+use decdn_incentive::PoolId;
 use iroh::RelayUrl;
 
 use crate::discovery::NodeCandidate;
 use crate::funding::PoolFunder;
 use crate::lanes::{
-    FaceLaneHandle, LaneDeps, build_multi_lane, lane_target, queue_face_watermarks,
+    FaceLaneHandle, LaneDeps, LanePayer, build_multi_lane, lane_target, queue_face_watermarks,
 };
 use crate::session::{DiscoveryOptions, ProxyWarmingParams};
 use crate::source::{SourceFuture, SourceStream};
@@ -85,9 +85,13 @@ pub struct LaneSources<'a, P> {
     deps: &'a LaneDeps<'a, P>,
     discovery: &'a DiscoveryOptions,
     relays: &'a [RelayUrl],
-    grant: Option<&'a CapabilityGrant>,
-    signer: &'a Arc<PrivateKeySigner>,
+    /// What every lane signs under: the owner key, or the delegated slot it
+    /// reads at each lane build.
+    payer: LanePayer<'a>,
     voucher_dom: &'a Eip712Domain,
+    /// The slot generation whose key's earlier spend was last recorded in the
+    /// slot ([`Self::seed_spend`]); `u64::MAX` before the first record.
+    seeded: AtomicU64,
     /// Serializes each lane's pool open-or-reuse: across one fetch's
     /// concurrently built lanes, which all open or reuse the one pool, and
     /// across sibling fetches on that pool (`bundle pull`).
@@ -123,7 +127,7 @@ pub struct LaneSources<'a, P> {
 impl<P> std::fmt::Debug for LaneSources<'_, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LaneSources")
-            .field("delegated", &self.grant.is_some())
+            .field("payer", &self.payer)
             .field("relays", &self.relays.len())
             .finish_non_exhaustive()
     }
@@ -139,8 +143,7 @@ where
         deps: &'a LaneDeps<'a, P>,
         discovery: &'a DiscoveryOptions,
         relays: &'a [RelayUrl],
-        grant: Option<&'a CapabilityGrant>,
-        signer: &'a Arc<PrivateKeySigner>,
+        payer: LanePayer<'a>,
         voucher_dom: &'a Eip712Domain,
         open_lock: Option<&'a tokio::sync::Mutex<()>>,
         ledgers: Option<&'a LaneLedgers>,
@@ -151,9 +154,9 @@ where
             deps,
             discovery,
             relays,
-            grant,
-            signer,
+            payer,
             voucher_dom,
+            seeded: AtomicU64::new(u64::MAX),
             open_lock,
             ledgers,
             lane_cap,
@@ -202,7 +205,10 @@ where
             rpc: self.deps.rpc,
             store: self.deps.store.as_ref(),
             owner: self.deps.self_address,
-            signer: self.signer,
+            signer: match self.payer {
+                LanePayer::Owned(signer) => Arc::clone(signer),
+                LanePayer::Delegated(slot) => slot.current().signer,
+            },
             deployment: self.deps.chain.deployment(),
             token: self.deps.token,
             payment_pool_addr: self.deps.chain.payment_pool,
@@ -212,33 +218,37 @@ where
         }
     }
 
-    /// A delegated fetch's credential slot: the grant's capability for the
-    /// delegate key every lane signs with. The CLI swaps in no new credential,
-    /// so the slot waits for none, and an exhausted candidate set ends at
-    /// once with a typed [`crate::FundingNeeded`]. `None` for a fetch
-    /// that pays from its own pool.
+    /// A delegated fetch's credential slot, shared by every lane the fetch
+    /// builds, with its current key's earlier spend recorded
+    /// ([`Self::seed_spend`]). `None` for a fetch that pays from its own pool.
     pub fn credentials(&self) -> Option<CredentialSlot> {
-        let grant = self.grant?;
-        // A grant that does not decode fails the lane build first, which
-        // names the fault; without a slot the fetch still ends funding needed.
-        let capability = grant.to_signed_capability().ok()?;
-        // The command checked the loaded key against the grant before any
-        // lane was built ([`crate::funding::build_delegated_pool_ctx`]).
-        let slot = CredentialSlot::new(Arc::clone(self.signer), capability)
-            .ok()?
-            .with_swap_wait(std::time::Duration::ZERO);
-        // What earlier fetches signed under this key, at every provider the
-        // buyer store holds a lane for: the capability's spend so far.
-        let signer = self.signer.address();
+        let LanePayer::Delegated(slot) = self.payer else {
+            return None;
+        };
+        self.seed_spend(slot);
+        Some(slot.clone())
+    }
+
+    /// Record in `slot` what earlier fetches signed under its current key, at
+    /// every provider the buyer store holds a lane for: the capability's
+    /// spend so far. Read once per slot generation, so a swapped-in key is
+    /// counted from its own records.
+    fn seed_spend(&self, slot: &CredentialSlot) {
+        let generation = slot.generation();
+        if self.seeded.swap(generation, Ordering::Relaxed) == generation {
+            return;
+        }
+        let signer = slot.current().signer.address();
+        let pool_id = slot.pool_id();
         let row = self
             .deps
             .store
-            .get_by_pool_id(grant.pool_id)
+            .get_by_pool_id(pool_id)
             .unwrap_or_else(|error| {
                 // Counting from zero overstates the headroom, so a spent cap
                 // can read as the publisher's pool needing funds.
                 tracing::warn!(
-                    pool_id = %grant.pool_id,
+                    %pool_id,
                     %error,
                     "could not read the buyer store; this key's earlier spend counts as zero"
                 );
@@ -252,7 +262,6 @@ where
                 })
         });
         slot.record_spend(signer, recorded);
-        Some(slot)
     }
 
     /// The fetch's funding recovery gate.
@@ -388,7 +397,7 @@ where
                 .first()
                 .map(|h| Arc::clone(&h.ctx)),
             pool_id: self.deps.funding.pool_id(),
-            delegated: self.grant.is_some(),
+            delegated: matches!(self.payer, LanePayer::Delegated(_)),
         }
     }
 
@@ -460,10 +469,13 @@ where
             .ok_or_else(|| anyhow::anyhow!("no known node for provider {}", holder.provider))?;
         let addr = self.discovery.pinned.and_then(|pinned| pinned.addr);
         let target = lane_target(&candidate, addr, self.relays);
+        // A lane built after a swap records the new key's earlier spend first.
+        if let LanePayer::Delegated(slot) = self.payer {
+            self.seed_spend(slot);
+        }
         let lane = build_multi_lane(
             self.deps,
-            self.grant,
-            self.signer,
+            self.payer,
             self.voucher_dom,
             holder.provider,
             target,
@@ -478,6 +490,7 @@ where
             .push(FaceLaneHandle {
                 pool_id: lane.pool_id,
                 provider: lane.provider,
+                signer: lane.signer,
                 prior_amount: lane.prior_amount,
                 ledger: Arc::clone(&lane.ledger),
                 ctx: Arc::clone(&lane.ctx),

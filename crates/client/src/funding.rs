@@ -273,7 +273,7 @@ pub struct PoolFunder<'a, P> {
     pub(crate) store: &'a dyn BuyerPoolStore,
     pub(crate) owner: Address,
     /// Signs a replacement pool's `openPool` and its self-issued capability.
-    pub(crate) signer: &'a Arc<PrivateKeySigner>,
+    pub(crate) signer: Arc<PrivateKeySigner>,
     /// The chain and `PaymentPool` a replacement pool opens on.
     pub(crate) deployment: Deployment,
     pub(crate) token: Address,
@@ -466,7 +466,7 @@ where
         .await?;
         let opened = open_pool(
             self.contract,
-            Arc::clone(self.signer),
+            Arc::clone(&self.signer),
             self.deployment,
             self.token,
             self.owner,
@@ -502,7 +502,6 @@ where
             signer,
             voucher_dom,
             provider,
-            deps.self_address,
             deps.chain,
             deps.endpoint,
             grant,
@@ -553,29 +552,14 @@ where
     ))
 }
 
-/// Reject a delegated fetch whose loaded key is not the signer the capability
-/// authorizes. The client can only sign vouchers as `self_address`, and a
-/// capability scoped to a different signer would have every voucher rejected as
-/// `WrongSigner` — so fail fast, before any network or on-chain work.
-fn ensure_delegate_signer(self_address: Address, authorized: Address) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        self_address == authorized,
-        "this capability authorizes signer {authorized}, but the loaded key is {self_address} — \
-         load the delegate keystore the pool owner assigned (--keystore / \
-         blockchain.eth_keystore), or ask for a capability issued to {self_address}",
-    );
-    Ok(())
-}
-
 /// Build a [`PoolContext`] that adopts a pool the caller does NOT own, from a
 /// delegated [`CapabilityGrant`] (`decdn pool assign` → `--capability`).
 ///
 /// Unlike [`build_pool_ctx`] this opens nothing on-chain and signs no
 /// self-capability: it presents the OWNER's capability (rebuilt from the token)
 /// so the serving node registers this client's signer on its first redemption.
-/// It hard-fails when the loaded keystore is not the delegate the capability
-/// authorizes — the client cannot sign vouchers under a capability scoped to a
-/// different signer, and a node would reject them as `WrongSigner`.
+/// `signer` is the delegate the capability authorizes: the caller takes both
+/// from one [`crate::Credential`], which checks that they match.
 ///
 /// The pool's on-chain row is read once for the informational `deposit` and to
 /// confirm the pool exists (a zero-owner row means it was never opened on this
@@ -592,7 +576,6 @@ pub(crate) async fn build_delegated_pool_ctx<P>(
     signer: &Arc<PrivateKeySigner>,
     voucher_dom: &Eip712Domain,
     provider: Address,
-    self_address: Address,
     chain: &ChainConfig,
     endpoint: &Endpoint,
     grant: &CapabilityGrant,
@@ -600,8 +583,7 @@ pub(crate) async fn build_delegated_pool_ctx<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    ensure_delegate_signer(self_address, grant.signer)?;
-
+    let self_address = signer.address();
     let signed_capability = grant.to_signed_capability().map_err(|e| {
         anyhow::anyhow!("capability token carries a malformed owner signature: {e}")
     })?;

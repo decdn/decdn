@@ -352,6 +352,42 @@ impl std::fmt::Display for FundingNeeded {
 
 impl std::error::Error for FundingNeeded {}
 
+/// What a run of several fetches still needs, shared by every fetch of the
+/// run, so a delegated credential's running-low signal prices the run as one:
+/// the content bytes the run still plans, and the highest quote any lane of
+/// the run got. Without it, each fetch prices only its own work at its own
+/// lanes' quotes, and the fetches of one run publish differing signals to
+/// the one slot.
+#[derive(Debug, Default)]
+#[doc(hidden)]
+pub struct RunDemand {
+    /// The content bytes the run still plans to fetch.
+    pub(crate) outstanding: AtomicU64,
+    /// The highest rate and voucher interval any lane of the run was quoted.
+    pub(crate) quotes: QuoteMax,
+}
+
+impl RunDemand {
+    /// Set the run's planned work to `bytes`.
+    pub fn plan(&self, bytes: u64) {
+        self.outstanding.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Take `bytes` that landed or that no fetch needs any more off the
+    /// run's planned work.
+    pub fn done(&self, bytes: u64) {
+        self.outstanding
+            .update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.saturating_sub(bytes)
+            });
+    }
+
+    /// The content bytes the run still plans to fetch.
+    pub fn outstanding(&self) -> u64 {
+        self.outstanding.load(Ordering::Relaxed)
+    }
+}
+
 /// The highest rate and voucher interval any lane of one fetch was quoted.
 #[derive(Debug, Default)]
 #[doc(hidden)]
