@@ -21,9 +21,9 @@ You run two services next to a `PaymentPool` you fund:
 ```text
  user's machine                        ──────────────────── your servers ─────────────────────        chain
 ┌─────────────────┐ GET /v1/capability ┌──────────────────┐ POST /v1/capabilities ┌──────────┐
-│ decdn-sponsored │ ─────────────────▶ │ sponsord-onramp  │ ────────────────────▶ │ sponsord │ ──▶ PaymentPool
+│ decdn.sh / .ps1 │ ─────────────────▶ │ sponsord-onramp  │ ────────────────────▶ │ sponsord │ ──▶ PaymentPool
 │ (throwaway key  │ ◀── installers ─── │ gate · hand-off  │    (bearer token)     │ signs,   │     (your pool)
-│  per download)  │                    │ /v1/profile      │                       │ tops up  │
+│  per download)  │                    │                  │                       │ tops up  │
 └────────┬────────┘                    └─────────▲────────┘                       └──────────┘
          │ decdn bundle pull                     │ POST /v1/fund (gate passed)
          ▼                                       │
@@ -35,11 +35,12 @@ You run two services next to a `PaymentPool` you fund:
   holding its bearer token, and keeps the pool topped up from that wallet. It
   has no opinion on who deserves one; that's the gate's job.
 - **`sponsord-onramp`** is the public part: the installers, the gate page,
-  and the API the CLI polls. Turnstile is the built-in gate; you can write
-  your own in Rust (see the [integrator guide](docs/integrator.md)).
-- **`decdn-sponsored`** is the end-user CLI. It gives each download a
-  throwaway key, gets a capability for it through the onramp, and hands the
-  pull to `decdn`, which verifies every byte against the content hash.
+  and the API the installers poll. Turnstile is the built-in gate; you can
+  write your own in Rust (see the [integrator guide](docs/integrator.md)).
+- **The installers** (`decdn.sh`, `decdn.ps1`), served by the onramp, are
+  all a user runs. They install `decdn`, give each download a throwaway key,
+  get a capability for it through the onramp, and hand the pull to `decdn`,
+  which verifies every byte against the content hash.
 
 A capability lets one key spend up to its cap against your pool until it
 expires. Issuing one costs zero transactions and locks no deposit per user.
@@ -74,7 +75,7 @@ default) and tops it up whenever it is below the low-water mark.
    ```
 
    ```powershell
-   irm https://downloads.example.org/decdn.ps1 | iex; decdn-sponsored pull b3:<hash> --namespace <id>
+   & ([scriptblock]::Create((irm https://downloads.example.org/decdn.ps1))) pull b3:<hash> --namespace <id>
    ```
 
    `--namespace` is optional. It takes the numeric deCDN namespace the bundle
@@ -93,7 +94,7 @@ default) and tops it up whenever it is below the low-water mark.
   [`docs/openapi/`](docs/openapi).
 - [Security model](docs/security.md): what each key can do, and what bounds
   a loss.
-- [The CLI](docs/cli.md): what `decdn-sponsored` does on a user's machine.
+- [The installer](docs/installer.md): what happens on a user's machine.
 
 ## Crates
 
@@ -104,10 +105,9 @@ Every crate shares one version and is released together, from a signed
 |---|---|---|---|
 | [`sponsord`](crates/sponsord) | The signing and top-up daemon | Linux (x86_64, aarch64) | `ghcr.io/decdn/sponsord` |
 | [`sponsord-onramp`](crates/sponsord-onramp) | The public onramp: gate, installers, hand-off | Linux (x86_64, aarch64) | `ghcr.io/decdn/sponsord-onramp` |
-| [`decdn-sponsored`](crates/decdn-sponsored) | The end-user CLI | Linux, macOS, Windows (x86_64, aarch64 each) | `ghcr.io/decdn/decdn-sponsored` |
 | [`sponsord-core`](crates/sponsord-core) | The daemon's logic as a library, to embed instead of running the daemon | — | — |
 | [`sponsord-api`](crates/sponsord-api) | Wire types, error codes and typed clients for both servers | — | — |
-| [`sponsord-e2e`](crates/e2e) | Tests that run all three together (not released) | — | — |
+| [`sponsord-e2e`](crates/e2e) | Tests that run the daemon, the onramp and an installer together (not released) | — | — |
 
 All but `sponsord-e2e` also go to crates.io. Images are mirrored to Docker
 Hub. Releases are signed by a maintainer: see [RELEASING.md](RELEASING.md),

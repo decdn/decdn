@@ -96,7 +96,7 @@ def test_the_real_workspace():
         assert errors == [], name
         needs[name] = {(n, o) for n, _, o in got}
     # The crates that link decdn need its release on crates.io first.
-    for name in ("sponsord-core", "sponsord", "decdn-sponsored"):
+    for name in ("sponsord-core", "sponsord"):
         assert any(o == "decdn" for _, o in needs[name]), name
     # The wire types and the onramp stay off decdn entirely.
     for name in ("sponsord-api", "sponsord-onramp"):

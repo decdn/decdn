@@ -1,7 +1,7 @@
 # Releasing sponsord
 
 The workspace is released as a whole: `sponsord-api`, `sponsord-core`,
-`sponsord`, `sponsord-onramp` and `decdn-sponsored` share one version
+`sponsord` and `sponsord-onramp` share one version
 (`[workspace.package]` in the root `Cargo.toml`) and are released together,
 from one `vX.Y.Z` tag, as decdn's crates are. A release with no change to a
 crate still carries it at the new version.
@@ -18,7 +18,6 @@ cargo release patch --execute                  # cut, sign and push the tag
 # ...wait for the tag-push run to finish...
 scripts/sign-release.sh v0.1.2                 # verify, sign, tag images, publish
 scripts/publish-crates.sh v0.1.2               # publish every crate to crates.io
-# then pin it in the onramp (ONRAMP_CLI_RELEASE / _SUMS_SHA256)
 ```
 
 ## What a release carries
@@ -27,18 +26,15 @@ scripts/publish-crates.sh v0.1.2               # publish every crate to crates.i
 table the workflow and both scripts read. Every `vX.Y.Z` release carries all
 of it:
 
-| Crate | Archives (one `SHA256SUMS` covers all 10) | Image | crates.io |
+| Crate | Archives (one `SHA256SUMS` covers all 4) | Image | crates.io |
 |---|---|---|---|
-| `decdn-sponsored` | Linux, macOS and Windows, x86_64 and aarch64 each (6) | `decdn-sponsored` | yes |
 | `sponsord` | Linux, x86_64 and aarch64 (2) | `sponsord` | yes |
 | `sponsord-onramp` | Linux, x86_64 and aarch64 (2) | `sponsord-onramp` | yes |
 | `sponsord-core` | — (library) | — | yes |
 | `sponsord-api` | — (library) | — | yes |
 
-**The archive names are a contract.** The installers the onramp serves fetch
-`<binary>-<version>-<target>.tar.gz` (`.zip` on Windows) from a release and
-look it up in its `SHA256SUMS`, with the binary at the archive root. Renaming
-either breaks every installer already served.
+The installers the onramp serves download nothing from these releases: they
+install `decdn` from decdn's own release (`ONRAMP_DECDN_RELEASE`).
 
 ## One-time setup
 
@@ -220,12 +216,12 @@ squash-merge subjects conventional; others are left out).
 - Entries group under **Changed (BREAKING)**, **Added**, **Changed**,
   **Fixed**, **Removed**, **Security**, each a bullet that opens with a bold
   one-line summary.
-- **Contract-breaking** changes are called out explicitly: the release archive
-  names, the `~/.decdn/sponsor.toml` schema, the CLI's `DECDN_SPONSOR_*`
-  variables, and both servers' HTTP APIs (`sponsord-api`) are read by
-  installers and clients already deployed.
-- **Config-breaking** changes name the `SPONSORD_*`, `ONRAMP_*` or
-  `DECDN_SPONSOR_*` variable (rename, new required variable, default shift).
+- **Contract-breaking** changes are called out explicitly: the installers'
+  arguments, their state layout under `~/.decdn/sponsored/`, and both
+  servers' HTTP APIs (`sponsord-api`) are read by commands already published,
+  downloads in progress and clients already deployed.
+- **Config-breaking** changes name the `SPONSORD_*` or `ONRAMP_*` variable
+  (rename, new required variable, default shift).
 - A move of the locked decdn names the new commit in every crate it reaches.
 - Security advisories cite the `RUSTSEC-YYYY-NNNN` id.
 
@@ -269,15 +265,12 @@ Then two jobs run side by side:
 
 Only once both pass:
 
-1. `upload-assets` attaches all 10 archives and one `SHA256SUMS` manifest,
-   asserting all of them are present, and appends the onramp pin values to
-   the notes;
+1. `upload-assets` attaches all 4 archives and one `SHA256SUMS` manifest,
+   asserting all of them are present;
 2. after it, for each image, `docker` assembles the multi-arch image from
    those archives — it does not compile from source, so the image's binary is
    byte-identical to the archived one — and pushes the manifest **untagged**,
-   attaching the SBOM and `<image>-image-digest.txt`. The `decdn-sponsored`
-   image also gets the `decdn` binary from decdn's release at the pinned tag,
-   checked against decdn's signed `SHA256SUMS` (`fetch-decdn.sh`).
+   attaching the SBOM and `<image>-image-digest.txt`.
 
 A release that fails verification therefore leaves no asset on the draft and
 pushes no image.
@@ -306,7 +299,7 @@ verifies the tag signature; then:
 
 - **archives:** downloads them, checks `SHA256SUMS` strictly against them,
   that every published archive appears in it, **and** that the release carries
-  exactly the 10 archives the plan lists, then signs `SHA256SUMS`;
+  exactly the 4 archives the plan lists, then signs `SHA256SUMS`;
 - **each image:** validates `<image>-image-digest.txt`, signs it and the SBOM,
   promotes `:<version>` and `:<major>.<minor>` from the signed digest on
   GHCR, and `:latest` too unless a higher release exists, then mirrors that
@@ -341,28 +334,14 @@ tag: moving `latest` to a candidate would hand it to every unpinned pull.
 Re-running is safe at any point before the release is published. Once it is
 out of draft the script refuses to run again.
 
-## Pinning a release in the onramp
+## Pinning decdn in the onramp
 
-Signing adds `SHA256SUMS.asc` beside `SHA256SUMS` and changes nothing else, so
-the values the workflow appended to the release notes stay valid. Set them on
-the onramp to make its installers serve the release:
-
-```bash
-ONRAMP_CLI_RELEASE=v0.1.2
-ONRAMP_CLI_SUMS_SHA256=<from the release notes>
-```
-
-The onramp refuses a pin that is not `vX.Y.Z`, and passes the installers the
-version alongside the tag, so they fetch `decdn-sponsored-0.1.2-<target>.*`.
-`decdn` releases are pinned the same way with decdn's own `vX.Y.Z` tags
-(`ONRAMP_DECDN_RELEASE`, and `ONRAMP_DECDN_SUMS_SHA256` = the SHA-256 of that
-release's `SHA256SUMS`). Both pins share the form, so check which repository's
-release notes each value came from.
-
-Users who already installed keep their CLI until they re-run the installer.
-When a release changes what the onramp and the CLI exchange, set
-`ONRAMP_MIN_CLI_VERSION` on the onramp once the new pin is live, so older CLIs
-tell their users to re-run it.
+The installers install `decdn` from the decdn release the onramp pins: its
+`vX.Y.Z` tag (`ONRAMP_DECDN_RELEASE`) and the SHA-256 of that release's
+`SHA256SUMS` (`ONRAMP_DECDN_SUMS_SHA256`). The onramp refuses a pin that is
+not `vX.Y.Z`, and passes the installers the version alongside the tag, so
+they fetch `decdn-<version>-<target>.*`. Every download runs the script the
+onramp serves at that moment, so a new pin reaches the next download.
 
 ## Publishing to crates.io
 

@@ -10,10 +10,6 @@ uploads. Keeping it in one place, rather than in a workflow matrix, a signing
 script and a publishing script separately, is what stops the three from
 disagreeing about a crate.
 
-The archive names (`<binary>-<version>-<target>.{tar.gz,zip}`, binary at the
-archive root) are a contract with every installer the onramp has served:
-`decdn.sh` / `decdn.ps1` fetch exactly that name for `decdn-sponsored`.
-
 Usage:
   release_plan.py <tag>              key=value lines for $GITHUB_OUTPUT
   release_plan.py <tag> --get KEY    one value (tag, version, archives, images,
@@ -43,13 +39,6 @@ LINUX = [
     ("x86_64-unknown-linux-gnu", "ubuntu-22.04"),
     ("aarch64-unknown-linux-gnu", "ubuntu-22.04-arm"),
 ]
-CLIENT = LINUX + [
-    ("x86_64-apple-darwin", "macos-latest"),
-    ("aarch64-apple-darwin", "macos-latest"),
-    ("x86_64-pc-windows-msvc", "windows-latest"),
-    # Cross-compiled on the x64 runner with the MSVC ARM64 toolchain.
-    ("aarch64-pc-windows-msvc", "windows-latest"),
-]
 
 # crate -> where it lives, the binary its archives carry (if any), the targets
 # they are built for, and the container image (if any). Every release carries
@@ -68,14 +57,6 @@ CRATES: dict[str, dict] = {
         "binary": "sponsord-onramp",
         "targets": LINUX,
         "image": "sponsord-onramp",
-    },
-    "decdn-sponsored": {
-        "dir": "crates/decdn-sponsored",
-        "binary": "decdn-sponsored",
-        "targets": CLIENT,
-        # Also carries decdn's `decdn`, which release.yml's docker job fetches
-        # from decdn's release (fetch-decdn.sh), not from this one's archives.
-        "image": "decdn-sponsored",
     },
 }
 

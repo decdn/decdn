@@ -1,6 +1,6 @@
 //! `GET /v1/capability?client=<0xSIGNER>`: return the `dcap1:` token issued
-//! to `client`, or `204` if none yet. The CLI polls this while the person
-//! passes the gate in the browser.
+//! to `client`, or `204` if none yet. The installer polls this while the
+//! person passes the gate in the browser.
 
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
@@ -27,12 +27,13 @@ pub async fn get(
     let Ok(Query(ClientQuery { client })) = query else {
         return ErrorCode::BadRequest.into_response();
     };
-    // An expired capability reads as absent, so the polling CLI sends the
+    // An expired capability reads as absent, so the polling installer sends the
     // person through the gate again instead of latching onto a token it can
     // never redeem.
     match state.grants.get(client, now) {
         Some(capability) => Json(CapabilityResponse {
             token: capability.token,
+            expiry: capability.expiry,
         })
         .into_response(),
         None => StatusCode::NO_CONTENT.into_response(),

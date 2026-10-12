@@ -74,7 +74,7 @@ def archives(p: dict[str, str]) -> list[tuple[str, str, str]]:
 def test_every_release_carries_every_archive_and_image():
     p = rp.plan("v0.1.0")
     built = archives(p)
-    assert p["archives"] == str(len(built)) == "10"
+    assert p["archives"] == str(len(built)) == "4"
     per_binary = {}
     for package, binary, target in built:
         per_binary.setdefault(binary, set()).add(target)
@@ -82,23 +82,9 @@ def test_every_release_carries_every_archive_and_image():
     assert {b: len(t) for b, t in per_binary.items()} == {
         "sponsord": 2,
         "sponsord-onramp": 2,
-        "decdn-sponsored": 6,
     }
-    assert p["images"] == "decdn-sponsored sponsord sponsord-onramp"
-    assert json.loads(p["images_json"]) == ["decdn-sponsored", "sponsord", "sponsord-onramp"]
-
-
-def test_installer_contract_targets_for_the_wrapper():
-    """decdn.sh / decdn.ps1 fetch these six; dropping one breaks an installer."""
-    built = archives(rp.plan("v0.1.0"))
-    assert {t for _, b, t in built if b == "decdn-sponsored"} == {
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-apple-darwin",
-        "aarch64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc",
-    }
+    assert p["images"] == "sponsord sponsord-onramp"
+    assert json.loads(p["images_json"]) == ["sponsord", "sponsord-onramp"]
 
 
 def test_archive_names_are_unique():
@@ -111,15 +97,9 @@ def test_one_build_job_per_target():
     """Each target compiles the shared dependency graph once, in one job."""
     legs = json.loads(rp.plan("v0.1.0")["matrix"])["include"]
     targets = [leg["target"] for leg in legs]
-    assert len(targets) == len(set(targets)) == 6
+    assert len(targets) == len(set(targets)) == 2
     for leg in legs:
-        if leg["target"].endswith("-linux-gnu"):
-            assert leg["builds"] == (
-                "sponsord:sponsord sponsord-onramp:sponsord-onramp "
-                "decdn-sponsored:decdn-sponsored"
-            )
-        else:
-            assert leg["builds"] == "decdn-sponsored:decdn-sponsored"
+        assert leg["builds"] == "sponsord:sponsord sponsord-onramp:sponsord-onramp"
 
 
 def test_a_target_with_two_runners_is_refused(monkeypatch):
@@ -221,8 +201,8 @@ def test_cli_output_and_errors():
     )
     ok = run("v1.0.0")
     assert ok.returncode == 0
-    assert "version=1.0.0\n" in ok.stdout and "archives=10\n" in ok.stdout
-    assert run("v1.0.0", "--get", "images").stdout == "decdn-sponsored sponsord sponsord-onramp\n"
+    assert "version=1.0.0\n" in ok.stdout and "archives=4\n" in ok.stdout
+    assert run("v1.0.0", "--get", "images").stdout == "sponsord sponsord-onramp\n"
     assert run("sponsord-v1.0.0").returncode == 1
     assert run("v1.0.0", "--get", "nope").returncode == 2
 

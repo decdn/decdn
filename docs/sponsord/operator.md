@@ -54,13 +54,11 @@ on another host needs it.
 | `ONRAMP_TURNSTILE_SECRET` / `_FILE` | required (Turnstile gate) | Cloudflare Turnstile secret |
 | `ONRAMP_TURNSTILE_SITEKEY` | required (Turnstile gate) | Cloudflare Turnstile sitekey |
 | `ONRAMP_DECDN_RELEASE`, `ONRAMP_DECDN_SUMS_SHA256` | required | `decdn` release the installers install, and the SHA-256 of its `SHA256SUMS` |
-| `ONRAMP_CLI_RELEASE`, `ONRAMP_CLI_SUMS_SHA256` | required | sponsord release (`vX.Y.Z`) the installers take `decdn-sponsored` from, likewise; both values are printed in its release notes |
 | `ONRAMP_BIND` | `127.0.0.1:8080` | Listen address |
 | `ONRAMP_DAEMON_URL` | `http://127.0.0.1:8090` | The daemon |
 | `ONRAMP_SPENDING_CAP_MICRO_USDC` | daemon maximum | Cap requested per capability |
 | `ONRAMP_TTL_SECS` | daemon maximum | TTL requested per capability |
 | `ONRAMP_SLASH_JUDGE_ADDR` | none | `SlashJudge` contract, handed to `decdn` |
-| `ONRAMP_MIN_CLI_VERSION` | none | Oldest `decdn-sponsored` accepted; older ones are told to re-run the installer |
 | `ONRAMP_GATE` | `turnstile` | The gate; `custom` only for programs that embed the onramp with their own (docs/integrator.md) |
 | `ONRAMP_BRAND_NAME` | `deCDN` | Name on the gate page |
 | `ONRAMP_GATE_TEMPLATE` | built-in | Your own gate page (below) |
@@ -74,7 +72,7 @@ requested cap or TTL is above the daemon's maximum. A change to the daemon's
 pool settings needs an onramp restart. Run it under a supervisor that
 restarts it on failure.
 
-It holds issued capabilities in memory for the browser-to-CLI hand-off (30
+It holds issued capabilities in memory for the browser-to-installer hand-off (30
 minutes at most). A restart loses only hand-offs in flight; those users pass
 the gate again.
 
@@ -164,7 +162,7 @@ pending somewhere the pool can be refilled twice.
 
 ## 6. Upgrades
 
-Point `ONRAMP_CLI_RELEASE`/`ONRAMP_CLI_SUMS_SHA256` (and the `decdn` pair) at
-a new release and restart the onramp: new installs get it. Users who
-already installed keep their CLI until they re-run the installer; set
-`ONRAMP_MIN_CLI_VERSION` to make them.
+Point `ONRAMP_DECDN_RELEASE`/`ONRAMP_DECDN_SUMS_SHA256` at a new `decdn`
+release and restart the onramp. Every download runs the script the onramp
+serves at that moment, so the next one installs the new `decdn`; the chain
+and contract settings reach it the same way.

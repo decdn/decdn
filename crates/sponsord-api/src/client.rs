@@ -8,7 +8,7 @@ use alloy_primitives::Address;
 
 use crate::daemon::{self, Info, IssueRequest, IssueResponse};
 use crate::error::{ErrorBody, ErrorCode};
-use crate::onramp::{self, CapabilityResponse, Profile};
+use crate::onramp::{self, CapabilityResponse};
 use crate::secret::Secret;
 
 /// Why a daemon call failed.
@@ -142,7 +142,7 @@ pub enum OnrampError {
     /// The onramp answered with an unexpected status.
     #[error("{route} failed: {status} {code}")]
     Status {
-        /// The route path called, e.g. `/v1/profile`.
+        /// The route path called, e.g. `/v1/capability`.
         route: &'static str,
         /// The HTTP status the onramp answered with.
         status: u16,
@@ -169,23 +169,6 @@ impl OnrampClient {
             base: base.trim_end_matches('/').to_owned(),
             http,
         }
-    }
-
-    /// `GET /v1/profile`.
-    ///
-    /// # Errors
-    ///
-    /// The request fails, or the onramp answers other than `200`.
-    pub async fn profile(&self) -> Result<Profile, OnrampError> {
-        let resp = self
-            .http
-            .get(format!("{}{}", self.base, onramp::routes::PROFILE))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            return Err(status_error(onramp::routes::PROFILE, resp).await);
-        }
-        Ok(resp.json().await?)
     }
 
     /// `GET /v1/capability?client=..`: the token issued to `client`, or

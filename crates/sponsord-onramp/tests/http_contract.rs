@@ -16,7 +16,6 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use sponsord_api::onramp::Profile;
 use sponsord_api::time::{Clock, FixedClock, SystemClock};
 use sponsord_api::{ErrorBody, ErrorCode, IssuedCapability, MicroUsdc};
 use sponsord_onramp::net::ClientIpSource;
@@ -95,10 +94,13 @@ async fn fund_issues_a_token_the_poll_then_returns() {
     assert_eq!(s, StatusCode::OK);
     let token = v["token"].as_str().unwrap().to_owned();
     assert!(token.starts_with("dcap1:"));
+    let expiry = v["expiry"].as_u64().unwrap();
+    assert!(expiry > 0);
 
     let (s, v) = send_json(&app, poll()).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["token"].as_str(), Some(token.as_str()));
+    assert_eq!(v["expiry"].as_u64(), Some(expiry));
 
     // A second fund is idempotent: the same token, no second daemon call.
     let (s, v) = send_json(&app, fund()).await;
@@ -230,103 +232,90 @@ async fn fund_asks_the_daemon_for_the_configured_terms() {
 }
 
 #[tokio::test]
-async fn profile_carries_the_daemon_chain_and_the_configured_contracts() {
-    let mut config = test_config();
-    config.slash_judge = Some(Address::repeat_byte(0x44));
-    config.min_cli_version = Some(semver::Version::new(0, 2, 0));
+async fn the_profile_is_not_served_separately() {
+    let app = sponsord_onramp::http::router(app_state_with_fakes().await);
+    let (s, _) = send(&app, get("/v1/profile")).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+async fn installer(path: &str, config: sponsord_onramp::config::OnrampConfig) -> String {
     let (state, _) = app_state_with_options(FakeOptions {
         config,
         ..FakeOptions::default()
     })
     .await;
     let app = sponsord_onramp::http::router(state);
-    let (s, v) = send_json(&app, get("/v1/profile")).await;
-    assert_eq!(s, StatusCode::OK);
-    let profile: Profile = serde_json::from_value(v).unwrap();
-    assert_eq!(
-        profile,
-        Profile {
-            chain_id: 421_614,
-            rpc_url: "https://rpc.example".into(),
-            payment_pool: Address::repeat_byte(0x22),
-            capacity_bond: Address::repeat_byte(0x33),
-            slash_judge: Some(Address::repeat_byte(0x44)),
-            min_cli_version: Some(semver::Version::new(0, 2, 0)),
-        }
-    );
-}
-
-async fn installer(path: &str) -> String {
-    let app = sponsord_onramp::http::router(app_state_with_fakes().await);
     let (s, body) = send(&app, get(path)).await;
     assert_eq!(s, StatusCode::OK);
-    String::from_utf8(body).unwrap()
+    let body = String::from_utf8(body).unwrap();
+    assert!(!body.contains("{{"), "no placeholder should remain");
+    body
 }
 
-/// Both installers name this onramp, download from the pinned GitHub
-/// Releases (`test_config`: decdn `v0.1.0`, sponsord `v0.2.0`) by tag
-/// and SHA256SUMS digest, name the archives by the version the onramp parsed
-/// out of each tag, and write only the onramp URL and `decdn` path.
-fn assert_installer(body: &str) {
-    let quoted = |s: &str| body.contains(&format!("'{s}'")) || body.contains(&format!("\"{s}\""));
-    assert!(!body.contains("{{"), "no placeholder should remain");
-    assert!(body.contains("https://up.example.org"));
-    assert!(body.contains("https://github.com/decdn"));
-    assert!(quoted("v0.1.0"), "decdn release tag");
-    assert!(quoted("0.1.0"), "decdn version");
-    assert!(quoted("v0.2.0"), "decdn-sponsored release tag");
-    assert!(quoted("0.2.0"), "decdn-sponsored version");
-    assert!(body.contains(&"ab".repeat(32)), "decdn SHA256SUMS digest");
-    assert!(
-        body.contains(&"cd".repeat(32)),
-        "sponsord SHA256SUMS digest"
-    );
-    assert!(body.contains("onramp_url = "));
-    assert!(body.contains("decdn_bin = "));
-    assert!(
-        !body.contains("payment_pool"),
-        "chain values come from /v1/profile"
-    );
+/// The values each installer carries (`test_config` and `test_info`): this
+/// onramp, the pinned decdn release, and the download profile.
+fn expected(slash_judge: &str) -> [(&'static str, String); 10] {
+    let pool = Address::repeat_byte(0x22).to_string();
+    let bond = Address::repeat_byte(0x33).to_string();
+    [
+        ("ONRAMP_URL", "https://up.example.org".into()),
+        ("RELEASES", "https://github.com/decdn".into()),
+        ("DECDN_RELEASE", "v0.1.0".into()),
+        ("DECDN_VERSION", "0.1.0".into()),
+        ("DECDN_SUMS_SHA256", "ab".repeat(32)),
+        ("CHAIN_ID", "421614".into()),
+        ("RPC_URL", "https://rpc.example".into()),
+        ("PAYMENT_POOL", pool),
+        ("CAPACITY_BOND", bond),
+        ("SLASH_JUDGE", slash_judge.into()),
+    ]
+}
+
+/// `SCREAMING_SNAKE` to the PowerShell installer's `PascalCase`.
+fn ps1_name(sh: &str) -> String {
+    sh.split('_')
+        .map(|w| {
+            let w = w.to_ascii_lowercase();
+            w[..1].to_ascii_uppercase() + &w[1..]
+        })
+        .collect()
 }
 
 #[tokio::test]
 async fn decdn_sh_is_rendered() {
-    let body = installer("/decdn.sh").await;
-    assert_installer(&body);
+    let body = installer("/decdn.sh", test_config()).await;
     assert!(body.starts_with("#!/bin/sh"));
-    // Both pins are `v` tags now, so only the slot tells them apart.
-    let ab = "ab".repeat(32);
-    let cd = "cd".repeat(32);
-    for line in [
-        "DECDN_RELEASE=\"v0.1.0\"",
-        "DECDN_VERSION=\"0.1.0\"",
-        &format!("DECDN_SUMS_SHA256=\"{ab}\""),
-        "CLI_RELEASE=\"v0.2.0\"",
-        "CLI_VERSION=\"0.2.0\"",
-        &format!("CLI_SUMS_SHA256=\"{cd}\""),
-    ] {
+    for (name, value) in expected("") {
+        let line = format!("{name}=\"{value}\"");
         assert!(body.lines().any(|l| l == line), "{line}");
     }
 }
 
 #[tokio::test]
 async fn decdn_ps1_is_rendered() {
-    let body = installer("/decdn.ps1").await;
-    assert_installer(&body);
+    let body = installer("/decdn.ps1", test_config()).await;
     assert!(body.contains("-pc-windows-msvc"));
-    // Both pins are `v` tags now, so only the slot tells them apart.
-    let ab = "ab".repeat(32);
-    let cd = "cd".repeat(32);
-    for line in [
-        "$DecdnRelease = 'v0.1.0'",
-        "$DecdnVersion = '0.1.0'",
-        &format!("$DecdnSumsSha256 = '{ab}'"),
-        "$CliRelease = 'v0.2.0'",
-        "$CliVersion = '0.2.0'",
-        &format!("$CliSumsSha256 = '{cd}'"),
-    ] {
+    for (name, value) in expected("") {
+        let line = format!("${} = '{value}'", ps1_name(name));
         assert!(body.lines().any(|l| l.trim() == line), "{line}");
     }
+}
+
+#[tokio::test]
+async fn installers_carry_the_slash_judge_when_set() {
+    let judge = Address::repeat_byte(0x44);
+    let mut config = test_config();
+    config.slash_judge = Some(judge);
+    let sh = installer("/decdn.sh", config).await;
+    assert!(sh.lines().any(|l| l == format!("SLASH_JUDGE=\"{judge}\"")));
+
+    let mut config = test_config();
+    config.slash_judge = Some(judge);
+    let ps1 = installer("/decdn.ps1", config).await;
+    assert!(
+        ps1.lines()
+            .any(|l| l.trim() == format!("$SlashJudge = '{judge}'"))
+    );
 }
 
 fn from_peer(mut req: Request<Body>, ip: &str) -> Request<Body> {

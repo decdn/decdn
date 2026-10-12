@@ -1,7 +1,7 @@
-//! The hand-off from the browser to the CLI: `POST /v1/fund` stores the
-//! capability it got for a client, and `GET /v1/capability` hands it to the
-//! polling CLI. In memory: a restart loses only hand-offs in flight, and the
-//! user passes the gate again.
+//! The hand-off from the browser to the installer: `POST /v1/fund` stores
+//! the capability it got for a client, and `GET /v1/capability` hands it to
+//! the polling installer. In memory: a restart loses only hand-offs in
+//! flight, and the user passes the gate again.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use alloy_primitives::Address;
 use sponsord_api::IssuedCapability;
 
-/// How long a capability stays here after it is issued. The CLI polls for
-/// at most 10 minutes; past this, `POST /v1/fund` asks the daemon again,
+/// How long a capability stays here after it is issued. The installer polls
+/// for at most 10 minutes; past this, `POST /v1/fund` asks the daemon again,
 /// which hands a registered signer its same capability back.
 pub const HANDOFF_SECS: u64 = 30 * 60;
 
@@ -25,7 +25,7 @@ struct Entry {
 }
 
 /// Capabilities issued by `POST /v1/fund`, keyed by client signer, until
-/// the CLI polls them or they expire.
+/// the installer polls them or they expire.
 pub struct GrantCache {
     entries: Mutex<HashMap<Address, Entry>>,
     handoff_secs: u64,

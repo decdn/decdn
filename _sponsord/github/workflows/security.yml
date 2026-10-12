@@ -68,7 +68,7 @@ jobs:
       matrix:
         # The images release_plan.py lists; check-image-name.sh holds them in
         # step.
-        image: [decdn-sponsored, sponsord, sponsord-onramp]
+        image: [sponsord, sponsord-onramp]
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
     steps:

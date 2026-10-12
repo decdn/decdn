@@ -2,9 +2,9 @@
 # Signs and publishes a release draft staged by .github/workflows/release.yml.
 #
 # The workspace is released as a whole, from a `v<version>` tag, and
-# release_plan.py says what every release carries: the archives of sponsord,
-# sponsord-onramp and decdn-sponsored under one SHA256SUMS, and a container
-# image per binary with its SBOM and digest file.
+# release_plan.py says what every release carries: the archives of sponsord
+# and sponsord-onramp under one SHA256SUMS, and a container image per binary
+# with its SBOM and digest file.
 #
 # The workflow builds all of that but signs nothing and publishes nothing — the
 # GitHub Release is left as a draft and the image manifest is pushed untagged.
@@ -369,7 +369,7 @@ Delete the draft and the tag and cut the release again (RELEASING.md § Recovery
 
 # `sha256sum --check` only answers "does every file the manifest names hash
 # correctly?" — never "does the manifest name every file being published?".
-# Without this, a manifest covering 8 of 10 archives verifies clean and gets
+# Without this, a manifest covering 3 of 4 archives verifies clean and gets
 # signed as if it were complete.
 echo "==> Checking every published archive is covered by the manifest"
 uncovered=()
@@ -383,7 +383,7 @@ Signing would vouch for a release whose manifest is incomplete.
 Re-run the upload-assets job, then retry."
 
 # Neither check above notices a release that is merely SHORT: a manifest
-# naming 9 of 10 archives, with only those attached, verifies clean. The
+# naming 3 of 4 archives, with only those attached, verifies clean. The
 # plan says how many a release carries; hold both to it.
 echo "==> Checking the release carries all $ARCHIVES archives"
 shopt -s nullglob

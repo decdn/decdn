@@ -14,9 +14,9 @@ use crate::net::ClientIpSource;
 use sponsord_api::MicroUsdc;
 use sponsord_api::daemon::Info;
 
-/// Tag prefix of a release of either repository the installers download
-/// from: `decdn/decdn` and `decdn/sponsord` each release their whole
-/// workspace under one version, so both tag `vMAJOR.MINOR.PATCH`.
+/// Tag prefix of the `decdn/decdn` release the installers download from:
+/// it releases its whole workspace under one version, tagged
+/// `vMAJOR.MINOR.PATCH`.
 pub const RELEASE_TAG_PREFIX: &str = "v";
 
 /// A GitHub Release the installers download binaries from, pinned by its tag
@@ -86,7 +86,7 @@ fn is_semver(version: &str) -> bool {
 }
 
 /// sponsord-onramp: the public onramp in front of a sponsord daemon. Serves
-/// the installers, the gate page, and the API decdn-sponsored polls.
+/// the installers, the gate page, and the API the installers poll.
 #[derive(Debug, Parser)]
 #[command(name = "sponsord-onramp", version)]
 #[command(group(ArgGroup::new("daemon_token_src").required(true).args(["daemon_token", "daemon_token_file"])))]
@@ -123,10 +123,6 @@ pub struct Args {
     /// `SlashJudge` contract address, handed to `decdn` when set.
     #[arg(long, env = "ONRAMP_SLASH_JUDGE_ADDR")]
     pub slash_judge: Option<Address>,
-    /// Oldest `decdn-sponsored` this onramp works with; older CLIs are told
-    /// to re-run the installer.
-    #[arg(long, env = "ONRAMP_MIN_CLI_VERSION")]
-    pub min_cli_version: Option<semver::Version>,
 
     /// Cap requested for each capability, in micro-USDC; unset takes the
     /// daemon's maximum.
@@ -171,7 +167,7 @@ pub struct Args {
     #[arg(long, env = "ONRAMP_FUND_RATE_PER_MIN", default_value_t = 10)]
     pub fund_rate_per_min: u32,
     /// `GET /v1/capability` polls allowed per client address per minute (the
-    /// CLI polls every 2 s); 0 disables the limit.
+    /// installer polls every 2 s); 0 disables the limit.
     #[arg(long, env = "ONRAMP_POLL_RATE_PER_MIN", default_value_t = 120)]
     pub poll_rate_per_min: u32,
 
@@ -190,14 +186,6 @@ pub struct Args {
     /// SHA-256 of that release's `SHA256SUMS` file.
     #[arg(long, env = "ONRAMP_DECDN_SUMS_SHA256")]
     pub decdn_sums_sha256: String,
-    /// `decdn/sponsord` release tag the installers install `decdn-sponsored`
-    /// from (`vMAJOR.MINOR.PATCH[-pre]`).
-    #[arg(long, env = "ONRAMP_CLI_RELEASE")]
-    pub cli_release: String,
-    /// SHA-256 of that release's `SHA256SUMS` file (printed in its release
-    /// notes).
-    #[arg(long, env = "ONRAMP_CLI_SUMS_SHA256")]
-    pub cli_sums_sha256: String,
 }
 
 /// The gates built in. More can be added by implementing `gate::Gate`.
@@ -241,9 +229,6 @@ pub struct OnrampConfig {
     /// `SlashJudge` contract address handed to `decdn`; `None` leaves it out
     /// of the profile (`ONRAMP_SLASH_JUDGE_ADDR`).
     pub slash_judge: Option<Address>,
-    /// Oldest `decdn-sponsored` this onramp works with; older CLIs are told
-    /// to re-run the installer. `None` accepts any (`ONRAMP_MIN_CLI_VERSION`).
-    pub min_cli_version: Option<semver::Version>,
     /// Cap requested for each capability; `None` takes the daemon maximum.
     pub spending_cap: Option<MicroUsdc>,
     /// TTL requested for each capability; `None` takes the daemon maximum.
@@ -269,9 +254,6 @@ pub struct OnrampConfig {
     pub releases_base: String,
     /// The `decdn/decdn` release the installers install `decdn` from.
     pub decdn_release: ReleasePin,
-    /// The `decdn/sponsord` release the installers install `decdn-sponsored`
-    /// from.
-    pub cli_release: ReleasePin,
 }
 
 impl OnrampConfig {
@@ -332,7 +314,6 @@ impl OnrampConfig {
             rpc_url: script_safe_url("ONRAMP_RPC_URL", &args.rpc_url)?,
             capacity_bond: args.capacity_bond,
             slash_judge: args.slash_judge,
-            min_cli_version: args.min_cli_version,
             spending_cap: args.spending_cap,
             ttl_secs: args.ttl_secs,
             turnstile,
@@ -355,8 +336,6 @@ impl OnrampConfig {
             decdn_release: ReleasePin::new(&args.decdn_release, &args.decdn_sums_sha256).map_err(
                 |e| anyhow::anyhow!("ONRAMP_DECDN_RELEASE/ONRAMP_DECDN_SUMS_SHA256: {e}"),
             )?,
-            cli_release: ReleasePin::new(&args.cli_release, &args.cli_sums_sha256)
-                .map_err(|e| anyhow::anyhow!("ONRAMP_CLI_RELEASE/ONRAMP_CLI_SUMS_SHA256: {e}"))?,
         })
     }
 

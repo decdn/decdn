@@ -4,8 +4,8 @@
 //!
 //! - [`daemon`]: the daemon's bearer-token API. A gate of your own calls
 //!   `POST /v1/capabilities` once its check passes ([`client::DaemonClient`]).
-//! - [`onramp`]: the onramp's public JSON API, which `decdn-sponsored` calls
-//!   ([`client::OnrampClient`]).
+//! - [`onramp`]: the onramp's public JSON API, which the installer scripts
+//!   call ([`client::OnrampClient`]).
 //! - [`error`]: the `{"error": "<code>"}` body both servers answer with.
 //!
 //! The `openapi` feature adds the `OpenAPI` documents (`openapi::daemon()`,

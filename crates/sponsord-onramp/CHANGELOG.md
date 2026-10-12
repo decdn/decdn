@@ -15,6 +15,35 @@ release.
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **The installers download through the onramp themselves; there is no
+  `decdn-sponsored` CLI.** `decdn.sh pull <hash> [-o <dir>] [--namespace <id>]`
+  (and `decdn.ps1` the same) installs only `decdn`, makes the download's
+  throwaway key with `decdn key-gen`, gets its capability through the gate,
+  and runs `decdn bundle pull --capability <token>`. The state under
+  `~/.decdn/sponsored/downloads/<hash>/` gains an `expiry` file; a download
+  interrupted under the CLI starts again with a new key. Contract-breaking:
+  the installers no longer write `~/.decdn/sponsor.toml`, and on Windows the
+  one-line form is
+  `& ([scriptblock]::Create((irm <onramp>/decdn.ps1))) pull b3:<hash>`.
+  Commands of the form `curl … | sh -s -- pull b3:<hash>` keep working.
+- **The download profile is baked into the installers, and
+  `GET /v1/profile` is removed.** The chain id, RPC URL, `PaymentPool`,
+  `CapacityBond` and `SlashJudge` are rendered into the scripts at startup,
+  beside the onramp URL and the `decdn` pin. `decdn-sponsored` binaries
+  already installed read `/v1/profile` on every run, so they stop working
+  against this onramp; re-running the installer command replaces them.
+- **`ONRAMP_CLI_RELEASE`, `ONRAMP_CLI_SUMS_SHA256` and
+  `ONRAMP_MIN_CLI_VERSION` are removed.** The onramp ignores them; delete
+  them from your configuration.
+
+### Added
+
+- **`GET /v1/capability` and `POST /v1/fund` return the capability's
+  `expiry`** beside its `token`, so the installer can replace a capability
+  near expiry without decoding it.
+
 ### Changed
 
 - **The installers skip binaries already installed from the pinned

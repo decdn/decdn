@@ -4,7 +4,6 @@
 # toolchain instead of silently pulling one that raised its MSRV past it.
 resolver = "3"
 members = [
-    "crates/decdn-sponsored",
     "crates/e2e",
     "crates/sponsord",
     "crates/sponsord-api",
@@ -62,8 +61,7 @@ cast_sign_loss = "deny"
 cast_precision_loss = "deny"
 
 # No stray output or scaffolding. The print lints keep stdio out of the
-# libraries and the servers; the decdn-sponsored CLI is a terminal UI and
-# allows both at its crate roots.
+# libraries and the servers.
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
@@ -90,7 +88,6 @@ missing_panics_doc = "allow"
 # manifest has no path to follow, so cargo rejects a path dependency without
 # one. Locally the `path` wins. It equals the workspace version above;
 # `cargo release` rewrites it (`dependent-version = "upgrade"`).
-decdn-sponsored = { path = "crates/decdn-sponsored", version = "0.0.2" }
 sponsord = { path = "crates/sponsord", version = "0.0.2" }
 sponsord-api = { path = "crates/sponsord-api", version = "0.0.2" }
 sponsord-core = { path = "crates/sponsord-core", version = "0.0.2" }

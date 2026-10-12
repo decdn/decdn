@@ -47,7 +47,6 @@ pub fn test_config() -> OnrampConfig {
         rpc_url: "https://rpc.example".into(),
         capacity_bond: Address::repeat_byte(0x33),
         slash_judge: None,
-        min_cli_version: None,
         spending_cap: None,
         ttl_secs: None,
         gate: GateKind::Turnstile,
@@ -65,11 +64,6 @@ pub fn test_config() -> OnrampConfig {
             tag: "v0.1.0".into(),
             version: "0.1.0".into(),
             sums_sha256: "ab".repeat(32),
-        },
-        cli_release: ReleasePin {
-            tag: "v0.2.0".into(),
-            version: "0.2.0".into(),
-            sums_sha256: "cd".repeat(32),
         },
     }
 }
@@ -236,4 +230,91 @@ pub async fn app_state_with_options(opts: FakeOptions) -> (AppState, Fakes) {
 /// An [`AppState`] over the default [`FakeOptions`].
 pub async fn app_state_with_fakes() -> AppState {
     app_state_with_options(FakeOptions::default()).await.0
+}
+
+/// A stub `decdn` for running the installers, configured by environment
+/// variables. `key-gen --output-dir <dir> ...` writes `<dir>/keystore.json`
+/// and prints a fresh address (`0x00..01`, then `0x00..02`, counted in
+/// `$STUB_DIR/keys`). Anything else appends its arguments as one line to
+/// `$STUB_DIR/calls` and exits with `$STUB_EXIT` (default 0).
+#[cfg(unix)]
+pub const STUB_DECDN: &str = r#"#!/bin/sh
+case "$1" in
+  key-gen)
+    n=$(($(cat "$STUB_DIR/keys" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$STUB_DIR/keys"
+    echo '{}' >"$3/keystore.json"
+    echo "node id: stub"
+    printf 'eth address: 0x%040x\n' "$n"
+    ;;
+  *)
+    echo "$@" >>"$STUB_DIR/calls"
+    exit "${STUB_EXIT:-0}"
+    ;;
+esac
+"#;
+
+/// Every target `decdn.sh` can pick, so a published release serves any host.
+#[cfg(unix)]
+const SH_TARGETS: [&str; 4] = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+];
+
+/// The SHA-256 of `path` as lowercase hex, from `sha256sum` or `shasum`.
+#[cfg(unix)]
+pub fn sha256_file(path: &std::path::Path) -> String {
+    use std::process::Command;
+    let run = |cmd: &str, args: &[&str]| Command::new(cmd).args(args).arg(path).output().ok();
+    let out = run("sha256sum", &[])
+        .filter(|o| o.status.success())
+        .or_else(|| run("shasum", &["-a", "256"]))
+        .expect("sha256sum or shasum");
+    String::from_utf8(out.stdout).unwrap()[..64].to_owned()
+}
+
+/// Publish `<root>/<repo>/releases/download/<tag>/` the way a GitHub Release
+/// lays it out for `decdn.sh`: one `<bin>-<version>-<target>.tar.gz` per
+/// target holding `bin` with `contents`, and a `SHA256SUMS`. Returns the
+/// `SHA256SUMS` digest to pin.
+#[cfg(unix)]
+pub fn publish_release(
+    root: &std::path::Path,
+    repo: &str,
+    bin: &str,
+    tag: &str,
+    version: &str,
+    contents: &str,
+) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let dir = root.join(repo).join("releases/download").join(tag);
+    let stage = root.join(format!("stage-{bin}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&stage).unwrap();
+    let stub = stage.join(bin);
+    std::fs::write(&stub, contents).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut sums = String::new();
+    for target in SH_TARGETS {
+        let archive = format!("{bin}-{version}-{target}.tar.gz");
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(dir.join(&archive))
+            .arg("-C")
+            .arg(&stage)
+            .arg(bin)
+            .status()
+            .unwrap();
+        assert!(status.success(), "tar {archive}");
+        writeln!(sums, "{}  {archive}", sha256_file(&dir.join(&archive))).unwrap();
+    }
+    let sums_path = dir.join("SHA256SUMS");
+    std::fs::write(&sums_path, sums).unwrap();
+    sha256_file(&sums_path)
 }

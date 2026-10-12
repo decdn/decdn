@@ -17,7 +17,7 @@ use crate::IssuedCapability;
 use crate::daemon::{Health, Info, IssueRequest, IssueResponse};
 use crate::error::{ErrorBody, ErrorCode};
 use crate::money::MicroUsdc;
-use crate::onramp::{CapabilityResponse, ClientQuery, FundRequest, Profile};
+use crate::onramp::{CapabilityResponse, ClientQuery, FundRequest};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -41,22 +41,13 @@ struct DaemonDoc;
     info(
         title = "sponsord-onramp",
         description = "The sponsord onramp: a gate in front of the daemon, the installers, and \
-                       the API decdn-sponsored polls.",
+                       the API the installers poll.",
         license(name = "MIT OR Apache-2.0"),
     ),
-    paths(
-        fund_page,
-        fund,
-        capability,
-        profile,
-        install_sh,
-        install_ps1,
-        onramp_healthz
-    ),
+    paths(fund_page, fund, capability, install_sh, install_ps1, onramp_healthz),
     components(schemas(
         FundRequest,
         CapabilityResponse,
-        Profile,
         Health,
         ErrorBody,
         ErrorCode,
@@ -178,10 +169,6 @@ fn fund() {}
     ),
 )]
 fn capability() {}
-
-/// What `decdn-sponsored` needs to run `decdn` against this onramp's pool.
-#[utoipa::path(get, path = "/v1/profile", responses((status = 200, description = "The download profile", body = Profile)))]
-fn profile() {}
 
 /// The macOS/Linux installer: `curl -fsSL <onramp>/decdn.sh | sh`.
 #[utoipa::path(

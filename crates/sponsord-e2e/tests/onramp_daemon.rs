@@ -142,14 +142,21 @@ async fn expired_registration_is_409_through_the_stack() {
 }
 
 #[tokio::test]
-async fn profile_carries_the_daemon_chain_values() {
+async fn the_installers_carry_the_daemon_chain_values() {
     let (app, _) = stack().await;
-    let (s, v) = send(
-        &app,
-        Request::get("/v1/profile").body(Body::empty()).unwrap(),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["payment_pool"], json!(TEST_PAYMENT_POOL));
-    assert_eq!(v["chain_id"], TEST_CHAIN_ID);
+    let resp = app
+        .oneshot(Request::get("/decdn.sh").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let script = String::from_utf8(bytes.to_vec()).unwrap();
+    for line in [
+        format!("CHAIN_ID=\"{TEST_CHAIN_ID}\""),
+        format!("PAYMENT_POOL=\"{TEST_PAYMENT_POOL}\""),
+    ] {
+        assert!(script.lines().any(|l| l == line), "{line}");
+    }
 }

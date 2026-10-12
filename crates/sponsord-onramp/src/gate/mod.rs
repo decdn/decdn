@@ -1,5 +1,5 @@
 //! The gate: what a person must pass before the onramp asks the daemon for
-//! a capability. A gate renders the page the CLI sends them to and checks
+//! a capability. A gate renders the page the installer sends them to and checks
 //! the proof that page posts back to `POST /v1/fund`.
 //!
 //! [`TurnstileGate`] (a Cloudflare Turnstile captcha) is the one built in.

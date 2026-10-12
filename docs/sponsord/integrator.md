@@ -73,7 +73,8 @@ match daemon.issue(&req).await {
 The signer is the user's download key. With your own gate you also decide
 how the token reaches the user's `decdn`: write it to a file and run
 `decdn bundle pull --capability-file <file> --keystore <their key> ...`, or
-keep using `decdn-sponsored` by putting it behind an onramp (option 2).
+keep using the onramp's installers by putting your gate in the onramp
+(option 2).
 
 ## 2. A gate for the onramp
 
@@ -82,7 +83,7 @@ The onramp's gate is the `sponsord_onramp::gate::Gate` trait:
 ```rust
 #[async_trait]
 pub trait Gate: Send + Sync {
-    /// The HTML page the CLI sends the person to, for download key `client`.
+    /// The HTML page the installer sends the person to, for download key `client`.
     /// Once its check passes it must POST {"client", "proof"} to /v1/fund.
     fn page(&self, client: Address) -> String;
 
@@ -96,7 +97,7 @@ Build the onramp around yours the way its `main.rs` does: load an
 `OnrampConfig` with `ONRAMP_GATE=custom` (which drops the Turnstile settings
 from what is required), build `state::build(&cfg, daemon, Arc::new(YourGate))`,
 and serve `http::router(state)`. The stock `sponsord-onramp` binary refuses
-`custom`, since it has no gate of yours to run. Everything else (installers, `/v1/profile`, the
+`custom`, since it has no gate of yours to run. Everything else (installers, the
 hand-off, rate limits) stays as it is. `TurnstileGate`
 (`crates/sponsord-onramp/src/gate/turnstile.rs`) is a complete example.
 
@@ -105,7 +106,7 @@ Webhook ([#22](https://github.com/decdn/sponsord/issues/22)), signed-JWT
 ([#24](https://github.com/decdn/sponsord/issues/24)) gates are planned as
 built-ins.
 
-The onramp's own API (what the CLI and the gate page call) is in
+The onramp's own API (what the installers and the gate page call) is in
 [`docs/openapi/sponsord-onramp.json`](openapi/sponsord-onramp.json).
 
 ## 3. Embed `sponsord-core`

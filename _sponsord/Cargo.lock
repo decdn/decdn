@@ -2966,27 +2966,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "decdn-sponsored"
-version = "0.0.2"
-dependencies = [
- "alloy",
- "anyhow",
- "clap",
- "decdn-incentive",
- "getrandom 0.4.3",
- "hex",
- "reqwest",
- "semver 1.0.28",
- "serde",
- "serde_json",
- "sponsord-api",
- "tempfile",
- "tokio",
- "toml",
- "wiremock",
-]
-
-[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7037,10 +7016,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-dependencies = [
- "serde",
- "serde_core",
-]
 
 [[package]]
 name = "semver-parser"
@@ -7490,7 +7465,6 @@ dependencies = [
  "anyhow",
  "axum",
  "reqwest",
- "semver 1.0.28",
  "serde",
  "serde_json",
  "sponsord-api",
@@ -7527,7 +7501,6 @@ dependencies = [
  "alloy",
  "axum",
  "decdn-incentive",
- "decdn-sponsored",
  "globset",
  "reqwest",
  "serde_json",
@@ -7552,7 +7525,6 @@ dependencies = [
  "axum",
  "clap",
  "reqwest",
- "semver 1.0.28",
  "serde",
  "serde_json",
  "sponsord-api",

@@ -204,6 +204,6 @@ def test_repository_currently_passes():
 def test_workspace_members_are_discovered_from_the_manifest():
     members = cpe.workspace_members(REPO_ROOT)
     names = {m.name for m in members}
-    assert {"sponsord-core", "sponsord", "sponsord-onramp", "decdn-sponsored"} <= names
+    assert {"sponsord-core", "sponsord", "sponsord-onramp"} <= names
     for m in members:
         assert (m / "Cargo.toml").is_file()

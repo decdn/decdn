@@ -7,7 +7,6 @@ const UNSET: &str = "<unset>";
 /// replacing, adding to or ([`UNSET`]) removing them.
 fn args(overrides: &[&str]) -> Result<Args, clap::Error> {
     let ab = "ab".repeat(32);
-    let cd = "cd".repeat(32);
     let mut flags: Vec<(&str, &str)> = vec![
         ("--public-url", "https://up.example.org/"),
         ("--daemon-token", "tok"),
@@ -20,8 +19,6 @@ fn args(overrides: &[&str]) -> Result<Args, clap::Error> {
         ("--turnstile-sitekey", "0x4AAA-key_1"),
         ("--decdn-release", "v0.1.0"),
         ("--decdn-sums-sha256", &ab),
-        ("--cli-release", "v0.2.0-rc.1"),
-        ("--cli-sums-sha256", &cd),
     ];
     for pair in overrides.chunks(2) {
         let (flag, value) = (pair[0], pair[1]);
@@ -45,8 +42,6 @@ fn reads_required_and_defaults() {
     assert_eq!(cfg.ttl_secs, None);
     assert_eq!(cfg.decdn_release.tag, "v0.1.0");
     assert_eq!(cfg.decdn_release.version, "0.1.0");
-    assert_eq!(cfg.cli_release.tag, "v0.2.0-rc.1");
-    assert_eq!(cfg.cli_release.version, "0.2.0-rc.1");
     assert!(!format!("{cfg:?}").contains("\"tok\""));
 }
 
@@ -124,8 +119,7 @@ fn release_pin_accepts_semver_tags_and_hex_digests() {
 #[test]
 fn release_pin_refuses_per_crate_tags() {
     let digest = "ab".repeat(32);
-    // sponsord no longer tags per crate; such a pin names no release.
-    assert!(ReleasePin::new("decdn-sponsored-v0.2.0", &digest).is_err());
+    assert!(ReleasePin::new("decdn-cli-v0.2.0", &digest).is_err());
     assert!(ReleasePin::new("sponsord-v0.2.0", &digest).is_err());
 }
 

@@ -15,6 +15,15 @@ release.
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **`CapabilityResponse` carries `expiry`**, the Unix time the capability is
+  void after. The field is required, so an `OnrampClient` reading a
+  `/v1/capability` answer from an older onramp fails to parse it.
+- **`Profile`, `routes::PROFILE` and `OnrampClient::profile` are removed**,
+  with the onramp's `GET /v1/profile`. The installers carry the profile
+  baked in.
+
 ## [0.0.2] - 2026-10-09
 
 ## [0.0.1] - 2026-10-09

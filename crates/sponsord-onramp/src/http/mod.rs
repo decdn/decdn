@@ -1,6 +1,5 @@
 //! HTTP surface: `/healthz`, `/decdn.sh` + `/decdn.ps1`, `/fund` (gate
-//! page), `/v1/fund` (issue), `/v1/capability` (poll for the issued token),
-//! `/v1/profile` (what the CLI runs `decdn` with).
+//! page), `/v1/fund` (issue), `/v1/capability` (poll for the issued token).
 
 pub mod capability;
 pub mod fund;
@@ -11,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use sponsord_api::daemon::Health;
-use sponsord_api::onramp::{Profile, routes};
+use sponsord_api::onramp::routes;
 
 use crate::state::AppState;
 
@@ -21,7 +20,6 @@ pub fn router(state: AppState) -> Router {
         .route(routes::HEALTHZ, get(healthz))
         .route(routes::INSTALL_SH, get(install_sh))
         .route(routes::INSTALL_PS1, get(install_ps1))
-        .route(routes::PROFILE, get(profile))
         .route(routes::FUND_PAGE, get(fund::page))
         .route(routes::FUND, post(fund::submit))
         .route(routes::CAPABILITY, get(capability::get))
@@ -30,10 +28,6 @@ pub fn router(state: AppState) -> Router {
 
 async fn healthz() -> Json<Health> {
     Json(Health { ok: true })
-}
-
-async fn profile(State(state): State<AppState>) -> Json<Profile> {
-    Json(Profile::clone(&state.profile))
 }
 
 fn script(body: &str, content_type: &'static str) -> Response {

@@ -1,6 +1,6 @@
 [package]
 name = "sponsord-onramp"
-description = "The public onramp in front of sponsord: a pluggable gate, the decdn installers and the CLI hand-off"
+description = "The public onramp in front of sponsord: a pluggable gate, and the installers that download through it"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
@@ -17,7 +17,6 @@ workspace = true
 [dependencies]
 sponsord-api = { workspace = true, features = ["axum", "client", "secret"] }
 clap.workspace = true
-semver = "1"
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true

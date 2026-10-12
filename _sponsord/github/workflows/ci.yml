@@ -77,13 +77,6 @@ jobs:
             docker:
               - 'Dockerfile'
               - '.dockerignore'
-              # The decdn pin decides which decdn release the CLI image
-              # fetches, so a bump PR proves that release still verifies.
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.github/scripts/fetch-decdn.sh'
-              - '.github/scripts/bump-decdn.sh'
-              - '.github/scripts/bump_decdn.py'
               - '.github/workflows/ci.yml'
             markdown:
               - '**/*.md'
@@ -294,11 +287,11 @@ jobs:
           cargo nextest run --features sponsord-core/anvil-e2e,sponsord/anvil-e2e
           -p sponsord-core -p sponsord --test chain_pool --test binary_anvil
 
-  # decdn-sponsored is the end-user CLI (decdn.sh on macOS/Linux, decdn.ps1 on
-  # Windows x64 and ARM64). The servers run only on Linux, so these legs cover
-  # the client crate alone; the Linux client is covered by `test`.
-  client:
-    name: client (${{ matrix.target }})
+  # The installers run on users' machines: decdn.sh under macOS's /bin/sh
+  # here (Linux's is covered by `test`), decdn.ps1 under Windows PowerShell.
+  # Each runs as the onramp serves it, against that onramp over HTTP.
+  installers:
+    name: installers (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
@@ -306,10 +299,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-latest, target: aarch64-apple-darwin, test: true }
-          - { runner: windows-latest, target: x86_64-pc-windows-msvc, test: true }
-          # Cross-compiled on the x64 runner, so it is linted, not run.
-          - { runner: windows-latest, target: aarch64-pc-windows-msvc, test: false }
+          - { runner: macos-latest, test: installer_sh }
+          - { runner: windows-latest, test: installer_ps1 }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -318,17 +309,12 @@ jobs:
         with:
           toolchain: 1.99.0
           components: clippy
-          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: client-${{ matrix.target }}
+          shared-key: installers-${{ matrix.runner }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy -p decdn-sponsored --all-targets --target ${{ matrix.target }} -- -D warnings
-      - if: matrix.test
-        run: cargo test -p decdn-sponsored --target ${{ matrix.target }}
-      - name: Smoke-run decdn-sponsored
-        if: matrix.test
-        run: cargo run -q -p decdn-sponsored --target ${{ matrix.target }} -- --version
+      - run: cargo clippy -p sponsord-onramp --test ${{ matrix.test }} -- -D warnings
+      - run: cargo test -p sponsord-onramp --test ${{ matrix.test }}
 
   deny:
     name: cargo deny
@@ -430,7 +416,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [decdn-sponsored, sponsord, sponsord-onramp]
+        image: [sponsord, sponsord-onramp]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -449,14 +435,6 @@ jobs:
           mkdir -p dist/amd64
           printf '#!/bin/sh\necho "%s placeholder"\n' "$IMAGE" > "dist/amd64/$IMAGE"
           chmod +x "dist/amd64/$IMAGE"
-      # The decdn the CLI image ships is a release that already exists, so
-      # CI fetches the real one: this runs the same verification the release
-      # does, and catches a decdn pin whose release no longer verifies.
-      - name: Fetch decdn into dist/
-        if: matrix.image == 'decdn-sponsored'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: .github/scripts/fetch-decdn.sh dist
       - name: Build the image
         env:
           IMAGE: ${{ matrix.image }}
@@ -469,16 +447,8 @@ jobs:
           out=$(docker run --rm "$IMAGE:ci")
           [ "$out" = "$IMAGE placeholder" ] || {
             echo "::error::entrypoint did not run the copied binary (got: $out)"; exit 1; }
-      # The CLI spawns `decdn` by name, so it must resolve on PATH, and must
-      # run on the base image's glibc: decdn's release sets its own floor.
-      - name: Check decdn runs from PATH
-        if: matrix.image == 'decdn-sponsored'
-        env:
-          IMAGE: ${{ matrix.image }}
-        run: docker run --rm --entrypoint decdn "$IMAGE:ci" --version
-      # No image needs a volume: the servers keep nothing on disk, and the
-      # CLI's state is the user's to mount if they want it. A declared volume
-      # would make every `docker run` provision one for nothing.
+      # No image needs a volume: the servers keep nothing on disk. A declared
+      # volume would make every `docker run` provision one for nothing.
       - name: Check the image declares no volume
         env:
           IMAGE: ${{ matrix.image }}
@@ -557,12 +527,12 @@ jobs:
     name: CI success
     if: always()
     runs-on: ubuntu-latest
-    needs: [changes, fmt, clippy, doc, doctest, test, anvil-e2e, client, deny, packaging,
+    needs: [changes, fmt, clippy, doc, doctest, test, anvil-e2e, installers, deny, packaging,
             decdn-main, docker-build, markdownlint, ci-tooling-tests, pr-title]
     steps:
       - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}
           allowed-failures: decdn-main
-          allowed-skips: fmt, clippy, doc, doctest, test, anvil-e2e, client, deny, decdn-main,
+          allowed-skips: fmt, clippy, doc, doctest, test, anvil-e2e, installers, deny, decdn-main,
                          docker-build, markdownlint, ci-tooling-tests, pr-title

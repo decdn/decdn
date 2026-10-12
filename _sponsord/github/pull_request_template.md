@@ -21,5 +21,5 @@ Closes #
 - [ ] `cargo nextest run --workspace`
 - [ ] Pool, keeper or daemon code changed: `cargo nextest run --features sponsord-core/anvil-e2e,sponsord/anvil-e2e -p sponsord-core -p sponsord` (needs `anvil` and `forge`)
 - [ ] User-visible change: entry in the changed crate's `crates/<dir>/CHANGELOG.md`
-- [ ] Installer archive names, `~/.decdn/sponsor.toml` or an `sponsord-api` type touched: every deployed installer and CLI still works (all three are contracts, see docs/architecture.md); OpenAPI documents regenerated if a type changed
+- [ ] Installer arguments, the installers' `~/.decdn/sponsored/` layout or an `sponsord-api` type touched: every command already published and every download in progress still works (all three are contracts, see docs/architecture.md); OpenAPI documents regenerated if a type changed
 - [ ] PR title uses a type the `pr-title` check allows (feat, fix, docs, chore, refactor, perf, test, build, ci, revert), and the subject does not start with an uppercase letter. The check gates merge and does not re-run on a title edit: push, or re-run the job.

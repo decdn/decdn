@@ -59,24 +59,25 @@ decdn before it runs the tests (see the `anvil-e2e` job in `ci.yml`).
 - **`sponsord-onramp`** is the public server. A `Gate` trait (only
   `TurnstileGate` is built in) sits in front of a `CapabilitySource` (the
   daemon client). `GrantCache` is an in-memory hand-off from the browser's
-  `POST /v1/fund` to the CLI's polling `GET /v1/capability`. Installers are
-  rendered once at startup from `assets/decdn.{sh,ps1}`, with the onramp URL
-  and the pinned release tags and `SHA256SUMS` digests baked in. Config comes
-  from `ONRAMP_*` env vars.
-- **`decdn-sponsored`** is the end-user CLI (Linux, macOS and Windows). It
-  creates a throwaway key per download under its data dir
-  (`~/.decdn/sponsored/` by default), polls the onramp, then spawns
-  `decdn bundle pull` with the capability. The spawned `decdn` handles
-  discovery, payment and verification. Config comes from
-  `~/.decdn/sponsor.toml`, or from `DECDN_SPONSOR_*` env vars when
-  `DECDN_SPONSOR_ONRAMP_URL` is set. Its image ships decdn's own `decdn`
-  release binary beside it (`.github/scripts/fetch-decdn.sh`).
+  `POST /v1/fund` to the installer's polling `GET /v1/capability`. Config
+  comes from `ONRAMP_*` env vars.
+- **The installers** (`crates/sponsord-onramp/assets/decdn.{sh,ps1}`) are
+  everything that runs on a user's machine (Linux, macOS and Windows). The
+  onramp renders them once at startup with its URL, the pinned `decdn`
+  release and the download profile baked in. Given `pull <hash>`, a script
+  installs `decdn`, makes a throwaway key per download with `decdn key-gen`
+  under `~/.decdn/sponsored/downloads/<hash>/`, polls the onramp for the
+  capability, then runs `decdn bundle pull --capability <token>`, which
+  handles discovery, payment and verification. `tests/installer_sh.rs` runs
+  `decdn.sh` against a served onramp and a stub `decdn`;
+  `tests/installer_ps1.rs` does the same for `decdn.ps1` on Windows CI.
 - **`crates/e2e`** (`sponsord-e2e`, never released) runs the real daemon
-  router behind the real onramp, driven by the CLI's pull flow, against
+  router behind the real onramp, driven by the onramp's `decdn.sh`, against
   `FakePool`.
 
 `test-support` features expose fakes (`FakePool`, `fake_sponsor`,
-`FakeCapabilitySource`, `FakeGate`, `test_config`). Crates enable them for
+`FakeCapabilitySource`, `FakeGate`, `test_config`, and for the installer
+tests `STUB_DECDN` and `publish_release`). Crates enable them for
 their own tests through a path dev-dependency on themselves. Use these fakes
 rather than writing new ones.
 
@@ -87,8 +88,7 @@ rather than writing new ones.
   `panic!`, slice indexing, truncating casts and `print!`/`eprintln!`
   outside tests, `unsafe_code` forbidden, and a doc comment on every public
   item (on `sponsord-api` types those comments are the OpenAPI
-  descriptions, so regenerate the snapshots after editing them). The
-  `decdn-sponsored` CLI allows the print lints at its crate roots. Silence a
+  descriptions, so regenerate the snapshots after editing them). Silence a
   lint at the site with `#[expect(…, reason = "…")]`. Every member must keep
   `[lints] workspace = true` (CI checks this).
 - **Unit tests live in their own file**: every test module is declared
@@ -100,13 +100,12 @@ rather than writing new ones.
   `test_support.rs`, `tests_support.rs`), so name a new one to match.
   `crates/e2e/tests/no_inline_test_modules.rs` fails on an inline body, and on
   a file with one of those names that is not a test module.
-- **Contracts with deployed software**: the release archive names, the
-  `~/.decdn/sponsor.toml` schema, the CLI's `DECDN_SPONSOR_*` variable names
-  and both HTTP APIs (`sponsord-api`) are read by installers, CLIs and
-  scripts already in the field. A change to any of them must be
-  called out as contract-breaking in the changelog. If the onramp and the CLI
-  exchange something new, `ONRAMP_MIN_CLI_VERSION` controls when older CLIs
-  are told to upgrade.
+- **Contracts with deployed software**: the installers' arguments, their
+  state layout under `~/.decdn/sponsored/` (an interrupted download resumes
+  from it) and both HTTP APIs (`sponsord-api`) are read by commands already
+  published and downloads in progress. A change to any of them must be
+  called out as contract-breaking in the changelog. Every run fetches the
+  script fresh from the onramp, so the script and the onramp always match.
 - **Single-tenant and stateless**: each publisher runs their own daemon and
   pool, so there are no per-caller budgets or tokens. The onramp keeps nothing
   on disk, and CI fails if a Docker image declares a volume.

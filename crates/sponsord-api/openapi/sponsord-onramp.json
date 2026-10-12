@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "sponsord-onramp",
-    "description": "The sponsord onramp: a gate in front of the daemon, the installers, and the API decdn-sponsored polls.",
+    "description": "The sponsord onramp: a gate in front of the daemon, the installers, and the API the installers poll.",
     "license": {
       "name": "MIT OR Apache-2.0"
     },
@@ -247,25 +247,6 @@
           }
         }
       }
-    },
-    "/v1/profile": {
-      "get": {
-        "tags": [],
-        "summary": "What `decdn-sponsored` needs to run `decdn` against this onramp's pool.",
-        "operationId": "profile",
-        "responses": {
-          "200": {
-            "description": "The download profile",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Profile"
-                }
-              }
-            }
-          }
-        }
-      }
     }
   },
   "components": {
@@ -274,9 +255,16 @@
         "type": "object",
         "description": "The capability issued to a client.",
         "required": [
-          "token"
+          "token",
+          "expiry"
         ],
         "properties": {
+          "expiry": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix time (seconds) after which the capability is void.",
+            "minimum": 0
+          },
           "token": {
             "type": "string",
             "description": "The `dcap1:` token."
@@ -378,51 +366,6 @@
         "format": "int64",
         "description": "An amount of USDC in its base unit (6 decimals): `1_000_000` is $1. On the\nwire it is a bare integer.",
         "minimum": 0
-      },
-      "Profile": {
-        "type": "object",
-        "description": "`GET /v1/profile`: the chain and contracts the CLI hands to `decdn`. The\nCLI reads it on every run, so the onramp can change any of it without\nusers reinstalling.",
-        "required": [
-          "chain_id",
-          "rpc_url",
-          "payment_pool",
-          "capacity_bond"
-        ],
-        "properties": {
-          "capacity_bond": {
-            "type": "string",
-            "description": "The `CapacityBond`, for node discovery."
-          },
-          "chain_id": {
-            "type": "integer",
-            "format": "int64",
-            "description": "EIP-155 id of the chain the contracts are on.",
-            "minimum": 0
-          },
-          "min_cli_version": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Oldest `decdn-sponsored` this onramp works with; an older CLI tells\nthe user to re-run the installer.",
-            "example": "0.2.0"
-          },
-          "payment_pool": {
-            "type": "string",
-            "description": "The `PaymentPool` the capabilities are signed against."
-          },
-          "rpc_url": {
-            "type": "string",
-            "description": "JSON-RPC endpoint `decdn` reads the chain through."
-          },
-          "slash_judge": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The `SlashJudge`, when the onramp names one."
-          }
-        }
       }
     }
   }

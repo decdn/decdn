@@ -1,6 +1,8 @@
-//! `assets/decdn.sh` run for real against `file://` releases: a second run
-//! with the same pins keeps the installed binaries and downloads nothing, and
-//! a missing marker or binary brings the download back.
+//! `assets/decdn.sh` as the onramp serves it, run for real against that
+//! onramp over HTTP (fake daemon and gate), `file://` releases and a stub
+//! `decdn`: the install skips binaries already at the pin, and `pull` passes
+//! the gate once per download, resumes a failed one without it, replaces a
+//! capability near expiry, and refuses a second run of the same download.
 
 #![cfg(unix)]
 #![allow(
@@ -10,115 +12,158 @@
     clippy::indexing_slicing
 )]
 
-use std::fmt::Write as _;
 use std::fs;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Stdio;
+use std::time::Duration;
 
-const TEMPLATE: &str = include_str!("../assets/decdn.sh");
+use sponsord_onramp::test_support::{
+    FakeOptions, Fakes, STUB_DECDN, app_state_with_options, publish_release, test_config,
+};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// Every target the installer can pick, so the test runs on any host.
-const TARGETS: [&str; 4] = [
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-];
+macro_rules! hash {
+    () => {
+        "9194000d7b356650e6924a7746ec4afb0b705838b65913c0e46cba6b15af69e5"
+    };
+}
+const HASH: &str = hash!();
+const PULL: [&str; 2] = ["pull", concat!("b3:", hash!())];
 
-fn sha256(path: &Path) -> String {
-    let run = |cmd: &str, args: &[&str]| Command::new(cmd).args(args).arg(path).output().ok();
-    let out = run("sha256sum", &[])
-        .filter(|o| o.status.success())
-        .or_else(|| run("shasum", &["-a", "256"]))
-        .expect("sha256sum or shasum");
-    String::from_utf8(out.stdout).unwrap()[..64].to_owned()
+/// The address the stub `decdn` prints for the `n`th key it makes.
+fn stub_address(n: u64) -> String {
+    format!("0x{n:040x}")
 }
 
-/// Publishes `<root>/<repo>/releases/download/<tag>/` with one archive per
-/// target holding a stub `bin`, and returns the SHA256SUMS digest.
-fn publish(root: &Path, repo: &str, bin: &str, tag: &str, version: &str) -> String {
-    let dir = root.join(repo).join("releases/download").join(tag);
-    let stage = root.join(format!("stage-{bin}"));
-    fs::create_dir_all(&dir).unwrap();
-    fs::create_dir_all(&stage).unwrap();
-    let stub = stage.join(bin);
-    fs::write(&stub, format!("#!/bin/sh\necho {bin}\n")).unwrap();
-    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let mut sums = String::new();
-    for target in TARGETS {
-        let archive = format!("{bin}-{version}-{target}.tar.gz");
-        let status = Command::new("tar")
-            .arg("-czf")
-            .arg(dir.join(&archive))
-            .arg("-C")
-            .arg(&stage)
-            .arg(bin)
-            .status()
-            .unwrap();
-        assert!(status.success(), "tar {archive}");
-        writeln!(sums, "{}  {archive}", sha256(&dir.join(&archive))).unwrap();
-    }
-    let sums_path = dir.join("SHA256SUMS");
-    fs::write(&sums_path, sums).unwrap();
-    sha256(&sums_path)
+/// One run of the script.
+struct Run {
+    ok: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 struct Fixture {
     home: PathBuf,
     releases: PathBuf,
+    stub: PathBuf,
     script: PathBuf,
+    onramp: String,
+    fakes: Fakes,
 }
 
 impl Fixture {
-    fn new(name: &str) -> Self {
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    async fn new(name: &str) -> Self {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("installer_sh")
+            .join(name);
         let _ = fs::remove_dir_all(&root);
         let home = root.join("home");
         let releases = root.join("releases");
+        let stub = root.join("stub");
         fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&stub).unwrap();
+        let sums = publish_release(&releases, "decdn", "decdn", "v0.1.0", "0.1.0", STUB_DECDN);
 
-        let decdn_sums = publish(&releases, "decdn", "decdn", "v0.1.0", "0.1.0");
-        let cli_sums = publish(&releases, "sponsord", "decdn-sponsored", "v0.2.0", "0.2.0");
-        let rendered = TEMPLATE
-            .replace("{{ONRAMP_URL}}", "https://up.example.org")
-            .replace(
-                "{{RELEASES_BASE}}",
-                &format!("file://{}", releases.display()),
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let onramp = format!("http://{}", listener.local_addr().unwrap());
+        let mut config = test_config();
+        config.public_url.clone_from(&onramp);
+        config.releases_base = format!("file://{}", releases.display());
+        config.decdn_release.sums_sha256 = sums;
+        let (state, fakes) = app_state_with_options(FakeOptions {
+            config,
+            ..FakeOptions::default()
+        })
+        .await;
+        let app = sponsord_onramp::http::router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
             )
-            .replace("{{DECDN_RELEASE}}", "v0.1.0")
-            .replace("{{DECDN_VERSION}}", "0.1.0")
-            .replace("{{DECDN_SUMS_SHA256}}", &decdn_sums)
-            .replace("{{CLI_RELEASE}}", "v0.2.0")
-            .replace("{{CLI_VERSION}}", "0.2.0")
-            .replace("{{CLI_SUMS_SHA256}}", &cli_sums);
+            .await
+            .unwrap();
+        });
+
+        let body = reqwest::get(format!("{onramp}/decdn.sh"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         let script = root.join("decdn.sh");
-        fs::write(&script, rendered).unwrap();
+        fs::write(&script, body).unwrap();
         Self {
             home,
             releases,
+            stub,
             script,
+            onramp,
+            fakes,
         }
     }
 
-    fn run(&self) -> String {
-        let Output {
-            status,
-            stdout,
-            stderr,
-        } = Command::new("sh")
-            .arg(&self.script)
+    /// Run the script with `args` and extra `env`. Plays the person in the
+    /// browser: whenever the script prints a gate link, the gate is passed
+    /// for that key, as opening the link would.
+    async fn run_with(&self, args: &[&str], env: &[(&str, &str)]) -> Run {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg(&self.script)
+            .args(args)
             .env("HOME", &self.home)
-            .output()
+            .env("STUB_DIR", &self.stub)
+            .env_remove("STUB_EXIT")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
+
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let onramp = self.onramp.clone();
+        let reader = tokio::spawn(async move {
+            let mut stdout = String::new();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if let Some((_, client)) = line.split_once("/fund?client=") {
+                    let resp = reqwest::Client::new()
+                        .post(format!("{onramp}/v1/fund"))
+                        .json(&serde_json::json!({ "client": client.trim(), "proof": "ok" }))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert!(resp.status().is_success(), "{}", resp.status());
+                }
+                stdout.push_str(&line);
+                stdout.push('\n');
+            }
+            stdout
+        });
+        let out = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+            .await
+            .expect("decdn.sh finishes")
             .unwrap();
-        let stdout = String::from_utf8(stdout).unwrap();
+        Run {
+            ok: out.status.success(),
+            code: out.status.code(),
+            stdout: reader.await.unwrap(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
+    /// Run the script, and fail the test unless it succeeds. Returns stdout.
+    async fn run_ok(&self, args: &[&str], env: &[(&str, &str)]) -> String {
+        let run = self.run_with(args, env).await;
         assert!(
-            status.success(),
-            "decdn.sh failed\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&stderr)
+            run.ok,
+            "decdn.sh failed\nstdout:\n{}\nstderr:\n{}",
+            run.stdout, run.stderr
         );
-        stdout
+        run.stdout
     }
 
     fn bin(&self, name: &str) -> PathBuf {
@@ -128,61 +173,222 @@ impl Fixture {
     fn marker(&self, name: &str) -> PathBuf {
         self.home.join(".decdn/installer").join(name)
     }
+
+    fn sponsored(&self) -> PathBuf {
+        self.home.join(".decdn/sponsored")
+    }
+
+    fn state(&self) -> PathBuf {
+        self.sponsored().join("downloads").join(HASH)
+    }
+
+    fn calls(&self) -> Vec<String> {
+        fs::read_to_string(self.stub.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn keys_made(&self) -> u32 {
+        fs::read_to_string(self.stub.join("keys")).map_or(0, |s| s.trim().parse().unwrap())
+    }
+
+    fn gate_link(&self, n: u64) -> String {
+        format!("{}/fund?client={}", self.onramp, stub_address(n))
+    }
 }
 
-#[test]
-fn a_second_run_with_the_same_pins_downloads_nothing() {
-    let fx = Fixture::new("same_pins");
-    let first = fx.run();
+#[tokio::test]
+async fn a_second_run_with_the_same_pin_downloads_nothing() {
+    let fx = Fixture::new("same_pin").await;
+    let first = fx.run_ok(&[], &[]).await;
     assert!(first.contains("Installing decdn v0.1.0"), "{first}");
-    assert!(
-        first.contains("Installing decdn-sponsored v0.2.0"),
-        "{first}"
-    );
-    assert!(fx.bin("decdn").exists() && fx.bin("decdn-sponsored").exists());
-    assert!(fx.marker("decdn").exists() && fx.marker("decdn-sponsored").exists());
+    assert!(first.contains("decdn is ready"), "{first}");
+    assert!(fx.bin("decdn").exists() && fx.marker("decdn").exists());
 
     // With the releases gone, any download would fail the run.
     fs::remove_dir_all(&fx.releases).unwrap();
-    let second = fx.run();
+    let second = fx.run_ok(&[], &[]).await;
     assert!(!second.contains("Installing"), "{second}");
     assert!(
         second.contains("decdn v0.1.0 is already installed."),
         "{second}"
     );
-    assert!(
-        second.contains("decdn-sponsored v0.2.0 is already installed."),
-        "{second}"
-    );
-    assert!(fx.home.join(".decdn/sponsor.toml").exists());
 }
 
-#[test]
-fn a_missing_marker_or_binary_reinstalls_only_that_binary() {
-    let fx = Fixture::new("reinstall");
-    fx.run();
+#[tokio::test]
+async fn a_missing_marker_or_binary_reinstalls() {
+    let fx = Fixture::new("reinstall").await;
+    fx.run_ok(&[], &[]).await;
 
     fs::remove_file(fx.marker("decdn")).unwrap();
-    let out = fx.run();
+    let out = fx.run_ok(&[], &[]).await;
     assert!(out.contains("Installing decdn v0.1.0"), "{out}");
-    assert!(
-        out.contains("decdn-sponsored v0.2.0 is already installed."),
-        "{out}"
-    );
 
-    fs::remove_file(fx.bin("decdn-sponsored")).unwrap();
-    let out = fx.run();
-    assert!(out.contains("decdn v0.1.0 is already installed."), "{out}");
-    assert!(out.contains("Installing decdn-sponsored v0.2.0"), "{out}");
-    assert!(fx.bin("decdn-sponsored").exists());
+    fs::remove_file(fx.bin("decdn")).unwrap();
+    let out = fx.run_ok(&[], &[]).await;
+    assert!(out.contains("Installing decdn v0.1.0"), "{out}");
+    assert!(fx.bin("decdn").exists());
 }
 
-#[test]
-fn a_changed_pin_reinstalls() {
-    let fx = Fixture::new("changed_pin");
-    fx.run();
+#[tokio::test]
+async fn a_changed_pin_reinstalls() {
+    let fx = Fixture::new("changed_pin").await;
+    fx.run_ok(&[], &[]).await;
     // A marker from another release, as after the onramp moves its pin.
     fs::write(fx.marker("decdn"), "00 x86_64-unknown-linux-gnu\n").unwrap();
-    let out = fx.run();
+    let out = fx.run_ok(&[], &[]).await;
     assert!(out.contains("Installing decdn v0.1.0"), "{out}");
+}
+
+#[tokio::test]
+async fn pull_passes_the_gate_and_runs_decdn_with_the_capability() {
+    let fx = Fixture::new("pull").await;
+    let args = [PULL[0], PULL[1], "-o", "out dir", "--namespace", "1"];
+    let stdout = fx.run_ok(&args, &[]).await;
+
+    assert!(
+        stdout.contains("Open this link to start the download:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&fx.gate_link(1)), "{stdout}");
+    let pool = alloy_primitives::Address::repeat_byte(0x22);
+    let bond = alloy_primitives::Address::repeat_byte(0x33);
+    let state = fx.state();
+    let shared = fx.sponsored().join("decdn");
+    assert_eq!(
+        fx.calls(),
+        [format!(
+            "bundle pull --hash {HASH} -o out dir --capability dcap1:FAKE1 \
+             --keystore {}/keystore.json --keystore-password-file {}/password \
+             --data-dir {} --rpc-url https://rpc.example --payment-pool-address {pool} \
+             --capacity-bond-address {bond} --chain-id 421614 --namespace 1",
+            state.display(),
+            state.display(),
+            shared.display(),
+        )]
+    );
+    assert_eq!(fx.fakes.source.issued_count(), 1);
+    assert!(!state.exists(), "state is deleted after a good pull");
+    assert!(!fx.sponsored().join("decdn.lock").exists());
+    assert!(
+        !fx.sponsored()
+            .join(format!("downloads/{HASH}.lock"))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_pull_resumes_with_the_same_key_and_capability() {
+    let fx = Fixture::new("resume").await;
+
+    let run = fx.run_with(&PULL, &[("STUB_EXIT", "3")]).await;
+    assert_eq!(run.code, Some(3));
+    assert!(run.stdout.contains(&fx.gate_link(1)), "{}", run.stdout);
+    assert!(
+        run.stderr.contains("Re-run the same command to resume"),
+        "{}",
+        run.stderr
+    );
+    let state = fx.state();
+    assert_eq!(
+        fs::read_to_string(state.join("capability")).unwrap(),
+        "dcap1:FAKE1"
+    );
+    assert!(
+        fs::read_to_string(state.join("expiry"))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+            > 0
+    );
+    // decdn refuses a data dir that group or others can read.
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&state), 0o700);
+    assert_eq!(mode(&fx.sponsored().join("decdn")), 0o700);
+    assert_eq!(mode(&state.join("password")), 0o600);
+
+    // No gate this time: the saved key and capability are reused.
+    let stdout = fx.run_ok(&PULL, &[]).await;
+    assert!(!stdout.contains("Open this link"), "{stdout}");
+    assert_eq!(fx.keys_made(), 1);
+    assert_eq!(fx.fakes.source.issued_count(), 1);
+    let calls = fx.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.contains("--capability dcap1:FAKE1 "))
+    );
+    assert!(!state.exists());
+}
+
+#[tokio::test]
+async fn a_capability_near_expiry_is_replaced_with_a_new_key() {
+    let fx = Fixture::new("expiry").await;
+
+    let run = fx.run_with(&PULL, &[("STUB_EXIT", "1")]).await;
+    assert!(run.stdout.contains(&fx.gate_link(1)), "{}", run.stdout);
+    fs::write(fx.state().join("expiry"), "1").unwrap();
+
+    let stdout = fx.run_ok(&PULL, &[]).await;
+    assert!(stdout.contains(&fx.gate_link(2)), "{stdout}");
+    assert_eq!(fx.keys_made(), 2);
+    assert!(fx.calls()[1].contains("--capability dcap1:FAKE2 "));
+}
+
+#[tokio::test]
+async fn a_download_already_running_is_not_started_twice() {
+    let fx = Fixture::new("locked").await;
+    let lock = fx.sponsored().join(format!("downloads/{HASH}.lock"));
+    fs::create_dir_all(&lock).unwrap();
+    fs::write(lock.join("pid"), std::process::id().to_string()).unwrap();
+
+    let run = fx.run_with(&PULL, &[]).await;
+    assert!(!run.ok);
+    assert!(run.stderr.contains("already running"), "{}", run.stderr);
+    assert_eq!(fx.keys_made(), 0);
+    assert!(lock.exists(), "another run's lock is left alone");
+
+    // A lock left by a process that has exited is taken over.
+    let mut dead = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = dead.id();
+    dead.wait().unwrap();
+    fs::write(lock.join("pid"), dead_pid.to_string()).unwrap();
+    fx.run_ok(&PULL, &[]).await;
+    assert!(!lock.exists());
+}
+
+#[tokio::test]
+async fn a_busy_shared_data_dir_runs_the_download_in_its_own() {
+    let fx = Fixture::new("busy_data_dir").await;
+    let lock = fx.sponsored().join("decdn.lock");
+    fs::create_dir_all(&lock).unwrap();
+    fs::write(lock.join("pid"), std::process::id().to_string()).unwrap();
+
+    let run = fx.run_with(&PULL, &[("STUB_EXIT", "1")]).await;
+    assert!(
+        run.stderr.contains("without the shared peer cache"),
+        "{}",
+        run.stderr
+    );
+    assert!(fx.calls()[0].contains(&format!("--data-dir {} ", fx.state().display())));
+}
+
+#[tokio::test]
+async fn bad_arguments_are_refused_before_installing() {
+    let fx = Fixture::new("bad_args").await;
+    for args in [
+        &["pull", "b3:nothex"][..],
+        &["pull"],
+        &["fetch", HASH],
+        &["pull", HASH, "--namespace", "0"],
+        &["pull", HASH, "--namespace", "x1"],
+        &["pull", HASH, "--bogus"],
+    ] {
+        let run = fx.run_with(args, &[]).await;
+        assert!(!run.ok, "{args:?}");
+    }
+    assert!(!fx.bin("decdn").exists());
 }

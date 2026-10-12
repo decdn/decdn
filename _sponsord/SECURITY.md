@@ -48,10 +48,10 @@ Every crate is released together under one version, from a `vX.Y.Z` tag
 
 - the tag;
 - the release commit (the version bump and changelog headings);
-- the `SHA256SUMS` manifest covering every archive of `decdn-sponsored`,
-  `sponsord` and `sponsord-onramp`;
+- the `SHA256SUMS` manifest covering every archive of `sponsord` and
+  `sponsord-onramp`;
 - `<image>-image-digest.txt` and the SBOM, for each image
-  (`sponsord`, `sponsord-onramp`, `decdn-sponsored`).
+  (`sponsord`, `sponsord-onramp`).
 
 `sponsord-core` and `sponsord-api` ship no binaries; the signed tag covers
 their source.
@@ -81,9 +81,9 @@ gpg --verify SHA256SUMS.asc SHA256SUMS
 sha256sum --ignore-missing --check SHA256SUMS
 ```
 
-The onramp's installers pin a release by the SHA-256 of this same
-`SHA256SUMS` file (`ONRAMP_CLI_SUMS_SHA256`) and check each download
-against it.
+The onramp's installers download only `decdn`, from decdn's own release. They
+pin it the same way, by the SHA-256 of that release's `SHA256SUMS` file
+(`ONRAMP_DECDN_SUMS_SHA256`), and check the download against it.
 
 ### Verify a container image
 
@@ -95,8 +95,7 @@ gpg --verify sponsord-image-digest.txt.asc sponsord-image-digest.txt
 docker pull "$(cat sponsord-image-digest.txt)"
 ```
 
-(and likewise for `sponsord-onramp-image-digest.txt` and
-`decdn-sponsored-image-digest.txt`).
+(and likewise for `sponsord-onramp-image-digest.txt`).
 
 The images are published to `ghcr.io/decdn/<image>` and mirrored to
 `decdn/<image>` on Docker Hub. The digest file records the GHCR reference, but
@@ -123,10 +122,7 @@ published checksums, then signs them. The signature means a named maintainer
 vouches that these are the release artifacts. It is not a reproducible-build
 attestation. To verify the binaries against the source, build from the signed
 tag with `cargo build --release --locked`, which fetches the decdn commit its
-`Cargo.lock` pins. That does not rebuild the `decdn` binary in the
-`decdn-sponsored` image: for it, the sponsord signature vouches for decdn's
-release archive as fetched and checked, and reproducing it goes through
-decdn's own release.
+`Cargo.lock` pins.
 
 Each image is assembled from the same archives rather than compiled
 separately, so its binary is byte-identical to the archived one:
@@ -137,25 +133,10 @@ docker run --rm --entrypoint sha256sum ghcr.io/decdn/sponsord:<version> \
 tar xzOf sponsord-<version>-x86_64-unknown-linux-gnu.tar.gz | sha256sum
 ```
 
-The `decdn-sponsored` image also carries the `decdn` binary the CLI spawns.
-That binary is not one of this release's archives: it is decdn's own release
-archive, at the decdn tag this release's `Cargo.toml` pins (the `tag` on its
-`decdn-*` dependencies), which must still name the commit its `Cargo.lock`
-locks and be an immutable GitHub release. It is verified against decdn's signed `SHA256SUMS` before the image is
-built
-([`fetch-decdn.sh`](.github/scripts/fetch-decdn.sh)). Check it against decdn's
-release the same way:
-
-```bash
-docker run --rm --entrypoint sha256sum ghcr.io/decdn/decdn-sponsored:<version> \
-  /usr/local/bin/decdn
-tar xzOf decdn-<decdn-version>-x86_64-unknown-linux-gnu.tar.gz | sha256sum
-```
-
 ### Crates published to crates.io
 
-`sponsord-api`, `sponsord-core`, `sponsord`, `sponsord-onramp` and
-`decdn-sponsored` are also published to crates.io. **Those artifacts carry no maintainer signature** —
+`sponsord-api`, `sponsord-core`, `sponsord` and `sponsord-onramp` are also
+published to crates.io. **Those artifacts carry no maintainer signature** —
 crates.io has no detached-signature mechanism, and the `.crate` files are built
 and uploaded from a maintainer's machine after the GitHub Release is signed.
 For the guarantees above, use the GitHub Release.

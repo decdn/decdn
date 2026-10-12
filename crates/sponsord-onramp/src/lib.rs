@@ -1,6 +1,6 @@
 //! `sponsord-onramp`: the public onramp in front of a `sponsord` daemon.
-//! Serves the installers, the gate page, and the API `decdn-sponsored`
-//! polls, and hands each capability from the browser to the CLI.
+//! Serves the installers, the gate page, and the API the installers poll,
+//! and hands each capability from the browser to the installer.
 //!
 //! The gate is pluggable ([`gate::Gate`]); [`gate::TurnstileGate`] is built in.
 

@@ -28,7 +28,7 @@ pub async fn page(
 
 /// `POST /v1/fund`: check the gate's proof, then hand back the capability
 /// held for the client or one newly issued by the daemon, and hold it for
-/// the polling CLI.
+/// the polling installer.
 pub async fn submit(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -58,10 +58,13 @@ pub async fn submit(
     //
     // Two concurrent requests for the same signer can both miss here and
     // both call the daemon. That is benign: each token is validly signed for
-    // the same signer and pool, the later `put` wins, and the CLI reads back
+    // the same signer and pool, the later `put` wins, and the installer reads back
     // whatever `GET /v1/capability` returns.
     if let Some(held) = state.grants.get(client, now) {
-        return Ok(Json(CapabilityResponse { token: held.token }));
+        return Ok(Json(CapabilityResponse {
+            token: held.token,
+            expiry: held.expiry,
+        }));
     }
 
     let issue = IssueRequest {
@@ -81,7 +84,10 @@ pub async fn submit(
             return Err(ErrorCode::Internal.into());
         }
     };
-    let token = issued.token.clone();
+    let response = CapabilityResponse {
+        token: issued.token.clone(),
+        expiry: issued.expiry,
+    };
     state.grants.put(client, issued, now);
-    Ok(Json(CapabilityResponse { token }))
+    Ok(Json(response))
 }
