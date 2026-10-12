@@ -51,6 +51,25 @@ impl LaneLedgers {
         map.entry(lane).or_insert_with(build).clone()
     }
 
+    /// The prior amount `lane`'s context was built with, or `None` if the
+    /// lane is not registered. The handle is cloned out under the map lock,
+    /// which is released before the `ctx` lock is taken (the lock order
+    /// [`Self::credit_all`] keeps).
+    pub(crate) fn prior_amount(&self, lane: LaneKey) -> Option<U256> {
+        let handle = {
+            let map = self
+                .map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.get(&lane).cloned()
+        }?;
+        let ctx = handle
+            .ctx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(ctx.prior_amount)
+    }
+
     /// Σ over every registered lane of its committed voucher amount — the pool's
     /// total spend, the basis every lane's remaining-deposit gate subtracts.
     #[must_use]

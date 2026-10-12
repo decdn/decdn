@@ -112,9 +112,12 @@ pub decdn_client::buyer_pool::ProgressWrite::Rebase
 pub decdn_client::buyer_pool::ProgressWrite::Rebase::anchor: decdn_incentive::buyer_pool::BuyerLaneProgress
 pub decdn_client::buyer_pool::ProgressWrite::Rebase::totals: decdn_incentive::buyer_pool::BuyerLaneProgress
 impl decdn_client::buyer_pool::ProgressWrite
-pub fn decdn_client::buyer_pool::ProgressWrite::apply<S: decdn_incentive::buyer_pool::BuyerPoolStore + ?core::marker::Sized>(&self, &S, alloy_primitives::bits::address::Address, decdn_incentive::lane::PoolId, decdn_incentive::lane::LaneKey) -> anyhow::Result<decdn_incentive::buyer_pool::AdvanceOutcome, decdn_incentive::store::StoreError>
+pub fn decdn_client::buyer_pool::ProgressWrite::apply<S: decdn_incentive::buyer_pool::BuyerPoolStore + ?core::marker::Sized>(&self, &S, decdn_client::buyer_pool::WatermarkRow, decdn_incentive::lane::LaneKey) -> anyhow::Result<decdn_incentive::buyer_pool::AdvanceOutcome, decdn_incentive::store::StoreError>
 pub fn decdn_client::buyer_pool::ProgressWrite::of(&decdn_client::VoucherProgress) -> core::option::Option<Self>
 pub const fn decdn_client::buyer_pool::ProgressWrite::totals(&self) -> decdn_incentive::buyer_pool::BuyerLaneProgress
+#[non_exhaustive] pub enum decdn_client::buyer_pool::WatermarkRow
+pub decdn_client::buyer_pool::WatermarkRow::Delegated(decdn_incentive::deployment::Deployment)
+pub decdn_client::buyer_pool::WatermarkRow::Owned(alloy_primitives::bits::address::Address)
 pub struct decdn_client::buyer_pool::AllowanceShortfall
 impl core::error::Error for decdn_client::buyer_pool::AllowanceShortfall
 impl core::fmt::Display for decdn_client::buyer_pool::AllowanceShortfall

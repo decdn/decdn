@@ -48,8 +48,9 @@ use tracing::{debug, error, info, warn};
 use crate::metrics::Metrics;
 use decdn_client::buyer_pool::{
     LOW_WATER_DIVISOR, OpenUnconfirmed, OpenedPool, PoolNotOpen, ProgressWrite, ToppedUpPool,
-    ensure_allowance, grade_deposit_credit, open_pool, opened_from_receipt, pool_accepts_funds,
-    refill_amount, self_owned_lane_ctx, send_open_pool, top_up as pool_top_up, topped_up_effect,
+    WatermarkRow, ensure_allowance, grade_deposit_credit, open_pool, opened_from_receipt,
+    pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool, top_up as pool_top_up,
+    topped_up_effect,
 };
 use decdn_client::{LocalPullFault, PoolContext, PoolReplaced, Recovery};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
@@ -1405,7 +1406,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         };
         let totals = write.totals();
         let outcome = write
-            .apply(self.store.as_ref(), self.owner, pool_id, lane)
+            .apply(self.store.as_ref(), WatermarkRow::Owned(self.owner), lane)
             .with_context(|| match write {
                 ProgressWrite::Rebase { anchor, .. } => format!(
                     "rebase buyer pool lane progress down to the upstream watermark \

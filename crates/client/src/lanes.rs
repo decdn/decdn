@@ -3,8 +3,9 @@
 //! fetch ends (`queue_face_watermarks`).
 //!
 //! A lane is one `(pool, signer, provider)` voucher sequence. It resumes from
-//! the buyer store's watermark, or from the chain's when the store has none, so
-//! its first voucher continues the lane. Every lane settles at its armed
+//! the buyer store's watermark, so its first voucher continues the lane. A
+//! self-owned lane the store has none for resumes from the chain's; a
+//! delegated one starts at zero and heals from the node's watermark bundle. Every lane settles at its armed
 //! cumulative, which equals its committed one on the clean path.
 
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,7 +19,7 @@ use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{CapabilityGrant, LaneKey, PoolId};
 use iroh::{Endpoint, EndpointAddr, RelayUrl};
 
-use crate::buyer_pool::ProgressWrite;
+use crate::buyer_pool::{ProgressWrite, WatermarkRow};
 use crate::discovery::{self, NodeCandidate};
 use crate::funding::{RunFunding, build_ctx_for_fetch};
 use crate::ordered_writes::OrderedWrites;
@@ -78,8 +79,7 @@ impl<F: FnOnce()> Drop for SettleOnDrop<F> {
 /// way, and a failure to record that only risks a rejected reuse next time.
 fn persist_watermark(
     store: &dyn BuyerPoolStore,
-    owner: Address,
-    pool_id: PoolId,
+    row: WatermarkRow,
     lane: LaneKey,
     progress: &VoucherProgress,
 ) {
@@ -90,13 +90,14 @@ fn persist_watermark(
         ProgressWrite::Rebase { .. } => "rebased",
         ProgressWrite::Advance { .. } => "advanced",
     };
-    let outcome = write.apply(store, owner, pool_id, lane);
+    let outcome = write.apply(store, row, lane);
     // A non-`Advanced` outcome (unknown pool / replaced owner slot / regression)
     // means the watermark did NOT move — same hazard as a backend error — so
     // surface it too rather than dropping it on the floor. A lost rebase write
     // heals itself: the next run signs from the old anchor, draws `Underpaid`
     // again, and rebases again.
     let (bytes_delivered, amount) = progress.totals();
+    let pool_id = lane.pool_id;
     match outcome {
         Ok(AdvanceOutcome::Advanced) => {}
         Ok(other) => tracing::warn!(
@@ -464,9 +465,9 @@ fn face_watermark_writes(handles: &[FaceLaneHandle]) -> Vec<LaneWrite> {
 
 /// Apply every write in `writes`. Blocking: each write that moves the row is a
 /// redb commit.
-fn write_watermarks(store: &dyn BuyerPoolStore, self_address: Address, writes: Vec<LaneWrite>) {
+fn write_watermarks(store: &dyn BuyerPoolStore, row: WatermarkRow, writes: Vec<LaneWrite>) {
     for (lane, vprogress) in writes {
-        persist_watermark(store, self_address, lane.pool_id, lane, &vprogress);
+        persist_watermark(store, row, lane, &vprogress);
     }
 }
 
@@ -495,21 +496,21 @@ fn write_watermarks(store: &dyn BuyerPoolStore, self_address: Address, writes: V
 pub(crate) fn queue_face_watermarks(
     writes: &OrderedWrites,
     store: &Arc<dyn BuyerPoolStore>,
-    self_address: Address,
+    row: WatermarkRow,
     handles: &[FaceLaneHandle],
 ) -> tokio::sync::oneshot::Receiver<()> {
-    queue_watermark_writes(writes, store, self_address, face_watermark_writes(handles))
+    queue_watermark_writes(writes, store, row, face_watermark_writes(handles))
 }
 
 /// Queue `lane_writes` on `writes` ([`queue_face_watermarks`]).
 fn queue_watermark_writes(
     writes: &OrderedWrites,
     store: &Arc<dyn BuyerPoolStore>,
-    self_address: Address,
+    row: WatermarkRow,
     lane_writes: Vec<LaneWrite>,
 ) -> tokio::sync::oneshot::Receiver<()> {
     let store = Arc::clone(store);
-    writes.queue_awaitable(move || write_watermarks(store.as_ref(), self_address, lane_writes))
+    writes.queue_awaitable(move || write_watermarks(store.as_ref(), row, lane_writes))
 }
 
 /// One lane's persisted-watermark inputs, lifted out of [`MultiLane`] so the

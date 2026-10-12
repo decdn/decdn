@@ -14,9 +14,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
-use decdn_incentive::PoolId;
+use decdn_incentive::{LaneKey, PoolId};
 use iroh::RelayUrl;
 
+use crate::buyer_pool::WatermarkRow;
 use crate::discovery::NodeCandidate;
 use crate::funding::PoolFunder;
 use crate::lanes::{
@@ -229,39 +230,59 @@ where
         Some(slot.clone())
     }
 
-    /// Record in `slot` what earlier fetches signed under its current key, at
-    /// every provider the buyer store holds a lane for: the capability's
-    /// spend so far. Read once per slot generation, so a swapped-in key is
-    /// counted from its own records.
+    /// Record in `slot` what earlier fetches signed under its current key: the
+    /// delegate lanes this data dir records for the key in the capability's
+    /// pool on the fetch's deployment, at every provider. Read once per slot
+    /// generation, so a swapped-in key is counted from its own records; a
+    /// failed read is tried again at the next lane build.
+    ///
+    /// A lane the run's registry already holds counts only the prior it was
+    /// built with. The run's spend past that prior is counted from the
+    /// registry ([`LaneLedgers::signed_by`]), and a sibling entry of a bundle
+    /// may already have written it to the store, so the record would count it
+    /// twice.
     fn seed_spend(&self, slot: &CredentialSlot) {
         let generation = slot.generation();
-        if self.seeded.swap(generation, Ordering::Relaxed) == generation {
+        if self.seeded.load(Ordering::Relaxed) == generation {
             return;
         }
         let signer = slot.current().signer.address();
         let pool_id = slot.pool_id();
-        let row = self
-            .deps
-            .store
-            .get_by_pool_id(pool_id)
-            .unwrap_or_else(|error| {
-                // Counting from zero overstates the headroom, so a spent cap
+        let deployment = self.deps.chain.deployment();
+        let lanes = match self.deps.store.delegate_lanes(deployment, pool_id, signer) {
+            Ok(lanes) => lanes,
+            Err(error) => {
+                // The headroom reads high until a read succeeds, so a spent cap
                 // can read as the publisher's pool needing funds.
                 tracing::warn!(
                     %pool_id,
+                    %signer,
+                    chain_id = deployment.chain_id,
+                    payment_pool = %deployment.payment_pool,
                     %error,
-                    "could not read the buyer store; this key's earlier spend counts as zero"
+                    "could not read this key's delegate lanes from the buyer store; its \
+                     earlier spend is not counted against the capability until a read succeeds"
                 );
-                None
-            });
-        let recorded = row.map_or(alloy::primitives::U256::ZERO, |row| {
-            row.lanes()
-                .filter(|(lane, _)| lane.signer == signer)
-                .fold(alloy::primitives::U256::ZERO, |acc, (_, progress)| {
-                    acc.saturating_add(progress.last_amount)
-                })
-        });
+                return;
+            }
+        };
+        let recorded = lanes.iter().fold(
+            alloy::primitives::U256::ZERO,
+            |acc, (provider, progress)| {
+                let lane = LaneKey {
+                    pool_id,
+                    signer,
+                    provider: *provider,
+                };
+                let earlier = self
+                    .ledgers
+                    .and_then(|ledgers| ledgers.prior_amount(lane))
+                    .unwrap_or(progress.last_amount);
+                acc.saturating_add(earlier)
+            },
+        );
         slot.record_spend(signer, recorded);
+        self.seeded.store(generation, Ordering::Relaxed);
     }
 
     /// The fetch's funding recovery gate.
@@ -375,6 +396,15 @@ where
         drop(self.queue_watermarks());
     }
 
+    /// The buyer-store record every lane's watermark goes to: the owner's
+    /// pool row, or the delegate lanes on the fetch's deployment.
+    const fn watermark_row(&self) -> WatermarkRow {
+        match self.payer {
+            LanePayer::Owned(_) => WatermarkRow::Owned(self.deps.self_address),
+            LanePayer::Delegated(_) => WatermarkRow::Delegated(self.deps.chain.deployment()),
+        }
+    }
+
     /// Read every built lane's watermark from its ledger now, and queue the
     /// writes in that order ([`queue_face_watermarks`]).
     fn queue_watermarks(&self) -> tokio::sync::oneshot::Receiver<()> {
@@ -382,7 +412,7 @@ where
         queue_face_watermarks(
             self.deps.writes,
             self.deps.store,
-            self.deps.self_address,
+            self.watermark_row(),
             &handles,
         )
     }

@@ -1086,3 +1086,245 @@ async fn a_full_closing_pool_is_replaced() {
         "the estimate and the allowance ran"
     );
 }
+
+/// A delegated lane resumes from the delegate lanes the store holds for its
+/// key at this provider on this deployment. The key's lane at another
+/// provider is not this lane, and nor is a lane of the same key and pool on
+/// another deployment: `pool_id` repeats across deployments.
+#[tokio::test]
+async fn a_delegated_lane_resumes_from_its_delegate_record() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
+    let owner = Arc::new(PrivateKeySigner::random());
+    let delegate = Arc::new(PrivateKeySigner::random());
+    let pool_id = PoolId::repeat_byte(0x11);
+    let signed = decdn_incentive::Capability {
+        signer: delegate.address(),
+        spending_cap: 1_000_000,
+        pool_id,
+        expiry: u64::MAX,
+    }
+    .sign(owner.as_ref(), &bind_node_id_domain(1, Address::ZERO))?;
+    let grant = CapabilityGrant::from_signed_capability(&signed);
+    let lane = LaneKey {
+        pool_id,
+        signer: delegate.address(),
+        provider: PROVIDER,
+    };
+    let foreign = Deployment {
+        chain_id: 2,
+        ..DEPLOYMENT
+    };
+    let elsewhere = LaneKey {
+        provider: Address::repeat_byte(0x78),
+        ..lane
+    };
+    let outcome = store.advance_delegate_progress(
+        DEPLOYMENT,
+        elsewhere,
+        decdn_incentive::BuyerLaneProgress {
+            last_amount: U256::from(500u64),
+            last_bytes: U256::from(50_000u64),
+        },
+    )?;
+    anyhow::ensure!(outcome == AdvanceOutcome::Advanced);
+    for (deployment, bytes, amount) in [(DEPLOYMENT, 4_096u64, 40u64), (foreign, 9_999, 99)] {
+        let outcome = store.advance_delegate_progress(
+            deployment,
+            lane,
+            decdn_incentive::BuyerLaneProgress {
+                last_amount: U256::from(amount),
+                last_bytes: U256::from(bytes),
+            },
+        )?;
+        anyhow::ensure!(outcome == AdvanceOutcome::Advanced);
+    }
+
+    let ctx = delegated_ctx(&store, owner.address(), &delegate, &grant).await?;
+    anyhow::ensure!(
+        (ctx.prior_bytes_delivered, ctx.prior_amount) == (U256::from(4_096u64), U256::from(40u64)),
+        "resumed at ({}, {})",
+        ctx.prior_bytes_delivered,
+        ctx.prior_amount
+    );
+    Ok(())
+}
+
+/// Build `delegate`'s lane context at [`PROVIDER`] under `grant`, against a
+/// mocked `PaymentPool` that answers `getPool` with `owner`'s open pool and
+/// `usdc()` with [`TOKEN`].
+async fn delegated_ctx(
+    store: &dyn BuyerPoolStore,
+    owner: Address,
+    delegate: &Arc<PrivateKeySigner>,
+    grant: &CapabilityGrant,
+) -> anyhow::Result<PoolContext> {
+    let asserter = Asserter::new();
+    asserter.push_success(&pool(owner, WORKING, 0).abi_encode());
+    asserter.push_success(&TOKEN.abi_encode());
+    let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
+    let contract = PaymentPool::new(PP, rpc);
+    let chain = ChainConfig {
+        rpc_url: "http://config:8545".to_string(),
+        chain_id: DEPLOYMENT.chain_id,
+        payment_pool: PP,
+        slash_judge: Address::repeat_byte(0x44),
+        capacity_bond: None,
+    };
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind()
+        .await?;
+    let ctx = build_delegated_pool_ctx(
+        store,
+        &contract,
+        delegate,
+        &DEPLOYMENT.voucher_domain(),
+        PROVIDER,
+        &chain,
+        &endpoint,
+        grant,
+    )
+    .await;
+    endpoint.close().await;
+    ctx
+}
+
+/// The in-memory store, except that every delegate-lane read faults.
+#[derive(Debug, Default)]
+struct UnreadableDelegateLanes(decdn_incentive::MemoryBuyerPoolStore);
+
+impl BuyerPoolStore for UnreadableDelegateLanes {
+    fn load_all(&self) -> Result<decdn_incentive::BuyerLoad, decdn_incentive::StoreError> {
+        self.0.load_all()
+    }
+    fn record(&self, state: &BuyerPoolState) -> Result<(), decdn_incentive::StoreError> {
+        self.0.record(state)
+    }
+    fn forget(&self, owner: Address) -> Result<(), decdn_incentive::StoreError> {
+        self.0.forget(owner)
+    }
+    fn get_by_pool_id(
+        &self,
+        pool_id: PoolId,
+    ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
+        self.0.get_by_pool_id(pool_id)
+    }
+    fn forget_if_pool(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+    ) -> Result<bool, decdn_incentive::StoreError> {
+        self.0.forget_if_pool(owner, pool_id)
+    }
+    fn get_by_owner(
+        &self,
+        owner: Address,
+    ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
+        self.0.get_by_owner(owner)
+    }
+    fn advance_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
+        self.0.advance_progress(owner, pool_id, lane, bytes, amount)
+    }
+    fn rebase_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        anchor: decdn_incentive::BuyerLaneProgress,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
+        self.0.rebase_progress(owner, pool_id, lane, anchor, totals)
+    }
+    fn seed_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
+        self.0.seed_progress(owner, pool_id, lane, bytes, amount)
+    }
+    fn add_deposit(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        additional: U256,
+    ) -> Result<decdn_incentive::DepositOutcome, decdn_incentive::StoreError> {
+        self.0.add_deposit(owner, pool_id, additional)
+    }
+    fn delegate_lanes(
+        &self,
+        _deployment: Deployment,
+        pool_id: PoolId,
+        _signer: Address,
+    ) -> Result<Vec<(Address, decdn_incentive::BuyerLaneProgress)>, decdn_incentive::StoreError>
+    {
+        Err(decdn_incentive::StoreError::Corrupt {
+            pool_id: Some(pool_id),
+            detail: "delegate lane record damaged".into(),
+        })
+    }
+    fn advance_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
+        self.0.advance_delegate_progress(deployment, lane, totals)
+    }
+    fn rebase_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        anchor: decdn_incentive::BuyerLaneProgress,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
+        self.0
+            .rebase_delegate_progress(deployment, lane, anchor, totals)
+    }
+}
+
+/// A delegate-lane record the store cannot read fails the delegated lane
+/// build as this machine's fault: the acquire loop ends the command and does
+/// not retry the build as a chain-side fault that can never clear.
+#[tokio::test]
+async fn an_unreadable_delegate_record_fails_the_lane_build_fatally() -> anyhow::Result<()> {
+    let owner = Arc::new(PrivateKeySigner::random());
+    let delegate = Arc::new(PrivateKeySigner::random());
+    let signed = decdn_incentive::Capability {
+        signer: delegate.address(),
+        spending_cap: 1_000_000,
+        pool_id: PoolId::repeat_byte(0x11),
+        expiry: u64::MAX,
+    }
+    .sign(owner.as_ref(), &bind_node_id_domain(1, Address::ZERO))?;
+    let grant = CapabilityGrant::from_signed_capability(&signed);
+    let Err(err) = delegated_ctx(
+        &UnreadableDelegateLanes::default(),
+        owner.address(),
+        &delegate,
+        &grant,
+    )
+    .await
+    else {
+        anyhow::bail!("an unreadable delegate record built a lane");
+    };
+    let fault = crate::fault::classify(&anyhow::Error::new(crate::fault::LaneBuildFault(err)));
+    anyhow::ensure!(
+        matches!(
+            fault,
+            crate::fault::Fault::Fatal(crate::fault::FatalScope::Command)
+        ),
+        "classified {fault:?}"
+    );
+    Ok(())
+}

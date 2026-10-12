@@ -306,7 +306,7 @@ fn persist_watermark_overwrites_once_on_a_rebase() -> anyhow::Result<()> {
     };
     let progress = VoucherProgress::from_cumulative(totals, U256::from(90u64))
         .with_rebase_anchor(Some(anchor));
-    persist_watermark(&store, owner, pool_id, lane, &progress);
+    persist_watermark(&store, WatermarkRow::Owned(owner), lane, &progress);
     let got = lane_record(&store, pool_id, lane)?;
     assert_eq!(
         (got.last_bytes, got.last_amount),
@@ -318,7 +318,7 @@ fn persist_watermark_overwrites_once_on_a_rebase() -> anyhow::Result<()> {
         amount: U256::from(65u64),
     };
     let progress = VoucherProgress::from_cumulative(lower, U256::ZERO);
-    persist_watermark(&store, owner, pool_id, lane, &progress);
+    persist_watermark(&store, WatermarkRow::Owned(owner), lane, &progress);
     let got = lane_record(&store, pool_id, lane)?;
     assert_eq!(
         (got.last_bytes, got.last_amount),
@@ -407,9 +407,14 @@ async fn a_rebase_read_first_never_lands_over_a_newer_advance() -> anyhow::Resul
     let writes = OrderedWrites::default();
     let release = hold(&writes);
     let rebase = lane_write(lane, (200, 70), 90, Some((100, 60)));
-    drop(queue_watermark_writes(&writes, &store, owner, vec![rebase]));
+    drop(queue_watermark_writes(
+        &writes,
+        &store,
+        WatermarkRow::Owned(owner),
+        vec![rebase],
+    ));
     let advance = lane_write(lane, (300, 80), 70, None);
-    let landed = queue_watermark_writes(&writes, &store, owner, vec![advance]);
+    let landed = queue_watermark_writes(&writes, &store, WatermarkRow::Owned(owner), vec![advance]);
     release.send(())?;
     tokio::time::timeout(Duration::from_secs(10), landed).await??;
     let got = lane_record(store.as_ref(), pool_id, lane)?;
@@ -433,11 +438,11 @@ async fn a_stale_advance_read_first_never_lands_over_a_rebase() -> anyhow::Resul
     drop(queue_watermark_writes(
         &writes,
         &store,
-        owner,
+        WatermarkRow::Owned(owner),
         vec![advance],
     ));
     let rebase = lane_write(lane, (200, 70), 90, Some((100, 60)));
-    let landed = queue_watermark_writes(&writes, &store, owner, vec![rebase]);
+    let landed = queue_watermark_writes(&writes, &store, WatermarkRow::Owned(owner), vec![rebase]);
     release.send(())?;
     tokio::time::timeout(Duration::from_secs(10), landed).await??;
     let got = lane_record(store.as_ref(), pool_id, lane)?;
@@ -466,7 +471,7 @@ fn a_detached_settle_lands_by_runtime_shutdown() -> anyhow::Result<()> {
         drop(queue_watermark_writes(
             &writes,
             &store,
-            owner,
+            WatermarkRow::Owned(owner),
             vec![advance],
         ));
     });
@@ -575,4 +580,66 @@ fn multi_lane_watermarks_report_no_advance_for_an_untouched_lane() {
         None,
         "a lane at its prior amount has not advanced"
     );
+}
+
+/// A delegated lane's watermark lands in the delegate lanes of its
+/// deployment: advanced, then moved down by a rebase. A delegate owns no pool
+/// row, so the same write as an owner's would land nowhere.
+#[test]
+fn persist_watermark_records_a_delegated_lane() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = RedbBuyerPoolStore::open(&dir.path().join("data"))?;
+    let deployment = Deployment {
+        chain_id: 421_614,
+        payment_pool: Address::repeat_byte(0x7B),
+    };
+    let lane = LaneKey {
+        pool_id: PoolId::repeat_byte(0x01),
+        signer: Address::repeat_byte(0x0D),
+        provider: Address::repeat_byte(0xB0),
+    };
+    let recorded =
+        |store: &RedbBuyerPoolStore| store.delegate_lanes(deployment, lane.pool_id, lane.signer);
+    let paid = Cumulative {
+        bytes: U256::from(200u64),
+        amount: U256::from(70u64),
+    };
+
+    let progress = VoucherProgress::from_cumulative(paid, U256::ZERO);
+    let owned = ProgressWrite::of(&progress)
+        .ok_or_else(|| anyhow::anyhow!("an advance calls for a write"))?
+        .apply(&store, WatermarkRow::Owned(lane.signer), lane)?;
+    anyhow::ensure!(owned == AdvanceOutcome::UnknownPool);
+
+    persist_watermark(&store, WatermarkRow::Delegated(deployment), lane, &progress);
+    anyhow::ensure!(
+        recorded(&store)?
+            == vec![(
+                lane.provider,
+                BuyerLaneProgress {
+                    last_amount: paid.amount,
+                    last_bytes: paid.bytes,
+                },
+            )]
+    );
+
+    let anchor = Cumulative {
+        bytes: U256::from(100u64),
+        amount: U256::from(60u64),
+    };
+    let progress = VoucherProgress::from_cumulative(anchor, U256::from(70u64))
+        .with_rebase_anchor(Some(anchor));
+    persist_watermark(&store, WatermarkRow::Delegated(deployment), lane, &progress);
+    anyhow::ensure!(
+        recorded(&store)?
+            == vec![(
+                lane.provider,
+                BuyerLaneProgress {
+                    last_amount: anchor.amount,
+                    last_bytes: anchor.bytes,
+                },
+            )],
+        "a rebase moves the delegate lane down"
+    );
+    Ok(())
 }

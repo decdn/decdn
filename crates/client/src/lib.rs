@@ -115,8 +115,11 @@
 //!   hold.
 //! - **Never resume a lane below its on-chain watermark.** A voucher at or below
 //!   the watermark redeems nothing, so the provider streams bytes it can never
-//!   cash. A lane the buyer store has not seen resumes from the chain's
-//!   `getWatermark`.
+//!   cash. A self-owned lane the buyer store has not seen resumes from the
+//!   chain's `getWatermark`. A delegated lane has no watermark on chain until a
+//!   redemption records it, so one the store has not seen starts at zero and
+//!   heals from the watermark bundle the node returns (ADR 003 § Capability
+//!   delegation).
 //! - **Keep the stream drive running.** [`Streamer::open`] returns a reader and
 //!   a [`StreamDrive`]. Run your read inside [`StreamDrive::alongside`]: the
 //!   drive pays and drains open legs, and it must not wait behind a blocked

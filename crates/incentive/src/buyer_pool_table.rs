@@ -20,6 +20,10 @@
 //! [`BuyerPoolTable`]. Both stores share this code, so their on-disk format is
 //! byte-identical by construction, and `tests::encode_is_byte_stable` pins the bytes.
 //!
+//! The file can also hold the delegate-lane table (`DELEGATE_LANE_TABLE`):
+//! the voucher watermarks of a key that signs on a pool another owner funds.
+//! Only a delegated client writes it.
+//!
 //! The operations here never assume they own the file or that the buyer
 //! table is the only table in it — that is what makes the node's
 //! multi-table layout safe to serve from the same code.
@@ -98,6 +102,154 @@ const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 /// padding attempt is observable in operator logs without re-introducing
 /// the strict-decoding regression issue #527's reviewers warned against.
 const SANE_TRAILER_MAX_BYTES: usize = 256;
+
+/// The delegate-lane table: `chain_id ‖ payment_pool ‖ pool_id ‖ signer ‖
+/// provider` (100 bytes) → one lane's progress.
+///
+/// A delegate signs vouchers under an owner-signed capability on a pool
+/// another owner funds (ADR 003 § Capability delegation). It holds no pool row
+/// in [`BUYER_POOL_TABLE`], so its lanes live here, apart from the pool rows
+/// and the owner index. The key starts with the [`Deployment`]
+/// ([`Deployment::to_bytes`]) because a `pool_id` repeats across
+/// `PaymentPool` deployments. Every key part has a fixed width and the parts
+/// sit in this order, so all lanes of one signer in one pool share one
+/// [`DELEGATE_SIGNER_PREFIX_LEN`]-byte prefix, and one range scan returns
+/// them.
+///
+/// The same frozen-identifier rule as [`BUYER_POOL_TABLE`] applies: **a
+/// layout change bumps [`DELEGATE_LANE_SCHEMA_VERSION`] and this table-name
+/// suffix together.** A file that holds no table of this name reads as no
+/// delegate lanes.
+const DELEGATE_LANE_TABLE: TableDefinition<
+    'static,
+    &'static [u8; DELEGATE_LANE_KEY_LEN],
+    &'static [u8],
+> = TableDefinition::new("buyer_delegate_lanes_v1");
+
+/// The delegate-lane record `schema_version` this binary reads and writes.
+/// Matched exactly, as [`BUYER_SUPPORTED_SCHEMA_VERSION`] is.
+const DELEGATE_LANE_SCHEMA_VERSION: u32 = 1;
+
+/// Byte width of a `pool_id` in a delegate-lane key.
+const POOL_ID_LEN: usize = 32;
+
+/// Byte width of an address (a signer or a provider) in a delegate-lane key.
+const ADDRESS_LEN: usize = 20;
+
+/// Byte width of the part of a delegate-lane key that names one signer in one
+/// pool: the deployment, the `pool_id` and the signer.
+const DELEGATE_SIGNER_PREFIX_LEN: usize = Deployment::ENCODED_LEN + POOL_ID_LEN + ADDRESS_LEN;
+
+/// Byte width of a delegate-lane key: the signer prefix and the provider.
+const DELEGATE_LANE_KEY_LEN: usize = DELEGATE_SIGNER_PREFIX_LEN + ADDRESS_LEN;
+
+// The key is a frozen on-disk identifier: a width change fails the build here,
+// not the key copy at run time.
+const _: () = assert!(DELEGATE_LANE_KEY_LEN == 100);
+
+/// On-disk delegate-lane record. `last_amount` and `last_bytes` use the
+/// fixed-size big-endian encoding of [`StoredLane`]; the signer and the
+/// provider live in the key, not the value. **The field order is the wire
+/// order**, pinned by `delegate_lane_encode_is_byte_stable`.
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredDelegateLane {
+    schema_version: u32,
+    last_amount: [u8; 32],
+    last_bytes: [u8; 32],
+}
+
+/// One delegate-lane write: a monotone advance checked against the recorded
+/// lane, or a rebase that overwrites it unread.
+#[derive(Debug, Clone, Copy)]
+enum DelegateWrite {
+    Advance(BuyerLaneProgress),
+    Rebase {
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    },
+}
+
+/// The delegate-lane key prefix for `signer` in `pool_id` on `deployment`.
+fn delegate_signer_prefix(
+    deployment: Deployment,
+    pool_id: PoolId,
+    signer: Address,
+) -> [u8; DELEGATE_SIGNER_PREFIX_LEN] {
+    let mut out = [0u8; DELEGATE_SIGNER_PREFIX_LEN];
+    for (slot, byte) in out.iter_mut().zip(
+        deployment
+            .to_bytes()
+            .into_iter()
+            .chain(pool_id.0)
+            .chain(signer.into_array()),
+    ) {
+        *slot = byte;
+    }
+    out
+}
+
+/// The delegate-lane key `prefix ‖ tail`: `tail` is a provider's bytes for a
+/// point key, or the all-`0x00` / all-`0xff` bound of a range scan over one
+/// signer prefix.
+fn delegate_lane_key(
+    prefix: [u8; DELEGATE_SIGNER_PREFIX_LEN],
+    tail: [u8; 20],
+) -> [u8; DELEGATE_LANE_KEY_LEN] {
+    let mut out = [0u8; DELEGATE_LANE_KEY_LEN];
+    for (slot, byte) in out.iter_mut().zip(prefix.into_iter().chain(tail)) {
+        *slot = byte;
+    }
+    out
+}
+
+/// The point key of `lane` on `deployment`.
+fn delegate_key(deployment: Deployment, lane: LaneKey) -> [u8; DELEGATE_LANE_KEY_LEN] {
+    delegate_lane_key(
+        delegate_signer_prefix(deployment, lane.pool_id, lane.signer),
+        lane.provider.into_array(),
+    )
+}
+
+/// Encode one delegate-lane record.
+fn encode_delegate_lane(progress: BuyerLaneProgress) -> Result<Vec<u8>, StoreError> {
+    postcard::to_allocvec(&StoredDelegateLane {
+        schema_version: DELEGATE_LANE_SCHEMA_VERSION,
+        last_amount: progress.last_amount.to_be_bytes(),
+        last_bytes: progress.last_bytes.to_be_bytes(),
+    })
+    .map_err(|err| StoreError::Codec(format!("delegate lane postcard encode: {err}")))
+}
+
+/// Decode the delegate-lane record of `lane`. `lane` names the record in a
+/// decode error.
+///
+/// The record has one fixed layout per table name, so trailing bytes mean a
+/// damaged record and decode as [`StoreError::Corrupt`]: a damaged record
+/// that still starts with a valid one must not read as a plausible watermark.
+fn decode_delegate_lane(lane: LaneKey, bytes: &[u8]) -> Result<BuyerLaneProgress, StoreError> {
+    let corrupt = |why: String| StoreError::Corrupt {
+        pool_id: Some(lane.pool_id),
+        detail: format!(
+            "delegate lane record (pool_id {}, signer {}, provider {}) {why}",
+            lane.pool_id, lane.signer, lane.provider
+        ),
+    };
+    let (stored, remainder): (StoredDelegateLane, &[u8]) = postcard::take_from_bytes(bytes)
+        .map_err(|err| corrupt(format!("postcard decode failed: {err}")))?;
+    if !remainder.is_empty() {
+        return Err(corrupt(format!("has {} trailing bytes", remainder.len())));
+    }
+    if stored.schema_version != DELEGATE_LANE_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found: stored.schema_version,
+            supported: DELEGATE_LANE_SCHEMA_VERSION,
+        });
+    }
+    Ok(BuyerLaneProgress {
+        last_amount: U256::from_be_bytes(stored.last_amount),
+        last_bytes: U256::from_be_bytes(stored.last_bytes),
+    })
+}
 
 /// On-disk per-lane progress entry. Fixed-size big-endian fields, same
 /// convention as the pool-level record.
@@ -770,6 +922,142 @@ impl<'a> BuyerPoolTable<'a> {
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
         Ok(DepositOutcome::Added(new_deposit))
+    }
+
+    /// The recorded progress of every delegate lane `signer` holds in
+    /// `pool_id` on `deployment`, as `(provider, progress)` pairs ordered by
+    /// provider. Empty if the delegate-lane table does not exist; a read never
+    /// creates it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if unreadable, [`StoreError::Corrupt`] /
+    /// [`StoreError::UnsupportedSchema`] if a record cannot be decoded.
+    pub fn delegate_lanes(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+        signer: Address,
+    ) -> Result<Vec<(Address, BuyerLaneProgress)>, StoreError> {
+        let prefix = delegate_signer_prefix(deployment, pool_id, signer);
+        let first = delegate_lane_key(prefix, [0x00; ADDRESS_LEN]);
+        let last = delegate_lane_key(prefix, [0xff; ADDRESS_LEN]);
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let table = match read_txn.open_table(DELEGATE_LANE_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(StoreError::Backend(format!("open_table (delegate): {err}"))),
+        };
+        let range = table
+            .range::<&[u8; DELEGATE_LANE_KEY_LEN]>(&first..=&last)
+            .map_err(|err| StoreError::Backend(format!("range (delegate): {err}")))?;
+        let mut out = Vec::new();
+        for entry in range {
+            let (key_guard, value_guard) =
+                entry.map_err(|err| StoreError::Backend(format!("range entry: {err}")))?;
+            let (_, provider) =
+                key_guard
+                    .value()
+                    .split_last_chunk::<ADDRESS_LEN>()
+                    .ok_or(StoreError::Corrupt {
+                        pool_id: Some(pool_id),
+                        detail: "delegate lane key is shorter than a provider address".into(),
+                    })?;
+            let lane = LaneKey {
+                pool_id,
+                signer,
+                provider: Address::from(*provider),
+            };
+            out.push((
+                lane.provider,
+                decode_delegate_lane(lane, value_guard.value())?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Atomically advance the delegate lane `lane` on `deployment` to `totals`
+    /// ([`BuyerLaneProgress`]'s monotonicity rule), inside one durable write
+    /// transaction. Creates the table and the lane if absent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] / [`StoreError::Codec`] on I/O or codec
+    /// failure, [`StoreError::Corrupt`] / [`StoreError::UnsupportedSchema`] if
+    /// the recorded lane cannot be decoded.
+    pub fn advance_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.write_delegate_lane(deployment, lane, DelegateWrite::Advance(totals))
+    }
+
+    /// Atomically overwrite the delegate lane `lane` on `deployment` with
+    /// `anchor` and advance it to `totals` (the rule of
+    /// [`BuyerPoolState::rebase_lane`]), inside one durable write transaction.
+    /// Creates the table and the lane if absent. The recorded lane is not
+    /// read, so the overwrite also replaces a record that cannot be decoded.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] / [`StoreError::Codec`] on I/O or codec
+    /// failure.
+    pub fn rebase_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.write_delegate_lane(deployment, lane, DelegateWrite::Rebase { anchor, totals })
+    }
+
+    /// The shared body of [`Self::advance_delegate_progress`] and
+    /// [`Self::rebase_delegate_progress`]: compute the lane's new progress
+    /// (an advance reads the committed lane first) and write it, all in one
+    /// durable write transaction.
+    fn write_delegate_lane(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        write: DelegateWrite,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        let key = delegate_key(deployment, lane);
+        let write_txn = self.begin_durable_write()?;
+        {
+            let mut table = write_txn
+                .open_table(DELEGATE_LANE_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table (delegate): {err}")))?;
+            let progress = match write {
+                DelegateWrite::Advance(totals) => {
+                    let recorded = table
+                        .get(&key)
+                        .map_err(|err| StoreError::Backend(format!("get (delegate): {err}")))?
+                        .map(|guard| decode_delegate_lane(lane, guard.value()))
+                        .transpose()?;
+                    match BuyerLaneProgress::advanced(recorded, totals) {
+                        Ok(progress) => progress,
+                        Err(err) => return Ok(AdvanceOutcome::Regressed(err)),
+                    }
+                }
+                DelegateWrite::Rebase { anchor, totals } => {
+                    BuyerLaneProgress::rebased(anchor, totals)
+                }
+            };
+            let encoded = encode_delegate_lane(progress)?;
+            table
+                .insert(&key, encoded.as_slice())
+                .map_err(|err| StoreError::Backend(format!("insert (delegate): {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(AdvanceOutcome::Advanced)
     }
 
     /// Write raw value bytes under `pool_id`'s primary key, **bypassing the
