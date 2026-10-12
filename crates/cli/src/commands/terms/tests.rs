@@ -79,3 +79,10 @@ fn ensure_accepted_stale_terms_refused_even_with_flag() {
     // must be refused regardless of the flag — never sign unseen terms.
     assert!(ensure_accepted(B256::repeat_byte(0x99), true).is_err());
 }
+
+#[test]
+fn carriage_return_check_flags_crlf_only() {
+    assert!(contains_cr(b"line\r\nline"));
+    assert!(!contains_cr(b"line\nline"));
+    assert!(!contains_cr(TERMS_TEXT.as_bytes()));
+}
