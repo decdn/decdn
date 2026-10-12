@@ -1,7 +1,8 @@
 use super::{
     AllowanceShortfall, LOW_WATER_DIVISOR, OpenUnconfirmed, PaymentPool, TopUpUnconfirmed,
-    approval_floor, approve_decision, escrowed_but_untracked, grade_deposit_credit,
-    issue_self_capability, open_pool, pool_accepts_funds, refill_amount, send_open_pool, top_up,
+    approval_floor, approve_decision, ensure_allowance, escrowed_but_untracked,
+    grade_deposit_credit, issue_self_capability, open_pool, pool_accepts_funds, refill_amount,
+    send_open_pool, top_up,
 };
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, TxHash, U256};
@@ -225,6 +226,49 @@ fn regenerated_capability_is_deterministic_for_same_params() -> anyhow::Result<(
 }
 
 // ---- allowance decision -------------
+
+/// The `approve` note that a transport failure may have broadcast the tx.
+const APPROVE_MAYBE_BROADCAST: &str = "may have reached the node and broadcast the transaction";
+
+/// Run [`ensure_allowance`] on a filler-free mocked provider whose RPC calls
+/// `asserter` answers in order, and return its error.
+async fn approve_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error {
+    ensure_allowance(
+        &alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter),
+        Address::repeat_byte(0x44),
+        Address::repeat_byte(0x22),
+        Address::repeat_byte(0x01),
+        None,
+    )
+    .await
+    .unwrap_err()
+}
+
+/// An `approve` submit that fails in transport may have been broadcast with no
+/// hash returned, so the error warns before the operator re-runs (#2416).
+#[tokio::test]
+async fn a_transport_failed_approve_submit_warns_it_may_have_broadcast() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    // An ABI-encoded zero allowance, so `approve` is sent; the send itself
+    // finds no reply.
+    asserter.push_success(&B256::ZERO);
+    let msg = format!("{:#}", approve_on(asserter).await);
+    assert!(msg.contains("submit USDC approve"), "{msg}");
+    assert!(msg.contains(APPROVE_MAYBE_BROADCAST), "{msg}");
+    assert!(msg.contains("eth_sendTransaction"), "{msg}");
+}
+
+/// An `approve` submit the RPC node rejects broadcast nothing, so it carries no
+/// broadcast warning.
+#[tokio::test]
+async fn a_rejected_approve_submit_does_not_warn() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&B256::ZERO);
+    asserter.push_failure_msg("insufficient funds for gas");
+    let msg = format!("{:#}", approve_on(asserter).await);
+    assert!(msg.contains("submit USDC approve"), "{msg}");
+    assert!(!msg.contains(APPROVE_MAYBE_BROADCAST), "{msg}");
+}
 
 #[test]
 fn unlimited_zero_allowance_approves_max() {

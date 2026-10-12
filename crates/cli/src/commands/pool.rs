@@ -557,9 +557,9 @@ fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Errors when the send is rejected, the receipt cannot be read, the tx
-/// reverted, or the local row-clear faulted after a landed close. A send that
-/// fails in transport warns that the tx may have broadcast (see `send_failed`).
+/// Errors when the send fails (an error that leaves the broadcast unknown says
+/// so; see `send_failed`), the receipt cannot be read, the tx reverted, or the
+/// local row-clear faulted after a landed close.
 async fn close_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -622,10 +622,10 @@ where
 ///
 /// # Errors
 ///
-/// Errors when the send is rejected, the receipt cannot be read, or the tx
-/// reverted after the pre-check passed (see `reclaim_reverted`). A send that
-/// fails in transport warns that the tx may have broadcast (see `send_failed`).
-/// A failed local row-clear only warns — the refund itself landed.
+/// Errors when the send fails (an error that leaves the broadcast unknown says
+/// so; see `send_failed`), the receipt cannot be read, or the tx reverted after
+/// the pre-check passed (see `reclaim_reverted`). A failed local row-clear only
+/// warns — the refund itself landed.
 async fn reclaim_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -675,10 +675,11 @@ fn reclaim_reverted(pool_id: PoolId, tx: Option<TxHash>) -> String {
 }
 
 /// The error for a `closePool` / `reclaim` send that failed with no revert
-/// data. A transport-class failure may have broadcast the tx before its response
-/// was lost and returned no hash, so the note sends the operator to this
-/// signer's own transactions. A JSON-RPC rejection broadcast nothing and gets no
-/// note (#1577).
+/// data. When `send_broadcast_unknown` holds (a timeout, a reset, an HTTP 5xx,
+/// an unreadable response), the tx may have broadcast before its response was
+/// lost and no hash came back, so the note sends the operator to this signer's
+/// own transactions. Any other failure (a JSON-RPC rejection, an HTTP 4xx, a
+/// local fault) broadcast nothing and gets no note (#1577).
 fn send_failed(err: alloy::contract::Error, label: &str) -> anyhow::Error {
     let note = if decdn_incentive::tx::send_broadcast_unknown(&err) {
         ": the request may have reached the node and broadcast the transaction — check this \

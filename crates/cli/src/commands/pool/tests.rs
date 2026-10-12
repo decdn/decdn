@@ -857,6 +857,8 @@ async fn a_transport_failed_close_send_warns_it_may_have_broadcast() {
     );
     assert!(msg.contains("closePool send failed"), "{msg}");
     assert!(msg.contains(MAYBE_BROADCAST), "{msg}");
+    // The failure is the send itself, not a fill-stage read before it.
+    assert!(msg.contains("eth_sendTransaction"), "{msg}");
 }
 
 /// A `closePool` send the RPC node rejects broadcast nothing, so it carries no
@@ -880,6 +882,8 @@ async fn a_transport_failed_reclaim_send_warns_it_may_have_broadcast() {
     );
     assert!(msg.contains("reclaim send failed"), "{msg}");
     assert!(msg.contains(MAYBE_BROADCAST), "{msg}");
+    // The failure is the send itself, not a fill-stage read before it.
+    assert!(msg.contains("eth_sendTransaction"), "{msg}");
 }
 
 /// A `reclaim` send the RPC node rejects broadcast nothing, so it carries no

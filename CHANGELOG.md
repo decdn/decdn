@@ -996,12 +996,14 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
-- **`decdn pool close` and `pool reclaim` warn when a failed send may have
-  broadcast (#2416).** A `closePool` or `reclaim` send that fails in transport
-  (a timeout, a connection reset, an HTTP 5xx) may have reached the node and
-  broadcast the tx with no hash returned. The error now says so and tells the
-  operator to check this signer's pending and mined transactions before
-  re-running. A send the RPC node rejects outright carries no warning.
+- **`decdn pool close`, `pool reclaim`, and the USDC `approve` warn when a
+  failed send may have broadcast (#2416).** A `closePool`, `reclaim`, or
+  `approve` send that fails in transport (a timeout, a connection reset, an HTTP
+  5xx) may have reached the node and broadcast the tx with no hash returned.
+  The error now says so and tells the operator to check this signer's pending
+  and mined transactions before re-running. The `approve` runs from `pool
+  open`, `pool top-up`, `fetch`, and the daemon's buyer funding. A send the RPC
+  node rejects outright carries no warning.
 - **The daemon no longer escrows a second pool deposit after an `openPool`
   whose outcome it did not see (#2415).** When the `openPool` receipt read
   failed, or its submit failed in transport, the open task freed the open
