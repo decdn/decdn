@@ -2862,7 +2862,9 @@ since project inception and will roll into the first tagged release.
 - **Published crate docs read for crates.io and docs.rs users (#2442).** The
   crate roots of `decdn-protocol`, `-incentive`, `-node`, `-reputation`,
   `-bao-range`, `-config-types` and `-cache` each open with a one-sentence
-  purpose and a module or entry-point table, and link ADRs by absolute URL.
+  purpose and a map of the crate's API, and link ADRs by absolute URL. Six of
+  them map it as a module or entry-point table; `decdn-reputation`, whose API
+  is one type and its config, names them in prose.
   `decdn-protocol` and `decdn-incentive` each carry a compiled example (frame
   round-trip, voucher sign and verify). docs.rs builds `decdn-incentive` with
   the `redb` feature, so `buyer_pool_redb` and `buyer_pool_table` render with
