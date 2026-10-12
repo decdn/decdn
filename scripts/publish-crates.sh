@@ -7,7 +7,7 @@
 # workflow definition from the pushed ref, so a token reachable from release.yml
 # would be reachable from any tag anyone with push access could craft.
 #
-# Usage:  .github/scripts/publish-crates.sh v0.1.2
+# Usage:  scripts/publish-crates.sh v0.1.2
 #
 # Environment:
 #   DECDN_REPO             override the owner/repo (default: decdn/decdn)
@@ -209,7 +209,7 @@ Check: gh release view $TAG --repo $REPO"
 case "$IS_DRAFT" in
   false) ;;
   true) die "release $TAG is still a draft.
-Run .github/scripts/sign-release.sh $TAG first — crates.io publishes are
+Run scripts/sign-release.sh $TAG first — crates.io publishes are
 irreversible, so nothing goes out before the signed release does." ;;
   *) die "unexpected isDraft value from gh: '$IS_DRAFT' (expected true or false)" ;;
 esac
@@ -223,7 +223,7 @@ gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev
   grep -qx 'SHA256SUMS.asc' || die \
   "release $TAG carries no SHA256SUMS.asc — it is published but was never signed.
 Nothing goes to crates.io that no maintainer signature vouches for.
-Run .github/scripts/sign-release.sh $TAG."
+Run scripts/sign-release.sh $TAG."
 
 # ---- publish from the tagged tree ----------------------------------------
 
@@ -527,7 +527,7 @@ else
   echo
   echo "==> Skipping devops's decdn bump ($TAG is a pre-release)"
 fi
-open_bump sponsord decdn/sponsord .github/scripts/open-decdn-bump.sh "$SKIP_SPONSORD_BUMP"
+open_bump sponsord decdn/sponsord scripts/open-decdn-bump.sh "$SKIP_SPONSORD_BUMP"
 
 echo
 echo "Published ${#CRATES[@]} crates at $VERSION."

@@ -8,7 +8,7 @@
 # promotes the image tags, and publishes. There is no signing key in Actions
 # secrets.
 #
-# Usage:  .github/scripts/sign-release.sh v0.1.2
+# Usage:  scripts/sign-release.sh v0.1.2
 #
 # Environment:
 #   DECDN_REPO            override the owner/repo (default: decdn/decdn)

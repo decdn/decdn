@@ -22,8 +22,8 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SCRIPT = REPO_ROOT / ".github/scripts/sign-release.sh"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts/sign-release.sh"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("gpg") is None or shutil.which("gpgconf") is None,

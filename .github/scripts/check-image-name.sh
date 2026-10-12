@@ -62,14 +62,14 @@ expect_pair() {
 # The list is checked whole: dropping a stage from it would leave that image's
 # digest unsigned and its tags unpromoted, and the table lines alone would
 # still pass.
-expect .github/scripts/sign-release.sh 'IMAGES=( "decdn-node" "decdn" )'
+expect scripts/sign-release.sh 'IMAGES=( "decdn-node" "decdn" )'
 
 # Stage name → repository suffix.
 for pair in "decdn-node:-node" "decdn:"; do
   stage="${pair%%:*}" suffix="${pair#*:}"
   expect_pair .github/workflows/release.yml "$stage" "${GH_REPO}${suffix}"
   # shellcheck disable=SC2016  # ${REPO} is literal text in the target file
-  expect .github/scripts/sign-release.sh "[${stage}]="'"ghcr.io/${REPO}'"${suffix}"'"'
+  expect scripts/sign-release.sh "[${stage}]="'"ghcr.io/${REPO}'"${suffix}"'"'
   expect .github/workflows/security.yml  "- ghcr.io/${GH_REPO}${suffix}"
 done
 

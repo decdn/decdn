@@ -2817,6 +2817,12 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Release: `sign-release.sh` and `publish-crates.sh` live in `scripts/`.**
+  Run them as `scripts/sign-release.sh <tag>` and
+  `scripts/publish-crates.sh <tag>`. `.github/scripts/` keeps only what
+  workflows and hooks run. `publish-crates.sh` runs sponsord's bump from its
+  `scripts/open-decdn-bump.sh`, so a release needs sponsord's matching move on
+  its `main`.
 - **Both container images run on Debian 13 (`trixie-slim`, glibc 2.41)
   (#2409).** The binaries are the same cross-built release archives, so
   nothing changes for an operator who runs the daemon or CLI as shipped. An
@@ -3595,7 +3601,7 @@ since project inception and will roll into the first tagged release.
   `-gossip`, `-reputation`, `-incentive`, `-client-pull`, `-node` and
   `decdn-cli` — making `cargo install decdn-cli` and `cargo install decdn-node`
   work. `decdn-e2e` stays `publish = false`.
-  - Publishing is a new maintainer-run step, `.github/scripts/publish-crates.sh`,
+  - Publishing is a new maintainer-run step, `scripts/publish-crates.sh`,
     which runs *after* `sign-release.sh`. It verifies the tag against `KEYS` and
     against `origin`, requires the GitHub Release to be published rather than a
     draft, and publishes from a detached worktree at the tag rather than from the
