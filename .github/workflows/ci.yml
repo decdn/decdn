@@ -299,9 +299,11 @@ jobs:
               # .github/scripts/tests and scripts/tests). CI helpers live under
               # .github/scripts/, maintainer-run release scripts under scripts/,
               # each beside its regression tests; a PR that touches no scripts
-              # has nothing for that job to verify.
+              # has nothing for that job to verify. docker/ holds the Docker Hub
+              # overviews, whose format and links scripts/tests checks.
               - '.github/scripts/**'
               - 'scripts/**'
+              - 'docker/**'
               - '.github/workflows/ci.yml'
             docker:
               # Gates `docker-build`. Must live in THIS filter, not the
@@ -1173,8 +1175,9 @@ jobs:
     name: CI tooling tests
     runs-on: ubuntu-latest
     needs: changes
-    # Gated on the `scripts` filter: this only exercises .github/scripts/ and
-    # scripts/, so a PR that touches neither has nothing to verify here. Not in ci-success.needs
+    # Gated on the `scripts` filter: this only exercises .github/scripts/,
+    # scripts/ and the docker/ overviews, so a PR that touches none of them has
+    # nothing to verify here. Not in ci-success.needs
     # (non-blocking by design), so a skip needs no allowed-skips entry.
     if: needs.changes.outputs.scripts == 'true' || github.event_name != 'pull_request'
     steps:
@@ -1216,7 +1219,7 @@ jobs:
       # In a script, not inline: a `run:` block is templated by Actions before
       # bash sees it, so an inline grep for the literal `${{ github.repository }}`
       # would search for the expanded value and never match.
-      - name: Image names agree across workflows and the signing script
+      - name: Image names agree across workflows and the signing script, and each image has an overview
         run: .github/scripts/check-image-name.sh
 
       # The Rust version is written in rust-toolchain.toml, Cargo.toml's

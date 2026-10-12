@@ -22,9 +22,13 @@
 #                         image tag — the release then ships with only the
 #                         signed digests in the *-image-digest.txt files
 #   DECDN_SKIP_DOCKERHUB  set to 1 to tag on GHCR only, skipping the Docker Hub
-#                         mirror (implied by DECDN_SKIP_IMAGE_TAGS)
+#                         mirror and overview (implied by DECDN_SKIP_IMAGE_TAGS)
 #   DECDN_DOCKERHUB_REPO  the Docker Hub counterpart of DECDN_REPO (default:
 #                         DECDN_REPO). The images are <it>-node and <it>.
+#   DECDN_DOCKERHUB_USERNAME, DECDN_DOCKERHUB_TOKEN
+#                         a Docker Hub personal access token for the overview
+#                         push, when the `docker login` credential is not one
+#                         the Hub API accepts (see dockerhub-description.py)
 #
 # Re-running is safe at any point before the release is published: signatures
 # are re-uploaded with --clobber and the tag promotion is idempotent. Once the
@@ -142,6 +146,12 @@ if [[ -z "$SKIP_IMAGE_TAGS" ]]; then
     echo "warning: no Docker Hub credentials found in the docker config." >&2
     echo "         Run \`docker login docker.io\`, or set DECDN_SKIP_DOCKERHUB=1" >&2
     echo "         to tag on GHCR only." >&2
+  fi
+  # The overview push only warns when it fails, so a missing python3 only warns
+  # too. Said now, so it can be installed before anything is signed.
+  if [[ -z "$SKIP_DOCKERHUB" ]] && ! command -v python3 >/dev/null; then
+    echo "warning: python3 not found on PATH; the Docker Hub overview push" >&2
+    echo "         will fail. The mirror itself does not need it." >&2
   fi
 fi
 
@@ -519,6 +529,7 @@ imagetools create succeeded, so ${target} tags may already have moved.${already}
 
   if [[ -n "$SKIP_DOCKERHUB" ]]; then
     echo "==> Skipping the Docker Hub mirror (DECDN_SKIP_DOCKERHUB set)"
+    OVERVIEW_NOTE="skipped (DECDN_SKIP_DOCKERHUB set)"
   else
     # Before the release leaves draft, not after: the two registries are
     # advertised as interchangeable, so publishing with only one populated
@@ -528,6 +539,32 @@ imagetools create succeeded, so ${target} tags may already have moved.${already}
       promote_to "${DOCKERHUB_IMAGE[$img]}" "${GHCR_IMAGE[$img]}" "${DIGEST[$img]}" "docker.io"
       PROMOTED+=( "${DOCKERHUB_IMAGE[$img]}" )
     done
+
+    # Docker Hub does not read the OCI labels, so each repository's
+    # description and overview come from docker/README.<stage>.md as committed
+    # at the tag. A prerelease leaves them alone, for the reason it leaves
+    # `latest` alone: the page describes what an unpinned pull gets. A failure
+    # here only warns. The overview does not decide whether the release is
+    # sound, and the standalone command repairs it after publishing, when this
+    # script refuses to run again. The summary at the end repeats the warning.
+    OVERVIEW_ARGS=( --ref "$TAG" )
+    for img in "${IMAGES[@]}"; do
+      OVERVIEW_ARGS+=( "${DOCKERHUB_IMAGE[$img]#docker.io/}=${img}" )
+    done
+    if [[ "$VERSION" == *-* ]]; then
+      echo "==> $VERSION is a prerelease: leaving the Docker Hub overviews alone"
+      OVERVIEW_NOTE="left alone (prerelease)"
+    else
+      echo "==> Pushing the Docker Hub overviews from docker/README.<stage>.md at $TAG"
+      if "$REPO_ROOT/scripts/dockerhub-description.py" "${OVERVIEW_ARGS[@]}"; then
+        OVERVIEW_NOTE="pushed"
+      else
+        OVERVIEW_FAILED="scripts/dockerhub-description.py ${OVERVIEW_ARGS[*]}"
+        echo "warning: the Docker Hub overview push failed; the release goes on." >&2
+        echo "         Fix the cause above, then run:" >&2
+        echo "         ${OVERVIEW_FAILED}" >&2
+      fi
+    fi
   fi
 
   # The checks above run with the maintainer's registry credentials, so they
@@ -562,3 +599,9 @@ gh release edit $TAG --repo $REPO --draft=false"
 
 echo
 echo "Published: https://github.com/${REPO}/releases/tag/${TAG}"
+if [[ -n "${OVERVIEW_FAILED:-}" ]]; then
+  echo "warning: the Docker Hub overviews are NOT updated. Run:" >&2
+  echo "         ${OVERVIEW_FAILED}" >&2
+elif [[ -n "${OVERVIEW_NOTE:-}" ]]; then
+  echo "Docker Hub overviews: ${OVERVIEW_NOTE}"
+fi

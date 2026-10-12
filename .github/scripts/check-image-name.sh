@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fails if a container image repository is spelled inconsistently.
+# Fails if a container image repository is spelled inconsistently, or if an
+# image has no Docker Hub overview file.
 #
 # There are two images: `<repo>-node` (daemon + CLI) and `<repo>` (CLI only).
 # Each name lives in three places that must agree:
@@ -12,6 +13,12 @@
 #
 # A mismatch is otherwise caught only when sign-release.sh rejects a digest
 # file — after a full release build, with the tag already pushed.
+#
+# Each stage also needs its Docker Hub overview, docker/README.<stage>.md,
+# which sign-release.sh pushes to the Hub repository after the mirror. A
+# missing one otherwise shows up only as a warning at release time, with the
+# Hub page left stale. This checks only that the file exists; the
+# scripts/tests suite checks its contents.
 #
 # This lives in a script rather than inline in the workflow ON PURPOSE. GitHub
 # Actions expands `${{ … }}` inside a `run:` block before bash ever sees it, so
@@ -29,6 +36,7 @@ cd "$REPO_ROOT"
 GH_REPO='${{ github.repository }}'
 
 fail=0
+missing_overview=0
 # Whole-line match after stripping indentation: `image: <repo>` is a prefix of
 # `image: <repo>-node`, so a substring match would let the CLI line go missing
 # unnoticed.
@@ -71,6 +79,10 @@ for pair in "decdn-node:-node" "decdn:"; do
   # shellcheck disable=SC2016  # ${REPO} is literal text in the target file
   expect scripts/sign-release.sh "[${stage}]="'"ghcr.io/${REPO}'"${suffix}"'"'
   expect .github/workflows/security.yml  "- ghcr.io/${GH_REPO}${suffix}"
+  [[ -f "docker/README.${stage}.md" ]] || {
+    echo "error: stage $stage has no Docker Hub overview: docker/README.${stage}.md" >&2
+    missing_overview=1
+  }
 done
 
 if (( fail )); then
@@ -80,7 +92,16 @@ Each image repository must be spelled the same in all three places, or
 sign-release.sh will reject the digest file that release.yml wrote —
 after a full release build, with the tag already pushed.
 EOF
+fi
+if (( missing_overview )); then
+  cat >&2 <<EOF
+
+Each image needs docker/README.<stage>.md (see RELEASING.md § Signing and
+publishing), or its Docker Hub page is left stale at release time.
+EOF
+fi
+if (( fail || missing_overview )); then
   exit 1
 fi
 
-echo "image names consistent across release.yml, security.yml and sign-release.sh"
+echo "image names consistent across release.yml, security.yml and sign-release.sh; every image has an overview file"
