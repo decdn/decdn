@@ -66,8 +66,8 @@ HELPER_MISS = "credentials not found"
 # Docker's marker for an identity (OAuth) token in place of a username.
 IDENTITY_TOKEN_USER = "<token>"
 DEFAULT_API = "https://hub.docker.com"
-# The test seam: tests point the script at a fake Hub on localhost. Anything
-# else must be https, because the login carries the secret.
+# The test seam: tests point the script at a fake Hub on localhost. The login
+# carries the secret, so the seam accepts only Docker Hub itself or loopback.
 API_ENV = "DECDN_DOCKERHUB_API"
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 # Hub's own limits on the two fields.
@@ -136,12 +136,15 @@ def parse_overview(text: str, source: str) -> Overview:
 
 def read_at_ref(ref: str, path: str) -> str:
     """The file at `path` as committed at `ref`."""
-    result = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "show", f"{ref}:{path}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "show", f"{ref}:{path}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except UnicodeDecodeError:
+        raise Failure(f"{path} at {ref} is not UTF-8") from None
     if result.returncode != 0:
         raise Failure(f"cannot read {path} at {ref}: {result.stderr.strip()}")
     return result.stdout
@@ -187,6 +190,8 @@ def from_helper(helper: str) -> tuple[str, str] | None:
             f"{program} gave no answer in {TIMEOUT}s (is the keychain locked, "
             "or waiting for a passphrase?)"
         ) from None
+    except UnicodeDecodeError:
+        raise Failure(f"{program} printed something that is not UTF-8") from None
     except OSError as err:
         raise Failure(f"cannot run {program}: {err}") from None
     if result.returncode != 0:
@@ -266,13 +271,15 @@ def credential() -> tuple[str, str]:
 
 
 def api_base() -> str:
-    """The Hub API origin: DEFAULT_API, or the test seam's fake."""
+    """The Hub API origin: DEFAULT_API, or the test seam's fake on loopback."""
     api = (os.environ.get(API_ENV) or DEFAULT_API).rstrip("/")
+    if api == DEFAULT_API:
+        return api
     parsed = urllib.parse.urlsplit(api)
-    if parsed.scheme != "https" and not (
-        parsed.scheme == "http" and parsed.hostname in LOCAL_HOSTS
-    ):
-        raise Failure(f"{API_ENV} must be an https:// URL (or http:// on localhost): {api!r}")
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in LOCAL_HOSTS:
+        raise Failure(
+            f"{API_ENV} accepts only {DEFAULT_API} or a loopback test server: {api!r}"
+        )
     return api
 
 

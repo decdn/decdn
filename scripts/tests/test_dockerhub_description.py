@@ -353,6 +353,15 @@ def test_line_1_and_the_blank_lines_after_it_are_stripped(hub_env: Env) -> None:
     }
 
 
+def test_a_file_that_is_not_utf8_fails_cleanly(hub_env: Env) -> None:
+    (hub_env.repo / "docker/README.decdn.md").write_bytes(b"<!-- description: x -->\n\xff\xfe\n")
+    hub_env.git("add", "-A")
+    hub_env.git("commit", "-q", "-m", "binary")
+    result = hub_env.run("decdn/decdn=decdn")
+    assert_clean_failure(result, "docker/README.decdn.md at HEAD is not UTF-8")
+    assert hub_env.hub.requests == []
+
+
 def test_a_missing_file_names_it(hub_env: Env) -> None:
     result = hub_env.run("decdn/other=other")
     assert_clean_failure(result, "docker/README.other.md")
@@ -462,6 +471,13 @@ def test_no_docker_config_at_all(hub_env: Env) -> None:
         ),
         (
             lambda e: (
+                e.helper("binary", "printf '\\377\\376'"),
+                e.config({"credsStore": "binary"}),
+            ),
+            "docker-credential-binary printed something that is not UTF-8",
+        ),
+        (
+            lambda e: (
                 e.answering_helper("blank", {"Username": "", "Secret": SECRET}),
                 e.config({"credsStore": "blank"}),
             ),
@@ -485,6 +501,11 @@ def test_a_hung_helper_times_out_cleanly(
     monkeypatch.setattr(module, "TIMEOUT", 0.5)
     hub_env.helper("hung", "sleep 10")
     hub_env.config({"credsStore": "hung"})
+    # Env.env() drops the caller's DECDN_/DOCKER_ variables; drop them here too,
+    # or an exported token would bypass the helper this test hangs.
+    for key in list(os.environ):
+        if key.startswith(("DECDN_", "DOCKER_")):
+            monkeypatch.delenv(key)
     for key, value in hub_env.env().items():
         monkeypatch.setenv(key, value)
     with pytest.raises(module.Failure, match="gave no answer"):
@@ -526,10 +547,21 @@ def test_an_unreachable_hub_fails_cleanly(hub_env: Env) -> None:
     assert "refused the login" not in result.stderr
 
 
-@pytest.mark.parametrize("api", ["http://hub.example.com", "ftp://127.0.0.1", "hub.docker.com"])
-def test_the_api_override_must_be_https_off_localhost(hub_env: Env, api: str) -> None:
+@pytest.mark.parametrize(
+    "api",
+    [
+        "https://hub.example.com",
+        "https://hub.docker.com.example.com",
+        "http://hub.docker.com",
+        "http://hub.example.com",
+        "ftp://127.0.0.1",
+        "hub.docker.com",
+    ],
+)
+def test_the_api_override_accepts_only_docker_hub_or_loopback(hub_env: Env, api: str) -> None:
+    # The login sends the secret to this origin, so no other host may receive it.
     result = hub_env.run(DECDN_DOCKERHUB_API=api)
-    assert_clean_failure(result, "must be an https:// URL")
+    assert_clean_failure(result, "accepts only https://hub.docker.com or a loopback")
     assert hub_env.hub.requests == []
 
 
