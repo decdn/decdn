@@ -33,8 +33,8 @@ release.
 
 ### Changed
 
-- **decdn v0.0.2.** The decdn crates are locked at decdn's `v0.0.2` release tag
-  (`a9f8af9c655666f3a03efe073035139e6f4bdbfa`) and require `0.0.2`, which is on
+- **decdn v0.0.3.** The decdn crates are locked at decdn's `v0.0.3` release tag
+  (`1c41dd6e095e843ff6e2bab8340e12767aa68e32`) and require `0.0.3`, which is on
   crates.io.
 
 ## [0.0.2] - 2026-10-09
