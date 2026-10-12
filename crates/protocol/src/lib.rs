@@ -1,7 +1,58 @@
-//! Wire protocol types, ALPN identifiers, and message definitions for deCDN.
+//! The deCDN wire protocol: the ALPN identifiers, the message types each ALPN
+//! carries, and the framing that puts them on a QUIC stream.
 //!
-//! This is the leaf crate in the dependency graph — it has minimal dependencies
-//! and defines the shared vocabulary used by all other deCDN crates.
+//! deCDN speaks three ALPNs ([ADR 005]):
+//!
+//! | ALPN | Constant | Messages | Purpose |
+//! |---|---|---|---|
+//! | `cdn/probe/v1` | [`ALPN_PROBE`] | [`ProbeMessage`] | Latency and availability probing |
+//! | `cdn/client/v1` | [`ALPN_CLIENT`] | [`ClientMessage`] | All paid delivery, client to node and node to node |
+//! | `cdn/dht/v1` | [`ALPN_DHT`] | [`DhtMessage`] | Content discovery over a Kademlia DHT ([ADR 022]) |
+//!
+//! # Modules
+//!
+//! | Module | Contents |
+//! |---|---|
+//! | [`framing`] | The length-prefixed frame, [`encode_message`] / [`decode_message`], and the async [`read_frame`] / [`write_frame`] |
+//! | [`message`] | `cdn/probe/v1`: [`ProbeRequest`], [`ProbeResponse`] |
+//! | [`client`] | `cdn/client/v1`: [`StreamRequest`], [`StreamResponse`], [`ChunkData`], the wire [`Voucher`], [`StreamError`] |
+//! | [`dht`] | `cdn/dht/v1`: store and find requests, provider records, closer-node lists |
+//! | [`coverage`] | The block coverage bitmap a partial holder advertises |
+//! | [`identity`] | The 32-byte [`NodeId`] and [`ContentHash`] newtypes |
+//! | [`region`] | ISO 3166-1 alpha-2 [`Region`] codes |
+//!
+//! # Frames and extensions
+//!
+//! Every message is a postcard encoding behind a varint length prefix, capped at
+//! [`MAX_MESSAGE_SIZE`] ([ADR 013 § Wire Framing]). A signed message has a frozen
+//! base: the fields its signature covers. Unsigned fields travel as trailing
+//! bytes after the base. [`decode_message`] returns them as a remainder, and the
+//! `parse_*_ext` functions read them ([ADR 013 § Three Tiers of Evolution]).
+//!
+//! ```
+//! use decdn_protocol::{ProbeMessage, ProbeRequest, decode_message, encode_message};
+//!
+//! let request = ProbeMessage::Request(ProbeRequest {
+//!     hash: [7; 32],
+//!     timestamp_us: 1_700_000_000_000_000,
+//! });
+//! let frame = encode_message(&request)?;
+//! let (decoded, remainder) = decode_message::<ProbeMessage>(&frame)?;
+//! assert_eq!(decoded, request);
+//! assert!(remainder.is_empty());
+//! # Ok::<(), decdn_protocol::FrameError>(())
+//! ```
+//!
+//! This crate holds no cryptography. The signatures carried in these messages
+//! are made and checked by [`decdn-incentive`]. It has few dependencies, so
+//! code that only speaks the protocol links no blob store, Ethereum client, or
+//! cloud SDK.
+//!
+//! [ADR 005]: https://github.com/decdn/decdn/blob/main/adr/005-protocol.md
+//! [ADR 022]: https://github.com/decdn/decdn/blob/main/adr/022-content-discovery.md
+//! [ADR 013 § Wire Framing]: https://github.com/decdn/decdn/blob/main/adr/013-schema-evolution.md#wire-framing
+//! [ADR 013 § Three Tiers of Evolution]: https://github.com/decdn/decdn/blob/main/adr/013-schema-evolution.md#three-tiers-of-evolution
+//! [`decdn-incentive`]: https://docs.rs/decdn-incentive
 
 pub mod client;
 pub mod coverage;

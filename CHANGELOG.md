@@ -2859,6 +2859,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Published crate docs read for crates.io and docs.rs users (#2442).** The
+  crate roots of `decdn-protocol`, `-incentive`, `-node`, `-reputation`,
+  `-bao-range`, `-config-types` and `-cache` each open with a one-sentence
+  purpose and a module or entry-point table, and link ADRs by absolute URL.
+  `decdn-protocol` and `decdn-incentive` each carry a compiled example (frame
+  round-trip, voucher sign and verify). docs.rs builds `decdn-incentive` with
+  the `redb` feature, so `buyer_pool_redb` and `buyer_pool_table` render with
+  feature badges. The `decdn-node`, `-bao-range`, `-config-types`,
+  `-incentive` and `decdn-e2e` package descriptions say what the crate is.
+
 - **`decdn-client`: a delegated fetch or bundle pull takes a credential swap
   mid-run (#2429).** Every lane reads the `CredentialSlot`'s current key and
   capability when it is built, so a credential the application swaps in takes

@@ -4,12 +4,14 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 
 > **Status: early implementation.** deCDN runs a public testnet on Arbitrum Sepolia and is pre-mainnet. Wire formats, APIs and on-chain interfaces change without compatibility shims until mainnet.
 
-[`bao-tree`](https://docs.rs/bao-tree)-based verified-range helpers: chunk-group alignment,
-encoded-size arithmetic, and range encode/verify against an untrusted `{hash}.obao4` pre-order
-outboard.
+Bao verified-range helpers, built on [`bao-tree`](https://docs.rs/bao-tree): align a byte
+range to bao chunk groups, encode a verified range for the wire, and size that encoding. An
+origin range verifies against an untrusted `{hash}.obao4` pre-order outboard.
 
-Deliberately free of `iroh-blobs`. That is what lets the publisher CLI request and verify byte
-ranges without linking a blob store — see ADR 038 for the range-transfer design.
+Deliberately free of `iroh-blobs`. That is what lets the client SDK and the `decdn` CLI request
+and verify byte ranges without linking a blob store. See
+[ADR 038](https://github.com/decdn/decdn/blob/main/adr/038-bao-verified-range-streaming.md) for
+the range-transfer design.
 
 ## License
 

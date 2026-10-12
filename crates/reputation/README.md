@@ -4,11 +4,12 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 
 > **Status: early implementation.** deCDN runs a public testnet on Arbitrum Sepolia and is pre-mainnet. Wire formats, APIs and on-chain interfaces change without compatibility shims until mainnet.
 
-Local per-peer reputation scoring (ADR 008): an exponentially weighted moving average over
+Local per-peer reputation scoring
+([ADR 008](https://github.com/decdn/decdn/blob/main/adr/008-reputation.md)): an exponentially weighted moving average over
 observed delivery outcomes, used to rank candidate peers. Probes record nothing.
 
 Scores are strictly local. There is no gossip aggregation and no shared reputation state — a
-node's view is built only from what it has itself observed.
+node's view is built only from what it has itself observed, and it lives in memory only.
 
 ## License
 

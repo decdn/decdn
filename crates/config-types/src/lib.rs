@@ -1,17 +1,20 @@
-//! Config-vocabulary value types shared by `decdn-cache` and `decdn-common`.
+//! The value types of the deCDN config vocabulary: hashes, byte sizes, origin
+//! URLs, and the retry, breaker, and decompression policies that a node's
+//! config is built from.
 //!
-//! This is a leaf crate: its only *runtime* dependencies are `serde`,
-//! `url`, and `anyhow` (the test suite also uses `serde_json`, a
-//! dev-dependency that never reaches the release binary).
-//! It deliberately does NOT pull `iroh-blobs`, the AWS SDK, or `reqwest`,
-//! so the publisher CLI (`decdn`, via `decdn-common`) links none of the
-//! heavy storage/network stack — see `adr/appendix-binaries.md` and
-//! issue #578.
+//! | Area | Types |
+//! |---|---|
+//! | Content | [`struct@Hash`] (a BLAKE3 hash as config text), [`PinnedHashes`], [`DeniedHashes`], [`PinDiff`] |
+//! | Origins | [`OriginUrl`], [`OriginKind`], [`parse_origin_url`], [`redact_for_log`] |
+//! | Policies | [`RetryPolicy`], [`CircuitBreakerPolicy`], [`DecompressMode`] |
+//! | Sizes and defaults | [`Bytes`], the `DEFAULT_*` constants |
 //!
-//! `decdn-cache` re-exports every type here so existing `decdn_cache::*`
-//! paths in `decdn-node` keep resolving; the conversion between the
-//! [`struct@Hash`] newtype here and `iroh_blobs::Hash` (the blob-store hash)
-//! lives behind a thin shim in `decdn-cache`.
+//! Both `decdn-cache` and `decdn-common` build on these types. This crate
+//! depends only on `serde`, `url`, and `anyhow`. It links no blob store, no
+//! cloud SDK, and no HTTP client, so the `decdn` CLI can parse a node config
+//! without them ([Binaries § Decision]).
+//!
+//! [Binaries § Decision]: https://github.com/decdn/decdn/blob/main/adr/appendix-binaries.md#decision
 
 mod bytes;
 mod circuit_breaker;

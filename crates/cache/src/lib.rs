@@ -1,19 +1,36 @@
-//! Cache engine for deCDN.
+//! The deCDN node's cache engine: an `iroh-blobs` store with origin
+//! pull-through, range admission, and pluggable admission and eviction
+//! policies.
 //!
-//! Wraps `iroh-blobs` with origin pull-through logic. The buffered entry
-//! points ([`engine::CacheEngine::get`] / `populate`) fetch from a configured
-//! [`Origin`] backend on a cache miss, verify the BLAKE3 hash, and insert the
-//! bytes before returning them to the caller. The streaming entry points do
-//! not buffer whole-blob first: [`engine::CacheEngine::origin_range_wire`]
-//! streams one verified sub-range per draw, window by window, for the node's
-//! two-leg serve-miss spine. Node-to-node pull-through is one
-//! such backend — the
-//! `node` crate supplies an [`Origin`] (`NodeOrigin`, #831) that pays a peer
-//! over `cdn/client/v1` — so this crate needs no knowledge of the paid path.
+//! [`CacheEngine`] owns the store. On a cache miss it pulls from a configured
+//! [`Origin`] and verifies the bytes against their BLAKE3 hash before it
+//! stores or returns them. Pinned blobs, probe holds, and the deny-sets are
+//! enforced by the engine itself, whatever policy is plugged in.
 //!
-//! Leaf crate per `adr/appendix-poc-production-seams.md` — no `#[cfg(...)]`
-//! mode branching or feature flags here. The `node` crate's wiring layer
-//! selects which origin backend to construct.
+//! # Entry points
+//!
+//! | You want to | Use |
+//! |---|---|
+//! | Open a store | [`CacheEngine::open`] and its variants |
+//! | Read a whole blob, pulling it from the origin on a miss | [`CacheEngine::get`], [`CacheEngine::populate`] |
+//! | Stream a verified sub-range from the origin, one window per draw | [`CacheEngine::origin_range_wire`] |
+//! | Export a stored range as the bao wire encoding | [`CacheEngine::export_bao_range_stream`] |
+//! | Admit a verified bao stream into the store | [`CacheEngine::admit_bao_stream`] |
+//! | Share one in-progress fill between several readers | [`FillRegistry`], [`FillSession`] |
+//! | Pick an origin backend | [`FilesystemOrigin`], [`HttpOrigin`], [`S3Origin`], or your own [`Origin`] |
+//! | Choose what to admit and what to evict | [`AdmissionPolicy`], [`EvictionPolicy`] ([ADR 040]) |
+//! | Bound a failing origin | [`OriginBreaker`], [`RetryPolicy`] |
+//!
+//! # Seams
+//!
+//! This crate has no payment logic, so it runs on its own for local
+//! development and tests. A paid node-to-node pull is one more [`Origin`]: the
+//! node supplies an origin that pays a peer over `cdn/client/v1`. The crate has
+//! no mode branching and no feature flags. The node's wiring layer picks the
+//! backends ([PoC/production seams]).
+//!
+//! [ADR 040]: https://github.com/decdn/decdn/blob/main/adr/040-cache-policy.md
+//! [PoC/production seams]: https://github.com/decdn/decdn/blob/main/adr/appendix-poc-production-seams.md
 
 pub mod circuit_breaker;
 pub mod engine;
@@ -52,13 +69,11 @@ pub use fill_session::{
     Demand, DemandSlot, DownstreamWatch, FillClaim, FillError, FillRegistry, FillSession, Frontier,
     HashOutboard, ObserverLease, SessionOutboardReader,
 };
-/// The blob-store hash. `decdn_cache::Hash` continues to mean
-/// `iroh_blobs::Hash` (the BLAKE3 digest the iroh-blobs store keys on)
-/// so every existing `decdn_cache::Hash` path in `decdn-node` and the
-/// cache crate is unchanged. The *config-vocabulary* hash that crosses
+/// The blob-store hash: `decdn_cache::Hash` is `iroh_blobs::Hash`, the BLAKE3
+/// digest the iroh-blobs store keys on. The *config-vocabulary* hash that crosses
 /// operator-facing config/admin surfaces is the distinct
 /// [`decdn_config_types::Hash`]; [`to_store_hash`]/[`from_store_hash`]
-/// convert between the two (both are the same 32 bytes — issue #578).
+/// convert between the two (both are the same 32 bytes).
 pub use iroh_blobs::Hash;
 pub use metrics::CacheMetrics;
 pub use origin::{
@@ -78,10 +93,9 @@ pub use serve_store::{EncodeStream, PresentRangeWatch, ServeStore};
 
 // Config-vocabulary types live in the `decdn-config-types` leaf crate
 // (no iroh-blobs / no AWS SDK) so the publisher CLI doesn't link the
-// storage stack — see issue #578 and `adr/appendix-binaries.md`.
-// Re-exported here so existing `decdn_cache::*` paths in `decdn-node`
-// keep resolving unchanged. `decdn_config_types::Hash` is intentionally
-// NOT re-exported as `decdn_cache::Hash` — that name stays the store
+// storage stack (see `adr/appendix-binaries.md`). They are re-exported here so the
+// node names its cache vocabulary from one crate. `decdn_config_types::Hash`
+// is NOT re-exported as `decdn_cache::Hash` — that name stays the store
 // hash above.
 /// The config-vocabulary hash type (`decdn_config_types::Hash`), re-exported so
 /// callers can build a [`DeniedHashes`] / [`PinnedHashes`] without taking a
@@ -96,7 +110,7 @@ pub use decdn_config_types::{
 
 /// Convert a config-vocabulary [`decdn_config_types::Hash`] into the
 /// blob-store [`struct@Hash`]. Both are 32-byte BLAKE3 digests; this is a pure
-/// byte-for-byte reinterpretation (issue #578). Used at the node's
+/// byte-for-byte reinterpretation. Used at the node's
 /// admin boundary where `parse_hash_arg` yields the config-vocabulary
 /// hash that must then index the store.
 #[must_use]

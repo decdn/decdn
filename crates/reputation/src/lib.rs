@@ -1,12 +1,20 @@
-//! Reputation scoring for deCDN nodes (ADR 008).
+//! Local reputation scoring for deCDN nodes: each node scores the peers it
+//! deals with from its own delivery outcomes ([ADR 008]).
 //!
-//! - [`local`] — per-peer EWMA folded from direct delivery outcomes (ADR 008
-//!   §Local Score Calculation). In-memory; persistence deferred per §14a.3.
-//! - `interaction` (crate-private) — the per-outcome interaction-quality
-//!   helpers that map an observed delivery (speed, correctness) to a `[0,1]`
-//!   score fed into the local EWMA.
+//! [`LocalReputation`] keeps one EWMA score in `[0, 1]` per peer. Feed it each
+//! observed delivery with [`LocalReputation::record`], and read a peer's score
+//! with [`LocalReputation::score`]. An idle score decays back toward neutral
+//! ([ADR 008 § Score Decay]). [`LocalReputationConfig`] sets the smoothing
+//! factor, the neutral score, the decay half-life, and the outcome weights
+//! ([ADR 008 § Local Score Calculation]).
 //!
-//! This crate scores only from direct, first-party delivery outcomes.
+//! Every score comes from direct, first-party outcomes. Nodes do not share or
+//! aggregate scores. Scores live in memory only, so a restart starts every peer
+//! at neutral.
+//!
+//! [ADR 008]: https://github.com/decdn/decdn/blob/main/adr/008-reputation.md
+//! [ADR 008 § Score Decay]: https://github.com/decdn/decdn/blob/main/adr/008-reputation.md#score-decay
+//! [ADR 008 § Local Score Calculation]: https://github.com/decdn/decdn/blob/main/adr/008-reputation.md#local-score-calculation
 
 mod interaction;
 pub mod local;

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Cross-layer Rust↔contract end-to-end test fixtures for deCDN (issue #1028)"
+description = "Cross-layer Rust↔contract end-to-end test fixtures for deCDN"
 publish = false
 
 # This crate is test-infrastructure only: it ships reusable fixtures (chain /

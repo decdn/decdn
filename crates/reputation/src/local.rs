@@ -1,10 +1,10 @@
-//! Local reputation scoring (ADR 008 §3 with the §14a scope reductions).
+//! Local reputation scoring (ADR 008 §Local Score Calculation).
 //!
 //! Folds delivery outcomes into a per-peer EWMA score in `[0.0, 1.0]`, and
 //! decays idle scores back toward neutral over time (ADR 008 §Score Decay) so
 //! a peer that stops being used drifts back to unopinionated rather than
-//! holding a stale high or low score. In-memory only; persistence is deferred
-//! per ADR 008 §14a.3.
+//! holding a stale high or low score. Scores live in memory only, so a restart
+//! starts every peer at neutral.
 
 use iroh::PublicKey as NodeId;
 use std::collections::HashMap;
