@@ -25,6 +25,26 @@ use anyhow::Context;
 /// `TERMS_README.md` alongside it for the editing rules.
 pub const TERMS_TEXT: &str = include_str!("../../TERMS.md");
 
+/// Fails the build when the embedded terms carry a carriage return. The
+/// on-chain hash commits to the LF bytes of `TERMS.md`; a checkout that converts
+/// line endings to CRLF would otherwise build a binary whose terms hash never
+/// matches the network. `.gitattributes` keeps the file byte-exact.
+const _: () = assert!(
+    !contains_cr(TERMS_TEXT.as_bytes()),
+    "TERMS.md has CRLF line endings; check it out byte-exact (see .gitattributes)"
+);
+
+const fn contains_cr(bytes: &[u8]) -> bool {
+    let mut rest = bytes;
+    while let [first, tail @ ..] = rest {
+        if *first == b'\r' {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
 /// `keccak256` of the embedded terms — the value the operator's signature
 /// commits to and which must equal the network's on-chain `currentTermsHash`.
 #[must_use]

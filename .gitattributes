@@ -1,0 +1,3 @@
+# Byte-exact on every checkout: the hash of these bytes is the on-chain
+# `currentTermsHash` preimage. A CRLF conversion changes the hash.
+crates/cli/TERMS.md -text
