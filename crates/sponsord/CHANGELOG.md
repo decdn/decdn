@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-10-12
+
 ### Changed
 
 - **Debian 13 image base.** The container image is built on

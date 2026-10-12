@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-10-12
+
 ### Changed (BREAKING)
 
 - **The installers download through the onramp themselves; there is no

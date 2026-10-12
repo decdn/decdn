@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-10-12
+
 ### Changed (BREAKING)
 
 - **`CapabilityResponse` carries `expiry`**, the Unix time the capability is
