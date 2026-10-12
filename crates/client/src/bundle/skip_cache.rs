@@ -152,7 +152,7 @@ pub(crate) fn serialize(manifest: &SavedManifest) -> anyhow::Result<Vec<u8>> {
 /// lets an incremental flush move the write off the async executor.
 pub(crate) fn write_bytes(out_root: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let dest = out_root.join(SAVED_MANIFEST_NAME);
-    let mut tmp = super::fetch::temp_in_parent(&dest).context("stage saved manifest")?;
+    let mut tmp = super::engine::temp_in_parent(&dest).context("stage saved manifest")?;
     std::io::Write::write_all(tmp.as_file_mut(), bytes).context("write saved manifest")?;
     tmp.as_file().sync_all().context("sync saved manifest")?;
     tmp.persist(&dest)

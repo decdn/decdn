@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
 use decdn_client::funding::{RunFunding, cached_pool_token};
-use decdn_client::lane_sources::LaneSources;
+use decdn_client::lane_sources::{FaultContext, LaneSources};
 use decdn_client::lanes::{LaneDeps, STALL_WINDOW, SettleOnDrop};
 use decdn_client::session::{
     ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, ProxyWarmingParams,
@@ -72,19 +72,7 @@ use decdn_client::ordered_writes::OrderedWrites;
 
 /// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
-pub(crate) fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
-    let hex = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("b3:"))
-        .unwrap_or(s);
-    let h = blake3::Hash::from_hex(hex).map_err(|e| {
-        anyhow::anyhow!(
-            "invalid hash {s:?}: expected 64 hex chars (BLAKE3 digest), optional `0x`/`b3:` \
-             prefix: {e}"
-        )
-    })?;
-    Ok(*h.as_bytes())
-}
+pub(crate) use decdn_client::bundle::parse_hash;
 
 /// Build the `decdn fetch` delivery progress bar (#1118). Drawn to stderr and
 /// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
@@ -743,7 +731,7 @@ async fn fetch_over(
         if let Some(shortfall) = funding.shortfall() {
             eprintln!("warning: {shortfall}");
         }
-        let result = result.map_err(|err| annotate(err, &sources));
+        let result = result.map_err(|err| annotate(err, &sources.fault_context()));
         match next_pass(result, &mut replaced, wants_stdout(&args.output)) {
             Some(pass_result) => return pass_result,
             None => recovery.start_next_pass(),
@@ -861,18 +849,15 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
 /// underfunded cache miss ([`annotate_unbound_cache_miss`]), and a pool no
 /// provider's voucher fits — the owner-side remedy on a delegated pool
 /// ([`annotate_delegated_exhaustion`]), else the top-up command.
-pub(crate) fn annotate<P>(err: anyhow::Error, sources: &LaneSources<'_, P>) -> anyhow::Error
-where
-    P: alloy::providers::Provider + Clone,
-{
-    let err = match sources.first_lane_ctx() {
-        Some(ctx) => annotate_with(err, &ctx),
+pub(crate) fn annotate(err: anyhow::Error, at: &FaultContext) -> anyhow::Error {
+    let err = match &at.first_lane {
+        Some(ctx) => annotate_with(err, ctx),
         None => err,
     };
-    if sources.is_delegated() {
+    if at.delegated {
         return annotate_delegated_exhaustion(err);
     }
-    with_top_up_hint(err, sources.pool_id())
+    with_top_up_hint(err, at.pool_id)
 }
 
 /// Name the top-up command on a self-owned pool no provider's voucher fits.
@@ -1080,25 +1065,6 @@ where
 /// `-` is written by addressing it as `./-`, the usual convention (#1848 4b).
 fn wants_stdout(output: &Path) -> bool {
     output == Path::new("-")
-}
-
-/// Where the [`decdn_client::ClientRangedStore`] for `--output` lives: its directory (the
-/// output's parent, or the current dir) and its stem (the output's own file
-/// name). Keying the store by the output name makes its promoted final path IS
-/// `--output` (no post-finalize rename), and its `.partial` sits beside the
-/// destination exactly like `<output>.partial`, so promotion is a
-/// same-filesystem atomic rename.
-pub(crate) fn ranged_store_location(output: &Path) -> anyhow::Result<(PathBuf, String)> {
-    let dir = match output.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let stem = output
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("--output {} has no usable file name", output.display()))?
-        .to_string();
-    Ok((dir, stem))
 }
 
 /// Time constant for the smoothed delivery rate (seconds). Larger holds the
@@ -1332,16 +1298,6 @@ pub(crate) fn resolve_delegation_grant(
         chain.working_deposit = U256::ZERO;
     }
     Ok(grant)
-}
-
-/// A unique `O_CREAT|O_EXCL` temp file in `target`'s directory, ready to be
-/// `persist`ed over it. Staging beside the destination is what makes the final
-/// rename atomic (same filesystem) — a temp in `/tmp` would not be.
-pub(crate) fn temp_in_parent(target: &Path) -> std::io::Result<tempfile::NamedTempFile> {
-    match target.parent().filter(|p| !p.as_os_str().is_empty()) {
-        Some(p) => tempfile::NamedTempFile::new_in(p),
-        None => tempfile::NamedTempFile::new_in("."),
-    }
 }
 
 #[cfg(test)]

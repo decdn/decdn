@@ -141,6 +141,9 @@
 //! that the node and the `decdn` CLI drive directly. They carry no stability
 //! promise.
 
+// Docs live in `bundle.rs` as `//!`, for the same reason as `sink` below.
+pub mod bundle;
+// Docs live in `session.rs` as `//!`, for the same reason as `sink` below.
 /// Buyer-side `PaymentPool` open kernel (#940), shared by the node service
 /// and the CLI.
 pub mod buyer_pool;
@@ -178,6 +181,7 @@ pub mod driver;
 /// One-shot client `Endpoint` construction: relay + discovery resolution for
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
 pub mod endpoint;
+pub mod session;
 // Hidden engine seams with `//!` docs in their own files: how a paid fetch
 // finds holders, builds and funds its lanes, and records what they paid. The
 // `decdn` CLI drives them; they carry no stability promise.
@@ -237,8 +241,6 @@ mod scheduler;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (ADR 039 § Dynamic segmentation and tail-stealing): no I/O, no async.
 mod segment;
-#[doc(hidden)]
-pub mod session;
 /// When a command gives up (ADR 039 § Failure handling: reassign-only tail):
 /// the progress clock and the stop policy that watches it.
 pub mod stop;

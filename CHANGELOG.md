@@ -3310,6 +3310,22 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **`decdn-client`: a public bundle pull, `decdn_client::bundle` (#2429).**
+  `BundlePuller` pulls every blob of a bundle manifest into a directory over
+  one paid run, with what `decdn bundle pull` does: fetch-once per blob,
+  hard-link duplicates, whole-file and range dedup against the output
+  directory, resume from `.partial` prefixes and the skip-cache, a jobs cap
+  and a per-provider stream cap, and the funding recovery second pass.
+  `select_nodes` resolves the pinned node or the run's registry list first, so
+  a failed discovery costs no key unlock. `Funding` is the buyer's own pool or
+  a delegated `CredentialSlot`. Progress reaches a `BundleObserver`, a
+  `CancellationToken` stops the pull, and the result is a typed
+  `BundleOutcome` (`Complete`, `Interrupted`, `FundingNeeded`, `Stopped`) with
+  a `BundleReport`. The new public `decdn_client::session` module holds the
+  inputs: `ChainConfig`, `PullSite`, `DepositPolicy`, `DiscoveryOptions`.
+  `decdn bundle pull` is now a caller of it; its output, `--json` report and
+  exit codes do not change. The pull future is not `Send`.
+
 - **Release: `publish-crates.sh` opens devops' and sponsord's decdn bump PRs
   (#2399, #2421).** After the upload, the script clones decdn/devops and then
   decdn/sponsord into temporary directories and runs each one's

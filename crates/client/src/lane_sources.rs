@@ -68,7 +68,19 @@ where
     }
 }
 
-/// The [`SourceProvider`] a CLI fetch runs its acquire loop over.
+/// What a failed fetch's lanes saw, for explaining the failure to the user
+/// ([`LaneSources::fault_context`]).
+#[derive(Debug, Clone)]
+pub struct FaultContext {
+    /// The context of the first lane built; `None` before any lane is built.
+    pub first_lane: Option<Arc<Mutex<PoolContext>>>,
+    /// The pool the run's lanes pay from, once a lane is built.
+    pub pool_id: Option<PoolId>,
+    /// Whether the fetch pays from a delegated pool under a capability.
+    pub delegated: bool,
+}
+
+/// The [`SourceProvider`] a paid fetch runs its acquire loop over.
 pub struct LaneSources<'a, P> {
     deps: &'a LaneDeps<'a, P>,
     discovery: &'a DiscoveryOptions,
@@ -366,24 +378,18 @@ where
         )
     }
 
-    /// The context of the first lane built, which a caller reads to explain
-    /// a refusal; `None` before any lane is built.
-    pub fn first_lane_ctx(&self) -> Option<Arc<Mutex<PoolContext>>> {
-        self.handles
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .first()
-            .map(|h| Arc::clone(&h.ctx))
-    }
-
-    /// The pool the run's lanes pay from, once a lane is built.
-    pub fn pool_id(&self) -> Option<PoolId> {
-        self.deps.funding.pool_id()
-    }
-
-    /// Whether the fetch pays from a delegated pool under a capability.
-    pub const fn is_delegated(&self) -> bool {
-        self.grant.is_some()
+    /// What the fetch's lanes saw, for a caller that explains a failure.
+    pub fn fault_context(&self) -> FaultContext {
+        FaultContext {
+            first_lane: self
+                .handles
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .first()
+                .map(|h| Arc::clone(&h.ctx)),
+            pool_id: self.deps.funding.pool_id(),
+            delegated: self.grant.is_some(),
+        }
     }
 
     /// File a lane's first answer in the peer store: its quoted rate, with the

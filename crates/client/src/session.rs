@@ -51,8 +51,10 @@ pub struct PullSite {
     /// The client's region, for region-first discovery ordering. `None` skips
     /// the ordering.
     pub region: Option<String>,
-    /// The regions discovery may probe. Empty allows every region. It
-    /// narrows the candidates and never ranks them.
+    /// The regions a single fetch's discovery may probe. Empty allows every
+    /// region. It narrows the candidates and never ranks them, and widens back
+    /// to every region when too few candidates remain. A bundle pull does not
+    /// apply it: each entry samples the run's registry list region-first.
     pub region_allowlist: Vec<decdn_protocol::Region>,
 }
 
@@ -99,6 +101,18 @@ pub struct ProxyWarmingParams {
     pub margin_ms: f64,
 }
 
+impl Default for ProxyWarmingParams {
+    /// The rule on: route through a non-holder at least 30 ms nearer than a
+    /// best holder 150 ms or more away.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rtt_threshold_ms: 150.0,
+            margin_ms: 30.0,
+        }
+    }
+}
+
 /// One node every fetch of a pull is pinned to, instead of discovering the
 /// holders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,9 +142,25 @@ pub struct DiscoveryOptions {
     pub proxy_warming: ProxyWarmingParams,
 }
 
+impl Default for DiscoveryOptions {
+    /// Discover the holders, from the peer store when it holds a fresh
+    /// candidate set; stripe each fetch across up to 4 of them; bound a
+    /// registry read by one hour; and warm proxies by the default rule.
+    fn default() -> Self {
+        Self {
+            pinned: None,
+            rediscover: false,
+            max_sources: 4,
+            registry_timeout: Duration::from_hours(1),
+            proxy_warming: ProxyWarmingParams::default(),
+        }
+    }
+}
+
 /// The points of a fetch's path to its first byte that the pull reports to its
 /// caller, for a time-to-first-byte log. Each is reported every time it is
 /// reached; the caller keeps the first.
+#[doc(hidden)]
 pub trait FetchMarks: Send + Sync {
     /// Discovery starts a probe round.
     fn probe_started(&self);

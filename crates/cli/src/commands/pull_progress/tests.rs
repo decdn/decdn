@@ -1,4 +1,5 @@
 use super::*;
+use decdn_client::bundle::FileObserver as _;
 
 #[test]
 fn file_label_single_path_is_the_path() {
@@ -34,7 +35,12 @@ fn hidden_total(len: u64) -> TotalBar {
 #[test]
 fn disabled_file_bar_has_no_callback() {
     let fb = FileBar::disabled();
-    assert!(fb.callback().is_none());
+    assert!(fb.cb.is_none());
+    // A silent bar ignores every report.
+    fb.delivered(10, 20);
+    fb.reconstructing();
+    fb.hashed(5);
+    fb.finished();
 }
 
 /// A hidden [`PullProgress`] whose total bar denominates the run's download. The
@@ -60,14 +66,13 @@ fn file_bar_download_folds_into_the_total_capped_at_download_bytes() {
     // capped at the download size — a splice never inflates the download total.
     let (pp, total) = hidden_pp(1000);
     let fb = pp.file_bar("m", 1000, 500);
-    let cb = fb.callback().expect("enabled");
-    cb(400, 9999);
+    fb.delivered(400, 9999);
     assert_eq!(total.position(), 400);
-    cb(1000, 9999);
+    fb.delivered(1000, 9999);
     assert_eq!(total.position(), 1000);
     // Delivery past the download size (should not happen, but be safe) does not
     // push the total past the download denominator.
-    cb(1200, 9999);
+    fb.delivered(1200, 9999);
     assert_eq!(total.position(), 1000);
 }
 
@@ -78,8 +83,7 @@ fn unsized_file_bar_shows_stream_length_but_adds_nothing_to_the_total() {
     // contributes nothing to the total bar's download meter.
     let (pp, total) = hidden_pp(1000);
     let fb = pp.file_bar("m", 0, 0);
-    let cb = fb.callback().expect("enabled");
-    cb(500, 2000);
+    fb.delivered(500, 2000);
     let bar = &fb.phase.as_ref().expect("enabled").bar;
     assert_eq!(bar.length(), Some(2000), "borrows the stream length");
     assert_eq!(bar.position(), 500);
@@ -88,7 +92,7 @@ fn unsized_file_bar_shows_stream_length_but_adds_nothing_to_the_total() {
         0,
         "an unsized entry adds nothing to the total"
     );
-    cb(1500, 2000);
+    fb.delivered(1500, 2000);
     assert_eq!(bar.position(), 1500);
     assert_eq!(total.position(), 0);
 }
@@ -98,7 +102,7 @@ fn file_bar_message_shows_download_counts_and_reconstruct_size() {
     let (pp, _total) = hidden_pp(1000);
     let fb = pp.file_bar("m", 1000, 500);
     let bar = &fb.phase.as_ref().expect("enabled").bar;
-    fb.callback().expect("enabled")(400, 0);
+    fb.delivered(400, 0);
     let msg = bar.message();
     // "<downloaded>/<download-total> (<reconstruct>)".
     assert!(msg.contains('/'), "{msg}");
@@ -109,12 +113,12 @@ fn file_bar_message_shows_download_counts_and_reconstruct_size() {
 fn file_bar_reconstructing_spans_the_whole_blob_and_tracks_hashed_bytes() {
     let (pp, _total) = hidden_pp(1000);
     let fb = pp.file_bar("m", 1000, 500);
-    let reporter = fb.reconstruct_reporter().expect("enabled");
+    fb.reconstructing();
     let bar = &fb.phase.as_ref().expect("enabled").bar;
     // The bar now spans the whole blob (download + reconstruct) and fills with
     // bytes hashed, so a multi-GB verify is never a frozen row.
     assert_eq!(bar.length(), Some(1500));
-    reporter(750);
+    fb.hashed(750);
     assert_eq!(bar.position(), 750);
     assert!(
         bar.message().contains("reconstructing"),

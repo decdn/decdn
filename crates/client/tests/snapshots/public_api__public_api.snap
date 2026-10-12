@@ -3,6 +3,107 @@ source: crates/client/tests/public_api.rs
 expression: public_api.to_string()
 ---
 pub mod decdn_client
+pub mod decdn_client::bundle
+#[non_exhaustive] pub enum decdn_client::bundle::BundleEnd
+pub decdn_client::bundle::BundleEnd::Complete
+pub decdn_client::bundle::BundleEnd::FundingNeeded
+pub decdn_client::bundle::BundleEnd::FundingNeeded::error: anyhow::Error
+pub decdn_client::bundle::BundleEnd::FundingNeeded::needed: decdn_client::credential::FundingNeeded
+pub decdn_client::bundle::BundleEnd::Interrupted
+pub decdn_client::bundle::BundleEnd::Stopped(anyhow::Error)
+#[non_exhaustive] pub enum decdn_client::bundle::Funding
+pub decdn_client::bundle::Funding::Delegated
+pub decdn_client::bundle::Funding::Delegated::slot: decdn_client::credential::CredentialSlot
+pub decdn_client::bundle::Funding::SelfOwned
+pub decdn_client::bundle::Funding::SelfOwned::deposit: decdn_client::session::DepositPolicy
+pub decdn_client::bundle::Funding::SelfOwned::signer: alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>
+#[non_exhaustive] pub struct decdn_client::bundle::BundleManifest
+pub decdn_client::bundle::BundleManifest::entries: alloc::vec::Vec<decdn_client::bundle::ManifestEntry>
+impl decdn_client::bundle::BundleManifest
+pub fn decdn_client::bundle::BundleManifest::cache_path(&std::path::Path, [u8; 32]) -> std::path::PathBuf
+pub fn decdn_client::bundle::BundleManifest::cached(&std::path::Path, [u8; 32]) -> anyhow::Result<core::option::Option<Self>>
+pub const fn decdn_client::bundle::BundleManifest::new(alloc::vec::Vec<decdn_client::bundle::ManifestEntry>) -> Self
+pub fn decdn_client::bundle::BundleManifest::parse(&[u8]) -> anyhow::Result<Self>
+#[non_exhaustive] pub struct decdn_client::bundle::BundleOutcome
+pub decdn_client::bundle::BundleOutcome::end: decdn_client::bundle::BundleEnd
+pub decdn_client::bundle::BundleOutcome::replaced: core::option::Option<decdn_client::source::PoolReplaced>
+pub decdn_client::bundle::BundleOutcome::report: decdn_client::bundle::BundleReport
+pub struct decdn_client::bundle::BundlePuller
+impl decdn_client::bundle::BundlePuller
+pub fn decdn_client::bundle::BundlePuller::builder(decdn_client::session::ChainConfig, decdn_client::session::PullSite, iroh::endpoint::Endpoint, alloc::sync::Arc<dyn decdn_incentive::buyer_pool::BuyerPoolStore>, decdn_client::bundle::Funding, decdn_client::session::DiscoveryOptions, decdn_client::bundle::NodeSelection) -> decdn_client::bundle::BundlePullerBuilder
+pub async fn decdn_client::bundle::BundlePuller::fetch_manifest(&self, [u8; 32], &std::path::Path, bool) -> anyhow::Result<decdn_client::bundle::BundleManifest>
+pub async fn decdn_client::bundle::BundlePuller::finish(self)
+pub fn decdn_client::bundle::BundlePuller::funding_shortfall(&self) -> core::option::Option<alloc::string::String>
+pub async fn decdn_client::bundle::BundlePuller::pull(&mut self, &decdn_client::bundle::BundleManifest, &std::path::Path, bool, &tokio_util::sync::cancellation_token::CancellationToken) -> decdn_client::bundle::BundleOutcome
+impl core::fmt::Debug for decdn_client::bundle::BundlePuller
+pub fn decdn_client::bundle::BundlePuller::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_client::bundle::BundlePullerBuilder
+impl decdn_client::bundle::BundlePullerBuilder
+pub async fn decdn_client::bundle::BundlePullerBuilder::build(self) -> anyhow::Result<decdn_client::bundle::BundlePuller>
+pub const fn decdn_client::bundle::BundlePullerBuilder::jobs(self, usize) -> Self
+pub const fn decdn_client::bundle::BundlePullerBuilder::max_blob_bytes(self, u64) -> Self
+pub const fn decdn_client::bundle::BundlePullerBuilder::max_lane_streams(self, usize) -> Self
+pub const fn decdn_client::bundle::BundlePullerBuilder::max_rate_per_mb(self, u64) -> Self
+pub const fn decdn_client::bundle::BundlePullerBuilder::namespace(self, core::option::Option<u64>) -> Self
+pub fn decdn_client::bundle::BundlePullerBuilder::observer(self, alloc::sync::Arc<dyn decdn_client::bundle::BundleObserver>) -> Self
+pub fn decdn_client::bundle::BundlePullerBuilder::relays(self, alloc::vec::Vec<iroh_base::relay_url::RelayUrl>) -> Self
+pub const fn decdn_client::bundle::BundlePullerBuilder::stop(self, bool, core::option::Option<core::time::Duration>) -> Self
+impl core::fmt::Debug for decdn_client::bundle::BundlePullerBuilder
+pub fn decdn_client::bundle::BundlePullerBuilder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct decdn_client::bundle::BundleReport
+pub decdn_client::bundle::BundleReport::downloaded: u64
+pub decdn_client::bundle::BundleReport::failed: u64
+pub decdn_client::bundle::BundleReport::failures: alloc::vec::Vec<decdn_client::bundle::EntryFailure>
+pub decdn_client::bundle::BundleReport::fetched: u64
+pub decdn_client::bundle::BundleReport::hints_ignored: u64
+pub decdn_client::bundle::BundleReport::linked: u64
+pub decdn_client::bundle::BundleReport::reconstructed: u64
+pub decdn_client::bundle::BundleReport::resumed_bytes: u64
+pub decdn_client::bundle::BundleReport::reused: u64
+pub decdn_client::bundle::BundleReport::reused_bytes: u64
+pub decdn_client::bundle::BundleReport::skipped: u64
+pub decdn_client::bundle::BundleReport::spliced_bytes: u64
+pub decdn_client::bundle::BundleReport::warnings: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub struct decdn_client::bundle::EntryFailure
+pub decdn_client::bundle::EntryFailure::error: alloc::string::String
+pub decdn_client::bundle::EntryFailure::path: alloc::string::String
+#[non_exhaustive] pub struct decdn_client::bundle::EntryLanded
+pub decdn_client::bundle::EntryLanded::elapsed: core::time::Duration
+pub decdn_client::bundle::EntryLanded::hash: [u8; 32]
+pub decdn_client::bundle::EntryLanded::paid: u64
+pub decdn_client::bundle::EntryLanded::resumed: u64
+pub decdn_client::bundle::EntryLanded::size: u64
+pub decdn_client::bundle::EntryLanded::spliced: u64
+#[non_exhaustive] pub struct decdn_client::bundle::ManifestChunk
+pub decdn_client::bundle::ManifestChunk::hash: alloc::string::String
+pub decdn_client::bundle::ManifestChunk::size: u64
+impl decdn_client::bundle::ManifestChunk
+pub fn decdn_client::bundle::ManifestChunk::new(impl core::convert::Into<alloc::string::String>, u64) -> Self
+#[non_exhaustive] pub struct decdn_client::bundle::ManifestEntry
+pub decdn_client::bundle::ManifestEntry::chunks: core::option::Option<alloc::vec::Vec<decdn_client::bundle::ManifestChunk>>
+pub decdn_client::bundle::ManifestEntry::hash: alloc::string::String
+pub decdn_client::bundle::ManifestEntry::path: alloc::string::String
+pub decdn_client::bundle::ManifestEntry::size: core::option::Option<u64>
+impl decdn_client::bundle::ManifestEntry
+pub fn decdn_client::bundle::ManifestEntry::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, core::option::Option<u64>) -> Self
+pub fn decdn_client::bundle::ManifestEntry::with_chunks(self, alloc::vec::Vec<decdn_client::bundle::ManifestChunk>) -> Self
+pub struct decdn_client::bundle::NodeSelection
+pub const decdn_client::bundle::STAGING_DIR: &str
+pub trait decdn_client::bundle::BundleObserver: core::marker::Send + core::marker::Sync
+pub fn decdn_client::bundle::BundleObserver::entry_landed(&self, &decdn_client::bundle::EntryLanded)
+pub fn decdn_client::bundle::BundleObserver::file_started(&self, &[alloc::string::String], u64, u64) -> alloc::sync::Arc<dyn decdn_client::bundle::FileObserver>
+pub fn decdn_client::bundle::BundleObserver::pool_replaced(&self, &decdn_client::source::PoolReplaced)
+pub fn decdn_client::bundle::BundleObserver::run_started(&self, core::option::Option<u64>, core::option::Option<u64>)
+pub fn decdn_client::bundle::BundleObserver::warning(&self, &str)
+pub trait decdn_client::bundle::FileObserver: core::marker::Send + core::marker::Sync
+pub fn decdn_client::bundle::FileObserver::delivered(&self, u64, u64)
+pub fn decdn_client::bundle::FileObserver::discovering(&self)
+pub fn decdn_client::bundle::FileObserver::finished(&self)
+pub fn decdn_client::bundle::FileObserver::hashed(&self, u64)
+pub fn decdn_client::bundle::FileObserver::pending(&self)
+pub fn decdn_client::bundle::FileObserver::reconstructing(&self)
+pub fn decdn_client::bundle::parse_hash(&str) -> anyhow::Result<[u8; 32]>
+pub async fn decdn_client::bundle::select_nodes(&decdn_client::session::ChainConfig, &decdn_client::session::PullSite, &decdn_client::session::DiscoveryOptions) -> anyhow::Result<decdn_client::bundle::NodeSelection>
 pub mod decdn_client::buyer_pool
 #[non_exhaustive] pub enum decdn_client::buyer_pool::ProgressWrite
 pub decdn_client::buyer_pool::ProgressWrite::Advance
@@ -193,6 +294,44 @@ pub fn decdn_client::recovery::RecoveryGate::with_settle(core::time::Duration) -
 impl core::default::Default for decdn_client::recovery::RecoveryGate
 pub fn decdn_client::recovery::RecoveryGate::default() -> Self
 pub const decdn_client::recovery::RECOVERY_SETTLE: core::time::Duration
+pub mod decdn_client::session
+pub enum decdn_client::session::ChainAdoption
+pub decdn_client::session::ChainAdoption::Allowed
+pub decdn_client::session::ChainAdoption::Refused
+pub struct decdn_client::session::ChainConfig
+pub decdn_client::session::ChainConfig::capacity_bond: core::option::Option<alloy_primitives::bits::address::Address>
+pub decdn_client::session::ChainConfig::chain_id: u64
+pub decdn_client::session::ChainConfig::payment_pool: alloy_primitives::bits::address::Address
+pub decdn_client::session::ChainConfig::rpc_url: alloc::string::String
+pub decdn_client::session::ChainConfig::slash_judge: alloy_primitives::bits::address::Address
+impl decdn_client::session::ChainConfig
+pub const fn decdn_client::session::ChainConfig::deployment(&self) -> decdn_incentive::deployment::Deployment
+pub struct decdn_client::session::DepositPolicy
+pub decdn_client::session::DepositPolicy::adoption: decdn_client::session::ChainAdoption
+pub decdn_client::session::DepositPolicy::max_approve: bool
+pub decdn_client::session::DepositPolicy::working_deposit: alloy_primitives::aliases::U256
+pub struct decdn_client::session::DiscoveryOptions
+pub decdn_client::session::DiscoveryOptions::max_sources: usize
+pub decdn_client::session::DiscoveryOptions::pinned: core::option::Option<decdn_client::session::PinnedNode>
+pub decdn_client::session::DiscoveryOptions::proxy_warming: decdn_client::session::ProxyWarmingParams
+pub decdn_client::session::DiscoveryOptions::rediscover: bool
+pub decdn_client::session::DiscoveryOptions::registry_timeout: core::time::Duration
+impl core::default::Default for decdn_client::session::DiscoveryOptions
+pub fn decdn_client::session::DiscoveryOptions::default() -> Self
+pub struct decdn_client::session::PinnedNode
+pub decdn_client::session::PinnedNode::addr: core::option::Option<core::net::socket_addr::SocketAddr>
+pub decdn_client::session::PinnedNode::node_id: iroh_base::key::PublicKey
+pub decdn_client::session::PinnedNode::provider: alloy_primitives::bits::address::Address
+pub struct decdn_client::session::ProxyWarmingParams
+pub decdn_client::session::ProxyWarmingParams::enabled: bool
+pub decdn_client::session::ProxyWarmingParams::margin_ms: f64
+pub decdn_client::session::ProxyWarmingParams::rtt_threshold_ms: f64
+impl core::default::Default for decdn_client::session::ProxyWarmingParams
+pub fn decdn_client::session::ProxyWarmingParams::default() -> Self
+pub struct decdn_client::session::PullSite
+pub decdn_client::session::PullSite::data_dir: std::path::PathBuf
+pub decdn_client::session::PullSite::region: core::option::Option<alloc::string::String>
+pub decdn_client::session::PullSite::region_allowlist: alloc::vec::Vec<decdn_protocol::region::Region>
 pub mod decdn_client::sink
 pub struct decdn_client::sink::NoCache
 impl decdn_client::sink::BlobCache for decdn_client::sink::NoCache
