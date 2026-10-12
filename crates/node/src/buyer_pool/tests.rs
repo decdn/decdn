@@ -1750,6 +1750,35 @@ impl BuyerPoolStore for FailingStore {
     ) -> std::result::Result<decdn_incentive::DepositOutcome, StoreError> {
         Err(StoreError::Backend("add_deposit faulted".into()))
     }
+    fn delegate_lanes(
+        &self,
+        _deployment: decdn_incentive::Deployment,
+        _pool_id: PoolId,
+        _signer: Address,
+    ) -> std::result::Result<Vec<(Address, BuyerLaneProgress)>, StoreError> {
+        Err(StoreError::Backend("delegate_lanes faulted".into()))
+    }
+    fn advance_delegate_progress(
+        &self,
+        _deployment: decdn_incentive::Deployment,
+        _lane: LaneKey,
+        _totals: BuyerLaneProgress,
+    ) -> std::result::Result<decdn_incentive::AdvanceOutcome, StoreError> {
+        Err(StoreError::Backend(
+            "advance_delegate_progress faulted".into(),
+        ))
+    }
+    fn rebase_delegate_progress(
+        &self,
+        _deployment: decdn_incentive::Deployment,
+        _lane: LaneKey,
+        _anchor: BuyerLaneProgress,
+        _totals: BuyerLaneProgress,
+    ) -> std::result::Result<decdn_incentive::AdvanceOutcome, StoreError> {
+        Err(StoreError::Backend(
+            "rebase_delegate_progress faulted".into(),
+        ))
+    }
 }
 
 /// A fully-redeemed pool is still `Open` on chain, and adopting it would
@@ -1914,6 +1943,32 @@ impl BuyerPoolStore for WriteOnlyFault {
     ) -> std::result::Result<decdn_incentive::DepositOutcome, StoreError> {
         self.0.add_deposit(owner, pool_id, additional)
     }
+    fn delegate_lanes(
+        &self,
+        deployment: decdn_incentive::Deployment,
+        pool_id: PoolId,
+        signer: Address,
+    ) -> std::result::Result<Vec<(Address, BuyerLaneProgress)>, StoreError> {
+        self.0.delegate_lanes(deployment, pool_id, signer)
+    }
+    fn advance_delegate_progress(
+        &self,
+        deployment: decdn_incentive::Deployment,
+        lane: LaneKey,
+        totals: BuyerLaneProgress,
+    ) -> std::result::Result<decdn_incentive::AdvanceOutcome, StoreError> {
+        self.0.advance_delegate_progress(deployment, lane, totals)
+    }
+    fn rebase_delegate_progress(
+        &self,
+        deployment: decdn_incentive::Deployment,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> std::result::Result<decdn_incentive::AdvanceOutcome, StoreError> {
+        self.0
+            .rebase_delegate_progress(deployment, lane, anchor, totals)
+    }
 }
 
 /// Faults only `forget_if_pool`, so a test can hold a foreign row that
@@ -1986,6 +2041,32 @@ impl BuyerPoolStore for ForgetFault {
         additional: U256,
     ) -> std::result::Result<decdn_incentive::DepositOutcome, StoreError> {
         self.0.add_deposit(owner, pool_id, additional)
+    }
+    fn delegate_lanes(
+        &self,
+        deployment: decdn_incentive::Deployment,
+        pool_id: PoolId,
+        signer: Address,
+    ) -> std::result::Result<Vec<(Address, BuyerLaneProgress)>, StoreError> {
+        self.0.delegate_lanes(deployment, pool_id, signer)
+    }
+    fn advance_delegate_progress(
+        &self,
+        deployment: decdn_incentive::Deployment,
+        lane: LaneKey,
+        totals: BuyerLaneProgress,
+    ) -> std::result::Result<decdn_incentive::AdvanceOutcome, StoreError> {
+        self.0.advance_delegate_progress(deployment, lane, totals)
+    }
+    fn rebase_delegate_progress(
+        &self,
+        deployment: decdn_incentive::Deployment,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> std::result::Result<decdn_incentive::AdvanceOutcome, StoreError> {
+        self.0
+            .rebase_delegate_progress(deployment, lane, anchor, totals)
     }
 }
 

@@ -941,3 +941,338 @@ fn concurrent_top_up_and_progress_preserve_both() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A delegate lane of `signer` at `provider` in the pool `pool`.
+fn delegate_lane(pool: u8, signer: u8, provider: u8) -> LaneKey {
+    LaneKey {
+        pool_id: PoolId::repeat_byte(pool),
+        signer: Address::repeat_byte(signer),
+        provider: Address::repeat_byte(provider),
+    }
+}
+
+/// `progress` with `bytes` and `amount` as plain integers.
+fn progress(bytes: u64, amount: u64) -> BuyerLaneProgress {
+    BuyerLaneProgress {
+        last_amount: U256::from(amount),
+        last_bytes: U256::from(bytes),
+    }
+}
+
+/// `true` if the delegate-lane table was never created.
+fn delegate_table_absent(db: &Database) -> anyhow::Result<bool> {
+    let read_txn = db.begin_read()?;
+    Ok(matches!(
+        read_txn.open_table(DELEGATE_LANE_TABLE),
+        Err(redb::TableError::TableDoesNotExist(_))
+    ))
+}
+
+/// Postcard encoding of `progress(0xdd, 0xbb)` as a delegate-lane record
+/// (schema 1).
+const GOLDEN_DELEGATE_LANE_HEX: &str = concat!(
+    "01",                                                               // schema_version (varint)
+    "00000000000000000000000000000000000000000000000000000000000000bb", // last_amount
+    "00000000000000000000000000000000000000000000000000000000000000dd", // last_bytes
+);
+
+/// The delegate-lane record is a frozen on-disk format, as the buyer record
+/// is ([`encode_is_byte_stable`]), and its bytes still decode.
+#[test]
+fn delegate_lane_encode_is_byte_stable() -> anyhow::Result<()> {
+    let hex = hex_of(&encode_delegate_lane(progress(0xdd, 0xbb))?);
+    anyhow::ensure!(
+        hex == GOLDEN_DELEGATE_LANE_HEX,
+        "the delegate-lane record's on-disk encoding changed.\n  got:  {hex}\n  want: \
+         {GOLDEN_DELEGATE_LANE_HEX}",
+    );
+    let bytes: Vec<u8> = (0..GOLDEN_DELEGATE_LANE_HEX.len() / 2)
+        .map(|i| {
+            GOLDEN_DELEGATE_LANE_HEX
+                .get(i * 2..i * 2 + 2)
+                .ok_or_else(|| anyhow::anyhow!("odd-length golden hex"))
+                .and_then(|b| u8::from_str_radix(b, 16).map_err(Into::into))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    anyhow::ensure!(
+        decode_delegate_lane(delegate_lane(0x11, 0x22, 0x33), &bytes)? == progress(0xdd, 0xbb)
+    );
+    Ok(())
+}
+
+/// The key is the deployment, the pool, the signer and the provider, in that
+/// order: the order the signer-prefix range scan relies on.
+#[test]
+fn delegate_key_is_deployment_pool_signer_provider() -> anyhow::Result<()> {
+    let hex = hex_of(&delegate_key(DEPLOYMENT, delegate_lane(0x11, 0x22, 0x33)));
+    let want = concat!(
+        "0000000000066eee",                         // chain_id 421614
+        "9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c", // payment_pool
+        "1111111111111111111111111111111111111111111111111111111111111111", // pool_id
+        "2222222222222222222222222222222222222222", // signer
+        "3333333333333333333333333333333333333333", // provider
+    );
+    anyhow::ensure!(hex == want, "got:  {hex}\nwant: {want}");
+    Ok(())
+}
+
+/// A delegate's first write creates its lane, a later advance moves it, and
+/// a regression is refused and leaves it in place. No pool row and no owner
+/// index entry is written.
+#[test]
+fn delegate_advance_creates_then_refuses_a_regression() -> anyhow::Result<()> {
+    let (_d, db) = db()?;
+    let lane = delegate_lane(0x11, 0x22, 0x33);
+    anyhow::ensure!(
+        tbl(&db).advance_delegate_progress(
+            DEPLOYMENT,
+            lane,
+            BuyerLaneProgress {
+                last_amount: U256::from(10u64),
+                last_bytes: U256::from(100u64)
+            }
+        )? == AdvanceOutcome::Advanced
+    );
+    anyhow::ensure!(
+        tbl(&db).advance_delegate_progress(
+            DEPLOYMENT,
+            lane,
+            BuyerLaneProgress {
+                last_amount: U256::from(20u64),
+                last_bytes: U256::from(200u64)
+            }
+        )? == AdvanceOutcome::Advanced
+    );
+    anyhow::ensure!(matches!(
+        tbl(&db).advance_delegate_progress(
+            DEPLOYMENT,
+            lane,
+            BuyerLaneProgress {
+                last_amount: U256::from(30u64),
+                last_bytes: U256::from(150u64)
+            }
+        )?,
+        AdvanceOutcome::Regressed(_)
+    ));
+    anyhow::ensure!(
+        tbl(&db).delegate_lanes(DEPLOYMENT, lane.pool_id, lane.signer)?
+            == vec![(lane.provider, progress(200, 20))]
+    );
+    anyhow::ensure!(
+        table_absent(&db)?,
+        "a delegate write created the pool table"
+    );
+    anyhow::ensure!(tbl(&db).get_by_pool_id(lane.pool_id)?.is_none());
+    anyhow::ensure!(tbl(&db).get_by_owner(lane.signer)?.is_none());
+    Ok(())
+}
+
+/// A rebase overwrites the lane downward, with the pool-row rebase rule: a
+/// `totals` behind the anchor records the anchor alone.
+#[test]
+fn delegate_rebase_overwrites_down() -> anyhow::Result<()> {
+    let (_d, db) = db()?;
+    let lane = delegate_lane(0x11, 0x22, 0x33);
+    let _ = tbl(&db).advance_delegate_progress(
+        DEPLOYMENT,
+        lane,
+        BuyerLaneProgress {
+            last_amount: U256::from(50u64),
+            last_bytes: U256::from(500u64),
+        },
+    )?;
+    anyhow::ensure!(
+        tbl(&db).rebase_delegate_progress(
+            DEPLOYMENT,
+            lane,
+            progress(100, 10),
+            progress(120, 12)
+        )? == AdvanceOutcome::Advanced
+    );
+    anyhow::ensure!(
+        tbl(&db).delegate_lanes(DEPLOYMENT, lane.pool_id, lane.signer)?
+            == vec![(lane.provider, progress(120, 12))]
+    );
+    let _ =
+        tbl(&db).rebase_delegate_progress(DEPLOYMENT, lane, progress(100, 10), progress(90, 12))?;
+    anyhow::ensure!(
+        tbl(&db).delegate_lanes(DEPLOYMENT, lane.pool_id, lane.signer)?
+            == vec![(lane.provider, progress(100, 10))]
+    );
+    Ok(())
+}
+
+/// The scan returns one signer's lanes in one pool on one deployment, every
+/// provider in order, and nothing of another signer, pool, chain or contract.
+#[test]
+fn delegate_lanes_scan_one_signer_in_one_pool_on_one_deployment() -> anyhow::Result<()> {
+    let (_d, db) = db()?;
+    let mine_a = delegate_lane(0x11, 0x22, 0x0a);
+    let mine_b = delegate_lane(0x11, 0x22, 0xfb);
+    let other_signer = delegate_lane(0x11, 0x23, 0x0a);
+    let lower_signer = delegate_lane(0x11, 0x21, 0xff);
+    let other_pool = delegate_lane(0x12, 0x22, 0x0a);
+    let other_chain = Deployment {
+        chain_id: DEPLOYMENT.chain_id + 1,
+        ..DEPLOYMENT
+    };
+    let other_contract = Deployment {
+        payment_pool: Address::repeat_byte(0x9d),
+        ..DEPLOYMENT
+    };
+    for (deployment, lane, amount) in [
+        (DEPLOYMENT, mine_a, 1u64),
+        (DEPLOYMENT, mine_b, 2),
+        (DEPLOYMENT, other_signer, 4),
+        (DEPLOYMENT, lower_signer, 8),
+        (DEPLOYMENT, other_pool, 16),
+        (other_chain, mine_a, 32),
+        (other_contract, mine_a, 64),
+    ] {
+        let outcome = tbl(&db).advance_delegate_progress(
+            deployment,
+            lane,
+            BuyerLaneProgress {
+                last_amount: U256::from(amount),
+                last_bytes: U256::from(amount),
+            },
+        )?;
+        anyhow::ensure!(outcome == AdvanceOutcome::Advanced);
+    }
+    let got = tbl(&db).delegate_lanes(DEPLOYMENT, mine_a.pool_id, mine_a.signer)?;
+    anyhow::ensure!(
+        got == vec![
+            (mine_a.provider, progress(1, 1)),
+            (mine_b.provider, progress(2, 2)),
+        ],
+        "got {got:?}"
+    );
+    anyhow::ensure!(
+        tbl(&db).delegate_lanes(other_chain, mine_a.pool_id, mine_a.signer)?
+            == vec![(mine_a.provider, progress(32, 32))]
+    );
+    Ok(())
+}
+
+/// A read on a file with no delegate-lane table answers no lanes and does
+/// not create the table.
+#[test]
+fn delegate_lanes_read_does_not_create_the_table() -> anyhow::Result<()> {
+    let (_d, db) = db()?;
+    anyhow::ensure!(
+        tbl(&db)
+            .delegate_lanes(DEPLOYMENT, PoolId::repeat_byte(1), Address::repeat_byte(2))?
+            .is_empty()
+    );
+    anyhow::ensure!(delegate_table_absent(&db)?);
+    Ok(())
+}
+
+/// A delegate lane survives a close and reopen.
+#[test]
+fn delegate_progress_survives_reopen() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("t.redb");
+    let lane = delegate_lane(0x11, 0x22, 0x33);
+    {
+        let db = Database::create(&path)?;
+        let _ = tbl(&db).advance_delegate_progress(
+            DEPLOYMENT,
+            lane,
+            BuyerLaneProgress {
+                last_amount: U256::from(70u64),
+                last_bytes: U256::from(700u64),
+            },
+        )?;
+    }
+    let db = Database::create(&path)?;
+    anyhow::ensure!(
+        tbl(&db).delegate_lanes(DEPLOYMENT, lane.pool_id, lane.signer)?
+            == vec![(lane.provider, progress(700, 70))]
+    );
+    Ok(())
+}
+
+/// Write `bytes` as the raw record of `lane` on [`DEPLOYMENT`], bypassing the
+/// encoder, to stand for a damaged record.
+fn insert_raw_delegate_lane(db: &Database, lane: LaneKey, bytes: &[u8]) -> anyhow::Result<()> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(DELEGATE_LANE_TABLE)?;
+        table.insert(&delegate_key(DEPLOYMENT, lane), bytes)?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// A damaged delegate record fails the read and the advance loudly, naming
+/// the lane: undecodable bytes, a valid record with trailing bytes, and a
+/// record of another schema version. A rebase overwrites the record unread,
+/// so it replaces a damaged one, and the lane reads again.
+#[test]
+fn a_damaged_delegate_record_fails_loudly_and_a_rebase_replaces_it() -> anyhow::Result<()> {
+    let lane = delegate_lane(0x11, 0x22, 0x33);
+    let valid = encode_delegate_lane(progress(0xdd, 0xbb))?;
+    let mut trailing = valid.clone();
+    trailing.push(0x00);
+    let mut other_schema = valid.clone();
+    if let Some(version) = other_schema.first_mut() {
+        *version = 0x02;
+    }
+    for (bytes, schema) in [
+        (vec![0xff; 3], false),
+        (trailing, false),
+        (other_schema, true),
+    ] {
+        let (_d, db) = db()?;
+        insert_raw_delegate_lane(&db, lane, &bytes)?;
+        let read = tbl(&db).delegate_lanes(DEPLOYMENT, lane.pool_id, lane.signer);
+        let advance = tbl(&db).advance_delegate_progress(DEPLOYMENT, lane, progress(0xee, 0xcc));
+        for result in [read.map(|_| ()), advance.map(|_| ())] {
+            match (result, schema) {
+                (Err(StoreError::Corrupt { detail, .. }), false) => anyhow::ensure!(
+                    detail.contains("delegate lane") && detail.contains(&lane.provider.to_string()),
+                    "the error names the lane: {detail}"
+                ),
+                (Err(StoreError::UnsupportedSchema { found: 2, .. }), true) => {}
+                (other, _) => anyhow::bail!("{bytes:02x?} read as {other:?}"),
+            }
+        }
+
+        anyhow::ensure!(
+            tbl(&db).rebase_delegate_progress(
+                DEPLOYMENT,
+                lane,
+                progress(0x10, 0x01),
+                progress(0x20, 0x02)
+            )? == AdvanceOutcome::Advanced
+        );
+        anyhow::ensure!(
+            tbl(&db).delegate_lanes(DEPLOYMENT, lane.pool_id, lane.signer)?
+                == vec![(lane.provider, progress(0x20, 0x02))]
+        );
+    }
+    Ok(())
+}
+
+/// An advance to the recorded totals is an idempotent re-record, and an
+/// advance behind on the amount alone is refused, as on a pool row.
+#[test]
+fn delegate_advance_accepts_equal_totals_and_refuses_a_lower_amount() -> anyhow::Result<()> {
+    let (_d, db) = db()?;
+    let lane = delegate_lane(0x11, 0x22, 0x33);
+    for _ in 0..2 {
+        anyhow::ensure!(
+            tbl(&db).advance_delegate_progress(DEPLOYMENT, lane, progress(200, 20))?
+                == AdvanceOutcome::Advanced
+        );
+    }
+    anyhow::ensure!(matches!(
+        tbl(&db).advance_delegate_progress(DEPLOYMENT, lane, progress(300, 19))?,
+        AdvanceOutcome::Regressed(BuyerProgressError::Regressed {
+            field: "amount",
+            ..
+        })
+    ));
+    Ok(())
+}

@@ -26,6 +26,7 @@ use crate::buyer_pool::{
     AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome,
 };
 use crate::buyer_pool_table::{BuyerPoolTable, load_all_from};
+use crate::deployment::Deployment;
 use crate::lane::{LaneKey, PoolId};
 use crate::store::StoreError;
 
@@ -270,6 +271,36 @@ impl BuyerPoolStore for RedbBuyerPoolStore {
         additional: U256,
     ) -> Result<DepositOutcome, StoreError> {
         self.table().add_deposit(owner, pool_id, additional)
+    }
+
+    fn delegate_lanes(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+        signer: Address,
+    ) -> Result<Vec<(Address, BuyerLaneProgress)>, StoreError> {
+        self.table().delegate_lanes(deployment, pool_id, signer)
+    }
+
+    fn advance_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.table()
+            .advance_delegate_progress(deployment, lane, totals)
+    }
+
+    fn rebase_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.table()
+            .rebase_delegate_progress(deployment, lane, anchor, totals)
     }
 }
 

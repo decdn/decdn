@@ -13,7 +13,9 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
-use decdn_client::buyer_pool::{ProgressWrite, ensure_allowance, open_pool, self_owned_lane_ctx};
+use decdn_client::buyer_pool::{
+    ProgressWrite, WatermarkRow, ensure_allowance, open_pool, self_owned_lane_ctx,
+};
 use decdn_client::discovery::{self, NodeCandidate};
 use decdn_client::{
     Funder, PeerSource, PoolContext, PoolLedger, PullDeadlines, Recovery, SourceFuture,
@@ -288,7 +290,8 @@ impl Buyer {
                 continue;
             };
             let owner = self.signer.address();
-            if let Err(err) = write.apply(&self.store, owner, lane.key.pool_id, lane.key) {
+            let row = WatermarkRow::Owned(owner);
+            if let Err(err) = write.apply(&self.store, row, lane.key) {
                 tracing::warn!(provider = %lane.key.provider, error = %err, "lane not recorded");
             }
         }

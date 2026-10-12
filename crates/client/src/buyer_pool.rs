@@ -24,7 +24,7 @@ use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::{
     AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, Capability, Deployment,
-    DepositOutcome, LaneKey, PoolId, PoolOpenFailureReason, SignedCapability, StoreError,
+    DepositOutcome, LaneKey, PoolOpenFailureReason, SignedCapability, StoreError,
 };
 use tracing::{debug, error, info, warn};
 
@@ -331,7 +331,10 @@ impl ProgressWrite {
         }
     }
 
-    /// Apply this write to `lane` inside `owner`'s pool `pool_id`.
+    /// Apply this write to `lane` in the record `row` names. A
+    /// [`WatermarkRow::Owned`] write goes to the owner's pool row for
+    /// `lane.pool_id`; a [`WatermarkRow::Delegated`] write goes to the delegate
+    /// lane `lane` on the row's deployment.
     ///
     /// # Errors
     ///
@@ -341,19 +344,40 @@ impl ProgressWrite {
     pub fn apply<S: BuyerPoolStore + ?Sized>(
         &self,
         store: &S,
-        owner: Address,
-        pool_id: PoolId,
+        row: WatermarkRow,
         lane: LaneKey,
     ) -> Result<AdvanceOutcome, StoreError> {
-        match *self {
-            Self::Rebase { anchor, totals } => {
-                store.rebase_progress(owner, pool_id, lane, anchor, totals)
+        match (row, *self) {
+            (WatermarkRow::Owned(owner), Self::Rebase { anchor, totals }) => {
+                store.rebase_progress(owner, lane.pool_id, lane, anchor, totals)
             }
-            Self::Advance { totals } => {
-                store.advance_progress(owner, pool_id, lane, totals.last_bytes, totals.last_amount)
+            (WatermarkRow::Owned(owner), Self::Advance { totals }) => store.advance_progress(
+                owner,
+                lane.pool_id,
+                lane,
+                totals.last_bytes,
+                totals.last_amount,
+            ),
+            (WatermarkRow::Delegated(deployment), Self::Rebase { anchor, totals }) => {
+                store.rebase_delegate_progress(deployment, lane, anchor, totals)
+            }
+            (WatermarkRow::Delegated(deployment), Self::Advance { totals }) => {
+                store.advance_delegate_progress(deployment, lane, totals)
             }
         }
     }
+}
+
+/// Which buyer-store record holds a lane's watermark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatermarkRow {
+    /// The pool row of this owner: a lane on the buyer's own pool.
+    Owned(Address),
+    /// The delegate lanes on this deployment: a lane a key signs under an
+    /// owner-signed capability on a pool another owner funds
+    /// ([`BuyerPoolStore::delegate_lanes`]).
+    Delegated(Deployment),
 }
 
 /// Ensure `owner` holds a sufficient USDC allowance for the `PaymentPool`

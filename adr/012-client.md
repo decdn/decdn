@@ -176,14 +176,21 @@ All client state resides under `~/.decdn/`, with the per-client data dir (`--dat
 ├── iroh_key                  # Ed25519 secret key (0600)
 └── client/                   # the resolved client data dir
     ├── keystore.json         # Encrypted Ethereum keystore (Web3 Secret Storage)
-    ├── buyer-pools.redb       # Buyer-side payment-pool store
+    ├── buyer-pools.redb       # Buyer-side payment-pool store and delegate lanes
     └── peers/                 # Per-node peer knowledge base (identity + stats), one JSON file per node
 ```
 
 The client data dir defaults away from `~/.decdn/` so a client install does not sit
 on top of a node's. A daemon keeps its own buyer pools in `buyer.redb` under its
 data dir. The two files share one table format and nothing else: they hold different
-pools, and a daemon holds an exclusive lock on its file for its lifetime. `decdn pool`
+pools, and a daemon holds an exclusive lock on its file for its lifetime. A client
+that signs under a capability on a pool another owner funds owns no pool row. Its
+`buyer-pools.redb` keeps its lanes in a separate delegate-lane table. The table key
+of a lane is the chain id, the `PaymentPool` address, the pool id, the signer
+address and the provider. A later fetch resumes the lane from this record. The
+running-low signal counts the recorded amount as earlier spend of the signer
+([ADR 039 § Client SDK funding
+signal](039-multi-source-parallel-fetch.md#client-sdk-funding-signal)). `decdn pool`
 reads and writes `buyer-pools.redb`. A `decdn pool` command whose data dir holds any
 of the daemon's stores (`decdn_common::data_dir::DAEMON_STORE_FILES` — `buyer.redb`,
 `lanes.redb`, `settle.redb`, `checkpoint.redb`) is pointed at a node: it reports the

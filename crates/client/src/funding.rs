@@ -563,9 +563,10 @@ where
 ///
 /// The pool's on-chain row is read once for the informational `deposit` and to
 /// confirm the pool exists (a zero-owner row means it was never opened on this
-/// contract). The lane resumes from any locally-tracked watermark for
-/// `(pool, this signer, provider)`; a delegate that has never streamed this lane
-/// starts at zero. The ADR 005 client binding is attached the same as the
+/// contract). The lane resumes from the store's delegate lane for
+/// `(pool, this signer, provider)` on this deployment
+/// ([`BuyerPoolStore::delegate_lanes`]); a delegate that has never streamed this
+/// lane starts at zero. The ADR 005 client binding is attached the same as the
 /// self-owned path — it only authorizes reactive origin pull-through when the
 /// binding owner also owns the pool, which a delegate does not, so a cache miss
 /// still refuses (already-cached content serves and is paid via the capability).
@@ -599,20 +600,26 @@ where
         chain.payment_pool,
     );
 
-    // Resume this delegate's lane watermark if a local record exists; a delegate
-    // that has never streamed this lane starts at zero (a fresh lane).
-    let lane = LaneKey {
-        pool_id,
-        signer: self_address,
-        provider,
-    };
+    // A store that cannot be read is this machine's fault: it fails the
+    // command rather than retrying the lane build as a chain-side fault.
     let (prior_bytes, prior_amount) = store
-        .get_by_pool_id(pool_id)?
-        .and_then(|state| state.lane_progress(lane))
-        .map_or((U256::ZERO, U256::ZERO), |p| (p.last_bytes, p.last_amount));
+        .delegate_lanes(chain.deployment(), pool_id, self_address)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "read this key's delegate-lane watermarks for pool {pool_id} from the buyer \
+                 store: {e}; the store needs repair before a delegated fetch can run"
+            )
+            .context(crate::LocalPullFault)
+        })?
+        .into_iter()
+        .find(|(lane_provider, _)| *lane_provider == provider)
+        .map_or((U256::ZERO, U256::ZERO), |(_, p)| {
+            (p.last_bytes, p.last_amount)
+        });
 
     // A transient state carrying the informational pool facts the context reads
-    // (`pool_id`, `deposit`); it is not persisted (the delegate owns no pool row).
+    // (`pool_id`, `deposit`); it is not persisted (the delegate owns no pool
+    // row, and its lane watermarks go to the delegate lanes instead).
     // The pool does not store its token — it is the contract's immutable
     // `usdc()`, so read it there rather than duplicating it per pool.
     let token = contract

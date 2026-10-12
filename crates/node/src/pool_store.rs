@@ -1409,6 +1409,36 @@ impl BuyerPoolStore for BuyerPoolStoreHandle {
     ) -> Result<DepositOutcome, StoreError> {
         self.table().add_deposit(owner, pool_id, additional)
     }
+
+    fn delegate_lanes(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+        signer: Address,
+    ) -> Result<Vec<(Address, BuyerLaneProgress)>, StoreError> {
+        self.table().delegate_lanes(deployment, pool_id, signer)
+    }
+
+    fn advance_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.table()
+            .advance_delegate_progress(deployment, lane, totals)
+    }
+
+    fn rebase_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        self.table()
+            .rebase_delegate_progress(deployment, lane, anchor, totals)
+    }
 }
 
 impl PersistentPoolStateStore {

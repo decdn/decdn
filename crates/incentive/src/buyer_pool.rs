@@ -14,12 +14,16 @@
 //!
 //! - The seller keys lane state by [`crate::lane::LaneKey`] `(pool_id,
 //!   signer, provider)` and records the latest voucher *signature* (to
-//!   submit on-chain). The buyer keys pool state by **owner address** — the
+//!   submit on-chain). The buyer reuses pool state by **owner address** — the
 //!   reuse unit is "one open pool per owner", almost always the node's own
 //!   address — and does not retain signatures (the buyer is the signer; it
 //!   never submits another party's voucher on-chain). One pool fans out to
 //!   many `(signer, provider)` lanes, so `BuyerPoolState` carries a
 //!   per-[`LaneKey`] progress table alongside the pool-level fields.
+//! - A delegated client — a key that signs under an owner's capability on a
+//!   pool it does not own — holds no pool row. Its lane watermarks are stored
+//!   apart from the pool rows, keyed by `(deployment, pool_id, signer,
+//!   provider)` ([`BuyerPoolStore::delegate_lanes`]).
 //! - The seller validates inbound vouchers (replay guard, #527). The buyer
 //!   only records its own monotonically-advancing cumulative totals — priced
 //!   as `cumulative = received_bytes × rate` from its own BLAKE3-verified
@@ -55,6 +59,48 @@ pub struct BuyerLaneProgress {
     pub last_bytes: U256,
 }
 
+impl BuyerLaneProgress {
+    /// The progress a lane holds after advancing from `recorded` to the
+    /// cumulative `totals`. Totals may stay equal (an idempotent re-record) or
+    /// rise, never fall. A lane with no `recorded` progress accepts any totals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuyerProgressError`] if either total is below the recorded
+    /// value.
+    pub(crate) fn advanced(
+        recorded: Option<Self>,
+        totals: Self,
+    ) -> Result<Self, BuyerProgressError> {
+        if let Some(existing) = recorded {
+            if totals.last_bytes < existing.last_bytes {
+                return Err(BuyerProgressError::Regressed {
+                    field: "bytes",
+                    recorded: existing.last_bytes,
+                    got: totals.last_bytes,
+                });
+            }
+            if totals.last_amount < existing.last_amount {
+                return Err(BuyerProgressError::Regressed {
+                    field: "amount",
+                    recorded: existing.last_amount,
+                    got: totals.last_amount,
+                });
+            }
+        }
+        Ok(totals)
+    }
+
+    /// The progress a lane holds after a rebase to `anchor` and an advance to
+    /// `totals`, with no check against the recorded progress. A `totals`
+    /// below `anchor` on either axis gives `anchor` alone.
+    pub(crate) fn rebased(anchor: Self, totals: Self) -> Self {
+        let advanced =
+            totals.last_amount >= anchor.last_amount && totals.last_bytes >= anchor.last_bytes;
+        if advanced { totals } else { anchor }
+    }
+}
+
 /// Buyer-held state for one pool, fanned out across every `(signer,
 /// provider)` lane the owner has signed vouchers on.
 ///
@@ -67,9 +113,10 @@ pub struct BuyerLaneProgress {
 ///
 /// `deployment` — the chain id and the `PaymentPool` address — is the
 /// **deployment tag** that tells two such pools apart. It is not part of the
-/// store key: a [`BuyerPoolStore`] is keyed by `pool_id`
+/// store key: a [`BuyerPoolStore`] keys its pool rows by `pool_id`
 /// alone, so it cannot hold rows for two deployments under one id — recording
-/// the second overwrites the first. What the tag buys is detection, and every
+/// the second overwrites the first. (Its delegate lanes carry the deployment
+/// in their key, [`BuyerPoolStore::delegate_lanes`].) What the tag buys is detection, and every
 /// path that reuses a persisted row owes it a check (see [`Self::is_on`]).
 ///
 /// A row from a deployment the node is not configured against carries two numbers
@@ -297,10 +344,8 @@ impl BuyerPoolState {
         anchor: BuyerLaneProgress,
         totals: BuyerLaneProgress,
     ) {
-        let advanced =
-            totals.last_amount >= anchor.last_amount && totals.last_bytes >= anchor.last_bytes;
         self.lanes
-            .insert(lane, if advanced { totals } else { anchor });
+            .insert(lane, BuyerLaneProgress::rebased(anchor, totals));
     }
 
     /// Advance `lane`'s cumulative totals to the reported values, enforcing
@@ -321,29 +366,14 @@ impl BuyerPoolState {
         bytes: U256,
         amount: U256,
     ) -> Result<(), BuyerProgressError> {
-        if let Some(existing) = self.lanes.get(&lane) {
-            if bytes < existing.last_bytes {
-                return Err(BuyerProgressError::Regressed {
-                    field: "bytes",
-                    recorded: existing.last_bytes,
-                    got: bytes,
-                });
-            }
-            if amount < existing.last_amount {
-                return Err(BuyerProgressError::Regressed {
-                    field: "amount",
-                    recorded: existing.last_amount,
-                    got: amount,
-                });
-            }
-        }
-        self.lanes.insert(
-            lane,
+        let progress = BuyerLaneProgress::advanced(
+            self.lanes.get(&lane).copied(),
             BuyerLaneProgress {
                 last_amount: amount,
                 last_bytes: bytes,
             },
-        );
+        )?;
+        self.lanes.insert(lane, progress);
         Ok(())
     }
 }
@@ -382,7 +412,10 @@ pub struct BuyerLoad {
     pub skipped: Vec<PoolId>,
 }
 
-/// Outcome of an atomic [`BuyerPoolStore::advance_progress`].
+/// Outcome of an atomic lane write: [`BuyerPoolStore::advance_progress`],
+/// [`BuyerPoolStore::rebase_progress`], [`BuyerPoolStore::seed_progress`], or a
+/// delegate-lane write. A delegate-lane write returns only `Advanced` or
+/// `Regressed`: it has no pool row and no owner index to miss.
 ///
 /// The read-check-advance-write happens inside one serialized write
 /// transaction, so these variants describe the committed-row decision rather
@@ -438,6 +471,9 @@ pub enum DepositOutcome {
 /// resolves through the owner index to the primary `pool_id`-keyed row.
 /// Implementations MUST persist `record`/`forget` durably (fsync, for
 /// disk-backed impls) before returning `Ok`.
+///
+/// The store also keeps a delegate's lane watermarks, apart from the pool rows
+/// and keyed by deployment and [`LaneKey`] ([`Self::delegate_lanes`]).
 pub trait BuyerPoolStore: Send + Sync {
     /// Load every persisted buyer pool. Called once at bring-up to hydrate
     /// the in-memory pool map and seed the reclaim sweep.
@@ -595,6 +631,61 @@ pub trait BuyerPoolStore: Send + Sync {
         pool_id: PoolId,
         additional: U256,
     ) -> Result<DepositOutcome, StoreError>;
+
+    /// The recorded progress of every lane `signer` holds in `pool_id` on
+    /// `deployment`, as `(provider, progress)` pairs ordered by provider.
+    ///
+    /// These are a delegate's lanes: a key that signs under an owner-signed
+    /// capability (ADR 003 § Capability delegation) on a pool another owner
+    /// funds. The store holds no pool row for such a pool, so delegate lanes
+    /// live apart from the pool rows and every other method here ignores them.
+    /// The lanes are keyed by `deployment` because a `pool_id` repeats across
+    /// `PaymentPool` deployments.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the backing store is unreadable or a
+    /// record is corrupt.
+    fn delegate_lanes(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+        signer: Address,
+    ) -> Result<Vec<(Address, BuyerLaneProgress)>, StoreError>;
+
+    /// Atomically advance the delegate lane `lane` on `deployment` to
+    /// `totals`, with the monotonicity rule of [`BuyerPoolState::advance_lane`].
+    /// A lane with no recorded progress takes the totals as its first record.
+    /// Returns [`AdvanceOutcome::Advanced`] or [`AdvanceOutcome::Regressed`].
+    /// MUST commit durably.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] on a backend/codec fault, or if the recorded
+    /// lane cannot be decoded.
+    fn advance_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError>;
+
+    /// Atomically overwrite the delegate lane `lane` on `deployment` with
+    /// `anchor` and advance it to `totals`, with the rule of
+    /// [`BuyerPoolState::rebase_lane`]. The recorded lane is not read, so the
+    /// overwrite also replaces a record that cannot be decoded. Always returns
+    /// [`AdvanceOutcome::Advanced`]. MUST commit durably.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] only on a backend/codec fault.
+    fn rebase_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError>;
 }
 
 /// In-memory backing for [`MemoryBuyerPoolStore`]: the primary
@@ -605,6 +696,7 @@ pub trait BuyerPoolStore: Send + Sync {
 struct MemoryInner {
     pools: HashMap<PoolId, BuyerPoolState>,
     owner_index: HashMap<Address, PoolId>,
+    delegate_lanes: HashMap<(Deployment, LaneKey), BuyerLaneProgress>,
 }
 
 /// In-memory [`BuyerPoolStore`] for tests and the trait's reference
@@ -801,6 +893,66 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
         };
         state.deposit = state.deposit.saturating_add(additional);
         Ok(DepositOutcome::Added(state.deposit))
+    }
+
+    fn delegate_lanes(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+        signer: Address,
+    ) -> Result<Vec<(Address, BuyerLaneProgress)>, StoreError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        let mut lanes: Vec<(Address, BuyerLaneProgress)> = guard
+            .delegate_lanes
+            .iter()
+            .filter(|((on, lane), _)| {
+                *on == deployment && lane.pool_id == pool_id && lane.signer == signer
+            })
+            .map(|((_, lane), progress)| (lane.provider, *progress))
+            .collect();
+        lanes.sort_by_key(|(provider, _)| *provider);
+        Ok(lanes)
+    }
+
+    fn advance_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        let key = (deployment, lane);
+        match BuyerLaneProgress::advanced(guard.delegate_lanes.get(&key).copied(), totals) {
+            Ok(progress) => {
+                guard.delegate_lanes.insert(key, progress);
+                Ok(AdvanceOutcome::Advanced)
+            }
+            Err(err) => Ok(AdvanceOutcome::Regressed(err)),
+        }
+    }
+
+    fn rebase_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: LaneKey,
+        anchor: BuyerLaneProgress,
+        totals: BuyerLaneProgress,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        guard.delegate_lanes.insert(
+            (deployment, lane),
+            BuyerLaneProgress::rebased(anchor, totals),
+        );
+        Ok(AdvanceOutcome::Advanced)
     }
 }
 

@@ -18,7 +18,9 @@
 //! the assigned FINITE cap (never `U256::MAX`) and `.expiry` at the assigned
 //! expiry; the delegate's `(pool, delegate, operator)` lane watermark advances and
 //! a `PoolRedeemed` event names the delegate; and the OWNER address is never a
-//! signer on that pool — owner ≠ signer delegation, on-chain.
+//! signer on that pool — owner ≠ signer delegation, on-chain. Off-chain, the
+//! delegate's own `buyer-pools.redb` records that lane at or above what the
+//! node redeemed, so a later fetch resumes it.
 //!
 //! CLI-driven rather than a programmatic `ClientFixture` journey because the
 //! fixture's client is hardwired to `signer == owner` (it self-issues the
@@ -62,8 +64,10 @@ use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::poll;
+use decdn_incentive::buyer_pool::BuyerPoolStore;
+use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity;
-use decdn_incentive::{CapabilityGrant, voucher_domain};
+use decdn_incentive::{CapabilityGrant, Deployment, voucher_domain};
 
 const MIB: usize = 1024 * 1024;
 /// Owner pool deposit: 10 USDC (ADR 003 recommended minimum).
@@ -309,6 +313,39 @@ async fn run() -> anyhow::Result<()> {
     anyhow::ensure!(
         lane.amount > 0 && lane.bytesDelivered > 0,
         "the delegate's lane must have advanced (amount={}, bytesDelivered={})",
+        lane.amount,
+        lane.bytesDelivered
+    );
+
+    // The delegate recorded the lane in its own store, so a later fetch resumes
+    // it: the delegate lane for `(pool, delegate, operator)` on this deployment
+    // covers at least what the node redeemed.
+    let recorded = {
+        let store = RedbBuyerPoolStore::open(delegate_dir.path())
+            .context("open the delegate's buyer store")?;
+        store
+            .delegate_lanes(
+                Deployment {
+                    chain_id: chain.chain_id(),
+                    payment_pool,
+                },
+                pool_id,
+                delegate_addr,
+            )
+            .context("read the delegate's lanes")?
+    };
+    let [(provider, progress)] = recorded.as_slice() else {
+        anyhow::bail!("the delegate must record exactly one lane, got {recorded:?}");
+    };
+    anyhow::ensure!(
+        *provider == operator,
+        "the delegate lane names provider {provider}, expected the operator {operator}"
+    );
+    anyhow::ensure!(
+        progress.last_amount >= U256::from(lane.amount)
+            && progress.last_bytes >= U256::from(lane.bytesDelivered),
+        "the delegate recorded {progress:?}, below the redeemed lane (amount={}, \
+         bytesDelivered={})",
         lane.amount,
         lane.bytesDelivered
     );

@@ -249,5 +249,47 @@ fn store_delegates_every_op() -> anyhow::Result<()> {
     store.record(&s)?;
     store.forget(s.owner)?;
     anyhow::ensure!(store.load_all()?.pools.is_empty(), "forget");
+
+    // advance_delegate_progress + rebase_delegate_progress + delegate_lanes:
+    // the row again, not the outcome, proves the U256 arguments landed in
+    // their own fields.
+    let deployment = s.deployment;
+    anyhow::ensure!(
+        store.advance_delegate_progress(
+            deployment,
+            lane,
+            BuyerLaneProgress {
+                last_amount: U256::from(30u64),
+                last_bytes: U256::from(3_000u64)
+            }
+        )? == AdvanceOutcome::Advanced,
+        "advance_delegate_progress"
+    );
+    let lanes = store.delegate_lanes(deployment, lane.pool_id, lane.signer)?;
+    anyhow::ensure!(
+        lanes
+            == vec![(
+                lane.provider,
+                BuyerLaneProgress {
+                    last_amount: U256::from(30u64),
+                    last_bytes: U256::from(3_000u64),
+                },
+            )],
+        "delegate_lanes after advance = {lanes:?}"
+    );
+    let anchor = BuyerLaneProgress {
+        last_amount: U256::from(5u64),
+        last_bytes: U256::from(500u64),
+    };
+    anyhow::ensure!(
+        store.rebase_delegate_progress(deployment, lane, anchor, anchor)?
+            == AdvanceOutcome::Advanced,
+        "rebase_delegate_progress"
+    );
+    anyhow::ensure!(
+        store.delegate_lanes(deployment, lane.pool_id, lane.signer)?
+            == vec![(lane.provider, anchor)],
+        "delegate_lanes after rebase"
+    );
     Ok(())
 }

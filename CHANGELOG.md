@@ -28,6 +28,13 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Buyer-store API: delegate lanes (#2435).** `BuyerPoolStore` gains three
+  required methods, `delegate_lanes`, `advance_delegate_progress` and
+  `rebase_delegate_progress`, so an implementor outside the workspace must add
+  them. In `decdn-client`, `ProgressWrite::apply` takes a `WatermarkRow` (the
+  owner's pool row, or the delegate lanes of a deployment) in place of the
+  owner address, and no longer takes a separate pool id: the lane key carries
+  it.
 - **Buyer metrics (#2405).** A lane-seed refusal now moves
   `decdn_node_pull_pool_open_failures_total` once, beside
   `decdn_buyer_lane_seed_failures_total`, so the open-failure total counts
@@ -996,6 +1003,18 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **A delegated client records its lane watermarks (#2435).** A client that
+  pays under a `dcap1` capability on a pool another owner funds owns no pool
+  row, so every lane watermark write it made was dropped with a warning. Its
+  lanes now go to a new `buyer_delegate_lanes_v1` table in
+  `buyer-pools.redb`, keyed by chain id, `PaymentPool` address, pool id,
+  signer key and provider. A later `decdn fetch`, `bundle pull` or
+  `decdn_client::bundle` run on the same data dir resumes each lane from its
+  record instead of from zero, and the ADR 039 funding signal counts what
+  earlier runs signed under the key. The pool tables are unchanged, so
+  existing rows still read and no lane reseeds. A delegate-lane record the
+  store cannot read fails the fetch as a local fault instead of retrying. The
+  API changes are under Changed (BREAKING).
 - **`decdn pool close` and `pool reclaim` name the revert that gas estimation
   rejects, and no longer call it on-chain (#2426, #2417).** A `closePool` or
   `reclaim` that would revert fails at gas estimation, before anything is

@@ -353,3 +353,76 @@ fn add_deposit_accumulates_committed_deposit() -> anyhow::Result<()> {
     anyhow::ensure!(stored.deposit == U256::from(140u64));
     Ok(())
 }
+
+/// The in-memory store keeps delegate lanes with the redb table's rules: a
+/// monotone advance, the rebase rule, and a scan of one signer in one pool on
+/// one deployment, ordered by provider. Delegate lanes touch no pool row.
+#[test]
+fn memory_store_delegate_lanes_match_the_table_rules() -> anyhow::Result<()> {
+    let store = MemoryBuyerPoolStore::new();
+    let lane = |provider: u8| LaneKey {
+        pool_id: PoolId::repeat_byte(0x11),
+        signer: Address::repeat_byte(0x22),
+        provider: Address::repeat_byte(provider),
+    };
+    let at = |bytes: u64, amount: u64| BuyerLaneProgress {
+        last_amount: U256::from(amount),
+        last_bytes: U256::from(bytes),
+    };
+    let other = Deployment {
+        chain_id: DEPLOYMENT.chain_id + 1,
+        ..DEPLOYMENT
+    };
+    let foreign_signer = LaneKey {
+        signer: Address::repeat_byte(0x23),
+        ..lane(0x01)
+    };
+
+    for (deployment, key, n) in [
+        (DEPLOYMENT, lane(0xfb), 2u64),
+        (DEPLOYMENT, lane(0x0a), 1),
+        (other, lane(0x0a), 4),
+        (DEPLOYMENT, foreign_signer, 8),
+    ] {
+        let outcome = store.advance_delegate_progress(
+            deployment,
+            key,
+            BuyerLaneProgress {
+                last_amount: U256::from(n),
+                last_bytes: U256::from(n),
+            },
+        )?;
+        anyhow::ensure!(outcome == AdvanceOutcome::Advanced);
+    }
+    anyhow::ensure!(matches!(
+        store.advance_delegate_progress(
+            DEPLOYMENT,
+            lane(0x0a),
+            BuyerLaneProgress {
+                last_amount: U256::from(9u64),
+                last_bytes: U256::ZERO
+            }
+        )?,
+        AdvanceOutcome::Regressed(_)
+    ));
+    let lanes = store.delegate_lanes(DEPLOYMENT, PoolId::repeat_byte(0x11), lane(0).signer)?;
+    anyhow::ensure!(
+        lanes
+            == vec![
+                (lane(0x0a).provider, at(1, 1)),
+                (lane(0xfb).provider, at(2, 2))
+            ],
+        "got {lanes:?}"
+    );
+
+    let _ = store.rebase_delegate_progress(DEPLOYMENT, lane(0xfb), at(1, 1), at(0, 5))?;
+    anyhow::ensure!(
+        store
+            .delegate_lanes(DEPLOYMENT, PoolId::repeat_byte(0x11), lane(0).signer)?
+            .get(1)
+            == Some(&(lane(0xfb).provider, at(1, 1))),
+        "a totals behind the anchor records the anchor"
+    );
+    anyhow::ensure!(store.is_empty(), "delegate lanes wrote a pool row");
+    Ok(())
+}
