@@ -322,11 +322,9 @@ async fn probe_candidate_does_not_retry_a_failure_that_is_not_a_shed() {
     server.close().await;
 }
 
-/// `spawn_harvest`/`NodeCandidate` are `pub(crate)`, unreachable from an
-/// integration test in `crates/cli/tests/` — so this lives in-crate
-/// instead of `crates/cli/tests/peer_store_harvest.rs`. The test awaits
-/// the returned `JoinHandle` (never done on the real fetch path) purely
-/// for determinism.
+/// A node key for the harvest tests. `spawn_harvest` is `pub(crate)`, so
+/// they live in-crate rather than in an integration test. They await the
+/// returned `JoinHandle`, which the fetch path never does, for determinism.
 fn harvest_key(b: u8) -> PublicKey {
     iroh::SecretKey::from_bytes(&[b; 32]).public()
 }

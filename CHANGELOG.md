@@ -2846,8 +2846,11 @@ since project inception and will roll into the first tagged release.
   stream cap move from the `decdn` CLI into hidden `decdn-client` modules
   (`session`, `targets`, `lanes`, `funding`, `lane_sources`, `stream_cap`,
   `ordered_writes`). `decdn fetch` and `decdn bundle pull` drive them, and
-  behave as before. The lanes take any `BuyerPoolStore`, so the client needs
-  no `redb` feature. The public API does not change.
+  behave as before, with one exception: the moved code logs under
+  `decdn_client::…` targets, so a module-scoped `RUST_LOG` filter that named a
+  `decdn_cli::commands::fetch` or `cli_sources` target names the new module.
+  The lanes take any `BuyerPoolStore`, so the client needs no `redb` feature.
+  The public API does not change.
 - **Release: `sign-release.sh` and `publish-crates.sh` live in `scripts/`.**
   Run them as `scripts/sign-release.sh <tag>` and
   `scripts/publish-crates.sh <tag>`. `.github/scripts/` keeps only what
