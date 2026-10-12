@@ -454,17 +454,71 @@ enum ReclaimPlan {
     SkipUnknown,
 }
 
-/// Running counts for a `--all` sweep. The exit code keys off `failed`; the
-/// other two are reported for the operator.
+/// Running counts for a `--all` sweep. The exit code keys off `failed` and
+/// `unconfirmed`; the other two are reported for the operator.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct BatchTally {
     /// Pools closed or reclaimed successfully.
     acted: usize,
     /// Pools intentionally left untouched (wrong status / window not elapsed).
     skipped: usize,
-    /// Pools whose read or transaction errored.
+    /// Pools whose read or transaction errored with a known outcome.
     failed: usize,
+    /// Pools whose transaction may have broadcast and may still mine (the
+    /// error carries [`TxUnconfirmed`]). Disjoint from `failed`.
+    unconfirmed: usize,
 }
+
+impl BatchTally {
+    /// Count one pool's `closePool` / `reclaim` error: as `unconfirmed` when it
+    /// carries [`TxUnconfirmed`], else as `failed`. Returns `true` for
+    /// `unconfirmed`.
+    fn record_error(&mut self, err: &anyhow::Error) -> bool {
+        let unconfirmed = err.downcast_ref::<TxUnconfirmed>().is_some();
+        if unconfirmed {
+            self.unconfirmed += 1;
+        } else {
+            self.failed += 1;
+        }
+        unconfirmed
+    }
+}
+
+/// The context on a `closePool` / `reclaim` error whose transaction may have
+/// broadcast and may still mine: its send failed in transport, or it was
+/// broadcast and its receipt could not be read. A re-run may double-submit,
+/// so a `--all` sweep counts it apart from a definite failure. Recover it with
+/// `err.downcast_ref::<TxUnconfirmed>()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TxUnconfirmed {
+    /// The contract call, `closePool` or `reclaim`.
+    label: &'static str,
+    /// The broadcast transaction. `None` when the send failed in transport:
+    /// the RPC node may have broadcast the transaction without returning its
+    /// hash.
+    tx: Option<TxHash>,
+}
+
+impl std::fmt::Display for TxUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = self.label;
+        match self.tx {
+            Some(tx) => write!(
+                f,
+                "{label} sent (tx {tx:#x}) but the receipt could not be fetched; it may still \
+                 mine — check the tx before re-running"
+            ),
+            None => write!(
+                f,
+                "{label} send failed: the request may have reached the node and broadcast the \
+                 transaction — check this signer's pending and mined transactions before \
+                 re-running"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TxUnconfirmed {}
 
 /// Classify one enumerated pool for `close --all`.
 const fn plan_close(status: PaymentPool::Status) -> ClosePlan {
@@ -536,20 +590,29 @@ fn single_reclaim_gate(
     }
 }
 
-/// Turn a finished `--all` sweep into a process result. Any failed pool is a
-/// nonzero exit; "nothing eligible" is success — the summary line already says
-/// so.
+/// Turn a finished `--all` sweep into a process result. Any failed or
+/// unconfirmed pool is a nonzero exit; "nothing eligible" is success — the
+/// summary line already says so.
 ///
 /// # Errors
 ///
-/// Errors when at least one pool failed to `verb`.
+/// Errors when at least one pool failed to `verb`, or its `verb` transaction
+/// may have broadcast without a confirmed outcome.
 fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        tally.failed == 0,
-        "{} pool(s) failed to {verb}; see the summary above",
-        tally.failed
-    );
-    Ok(())
+    let failed = (tally.failed > 0).then(|| format!("{} pool(s) failed to {verb}", tally.failed));
+    let unconfirmed = (tally.unconfirmed > 0).then(|| {
+        format!(
+            "{} pool(s) may have broadcast a {verb} transaction — check this signer's pending \
+             and mined transactions before re-running",
+            tally.unconfirmed
+        )
+    });
+    match (failed, unconfirmed) {
+        (None, None) => Ok(()),
+        (Some(f), None) => anyhow::bail!("{f}; see the summary above"),
+        (None, Some(u)) => anyhow::bail!("{u}; see the summary above"),
+        (Some(f), Some(u)) => anyhow::bail!("{f}, and {u}; see the summary above"),
+    }
 }
 
 /// Send `closePool(pool_id)`, wait for the receipt, and on success clear the
@@ -583,10 +646,10 @@ where
     // the tx's fate unknown, and the hash is the operator's only handle on it.
     let tx = *pending.tx_hash();
     let receipt = pending.get_receipt().await.map_err(|e| {
-        anyhow::Error::new(e).context(format!(
-            "closePool sent (tx {tx:#x}) but the receipt could not be fetched; it may still \
-             mine — check the tx before re-running"
-        ))
+        anyhow::Error::new(e).context(TxUnconfirmed {
+            label: "closePool",
+            tx: Some(tx),
+        })
     })?;
 
     match receipt_outcome(receipt.status()) {
@@ -655,10 +718,10 @@ where
     // the tx's fate unknown, and the hash is the operator's only handle on it.
     let tx = *pending.tx_hash();
     let receipt = pending.get_receipt().await.map_err(|e| {
-        anyhow::Error::new(e).context(format!(
-            "reclaim sent (tx {tx:#x}) but the receipt could not be fetched; it may still \
-             mine — check the tx before re-running"
-        ))
+        anyhow::Error::new(e).context(TxUnconfirmed {
+            label: "reclaim",
+            tx: Some(tx),
+        })
     })?;
 
     match receipt_outcome(receipt.status()) {
@@ -726,17 +789,16 @@ fn send_reverted(
 /// The error for a `closePool` / `reclaim` send that failed with no revert
 /// data. When `send_broadcast_unknown` holds (a timeout, a reset, an HTTP 5xx,
 /// an unreadable response), the tx may have broadcast before its response was
-/// lost and no hash came back, so the note sends the operator to this signer's
-/// own transactions. Any other failure (a JSON-RPC rejection, an HTTP 4xx, a
-/// local fault) broadcast nothing and gets no note (#1577).
-fn send_failed(err: alloy::contract::Error, label: &str) -> anyhow::Error {
-    let note = if decdn_incentive::tx::send_broadcast_unknown(&err) {
-        ": the request may have reached the node and broadcast the transaction — check this \
-         signer's pending and mined transactions before re-running"
+/// lost and no hash came back. The error then carries [`TxUnconfirmed`], whose
+/// message sends the operator to this signer's own transactions. Any other
+/// failure (a JSON-RPC rejection, an HTTP 4xx, a local fault) broadcast nothing
+/// and gets no such note (#1577).
+fn send_failed(err: alloy::contract::Error, label: &'static str) -> anyhow::Error {
+    if decdn_incentive::tx::send_broadcast_unknown(&err) {
+        anyhow::Error::new(err).context(TxUnconfirmed { label, tx: None })
     } else {
-        ""
-    };
-    anyhow::Error::new(err).context(format!("{label} send failed{note}"))
+        anyhow::Error::new(err).context(format!("{label} send failed"))
+    }
 }
 
 /// `decdn pool close`: start the grace-window close on a pool the caller owns
@@ -786,8 +848,10 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
 }
 
 /// `close --all`: enumerate every pool this keystore owns and close the `Open`
-/// ones. One pool's read or close failure is recorded and the sweep continues;
-/// the exit code is nonzero only if any pool failed.
+/// ones. One pool's read or close failure is recorded and the sweep continues.
+/// A close whose tx may have broadcast without a confirmed outcome counts as
+/// unconfirmed, not failed. The exit code is nonzero if any pool failed or is
+/// unconfirmed.
 async fn close_all<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -822,8 +886,12 @@ where
                     tally.acted += 1;
                 }
                 Err(e) => {
-                    eprintln!("failed to close pool {pool_id}: {}", sanitize_err_chain(&e));
-                    tally.failed += 1;
+                    let msg = sanitize_err_chain(&e);
+                    if tally.record_error(&e) {
+                        eprintln!("close of pool {pool_id} unconfirmed: {msg}");
+                    } else {
+                        eprintln!("failed to close pool {pool_id}: {msg}");
+                    }
                 }
             },
             ClosePlan::Skip(reason) => {
@@ -833,8 +901,8 @@ where
         }
     }
     println!(
-        "close --all: closed {}, skipped {}, failed {}",
-        tally.acted, tally.skipped, tally.failed
+        "close --all: closed {}, skipped {}, failed {}, unconfirmed {}",
+        tally.acted, tally.skipped, tally.failed, tally.unconfirmed
     );
     batch_result(&tally, "close")
 }
@@ -892,8 +960,10 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
 /// `reclaim --all`: enumerate every pool this keystore owns and reclaim the ones
 /// whose dispute window has elapsed. Pools still `Open`, still inside the
 /// window, or already reclaimed are skipped (in-window pools report when they
-/// become reclaimable). One pool's failure is recorded and the sweep continues;
-/// the exit code is nonzero only if any pool failed.
+/// become reclaimable). One pool's failure is recorded and the sweep continues.
+/// A reclaim whose tx may have broadcast without a confirmed outcome counts as
+/// unconfirmed, not failed. The exit code is nonzero if any pool failed or is
+/// unconfirmed.
 async fn reclaim_all<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -932,11 +1002,12 @@ where
                         tally.acted += 1;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "failed to reclaim pool {pool_id}: {}",
-                            sanitize_err_chain(&e)
-                        );
-                        tally.failed += 1;
+                        let msg = sanitize_err_chain(&e);
+                        if tally.record_error(&e) {
+                            eprintln!("reclaim of pool {pool_id} unconfirmed: {msg}");
+                        } else {
+                            eprintln!("failed to reclaim pool {pool_id}: {msg}");
+                        }
                     }
                 }
             }
@@ -962,8 +1033,8 @@ where
         }
     }
     println!(
-        "reclaim --all: reclaimed {}, skipped {}, failed {}",
-        tally.acted, tally.skipped, tally.failed
+        "reclaim --all: reclaimed {}, skipped {}, failed {}, unconfirmed {}",
+        tally.acted, tally.skipped, tally.failed, tally.unconfirmed
     );
     batch_result(&tally, "reclaim")
 }
