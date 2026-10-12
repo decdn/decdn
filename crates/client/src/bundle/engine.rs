@@ -760,11 +760,23 @@ impl DedupOutcome {
 
 /// Run-scoped range-dedup counters, shared by every concurrent entry via
 /// `&PullCtx`. Atomics because entries run concurrently under `buffer_unordered`;
-/// `Relaxed` is enough — the totals are read once, after the pull joins.
+/// `Relaxed` is enough — the totals are read and reset once per pull, after it
+/// joins ([`Self::take`]).
 #[derive(Default)]
 pub(super) struct DedupStats {
     spliced_bytes: AtomicU64,
     hints_ignored: AtomicU64,
+}
+
+impl DedupStats {
+    /// The counters as they stand, reset to zero, so the next pull of the
+    /// same puller reports only its own.
+    fn take(&self) -> DedupSummary {
+        DedupSummary {
+            spliced_bytes: self.spliced_bytes.swap(0, Ordering::Relaxed),
+            hints_ignored: self.hints_ignored.swap(0, Ordering::Relaxed),
+        }
+    }
 }
 
 /// A pull's byte accounting: `downloaded` is the content bytes this run fetched and
@@ -1550,10 +1562,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         });
         warnings.extend(self.funding.shortfall());
         // Every entry has joined, so the shared dedup counters are now stable.
-        let dedup = DedupSummary {
-            spliced_bytes: self.dedup_stats.spliced_bytes.load(Ordering::Relaxed),
-            hints_ignored: self.dedup_stats.hints_ignored.load(Ordering::Relaxed),
-        };
+        let dedup = self.dedup_stats.take();
         let report = bundle_report(&outcomes, transfer, dedup, warnings);
         let end = if interrupted {
             BundleEnd::Interrupted

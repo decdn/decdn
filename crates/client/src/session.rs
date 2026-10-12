@@ -51,8 +51,10 @@ pub struct PullSite {
     /// The client's region, for region-first discovery ordering. `None` skips
     /// the ordering.
     pub region: Option<String>,
-    /// The regions discovery may probe. Empty allows every region. It
-    /// narrows the candidates and never ranks them.
+    /// The regions a single fetch's discovery may probe. Empty allows every
+    /// region. It narrows the candidates and never ranks them, and widens back
+    /// to every region when too few candidates remain. A bundle pull does not
+    /// apply it: each entry samples the run's registry list region-first.
     pub region_allowlist: Vec<decdn_protocol::Region>,
 }
 

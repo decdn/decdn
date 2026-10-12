@@ -3659,3 +3659,16 @@ fn the_report_tallies_every_outcome() {
     );
     assert_eq!(report.warnings, vec!["w".to_string()]);
 }
+
+/// Each pull reports only its own range-dedup counters: reading them for one
+/// pull's report resets them for the next pull of the same puller.
+#[test]
+fn dedup_counters_are_per_pull() {
+    let stats = DedupStats::default();
+    stats.spliced_bytes.fetch_add(10, Ordering::Relaxed);
+    stats.hints_ignored.fetch_add(2, Ordering::Relaxed);
+    let first = stats.take();
+    assert_eq!((first.spliced_bytes, first.hints_ignored), (10, 2));
+    let second = stats.take();
+    assert_eq!((second.spliced_bytes, second.hints_ignored), (0, 0));
+}
