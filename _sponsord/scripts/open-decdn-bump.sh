@@ -2,7 +2,7 @@
 # Opens the PR that moves the decdn pin to a decdn release
 # (RELEASING.md § Pinning decdn).
 #
-# Usage:  .github/scripts/open-decdn-bump.sh [--dry-run] [vX.Y.Z]
+# Usage:  scripts/open-decdn-bump.sh [--dry-run] [vX.Y.Z]
 #
 # With no tag it takes decdn's latest published release. decdn's
 # publish-crates.sh runs it with the tag it just published; a maintainer runs
@@ -27,9 +27,9 @@
 set -euo pipefail
 
 DECDN=decdn/decdn
-# The helpers come from beside this script, so they match it; they act on the
+# The helpers come from this script's own checkout, so they match it; they act on the
 # repository of the current directory, which is the worktree below.
-SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.github/scripts" && pwd)
 SPONSORD=decdn/sponsord
 READY_ATTEMPTS=10
 READY_INTERVAL=60
@@ -201,7 +201,7 @@ BODY=$(mktemp)
     echo "Older bump PRs still open: ${others}. This one supersedes them."
     echo
   fi
-  echo "Opened by \`.github/scripts/open-decdn-bump.sh\` (RELEASING.md § Pinning decdn)."
+  echo "Opened by \`scripts/open-decdn-bump.sh\` (RELEASING.md § Pinning decdn)."
   echo "A red CI means the new decdn needs code changes here: push them to"
   echo "this branch."
 } > "$BODY"

@@ -16,8 +16,8 @@ A release is three commands with a CI build between the first two:
 ```bash
 cargo release patch --execute                  # cut, sign and push the tag
 # ...wait for the tag-push run to finish...
-.github/scripts/sign-release.sh v0.1.2         # verify, sign, tag images, publish
-.github/scripts/publish-crates.sh v0.1.2       # publish every crate to crates.io
+scripts/sign-release.sh v0.1.2                 # verify, sign, tag images, publish
+scripts/publish-crates.sh v0.1.2               # publish every crate to crates.io
 # then pin it in the onramp (ONRAMP_CLI_RELEASE / _SUMS_SHA256)
 ```
 
@@ -115,16 +115,16 @@ commit still releases binaries and images; it just cannot go to crates.io.
 
 ### The bump PR
 
-[`open-decdn-bump.sh`](.github/scripts/open-decdn-bump.sh) opens the PR that
+[`open-decdn-bump.sh`](scripts/open-decdn-bump.sh) opens the PR that
 moves the lock to a decdn release. decdn's `publish-crates.sh` runs it with
 the tag it just published. To run it by hand you need git, cargo, Python 3.11+
 and `gh` logged in to github.com, in a clone whose `origin` is decdn/sponsord
 and which you can push to:
 
 ```bash
-.github/scripts/open-decdn-bump.sh            # decdn's latest release
-.github/scripts/open-decdn-bump.sh v0.1.2     # one release
-.github/scripts/open-decdn-bump.sh --dry-run  # print the diff, push nothing
+scripts/open-decdn-bump.sh            # decdn's latest release
+scripts/open-decdn-bump.sh v0.1.2     # one release
+scripts/open-decdn-bump.sh --dry-run  # print the diff, push nothing
 ```
 
 It works in a temporary worktree at `origin/main`, so your checkout and
@@ -294,7 +294,7 @@ nothing resolves by name until the release is signed.
 Once the run is green:
 
 ```bash
-.github/scripts/sign-release.sh v0.1.2
+scripts/sign-release.sh v0.1.2
 ```
 
 It resolves your signing key to a fingerprint — `SPONSORD_SIGNING_KEY` if set,
@@ -369,13 +369,13 @@ tell their users to re-run it.
 Last, once the GitHub Release is out of draft:
 
 ```bash
-.github/scripts/publish-crates.sh v0.1.2
+scripts/publish-crates.sh v0.1.2
 ```
 
 It verifies the tag against `KEYS` and against `origin` the way
 `sign-release.sh` does, and requires the release to be published **and** to
 carry `SHA256SUMS.asc`. It then lists the decdn crates the uploaded manifests
-require ([`registry_deps.py`](.github/scripts/registry_deps.py)): the decdn
+require ([`registry_deps.py`](scripts/registry_deps.py)): the decdn
 commit `Cargo.lock` locks at the tag must be decdn's `v<version>` tag, and that
 release must be on crates.io. Until it is, the script stops there, with
 nothing uploaded. The sibling crates need no such check: they go up in the

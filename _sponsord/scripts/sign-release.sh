@@ -12,7 +12,7 @@
 # it with their own GPG key, promotes the image tags, and publishes. There is no
 # signing key in Actions secrets.
 #
-# Usage:  .github/scripts/sign-release.sh v0.1.2
+# Usage:  scripts/sign-release.sh v0.1.2
 #
 # Environment:
 #   SPONSORD_REPO            override the owner/repo (default: decdn/sponsord)
@@ -38,11 +38,11 @@ set -euo pipefail
 die() { echo "error: $*" >&2; exit 1; }
 
 TAG="${1:?tag required, e.g. v0.1.2}"
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CI_SCRIPTS=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.github/scripts" && pwd)
 command -v python3 >/dev/null || die "python3 not found on PATH"
 # The same plan release.yml staged the draft from; refuses a tag it does not
 # know rather than guessing what to sign.
-PLAN=$(python3 "$SCRIPT_DIR/release_plan.py" "$TAG") ||
+PLAN=$(python3 "$CI_SCRIPTS/release_plan.py" "$TAG") ||
   die "$TAG is not a release tag (vMAJOR.MINOR.PATCH[-pre])"
 plan_get() { sed -n "s/^$1=//p" <<<"$PLAN"; }
 VERSION=$(plan_get version)
@@ -447,7 +447,7 @@ done
 # release with no higher stable release above it, so a maintenance release cut
 # under a newer one takes neither. Read from the tags fetched above, in the
 # repository (this script has moved into the download directory by now).
-LATEST=$(cd "$REPO_ROOT" && python3 "$SCRIPT_DIR/release_plan.py" "$TAG" --latest) ||
+LATEST=$(cd "$REPO_ROOT" && python3 "$CI_SCRIPTS/release_plan.py" "$TAG" --latest) ||
   die "could not decide whether $TAG is the latest release"
 
 if [[ -n "$SKIP_IMAGE_TAGS" ]]; then

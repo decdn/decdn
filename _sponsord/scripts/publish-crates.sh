@@ -8,7 +8,7 @@
 # workflow definition from the pushed ref, so a token reachable from release.yml
 # would be reachable from any tag anyone with push access could craft.
 #
-# Usage:  .github/scripts/publish-crates.sh v0.1.2
+# Usage:  scripts/publish-crates.sh v0.1.2
 #
 # The uploaded manifests resolve every path and git dependency by its
 # `version`. The siblings go up in this same run, in dependency order; the
@@ -35,8 +35,9 @@ die() { echo "error: $*" >&2; exit 1; }
 
 TAG="${1:?tag required, e.g. v0.1.2}"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CI_SCRIPTS=$(cd "$SCRIPT_DIR/../.github/scripts" && pwd)
 command -v python3 >/dev/null || die "python3 not found on PATH"
-PLAN=$(python3 "$SCRIPT_DIR/release_plan.py" "$TAG") ||
+PLAN=$(python3 "$CI_SCRIPTS/release_plan.py" "$TAG") ||
   die "$TAG is not a release tag (vMAJOR.MINOR.PATCH[-pre])"
 VERSION=$(sed -n 's/^version=//p' <<<"$PLAN")
 REPO="${SPONSORD_REPO:-decdn/sponsord}"
@@ -202,7 +203,7 @@ Check: gh release view $TAG --repo $REPO"
 case "$IS_DRAFT" in
   false) ;;
   true) die "release $TAG is still a draft.
-Run .github/scripts/sign-release.sh $TAG first — crates.io publishes are
+Run scripts/sign-release.sh $TAG first — crates.io publishes are
 irreversible, so nothing goes out before the signed release does." ;;
   *) die "unexpected isDraft value from gh: '$IS_DRAFT' (expected true or false)" ;;
 esac
@@ -216,7 +217,7 @@ gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev
   grep -qx 'SHA256SUMS.asc' || die \
   "release $TAG carries no SHA256SUMS.asc — it is published but was never signed.
 Nothing goes to crates.io that no maintainer signature vouches for.
-Run .github/scripts/sign-release.sh $TAG."
+Run scripts/sign-release.sh $TAG."
 
 # ---- the decdn crates must be on crates.io first --------------------------
 
@@ -275,7 +276,7 @@ for entry in "${DEPS[@]}"; do
   case "$code" in
     200) echo "    ${name} ${ver} is on crates.io" ;;
     404) die "${name} ${ver} is not on crates.io.
-Publish decdn v${DECDN_VERSION} first (decdn's .github/scripts/publish-crates.sh),
+Publish decdn v${DECDN_VERSION} first (decdn's scripts/publish-crates.sh),
 then re-run this script. Nothing has been uploaded." ;;
     *) die "crates.io returned HTTP $code for $name $ver; refusing to guess" ;;
   esac

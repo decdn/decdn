@@ -33,7 +33,7 @@ pre-commit install --hook-type pre-commit --hook-type pre-push
 
 The workspace denies `unwrap`, `expect`, `panic!` and slice indexing outside
 tests (`[workspace.lints.clippy]`). `.github/scripts/cargo-deny-warn.sh` runs
-`cargo deny check` the way CI does, and `python3 -m pytest .github/scripts/tests`
+`cargo deny check` the way CI does, and `python3 -m pytest .github/scripts/tests scripts/tests`
 tests the release tooling.
 
 If you change a type in `sponsord-api`, regenerate the OpenAPI documents:

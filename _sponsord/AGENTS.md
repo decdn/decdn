@@ -29,7 +29,7 @@ cargo nextest run --features sponsord-core/anvil-e2e,sponsord/anvil-e2e \
 UPDATE_OPENAPI=1 cargo test -p sponsord-api --test openapi
 
 # Release/CI tooling (Python) and the repo consistency checks CI runs
-python3 -m pytest .github/scripts/tests
+python3 -m pytest .github/scripts/tests scripts/tests
 .github/scripts/check-{toolchain-pin,workspace-manifests,decdn-pin,package-embeds,image-name}.sh
 .github/scripts/cargo-deny-warn.sh
 ```
@@ -125,7 +125,7 @@ rather than writing new ones.
   the `version`, where one is set), then run
   `cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e`
   in a PR of its own (`RELEASING.md` § Pinning decdn).
-  `.github/scripts/open-decdn-bump.sh` opens that PR, and decdn's
+  `scripts/open-decdn-bump.sh` opens that PR, and decdn's
   `publish-crates.sh` runs it for each release. To build against a local
   `../decdn`, use an untracked `.cargo/config.toml` `[patch]` (see `CONTRIBUTING.md`), and do not commit
   the lockfile changes it causes.

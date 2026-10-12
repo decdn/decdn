@@ -91,6 +91,7 @@ jobs:
               - '.github/workflows/ci.yml'
             scripts:
               - '.github/scripts/**'
+              - 'scripts/**'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -517,7 +518,7 @@ jobs:
       - name: Test CI tooling
         run: |
           python3 -m pip install 'pytest==8.*'
-          python3 -m pytest .github/scripts/tests -q
+          python3 -m pytest .github/scripts/tests scripts/tests -q
 
   pr-title:
     name: PR title

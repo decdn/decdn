@@ -27,7 +27,7 @@ name: Release
 # Nothing reaches the draft or a registry for a release that failed verify:
 # verify creates the draft, and upload-assets and docker both need it.
 #
-# A maintainer then runs .github/scripts/sign-release.sh, which signs what the
+# A maintainer then runs scripts/sign-release.sh, which signs what the
 # release carries, tags the images on GHCR and Docker Hub, and takes the
 # release out of draft; then publish-crates.sh for crates.io.
 #

@@ -51,7 +51,7 @@ expect .github/workflows/security.yml  "$MATRIX_IMAGE"
 expect .github/workflows/security.yml  "$MATRIX"
 expect .github/workflows/ci.yml        "$MATRIX"
 # shellcheck disable=SC2016  # ${OWNER} is literal text in the target file
-expect .github/scripts/sign-release.sh 'GHCR_NAMESPACE="ghcr.io/${OWNER}"'
+expect scripts/sign-release.sh 'GHCR_NAMESPACE="ghcr.io/${OWNER}"'
 for image in "${IMAGES[@]}"; do
   grep -qE "^FROM [^ ]+ AS ${image}\$" Dockerfile || {
     echo "error: Dockerfile has no final target \`AS ${image}\`" >&2

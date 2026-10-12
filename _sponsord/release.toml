@@ -20,7 +20,7 @@ pre-release-replacements = [
 push = true
 push-remote = "origin"
 # Not a "we never publish" flag: crates go to crates.io via
-# .github/scripts/publish-crates.sh. It must not happen HERE, before CI has
+# scripts/publish-crates.sh. It must not happen HERE, before CI has
 # built anything and before a maintainer has signed anything — a crates.io
 # version is immutable, so an upload at this point could never be taken back.
 publish = false

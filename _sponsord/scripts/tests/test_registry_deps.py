@@ -11,8 +11,8 @@ import sys
 import tomllib
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-MODULE_PATH = REPO_ROOT / ".github/scripts/registry_deps.py"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+MODULE_PATH = REPO_ROOT / "scripts/registry_deps.py"
 
 _spec = importlib.util.spec_from_file_location("registry_deps", MODULE_PATH)
 assert _spec and _spec.loader

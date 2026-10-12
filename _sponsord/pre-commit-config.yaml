@@ -97,5 +97,5 @@ repos:
         name: image names agree across workflows and the signing script
         entry: .github/scripts/check-image-name.sh
         language: system
-        files: '^(Dockerfile|\.github/workflows/(release|security)\.yml|\.github/scripts/(sign-release\.sh|check-image-name\.sh|release_plan\.py))$'
+        files: '^(Dockerfile|scripts/sign-release\.sh|\.github/workflows/(release|security)\.yml|\.github/scripts/(check-image-name\.sh|release_plan\.py))$'
         pass_filenames: false
