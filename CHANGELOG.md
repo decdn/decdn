@@ -3342,6 +3342,16 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Release: Docker Hub overviews for `decdn/decdn-node` and `decdn/decdn`
+  (#2440).** Each image's Hub short description and overview live in
+  `docker/README.<stage>.md`. `sign-release.sh` pushes them after the Docker
+  Hub mirror, from the files as committed at the tag, and reads them back
+  without credentials. A prerelease leaves them alone. A failed push only
+  warns; running `scripts/dockerhub-description.py` by hand repeats it. The
+  push logs in with `DECDN_DOCKERHUB_USERNAME` and `DECDN_DOCKERHUB_TOKEN`
+  when both are set, else with the `docker login docker.io` credential, and
+  needs `python3`. `DECDN_SKIP_DOCKERHUB` skips it with the mirror.
+  `check-image-name.sh` fails an image with no overview file.
 - **`decdn-client`: a public bundle pull, `decdn_client::bundle` (#2429).**
   `BundlePuller` pulls every blob of a bundle manifest into a directory over
   one paid run, with what `decdn bundle pull` does: fetch-once per blob,

@@ -38,12 +38,18 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    ```
 
 3. **Tools.** `cargo install cargo-release git-cliff`, plus `gh auth login`.
+   `python3` for the Docker Hub overview push.
 
 4. **Registry logins.** `docker login ghcr.io` with a token carrying
    `write:packages`, and `docker login docker.io` — both images go to both
    registries. The Docker Hub repositories `decdn/decdn-node` and
-   `decdn/decdn` must exist first. Skip the Docker Hub login with
-   `DECDN_SKIP_DOCKERHUB=1` if you only need GHCR.
+   `decdn/decdn` must exist first. The same Docker Hub login writes each
+   repository's overview, through the Hub API. That API accepts a password or
+   a personal access token with the *Read, Write, Delete* scope. If your
+   `docker login` stored something else (a browser-based login can), set
+   `DECDN_DOCKERHUB_USERNAME` and `DECDN_DOCKERHUB_TOKEN` to such a token.
+   Skip the Docker Hub login with `DECDN_SKIP_DOCKERHUB=1` if you only need
+   GHCR.
 
 5. **Public GHCR packages.** The first push of an image creates its GHCR
    package as **private**, and a private package denies every anonymous
@@ -172,9 +178,9 @@ strictly against them **and** that every published archive appears in the
 manifest; signs `SHA256SUMS` and each image's digest file and SBOM; verifies
 each signature against a keyring built only from `KEYS`; uploads the five
 `.asc` files; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
-signed digest on GHCR; mirrors those same digests to Docker Hub; checks that
-every promoted repository is pullable without credentials; and flips the
-release out of draft.
+signed digest on GHCR; mirrors those same digests to Docker Hub; for a stable
+release, pushes each Docker Hub overview; checks that every promoted repository
+is pullable without credentials; and flips the release out of draft.
 
 The mirror is a manifest copy, not a rebuild: `docker buildx imagetools create`
 copies the manifest bytes verbatim, so `docker.io/decdn/decdn-node` and
@@ -184,14 +190,35 @@ over `decdn-node-image-digest.txt` vouches for both. The same holds for
 registries afterwards and refuses to publish if any resolves to a different
 digest, so this is checked rather than assumed.
 
+Docker Hub does not read an image's OCI labels, and the mirror copies only the
+manifest. Each Hub repository's short description and overview therefore come
+from [`docker/README.<stage>.md`](docker/): line 1 holds the short description
+as `<!-- description: … -->` (100 characters at most), and the rest is the
+overview. The script pushes the files as committed at the tag, then reads each
+repository back without credentials and compares. A prerelease leaves the
+overviews alone, as it leaves `latest` alone. A failed push only warns: the
+release goes on, and the script prints, at the failure and again at the end,
+the command that repeats the push:
+
+```bash
+scripts/dockerhub-description.py --ref v0.1.2 \
+  decdn/decdn-node=decdn-node decdn/decdn=decdn
+```
+
+To push an edit to an overview between releases, run the same command with
+`--ref origin/main` after `git fetch`. The Hub page then describes `main`
+rather than the image `latest` serves, so keep such an edit true of the
+current release.
+
 Useful environment overrides:
 
 | Variable | Effect |
 |----------|--------|
 | `DECDN_SIGNING_KEY` | key to sign with. Unset, the script uses your one secret key with a live `@decdn.org` uid that is in `KEYS`, else your one secret key that is in `KEYS`. Set it when you hold two or more such keys (for example during a key rotation). gpg.conf's `default-key` is not read |
 | `DECDN_SKIP_IMAGE_TAGS` | set to `1` to publish with **no** pullable image tag at all — the release then ships only the signed digests |
-| `DECDN_SKIP_DOCKERHUB` | set to `1` to tag on GHCR only (implied by `DECDN_SKIP_IMAGE_TAGS`) |
+| `DECDN_SKIP_DOCKERHUB` | set to `1` to tag on GHCR only, with no Docker Hub mirror or overview (implied by `DECDN_SKIP_IMAGE_TAGS`) |
 | `DECDN_DOCKERHUB_REPO` | the Docker Hub counterpart of `DECDN_REPO` (defaults to it); the images are `<it>-node` and `<it>` |
+| `DECDN_DOCKERHUB_USERNAME`, `DECDN_DOCKERHUB_TOKEN` | a Docker Hub personal access token for the overview push, used instead of the `docker login` credential |
 | `DECDN_REPO` | target a fork instead of `decdn/decdn` — both registries follow it |
 
 The skip variables take `1`/`true`/`yes` or `0`/`false`/`no`; anything else is
