@@ -124,6 +124,7 @@ async fn a_transport_failed_open_pool_submit_is_unconfirmed_with_its_nonce() {
         err.downcast_ref::<OpenUnconfirmed>(),
         Some(&OpenUnconfirmed { tx: None, nonce: 5 })
     );
+    assert!(format!("{err:#}").contains("may have broadcast"), "{err:#}");
     assert_eq!(
         err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
         Some(&decdn_incentive::PoolOpenFailureReason::RpcError)

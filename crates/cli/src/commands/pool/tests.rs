@@ -760,6 +760,17 @@ async fn an_unreachable_rpc_warns_and_still_issues() {
         .expect("offline issuance is valid by design — an unreachable RPC must not fail it");
 }
 
+/// A `PaymentPool` on a filler-free provider whose RPC calls `asserter` answers
+/// in order; a call past the queue fails in transport.
+fn pool_on(
+    asserter: alloy::providers::mock::Asserter,
+) -> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone> {
+    PaymentPool::new(
+        Address::repeat_byte(0x01),
+        alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter),
+    )
+}
+
 /// A `PaymentPool` on a filler-free provider that answers the
 /// `eth_sendTransaction` with `hash` and then fails every call, so
 /// `get_receipt` cannot read the receipt of a broadcast tx.
@@ -768,10 +779,7 @@ fn pool_whose_receipt_is_unreadable(
 ) -> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone> {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&hash);
-    PaymentPool::new(
-        Address::repeat_byte(0x01),
-        alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter),
-    )
+    pool_on(asserter)
 }
 
 /// A `closePool` whose receipt cannot be read may still be in flight, so the
@@ -810,6 +818,79 @@ async fn an_unreadable_reclaim_receipt_names_the_tx() {
         format!("{err:#}").contains(&format!("{hash:#x}")),
         "{err:#}"
     );
+}
+
+/// The `send_failed` note that a transport failure may have broadcast the tx.
+const MAYBE_BROADCAST: &str = "may have reached the node and broadcast the transaction";
+
+/// Run [`close_and_forget`] against a pool whose RPC calls `asserter` answers.
+async fn close_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error {
+    close_and_forget(
+        &pool_on(asserter),
+        LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+        Address::repeat_byte(0x22),
+        B256::repeat_byte(0x33),
+    )
+    .await
+    .unwrap_err()
+}
+
+/// Run [`reclaim_and_forget`] against a pool whose RPC calls `asserter` answers.
+async fn reclaim_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error {
+    reclaim_and_forget(
+        &pool_on(asserter),
+        LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+        Address::repeat_byte(0x22),
+        B256::repeat_byte(0x33),
+    )
+    .await
+    .unwrap_err()
+}
+
+/// A `closePool` send that fails in transport may have broadcast the tx with no
+/// hash returned, so the error warns before the operator re-runs (#2416).
+#[tokio::test]
+async fn a_transport_failed_close_send_warns_it_may_have_broadcast() {
+    let msg = format!(
+        "{:#}",
+        close_on(alloy::providers::mock::Asserter::new()).await
+    );
+    assert!(msg.contains("closePool send failed"), "{msg}");
+    assert!(msg.contains(MAYBE_BROADCAST), "{msg}");
+}
+
+/// A `closePool` send the RPC node rejects broadcast nothing, so it carries no
+/// broadcast warning.
+#[tokio::test]
+async fn a_rejected_close_send_does_not_warn() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("insufficient funds for gas");
+    let msg = format!("{:#}", close_on(asserter).await);
+    assert!(msg.contains("closePool send failed"), "{msg}");
+    assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
+}
+
+/// A `reclaim` send that fails in transport may have broadcast the tx with no
+/// hash returned, so the error warns before the operator re-runs (#2416).
+#[tokio::test]
+async fn a_transport_failed_reclaim_send_warns_it_may_have_broadcast() {
+    let msg = format!(
+        "{:#}",
+        reclaim_on(alloy::providers::mock::Asserter::new()).await
+    );
+    assert!(msg.contains("reclaim send failed"), "{msg}");
+    assert!(msg.contains(MAYBE_BROADCAST), "{msg}");
+}
+
+/// A `reclaim` send the RPC node rejects broadcast nothing, so it carries no
+/// broadcast warning.
+#[tokio::test]
+async fn a_rejected_reclaim_send_does_not_warn() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("insufficient funds for gas");
+    let msg = format!("{:#}", reclaim_on(asserter).await);
+    assert!(msg.contains("reclaim send failed"), "{msg}");
+    assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
 }
 
 /// A mined reclaim revert names its tx; an estimation-time revert broadcast
