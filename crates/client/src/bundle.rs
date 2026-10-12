@@ -441,11 +441,13 @@ pub struct BundleReport {
     /// The content bytes this pull fetched and paid for, from entry sizes: a
     /// blob counts once, less what it spliced or resumed.
     pub downloaded: u64,
-    /// The lane bytes this pull's vouchers and hash-chain reveals paid for,
-    /// summed over every lane ([`crate::PoolLedger::paid_bytes`]). These are
-    /// wire bytes, so they include the bao proof overhead. A byte paid for
-    /// twice, or paid for and then dropped after a lane fault, counts each
-    /// time, so a figure well above `downloaded` shows wasted payment.
+    /// The lane bytes this pull's vouchers and hash-chain reveals paid for:
+    /// how far it grew the claims the nodes can redeem, summed over every lane
+    /// ([`crate::PoolLedger::paid_bytes`]). These are wire bytes, so they
+    /// include the bao proof overhead. Content delivered twice, or paid for and
+    /// then dropped after a lane fault, counts each time it is paid. An entry
+    /// that fails or is interrupted counts here but not in `downloaded`; a
+    /// later pull resumes its `.partial` and reports it as `resumed_bytes`.
     pub paid_bytes: u64,
     /// The bytes written to disk: every landed copy of every blob.
     pub reconstructed: u64,

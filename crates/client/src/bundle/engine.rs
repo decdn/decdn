@@ -1603,8 +1603,8 @@ impl<P: Provider + Clone> PullCtx<P> {
             if let Some(observer) = &self.observer {
                 observer.pool_replaced(&new);
             }
-            // The fresh registry starts at zero, so the second pass's lanes
-            // add their whole total.
+            // Every lane in the fresh registry counts from its own seed, so
+            // the second pass's payment is the new registry's whole total.
             self.ledgers = LaneLedgers::new();
             self.funding = RunFunding::default();
             self.recovery.start_next_pass();

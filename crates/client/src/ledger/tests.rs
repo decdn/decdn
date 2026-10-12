@@ -1253,8 +1253,8 @@ async fn paid_bytes_leaves_out_an_armed_voucher() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A reseed jumps the watermark up to the node's figure. The jump is an
-/// earlier run's payment, so only the bytes paid around it count.
+/// A reseed jumps the watermark up to the node's figure. The jump is payment
+/// this ledger did not make, so only the bytes paid around it count.
 #[tokio::test]
 async fn paid_bytes_leaves_out_a_reseed_jump() -> anyhow::Result<()> {
     let ledger = PoolLedger::new(Cumulative::default());
@@ -1294,5 +1294,79 @@ async fn paid_bytes_leaves_out_a_rebase_drop() -> anyhow::Result<()> {
         .issue(2_000, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
         .await?;
     assert_eq!(ledger.paid_bytes(), U256::from(2_000u64));
+    Ok(())
+}
+
+/// A rebase below the bytes this ledger already paid drops the claims the
+/// node never accepted, whatever the seed. The bytes signed again after it
+/// count, so the figure ends at the claim the node can redeem.
+#[tokio::test]
+async fn paid_bytes_after_a_rebase_below_the_run_is_seed_independent() -> anyhow::Result<()> {
+    for seed_bytes in [0u64, 8_000] {
+        let seed = Cumulative {
+            bytes: U256::from(seed_bytes),
+            amount: U256::from(seed_bytes / 100),
+        };
+        let ledger = PoolLedger::new(seed);
+        ledger
+            .issue(1_000, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+            .await?;
+        assert_eq!(ledger.paid_bytes(), U256::from(1_000u64));
+        // Behind on bytes, not ahead on amount: the node's accepted state
+        // below ours, which is the rebase case.
+        let node = Cumulative {
+            bytes: U256::from(seed_bytes + 200),
+            amount: seed.amount,
+        };
+        assert_matches!(ledger.rebase(node, Some(0)).await, Rebase::Rebased { .. });
+        assert_eq!(
+            ledger.paid_bytes(),
+            U256::from(200u64),
+            "seed {seed_bytes}: only the claim the node holds counts"
+        );
+        ledger
+            .issue(800, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+            .await?;
+        assert_eq!(
+            ledger.paid_bytes(),
+            U256::from(1_000u64),
+            "seed {seed_bytes}: the bytes signed again count once"
+        );
+    }
+    Ok(())
+}
+
+/// A `StreamEnd` that confirms an armed voucher counts its bytes as paid.
+#[tokio::test]
+async fn paid_bytes_counts_an_armed_voucher_once_confirmed() -> anyhow::Result<()> {
+    let ledger = PoolLedger::new(Cumulative::default());
+    let mut sent = None;
+    let failed = ledger
+        .issue(100, 10, EpochAction::Keep, |next, _c| {
+            sent = Some(next);
+            async { anyhow::bail!("send stopped") }
+        })
+        .await;
+    assert!(failed.is_err());
+    assert_eq!(ledger.paid_bytes(), U256::ZERO);
+    let armed = sent.ok_or_else(|| anyhow::anyhow!("issue never reached the send"))?;
+    assert_eq!(ledger.confirm_armed(armed.amount).await, Some(armed));
+    assert_eq!(ledger.paid_bytes(), U256::from(100u64));
+    Ok(())
+}
+
+/// A rejected reveal gives back the one chunk it paid for.
+#[tokio::test]
+async fn paid_bytes_gives_back_a_rejected_reveal() -> anyhow::Result<()> {
+    let ledger = metered_ledger(Cumulative::default());
+    ledger
+        .issue(0, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
+        .await?;
+    let metered = ledger
+        .meter(ledger.chain_root(), |_r| async { Ok(()) })
+        .await?;
+    assert_eq!(ledger.paid_bytes(), U256::from(CHUNK_BYTES));
+    assert!(ledger.resolve_reject(reveal_proof(metered)?));
+    assert_eq!(ledger.paid_bytes(), U256::ZERO);
     Ok(())
 }

@@ -245,23 +245,30 @@ struct Pipeline {
     /// and this lets the rest see that it did, so they leave alone the chain
     /// the healed lane opened next.
     healed_from: Option<Cumulative>,
-    /// The committed bytes this ledger's own proofs build on: the seed's
-    /// bytes, moved by every heal's jump ([`Pipeline::heal`]). A heal moves
-    /// the watermark to the node's figure rather than through a proof this
-    /// ledger sent, so the jump is never part of [`PoolLedger::paid_bytes`].
+    /// The lane claim, in bytes, that this ledger's own proofs grow from: the
+    /// seed's bytes, moved by every reseed and rebase ([`Pipeline::heal`]).
+    /// [`PoolLedger::paid_bytes`] is the committed claim above it.
     baseline: U256,
 }
 
 impl Pipeline {
-    /// Move the committed watermark to the node's watermark `cum` and shift
-    /// [`Self::baseline`] by the same jump in bytes, so the bytes this ledger
-    /// paid for before the heal stay counted and the jump does not count.
+    /// Move the committed watermark to the node's watermark `cum`, and move
+    /// [`Self::baseline`] so that [`PoolLedger::paid_bytes`] stays what this
+    /// ledger added to the claim the node can redeem.
+    ///
+    /// A watermark above ours carries payment this ledger did not make, so
+    /// the baseline rises by the same jump. A watermark below ours drops
+    /// claims the node never accepted. They were never redeemable, so they
+    /// leave the count. When the watermark is also below the baseline, the
+    /// claims between the two were never collected either: this ledger signs
+    /// them again, and they count as its payment, so the baseline falls to
+    /// the watermark.
     fn heal(&mut self, cum: Cumulative) {
         let from = self.committed.plus(self.accrued).bytes;
         self.baseline = if cum.bytes >= from {
             self.baseline.saturating_add(cum.bytes.saturating_sub(from))
         } else {
-            self.baseline.saturating_sub(from.saturating_sub(cum.bytes))
+            self.baseline.min(cum.bytes)
         };
         self.overwrite(cum);
         self.healed_from = Some(cum);
@@ -662,13 +669,20 @@ impl PoolLedger {
         pipeline.committed.plus(pipeline.accrued)
     }
 
-    /// The lane bytes this ledger paid for since its seed: [`Self::committed`]
-    /// less the seed's bytes, with every heal's jump left out (a
-    /// [`Self::reseed`] or a rebase moves the watermark to the node's figure,
-    /// not through a proof this ledger sent). Each voucher and hash-chain
-    /// reveal adds the bytes it pays for, and a rejection takes its bytes
-    /// back. Bytes paid for twice count twice. An armed voucher whose send did
-    /// not confirm is not counted ([`Self::settlement`] counts it).
+    /// The lane bytes this ledger paid for since its seed: how far it grew
+    /// the cumulative claim the node can redeem. Each voucher and hash-chain
+    /// reveal adds the bytes it pays for, and a rejection of that same proof
+    /// takes them back. Content delivered
+    /// twice is paid for twice and counts twice.
+    ///
+    /// A [`Self::reseed`] jump is payment this ledger did not make, so it
+    /// does not count. A rebase drops claims the node never accepted, so they
+    /// do not count either; claims below the seed that this ledger signs
+    /// again after a rebase do count.
+    ///
+    /// An armed voucher whose send did not confirm counts only once a later
+    /// voucher builds on it, a `StreamEnd` confirms it, or a retired chain's
+    /// fold commits it. [`Self::settlement`] counts it from the start.
     #[must_use]
     pub fn paid_bytes(&self) -> U256 {
         let pipeline = self.pipeline();

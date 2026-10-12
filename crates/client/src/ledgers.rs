@@ -65,8 +65,9 @@ impl LaneLedgers {
     }
 
     /// Σ over every registered lane of the bytes its ledger paid for since its
-    /// seed ([`PoolLedger::paid_bytes`]): what this run paid for, in lane
-    /// (wire) bytes. A lane built after a registry swap is not in this one.
+    /// seed ([`PoolLedger::paid_bytes`]), in lane (wire) bytes. It covers only
+    /// the lanes this registry holds, each from the moment it was built; a
+    /// caller that measures one pull takes the growth across it.
     #[must_use]
     pub fn paid_bytes(&self) -> U256 {
         let map = self
