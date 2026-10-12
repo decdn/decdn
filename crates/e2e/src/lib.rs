@@ -1,8 +1,7 @@
-//! Cross-layer Rust↔contract end-to-end test fixtures for deCDN (issue #1028).
+//! Cross-layer Rust↔contract end-to-end test fixtures for deCDN.
 //!
 //! Reusable building blocks for journeys that span *both* daemon behavior and
-//! on-chain state — the home the self-contained
-//! `crates/node/tests/anvil_settlement_e2e.rs` monolith never had. Compose:
+//! on-chain state. Compose:
 //!
 //! - [`chain::ChainFixture`] — spin up `anvil`, deploy the full protocol via the
 //!   production `DeployProtocol` script, expose typed `alloy` handles, and the

@@ -7,7 +7,7 @@
 //! built from (`RetryPolicy`, `DecompressMode`, `OriginUrl`,
 //! `OriginKind`, `Hash`, `PinnedHashes`) live in the
 //! [`decdn_config_types`] leaf crate, so this crate (and the publisher
-//! CLI) never link the cache engine / iroh-blobs / AWS SDK (#578). The
+//! CLI) never link the cache engine / iroh-blobs / AWS SDK. The
 //! cache-engine types proper stay in `decdn-cache`, a `decdn-node`-only
 //! dependency. This crate holds only what *both* binaries need to
 //! parse, validate, or pass between processes.

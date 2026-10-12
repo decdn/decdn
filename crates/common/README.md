@@ -9,8 +9,8 @@ resolver, the shared clap argument definitions both binaries build their command
 node identity loading, and the local admin JSON-RPC trait plus its request/response DTOs.
 
 Split out so the daemon and the CLI agree on config and admin wire shapes by construction
-rather than by convention — see the dockerd-style two-binary rationale in the repo's
-`adr/appendix-binaries.md`.
+rather than by convention — see the dockerd-style two-binary rationale in
+[the binaries appendix](https://github.com/decdn/decdn/blob/main/adr/appendix-binaries.md).
 
 ## License
 

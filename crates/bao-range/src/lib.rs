@@ -1,25 +1,39 @@
-//! Iroh-blobs-free bao verified-range helpers (#823, #915), shared by
-//! `decdn-cache` (origin range import + client serve) and `decdn-client`
-//! (client receive). Depends only on `bao-tree`, so linking it from the CLI's
-//! pull path keeps the iroh-blobs-free invariant (#578).
+//! Bao verified-range helpers for deCDN: align a byte range to bao chunk
+//! groups, encode a verified range for the wire, and size that encoding.
 //!
-//! [ADR 037 §Origin-tier pull-through](https://github.com/decdn/decdn/blob/main/adr/037-regional-proxy-warming.md),
-//! [ADR 038 §Wire format](https://github.com/decdn/decdn/blob/main/adr/038-bao-verified-range-streaming.md).
+//! deCDN streams every blob as bao's interleaved verified encoding, so a
+//! receiver checks each chunk group against the blob's BLAKE3 root as it lands
+//! ([ADR 038 § Wire format]). This crate holds the range arithmetic both sides
+//! share. It depends on `bao-tree` and not on `iroh-blobs`, so the client SDK
+//! and the `decdn` CLI link no blob store.
 //!
-//! An opaque origin backend (S3/R2/B2/HTTP/fs) serves raw bytes by hash with no
-//! bao tree, so a node that wants only a byte range `[a, b)` of a large blob
-//! historically had to pull the **whole** blob to verify any of it against the
-//! content address. When the origin also publishes the blob's pre-order bao
-//! outboard at the sibling key `{H}.obao4`, this module verifies the fetched
-//! range against the root `H` using that (untrusted) outboard and produces the
-//! bao interleaved encoding `iroh-blobs`' `import_bao_bytes` consumes — so the
-//! node imports a verified **partial** blob without whole-blob origin egress.
+//! # Entry points
 //!
-//! The outboard is **self-validating against `H`**: a tampered range, a tampered
-//! outboard, or a wrong wanted-root all fail, because every leaf must hash to its
-//! anchored parent and the spine must combine to the `H` the node already wanted
-//! ([`encode_ranges_validated`] checks `ParentHashMismatch`/`LeafHashMismatch`).
-//! There is no trusted-origin assumption — the origin stays a dumb byte store.
+//! | You want to | Use |
+//! |---|---|
+//! | Snap a `[offset, +len)` request to whole chunk groups | [`align_range`], [`align_range_clamped`], [`AlignedRange`] |
+//! | Encode a verified range from raw bytes and an untrusted outboard | [`encode_verified_range`] |
+//! | Know how many wire bytes a range costs, proof included | [`bao_encoded_size`], [`AlignedRange::wire_len`] |
+//! | Encode a whole blob as a stream, without buffering it | [`streaming`] |
+//! | Implement a range-aware blob backend | [`RangedStore`] |
+//! | Write or find a blob's outboard in a filesystem origin | [`encode_outboard`], [`OBAO4_SUFFIX`], [`shard_prefix`] |
+//!
+//! # Verifying an origin range
+//!
+//! An origin backend (S3, R2, B2, HTTP, or a filesystem) serves raw bytes by
+//! hash, with no bao tree. When the origin also stores the blob's pre-order
+//! bao outboard at the sibling key `{H}.obao4`, a node fetches only the range
+//! `[a, b)` it wants and verifies it against the root `H` with that outboard
+//! ([ADR 037 § Origin-tier pull-through]). The result is the bao interleaved
+//! encoding, which the node imports as a verified partial blob.
+//!
+//! The outboard needs no trust. Every leaf must hash to its parent, and the
+//! spine must combine to the root `H` the node asked for. A tampered range, a
+//! tampered outboard, or a wrong root fails with [`RangeVerifyError`]. The
+//! origin stays a plain byte store.
+//!
+//! [ADR 038 § Wire format]: https://github.com/decdn/decdn/blob/main/adr/038-bao-verified-range-streaming.md#wire-format
+//! [ADR 037 § Origin-tier pull-through]: https://github.com/decdn/decdn/blob/main/adr/037-regional-proxy-warming.md#origin-tier-pull-through-ranged-fetch--external-outboard
 
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use bao_tree::io::sync::encode_ranges_validated;
@@ -37,8 +51,8 @@ pub use ranged_store::{RangedFuture, RangedStore, RangedStoreError};
 
 /// `iroh-blobs`' canonical on-disk block size (16 KiB chunk groups,
 /// `from_chunk_log(4)`). Declared from the `bao-tree` primitive rather than
-/// re-exported from `iroh-blobs`, because this leaf crate must stay
-/// iroh-blobs-free (#578) so the CLI's pull path can link it. The value is
+/// re-exported from `iroh-blobs`, because this crate must stay iroh-blobs-free
+/// so the CLI's pull path can link it. The value is
 /// **identical by construction** to `iroh_blobs::store::IROH_BLOCK_SIZE` (which
 /// is also `BlockSize::from_chunk_log(4)`); `decdn-cache` carries a lock-step
 /// test asserting the two stay equal, so a divergence across an iroh-blobs bump
@@ -51,8 +65,8 @@ pub const IROH_BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(4);
 ///
 /// Public so a caller that must snap an offset to a group boundary WITHOUT
 /// knowing the blob's size can do so from the shared constant rather than
-/// re-deriving it (the resumable client fetch, #1120: it picks its resume offset
-/// before the signed response reveals `total_bytes`). Prefer [`align_range`] when
+/// re-deriving it (the resumable client fetch picks its resume offset before
+/// the signed response reveals `total_bytes`). Prefer [`align_range`] when
 /// the size is known — it also bound-checks.
 pub const CHUNK_GROUP_BYTES: u64 = 1u64 << (IROH_BLOCK_SIZE.chunk_log() + 10);
 
@@ -80,7 +94,7 @@ pub const CHUNK_GROUP_BYTES: u64 = 1u64 << (IROH_BLOCK_SIZE.chunk_log() + 10);
 /// groups before the first byte arrives.
 #[must_use]
 pub fn bao_encoded_size(total_bytes: u64, chunk_ranges: &ChunkRanges) -> u64 {
-    // A 0-byte blob (#1054) has no proof and no data — zero wire bytes for ANY
+    // A 0-byte blob has no proof and no data — zero wire bytes for ANY
     // requested range. An empty range set likewise encodes to nothing. Short-
     // circuit both before touching the tree: `bao-tree`'s pre-order chunk iterator
     // `debug_assert!`s `!ranges.is_empty()` (and would otherwise mis-walk an empty
@@ -334,9 +348,8 @@ fn build_aligned_range(byte_offset: u64, end: u64, blob_size: u64) -> AlignedRan
 ///
 /// The empty (0-byte) blob is addressable only as the whole blob — `(0, 0)` —
 /// and aligns to an empty [`AlignedRange`] (`fetch_start == fetch_end == 0`,
-/// empty `chunk_ranges`, zero [`wire_len`](AlignedRange::wire_len)). This
-/// preserves the pre-bao empty-bytes delivery on the bao path (#1054); the empty
-/// stream is still proven against the empty root `blake3::hash(&[])` by the
+/// empty `chunk_ranges`, zero [`wire_len`](AlignedRange::wire_len)), so a
+/// 0-byte blob delivers zero bytes. The empty stream is still proven against the empty root `blake3::hash(&[])` by the
 /// receiver, never accepted for an arbitrary root.
 ///
 /// # Errors

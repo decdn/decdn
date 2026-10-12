@@ -4,12 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Shared payment pools, bonding, and voucher management for deCDN"
+description = "The deCDN payment layer: USDC payment pools, off-chain EIP-712 vouchers, and the contract bindings that settle them"
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
+
+# docs.rs builds default features only. Document the buyer-pool stores too, so
+# `buyer_pool_redb` and `buyer_pool_table` render with their feature badges.
+# `test-util` stays out: it is a test seam, not API.
+[package.metadata.docs.rs]
+features = ["redb"]
 
 [features]
 # Shared buyer-pool redb table (`buyer_pool_table`, #1246): the on-disk
