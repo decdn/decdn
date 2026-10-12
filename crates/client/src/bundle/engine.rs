@@ -102,7 +102,7 @@ use crate::targets::{
 use crate::{
     ClientRangedStore, Connections, CredentialSlot, DownloadTarget, Downloader, FundingNeeded,
     LaneLedgers, PeerHealth, PoolReplaced, ProgressCallback, PullDeadlines, RecoveryGate,
-    StopPolicy,
+    RunDemand, StopPolicy,
 };
 
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
@@ -236,6 +236,63 @@ struct DiskState {
     /// lets a group materialize by link/copy instead of fetching — but only after
     /// the candidate is re-hashed and confirmed (done at the use site).
     whole_file: HashMap<[u8; 32], PathBuf>,
+    /// The run's planned work by blob ([`planned_work`]): each group that
+    /// still fetches, its planned download, and the prefix an earlier run
+    /// left in its `.partial`. Filled after the pre-pass.
+    work: HashMap<[u8; 32], PlannedWork>,
+}
+
+/// One group's planned download, and the bytes an earlier run already
+/// fetched into its `.partial`, which a fetch's position counts but this run
+/// does not pay for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PlannedWork {
+    download: u64,
+    resumed: u64,
+}
+
+/// The run's planned work after the disk pre-pass, by blob: each hash group
+/// that still has a destination to write and no whole-file donor, at its
+/// planned download less what an earlier run left in its `.partial`. A group
+/// the pre-pass skips or links plans none, so it never counts toward the
+/// run's outstanding work while it waits for a jobs slot.
+async fn planned_work(
+    entries: &[ManifestEntry],
+    out_root: &Path,
+    overwrite: bool,
+    fetch_plan: &FetchPlan,
+    disk: &DiskState,
+) -> HashMap<[u8; 32], PlannedWork> {
+    let refs: Vec<&ManifestEntry> = entries.iter().collect();
+    let empty = HashMap::new();
+    let mut work = HashMap::new();
+    for group in group_by_hash(&refs) {
+        let Ok(hash) = parse_hash(group.hash) else {
+            continue;
+        };
+        let writes = plan_slots(&group.entries, out_root, overwrite, &disk.skip)
+            .iter()
+            .any(|slot| matches!(slot, Slot::Write { .. }));
+        if !writes || disk.whole_file.contains_key(&hash) {
+            continue;
+        }
+        let (download, _) = blob_download_reconstruct(&group, fetch_plan, &empty);
+        if download == 0 {
+            continue;
+        }
+        let resumed = match staging_path(out_root, hash) {
+            Ok(staging) => span_bytes(&resumed_spans_off_runtime(&staging, hash).await),
+            Err(_) => 0,
+        };
+        work.insert(
+            hash,
+            PlannedWork {
+                download: download.saturating_sub(resumed),
+                resumed,
+            },
+        );
+    }
+    work
 }
 
 /// Classify every in-scope entry against the output tree and the saved
@@ -1254,7 +1311,7 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     pub(super) stop: StopPolicy,
     /// The run's undelivered planned download, in content bytes, which a
     /// delegated pull prices its running-low signal on ([`WorkShare`]).
-    pub(super) outstanding: Arc<AtomicU64>,
+    pub(super) demand: Arc<RunDemand>,
     /// Where the run reports its progress; `None` reports nothing.
     pub(super) observer: Option<Arc<dyn BundleObserver>>,
     /// What explains a failed fetch to the caller's user; `None` leaves every
@@ -1431,7 +1488,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 .recovery(Arc::clone(&self.recovery))
                 .max_lanes(self.discovery.max_sources)
                 .max_blob_bytes(max_blob_bytes)
-                .outstanding_work(Arc::clone(&self.outstanding));
+                .run_demand(Arc::clone(&self.demand));
             if let Some(slot) = sources.credentials() {
                 downloader = downloader.credentials(slot);
             }
@@ -1525,8 +1582,6 @@ impl<P: Provider + Clone> PullCtx<P> {
         if let Some(observer) = &self.observer {
             observer.run_started(planned, total_content_bytes(entries));
         }
-        self.outstanding
-            .store(planned.unwrap_or(0), Ordering::Relaxed);
         // Loaded once per pass: the pre-pass skip decisions consult it, and it
         // seeds the incremental skip-cache flush inside `pull_all` — a run's
         // completed files are folded onto this prior and rewritten as the pull
@@ -1546,8 +1601,6 @@ impl<P: Provider + Clone> PullCtx<P> {
             self.ledgers = LaneLedgers::new();
             self.funding = RunFunding::default();
             self.recovery.start_next_pass();
-            self.outstanding
-                .store(planned.unwrap_or(0), Ordering::Relaxed);
             let saved = skip_cache::load(out_root);
             let second = self
                 .pull_all(entries, out_root, overwrite, saved, cancel)
@@ -1656,7 +1709,15 @@ impl<P: Provider + Clone> PullCtx<P> {
         // the time since the manifest landed (a caller's selection
         // included) ends when it does.
         let hold = self.stop.clock.hold();
-        let disk = resolve_disk_state(entries, &saved, out_root, overwrite).await;
+        let mut disk = resolve_disk_state(entries, &saved, out_root, overwrite).await;
+        // The run's outstanding work starts at what the groups that still
+        // fetch plan to pay for.
+        disk.work = planned_work(entries, out_root, overwrite, &fetch_plan, &disk).await;
+        let outstanding = disk
+            .work
+            .values()
+            .fold(0u64, |sum, work| sum.saturating_add(work.download));
+        self.demand.plan(outstanding);
         drop(hold);
         for d in &disk.seed {
             index.seed_disk(d.hash, &d.source, d.offset, d.len);
@@ -2025,17 +2086,24 @@ impl<P: Provider + Clone> PullCtx<P> {
         Ok(EntryBytes::dedup(total, outcome))
     }
 
-    /// The group's share of the run's outstanding work: its planned download,
-    /// which stays outstanding until it lands or the group settles, whichever
-    /// way it settles. Returns the share with the blob's planned download and
-    /// reconstruct bytes ([`blob_download_reconstruct`]).
+    /// The group's share of the run's outstanding work: the work the
+    /// pre-pass planned for it ([`DiskState::work`]), which stays outstanding
+    /// until it lands or the group settles, whichever way it settles. A group
+    /// the pre-pass plans no work for holds an empty share. Returns the share
+    /// with the blob's planned download and reconstruct bytes for its file bar
+    /// ([`blob_download_reconstruct`]).
     fn work_share(
         &self,
         group: &HashGroup<'_>,
         fetch_plan: &FetchPlan,
+        disk: &DiskState,
     ) -> (Arc<WorkShare>, u64, u64) {
         let (download, reconstruct) = blob_download_reconstruct(group, fetch_plan, &HashMap::new());
-        let share = Arc::new(WorkShare::new(Arc::clone(&self.outstanding), download));
+        let work = parse_hash(group.hash)
+            .ok()
+            .and_then(|hash| disk.work.get(&hash).copied())
+            .unwrap_or_default();
+        let share = Arc::new(WorkShare::new(Arc::clone(&self.demand), work));
         (share, download, reconstruct)
     }
 
@@ -2056,7 +2124,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         disk: &DiskState,
     ) -> GroupRun {
         let (share, download_bytes_of_blob, reconstruct_bytes_of_blob) =
-            self.work_share(&group, fetch_plan);
+            self.work_share(&group, fetch_plan, disk);
         // The group's shared hash is carried explicitly; parse it once, and a bad
         // hash fails every path in the group. Then wait for the group's jobs slot:
         // every group of the run is in flight at once, and this is the cap.
@@ -2238,37 +2306,38 @@ impl<P: Provider + Clone> PullCtx<P> {
 /// One hash group's share of the run's outstanding work: its planned
 /// download bytes, taken off the run's total as they land, and whatever is
 /// left once the group settles, however it settles. A delegated pull prices
-/// its running-low signal on that total ([`crate::Downloader::outstanding_work`]).
+/// its running-low signal on that total ([`crate::Downloader::run_demand`]).
 struct WorkShare {
-    /// The run's outstanding work, in content bytes.
-    outstanding: Arc<AtomicU64>,
+    /// The run's demand, whose planned work this share is part of.
+    demand: Arc<RunDemand>,
     /// The group's planned download bytes.
     planned: u64,
-    /// The planned bytes already taken off `outstanding`.
+    /// The prefix an earlier run left, which a fetch's position counts first.
+    resumed: u64,
+    /// The planned bytes already taken off the run's planned work.
     taken: AtomicU64,
 }
 
 impl WorkShare {
-    /// A share of `planned` bytes of `outstanding`.
-    const fn new(outstanding: Arc<AtomicU64>, planned: u64) -> Self {
+    /// A share of `work` in `demand`.
+    const fn new(demand: Arc<RunDemand>, work: PlannedWork) -> Self {
         Self {
-            outstanding,
-            planned,
+            demand,
+            planned: work.download,
+            resumed: work.resumed,
             taken: AtomicU64::new(0),
         }
     }
 
-    /// The group's fetch has delivered `received` bytes: take what is new,
-    /// up to the group's plan, off the run's total.
+    /// The group's fetch has reached position `received`, its resumed prefix
+    /// included: take what is new this run, up to the group's plan, off the
+    /// run's total.
     fn delivered(&self, received: u64) {
-        let capped = received.min(self.planned);
+        let capped = received.saturating_sub(self.resumed).min(self.planned);
         let before = self.taken.fetch_max(capped, Ordering::Relaxed);
         if capped > before {
             let gone = capped - before;
-            self.outstanding
-                .update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                    left.saturating_sub(gone)
-                });
+            self.demand.done(gone);
         }
     }
 }
@@ -2276,7 +2345,7 @@ impl WorkShare {
 impl Drop for WorkShare {
     /// A settled group plans no more work.
     fn drop(&mut self) {
-        self.delivered(self.planned);
+        self.delivered(self.resumed.saturating_add(self.planned));
     }
 }
 

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::credential::CredentialSlot;
+use crate::credential::{CredentialSlot, RunDemand};
 use crate::health::PeerHealth;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::BudgetPacer;
@@ -121,9 +121,8 @@ pub struct Downloader<P, F> {
     /// Targets fetched again from scratch after a finalize hash mismatch
     /// ([`Self::refetched_targets`]).
     refetched: AtomicU64,
-    /// Work the caller's run still plans past these targets
-    /// ([`Self::outstanding_work`]).
-    outstanding: Option<Arc<AtomicU64>>,
+    /// What the caller's run still needs ([`Self::run_demand`]).
+    run: Option<Arc<RunDemand>>,
 }
 
 impl<P, F> std::fmt::Debug for Downloader<P, F> {
@@ -154,7 +153,7 @@ impl<P, F> Downloader<P, F> {
             max_lanes: usize::MAX,
             max_blob_bytes: 0,
             refetched: AtomicU64::new(0),
-            outstanding: None,
+            run: None,
         }
     }
 
@@ -196,14 +195,15 @@ impl<P, F> Downloader<P, F> {
         self
     }
 
-    /// Price the delegated funding signal on `work` content bytes the
-    /// caller's run still plans past these targets, when that is more than
-    /// the targets' own missing bytes. A bundle pull keeps it at the bundle's
-    /// undelivered download, so every entry reports one bundle-wide need.
+    /// Price the delegated funding signal on `run`: the work the caller's
+    /// run still plans, when that is more than the targets' own missing
+    /// bytes, at the highest quote any lane of the run got. A bundle pull
+    /// keeps it at the bundle's undelivered download, so every entry reports
+    /// one bundle-wide need.
     #[doc(hidden)]
     #[must_use]
-    pub fn outstanding_work(mut self, work: Arc<AtomicU64>) -> Self {
-        self.outstanding = Some(work);
+    pub fn run_demand(mut self, run: Arc<RunDemand>) -> Self {
+        self.run = Some(run);
         self
     }
 
@@ -414,7 +414,7 @@ where
                 // No consumption pacing: a download runs at full throughput.
                 pacing: None,
                 max_blob_bytes: self.max_blob_bytes,
-                outstanding: self.outstanding.as_deref(),
+                run: self.run.as_deref(),
             };
             // A finalize whose hash does not match clears every claim and
             // keeps the file, so one more pass fetches the blob again. A

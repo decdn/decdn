@@ -48,7 +48,7 @@ use crate::session::{
 use crate::stream_cap::LaneStreamCap;
 use crate::{
     Connections, CredentialSlot, FundingNeeded, LaneLedgers, PeerHealth, PoolReplaced,
-    ProgressClock, RecoveryGate, StopPolicy,
+    ProgressClock, RecoveryGate, RunDemand, StopPolicy,
 };
 
 mod engine;
@@ -728,7 +728,7 @@ impl BundlePullerBuilder {
                 self.give_up_after,
                 Arc::new(ProgressClock::new()),
             ),
-            outstanding: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            demand: Arc::new(RunDemand::default()),
             observer: self.observer,
             hints: self.hints,
         };

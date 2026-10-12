@@ -146,7 +146,7 @@ async fn run_acquire_with<S: BlobSource>(
             ledgers: knobs.ledgers,
             pacing: knobs.pacing,
             max_blob_bytes: knobs.max_blob_bytes,
-            outstanding: None,
+            run: None,
         },
     )
     .await
@@ -2817,7 +2817,7 @@ async fn acquire_bounded<St: crate::source::IngestStore>(
         ledgers: None,
         pacing: None,
         max_blob_bytes: 0,
-        outstanding: None,
+        run: None,
     };
     let target = AcquireTarget {
         store,
@@ -3444,7 +3444,7 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await
@@ -3489,7 +3489,7 @@ async fn acquire_under<S: BlobSource>(
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await
@@ -3974,7 +3974,7 @@ async fn a_partial_holder_refusing_an_uncovered_block_is_barred_from_it() -> any
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await?;
@@ -4055,7 +4055,7 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await?;
@@ -4274,7 +4274,7 @@ async fn a_lane_build_in_flight_is_awaited_before_acquire_returns() -> anyhow::R
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await?;
@@ -4363,7 +4363,7 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await?;
@@ -4422,7 +4422,7 @@ async fn a_refill_a_later_lane_build_made_raises_the_running_lanes() -> anyhow::
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await?;
@@ -4485,7 +4485,7 @@ async fn a_lane_built_on_a_lower_deposit_never_lowers_the_running_lanes() -> any
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await?;
@@ -4531,7 +4531,7 @@ async fn an_empty_set_discovers_its_holders_and_completes() -> anyhow::Result<()
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await?;
@@ -4571,7 +4571,7 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await?;
@@ -5327,7 +5327,7 @@ async fn acquire_over<P: crate::SourceProvider>(
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await
@@ -5867,7 +5867,7 @@ async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding: None,
+            run: None,
         },
     )
     .await?;
@@ -6389,7 +6389,7 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
         ledgers: None,
         pacing: None,
         max_blob_bytes: 0,
-        outstanding: None,
+        run: None,
     };
     let fetch = acquire(
         AcquireTarget {
@@ -6587,13 +6587,12 @@ async fn acquire_delegated(
     acquire_delegated_in_run(store, provider, root, None).await
 }
 
-/// [`acquire_delegated`] as one fetch of a run that still plans `outstanding`
-/// content bytes past it.
+/// [`acquire_delegated`] as one fetch of a run whose demand is `run`.
 async fn acquire_delegated_in_run(
     store: &ClientRangedStore,
     provider: &SlotSources,
     root: [u8; 32],
-    outstanding: Option<&std::sync::atomic::AtomicU64>,
+    run: Option<&crate::RunDemand>,
 ) -> anyhow::Result<()> {
     let total = store.total_bytes();
     let mut set = SourceSet::new(provider, root, Arc::default(), vec![SlotSources::holder()]);
@@ -6618,7 +6617,7 @@ async fn acquire_delegated_in_run(
             ledgers: None,
             pacing: None,
             max_blob_bytes: 0,
-            outstanding,
+            run,
         },
     )
     .await
@@ -6941,7 +6940,11 @@ async fn the_running_low_signal_prices_the_runs_outstanding_work() -> anyhow::Re
         let slot = slot_for(&credential, Duration::ZERO);
         let events = slot.funding_events();
         let provider = SlotSources::new(&slot, source);
-        let run = outstanding.map(std::sync::atomic::AtomicU64::new);
+        let run = outstanding.map(|bytes| {
+            let run = crate::RunDemand::default();
+            run.plan(bytes);
+            run
+        });
         acquire_delegated_in_run(&store, &provider, root, run.as_ref()).await?;
         store.finalize().await?;
         assert_eq!(std::fs::read(dir.path().join("b"))?, data);
@@ -6952,6 +6955,38 @@ async fn the_running_low_signal_prices_the_runs_outstanding_work() -> anyhow::Re
             ),
             signalled,
             "outstanding {outstanding:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The fetches of one run price the running-low signal at the highest quote
+/// any of them got. A fetch whose own holder quotes low still reports the run
+/// running low when a sibling's holder quoted high, so a cheap entry never
+/// clears the signal an expensive one raised.
+#[tokio::test(start_paused = true)]
+async fn the_running_low_signal_prices_the_runs_highest_quote() -> anyhow::Result<()> {
+    let data = blob(4 * 1024 * 1024);
+    // At this fetch's own 1 per MB, a cap of 100 covers the run's 50 MiB of
+    // planned work; at a sibling's 10 per MB it does not.
+    for (sibling_rate, signalled) in [(0, false), (10, true)] {
+        let source = ScriptedSource::new(data.clone())?.throttled(Duration::from_millis(50));
+        let (root, total) = (source.root(), source.total_bytes());
+        let (store, _dir) = fresh_store(root, total);
+        let slot = slot_for(&delegate(100), Duration::ZERO);
+        let events = slot.funding_events();
+        let provider = SlotSources::new(&slot, source);
+        let run = crate::RunDemand::default();
+        run.plan(50 * MIB);
+        run.quotes.observe(sibling_rate, 0);
+        acquire_delegated_in_run(&store, &provider, root, Some(&run)).await?;
+        assert_eq!(
+            matches!(
+                *events.borrow(),
+                Some(crate::FundingEvent::RunningLow { .. })
+            ),
+            signalled,
+            "sibling rate {sibling_rate}"
         );
     }
     Ok(())

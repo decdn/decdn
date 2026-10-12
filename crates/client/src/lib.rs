@@ -299,7 +299,7 @@ pub use connection::WarmConnection;
 #[doc(hidden)]
 pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 #[doc(hidden)]
-pub use credential::QuoteMax;
+pub use credential::{QuoteMax, RunDemand};
 #[doc(hidden)]
 pub use decdn_bao_range::RangedStore;
 #[doc(hidden)]

@@ -3677,24 +3677,93 @@ fn dedup_counters_are_per_pull() {
 /// never past its plan, and whatever is left goes when the group settles.
 #[test]
 fn a_work_share_takes_its_bytes_off_the_run() {
-    let outstanding = Arc::new(AtomicU64::new(1_000));
-    let share = WorkShare::new(Arc::clone(&outstanding), 300);
+    let outstanding = Arc::new(RunDemand::default());
+    outstanding.plan(1_000);
+    let share = WorkShare::new(
+        Arc::clone(&outstanding),
+        PlannedWork {
+            download: 300,
+            resumed: 0,
+        },
+    );
     share.delivered(100);
-    assert_eq!(outstanding.load(Ordering::Relaxed), 900);
+    assert_eq!(outstanding.outstanding(), 900);
     // Every fetch reports its whole position, so a repeat takes nothing more.
     share.delivered(100);
-    assert_eq!(outstanding.load(Ordering::Relaxed), 900);
+    assert_eq!(outstanding.outstanding(), 900);
     // Bytes past the plan take nothing past it.
     share.delivered(500);
-    assert_eq!(outstanding.load(Ordering::Relaxed), 700);
+    assert_eq!(outstanding.outstanding(), 700);
     drop(share);
-    assert_eq!(outstanding.load(Ordering::Relaxed), 700);
+    assert_eq!(outstanding.outstanding(), 700);
 
-    let unfetched = WorkShare::new(Arc::clone(&outstanding), 200);
+    let unfetched = WorkShare::new(
+        Arc::clone(&outstanding),
+        PlannedWork {
+            download: 200,
+            resumed: 0,
+        },
+    );
     drop(unfetched);
     assert_eq!(
-        outstanding.load(Ordering::Relaxed),
+        outstanding.outstanding(),
         500,
         "a group that settles without fetching plans no more work"
     );
+}
+
+/// A resumed group's fetch reports its whole position, the prefix an earlier
+/// run left included: only what lands past that prefix comes off the run.
+#[test]
+fn a_resumed_share_counts_only_this_runs_bytes() {
+    let outstanding = Arc::new(RunDemand::default());
+    outstanding.plan(1_000);
+    let share = WorkShare::new(
+        Arc::clone(&outstanding),
+        PlannedWork {
+            download: 600,
+            resumed: 400,
+        },
+    );
+    share.delivered(400);
+    assert_eq!(
+        outstanding.outstanding(),
+        1_000,
+        "the prefix was paid before"
+    );
+    share.delivered(700);
+    assert_eq!(outstanding.outstanding(), 700);
+    drop(share);
+    assert_eq!(outstanding.outstanding(), 400);
+}
+
+/// The pre-pass plans no work for a group whose every destination is
+/// present, nor for one a whole-file donor supplies: neither counts toward
+/// the run's outstanding work while it waits for a jobs slot.
+#[tokio::test]
+async fn planned_work_leaves_out_skipped_and_donor_groups() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let hash = |b: u8| format!("b3:{}", blake3::Hash::from_bytes([b; 32]).to_hex());
+    let entries = vec![
+        ManifestEntry::new("fetch.bin", hash(1), Some(100)),
+        ManifestEntry::new("present.bin", hash(2), Some(200)),
+        ManifestEntry::new("donor.bin", hash(3), Some(300)),
+    ];
+    let mut disk = DiskState::default();
+    disk.skip.insert("present.bin".to_string());
+    disk.whole_file
+        .insert([3; 32], tmp.path().join("elsewhere.bin"));
+    let plan = build_fetch_plan(&entries);
+    let work = planned_work(&entries, tmp.path(), false, &plan, &disk).await;
+    assert_eq!(
+        work.get(&[1; 32]),
+        Some(&PlannedWork {
+            download: 100,
+            resumed: 0,
+        })
+    );
+    assert_eq!(work.len(), 1, "{work:?}");
+
+    let all = planned_work(&entries, tmp.path(), true, &plan, &DiskState::default()).await;
+    assert_eq!(all.len(), 3, "an overwriting pull fetches every group");
 }
