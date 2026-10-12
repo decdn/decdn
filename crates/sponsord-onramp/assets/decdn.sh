@@ -24,6 +24,7 @@ CLI_SUMS_SHA256="{{CLI_SUMS_SHA256}}"
 
 BINDIR="${HOME}/.local/bin"
 DECDN_DIR="${HOME}/.decdn"
+MARKERS="${DECDN_DIR}/installer"
 
 die() {
   echo "decdn: $*" >&2
@@ -53,18 +54,29 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 130' INT TERM
-mkdir -p "$BINDIR" "$DECDN_DIR"
+mkdir -p "$BINDIR" "$DECDN_DIR" "$MARKERS"
 
 # fetch_bin <repo> <binary> <release tag> <version> <SHA256SUMS digest>
 #
 # Downloads SHA256SUMS and checks it against the pinned digest, then
 # downloads the archive for this platform and checks it against SHA256SUMS.
 # Nothing lands in BINDIR unless both checks pass.
+#
+# A marker in MARKERS records the pinned digest and target of the last
+# install, so a binary already installed from the same release is kept and
+# nothing is downloaded. Deleting the marker forces a reinstall.
 fetch_bin() {
   repo="$1" bin="$2" tag="$3" version="$4" sums_sha256="$5"
   base="${RELEASES}/${repo}/releases/download/${tag}"
   archive="${bin}-${version}-${TARGET}.tar.gz"
   dir="${WORK}/${bin}"
+  marker="${MARKERS}/${bin}"
+  stamp="${sums_sha256} ${TARGET}"
+
+  if [ -x "${BINDIR}/${bin}" ] && [ -f "$marker" ] && [ "$(cat "$marker")" = "$stamp" ]; then
+    echo "${bin} ${tag} is already installed."
+    return 0
+  fi
   mkdir -p "$dir"
 
   echo "Installing ${bin} ${tag} (${TARGET})..."
@@ -81,6 +93,7 @@ fetch_bin() {
   tar -xzf "${dir}/${archive}" -C "$dir" "$bin"
   chmod +x "${dir}/${bin}"
   mv -f "${dir}/${bin}" "${BINDIR}/${bin}"
+  echo "$stamp" >"$marker"
 }
 
 # 1. Install the decdn and decdn-sponsored binaries.

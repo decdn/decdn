@@ -36,7 +36,8 @@
 
     $BinDir = Join-Path $env:LOCALAPPDATA 'decdn\bin'
     $DecdnDir = Join-Path $HOME '.decdn'
-    New-Item -ItemType Directory -Force -Path $BinDir, $DecdnDir | Out-Null
+    $Markers = Join-Path $DecdnDir 'installer'
+    New-Item -ItemType Directory -Force -Path $BinDir, $DecdnDir, $Markers | Out-Null
 
     # The OS architecture, not the process's: x64 PowerShell under emulation on
     # an ARM64 machine reports AMD64 in PROCESSOR_ARCHITECTURE.
@@ -56,11 +57,24 @@
     # Downloads SHA256SUMS and checks it against the pinned digest, then
     # downloads the archive for this platform and checks it against
     # SHA256SUMS. Nothing lands in BinDir unless both checks pass.
+    #
+    # A marker in $Markers records the pinned digest and target of the last
+    # install, so a binary already installed from the same release is kept
+    # and nothing is downloaded. Deleting the marker forces a reinstall.
     $FetchBin = {
       param($Repo, $Bin, $Tag, $Version, $SumsSha256)
       $Base = "$Releases/$Repo/releases/download/$Tag"
       $Archive = "$Bin-$Version-$Target.zip"
       $Dir = Join-Path $Work $Bin
+      $Marker = Join-Path $Markers $Bin
+      $Stamp = "$SumsSha256 $Target"
+
+      if ((Test-Path -PathType Leaf (Join-Path $BinDir "$Bin.exe")) -and
+          (Test-Path -PathType Leaf $Marker) -and
+          ([IO.File]::ReadAllText($Marker).Trim() -eq $Stamp)) {
+        Write-Host "$Bin $Tag is already installed."
+        return
+      }
       New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
       Write-Host "Installing $Bin $Tag ($Target)..."
@@ -85,6 +99,7 @@
 
       Expand-Archive -Path $Zip -DestinationPath $Dir -Force
       Move-Item -Force -Path (Join-Path $Dir "$Bin.exe") -Destination (Join-Path $BinDir "$Bin.exe")
+      [IO.File]::WriteAllText($Marker, $Stamp)
     }
 
     # 1. Install the decdn and decdn-sponsored binaries.

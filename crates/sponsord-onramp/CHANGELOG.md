@@ -15,6 +15,14 @@ release.
 
 ## [Unreleased]
 
+### Changed
+
+- **The installers skip binaries already installed from the pinned
+  release.** `decdn.sh` and `decdn.ps1` record each install's `SHA256SUMS`
+  digest and target in `~/.decdn/installer/<binary>`, and download nothing
+  for a binary whose marker matches. A new pin, a deleted marker or a missing
+  binary installs it again.
+
 ## [0.0.2] - 2026-10-09
 
 ## [0.0.1] - 2026-10-09
