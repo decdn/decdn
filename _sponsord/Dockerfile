@@ -17,12 +17,12 @@
 # To build a server image from source instead (a fork, an unreleased commit),
 # use deploy/Dockerfile.
 
-# Pinned by digest, not just by tag: `bookworm-slim` moves, and a release is a
+# Pinned by digest, not just by tag: `trixie-slim` moves, and a release is a
 # maintainer signing exact bytes. The digest is also what lets Dependabot's
 # `docker` ecosystem open bump PRs. It is the multi-arch index digest, so
-# linux/amd64 and linux/arm64 both resolve from it. glibc 2.36, above the
+# linux/amd64 and linux/arm64 both resolve from it. glibc 2.41, above the
 # 2.35 the release binaries are built against on ubuntu-22.04.
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS base
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \

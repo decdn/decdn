@@ -361,7 +361,7 @@ jobs:
           TARGET: ${{ matrix.target }}
 
       # The glibc 2.35 floor (Ubuntu 22.04) every Linux archive promises, and
-      # below the 2.36 of the images' Debian bookworm base. A binary built on a
+      # below the 2.41 of the images' Debian trixie base. A binary built on a
       # newer runner would link newer glibc symbols and fail at exec with
       # "version `GLIBC_2.3x' not found". Checked here, before the archive
       # exists, so a binary above the floor never reaches upload-assets or an

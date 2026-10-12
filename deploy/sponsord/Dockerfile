@@ -7,7 +7,7 @@
 #
 #   docker build -f deploy/Dockerfile --build-arg BIN=sponsord -t sponsord .
 
-FROM rust:1.99-bookworm AS build
+FROM rust:1.99-trixie AS build
 ARG BIN
 WORKDIR /src
 COPY . .
@@ -15,7 +15,7 @@ RUN test -n "$BIN" \
  && cargo build --release --locked -p "$BIN" \
  && cp "target/release/$BIN" /usr/local/bin/server
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \

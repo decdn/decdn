@@ -46,6 +46,8 @@ release.
 
 ### Changed
 
+- **Debian 13 image base.** The container image is built on
+  `debian:trixie-slim` (was `bookworm-slim`).
 - **The installers skip binaries already installed from the pinned
   release.** `decdn.sh` and `decdn.ps1` record each install's `SHA256SUMS`
   digest and target in `~/.decdn/installer/<binary>`, and download nothing

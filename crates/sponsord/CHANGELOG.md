@@ -17,6 +17,8 @@ release.
 
 ### Changed
 
+- **Debian 13 image base.** The container image is built on
+  `debian:trixie-slim` (was `bookworm-slim`).
 - **decdn v0.0.3.** The decdn crates are locked at decdn's `v0.0.3` release tag
   (`1c41dd6e095e843ff6e2bab8340e12767aa68e32`) and require `0.0.3`, which is on
   crates.io.

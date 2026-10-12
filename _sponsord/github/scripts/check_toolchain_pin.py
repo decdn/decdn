@@ -34,7 +34,7 @@ which no workflow here sets.
 
 The release image (root `Dockerfile`) has no Rust stage: it copies prebuilt
 release binaries onto Debian. The from-source `deploy/Dockerfile` does name
-one, `FROM rust:X.Y-bookworm`, but is out of scope: the tag is major.minor
+one, `FROM rust:X.Y-trixie`, but is out of scope: the tag is major.minor
 only, and it is kept in step by hand (AGENTS.md).
 
 Run: .github/scripts/check-toolchain-pin.sh
