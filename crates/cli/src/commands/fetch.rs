@@ -479,7 +479,10 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 /// # Errors
 ///
 /// [`Interrupted`] on Ctrl-C, [`decdn_client::GaveUp`] once the stop policy's
-/// no-progress limit passes, or the fault that ended the fetch.
+/// no-progress limit passes, or the fault that ended the fetch. A fetch that
+/// ends with an `openPool` whose receipt it did not read carries
+/// [`super::interrupt::PendingOpens`], as context on any of those or as the
+/// error of a fetch that otherwise succeeded.
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let timings = FetchTimings::start();
     let hash = parse_hash(&args.hash)?;
@@ -520,12 +523,12 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // end cleanly instead of being aborted on drop. A Ctrl-C drops `fetch_over`
     // mid-transfer: each drive's drop guard queues what it paid for recording,
     // and the `.partial` is the next run's resume prefix.
-    let mut interrupt = Interrupt::watch();
+    // Outlives `fetch_over`, so an `openPool` that a Ctrl-C or a fault dropped
+    // before its receipt was read is still named.
+    let opens = UnconfirmedOpens::default();
+    let mut interrupt = Interrupt::watch(opens.clone());
     // The command's peer-record and watermark writes, off the runtime thread.
     let writes = OrderedWrites::default();
-    // Outlives `fetch_over`, so an `openPool` whose receipt wait the Ctrl-C
-    // dropped is still named.
-    let opens = UnconfirmedOpens::default();
     let result = tokio::select! {
         result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes, &opens, &timings) => {
             result

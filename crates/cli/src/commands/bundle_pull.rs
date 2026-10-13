@@ -20,6 +20,7 @@ use decdn_client::bundle::{
     BundleEnd, BundleManifest, BundleObserver, BundlePuller, BundleReport, EntryLanded,
     FaultContext, FaultHints, FileObserver, Funding, ManifestEntry, STAGING_DIR, select_nodes,
 };
+use decdn_client::buyer_pool::UnconfirmedOpens;
 use decdn_client::endpoint as client_endpoint;
 use decdn_common::cli::BundlePullArgs;
 use decdn_common::config::load_file_config;
@@ -650,6 +651,9 @@ async fn pull_over(
     };
 
     let observer = Arc::new(PullObserver::new(args.json, run_label(&args.output)));
+    // Outlives the puller's passes, so an `openPool` that a Ctrl-C or a fault
+    // dropped before its receipt was read is still named.
+    let opens = UnconfirmedOpens::default();
     let mut puller = BundlePuller::builder(
         chain.config.clone(),
         chain.site.clone(),
@@ -668,17 +672,26 @@ async fn pull_over(
     .stop(std::io::stderr().is_terminal(), common.give_up_after())
     .observer(Arc::clone(&observer) as Arc<dyn BundleObserver>)
     .fault_hints(Arc::new(CliFaultHints))
+    .unconfirmed_opens(opens.clone())
     .build()
     .await?;
 
+    // Watched from before the manifest: the `--hash` manifest fetch is paid,
+    // so it can open the run's pool. The first Ctrl-C stops the run where it
+    // is; a second one exits at once.
+    let mut interrupt = Interrupt::watch(opens.clone());
     let result = pull_manifest(
         &mut puller,
+        &mut interrupt,
         &observer,
         args,
         (filter, filters_given),
         local_manifest,
     )
     .await;
+    // Every exit of the manifest or the pull can drop an `openPool` before
+    // its receipt is read, and the transaction may still escrow its deposit.
+    let result = name_unconfirmed_open(result, &opens.pending());
     // On every exit, a Ctrl-C's included: what the entries queued is durable
     // before the command returns.
     puller.finish().await;
@@ -697,6 +710,7 @@ fn warn_shortfall(puller: &BundlePuller) {
 /// print the run summary.
 async fn pull_manifest(
     puller: &mut BundlePuller,
+    interrupt: &mut Interrupt,
     observer: &PullObserver,
     args: &BundlePullArgs,
     (filter, filters_given): (&EntryFilter, bool),
@@ -707,9 +721,13 @@ async fn pull_manifest(
     // `--select`: let the user trim the (already glob-filtered) list in their
     // editor. Everything deselected ends the run (reported) like an empty filter.
     let selected = async {
-        let Some(kept) =
-            obtain_manifest(puller, args, filter, filters_given, local_manifest).await?
-        else {
+        let obtained = tokio::select! {
+            obtained = obtain_manifest(puller, args, filter, filters_given, local_manifest) => {
+                obtained?
+            }
+            () = interrupt.wait() => return Err(Interrupted.into()),
+        };
+        let Some(kept) = obtained else {
             return Ok(None);
         };
         maybe_select(args, kept)
@@ -723,10 +741,8 @@ async fn pull_manifest(
         return Ok(());
     };
 
-    // Watched from here on: the first Ctrl-C cancels the pull, which stops
-    // every fetch where it is and still reports what landed; a second one
-    // exits at once.
-    let mut interrupt = Interrupt::watch();
+    // The first Ctrl-C cancels the pull, which stops every fetch where it is
+    // and still reports what landed.
     let cancel = CancellationToken::new();
     let outcome = {
         let watch = async {
@@ -746,15 +762,13 @@ async fn pull_manifest(
     warn_leftover_partials(&args.output, &manifest.entries, args.hash.as_deref());
     let reported = report(&outcome.report, excluded, &args.output, args.json);
     // A fault that ended the whole pull is its result, so `main` maps it to
-    // its exit code (75 for a give-up, 1 otherwise).
-    let result = match outcome.end {
+    // its exit code (75 for a give-up with no `openPool` in flight, 1
+    // otherwise).
+    match outcome.end {
         BundleEnd::Interrupted => Err(Interrupted.into()),
         BundleEnd::FundingNeeded { error, .. } | BundleEnd::Stopped(error) => Err(error),
         _ => reported,
-    };
-    // A cancel or a fault that ended the pull drops any `openPool` receipt
-    // wait, and the transaction may still escrow its deposit.
-    name_unconfirmed_open(result, &puller.unconfirmed_opens())
+    }
 }
 
 /// Name the pool a funding recovery step closed, which may still hold a

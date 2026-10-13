@@ -510,12 +510,13 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// it sends another `openPool`, and hands a receipt it reads later to
 /// [`opened_from_receipt`].
 ///
-/// A caller can also drop this future during the wait: a Ctrl-C, or a sibling
-/// fault that ends the command. No error is returned then, so `opens` holds
-/// the broadcast tx from the broadcast until the receipt wait returns. A caller
-/// that may drop the future passes `Some` and reads
-/// [`UnconfirmedOpens::pending`] when it ends, so it can still name the tx. The
-/// broadcast is also logged at `info` before the wait.
+/// A caller can also drop this future: a Ctrl-C, or a fault that ends the
+/// command. No error is returned then, and a caller can also drop an error a
+/// sibling task returned. So `opens` holds the `openPool` from before its
+/// submit until its receipt is read: with no hash while the submit is in
+/// flight or failed in transport, with the hash after. A caller that may drop
+/// the future or its error passes `Some` and reads
+/// [`UnconfirmedOpens::pending`] when it ends, so it can still name the tx.
 ///
 /// # The nonce is explicit
 ///
@@ -547,13 +548,20 @@ pub async fn open_pool<P: Provider + Clone>(
         .await
         .context("read the pending nonce for openPool")
         .context(PoolOpenFailureReason::RpcError)?;
-    let pending = match contract
+    // A caller with no handle holds the entries in one nobody reads.
+    let opens = opens.cloned().unwrap_or_default();
+    let submitted = OpenUnconfirmed { tx: None, nonce };
+    // Held across the submit: a drop while it is in flight leaves an
+    // `openPool` the RPC node may have broadcast with no hash returned.
+    opens.insert(submitted);
+    let sent = contract
         .openPool(amount)
         .from(owner)
         .nonce(nonce)
         .send()
-        .await
-    {
+        .await;
+    opens.remove(submitted);
+    let pending = match sent {
         Ok(pending) => pending,
         Err(err) => {
             // A deterministic revert (a zero deposit, USDC balance/allowance too
@@ -566,7 +574,8 @@ pub async fn open_pool<P: Provider + Clone>(
             let broadcast_unknown = decdn_incentive::tx::send_broadcast_unknown(&err);
             let mut err = anyhow::Error::new(err).context("submit openPool");
             if broadcast_unknown {
-                err = err.context(OpenUnconfirmed { tx: None, nonce });
+                opens.insert(submitted);
+                err = err.context(submitted);
             }
             return Err(err.context(reason));
         }
@@ -579,17 +588,12 @@ pub async fn open_pool<P: Provider + Clone>(
         tx: Some(tx),
         nonce,
     };
-    if let Some(opens) = opens {
-        opens.insert(unconfirmed);
-    }
+    opens.insert(unconfirmed);
 
     // Unbounded by design — see the `# The receipt wait is deliberately UNBOUNDED`
-    // section above. A drop here skips the `remove`, which is the point.
-    let receipt = pending.get_receipt().await;
-    if let Some(opens) = opens {
-        opens.remove(unconfirmed);
-    }
-    let receipt = receipt.map_err(|err| {
+    // section above. Only a receipt releases the entry: a drop here or a failed
+    // read leaves it, which is the point.
+    let receipt = pending.get_receipt().await.map_err(|err| {
         anyhow::Error::new(err)
             .context(format!(
                 "await openPool receipt (tx {tx:#x}; it may still mine and escrow the deposit)"
@@ -597,6 +601,7 @@ pub async fn open_pool<P: Provider + Clone>(
             .context(unconfirmed)
             .context(PoolOpenFailureReason::RpcError)
     })?;
+    opens.remove(unconfirmed);
     opened_from_receipt(&receipt, tx, signer, deployment, token, owner, deposit)
 }
 
@@ -709,15 +714,16 @@ pub const SELF_CAPABILITY_CAP: u64 = u64::MAX;
 
 /// Typed marker on an [`open_pool`] error raised when the `openPool` may have
 /// been broadcast but is not known to have mined: its submit failed in
-/// transport, or it was broadcast and its receipt could not be read. The
+/// transport, or it was broadcast and its receipt could not be read. An
+/// [`UnconfirmedOpens`] entry has the same meaning. The
 /// transaction may still mine and escrow the deposit, so a caller must resolve
 /// it before it sends another `openPool`. Recover it with
 /// `err.downcast_ref::<OpenUnconfirmed>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenUnconfirmed {
-    /// The broadcast `openPool` transaction. `None` when the submit failed in
-    /// transport: the RPC node may have broadcast the transaction without
-    /// returning its hash.
+    /// The broadcast `openPool` transaction. `None` when the submit returned
+    /// no hash (it failed in transport, or was dropped in flight): the RPC
+    /// node may have broadcast the transaction without returning its hash.
     pub tx: Option<TxHash>,
     /// The nonce the `openPool` was sent with. Once the account's confirmed
     /// nonce passes it, the `openPool` has either mined or can never mine.
@@ -731,16 +737,16 @@ impl std::fmt::Display for OpenUnconfirmed {
                 f,
                 "openPool tx {tx} (nonce {n}) was broadcast but its receipt was not read, so it \
                  may have mined and escrowed the deposit. An open sent before the tx confirms \
-                 or the account's nonce passes {n} escrows a second deposit; `decdn pool list \
-                 --all` shows the pools this account holds on chain",
+                 or the account's nonce passes {n} escrows a second deposit; once it mines, \
+                 `decdn pool list --all` shows its pool on chain",
                 n = self.nonce
             ),
             None => write!(
                 f,
-                "openPool submit (nonce {n}) failed in transport, so the RPC node may have \
+                "openPool submit (nonce {n}) returned no tx hash, so the RPC node may have \
                  broadcast it and it may mine. An open sent before the account's nonce passes \
-                 {n} escrows a second deposit; `decdn pool list --all` shows the pools this \
-                 account holds on chain",
+                 {n} escrows a second deposit; once it mines, `decdn pool list --all` shows its \
+                 pool on chain",
                 n = self.nonce
             ),
         }
@@ -749,14 +755,15 @@ impl std::fmt::Display for OpenUnconfirmed {
 
 impl std::error::Error for OpenUnconfirmed {}
 
-/// The `openPool` transactions a command broadcast whose receipt wait has not
-/// returned.
+/// The `openPool` transactions a command submitted whose receipt it has not
+/// read.
 ///
-/// [`open_pool`] adds its tx at the broadcast and removes it when the receipt
-/// wait returns, with a receipt or an error. A future dropped during the wait
-/// leaves its entry. A command that ends while an entry remains names the tx,
-/// because the deposit may escrow after the command exits and a re-run before
-/// it confirms escrows a second deposit.
+/// [`open_pool`] adds an entry before its submit and removes it once it reads
+/// the receipt, or once a submit is rejected without a broadcast. A future
+/// dropped mid-submit or mid-wait, or a receipt read that fails, leaves its
+/// entry. A command that ends while an entry remains names it, because the
+/// deposit may escrow after the command exits and a re-run before it confirms
+/// escrows a second deposit.
 ///
 /// A clone shares the same list, so one handle can outlive the per-pass state
 /// that the opens run under.
@@ -764,7 +771,7 @@ impl std::error::Error for OpenUnconfirmed {}
 pub struct UnconfirmedOpens(Arc<Mutex<Vec<OpenUnconfirmed>>>);
 
 impl UnconfirmedOpens {
-    /// The opens whose receipt wait has not returned, oldest first.
+    /// The opens whose receipt was not read, oldest first.
     #[must_use]
     pub fn pending(&self) -> Vec<OpenUnconfirmed> {
         self.0
@@ -773,7 +780,7 @@ impl UnconfirmedOpens {
             .clone()
     }
 
-    /// Hold `open` from its broadcast.
+    /// Hold `open` from its submit.
     fn insert(&self, open: OpenUnconfirmed) {
         self.0
             .lock()
@@ -781,7 +788,7 @@ impl UnconfirmedOpens {
             .push(open);
     }
 
-    /// Release `open` once its receipt wait returned.
+    /// Release `open` once its receipt is read, or its submit was rejected.
     fn remove(&self, open: OpenUnconfirmed) {
         self.0
             .lock()

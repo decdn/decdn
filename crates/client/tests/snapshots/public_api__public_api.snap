@@ -35,7 +35,6 @@ pub async fn decdn_client::bundle::BundlePuller::fetch_manifest(&self, [u8; 32],
 pub async fn decdn_client::bundle::BundlePuller::finish(self)
 pub fn decdn_client::bundle::BundlePuller::funding_shortfall(&self) -> core::option::Option<alloc::string::String>
 pub async fn decdn_client::bundle::BundlePuller::pull(&mut self, &decdn_client::bundle::BundleManifest, &std::path::Path, bool, &tokio_util::sync::cancellation_token::CancellationToken) -> decdn_client::bundle::BundleOutcome
-pub fn decdn_client::bundle::BundlePuller::unconfirmed_opens(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::OpenUnconfirmed>
 impl core::fmt::Debug for decdn_client::bundle::BundlePuller
 pub fn decdn_client::bundle::BundlePuller::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::bundle::BundlePullerBuilder
@@ -49,6 +48,7 @@ pub const fn decdn_client::bundle::BundlePullerBuilder::namespace(self, core::op
 pub fn decdn_client::bundle::BundlePullerBuilder::observer(self, alloc::sync::Arc<dyn decdn_client::bundle::BundleObserver>) -> Self
 pub fn decdn_client::bundle::BundlePullerBuilder::relays(self, alloc::vec::Vec<iroh_base::relay_url::RelayUrl>) -> Self
 pub const fn decdn_client::bundle::BundlePullerBuilder::stop(self, bool, core::option::Option<core::time::Duration>) -> Self
+pub fn decdn_client::bundle::BundlePullerBuilder::unconfirmed_opens(self, decdn_client::buyer_pool::UnconfirmedOpens) -> Self
 impl core::fmt::Debug for decdn_client::bundle::BundlePullerBuilder
 pub fn decdn_client::bundle::BundlePullerBuilder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct decdn_client::bundle::BundleReport

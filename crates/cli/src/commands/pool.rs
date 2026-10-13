@@ -200,7 +200,7 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
     // Watched from the open on: a Ctrl-C does not cancel a broadcast
     // `openPool`, so the command names it rather than dying with no hash.
     let opens = UnconfirmedOpens::default();
-    let mut interrupt = Interrupt::watch();
+    let mut interrupt = Interrupt::watch(opens.clone());
     let opened = async {
         let opened = open_pool(
             &contract,

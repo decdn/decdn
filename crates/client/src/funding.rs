@@ -79,7 +79,7 @@ pub fn cached_pool_token(
 /// lane pays from, which a funding recovery step tops up: every entry of a
 /// bundle pull shares it, the entries that have built no lane yet included.
 /// Every `openPool` a lane build or a recovery step sends is held in its
-/// [`UnconfirmedOpens`] until the receipt wait returns.
+/// [`UnconfirmedOpens`] until its receipt is read.
 #[derive(Debug, Default)]
 pub struct RunFunding {
     spend: Mutex<RunSpend>,
@@ -121,8 +121,9 @@ struct RunSpend {
 }
 
 impl RunFunding {
-    /// A run whose `openPool` broadcasts are held in `opens`, a handle the
-    /// caller keeps after the run's state is dropped.
+    /// A run whose `openPool` transactions are held in `opens`, a handle the
+    /// caller keeps after the run's state is dropped. A caller that builds a
+    /// `RunFunding` per pass passes the same handle to each.
     #[must_use]
     pub fn reporting_opens_to(opens: UnconfirmedOpens) -> Self {
         Self {
@@ -131,7 +132,8 @@ impl RunFunding {
         }
     }
 
-    /// The run's `openPool` transactions whose receipt wait has not returned.
+    /// The handle that holds the run's `openPool` transactions whose receipt
+    /// was not read ([`UnconfirmedOpens::pending`]).
     pub const fn opens(&self) -> &UnconfirmedOpens {
         &self.opens
     }
