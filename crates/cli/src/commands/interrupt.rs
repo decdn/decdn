@@ -32,7 +32,7 @@ impl std::error::Error for Interrupted {}
 /// The `openPool` transactions a command ended with and did not see confirm.
 /// Each may still mine and escrow its deposit. Displays one open per line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingOpens(pub Vec<OpenUnconfirmed>);
+pub struct PendingOpens(Vec<OpenUnconfirmed>);
 
 impl std::fmt::Display for PendingOpens {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
