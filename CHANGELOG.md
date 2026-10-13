@@ -1024,23 +1024,35 @@ since project inception and will roll into the first tagged release.
   API changes are under Changed (BREAKING).
 - **`decdn pool close` and `pool reclaim` clear the local row of a pool that
   is no longer Open (#2425).** When a `closePool` or `reclaim` mined but its
-  run could not clear the client-store row (the clear faulted, or the receipt
-  was unreadable), every re-run stopped at a status refusal or skip before it
-  touched the store. The row survived, and a later fetch reused a closing or
-  closed pool whose vouchers `redeemMany` rejects. Now each `close` or
-  `reclaim` that reads the pool as `Closing` or `Closed` clears its row:
+  run could not clear the client-store row (the clear faulted, or the tx's
+  outcome was unknown), every re-run stopped at a status refusal or skip
+  before it touched the store. The row survived, and a later fetch reused a
+  closing or closed pool whose vouchers `redeemMany` rejects. Now each `close`
+  or `reclaim` that reads the pool as `Closing` or `Closed` clears its row:
   `close --pool` and `reclaim --pool` on their refusal, and `close --all` and
   `reclaim --all` on their skip. The refusal or skip line says when it cleared
-  a row. Exit codes do not change: a `--pool` refusal still exits nonzero.
-  The clear is compare-and-delete, so a row for a newer pool stays. On a
-  daemon data dir the CLI leaves the daemon's row as it is and says so.
-  `reclaim --pool` clears the row with the pool's on-chain owner, so its
-  refusal still asks for no keystore password.
+  a row. Exit codes for a `--pool` refusal do not change: it still exits
+  nonzero.
+  - The clear is compare-and-delete, so a row for a newer pool stays.
+  - Every row-clear in `pool close` and `pool reclaim`, including the one
+    after a landed tx, touches only a row on the command's chain and
+    `PaymentPool`. A pool id repeats across deployments, so a command run
+    against an old `--payment-pool-address` leaves the live row for the same
+    id on the current deployment alone.
+  - `reclaim --pool` clears the row with the pool's on-chain owner, so its
+    refusal still asks for no keystore password. A local store that will not
+    open (another `decdn` process holds it) only warns: the refusal still
+    names its cause.
+  - A skipped pool whose row-clear faults counts in a new `row not cleared`
+    summary count, and the sweep exits nonzero, so a failed repair does not
+    read as success.
+  - On a daemon data dir the CLI leaves the daemon's row as it is and says so.
 - **`decdn pool close --all` counts a landed close whose row-clear faulted as
   closed, not as failed (#2425).** The per-pool line no longer reads "failed
-  to close" for a close that is on-chain. The summary line gains a `row not
-  cleared` count, and the sweep still exits nonzero, naming the re-run that
-  clears the row. `close --pool` names that re-run as well.
+  to close" for a close that is on-chain. The pool counts in `row not
+  cleared`, and the sweep still exits nonzero, naming the re-run that clears
+  the row. `close --pool` names that re-run as well, and both put the store
+  fault next to the word "failed".
 - **`decdn pool close` and `pool reclaim` name the revert that gas estimation
   rejects, and no longer call it on-chain (#2426, #2417).** A `closePool` or
   `reclaim` that would revert fails at gas estimation, before anything is
