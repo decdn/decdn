@@ -109,6 +109,13 @@ alloy = { workspace = true }
 # via `join_all`, which borrows one shared `&endpoint` instead of cloning it
 # per probe. Combinators only — no iroh-blobs, so the #578 invariant holds.
 futures-util = { workspace = true }
+# `decdn gateway` serves `decdn:` URIs over loopback HTTP/1.1, streaming each
+# verified body as it arrives. The same server stack the node's metrics
+# endpoint runs on.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 # `decdn whoami` holds the resolved keystore password in a `Zeroizing<String>`
 # (the type `eth_identity::read_password` returns) so it is scrubbed on drop.
 zeroize = { workspace = true }
