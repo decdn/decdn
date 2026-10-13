@@ -39,6 +39,7 @@ use iroh::{Endpoint, RelayUrl};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::buyer_pool::OpenUnconfirmed;
 use crate::discovery::NodeCandidate;
 use crate::funding::RunFunding;
 use crate::ordered_writes::OrderedWrites;
@@ -599,6 +600,14 @@ impl BundlePuller {
     #[must_use]
     pub fn funding_shortfall(&self) -> Option<String> {
         self.ctx.funding.shortfall()
+    }
+
+    /// The `openPool` transactions this run broadcast whose receipt wait has
+    /// not returned. A cancel or a command-wide fault drops the wait, so an
+    /// entry here may still mine and escrow its deposit.
+    #[must_use]
+    pub fn unconfirmed_opens(&self) -> Vec<OpenUnconfirmed> {
+        self.ctx.funding.opens().pending()
     }
 
     /// Wait for every queued peer-record and watermark write to land. Call it

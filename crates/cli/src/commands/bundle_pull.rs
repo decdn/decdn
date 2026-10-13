@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::buyer_store::open_client_store_for_buy;
 use super::fetch;
-use super::interrupt::{Interrupt, Interrupted};
+use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
 use super::manifest::build_glob_set;
 use super::pull_progress::{self, PullProgress};
 
@@ -747,11 +747,14 @@ async fn pull_manifest(
     let reported = report(&outcome.report, excluded, &args.output, args.json);
     // A fault that ended the whole pull is its result, so `main` maps it to
     // its exit code (75 for a give-up, 1 otherwise).
-    match outcome.end {
+    let result = match outcome.end {
         BundleEnd::Interrupted => Err(Interrupted.into()),
         BundleEnd::FundingNeeded { error, .. } | BundleEnd::Stopped(error) => Err(error),
         _ => reported,
-    }
+    };
+    // A cancel or a fault that ended the pull drops any `openPool` receipt
+    // wait, and the transaction may still escrow its deposit.
+    name_unconfirmed_open(result, &puller.unconfirmed_opens())
 }
 
 /// Name the pool a funding recovery step closed, which may still hold a

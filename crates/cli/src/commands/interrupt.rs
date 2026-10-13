@@ -1,4 +1,4 @@
-//! Graceful Ctrl-C for `decdn fetch` and `decdn bundle pull`.
+//! Graceful Ctrl-C for `decdn fetch`, `decdn bundle pull` and `decdn pool open`.
 //!
 //! The first Ctrl-C resolves `Interrupt::wait`: the command stops its
 //! transfers, writes what it must keep (the bundle skip-cache, the progress
@@ -7,7 +7,11 @@
 //! exits at once with the same status.
 //!
 //! Stopping mid-transfer loses nothing already paid for: every fetch resumes
-//! from its on-disk `.partial` on the next run.
+//! from its on-disk `.partial` on the next run. Stopping during an `openPool`
+//! receipt wait does not cancel the transaction, so the command names it
+//! (`name_unconfirmed_open`) instead of telling the user to run it again.
+
+use decdn_client::buyer_pool::OpenUnconfirmed;
 
 /// The error a command returns when Ctrl-C stopped it. `main` prints a resume
 /// hint and exits with status 130 (128 + SIGINT), the shell convention for an
@@ -22,6 +26,38 @@ impl std::fmt::Display for Interrupted {
 }
 
 impl std::error::Error for Interrupted {}
+
+/// The line `main` prints for an interrupted command: the `openPool` that
+/// `err` names as still in flight, or else the resume hint.
+#[must_use]
+pub fn interrupted_message(err: &anyhow::Error) -> String {
+    match err.downcast_ref::<OpenUnconfirmed>() {
+        Some(open) => format!("interrupted: {open}"),
+        None => "interrupted; run the same command again to resume".to_owned(),
+    }
+}
+
+/// End a command that may have dropped an `openPool` receipt wait. `opens`
+/// are the opens whose wait did not return
+/// ([`decdn_client::buyer_pool::UnconfirmedOpens::pending`]).
+///
+/// With none, `result` passes through. Otherwise the first one is attached
+/// to the result, so the command names its tx. An `Ok` becomes an error: the
+/// deposit may escrow with no local record, and only a non-zero exit makes
+/// sure someone reconciles it. An error keeps its own type underneath, so an
+/// [`Interrupted`] still exits 130.
+pub(crate) fn name_unconfirmed_open<T>(
+    result: anyhow::Result<T>,
+    opens: &[OpenUnconfirmed],
+) -> anyhow::Result<T> {
+    let Some(open) = opens.first() else {
+        return result;
+    };
+    match result {
+        Ok(_) => Err(anyhow::Error::new(*open)),
+        Err(err) => Err(err.context(*open)),
+    }
+}
 
 /// The exit status for an interrupted command: 128 + SIGINT.
 pub const INTERRUPTED_EXIT: u8 = 130;

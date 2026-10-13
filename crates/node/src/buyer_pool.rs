@@ -2437,6 +2437,9 @@ async fn run_open<P: Provider + Clone>(
         open.token,
         open.owner,
         open.deposit,
+        // The detached open task holds the owner's slot while the open is
+        // unconfirmed, so nothing drops this wait (#2415).
+        None,
     )
     .await
     {

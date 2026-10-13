@@ -40,7 +40,10 @@ async fn main() -> std::process::ExitCode {
             if e.downcast_ref::<decdn_cli::commands::interrupt::Interrupted>()
                 .is_some()
             {
-                eprintln!("interrupted; run the same command again to resume");
+                eprintln!(
+                    "{}",
+                    decdn_cli::commands::interrupt::interrupted_message(&e)
+                );
             } else if let Some(gave_up) = e.downcast_ref::<decdn_client::GaveUp>() {
                 // Not an error to fix: the message names the wait and the rerun.
                 eprintln!("{gave_up}");

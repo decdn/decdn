@@ -126,6 +126,7 @@ impl Buyer {
                 token,
                 owner,
                 env.deposit,
+                None,
             )
             .await?;
             // The deposit is escrowed once `open_pool` returns. A failed

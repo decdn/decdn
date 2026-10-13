@@ -12,7 +12,7 @@
 //! caller does directly: a one-shot CLI fetch needs neither the node service's
 //! per-owner concurrency guard nor its background reclaim/reconcile machinery.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -508,8 +508,14 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// transport ([`decdn_incentive::tx::send_broadcast_unknown`]) carries one too,
 /// with the nonce and no hash. The caller must resolve that transaction before
 /// it sends another `openPool`, and hands a receipt it reads later to
-/// [`opened_from_receipt`]. The broadcast is also logged at `info` before the
-/// wait, so a caller that drops this future still leaves the hash in the log.
+/// [`opened_from_receipt`].
+///
+/// A caller can also drop this future during the wait: a Ctrl-C, or a sibling
+/// fault that ends the command. No error is returned then, so `opens` holds
+/// the broadcast tx from the broadcast until the receipt wait returns. A caller
+/// that may drop the future passes `Some` and reads
+/// [`UnconfirmedOpens::pending`] when it ends, so it can still name the tx. The
+/// broadcast is also logged at `info` before the wait.
 ///
 /// # The nonce is explicit
 ///
@@ -525,6 +531,7 @@ pub async fn open_pool<P: Provider + Clone>(
     token: Address,
     owner: Address,
     deposit: U256,
+    opens: Option<&UnconfirmedOpens>,
 ) -> Result<OpenedPool> {
     anyhow::ensure!(
         *contract.address() == deployment.payment_pool,
@@ -568,18 +575,26 @@ pub async fn open_pool<P: Provider + Clone>(
     // the deposit may escrow, so a receipt failure names the tx to reconcile.
     let tx = *pending.tx_hash();
     info!(%tx, %owner, %deposit, "openPool broadcast; awaiting its receipt");
+    let unconfirmed = OpenUnconfirmed {
+        tx: Some(tx),
+        nonce,
+    };
+    if let Some(opens) = opens {
+        opens.insert(unconfirmed);
+    }
 
     // Unbounded by design — see the `# The receipt wait is deliberately UNBOUNDED`
-    // section above.
-    let receipt = pending.get_receipt().await.map_err(|err| {
+    // section above. A drop here skips the `remove`, which is the point.
+    let receipt = pending.get_receipt().await;
+    if let Some(opens) = opens {
+        opens.remove(unconfirmed);
+    }
+    let receipt = receipt.map_err(|err| {
         anyhow::Error::new(err)
             .context(format!(
                 "await openPool receipt (tx {tx:#x}; it may still mine and escrow the deposit)"
             ))
-            .context(OpenUnconfirmed {
-                tx: Some(tx),
-                nonce,
-            })
+            .context(unconfirmed)
             .context(PoolOpenFailureReason::RpcError)
     })?;
     opened_from_receipt(&receipt, tx, signer, deployment, token, owner, deposit)
@@ -716,16 +731,16 @@ impl std::fmt::Display for OpenUnconfirmed {
                 f,
                 "openPool tx {tx} (nonce {n}) was broadcast but its receipt was not read, so it \
                  may have mined and escrowed the deposit. An open sent before the tx confirms \
-                 or the account's nonce passes {n} escrows a second deposit; `decdn pool list` \
-                 shows the pools this account holds",
+                 or the account's nonce passes {n} escrows a second deposit; `decdn pool list \
+                 --all` shows the pools this account holds on chain",
                 n = self.nonce
             ),
             None => write!(
                 f,
                 "openPool submit (nonce {n}) failed in transport, so the RPC node may have \
                  broadcast it and it may mine. An open sent before the account's nonce passes \
-                 {n} escrows a second deposit; `decdn pool list` shows the pools this account \
-                 holds",
+                 {n} escrows a second deposit; `decdn pool list --all` shows the pools this \
+                 account holds on chain",
                 n = self.nonce
             ),
         }
@@ -733,6 +748,47 @@ impl std::fmt::Display for OpenUnconfirmed {
 }
 
 impl std::error::Error for OpenUnconfirmed {}
+
+/// The `openPool` transactions a command broadcast whose receipt wait has not
+/// returned.
+///
+/// [`open_pool`] adds its tx at the broadcast and removes it when the receipt
+/// wait returns, with a receipt or an error. A future dropped during the wait
+/// leaves its entry. A command that ends while an entry remains names the tx,
+/// because the deposit may escrow after the command exits and a re-run before
+/// it confirms escrows a second deposit.
+///
+/// A clone shares the same list, so one handle can outlive the per-pass state
+/// that the opens run under.
+#[derive(Debug, Default, Clone)]
+pub struct UnconfirmedOpens(Arc<Mutex<Vec<OpenUnconfirmed>>>);
+
+impl UnconfirmedOpens {
+    /// The opens whose receipt wait has not returned, oldest first.
+    #[must_use]
+    pub fn pending(&self) -> Vec<OpenUnconfirmed> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Hold `open` from its broadcast.
+    fn insert(&self, open: OpenUnconfirmed) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(open);
+    }
+
+    /// Release `open` once its receipt wait returned.
+    fn remove(&self, open: OpenUnconfirmed) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|held| *held != open);
+    }
+}
 
 /// Send `openPool(deposit)` from `owner` at exactly `nonce`, and return its
 /// hash without waiting for a receipt.

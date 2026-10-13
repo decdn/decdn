@@ -1,6 +1,6 @@
 use super::{
     AllowanceShortfall, LOW_WATER_DIVISOR, OpenUnconfirmed, PaymentPool, TopUpUnconfirmed,
-    approval_floor, approve_decision, ensure_allowance, escrowed_but_untracked,
+    UnconfirmedOpens, approval_floor, approve_decision, ensure_allowance, escrowed_but_untracked,
     grade_deposit_credit, issue_self_capability, open_pool, pool_accepts_funds, refill_amount,
     send_open_pool, top_up,
 };
@@ -70,7 +70,16 @@ async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
 
 /// Run [`open_pool`] against a mocked pool whose RPC calls `asserter` answers.
 async fn open_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error {
-    let contract = mocked_pool(asserter);
+    open_tracked(mocked_pool(asserter), &UnconfirmedOpens::default())
+        .await
+        .unwrap_err()
+}
+
+/// Run [`open_pool`] on `contract`, holding its broadcast in `opens`.
+async fn open_tracked(
+    contract: PaymentPool::PaymentPoolInstance<impl Provider + Clone>,
+    opens: &UnconfirmedOpens,
+) -> anyhow::Result<super::OpenedPool> {
     let deployment = decdn_incentive::Deployment {
         chain_id: CHAIN_ID,
         payment_pool: *contract.address(),
@@ -82,9 +91,104 @@ async fn open_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error {
         Address::repeat_byte(0x44),
         Address::repeat_byte(0x22),
         U256::from(1_000u64),
+        Some(opens),
     )
     .await
-    .unwrap_err()
+}
+
+/// Answers `eth_getTransactionCount` with nonce 5 and `eth_sendTransaction`
+/// with [`SCRIPTED_TX`]. Every other call never completes, so an `open_pool`
+/// on it parks in its receipt wait.
+#[derive(Clone, Debug)]
+struct BroadcastThenHang;
+
+/// The hash [`BroadcastThenHang`] returns for the `openPool` send.
+const SCRIPTED_TX: B256 = B256::repeat_byte(0xef);
+
+impl tower::Service<alloy_json_rpc::RequestPacket> for BroadcastThenHang {
+    type Response = alloy_json_rpc::ResponsePacket;
+    type Error = alloy::transports::TransportError;
+    type Future = alloy::transports::TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: alloy_json_rpc::RequestPacket) -> Self::Future {
+        let alloy_json_rpc::RequestPacket::Single(req) = req else {
+            return Box::pin(std::future::pending());
+        };
+        let result = match req.method() {
+            "eth_getTransactionCount" => serde_json::value::to_raw_value(&U256::from(5u64)),
+            "eth_sendTransaction" => serde_json::value::to_raw_value(&SCRIPTED_TX),
+            _ => return Box::pin(std::future::pending()),
+        };
+        let id = req.id().clone();
+        Box::pin(async move {
+            Ok(alloy_json_rpc::ResponsePacket::Single(
+                alloy_json_rpc::Response {
+                    id,
+                    payload: alloy_json_rpc::ResponsePayload::Success(
+                        result.map_err(alloy::transports::TransportErrorKind::custom)?,
+                    ),
+                },
+            ))
+        })
+    }
+}
+
+/// An `open_pool` dropped inside its receipt wait returns no error, so its
+/// broadcast stays in `opens`: the caller can still name the tx (#2418).
+#[tokio::test(start_paused = true)]
+async fn an_open_dropped_in_its_receipt_wait_stays_unconfirmed() {
+    let contract = PaymentPool::new(
+        Address::repeat_byte(0x01),
+        alloy::providers::ProviderBuilder::default()
+            .connect_client(alloy::rpc::client::RpcClient::new(BroadcastThenHang, false)),
+    );
+    let opens = UnconfirmedOpens::default();
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        open_tracked(contract, &opens),
+    )
+    .await;
+    assert!(waited.is_err(), "the receipt wait must still be pending");
+    assert_eq!(
+        opens.pending(),
+        vec![OpenUnconfirmed {
+            tx: Some(SCRIPTED_TX),
+            nonce: 5
+        }]
+    );
+}
+
+/// A receipt wait that returns, here with a read error, releases its entry:
+/// the error itself names the tx.
+#[tokio::test]
+async fn a_returned_receipt_wait_leaves_no_unconfirmed_open() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    asserter.push_success(&B256::repeat_byte(0xab));
+    let opens = UnconfirmedOpens::default();
+    let err = open_tracked(mocked_pool(asserter), &opens)
+        .await
+        .unwrap_err();
+    assert!(err.downcast_ref::<OpenUnconfirmed>().is_some(), "{err:#}");
+    assert_eq!(opens.pending(), vec![]);
+}
+
+/// A submit that fails never reaches the broadcast, so nothing is held: the
+/// error carries the nonce.
+#[tokio::test]
+async fn a_failed_submit_holds_no_unconfirmed_open() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    let opens = UnconfirmedOpens::default();
+    let _ = open_tracked(mocked_pool(asserter), &opens).await;
+    assert_eq!(opens.pending(), vec![]);
 }
 
 /// An `openPool` whose receipt cannot be read may still escrow its deposit, so

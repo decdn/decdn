@@ -28,6 +28,10 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn_client::buyer_pool::open_pool` takes an `opens` handle (#2418).**
+  The new last argument, `Option<&UnconfirmedOpens>`, holds the broadcast
+  `openPool` until its receipt wait returns. Pass `None` when nothing can drop
+  the future. The fix is under Fixed.
 - **Buyer-store API: delegate lanes (#2435).** `BuyerPoolStore` gains three
   required methods, `delegate_lanes`, `advance_delegate_progress` and
   `rebase_delegate_progress`, so an implementor outside the workspace must add
@@ -1002,6 +1006,17 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **CLI: a command that ends during an `openPool` receipt wait names the tx
+  (#2418).** A Ctrl-C during the wait in `decdn fetch` or `decdn bundle pull`
+  printed only "run the same command again", and `decdn pool open` died with no
+  output. The tx can still mine and escrow its deposit. A re-run before it
+  confirms opened a second pool. Now the command prints the tx hash and nonce,
+  says that a second open escrows again, and points to `decdn pool list --all`.
+  An interrupt still exits 130. A bundle pull that a sibling fault ends during
+  the wait names the tx the same way, and a command that otherwise succeeded
+  exits nonzero. The `OpenUnconfirmed` message points to `pool list --all`,
+  because only the on-chain list shows a pool the local store never recorded.
 
 - **CLI: Windows builds embed the canonical operator terms.** A Windows
   checkout converted `crates/cli/TERMS.md` to CRLF, so `decdn.exe` hashed

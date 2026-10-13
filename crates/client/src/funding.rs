@@ -20,9 +20,9 @@ use decdn_incentive::{CapabilityGrant, Deployment, LaneKey, PoolId, bind_node_id
 use iroh::Endpoint;
 
 use crate::buyer_pool::{
-    LOW_WATER_DIVISOR, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, WalletShortfall,
-    ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool, pool_accepts_funds,
-    refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
+    LOW_WATER_DIVISOR, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, UnconfirmedOpens,
+    WalletShortfall, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool,
+    pool_accepts_funds, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
 };
 use crate::lanes::LaneDeps;
 use crate::session::{ChainAdoption, ChainConfig, DepositPolicy};
@@ -78,11 +78,14 @@ pub fn cached_pool_token(
 /// `warning:` line naming it. It also names the pool the run's first built
 /// lane pays from, which a funding recovery step tops up: every entry of a
 /// bundle pull shares it, the entries that have built no lane yet included.
+/// Every `openPool` a lane build or a recovery step sends is held in its
+/// [`UnconfirmedOpens`] until the receipt wait returns.
 #[derive(Debug, Default)]
 pub struct RunFunding {
     spend: Mutex<RunSpend>,
     shortfall: Mutex<Option<String>>,
     pool_id: OnceLock<PoolId>,
+    opens: UnconfirmedOpens,
 }
 
 /// What a lane build learned about the pool's spend, for
@@ -118,6 +121,21 @@ struct RunSpend {
 }
 
 impl RunFunding {
+    /// A run whose `openPool` broadcasts are held in `opens`, a handle the
+    /// caller keeps after the run's state is dropped.
+    #[must_use]
+    pub fn reporting_opens_to(opens: UnconfirmedOpens) -> Self {
+        Self {
+            opens,
+            ..Self::default()
+        }
+    }
+
+    /// The run's `openPool` transactions whose receipt wait has not returned.
+    pub const fn opens(&self) -> &UnconfirmedOpens {
+        &self.opens
+    }
+
     /// Name `pool_id` as the pool the run's lanes pay from. The first lane
     /// built names it; every later lane pays from the same pool.
     pub(crate) fn note_pool(&self, pool_id: PoolId) {
@@ -471,6 +489,7 @@ where
             self.token,
             self.owner,
             deposit,
+            Some(self.funding.opens()),
         )
         .await?;
         self.store
@@ -1188,6 +1207,7 @@ where
         token,
         self_address,
         deposit,
+        Some(funding.opens()),
     )
     .await?;
     // The deposit is escrowed on-chain; a failed local record leaves it

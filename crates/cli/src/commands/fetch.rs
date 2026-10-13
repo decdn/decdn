@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
+use decdn_client::buyer_pool::UnconfirmedOpens;
 use decdn_client::funding::{RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
@@ -66,7 +67,7 @@ use decdn_client::provider;
 
 use super::buyer_store::{DataDirSource, chain_adoption_for_buy, open_client_store_for_buy};
 use super::fetch_timings::{FetchTimings, Mark};
-use super::interrupt::{Interrupt, Interrupted};
+use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
 use super::tab_progress::TabProgress;
 use decdn_client::ordered_writes::OrderedWrites;
 
@@ -522,12 +523,16 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let mut interrupt = Interrupt::watch();
     // The command's peer-record and watermark writes, off the runtime thread.
     let writes = OrderedWrites::default();
+    // Outlives `fetch_over`, so an `openPool` whose receipt wait the Ctrl-C
+    // dropped is still named.
+    let opens = UnconfirmedOpens::default();
     let result = tokio::select! {
-        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes, &timings) => {
+        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes, &opens, &timings) => {
             result
         }
         () = interrupt.wait() => Err(Interrupted.into()),
     };
+    let result = name_unconfirmed_open(result, &opens.pending());
     let output = if wants_stdout(&args.output) {
         "stdout"
     } else {
@@ -557,6 +562,7 @@ async fn fetch_over(
     store: &Arc<dyn BuyerPoolStore>,
     endpoint: &Endpoint,
     writes: &OrderedWrites,
+    opens: &UnconfirmedOpens,
     timings: &FetchTimings,
 ) -> anyhow::Result<()> {
     let common = &args.common;
@@ -655,7 +661,7 @@ async fn fetch_over(
     loop {
         // Per pass: the funding facts, the lanes and their handles all name the
         // pool the pass pays from.
-        let funding = RunFunding::default();
+        let funding = RunFunding::reporting_opens_to(opens.clone());
         // The shared pull/funding deps every lane borrows for the whole pass.
         let deps = LaneDeps {
             endpoint,
