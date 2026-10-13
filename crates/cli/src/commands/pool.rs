@@ -269,10 +269,10 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
 /// The on-chain leg of both is identical either way; only the local
 /// bookkeeping differs, and on a daemon's data dir there is none the CLI can
 /// legitimately do (#2078).
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum LocalBookkeeping<'a> {
     /// Clear the row in the client store this CLI owns.
-    Store(&'a RedbBuyerPoolStore),
+    Store(&'a dyn BuyerPoolStore),
     /// A `decdn-node` daemon owns this data dir. `decdn pool` has no code path
     /// to that daemon's `buyer.redb`, so its row stays as it is and the
     /// operator is told so — the alternative, a no-op `forget` graded as a
@@ -343,8 +343,9 @@ impl LocalBookkeeping<'_> {
                 // at a pool that is now `Closed`, whose `deposit` field still
                 // reads healthy, so a later fetch reuses it and signs vouchers
                 // `redeemMany` rejects outright. Warn rather than fail: the
-                // refund itself landed, and re-running the reclaim is what
-                // clears the row.
+                // refund itself landed, and a re-run of `reclaim --pool` reads
+                // the pool as `Closed` and clears the row on that refusal (see
+                // `forget_not_open`).
                 if let Err(e) = store.forget_if_pool(owner, pool_id) {
                     eprintln!(
                         "warning: pool {pool_id} reclaimed on-chain but clearing it from the \
@@ -359,6 +360,59 @@ impl LocalBookkeeping<'_> {
             }
         }
     }
+
+    /// Clear the row for a pool the chain shows as `Closing` or `Closed`, on a
+    /// refusal or a `--all` skip that sends no transaction.
+    ///
+    /// A row like this survives when the run that closed or reclaimed the pool
+    /// could not clear it: the row-clear faulted, or the receipt was unreadable
+    /// but the tx mined. A later fetch then reuses a pool whose vouchers are
+    /// (or soon will be) unredeemable. Seeing the status on-chain is enough to
+    /// drop it, so every later `close` / `reclaim` that reads such a status is
+    /// a repair. `forget_if_pool` is compare-and-delete, so a row that already
+    /// points at a newer pool survives.
+    ///
+    /// Returns a suffix for the caller's refusal or skip line: it names a
+    /// cleared row, and is empty otherwise. Best-effort: a store fault warns on
+    /// stderr, and the next run that reads the status retries the clear.
+    fn forget_not_open(
+        self,
+        owner: Address,
+        pool_id: PoolId,
+        status: PaymentPool::Status,
+    ) -> String {
+        match self {
+            Self::Store(store) => match store.forget_if_pool(owner, pool_id) {
+                Ok(true) => "; cleared its row from the local store".to_string(),
+                Ok(false) => String::new(),
+                Err(e) => {
+                    eprintln!(
+                        "warning: pool {pool_id} is {} on-chain but clearing it from the local \
+                         store failed: {e}; if the row survived, a later fetch reuses this pool \
+                         and its vouchers are rejected — re-run this command to retry the clear",
+                        status_label(status)
+                    );
+                    String::new()
+                }
+            },
+            Self::DaemonOwned(buyer_db) => {
+                let verb = format!("is already {}", status_label(status));
+                Self::report_daemon_row_untouched(buyer_db, pool_id, &verb);
+                String::new()
+            }
+        }
+    }
+}
+
+/// True for the statuses that mean a pool is winding down or done: `Closing`
+/// and `Closed`. A local row for such a pool is stale. `Open` and the hidden
+/// invalid `sol!` variant are not, so an unrecognized status never touches the
+/// store.
+const fn no_longer_open(status: PaymentPool::Status) -> bool {
+    matches!(
+        status,
+        PaymentPool::Status::Closing | PaymentPool::Status::Closed
+    )
 }
 
 /// Grade the local row-clear that follows a mined `closePool`.
@@ -381,9 +435,12 @@ impl LocalBookkeeping<'_> {
 /// signs vouchers that stop being redeemable at the dispute deadline, against a
 /// deposit the owner is about to reclaim.
 ///
-/// The close itself landed, so the error carries `tx` and `reclaim_note`: the
-/// reclaim is both the deadline the success line would have printed and the
-/// operation that clears the stale row.
+/// The close itself landed, so the error carries [`CloseUnrecorded`]: a `--all`
+/// sweep counts the pool as closed and still exits nonzero, because the money
+/// moved and the local record did not follow. Its message names the re-run of
+/// the close (which reads the pool as `Closing` and clears the row) and the
+/// reclaim (the deadline the success line would have printed, which also
+/// clears the row).
 ///
 /// # Errors
 ///
@@ -396,14 +453,45 @@ fn grade_local_forget(
 ) -> anyhow::Result<()> {
     match outcome {
         Ok(_) => Ok(()),
-        Err(e) => anyhow::bail!(
-            "pool {pool_id} closed on-chain (tx {tx}) but clearing it from the local store \
-             failed: {e}; the row may survive and send a later fetch back to this closing \
-             pool, whose vouchers stop being redeemable at the dispute deadline — \
-             {reclaim_note}, which also clears the row"
-        ),
+        Err(e) => Err(anyhow::Error::new(e).context(CloseUnrecorded {
+            pool_id,
+            tx,
+            reclaim_note: reclaim_note.to_string(),
+        })),
     }
 }
+
+/// The context on a `closePool` error whose close landed on-chain but whose
+/// local row-clear faulted. Recover it with
+/// `err.downcast_ref::<CloseUnrecorded>()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloseUnrecorded {
+    /// The pool that closed.
+    pool_id: PoolId,
+    /// The landed `closePool` transaction.
+    tx: TxHash,
+    /// The reclaim instruction the success line would have printed.
+    reclaim_note: String,
+}
+
+impl std::fmt::Display for CloseUnrecorded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            pool_id,
+            tx,
+            reclaim_note,
+        } = self;
+        write!(
+            f,
+            "pool {pool_id} closed on-chain (tx {tx}) but clearing it from the local store \
+             failed; the row may survive and send a later fetch back to this closing pool, whose \
+             vouchers stop being redeemable at the dispute deadline — re-run `decdn pool close \
+             --pool {pool_id}` to clear it, or {reclaim_note}, which also clears the row"
+        )
+    }
+}
+
+impl std::error::Error for CloseUnrecorded {}
 
 /// Terminal outcome of a single close/reclaim tx.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -467,20 +555,39 @@ struct BatchTally {
     /// Pools whose transaction may have broadcast and may still mine (the
     /// error carries [`TxUnconfirmed`]). Disjoint from `failed`.
     unconfirmed: usize,
+    /// Pools whose close landed but whose local row-clear faulted (the error
+    /// carries [`CloseUnrecorded`]). Each one also counts in `acted`.
+    unrecorded: usize,
+}
+
+/// How [`BatchTally::record_error`] counted one pool's error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorClass {
+    /// A definite failure.
+    Failed,
+    /// The transaction may still mine ([`TxUnconfirmed`]).
+    Unconfirmed,
+    /// The transaction landed, but the local row-clear faulted
+    /// ([`CloseUnrecorded`]).
+    LandedUnrecorded,
 }
 
 impl BatchTally {
-    /// Count one pool's `closePool` / `reclaim` error: as `unconfirmed` when it
-    /// carries [`TxUnconfirmed`], else as `failed`. Returns `true` for
-    /// `unconfirmed`.
-    fn record_error(&mut self, err: &anyhow::Error) -> bool {
-        let unconfirmed = err.downcast_ref::<TxUnconfirmed>().is_some();
-        if unconfirmed {
+    /// Count one pool's `closePool` / `reclaim` error: as `acted` and
+    /// `unrecorded` when it carries [`CloseUnrecorded`], as `unconfirmed` when
+    /// it carries [`TxUnconfirmed`], else as `failed`.
+    fn record_error(&mut self, err: &anyhow::Error) -> ErrorClass {
+        if err.downcast_ref::<CloseUnrecorded>().is_some() {
+            self.acted += 1;
+            self.unrecorded += 1;
+            ErrorClass::LandedUnrecorded
+        } else if err.downcast_ref::<TxUnconfirmed>().is_some() {
             self.unconfirmed += 1;
+            ErrorClass::Unconfirmed
         } else {
             self.failed += 1;
+            ErrorClass::Failed
         }
-        unconfirmed
     }
 }
 
@@ -590,14 +697,15 @@ fn single_reclaim_gate(
     }
 }
 
-/// Turn a finished `--all` sweep into a process result. Any failed or
-/// unconfirmed pool is a nonzero exit; "nothing eligible" is success — the
-/// summary line already says so.
+/// Turn a finished `--all` sweep into a process result. Any failed,
+/// unconfirmed, or unrecorded pool is a nonzero exit; "nothing eligible" is
+/// success — the summary line already says so.
 ///
 /// # Errors
 ///
-/// Errors when at least one pool failed to `verb`, or its `verb` transaction
-/// may have broadcast without a confirmed outcome.
+/// Errors when at least one pool failed to `verb`, its `verb` transaction may
+/// have broadcast without a confirmed outcome, or its `verb` landed but its
+/// local row-clear faulted.
 fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
     let failed = (tally.failed > 0).then(|| format!("{} pool(s) failed to {verb}", tally.failed));
     let unconfirmed = (tally.unconfirmed > 0).then(|| {
@@ -607,25 +715,35 @@ fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
             tally.unconfirmed
         )
     });
-    match (failed, unconfirmed) {
-        (None, None) => Ok(()),
-        (Some(f), None) => anyhow::bail!("{f}; see the summary above"),
-        (None, Some(u)) => anyhow::bail!("{u}; see the summary above"),
-        (Some(f), Some(u)) => anyhow::bail!("{f}, and {u}; see the summary above"),
+    let unrecorded = (tally.unrecorded > 0).then(|| {
+        format!(
+            "{} pool(s) landed the {verb} on-chain but kept a local row that may be stale — \
+             re-run the same command to clear it",
+            tally.unrecorded
+        )
+    });
+    let causes: Vec<String> = [failed, unconfirmed, unrecorded]
+        .into_iter()
+        .flatten()
+        .collect();
+    if causes.is_empty() {
+        return Ok(());
     }
+    anyhow::bail!("{}; see the summary above", causes.join(", and "))
 }
 
 /// Send `closePool(pool_id)`, wait for the receipt, and on success clear the
 /// local buyer row so a later fetch opens a fresh pool. Ownership and `Open`
 /// status are the caller's responsibility. Returns the reclaim note shared by
-/// the success line and the row-clear warning.
+/// the success line and the row-clear error.
 ///
 /// # Errors
 ///
 /// Errors when gas estimation rejects the call (see `send_reverted`), the send
 /// fails (an error that leaves the broadcast unknown says so; see
 /// `send_failed`), the receipt cannot be read, the tx reverted, or the local
-/// row-clear faulted after a landed close.
+/// row-clear faulted after a landed close (the error carries
+/// [`CloseUnrecorded`]).
 async fn close_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -837,21 +955,42 @@ async fn close(args: &cli::PoolCloseArgs, config_path: Option<&Path>) -> anyhow:
         .await
         .map_err(|e| anyhow::Error::new(e).context("getPool failed"))?;
     ensure_owned(pool.owner, owner, pool_id)?;
-    anyhow::ensure!(
-        matches!(pool.status, PaymentPool::Status::Open),
-        "pool {pool_id} is not Open — nothing to close (already closing or closed)"
-    );
+    if !matches!(pool.status, PaymentPool::Status::Open) {
+        return Err(refuse_close(books, owner, pool_id, pool.status));
+    }
 
     let reclaim_note = close_and_forget(&contract, books, owner, pool_id).await?;
     println!("closed pool {pool_id}; dispute window open — {reclaim_note}");
     Ok(())
 }
 
+/// The refusal for `close --pool` on a pool that is not `Open`. A `Closing` or
+/// `Closed` pool first has its local row cleared (see
+/// `LocalBookkeeping::forget_not_open`), so a re-run repairs a row that the
+/// landed close could not clear.
+fn refuse_close(
+    books: LocalBookkeeping<'_>,
+    owner: Address,
+    pool_id: PoolId,
+    status: PaymentPool::Status,
+) -> anyhow::Error {
+    let cleared = if no_longer_open(status) {
+        books.forget_not_open(owner, pool_id, status)
+    } else {
+        String::new()
+    };
+    anyhow::anyhow!(
+        "pool {pool_id} is not Open — nothing to close (already closing or closed){cleared}"
+    )
+}
+
 /// `close --all`: enumerate every pool this keystore owns and close the `Open`
-/// ones. One pool's read or close failure is recorded and the sweep continues.
+/// ones; a skipped `Closing` or `Closed` pool has its local row cleared. One
+/// pool's read or close failure is recorded and the sweep continues.
 /// A close whose tx may have broadcast without a confirmed outcome counts as
-/// unconfirmed, not failed. The exit code is nonzero if any pool failed or is
-/// unconfirmed.
+/// unconfirmed, not failed. A close that landed but whose row-clear faulted
+/// counts as closed and as "row not cleared". The exit code is nonzero if any
+/// pool failed, is unconfirmed, or kept its row.
 async fn close_all<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -887,22 +1026,29 @@ where
                 }
                 Err(e) => {
                     let msg = sanitize_err_chain(&e);
-                    if tally.record_error(&e) {
-                        eprintln!("close of pool {pool_id} unconfirmed: {msg}");
-                    } else {
-                        eprintln!("failed to close pool {pool_id}: {msg}");
+                    match tally.record_error(&e) {
+                        ErrorClass::LandedUnrecorded => eprintln!("warning: {msg}"),
+                        ErrorClass::Unconfirmed => {
+                            eprintln!("close of pool {pool_id} unconfirmed: {msg}");
+                        }
+                        ErrorClass::Failed => eprintln!("failed to close pool {pool_id}: {msg}"),
                     }
                 }
             },
             ClosePlan::Skip(reason) => {
-                println!("skipped pool {pool_id}: {reason}");
+                let cleared = if no_longer_open(status) {
+                    store.forget_not_open(owner, pool_id, status)
+                } else {
+                    String::new()
+                };
+                println!("skipped pool {pool_id}: {reason}{cleared}");
                 tally.skipped += 1;
             }
         }
     }
     println!(
-        "close --all: closed {}, skipped {}, failed {}, unconfirmed {}",
-        tally.acted, tally.skipped, tally.failed, tally.unconfirmed
+        "close --all: closed {}, skipped {}, failed {}, unconfirmed {}, row not cleared {}",
+        tally.acted, tally.skipped, tally.failed, tally.unconfirmed, tally.unrecorded
     );
     batch_result(&tally, "close")
 }
@@ -938,7 +1084,23 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
             .await
             .map_err(|e| anyhow::Error::new(e).context("getPool failed"))?;
         let now = chain_ctx::head_timestamp(reader.provider()).await?;
-        single_reclaim_gate(pool_id, pool.owner, pool.status, pool.disputeDeadline, now)?;
+        if let Err(refusal) =
+            single_reclaim_gate(pool_id, pool.owner, pool.status, pool.disputeDeadline, now)
+        {
+            if !no_longer_open(pool.status) {
+                return Err(refusal);
+            }
+            let store = store_owner.open_for_write()?;
+            let buyer_db = node_buyer_db(&chain.data_dir);
+            let books = LocalBookkeeping::new(store.as_ref(), &buyer_db);
+            return Err(refuse_reclaim(
+                &refusal,
+                books,
+                pool.owner,
+                pool_id,
+                pool.status,
+            ));
+        }
     }
     let store = store_owner.open_for_write()?;
     let buyer_db = node_buyer_db(&chain.data_dir);
@@ -957,10 +1119,26 @@ async fn reclaim(args: &cli::PoolReclaimArgs, config_path: Option<&Path>) -> any
     Ok(())
 }
 
+/// Finish a `reclaim --pool` refusal for a `Closing` or `Closed` pool: clear its
+/// local row (see `LocalBookkeeping::forget_not_open`) and name the clear in the
+/// refusal. `owner` is the on-chain owner, so the clear needs no keystore
+/// unlock; compare-and-delete leaves a row for any other pool alone.
+fn refuse_reclaim(
+    refusal: &anyhow::Error,
+    books: LocalBookkeeping<'_>,
+    owner: Address,
+    pool_id: PoolId,
+    status: PaymentPool::Status,
+) -> anyhow::Error {
+    let cleared = books.forget_not_open(owner, pool_id, status);
+    anyhow::anyhow!("{refusal}{cleared}")
+}
+
 /// `reclaim --all`: enumerate every pool this keystore owns and reclaim the ones
 /// whose dispute window has elapsed. Pools still `Open`, still inside the
 /// window, or already reclaimed are skipped (in-window pools report when they
-/// become reclaimable). One pool's failure is recorded and the sweep continues.
+/// become reclaimable), and a skipped `Closing` or `Closed` pool has its local
+/// row cleared. One pool's failure is recorded and the sweep continues.
 /// A reclaim whose tx may have broadcast without a confirmed outcome counts as
 /// unconfirmed, not failed. The exit code is nonzero if any pool failed or is
 /// unconfirmed.
@@ -1003,7 +1181,9 @@ where
                     }
                     Err(e) => {
                         let msg = sanitize_err_chain(&e);
-                        if tally.record_error(&e) {
+                        // `reclaim_and_forget` only warns on its row-clear, so
+                        // no reclaim error carries `CloseUnrecorded`.
+                        if tally.record_error(&e) == ErrorClass::Unconfirmed {
                             eprintln!("reclaim of pool {pool_id} unconfirmed: {msg}");
                         } else {
                             eprintln!("failed to reclaim pool {pool_id}: {msg}");
@@ -1016,14 +1196,16 @@ where
                 tally.skipped += 1;
             }
             ReclaimPlan::SkipInWindow(deadline) => {
+                let cleared = store.forget_not_open(owner, pool_id, pool.status);
                 println!(
-                    "skipped pool {pool_id}: dispute window open — reclaimable after {}",
+                    "skipped pool {pool_id}: dispute window open — reclaimable after {}{cleared}",
                     format_expiry(deadline, now)
                 );
                 tally.skipped += 1;
             }
             ReclaimPlan::SkipClosed => {
-                println!("skipped pool {pool_id}: already reclaimed");
+                let cleared = store.forget_not_open(owner, pool_id, pool.status);
+                println!("skipped pool {pool_id}: already reclaimed{cleared}");
                 tally.skipped += 1;
             }
             ReclaimPlan::SkipUnknown => {

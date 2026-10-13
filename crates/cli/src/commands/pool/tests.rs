@@ -231,7 +231,8 @@ fn mk_state(byte: u8, deposit_micro: u64) -> BuyerPoolState {
 
 /// A landed close on a node data dir does not claim the row was cleared —
 /// it reports that the daemon's row survives. The `Ok` here is the
-/// on-chain leg succeeding, which it did.
+/// on-chain leg succeeding, which it did. A status refusal on such a dir adds
+/// no "cleared" claim to its message.
 #[test]
 fn daemon_owned_bookkeeping_does_not_claim_a_clean_close() {
     let books = LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb"));
@@ -243,6 +244,12 @@ fn daemon_owned_bookkeeping_does_not_claim_a_clean_close() {
             "run `decdn pool reclaim` later",
         )
         .expect("the on-chain close landed; the local row is reported, not graded");
+    let suffix = books.forget_not_open(
+        Address::repeat_byte(0x11),
+        B256::repeat_byte(0x22),
+        PaymentPool::Status::Closed,
+    );
+    assert_eq!(suffix, "");
 }
 
 /// `--all` renders every lifecycle state, and `TRACKED` distinguishes
@@ -550,8 +557,8 @@ fn a_compare_and_delete_that_matched_nothing_is_still_a_clean_close() {
 }
 
 /// Only the backend fault leaves the row's fate unknown, and the close has
-/// already landed — so the error has to carry both the tx and the reclaim,
-/// which is the operation that clears the row it warns about.
+/// already landed — so the error has to carry the tx and the commands that
+/// clear the row it warns about, and mark the close as landed.
 #[test]
 fn a_faulted_clear_fails_and_keeps_the_reclaim_instruction() {
     let err = grade_local_forget(
@@ -561,6 +568,10 @@ fn a_faulted_clear_fails_and_keeps_the_reclaim_instruction() {
         RECLAIM_NOTE,
     )
     .expect_err("a row of unknown fate must not read as a clean close");
+    assert!(
+        err.downcast_ref::<CloseUnrecorded>().is_some(),
+        "a --all sweep must see that the close landed: {err:#}"
+    );
     let msg = format!("{err:#}");
     assert!(msg.contains("closed on-chain"), "{msg}");
     assert!(msg.contains("no space"), "the cause must survive: {msg}");
@@ -571,6 +582,10 @@ fn a_faulted_clear_fails_and_keeps_the_reclaim_instruction() {
     assert!(
         msg.contains("decdn pool reclaim"),
         "the close landed, so the reclaim deadline must survive the failure: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("decdn pool close --pool {}", a_pool())),
+        "a re-run of the close clears the row, so the warning names it: {msg}"
     );
 }
 
@@ -962,13 +977,13 @@ async fn a_rejected_reclaim_send_does_not_warn() {
 fn record_error_splits_unconfirmed_from_failed() {
     let mut tally = BatchTally::default();
     let rejected = anyhow::anyhow!("insufficient funds").context("closePool send failed");
-    assert!(!tally.record_error(&rejected));
+    assert_eq!(tally.record_error(&rejected), ErrorClass::Failed);
     let unconfirmed = anyhow::anyhow!("timed out").context(TxUnconfirmed {
         label: "closePool",
         tx: None,
     });
-    assert!(tally.record_error(&unconfirmed));
-    assert!(tally.record_error(&unconfirmed));
+    assert_eq!(tally.record_error(&unconfirmed), ErrorClass::Unconfirmed);
+    assert_eq!(tally.record_error(&unconfirmed), ErrorClass::Unconfirmed);
     assert_eq!(
         tally,
         BatchTally {
@@ -1202,4 +1217,371 @@ async fn a_close_estimation_revert_with_an_unknown_selector_keeps_the_revert_dat
     assert!(!msg.contains(RECLAIM_UNKNOWN_REVERT), "{msg}");
     assert!(!msg.contains(RECLAIM_REVERT_GUESS), "{msg}");
     assert!(msg.contains("0xdeadbeef"), "{msg}");
+}
+
+// ---- clearing the row of a pool that is no longer Open (#2425) ---------
+
+/// A row that maps `owner` to pool `pool_byte`.
+fn row(pool_byte: u8, owner: Address) -> BuyerPoolState {
+    BuyerPoolState::new(
+        B256::repeat_byte(pool_byte),
+        DEPLOYMENT,
+        owner,
+        Address::repeat_byte(0xcd),
+        U256::from(1_000_000_u64),
+    )
+}
+
+/// A store holding `rows`.
+fn store_with(rows: &[BuyerPoolState]) -> decdn_incentive::MemoryBuyerPoolStore {
+    let store = decdn_incentive::MemoryBuyerPoolStore::new();
+    for state in rows {
+        store
+            .record(state)
+            .expect("an in-memory record cannot fail");
+    }
+    store
+}
+
+/// The pool `owner`'s row points at, if any.
+fn tracked(store: &dyn BuyerPoolStore, owner: Address) -> Option<PoolId> {
+    store
+        .get_by_owner(owner)
+        .expect("an in-memory read cannot fail")
+        .map(|state| state.pool_id)
+}
+
+/// The `getPool` answer for a pool `owner` holds in `status`, with a dispute
+/// deadline of `deadline`.
+fn pool_until(
+    owner: Address,
+    status: PaymentPool::Status,
+    deadline: u64,
+) -> alloy::primitives::Bytes {
+    use alloy::sol_types::SolCall;
+
+    PaymentPool::getPoolCall::abi_encode_returns(&PaymentPool::Pool {
+        owner,
+        status,
+        disputeDeadline: deadline,
+        deposit: 1_000_000,
+        totalRedeemed: 0,
+    })
+    .into()
+}
+
+/// A head block at Unix `timestamp`, the read `reclaim_all` makes once.
+fn head_at(timestamp: u64) -> alloy::rpc::types::Block<alloy::rpc::types::Transaction> {
+    let mut head = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+    head.header.inner.timestamp = timestamp;
+    head
+}
+
+/// Only `Closing` and `Closed` mark a row stale; `Open` never touches it.
+#[test]
+fn only_a_closing_or_closed_pool_is_no_longer_open() {
+    assert!(!no_longer_open(PaymentPool::Status::Open));
+    assert!(no_longer_open(PaymentPool::Status::Closing));
+    assert!(no_longer_open(PaymentPool::Status::Closed));
+}
+
+/// `close --all` skips a `Closing` pool and clears the owner's row for it, so
+/// a close whose first run could not clear the row is repaired on a re-run. A
+/// row for another owner stays.
+#[tokio::test]
+async fn close_all_clears_the_row_of_a_skipped_closing_pool() {
+    let owner = Address::repeat_byte(0x22);
+    let other = Address::repeat_byte(0x44);
+    let store = store_with(&[row(0x02, owner), row(0x09, other)]);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&owned_pools(2));
+    asserter.push_success(&pool_in(owner, PaymentPool::Status::Closed));
+    asserter.push_success(&pool_in(owner, PaymentPool::Status::Closing));
+
+    close_all(&pool_on(asserter), LocalBookkeeping::Store(&store), owner)
+        .await
+        .expect("two skipped pools are a clean sweep");
+    assert_eq!(tracked(&store, owner), None);
+    assert_eq!(tracked(&store, other), Some(B256::repeat_byte(0x09)));
+}
+
+/// The clear is compare-and-delete: an owner whose row already points at a
+/// newer pool keeps it when an older pool is skipped as `Closing`.
+#[tokio::test]
+async fn close_all_keeps_a_row_for_a_newer_pool() {
+    let owner = Address::repeat_byte(0x22);
+    let store = store_with(&[row(0x05, owner)]);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&owned_pools(1));
+    asserter.push_success(&pool_in(owner, PaymentPool::Status::Closing));
+
+    close_all(&pool_on(asserter), LocalBookkeeping::Store(&store), owner)
+        .await
+        .expect("a skipped pool is a clean sweep");
+    assert_eq!(tracked(&store, owner), Some(B256::repeat_byte(0x05)));
+}
+
+/// `reclaim --all` clears the row of a skipped `Closed` pool (the reclaim
+/// already ran) and of a `Closing` pool still in its dispute window. A row
+/// for another owner stays.
+#[tokio::test]
+async fn reclaim_all_clears_the_row_of_a_skipped_closing_or_closed_pool() {
+    let owner = Address::repeat_byte(0x22);
+    let other = Address::repeat_byte(0x44);
+    for (status, deadline) in [
+        (PaymentPool::Status::Closed, 0),
+        (PaymentPool::Status::Closing, 5_000),
+    ] {
+        let store = store_with(&[row(0x01, owner), row(0x09, other)]);
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&owned_pools(1));
+        asserter.push_success(&head_at(1_000));
+        asserter.push_success(&pool_until(owner, status, deadline));
+
+        reclaim_all(&pool_on(asserter), LocalBookkeeping::Store(&store), owner)
+            .await
+            .expect("a skipped pool is a clean sweep");
+        assert_eq!(tracked(&store, owner), None, "{}", status_label(status));
+        assert_eq!(
+            tracked(&store, other),
+            Some(B256::repeat_byte(0x09)),
+            "{}",
+            status_label(status)
+        );
+    }
+}
+
+/// `close --pool` on a pool that is no longer `Open` still refuses, and clears
+/// the row first; the refusal says so.
+#[test]
+fn a_close_refusal_clears_the_row_and_says_so() {
+    let owner = Address::repeat_byte(0x22);
+    let other = Address::repeat_byte(0x44);
+    for status in [PaymentPool::Status::Closing, PaymentPool::Status::Closed] {
+        let store = store_with(&[row(0x01, owner), row(0x09, other)]);
+        let msg = refuse_close(
+            LocalBookkeeping::Store(&store),
+            owner,
+            B256::repeat_byte(0x01),
+            status,
+        )
+        .to_string();
+        assert!(msg.contains("is not Open — nothing to close"), "{msg}");
+        assert!(
+            msg.contains("cleared its row from the local store"),
+            "{msg}"
+        );
+        assert_eq!(tracked(&store, owner), None, "{}", status_label(status));
+        assert_eq!(
+            tracked(&store, other),
+            Some(B256::repeat_byte(0x09)),
+            "only the caller's row is cleared: {}",
+            status_label(status)
+        );
+    }
+}
+
+/// A refusal that cleared nothing does not claim a clear.
+#[test]
+fn a_close_refusal_with_no_row_claims_no_clear() {
+    let store = store_with(&[]);
+    let msg = refuse_close(
+        LocalBookkeeping::Store(&store),
+        Address::repeat_byte(0x22),
+        B256::repeat_byte(0x01),
+        PaymentPool::Status::Closing,
+    )
+    .to_string();
+    assert!(msg.contains("is not Open"), "{msg}");
+    assert!(!msg.contains("cleared"), "{msg}");
+}
+
+/// `reclaim --pool` on a `Closed` pool keeps the gate's refusal, and clears
+/// the row first — the re-run the `forget_after_reclaim` warning names.
+#[test]
+fn a_reclaim_refusal_clears_the_row_and_keeps_the_cause() {
+    let owner = Address::repeat_byte(0x22);
+    let pool_id = B256::repeat_byte(0x01);
+    let store = store_with(&[row(0x01, owner)]);
+    let refusal = single_reclaim_gate(pool_id, owner, PaymentPool::Status::Closed, 0, 300)
+        .expect_err("a Closed pool has nothing to reclaim");
+    let msg = refuse_reclaim(
+        &refusal,
+        LocalBookkeeping::Store(&store),
+        owner,
+        pool_id,
+        PaymentPool::Status::Closed,
+    )
+    .to_string();
+    assert!(msg.contains("already reclaimed"), "{msg}");
+    assert!(
+        msg.contains("cleared its row from the local store"),
+        "{msg}"
+    );
+    assert_eq!(tracked(&store, owner), None);
+}
+
+/// A store whose `forget_if_pool` faults; every other method delegates to an
+/// in-memory store.
+struct ForgetFaults(decdn_incentive::MemoryBuyerPoolStore);
+
+impl BuyerPoolStore for ForgetFaults {
+    fn load_all(&self) -> Result<BuyerLoad, decdn_incentive::StoreError> {
+        self.0.load_all()
+    }
+    fn record(&self, state: &BuyerPoolState) -> Result<(), decdn_incentive::StoreError> {
+        self.0.record(state)
+    }
+    fn forget(&self, owner: Address) -> Result<(), decdn_incentive::StoreError> {
+        self.0.forget(owner)
+    }
+    fn get_by_pool_id(
+        &self,
+        pool_id: PoolId,
+    ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
+        self.0.get_by_pool_id(pool_id)
+    }
+    fn forget_if_pool(
+        &self,
+        _owner: Address,
+        _pool_id: PoolId,
+    ) -> Result<bool, decdn_incentive::StoreError> {
+        Err(decdn_incentive::StoreError::Backend("no space".into()))
+    }
+    fn get_by_owner(
+        &self,
+        owner: Address,
+    ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
+        self.0.get_by_owner(owner)
+    }
+    fn advance_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: decdn_incentive::LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.0.advance_progress(owner, pool_id, lane, bytes, amount)
+    }
+    fn rebase_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: decdn_incentive::LaneKey,
+        anchor: decdn_incentive::BuyerLaneProgress,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.0.rebase_progress(owner, pool_id, lane, anchor, totals)
+    }
+    fn seed_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: decdn_incentive::LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.0.seed_progress(owner, pool_id, lane, bytes, amount)
+    }
+    fn add_deposit(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        additional: U256,
+    ) -> Result<decdn_incentive::DepositOutcome, decdn_incentive::StoreError> {
+        self.0.add_deposit(owner, pool_id, additional)
+    }
+    fn delegate_lanes(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+        signer: Address,
+    ) -> Result<Vec<(Address, decdn_incentive::BuyerLaneProgress)>, decdn_incentive::StoreError>
+    {
+        self.0.delegate_lanes(deployment, pool_id, signer)
+    }
+    fn advance_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: decdn_incentive::LaneKey,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.0.advance_delegate_progress(deployment, lane, totals)
+    }
+    fn rebase_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: decdn_incentive::LaneKey,
+        anchor: decdn_incentive::BuyerLaneProgress,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.0
+            .rebase_delegate_progress(deployment, lane, anchor, totals)
+    }
+}
+
+/// A faulted row-clear on a skipped pool warns and does not fail the sweep:
+/// the next run that reads the status retries it.
+#[tokio::test]
+async fn a_faulted_clear_on_a_skipped_pool_does_not_fail_the_sweep() {
+    let owner = Address::repeat_byte(0x22);
+    let store = ForgetFaults(store_with(&[row(0x01, owner)]));
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&owned_pools(1));
+    asserter.push_success(&pool_in(owner, PaymentPool::Status::Closing));
+
+    close_all(&pool_on(asserter), LocalBookkeeping::Store(&store), owner)
+        .await
+        .expect("a skipped pool is a clean sweep, even when its row-clear faults");
+}
+
+/// A close that landed but whose row-clear faulted counts as closed, not as
+/// "failed to close", and the sweep still exits nonzero: the money moved and
+/// the local record did not follow (#2425, from the #2430 review).
+#[test]
+fn a_landed_close_with_a_faulted_clear_counts_as_closed_and_still_fails_the_sweep() {
+    let err = grade_local_forget(
+        Err(decdn_incentive::StoreError::Backend("no space".into())),
+        a_pool(),
+        a_tx(),
+        RECLAIM_NOTE,
+    )
+    .expect_err("a faulted clear is an error");
+    let mut tally = BatchTally::default();
+    assert_eq!(tally.record_error(&err), ErrorClass::LandedUnrecorded);
+    assert_eq!(
+        tally,
+        BatchTally {
+            acted: 1,
+            unrecorded: 1,
+            ..BatchTally::default()
+        }
+    );
+    let msg = batch_result(&tally, "close").unwrap_err().to_string();
+    assert!(
+        msg.contains("1 pool(s) landed the close on-chain but kept a local row"),
+        "{msg}"
+    );
+    assert!(msg.contains("re-run the same command"), "{msg}");
+    assert!(!msg.contains("failed to close"), "{msg}");
+}
+
+/// Every cause in a mixed sweep reaches the final error.
+#[test]
+fn batch_result_names_every_cause() {
+    let all = BatchTally {
+        acted: 1,
+        failed: 1,
+        unconfirmed: 1,
+        unrecorded: 1,
+        ..BatchTally::default()
+    };
+    let msg = batch_result(&all, "close").unwrap_err().to_string();
+    assert!(msg.contains("1 pool(s) failed to close"), "{msg}");
+    assert!(
+        msg.contains("1 pool(s) may have broadcast a close"),
+        "{msg}"
+    );
+    assert!(msg.contains("1 pool(s) landed the close on-chain"), "{msg}");
 }

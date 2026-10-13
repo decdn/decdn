@@ -1022,6 +1022,25 @@ since project inception and will roll into the first tagged release.
   existing rows still read and no lane reseeds. A delegate-lane record the
   store cannot read fails the fetch as a local fault instead of retrying. The
   API changes are under Changed (BREAKING).
+- **`decdn pool close` and `pool reclaim` clear the local row of a pool that
+  is no longer Open (#2425).** When a `closePool` or `reclaim` mined but its
+  run could not clear the client-store row (the clear faulted, or the receipt
+  was unreadable), every re-run stopped at a status refusal or skip before it
+  touched the store. The row survived, and a later fetch reused a closing or
+  closed pool whose vouchers `redeemMany` rejects. Now each `close` or
+  `reclaim` that reads the pool as `Closing` or `Closed` clears its row:
+  `close --pool` and `reclaim --pool` on their refusal, and `close --all` and
+  `reclaim --all` on their skip. The refusal or skip line says when it cleared
+  a row. Exit codes do not change: a `--pool` refusal still exits nonzero.
+  The clear is compare-and-delete, so a row for a newer pool stays. On a
+  daemon data dir the CLI leaves the daemon's row as it is and says so.
+  `reclaim --pool` clears the row with the pool's on-chain owner, so its
+  refusal still asks for no keystore password.
+- **`decdn pool close --all` counts a landed close whose row-clear faulted as
+  closed, not as failed (#2425).** The per-pool line no longer reads "failed
+  to close" for a close that is on-chain. The summary line gains a `row not
+  cleared` count, and the sweep still exits nonzero, naming the re-run that
+  clears the row. `close --pool` names that re-run as well.
 - **`decdn pool close` and `pool reclaim` name the revert that gas estimation
   rejects, and no longer call it on-chain (#2426, #2417).** A `closePool` or
   `reclaim` that would revert fails at gas estimation, before anything is
@@ -2296,8 +2315,8 @@ since project inception and will roll into the first tagged release.
     newer pool — so nothing maps the owner to the closed pool and the close is
     clean. Closing a pool the local store never tracked (a second machine, a
     fresh `--data-dir`) lands there routinely. The `Err` error carries both the
-    close tx and the `pool reclaim` deadline, and the reclaim is what clears the
-    stale row.
+    close tx and the `pool reclaim` deadline, and a re-run of the close or the
+    reclaim clears the stale row.
   - Unchanged and deliberately so: `pool reclaim`'s row-clear and `fetch`'s
     `persist_watermark`. The reclaim stays a warning because the refund itself
     landed and re-running the reclaim clears the row; its warning now names that
