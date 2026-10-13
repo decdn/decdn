@@ -39,6 +39,7 @@ use iroh::{Endpoint, RelayUrl};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::buyer_pool::UnconfirmedOpens;
 use crate::discovery::NodeCandidate;
 use crate::funding::RunFunding;
 use crate::ordered_writes::OrderedWrites;
@@ -514,6 +515,7 @@ pub struct BundlePullerBuilder {
     give_up_after: Option<Duration>,
     observer: Option<Arc<dyn BundleObserver>>,
     hints: Option<Arc<dyn FaultHints>>,
+    opens: UnconfirmedOpens,
 }
 
 impl std::fmt::Debug for BundlePullerBuilder {
@@ -557,6 +559,7 @@ impl BundlePuller {
             give_up_after: None,
             observer: None,
             hints: None,
+            opens: UnconfirmedOpens::default(),
         }
     }
 
@@ -665,6 +668,16 @@ impl BundlePullerBuilder {
         self
     }
 
+    /// Where the pull holds each `openPool` whose receipt it has not read,
+    /// across every pass. A cancel or a fault that ends the pull can drop a
+    /// receipt wait, and the transaction may still escrow its deposit, so the
+    /// caller keeps a clone and names what is left when the pull ends. A
+    /// private handle by default.
+    pub fn unconfirmed_opens(mut self, opens: UnconfirmedOpens) -> Self {
+        self.opens = opens;
+        self
+    }
+
     /// What explains a failed fetch to the caller's user.
     #[doc(hidden)]
     pub fn fault_hints(mut self, hints: Arc<dyn FaultHints>) -> Self {
@@ -723,7 +736,7 @@ impl BundlePullerBuilder {
             slot,
             namespace_id: namespace_id(self.namespace),
             ledgers: LaneLedgers::new(),
-            funding: RunFunding::default(),
+            funding: RunFunding::reporting_opens_to(self.opens),
             recovery: Arc::new(RecoveryGate::new()),
             dedup_stats: engine::DedupStats::default(),
             open_lock: tokio::sync::Mutex::new(()),

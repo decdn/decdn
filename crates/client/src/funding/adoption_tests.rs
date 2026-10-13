@@ -3,6 +3,7 @@ use alloy::primitives::Bytes;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 
 use crate::Cumulative;
+use crate::buyer_pool::OpenUnconfirmed;
 use alloy::providers::ProviderBuilder;
 use alloy::providers::mock::Asserter;
 use alloy::sol_types::SolValue;
@@ -1014,8 +1015,11 @@ async fn the_cli_funder_reads_the_run_funding() {
 }
 
 /// Run a recovery step for a self-funded pool that already holds its working
-/// deposit, with the chain's `topUp` estimate answered by `estimate`.
-async fn step_on_a_full_pool(asserter: Asserter) -> anyhow::Result<Recovery> {
+/// deposit, with the chain's `topUp` estimate answered by `estimate`. Also
+/// returns the opens the step left unconfirmed in the run's handle.
+async fn step_on_a_full_pool(
+    asserter: Asserter,
+) -> (anyhow::Result<Recovery>, Vec<OpenUnconfirmed>) {
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
     let signer = Arc::new(PrivateKeySigner::random());
@@ -1025,7 +1029,8 @@ async fn step_on_a_full_pool(asserter: Asserter) -> anyhow::Result<Recovery> {
         .unwrap();
     let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
     let contract = PaymentPool::new(PP, rpc.clone());
-    let funding = RunFunding::default();
+    let opens = UnconfirmedOpens::default();
+    let funding = RunFunding::reporting_opens_to(opens.clone());
     funding.note_pool(id);
     let funder = PoolFunder {
         contract: &contract,
@@ -1040,7 +1045,7 @@ async fn step_on_a_full_pool(asserter: Asserter) -> anyhow::Result<Recovery> {
         max_approve: false,
         funding: &funding,
     };
-    funder.recover(U256::from(WORKING)).await
+    (funder.recover(U256::from(WORKING)).await, opens.pending())
 }
 
 /// A full pool that still accepts funds settles: the step escrows nothing and
@@ -1050,7 +1055,7 @@ async fn step_on_a_full_pool(asserter: Asserter) -> anyhow::Result<Recovery> {
 async fn a_full_open_pool_settles_without_a_top_up() {
     let asserter = Asserter::new();
     asserter.push_success(&alloy::primitives::U64::from(50_000u64));
-    let stepped = step_on_a_full_pool(asserter.clone()).await.unwrap();
+    let stepped = step_on_a_full_pool(asserter.clone()).await.0.unwrap();
     assert_matches!(stepped, Recovery::ToppedUp(d) if d == U256::from(WORKING));
     assert!(asserter.read_q().is_empty(), "only the estimate ran");
 }
@@ -1074,9 +1079,8 @@ async fn a_full_closing_pool_is_replaced() {
     // answers, so the open goes on to submit.
     asserter.push_success(&U256::MAX.abi_encode());
     asserter.push_success(&U256::ZERO);
-    let err = step_on_a_full_pool(asserter.clone())
-        .await
-        .expect_err("the replacement open reaches the chain");
+    let (stepped, opens) = step_on_a_full_pool(asserter.clone()).await;
+    let err = stepped.expect_err("the replacement open reaches the chain");
     assert!(
         format!("{err:#}").contains("submit openPool"),
         "the step submitted an openPool, not a topUp: {err:#}"
@@ -1084,6 +1088,50 @@ async fn a_full_closing_pool_is_replaced() {
     assert!(
         asserter.read_q().is_empty(),
         "the estimate and the allowance ran"
+    );
+    // The submit failed in transport, so it may have broadcast: the run's
+    // handle holds it, which is how the command names it (#2418).
+    assert_eq!(opens, vec![OpenUnconfirmed { tx: None, nonce: 0 }]);
+}
+
+/// A lane build that opens the run's pool holds the `openPool` in the run's
+/// handle, so a command that drops the build can still name it (#2418).
+#[tokio::test]
+async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let asserter = Asserter::new();
+    // `usdc()`, then the allowance read finds enough, and the pending-nonce
+    // read answers, so the open goes on to submit, which fails in transport.
+    asserter.push_success(&Bytes::from(TOKEN.abi_encode()));
+    asserter.push_success(&U256::MAX.abi_encode());
+    asserter.push_success(&U256::from(3u64));
+    let rpc = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+    let contract = PaymentPool::new(PP, rpc.clone());
+    let opens = UnconfirmedOpens::default();
+    let funding = RunFunding::reporting_opens_to(opens.clone());
+    let err = open_or_reuse_pool(
+        &store,
+        &contract,
+        &rpc,
+        &funding,
+        &signer,
+        PROVIDER,
+        signer.address(),
+        DEPLOYMENT,
+        DepositPolicy {
+            working_deposit: U256::from(WORKING),
+            max_approve: false,
+            adoption: ChainAdoption::Refused,
+        },
+    )
+    .await
+    .expect_err("the open's submit fails in transport");
+    assert!(format!("{err:#}").contains("submit openPool"), "{err:#}");
+    assert_eq!(
+        opens.pending(),
+        vec![OpenUnconfirmed { tx: None, nonce: 3 }]
     );
 }
 

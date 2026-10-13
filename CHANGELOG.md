@@ -28,6 +28,11 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn_client::buyer_pool::open_pool` takes an `opens` handle (#2418).**
+  The new last argument, `Option<&UnconfirmedOpens>`, holds the `openPool`
+  from before its submit until its receipt is read. Pass `None` when nothing
+  can drop the future or its error. `BundlePullerBuilder::unconfirmed_opens`
+  hands a bundle pull the same handle. The fix is under Fixed.
 - **Buyer-store API: delegate lanes (#2435).** `BuyerPoolStore` gains three
   required methods, `delegate_lanes`, `advance_delegate_progress` and
   `rebase_delegate_progress`, so an implementor outside the workspace must add
@@ -1002,6 +1007,24 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+- **CLI: a command that ends before an `openPool` confirms names the tx
+  (#2418).** A Ctrl-C during the `openPool` submit or receipt wait in `decdn
+  fetch` or `decdn bundle pull` printed only "run the same command again", and
+  `decdn pool open`, or the `--hash` manifest fetch of `bundle pull`, died with
+  no output. A give-up after the no-progress limit printed "rerun to resume"
+  and exited 75. The tx can still mine and escrow its deposit, and a re-run
+  before it confirms opened a second pool. Now every such end prints each
+  pending tx hash, or the nonce when the submit returned no hash, says that a
+  second open escrows again, and points to `decdn pool list --all`.
+  - An interrupt still exits 130, and a second Ctrl-C names the opens before
+    it exits. A give-up with an open pending exits 1, not 75, because 75 tells
+    a wrapper that a re-run is safe.
+  - A fault that ends the command, or a receipt read that fails while the
+    command drains, names the tx the same way. A command that otherwise
+    succeeded exits nonzero.
+  - The `OpenUnconfirmed` message points to `pool list --all`, because only
+    the on-chain list shows a pool the local store never recorded.
 
 - **CLI: Windows builds embed the canonical operator terms.** A Windows
   checkout converted `crates/cli/TERMS.md` to CRLF, so `decdn.exe` hashed

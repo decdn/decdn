@@ -37,13 +37,10 @@ async fn main() -> std::process::ExitCode {
                 // The report is already printed; exit nonzero without an Error: line.
                 return std::process::ExitCode::FAILURE;
             }
-            if e.downcast_ref::<decdn_cli::commands::interrupt::Interrupted>()
-                .is_some()
-            {
-                eprintln!("interrupted; run the same command again to resume");
-            } else if let Some(gave_up) = e.downcast_ref::<decdn_client::GaveUp>() {
-                // Not an error to fix: the message names the wait and the rerun.
-                eprintln!("{gave_up}");
+            if let Some(line) = decdn_cli::commands::interrupt::stop_message(&e) {
+                // Not an error to fix: an interrupt or a give-up, with any
+                // `openPool` still in flight in place of the rerun advice.
+                eprintln!("{line}");
             } else {
                 eprintln!("Error: {}", decdn_common::redact::sanitize_err_chain(&e));
             }
@@ -53,18 +50,13 @@ async fn main() -> std::process::ExitCode {
 }
 
 /// The process exit code for a command's error: 130 for an interrupt, 75
-/// (`EX_TEMPFAIL`) for a fetch that gave up for lack of progress, 1 otherwise.
+/// (`EX_TEMPFAIL`) for a fetch that gave up for lack of progress with no
+/// `openPool` in flight, 1 otherwise.
 fn exit_code_for(err: &anyhow::Error) -> std::process::ExitCode {
-    if err
-        .downcast_ref::<decdn_cli::commands::interrupt::Interrupted>()
-        .is_some()
-    {
-        return std::process::ExitCode::from(decdn_cli::commands::interrupt::INTERRUPTED_EXIT);
-    }
-    if err.downcast_ref::<decdn_client::GaveUp>().is_some() {
-        return std::process::ExitCode::from(decdn_cli::commands::interrupt::GAVE_UP_EXIT);
-    }
-    std::process::ExitCode::FAILURE
+    decdn_cli::commands::interrupt::stop_exit(err).map_or(
+        std::process::ExitCode::FAILURE,
+        std::process::ExitCode::from,
+    )
 }
 
 async fn run() -> anyhow::Result<()> {

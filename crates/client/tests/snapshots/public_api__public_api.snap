@@ -48,6 +48,7 @@ pub const fn decdn_client::bundle::BundlePullerBuilder::namespace(self, core::op
 pub fn decdn_client::bundle::BundlePullerBuilder::observer(self, alloc::sync::Arc<dyn decdn_client::bundle::BundleObserver>) -> Self
 pub fn decdn_client::bundle::BundlePullerBuilder::relays(self, alloc::vec::Vec<iroh_base::relay_url::RelayUrl>) -> Self
 pub const fn decdn_client::bundle::BundlePullerBuilder::stop(self, bool, core::option::Option<core::time::Duration>) -> Self
+pub fn decdn_client::bundle::BundlePullerBuilder::unconfirmed_opens(self, decdn_client::buyer_pool::UnconfirmedOpens) -> Self
 impl core::fmt::Debug for decdn_client::bundle::BundlePullerBuilder
 pub fn decdn_client::bundle::BundlePullerBuilder::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct decdn_client::bundle::BundleReport
@@ -151,6 +152,9 @@ pub fn decdn_client::buyer_pool::TopUpUnconfirmed::fmt(&self, &mut core::fmt::Fo
 #[non_exhaustive] pub struct decdn_client::buyer_pool::ToppedUpPool
 pub decdn_client::buyer_pool::ToppedUpPool::credited: alloy_primitives::aliases::U256
 pub decdn_client::buyer_pool::ToppedUpPool::tx: alloy_primitives::aliases::TxHash
+pub struct decdn_client::buyer_pool::UnconfirmedOpens(_)
+impl decdn_client::buyer_pool::UnconfirmedOpens
+pub fn decdn_client::buyer_pool::UnconfirmedOpens::pending(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::OpenUnconfirmed>
 pub struct decdn_client::buyer_pool::WalletShortfall
 impl core::error::Error for decdn_client::buyer_pool::WalletShortfall
 impl core::fmt::Display for decdn_client::buyer_pool::WalletShortfall
@@ -158,7 +162,7 @@ pub fn decdn_client::buyer_pool::WalletShortfall::fmt(&self, &mut core::fmt::For
 pub async fn decdn_client::buyer_pool::ensure_allowance<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&P, alloy_primitives::bits::address::Address, alloy_primitives::bits::address::Address, alloy_primitives::bits::address::Address, core::option::Option<alloy_primitives::aliases::U256>) -> anyhow::Result<()>
 pub fn decdn_client::buyer_pool::escrowed_but_untracked(&str, alloy_primitives::aliases::TxHash, impl core::fmt::Display) -> anyhow::Error
 pub fn decdn_client::buyer_pool::grade_deposit_credit(anyhow::Result<decdn_incentive::buyer_pool::DepositOutcome, decdn_incentive::store::StoreError>, &str, alloy_primitives::aliases::TxHash) -> anyhow::Result<alloy_primitives::aliases::U256>
-pub async fn decdn_client::buyer_pool::open_pool<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::deployment::Deployment, alloy_primitives::bits::address::Address, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::OpenedPool>
+pub async fn decdn_client::buyer_pool::open_pool<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::deployment::Deployment, alloy_primitives::bits::address::Address, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256, core::option::Option<&decdn_client::buyer_pool::UnconfirmedOpens>) -> anyhow::Result<decdn_client::buyer_pool::OpenedPool>
 pub fn decdn_client::buyer_pool::opened_from_receipt(&alloy_rpc_types_eth::transaction::receipt::TransactionReceipt, alloy_primitives::aliases::TxHash, alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, decdn_incentive::deployment::Deployment, alloy_primitives::bits::address::Address, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::buyer_pool::OpenedPool>
 pub async fn decdn_client::buyer_pool::pool_accepts_funds<P: alloy_provider::provider::trait::Provider + core::clone::Clone>(&decdn_incentive::payment_pool::sol_types::PaymentPool::PaymentPoolInstance<P>, alloy_primitives::bits::address::Address, alloy_primitives::aliases::B256) -> bool
 pub fn decdn_client::buyer_pool::self_owned_lane_ctx(&decdn_incentive::buyer_pool::BuyerPoolState, &alloc::sync::Arc<alloy_signer_local::PrivateKeySigner>, &alloy_sol_types::eip712::Eip712Domain, alloy_primitives::bits::address::Address, alloy_primitives::aliases::U256, alloy_primitives::aliases::U256) -> anyhow::Result<decdn_client::PoolContext>

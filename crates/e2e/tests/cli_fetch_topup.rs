@@ -124,6 +124,7 @@ async fn run() -> anyhow::Result<()> {
         chain.usdc(),
         buyer_addr,
         deposit,
+        None,
     )
     .await
     .context("open buyer pool")?;
@@ -492,6 +493,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
         chain.usdc(),
         buyer_addr,
         working_deposit,
+        None,
     )
     .await
     .context("open buyer pool")?;
@@ -797,6 +799,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         chain.usdc(),
         buyer_addr,
         U256::from(DEPOSIT_SHORT_WORKING_MICRO_USDC),
+        None,
     )
     .await
     .context("open buyer pool")?;

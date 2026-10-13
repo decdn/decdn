@@ -2437,6 +2437,10 @@ async fn run_open<P: Provider + Clone>(
         open.token,
         open.owner,
         open.deposit,
+        // The open runs in a detached task, so no pull's cancellation drops
+        // this wait, and an error names its tx. Only shutdown drops it, and
+        // the `info` broadcast line names the tx then (#2415).
+        None,
     )
     .await
     {

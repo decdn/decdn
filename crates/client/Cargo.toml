@@ -78,6 +78,9 @@ decdn-bao-range = { workspace = true, features = ["test-util"] }
 # `decdn fetch` uses, and print their warnings through a subscriber.
 decdn-incentive = { workspace = true, features = ["redb"] }
 tracing-subscriber = { workspace = true }
+# A scripted RPC transport that answers some methods and hangs on the rest, so a
+# test can drop `open_pool` inside its receipt wait.
+tower = { workspace = true }
 # Public-API stability snapshot (#1150). Only exercised by the `public_api` test
 # target below, which is gated behind `public-api-test`.
 public-api = { workspace = true }

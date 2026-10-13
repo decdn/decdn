@@ -625,6 +625,7 @@ impl ClientFixture {
             chain.usdc(),
             self.signer.address(),
             deposit,
+            None,
         )
         .await
         .context("open buyer pool")?;

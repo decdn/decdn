@@ -17,8 +17,8 @@ use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use decdn_client::buyer_pool::{
-    ToppedUpPool, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool,
-    top_up, topped_up_effect,
+    ToppedUpPool, UnconfirmedOpens, ensure_allowance, escrowed_but_untracked, grade_deposit_credit,
+    open_pool, top_up, topped_up_effect,
 };
 use decdn_common::admin::{AdminRpcClient as _, BuyerPoolsResponse};
 use decdn_common::cli::{self, common::expand_tilde};
@@ -43,6 +43,7 @@ use super::buyer_store::{
     open_client_store_for_escrow,
 };
 use super::chain_ctx;
+use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
 
 /// Dispatch `decdn pool <subcommand>`.
 pub async fn pool_dispatch(args: &cli::PoolArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
@@ -196,24 +197,36 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
 
     ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(deposit)).await?;
 
-    let opened = open_pool(
-        &contract,
-        Arc::clone(&signer),
-        deployment,
-        token,
-        owner,
-        deposit,
-    )
-    .await?;
-
-    // The deposit is escrowed on-chain; a failed local record leaves it
-    // untracked (reconcile against the tx).
-    store
-        .record(&opened.state)
-        .map_err(|e| escrowed_but_untracked("buyer pool opened", opened.tx, e))?;
+    // Watched from the open on: a Ctrl-C does not cancel a broadcast
+    // `openPool`, so the command names it rather than dying with no hash.
+    let opens = UnconfirmedOpens::default();
+    let mut interrupt = Interrupt::watch(opens.clone());
+    let opened = async {
+        let opened = open_pool(
+            &contract,
+            Arc::clone(&signer),
+            deployment,
+            token,
+            owner,
+            deposit,
+            Some(&opens),
+        )
+        .await?;
+        // The deposit is escrowed on-chain; a failed local record leaves it
+        // untracked (reconcile against the tx).
+        store
+            .record(&opened.state)
+            .map_err(|e| escrowed_but_untracked("buyer pool opened", opened.tx, e))?;
+        anyhow::Ok(opened.state.pool_id)
+    };
+    let result = tokio::select! {
+        result = opened => result,
+        () = interrupt.wait() => Err(Interrupted.into()),
+    };
+    let pool_id = name_unconfirmed_open(result, &opens.pending())?;
 
     let out = PoolOpenJson {
-        pool_id: format!("{:#x}", opened.state.pool_id),
+        pool_id: format!("{pool_id:#x}"),
     };
     serde_json::to_writer_pretty(std::io::stdout(), &out)?;
     println!();

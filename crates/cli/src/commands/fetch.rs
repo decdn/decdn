@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
+use decdn_client::buyer_pool::UnconfirmedOpens;
 use decdn_client::funding::{RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
@@ -66,7 +67,7 @@ use decdn_client::provider;
 
 use super::buyer_store::{DataDirSource, chain_adoption_for_buy, open_client_store_for_buy};
 use super::fetch_timings::{FetchTimings, Mark};
-use super::interrupt::{Interrupt, Interrupted};
+use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
 use super::tab_progress::TabProgress;
 use decdn_client::ordered_writes::OrderedWrites;
 
@@ -478,7 +479,10 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 /// # Errors
 ///
 /// [`Interrupted`] on Ctrl-C, [`decdn_client::GaveUp`] once the stop policy's
-/// no-progress limit passes, or the fault that ended the fetch.
+/// no-progress limit passes, or the fault that ended the fetch. A fetch that
+/// ends with an `openPool` whose receipt it did not read carries
+/// [`super::interrupt::PendingOpens`], as context on any of those or as the
+/// error of a fetch that otherwise succeeded.
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let timings = FetchTimings::start();
     let hash = parse_hash(&args.hash)?;
@@ -519,15 +523,19 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // end cleanly instead of being aborted on drop. A Ctrl-C drops `fetch_over`
     // mid-transfer: each drive's drop guard queues what it paid for recording,
     // and the `.partial` is the next run's resume prefix.
-    let mut interrupt = Interrupt::watch();
+    // Outlives `fetch_over`, so an `openPool` that a Ctrl-C or a fault dropped
+    // before its receipt was read is still named.
+    let opens = UnconfirmedOpens::default();
+    let mut interrupt = Interrupt::watch(opens.clone());
     // The command's peer-record and watermark writes, off the runtime thread.
     let writes = OrderedWrites::default();
     let result = tokio::select! {
-        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes, &timings) => {
+        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes, &opens, &timings) => {
             result
         }
         () = interrupt.wait() => Err(Interrupted.into()),
     };
+    let result = name_unconfirmed_open(result, &opens.pending());
     let output = if wants_stdout(&args.output) {
         "stdout"
     } else {
@@ -557,6 +565,7 @@ async fn fetch_over(
     store: &Arc<dyn BuyerPoolStore>,
     endpoint: &Endpoint,
     writes: &OrderedWrites,
+    opens: &UnconfirmedOpens,
     timings: &FetchTimings,
 ) -> anyhow::Result<()> {
     let common = &args.common;
@@ -655,7 +664,7 @@ async fn fetch_over(
     loop {
         // Per pass: the funding facts, the lanes and their handles all name the
         // pool the pass pays from.
-        let funding = RunFunding::default();
+        let funding = RunFunding::reporting_opens_to(opens.clone());
         // The shared pull/funding deps every lane borrows for the whole pass.
         let deps = LaneDeps {
             endpoint,
