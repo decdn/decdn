@@ -473,6 +473,33 @@ impl<P, F> decdn_client::streamer::Streamer<'_, P, F> where P: SourceProvider, F
 pub async fn decdn_client::streamer::Streamer<'_, P, F>::open<'a>(self, [u8; 32], u64, &decdn_client::config::PullConfig, alloc::sync::Arc<dyn decdn_client::sink::BlobCache>, decdn_client::stop::StopPolicy) -> anyhow::Result<(decdn_client::streamer::VerifiedReader, decdn_client::streamer::StreamDrive<'a>)> where P: 'a, F: 'a
 impl<P, F> core::fmt::Debug for decdn_client::streamer::Streamer<'_, P, F>
 pub fn decdn_client::streamer::Streamer<'_, P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub mod decdn_client::uri
+#[non_exhaustive] pub enum decdn_client::uri::UriError
+pub decdn_client::uri::UriError::Authority
+pub decdn_client::uri::UriError::Hash(alloc::string::String)
+pub decdn_client::uri::UriError::MissingScheme
+pub decdn_client::uri::UriError::Namespace(alloc::string::String)
+pub decdn_client::uri::UriError::Path(alloc::string::String)
+pub decdn_client::uri::UriError::Query(alloc::string::String)
+impl core::error::Error for decdn_client::uri::UriError
+impl core::fmt::Display for decdn_client::uri::UriError
+pub fn decdn_client::uri::UriError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum decdn_client::uri::UriTarget
+pub decdn_client::uri::UriTarget::Blob
+pub decdn_client::uri::UriTarget::Bundle
+pub decdn_client::uri::UriTarget::BundleEntry(alloc::string::String)
+#[non_exhaustive] pub struct decdn_client::uri::DecdnUri
+pub decdn_client::uri::DecdnUri::hash: [u8; 32]
+pub decdn_client::uri::DecdnUri::namespace: core::option::Option<u64>
+pub decdn_client::uri::DecdnUri::target: decdn_client::uri::UriTarget
+impl decdn_client::uri::DecdnUri
+pub const fn decdn_client::uri::DecdnUri::new([u8; 32], decdn_client::uri::UriTarget, core::option::Option<u64>) -> Self
+impl core::fmt::Display for decdn_client::uri::DecdnUri
+pub fn decdn_client::uri::DecdnUri::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for decdn_client::uri::DecdnUri
+pub type decdn_client::uri::DecdnUri::Err = decdn_client::uri::UriError
+pub fn decdn_client::uri::DecdnUri::from_str(&str) -> core::result::Result<Self, Self::Err>
+pub const decdn_client::uri::SCHEME: &str
 #[non_exhaustive] pub enum decdn_client::CapabilityCause
 pub decdn_client::CapabilityCause::CapSpent
 pub decdn_client::CapabilityCause::Expired

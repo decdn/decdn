@@ -190,6 +190,8 @@ pub mod driver;
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
 pub mod endpoint;
 pub mod session;
+// Docs live in `uri.rs` as `//!`, for the same reason as `sink` below.
+pub mod uri;
 // Hidden engine seams with `//!` docs in their own files: how a paid fetch
 // finds holders, builds and funds its lanes, and records what they paid. The
 // `decdn` CLI drives them; they carry no stability promise.
