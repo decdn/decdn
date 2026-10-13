@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-10-13
+
 ### Changed (BREAKING)
 
 - **`decdn.sh` and `decdn.ps1` take the hash first and pass every argument
