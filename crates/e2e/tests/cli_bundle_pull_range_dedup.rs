@@ -1251,7 +1251,7 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
         .context("mint buyer USDC")?;
 
     let out_dir = client_dir.path().join("out");
-    let args = bundle_pull_hash_argv(
+    let mut args = bundle_pull_hash_argv(
         &chain,
         &node,
         &bundle_hex,
@@ -1261,9 +1261,11 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
         1,
     );
 
+    args.push("--json".into());
+
     let before = billed_bytes(client_dir.path(), provider_addr)?;
     anyhow::ensure!(before == 0, "lane must be unbilled before the first pull");
-    run_bundle_pull_until_ready(client_dir.path(), &args).await?;
+    let report = run_bundle_pull_json_until_ready(client_dir.path(), &args).await?;
     let paid = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before);
 
     // (1) Byte-exact + whole-file-BLAKE3-exact outputs.
@@ -1300,6 +1302,16 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
         paid < no_dedup_total,
         "dedup must strictly undercut re-downloading both whole files (plus the manifest): \
          paid {paid} is not less than {no_dedup_total}"
+    );
+    // (3) The report counts only the pull's own payment: the manifest fetch
+    // drew on the same lane before the pull, and its bytes stay out.
+    let pull_paid = paid
+        .checked_sub(wire_manifest)
+        .context("billed less than the manifest")?;
+    anyhow::ensure!(
+        report["paid_bytes"].as_u64() == Some(pull_paid),
+        "the pull must report its own payment ({pull_paid}), without the manifest fetch \
+         ({wire_manifest}): {report}"
     );
 
     drop(node);
@@ -1422,6 +1434,11 @@ async fn run_delta_update() -> anyhow::Result<()> {
         "lane must be unbilled before the first pull"
     );
     let report1 = run_bundle_pull_json_until_ready(client_dir.path(), &args_v1).await?;
+    let paid_v1 = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before_v1);
+    anyhow::ensure!(
+        report1["paid_bytes"].as_u64() == Some(paid_v1),
+        "first pull must report the bytes it paid for ({paid_v1}): {report1}"
+    );
 
     // (1) Both files landed, byte-exact, and the skip-cache exists.
     let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin (first pull)")?;
@@ -1540,6 +1557,12 @@ async fn run_delta_update() -> anyhow::Result<()> {
         "second pull must bill EXACTLY b.bin's complement ({wire_b_complement}) — a.bin is \
          skipped (unbilled) and b.bin's shared leading chunk is spliced from disk, not \
          re-downloaded: got {paid_v2}"
+    );
+    // On a clean pull the report's `paid_bytes` equals the growth of the
+    // persisted lane watermark, so it matches the billed delta exactly.
+    anyhow::ensure!(
+        report2["paid_bytes"].as_u64() == Some(paid_v2),
+        "second pull must report the bytes it paid for ({paid_v2}): {report2}"
     );
 
     // (5) The changed file on disk now hashes to the NEW manifest hash.
@@ -1681,6 +1704,10 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
          {wire_dup}"
     );
     anyhow::ensure!(
+        report1["paid_bytes"].as_u64() == Some(paid1),
+        "first pull must report the bytes it paid for ({paid1}): {report1}"
+    );
+    anyhow::ensure!(
         report1["fetched"].as_u64() == Some(1),
         "first pull must fetch game1/lib/dup.bin fresh: {report1}"
     );
@@ -1758,6 +1785,10 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
 
     // (3) Zero bytes billed on the lane for the second pull: the shared file
     // is materialized from disk, never fetched or paid for.
+    anyhow::ensure!(
+        report2["paid_bytes"].as_u64() == Some(0),
+        "second pull must report zero paid bytes: {report2}"
+    );
     anyhow::ensure!(
         paid2 == 0,
         "second pull must bill ZERO bytes — dup.bin is deduped from the on-disk game1 copy, not \

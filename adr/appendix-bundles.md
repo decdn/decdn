@@ -391,13 +391,23 @@ Range-dedup holds within one pull. Reuse across separate pulls — v2 of a
 model skipping the ranges it already fetched for v1 — needs a persistent
 range-addressed cache and is a follow-up.
 
-At the end of a pull, the report states two totals. `downloaded` is the
+At the end of a pull, the report states three totals. `downloaded` is the
 content bytes that this pull fetched and paid for. `reconstructed` is the
 bytes that this pull wrote to disk. The totals differ when one blob goes to
-several paths, or when range-dedup splices part of a blob from disk. Then
-the report shows `downloaded X → reconstructed Y`. When the totals are
-equal, the report shows one `downloaded X`. The report states the spliced
-bytes separately, as `spliced_bytes`.
+several paths, or when range-dedup splices part of a blob from disk. The
+report states the spliced bytes separately, as `spliced_bytes`.
+
+`paid_bytes` is the wire bytes that the vouchers and hash-chain reveals of
+this pull paid for, summed over every lane. It is the growth of the claims
+that the nodes can redeem. It includes the bao proof overhead, so a clean
+pull pays a little more than `downloaded`. Content that a lane delivers two
+times counts two times. An entry that fails counts in `paid_bytes` but not
+in `downloaded`.
+
+The report shows `downloaded X (paid P) → reconstructed Y`. When
+`downloaded` and `reconstructed` are equal, the report omits the
+`→ reconstructed Y` part. When the pull downloads and pays nothing, the
+report omits the `(paid P)` part.
 
 A pull can resume a `.partial` prefix that an earlier, interrupted pull
 fetched. The earlier pull paid for those bytes, so they are not in

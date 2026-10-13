@@ -111,3 +111,26 @@ fn total_committed_does_not_lock_a_ctx_held_elsewhere() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(reg.total_committed(), U256::from(9u64));
 }
+
+#[tokio::test]
+async fn paid_bytes_sums_what_every_lane_paid_past_its_seed() -> anyhow::Result<()> {
+    use crate::ledger::EpochAction;
+
+    let reg = LaneLedgers::new();
+    let h1 = reg.get_or_insert(lane(1), || {
+        LaneHandle::for_test(Cumulative {
+            bytes: U256::from(4_000u64),
+            amount: U256::from(40u64),
+        })
+    });
+    let h2 = reg.get_or_insert(lane(2), || LaneHandle::for_test(Cumulative::default()));
+    assert_eq!(reg.paid_bytes(), U256::ZERO);
+    h1.ledger
+        .issue(300, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+        .await?;
+    h2.ledger
+        .issue(200, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+        .await?;
+    assert_eq!(reg.paid_bytes(), U256::from(500u64));
+    Ok(())
+}

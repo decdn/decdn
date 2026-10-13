@@ -192,6 +192,7 @@ fn the_summary_counts_reused_and_excluded_entries() {
     rep.reused = 1;
     rep.reused_bytes = 7;
     rep.downloaded = 4;
+    rep.paid_bytes = 5;
     rep.reconstructed = 20;
     rep.resumed_bytes = 6;
     let rep = pull_report(&rep, 3, Path::new("/out"));
@@ -207,6 +208,7 @@ fn the_summary_counts_reused_and_excluded_entries() {
     assert_eq!(json["excluded"], 3);
     assert_eq!(json["resumed_bytes"], 6);
     assert_eq!(json["downloaded"], 4);
+    assert_eq!(json["paid_bytes"], 5);
     assert!(json.get("deduped").is_none(), "{json}");
 }
 
@@ -222,14 +224,33 @@ fn human_bytes_scales_units() {
 fn transfer_line_shows_arrow_only_when_they_differ() {
     // Equal → a single figure, no "→ reconstructed" clause.
     assert_eq!(
-        transfer_line(27_600_000_000, 27_600_000_000),
-        "downloaded 27.6 GB"
+        transfer_line(27_600_000_000, 27_700_000_000, 27_600_000_000),
+        "downloaded 27.6 GB (paid 27.7 GB)"
     );
     // Differ (dedup saved bytes) → both figures with the arrow.
     assert_eq!(
-        transfer_line(13_800_000_000, 27_600_000_000),
-        "downloaded 13.8 GB → reconstructed 27.6 GB"
+        transfer_line(13_800_000_000, 13_900_000_000, 27_600_000_000),
+        "downloaded 13.8 GB (paid 13.9 GB) → reconstructed 27.6 GB"
     );
+}
+
+/// The paid figure shows whenever the run paid or downloaded anything, so a
+/// run that paid for bytes twice prints a figure above `downloaded` (#2377).
+/// A run that neither downloaded nor paid leaves it out.
+#[test]
+fn transfer_line_shows_paid_unless_nothing_moved() {
+    assert_eq!(
+        transfer_line(45_700_000_000, 52_100_000_000, 76_900_000_000),
+        "downloaded 45.7 GB (paid 52.1 GB) → reconstructed 76.9 GB"
+    );
+    // Every file reused from an on-disk donor: nothing paid.
+    assert_eq!(
+        transfer_line(0, 0, 4_000),
+        "downloaded 0 B → reconstructed 4.0 KB"
+    );
+    assert_eq!(transfer_line(0, 0, 0), "downloaded 0 B");
+    // A run whose every fetch failed after paying still shows what it paid.
+    assert_eq!(transfer_line(0, 2_000, 0), "downloaded 0 B (paid 2.0 KB)");
 }
 
 fn filtered_paths(include: &[&str], exclude: &[&str], entries: Vec<ManifestEntry>) -> Vec<String> {
