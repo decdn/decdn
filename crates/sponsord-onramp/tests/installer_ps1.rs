@@ -188,15 +188,16 @@ impl Fixture {
         }
     }
 
-    /// Run `pull <HASH> --namespace 1` and pass the gate for whatever key
-    /// the script prints a gate link for. Returns (success, stdout, stderr).
+    /// Run `pull <HASH> --namespace 1 --jobs 8` and pass the gate for
+    /// whatever key the script prints a gate link for. Returns (success,
+    /// stdout, stderr).
     async fn pull(&self, stub_exit: &str) -> (bool, String, String) {
         let home = self.root.join("home");
         let local = self.root.join("local");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&local).unwrap();
         let command = format!(
-            "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '{}'))) pull b3:{HASH} --namespace 1",
+            "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '{}'))) pull b3:{HASH} --namespace 1 --jobs 8",
             self.script.display()
         );
         let mut child = tokio::process::Command::new("powershell")
@@ -290,15 +291,16 @@ async fn pull_passes_the_gate_and_resumes_a_failed_download_without_it() {
     assert_eq!(calls.len(), 2, "{calls:?}");
     for call in &calls {
         assert!(
-            call.starts_with(&format!("bundle pull --hash {HASH} -o . ")),
+            call.starts_with(&format!(
+                "bundle pull --hash {HASH} -o . --namespace 1 --jobs 8 --capability dcap1:FAKE1 "
+            )),
             "{call}"
         );
-        assert!(call.contains(" --capability dcap1:FAKE1 "), "{call}");
         assert!(
             call.contains(&format!(" --payment-pool-address {pool} ")),
             "{call}"
         );
-        assert!(call.ends_with(" --chain-id 421614 --namespace 1"), "{call}");
+        assert!(call.ends_with(" --chain-id 421614"), "{call}");
     }
     assert_eq!(fx.fakes.source.issued_count(), 1);
     assert_eq!(

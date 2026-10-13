@@ -294,10 +294,10 @@ async fn pull_passes_the_gate_and_runs_decdn_with_the_capability() {
     assert_eq!(
         fx.calls(),
         [format!(
-            "bundle pull --hash {HASH} -o out dir --capability dcap1:FAKE1 \
+            "bundle pull --hash {HASH} -o out dir --namespace 1 --capability dcap1:FAKE1 \
              --keystore {}/keystore.json --keystore-password-file {}/password \
              --data-dir {} --rpc-url https://rpc.example --payment-pool-address {pool} \
-             --capacity-bond-address {bond} --chain-id 421614 --namespace 1",
+             --capacity-bond-address {bond} --chain-id 421614",
             state.display(),
             state.display(),
             shared.display(),
@@ -311,6 +311,36 @@ async fn pull_passes_the_gate_and_runs_decdn_with_the_capability() {
             .join(format!("downloads/{HASH}.lock"))
             .exists()
     );
+}
+
+#[tokio::test]
+async fn every_argument_after_the_hash_reaches_decdn_as_given() {
+    let fx = Fixture::new("pass_through").await;
+
+    // An output flag in any form replaces `-o .`.
+    let args = [
+        PULL[0],
+        PULL[1],
+        "--jobs",
+        "8",
+        "--output=out",
+        "--include",
+        "*.txt",
+    ];
+    fx.run_ok(&args, &[]).await;
+    // Without one, the bundle lands in the current directory.
+    fx.run_ok(&[PULL[0], PULL[1], "--jobs", "8"], &[]).await;
+
+    let calls = fx.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    let expected = [
+        format!("bundle pull --hash {HASH} --jobs 8 --output=out --include *.txt --capability "),
+        format!("bundle pull --hash {HASH} -o . --jobs 8 --capability "),
+    ];
+    for (call, start) in calls.iter().zip(&expected) {
+        assert!(call.starts_with(start), "{call}");
+        assert!(call.ends_with(" --chain-id 421614"), "{call}");
+    }
 }
 
 #[tokio::test]
@@ -414,12 +444,11 @@ async fn a_busy_shared_data_dir_runs_the_download_in_its_own() {
 async fn bad_arguments_are_refused_before_installing() {
     let fx = Fixture::new("bad_args").await;
     for args in [
-        &["pull", "b3:nothex"][..],
+        &["pull", "--jobs", "8"][..],
+        &["pull", "b3:nothex"],
         &["pull"],
         &["fetch", HASH],
-        &["pull", HASH, "--namespace", "0"],
-        &["pull", HASH, "--namespace", "x1"],
-        &["pull", HASH, "--bogus"],
+        &["pull", "-o", "out", HASH],
     ] {
         let run = fx.run_with(args, &[]).await;
         assert!(!run.ok, "{args:?}");

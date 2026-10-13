@@ -15,6 +15,17 @@ release.
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **`decdn.sh` and `decdn.ps1` take the hash first and pass every argument
+  after it to `decdn bundle pull`.** Any `decdn bundle pull` flag now works
+  in the one-liner (an unknown flag was refused before), with `-o .` added
+  when no output directory is given. `decdn` checks the arguments, so a bad
+  `--namespace` is reported after the gate instead of before the install.
+  Contract-breaking: a command that puts `-o` or `--namespace` before the
+  hash (`pull -o <dir> <hash>`) is refused; the documented order,
+  `pull <hash> [-o <dir>] [--namespace <id>]`, works as before.
+
 ## [0.0.3] - 2026-10-12
 
 ### Changed (BREAKING)
