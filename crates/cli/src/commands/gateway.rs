@@ -1023,32 +1023,25 @@ fn with_cors(mut response: Response<Body>, origin: Option<&str>) -> Response<Bod
     response
 }
 
-/// The `Content-Type` for an entry by its file name. HTML and SVG are served
-/// as text, so a fetched page never runs on the gateway's origin.
-fn content_type(name: &str) -> &'static str {
-    let ext = name
-        .rsplit_once('.')
-        .map(|(_, ext)| ext.to_ascii_lowercase())
-        .unwrap_or_default();
-    match ext.as_str() {
-        "mp4" | "m4v" => "video/mp4",
-        "webm" => "video/webm",
-        "mkv" => "video/x-matroska",
-        "mov" => "video/quicktime",
-        "mp3" => "audio/mpeg",
-        "m4a" => "audio/mp4",
-        "ogg" | "oga" => "audio/ogg",
-        "wav" => "audio/wav",
-        "flac" => "audio/flac",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "avif" => "image/avif",
-        "pdf" => "application/pdf",
-        "json" => "application/json",
-        "txt" | "md" | "csv" | "html" | "htm" | "svg" => "text/plain; charset=utf-8",
-        _ => "application/octet-stream",
+/// Types a browser runs or renders as a document. The gateway serves them as
+/// plain text, so fetched content never runs on the gateway's origin.
+const ACTIVE_TYPES: &[&str] = &[
+    "application/xhtml+xml",
+    "image/svg+xml",
+    "application/xml",
+    "application/javascript",
+    "application/ecmascript",
+];
+
+/// The `Content-Type` for an entry, guessed from its file name. Every `text/*`
+/// type and every type in [`ACTIVE_TYPES`] is served as plain text; a name
+/// with no known extension is served as bytes.
+fn content_type(name: &str) -> String {
+    let guess = mime_guess::from_path(name).first_or_octet_stream();
+    if guess.type_() == mime_guess::mime::TEXT || ACTIVE_TYPES.contains(&guess.essence_str()) {
+        "text/plain; charset=utf-8".to_owned()
+    } else {
+        guess.essence_str().to_owned()
     }
 }
 

@@ -306,6 +306,8 @@ arc-swap = "1.7"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# `decdn gateway` guesses an entry's `Content-Type` from its file name.
+mime_guess = "2"
 
 # Raw socket options for the loopback control-plane listeners (admin RPC +
 # metrics): `SO_REUSEADDR` so the daemon rebinds its fixed ports immediately

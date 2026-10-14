@@ -171,8 +171,25 @@ fn content_type_by_extension_and_markup_as_text() {
         content_type("weights.safetensors"),
         "application/octet-stream"
     );
-    assert_eq!(content_type("page.html"), "text/plain; charset=utf-8");
-    assert_eq!(content_type("logo.svg"), "text/plain; charset=utf-8");
+    assert_eq!(content_type("image.PNG"), "image/png");
+    assert_eq!(content_type("no-extension"), "application/octet-stream");
+    for active in [
+        "page.html",
+        "page.htm",
+        "page.xhtml",
+        "logo.svg",
+        "feed.xml",
+        "app.js",
+        "app.mjs",
+        "notes.txt",
+        "style.css",
+    ] {
+        assert_eq!(
+            content_type(active),
+            "text/plain; charset=utf-8",
+            "{active}"
+        );
+    }
 }
 
 #[test]

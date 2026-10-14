@@ -116,6 +116,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+mime_guess = { workspace = true }
 # `decdn whoami` holds the resolved keystore password in a `Zeroizing<String>`
 # (the type `eth_identity::read_password` returns) so it is scrubbed on drop.
 zeroize = { workspace = true }
