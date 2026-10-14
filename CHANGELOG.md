@@ -2937,6 +2937,14 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **`decdn gateway` runs pulls at once on one long-lived worker (#2458).**
+  The endpoint, the buyer-pool store and the connections to nodes are built
+  once per gateway run instead of once per request, and up to 16 pulls stream
+  at once instead of one. A response whose reader stops (a preloaded
+  `<video>`, a background tab) holds only its own pull until the no-progress
+  give-up, so other requests no longer wait behind it. Pulls under one
+  capability that overlap share each lane's voucher ledger, so the node
+  rejects none of their vouchers as `AmountRegression`.
 - **Client builds link one TLS backend and no JSON-RPC server (#2454).**
   `decdn-client` and the `decdn` CLI link ring alone: alloy's default
   `reqwest-rustls-tls` and the workspace's reqwest `rustls` feature each

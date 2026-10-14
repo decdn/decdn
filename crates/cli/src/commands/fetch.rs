@@ -48,9 +48,10 @@ use decdn_client::targets::{
     ProbeOpts, ProbeRound, ResolveConfigFault, holders_or_none, resolve_target_node,
 };
 use decdn_client::{
-    Connections, CredentialSlot, DownloadTarget, Downloader, Holder, NoAffordableSource, NoCache,
-    NoSourceHasBlob, PeerHealth, PoolContext, PoolReplaced, ProgressClock, PullConfig,
-    PullDeadlines, RecoveryGate, StopPolicy, Streamer, UpstreamRefused, UpstreamVoucherRejected,
+    Connections, CredentialSlot, DownloadTarget, Downloader, Holder, LaneLedgers,
+    NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PoolContext, PoolReplaced,
+    ProgressClock, PullConfig, PullDeadlines, RecoveryGate, StopPolicy, Streamer, UpstreamRefused,
+    UpstreamVoucherRejected,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -496,11 +497,35 @@ pub(crate) async fn fetch(
         output: args.output.clone(),
         common: args.common.clone(),
     };
-    fetch_into(&blob, config_path, &mut Sink::Output, None).await
+    let timings = FetchTimings::start();
+    let (host, grant) = FetchHost::open(&blob.common, config_path, false).await?;
+    timings.mark(Mark::Endpoint);
+    let payer = Payer::keystore(grant);
+    // A Ctrl-C drops the fetch mid-transfer: each drive's drop guard queues
+    // what it paid for recording, and the `.partial` is the next run's resume
+    // prefix. The handle outlives the fetch, so an `openPool` that a Ctrl-C or a
+    // fault dropped before its receipt was read is still named.
+    let mut interrupt = Interrupt::watch(host.opens.clone());
+    let mut sink = Sink::Output;
+    let result = tokio::select! {
+        result = fetch_on(&host, &payer, &blob, &mut sink, &timings) => result,
+        () = interrupt.wait() => Err(Interrupted.into()),
+    };
+    let result = name_unconfirmed_open(result, &host.opens.pending());
+    let output = if wants_stdout(&blob.output) {
+        "stdout"
+    } else {
+        "file"
+    };
+    timings.log(output, result.is_ok());
+    // On every exit, a Ctrl-C's included: what the drives queued is durable
+    // before the command returns.
+    host.close().await;
+    result
 }
 
 /// One blob fetch: what `decdn get decdn:<hash>` and the gateway each hand
-/// [`fetch_into`].
+/// [`fetch_on`].
 pub(crate) struct BlobFetch {
     /// The blob's BLAKE3 hash.
     pub(crate) hash: [u8; 32],
@@ -543,112 +568,199 @@ impl Sink {
     }
 }
 
-/// [`fetch`] with its verified bytes going to `sink`. `--output` names the
-/// destination only for [`Sink::Output`]. A `credential` pays in place of the
-/// keystore and capability the flags name.
+/// What every blob fetch on it shares, built once: the chain, the relays, the
+/// buyer-pool store, one discovery-enabled endpoint with one connection per
+/// node, the holder health table, and the queue of peer-record and watermark
+/// writes. `decdn get` builds one for its one fetch; the gateway builds one
+/// for its whole run and fetches on it concurrently from one thread.
+pub(crate) struct FetchHost {
+    relays: Vec<RelayUrl>,
+    chain: ResolvedChain,
+    store: Arc<dyn BuyerPoolStore>,
+    endpoint: Endpoint,
+    connections: Connections,
+    health: Arc<PeerHealth>,
+    writes: OrderedWrites,
+    /// Each `openPool` whose receipt is unread, across every fetch.
+    pub(crate) opens: UnconfirmedOpens,
+    /// The pool's settlement token, `PaymentPool.usdc()`, read once.
+    token: tokio::sync::OnceCell<alloy::primitives::Address>,
+}
+
+impl FetchHost {
+    /// Resolve `common` and the config at `config_path`, open the buyer-pool
+    /// store and bind the endpoint. With `held_key`, every fetch pays with a
+    /// key it is handed ([`Payer::held`]), so the capability flags are not
+    /// read and no pool is funded; otherwise the returned grant is the
+    /// `--capability`/`--capability-file` delegation, if any.
+    ///
+    /// # Errors
+    ///
+    /// A flag combination clap cannot express, unresolvable chain
+    /// coordinates or relays, an unreadable capability, a refused data dir,
+    /// or an endpoint that cannot bind.
+    pub(crate) async fn open(
+        common: &cli::ClientFetchArgs,
+        config_path: Option<&Path>,
+        held_key: bool,
+    ) -> anyhow::Result<(Self, Option<CapabilityGrant>)> {
+        // Before any network or keystore work, reject a flag combination clap
+        // cannot express, naming the flags the user actually typed.
+        common.validate()?;
+
+        // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:
+        // `[network.discovery]` composes operator resolution legs, else N0 (#936).
+        let relays = client_endpoint::resolve_relays(common.relay_url.as_deref(), config_path)?;
+        let disc = client_endpoint::client_discovery(config_path)?;
+
+        let file = load_file_config(config_path)?;
+        let mut chain = resolve_chain(common, &file)?;
+
+        // Delegated adoption: `--capability`/`--capability-file` names a pool the
+        // caller does NOT own and a capability authorizing this client's key to
+        // spend against it. `None` => the unchanged self-owned pool path. Zeroes
+        // the working deposit in `chain` (a delegate cannot fund an owner's pool).
+        // A held key is the same delegation, with its key in hand.
+        let grant = if held_key {
+            chain.working_deposit = U256::ZERO;
+            None
+        } else {
+            resolve_delegation_grant(common, &mut chain)?
+        };
+
+        // The buyer-pool store, opened once and recorded into by open-or-reuse.
+        // The guard runs here, before the keystore password prompt: the answer
+        // depends only on the data dir, and a refusal must not cost a prompt first.
+        // Shared, so a lane's watermark write runs off the runtime thread.
+        let store: Arc<dyn BuyerPoolStore> = Arc::new(open_client_store_for_buy(
+            &chain.site.data_dir,
+            chain.data_dir_source,
+            "fetch",
+        )?);
+
+        // One discovery-enabled endpoint, reused for probing and every delivery
+        // dial.
+        let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
+        let host = Self {
+            relays,
+            chain,
+            store,
+            connections: Connections::new(endpoint.clone()),
+            endpoint,
+            health: Arc::new(PeerHealth::default()),
+            writes: OrderedWrites::default(),
+            opens: UnconfirmedOpens::default(),
+            token: tokio::sync::OnceCell::new(),
+        };
+        Ok((host, grant))
+    }
+
+    /// Wait for every queued peer-record and watermark write to land, then
+    /// close the endpoint, so its open connections end cleanly instead of
+    /// being aborted on drop.
+    pub(crate) async fn close(self) {
+        self.writes.settle().await;
+        self.endpoint.close().await;
+    }
+}
+
+/// Who pays for a fetch, and what fetches under that payer share: the
+/// funding recovery gate, the open-or-reuse lock, and for a held key the
+/// per-lane voucher ledgers, so concurrent fetches under one capability
+/// advance each lane's cumulative voucher through one issuer.
+pub(crate) struct Payer {
+    key: PayerKey,
+    /// The lane ledgers concurrent fetches share; `None` for a solo fetch,
+    /// whose lanes each start from their persisted watermark.
+    ledgers: Option<LaneLedgers>,
+    recovery: Arc<RecoveryGate>,
+    open_lock: tokio::sync::Mutex<()>,
+}
+
+enum PayerKey {
+    /// The keystore the flags name, loaded once holders are found, with the
+    /// `--capability` delegation when there is one.
+    Keystore(Option<CapabilityGrant>),
+    /// A key in hand and the capability issued to it.
+    Held {
+        signer: Arc<alloy::signers::local::PrivateKeySigner>,
+        slot: CredentialSlot,
+    },
+}
+
+impl Payer {
+    /// A solo fetch paying from the keystore the flags name, under `grant`
+    /// when it is delegated.
+    pub(crate) fn keystore(grant: Option<CapabilityGrant>) -> Self {
+        Self {
+            key: PayerKey::Keystore(grant),
+            ledgers: None,
+            recovery: Arc::new(RecoveryGate::new()),
+            open_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Fetches paying with `credential`, sharing its lanes' voucher ledgers.
+    ///
+    /// # Errors
+    ///
+    /// The capability's owner signature is malformed, or it names another
+    /// signer.
+    pub(crate) fn held(credential: Credential) -> anyhow::Result<Self> {
+        let slot = delegated_slot(&credential.grant, Arc::clone(&credential.signer))?;
+        Ok(Self {
+            key: PayerKey::Held {
+                signer: credential.signer,
+                slot,
+            },
+            ledgers: Some(LaneLedgers::new()),
+            recovery: Arc::new(RecoveryGate::new()),
+            open_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Whether the fetch pays from a pool another owner funds.
+    const fn delegated(&self) -> bool {
+        match &self.key {
+            PayerKey::Keystore(grant) => grant.is_some(),
+            PayerKey::Held { .. } => true,
+        }
+    }
+}
+
+/// Fetch the blob `args` names on `host`, paid by `payer`, with its verified
+/// bytes going to `sink`: resolve the holders, take the first size claim (the
+/// probe hint, or a header-only open when there is none), then fetch it
+/// through the acquire loop. `--output` names the destination only for
+/// [`Sink::Output`]. The fetch ends on done, a fault only the user can fix,
+/// or the stop policy: a terminal waits for Ctrl-C, a script gives up after
+/// 10 minutes without progress, and `--give-up-after-secs` overrides both.
+///
+/// The future is not `Send`: run it in place, or as a local task.
 ///
 /// # Errors
 ///
-/// As [`fetch`].
-pub(crate) async fn fetch_into(
+/// [`decdn_client::GaveUp`] once the stop policy's no-progress limit passes,
+/// or the fault that ended the fetch.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn fetch_on(
+    host: &FetchHost,
+    payer: &Payer,
     args: &BlobFetch,
-    config_path: Option<&Path>,
     sink: &mut Sink,
-    credential: Option<Credential>,
-) -> anyhow::Result<()> {
-    let timings = FetchTimings::start();
-    let common = &args.common;
-    // Before any network or keystore work, reject a flag combination clap
-    // cannot express, naming the flags the user actually typed.
-    common.validate()?;
-
-    // Relays: `--relay-url` overrides `network.relay_urls` (#935). Discovery:
-    // `[network.discovery]` composes operator resolution legs, else N0 (#936).
-    let relays = client_endpoint::resolve_relays(common.relay_url.as_deref(), config_path)?;
-    let disc = client_endpoint::client_discovery(config_path)?;
-
-    let file = load_file_config(config_path)?;
-    let mut chain = resolve_chain(common, &file)?;
-
-    // Delegated adoption: `--capability`/`--capability-file` names a pool the
-    // caller does NOT own and a capability authorizing this client's key to
-    // spend against it. `None` => the unchanged self-owned pool path. Zeroes
-    // the working deposit in `chain` (a delegate cannot fund an owner's pool).
-    // An in-memory `credential` is the same delegation, with its key in hand.
-    let (grant, signer) = match credential {
-        Some(Credential { signer, grant }) => {
-            chain.working_deposit = U256::ZERO;
-            (Some(grant), Some(signer))
-        }
-        None => (resolve_delegation_grant(common, &mut chain)?, None),
-    };
-
-    // The buyer-pool store, opened once and recorded into by open-or-reuse.
-    // The guard runs here, before the keystore password prompt: the answer
-    // depends only on the data dir, and a refusal must not cost a prompt first.
-    // Shared, so a lane's watermark write runs off the runtime thread.
-    let store: Arc<dyn BuyerPoolStore> = Arc::new(open_client_store_for_buy(
-        &chain.site.data_dir,
-        chain.data_dir_source,
-        "fetch",
-    )?);
-
-    // One discovery-enabled endpoint, reused for probing and the delivery dial.
-    let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
-    timings.mark(Mark::Endpoint);
-    // The body runs in `fetch_over`, so the endpoint closes on every exit —
-    // success, an early return, an error, or a Ctrl-C — and its open connections
-    // end cleanly instead of being aborted on drop. A Ctrl-C drops `fetch_over`
-    // mid-transfer: each drive's drop guard queues what it paid for recording,
-    // and the `.partial` is the next run's resume prefix.
-    // Outlives `fetch_over`, so an `openPool` that a Ctrl-C or a fault dropped
-    // before its receipt was read is still named.
-    let opens = UnconfirmedOpens::default();
-    let mut interrupt = Interrupt::watch(opens.clone());
-    // The command's peer-record and watermark writes, off the runtime thread.
-    let writes = OrderedWrites::default();
-    let result = tokio::select! {
-        result = fetch_over(args, &relays, &chain, (grant, signer), &store, &endpoint, &writes, &opens, &timings, sink) => {
-            result
-        }
-        () = interrupt.wait() => Err(Interrupted.into()),
-    };
-    let result = name_unconfirmed_open(result, &opens.pending());
-    let output = match sink {
-        Sink::Writer(_) => "writer",
-        Sink::Output if wants_stdout(&args.output) => "stdout",
-        Sink::Output => "file",
-    };
-    timings.log(output, result.is_ok());
-    // On every exit, a Ctrl-C's included: what the drives queued is durable
-    // before the command returns.
-    writes.settle().await;
-    endpoint.close().await;
-    result
-}
-
-/// The part of [`fetch`] that runs over its open `endpoint`: resolve the
-/// holders, take the first size claim (the probe hint, or a header-only open
-/// when there is none), then fetch it through the acquire loop. The command
-/// ends on done, a fault only the user can fix, or the stop policy: a
-/// terminal waits for Ctrl-C, a script gives up after 10 minutes
-/// without progress, and `--give-up-after-secs` overrides both.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-async fn fetch_over(
-    args: &BlobFetch,
-    relays: &[RelayUrl],
-    chain: &ResolvedChain,
-    (grant, held_signer): (
-        Option<CapabilityGrant>,
-        Option<Arc<alloy::signers::local::PrivateKeySigner>>,
-    ),
-    store: &Arc<dyn BuyerPoolStore>,
-    endpoint: &Endpoint,
-    writes: &OrderedWrites,
-    opens: &UnconfirmedOpens,
     timings: &FetchTimings,
-    sink: &mut Sink,
 ) -> anyhow::Result<()> {
+    let FetchHost {
+        relays,
+        chain,
+        store,
+        endpoint,
+        connections,
+        health,
+        writes,
+        opens,
+        token,
+    } = host;
     let hash = args.hash;
     let common = &args.common;
     let streams = sink.streams(&args.output);
@@ -678,18 +790,26 @@ async fn fetch_over(
     // keystore, loaded after selection so a failed discovery never prompts for a
     // keystore password. Password from env, else `--keystore-password-file`,
     // else TTY.
-    let signer = if let Some(signer) = held_signer {
-        signer
-    } else {
-        let password = super::chain_ctx::read_keystore_password(
-            &super::chain_ctx::password_sources(
-                chain.keystore_password_file.as_deref(),
-                PasswordUse::Unlock,
-            ),
-            "eth keystore password",
-        )?
-        .into_secret();
-        Arc::new(load_signer(&chain.keystore, &password)?)
+    // A delegated fetch signs under one credential slot for the whole fetch,
+    // both passes included; a held key's slot spans every fetch it pays for.
+    let (signer, slot) = match &payer.key {
+        PayerKey::Held { signer, slot } => (Arc::clone(signer), Some(slot.clone())),
+        PayerKey::Keystore(grant) => {
+            let password = super::chain_ctx::read_keystore_password(
+                &super::chain_ctx::password_sources(
+                    chain.keystore_password_file.as_deref(),
+                    PasswordUse::Unlock,
+                ),
+                "eth keystore password",
+            )?
+            .into_secret();
+            let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+            let slot = grant
+                .as_ref()
+                .map(|grant| delegated_slot(grant, Arc::clone(&signer)))
+                .transpose()?;
+            (signer, slot)
+        }
     };
     timings.mark(Mark::Unlocked);
     let self_address = signer.address();
@@ -699,19 +819,24 @@ async fn fetch_over(
     let contract = PaymentPool::new(config.payment_pool, rpc.clone());
     let voucher_dom = voucher_domain(config.chain_id, config.payment_pool);
     let slash_dom = slash_judge_domain(config.chain_id, config.slash_judge);
-    // The pool's token is `PaymentPool.usdc()`, immutable per contract. A repeat
-    // fetch already holds it in the persisted pool row, so read it there and skip
-    // the eth_call; only a first-ever pool (no row) pays the `usdc()` round-trip.
-    // The reuse branch of `open_or_reuse_pool` already trusts this same
-    // `state.token`, so this only makes the top-level value consistent with it.
-    let token = match cached_pool_token(store.as_ref(), self_address, config.deployment())? {
-        Some(token) => token,
-        None => contract
-            .usdc()
-            .call()
-            .await
-            .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?,
-    };
+    // The pool's token is `PaymentPool.usdc()`, immutable per contract, so the
+    // host reads it once. A repeat fetch already holds it in the persisted pool
+    // row, so read it there and skip the eth_call; only a first-ever pool (no
+    // row) pays the `usdc()` round-trip. The reuse branch of
+    // `open_or_reuse_pool` already trusts this same `state.token`, so this only
+    // makes the top-level value consistent with it.
+    let token = *token
+        .get_or_try_init(|| async {
+            match cached_pool_token(store.as_ref(), self_address, config.deployment())? {
+                Some(token) => anyhow::Ok(token),
+                None => contract
+                    .usdc()
+                    .call()
+                    .await
+                    .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()")),
+            }
+        })
+        .await?;
 
     let max_blob_bytes = common.max_blob_mb.saturating_mul(1024 * 1024);
     // The namespace routing hint (ADR 005 § Namespace routing): the URI's
@@ -727,26 +852,19 @@ async fn fetch_over(
     // no overall wall-clock cap: it completes for any blob size as long as the
     // upstream keeps feeding it bytes.
     let deadlines = PullDeadlines::new(STALL_WINDOW, STALL_WINDOW, 0)?;
-    // One connection per node for the whole fetch: every lane and leg opens
-    // its streams on it.
-    let connections = Connections::new(endpoint.clone());
 
+    // Each fetch keeps its own progress clock, so one that stalls gives up
+    // alone while the host's other fetches carry on.
     let clock = Arc::new(ProgressClock::new());
     let stop = StopPolicy::new(
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
         common.give_up_after(),
         clock,
     );
-    let health = Arc::new(PeerHealth::default());
-    let deposit = chain.deposit_policy(grant.is_some())?;
-    // A delegated fetch signs under one credential slot for the whole command,
-    // both passes included.
-    let slot = grant
-        .as_ref()
-        .map(|grant| delegated_slot(grant, Arc::clone(&signer)))
-        .transpose()?;
-    // One funding recovery state for the whole fetch, both passes included.
-    let recovery = Arc::new(RecoveryGate::new());
+    let deposit = chain.deposit_policy(payer.delegated())?;
+    // One funding recovery state for everything the payer pays for, both passes
+    // included.
+    let recovery = &payer.recovery;
     // Set once a funding recovery step replaced the pool: the second pass then
     // runs the remaining work against the new pool, and resumes the `.partial`.
     let mut replaced: Option<PoolReplaced> = None;
@@ -770,15 +888,15 @@ async fn fetch_over(
             max_rate_per_mb: common.max_rate_per_mb,
             max_blob_bytes,
             deadlines,
-            connections: &connections,
+            connections,
             writes,
             funding: &funding,
             marks: Some(timings),
         };
         // The fetch's lanes build concurrently and every one opens or reuses the
-        // one pool on-chain, so the open-or-reuse runs one lane at a time, as it
-        // does across a bundle pull's entries.
-        let open_lock = tokio::sync::Mutex::new(());
+        // one pool on-chain, so the open-or-reuse runs one lane at a time across
+        // every fetch the payer pays for, as it does across a bundle pull's
+        // entries.
         let sources = LaneSources::new(
             &deps,
             &discovery,
@@ -788,10 +906,10 @@ async fn fetch_over(
                 None => LanePayer::Owned(&signer),
             },
             &voucher_dom,
-            Some(&open_lock),
+            Some(&payer.open_lock),
+            payer.ledgers.as_ref(),
             None,
-            None,
-            &recovery,
+            recovery,
         );
         let holders = sources.holders_from(&resolved);
         if replaced.is_none() {
@@ -801,13 +919,13 @@ async fn fetch_over(
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
             // The first size claim: the probe's hint, or a header-only open.
-            let claim = sources.first_claim(hash, holders, &health, &stop).await?;
+            let claim = sources.first_claim(hash, holders, health, &stop).await?;
             if streams {
                 return stream_out(
                     &deps,
                     &sources,
                     claim.holders,
-                    Arc::clone(&health),
+                    Arc::clone(health),
                     hash,
                     claim.total_bytes,
                     stop.clone(),
@@ -820,7 +938,7 @@ async fn fetch_over(
                 &deps,
                 &sources,
                 claim.holders,
-                Arc::clone(&health),
+                Arc::clone(health),
                 DownloadTarget {
                     hash,
                     total_bytes: claim.total_bytes,

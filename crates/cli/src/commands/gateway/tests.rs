@@ -326,7 +326,35 @@ fn a_capability_must_be_signed_by_its_pools_on_chain_owner() {
 
 const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-fn test_gateway() -> Arc<Gateway> {
+/// A pull backend for gateways whose requests all stop before a pull.
+struct NoPulls;
+
+impl worker::Backend for NoPulls {
+    type Host = ();
+    type Payer = ();
+
+    async fn open(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn payer(&self, _credential: Credential) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn pull(
+        &self,
+        (): &(),
+        (): &(),
+        _blob: &BlobFetch,
+        _sink: &mut super::super::fetch::Sink,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("these tests start no pull")
+    }
+
+    async fn close(&self, (): ()) {}
+}
+
+async fn test_gateway() -> Arc<Gateway> {
     let chain = ChainConfig {
         // Nothing here reaches the chain: every request below stops first.
         rpc_url: "http://127.0.0.1:1".to_owned(),
@@ -337,12 +365,11 @@ fn test_gateway() -> Arc<Gateway> {
     };
     Arc::new(Gateway {
         common: flags(&[]),
-        config_path: None,
         token: TEST_TOKEN.to_owned(),
         domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
         delegates: Mutex::new(HashMap::new()),
-        pull: Arc::new(Mutex::new(())),
+        pulls: PullWorker::start(NoPulls, 1).await.unwrap(),
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
@@ -369,7 +396,7 @@ async fn call(
 
 #[tokio::test]
 async fn head_never_starts_a_pull() {
-    let gateway = test_gateway();
+    let gateway = test_gateway().await;
     let status = call(
         &gateway,
         Method::HEAD,
@@ -383,7 +410,7 @@ async fn head_never_starts_a_pull() {
 
 #[tokio::test]
 async fn minting_needs_a_page_origin_or_the_token_and_stops_per_site() {
-    let gateway = test_gateway();
+    let gateway = test_gateway().await;
     assert_eq!(
         call(&gateway, Method::GET, "/_delegate", &[], "").await,
         StatusCode::FORBIDDEN
@@ -419,7 +446,7 @@ async fn minting_needs_a_page_origin_or_the_token_and_stops_per_site() {
 
 #[tokio::test]
 async fn a_page_with_the_token_still_registers_only_its_own_scope() {
-    let gateway = test_gateway();
+    let gateway = test_gateway().await;
     let body = r#"{"capability": "dcap1:x", "scope": "netflix.com"}"#;
     let status = call(
         &gateway,
