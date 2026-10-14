@@ -16,6 +16,7 @@ pub mod deregister;
 pub mod doctor;
 pub mod fetch;
 pub(crate) mod fetch_timings;
+pub mod gateway;
 pub mod get;
 pub mod interrupt;
 pub mod key_gen;

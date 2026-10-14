@@ -490,6 +490,72 @@ pub(crate) async fn fetch(
     uri: &DecdnUri,
     config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let blob = BlobFetch {
+        hash: uri.hash,
+        namespace: uri.namespace,
+        output: args.output.clone(),
+        common: args.common.clone(),
+    };
+    fetch_into(&blob, config_path, &mut Sink::Output, None).await
+}
+
+/// One blob fetch: what `decdn get decdn:<hash>` and the gateway each hand
+/// [`fetch_into`].
+pub(crate) struct BlobFetch {
+    /// The blob's BLAKE3 hash.
+    pub(crate) hash: [u8; 32],
+    /// The namespace routing hint (ADR 002).
+    pub(crate) namespace: Option<u64>,
+    /// `-o`: the destination file, or `-` for stdout. Read only for
+    /// [`Sink::Output`].
+    pub(crate) output: PathBuf,
+    /// The retrieval flags.
+    pub(crate) common: cli::ClientFetchArgs,
+}
+
+/// A delegate credential held in memory: the key that signs vouchers and the
+/// capability issued to it. Takes the place of `--keystore` and
+/// `--capability`.
+pub(crate) struct Credential {
+    /// The delegate key.
+    pub(crate) signer: Arc<alloy::signers::local::PrivateKeySigner>,
+    /// The capability the pool owner issued to `signer`.
+    pub(crate) grant: CapabilityGrant,
+}
+
+/// Where a fetch's verified bytes go.
+pub(crate) enum Sink {
+    /// `--output`: a file, or stdout for `-`.
+    Output,
+    /// A caller's byte stream, filled in order as `-o -` fills stdout. The
+    /// gateway hands one per HTTP response.
+    Writer(Box<dyn tokio::io::AsyncWrite + Send + Unpin>),
+}
+
+impl Sink {
+    /// Whether the fetch streams in order (stdout or a writer) rather than
+    /// downloading to a file.
+    fn streams(&self, output: &Path) -> bool {
+        match self {
+            Self::Output => wants_stdout(output),
+            Self::Writer(_) => true,
+        }
+    }
+}
+
+/// [`fetch`] with its verified bytes going to `sink`. `--output` names the
+/// destination only for [`Sink::Output`]. A `credential` pays in place of the
+/// keystore and capability the flags name.
+///
+/// # Errors
+///
+/// As [`fetch`].
+pub(crate) async fn fetch_into(
+    args: &BlobFetch,
+    config_path: Option<&Path>,
+    sink: &mut Sink,
+    credential: Option<Credential>,
+) -> anyhow::Result<()> {
     let timings = FetchTimings::start();
     let common = &args.common;
     // Before any network or keystore work, reject a flag combination clap
@@ -508,7 +574,14 @@ pub(crate) async fn fetch(
     // caller does NOT own and a capability authorizing this client's key to
     // spend against it. `None` => the unchanged self-owned pool path. Zeroes
     // the working deposit in `chain` (a delegate cannot fund an owner's pool).
-    let grant = resolve_delegation_grant(common, &mut chain)?;
+    // An in-memory `credential` is the same delegation, with its key in hand.
+    let (grant, signer) = match credential {
+        Some(Credential { signer, grant }) => {
+            chain.working_deposit = U256::ZERO;
+            (Some(grant), Some(signer))
+        }
+        None => (resolve_delegation_grant(common, &mut chain)?, None),
+    };
 
     // The buyer-pool store, opened once and recorded into by open-or-reuse.
     // The guard runs here, before the keystore password prompt: the answer
@@ -535,16 +608,16 @@ pub(crate) async fn fetch(
     // The command's peer-record and watermark writes, off the runtime thread.
     let writes = OrderedWrites::default();
     let result = tokio::select! {
-        result = fetch_over(args, uri, &relays, &chain, grant, &store, &endpoint, &writes, &opens, &timings) => {
+        result = fetch_over(args, &relays, &chain, (grant, signer), &store, &endpoint, &writes, &opens, &timings, sink) => {
             result
         }
         () = interrupt.wait() => Err(Interrupted.into()),
     };
     let result = name_unconfirmed_open(result, &opens.pending());
-    let output = if wants_stdout(&args.output) {
-        "stdout"
-    } else {
-        "file"
+    let output = match sink {
+        Sink::Writer(_) => "writer",
+        Sink::Output if wants_stdout(&args.output) => "stdout",
+        Sink::Output => "file",
     };
     timings.log(output, result.is_ok());
     // On every exit, a Ctrl-C's included: what the drives queued is durable
@@ -562,19 +635,23 @@ pub(crate) async fn fetch(
 /// without progress, and `--give-up-after-secs` overrides both.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn fetch_over(
-    args: &cli::GetArgs,
-    uri: &DecdnUri,
+    args: &BlobFetch,
     relays: &[RelayUrl],
     chain: &ResolvedChain,
-    grant: Option<CapabilityGrant>,
+    (grant, held_signer): (
+        Option<CapabilityGrant>,
+        Option<Arc<alloy::signers::local::PrivateKeySigner>>,
+    ),
     store: &Arc<dyn BuyerPoolStore>,
     endpoint: &Endpoint,
     writes: &OrderedWrites,
     opens: &UnconfirmedOpens,
     timings: &FetchTimings,
+    sink: &mut Sink,
 ) -> anyhow::Result<()> {
-    let hash = uri.hash;
+    let hash = args.hash;
     let common = &args.common;
+    let streams = sink.streams(&args.output);
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
     // Only a configuration fault ends the fetch here; with no holder yet, the
     // first open discovers them. The round streams: the fetch starts at the
@@ -597,18 +674,23 @@ async fn fetch_over(
     )?;
     timings.mark(Mark::Resolved);
 
-    // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
-    // failed discovery never prompts for a keystore password. Password from env,
-    // else `--keystore-password-file`, else TTY.
-    let password = super::chain_ctx::read_keystore_password(
-        &super::chain_ctx::password_sources(
-            chain.keystore_password_file.as_deref(),
-            PasswordUse::Unlock,
-        ),
-        "eth keystore password",
-    )?
-    .into_secret();
-    let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+    // Buyer signer (vouchers + the openPool/topUp tx): the held one, else the
+    // keystore, loaded after selection so a failed discovery never prompts for a
+    // keystore password. Password from env, else `--keystore-password-file`,
+    // else TTY.
+    let signer = if let Some(signer) = held_signer {
+        signer
+    } else {
+        let password = super::chain_ctx::read_keystore_password(
+            &super::chain_ctx::password_sources(
+                chain.keystore_password_file.as_deref(),
+                PasswordUse::Unlock,
+            ),
+            "eth keystore password",
+        )?
+        .into_secret();
+        Arc::new(load_signer(&chain.keystore, &password)?)
+    };
     timings.mark(Mark::Unlocked);
     let self_address = signer.address();
 
@@ -635,7 +717,7 @@ async fn fetch_over(
     // The namespace routing hint (ADR 005 § Namespace routing): the URI's
     // `?ns=<id>` → big-endian `uint256`; absent => `NO_NAMESPACE` (best-effort
     // cache/DHT).
-    let namespace_id = uri
+    let namespace_id = args
         .namespace
         .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
             alloy::primitives::U256::from(n).to_be_bytes()
@@ -720,8 +802,8 @@ async fn fetch_over(
         let result = async {
             // The first size claim: the probe's hint, or a header-only open.
             let claim = sources.first_claim(hash, holders, &health, &stop).await?;
-            if wants_stdout(&args.output) {
-                return stream_to_stdout(
+            if streams {
+                return stream_out(
                     &deps,
                     &sources,
                     claim.holders,
@@ -730,6 +812,7 @@ async fn fetch_over(
                     claim.total_bytes,
                     stop.clone(),
                     (common.max_sources, timings),
+                    &mut *sink,
                 )
                 .await;
             }
@@ -756,7 +839,7 @@ async fn fetch_over(
             eprintln!("warning: {shortfall}");
         }
         let result = result.map_err(|err| annotate(err, &sources.fault_context()));
-        match next_pass(result, &mut replaced, wants_stdout(&args.output)) {
+        match next_pass(result, &mut replaced, streams) {
             Some(pass_result) => return pass_result,
             None => recovery.start_next_pass(),
         }
@@ -768,14 +851,14 @@ async fn fetch_over(
 /// or the command's result (ADR 003 § Funding recovery).
 ///
 /// A pass runs again at most once: a second replacement in one command ends it
-/// "funding needed". A stream to stdout never runs again, because the bytes it
-/// already wrote cannot be taken back; its replacement ends the command with
-/// the new pool named. Once a pass replaced the pool, the closed pool's
-/// remaining balance is named on stderr, with the reclaim command.
+/// "funding needed". A stream (stdout or a writer) never runs again, because
+/// the bytes it already wrote cannot be taken back; its replacement ends the
+/// command with the new pool named. Once a pass replaced the pool, the closed
+/// pool's remaining balance is named on stderr, with the reclaim command.
 fn next_pass(
     result: anyhow::Result<()>,
     replaced: &mut Option<PoolReplaced>,
-    to_stdout: bool,
+    streams: bool,
 ) -> Option<anyhow::Result<()>> {
     let now_replaced = result
         .as_ref()
@@ -783,7 +866,7 @@ fn next_pass(
         .and_then(|err| err.downcast_ref::<PoolReplaced>().copied());
     if let Some(new) = now_replaced
         && replaced.is_none()
-        && !to_stdout
+        && !streams
     {
         eprintln!("note: {new}");
         *replaced = Some(new);
@@ -905,8 +988,8 @@ fn annotate_with(err: anyhow::Error, ctx: &Mutex<PoolContext>) -> anyhow::Error 
 
 /// Copy a [`decdn_client::VerifiedReader`]'s verified bytes to `sink`,
 /// feeding `on_progress` the cumulative content bytes drained. Returns the total
-/// drained. Only bao-verified bytes ever leave the reader, so `sink` (stdout) is
-/// safe to pipe.
+/// drained. Only bao-verified bytes ever leave the reader, so `sink` (stdout or
+/// a writer) is safe to pipe.
 async fn copy_verified<R, W>(
     reader: &mut R,
     sink: &mut W,
@@ -915,7 +998,7 @@ async fn copy_verified<R, W>(
 ) -> anyhow::Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + ?Sized,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -934,7 +1017,7 @@ where
             .ok_or_else(|| anyhow::anyhow!("read returned more than the buffer holds"))?;
         sink.write_all(chunk)
             .await
-            .map_err(|e| anyhow::anyhow!("write to stdout: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("write verified bytes: {e}"))?;
         drained = drained.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
         if let Some(cb) = on_progress {
             cb(drained, total_bytes);
@@ -942,21 +1025,22 @@ where
     }
     sink.flush()
         .await
-        .map_err(|e| anyhow::anyhow!("flush stdout: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("flush verified bytes: {e}"))?;
     Ok(drained)
 }
 
-/// Stream `hash`'s verified bytes to STDOUT via the [`Streamer`] consumption face
-/// (#1848 4b). Only bao-verified bytes ever reach the pipe — safe to `| tar x` —
-/// the fetch is consumption-paced (a slow or early-quit consumer stops the pull
-/// and the spend within one read-ahead window), and a source that faults
-/// mid-stream cools while another carries on, with no re-pull or re-pay.
+/// Stream `hash`'s verified bytes in order to `sink` (stdout for
+/// [`Sink::Output`]) via the [`Streamer`] consumption face (#1848 4b). Only
+/// bao-verified bytes ever reach the pipe — safe to `| tar x` — the fetch is
+/// consumption-paced (a slow or early-quit consumer stops the pull and the
+/// spend within one read-ahead window), and a source that faults mid-stream
+/// cools while another carries on, with no re-pull or re-pay.
 ///
-/// `max_sources` is the front lane cap. Progress draws on stderr, only when
-/// stderr is a terminal; stdout carries nothing but the verified bytes. The
-/// caller persists each lane's voucher watermark after the stream.
+/// `max_sources` is the front lane cap. For stdout, progress draws on stderr,
+/// only when stderr is a terminal; stdout carries nothing but the verified
+/// bytes. The caller persists each lane's voucher watermark after the stream.
 #[allow(clippy::too_many_arguments)]
-async fn stream_to_stdout<P>(
+async fn stream_out<P>(
     deps: &LaneDeps<'_, P>,
     sources: &LaneSources<'_, P>,
     holders: Vec<Holder>,
@@ -965,6 +1049,7 @@ async fn stream_to_stdout<P>(
     total_bytes: u64,
     stop: StopPolicy,
     (max_sources, timings): (usize, &FetchTimings),
+    sink: &mut Sink,
 ) -> anyhow::Result<()>
 where
     P: alloy::providers::Provider + Clone,
@@ -994,9 +1079,11 @@ where
         .open(hash, total_bytes, &pull_config, Arc::new(NoCache), stop)
         .await?;
 
-    // The bar draws on stderr, so it shows only when stderr is a terminal; stdout
-    // carries the verified bytes either way.
-    let bar = std::io::IsTerminal::is_terminal(&std::io::stderr()).then(delivery_progress);
+    // The bar draws on stderr, so it shows only when stderr is a terminal and
+    // the bytes go to stdout; stdout carries the verified bytes either way.
+    let bar = (matches!(sink, Sink::Output)
+        && std::io::IsTerminal::is_terminal(&std::io::stderr()))
+    .then(delivery_progress);
     // `copy_verified` reports after each write, so the first report with a
     // byte is the first byte on stdout.
     let on_progress = |received: u64, expected: u64| {
@@ -1011,11 +1098,18 @@ where
     // The drive runs beside the copy, not inside its reads: a blocked stdout
     // must not stop an open paid leg from paying and draining. The read-ahead
     // window bounds how far it runs ahead of the pipe.
-    let mut stdout = tokio::io::stdout();
+    let mut stdout;
+    let out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin) = match sink {
+        Sink::Writer(writer) => writer.as_mut(),
+        Sink::Output => {
+            stdout = tokio::io::stdout();
+            &mut stdout
+        }
+    };
     let copy_result = drive
         .alongside(copy_verified(
             &mut reader,
-            &mut stdout,
+            out,
             total_bytes,
             Some(&on_progress),
         ))
@@ -1025,7 +1119,7 @@ where
         bar.finish_and_clear();
     }
     let copied = copy_result.map_err(|read_err| stream_error(read_err, drive.take_error()))?;
-    tracing::info!("streamed {copied} verified bytes to stdout");
+    tracing::info!("streamed {copied} verified bytes");
     Ok(())
 }
 

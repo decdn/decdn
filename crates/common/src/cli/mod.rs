@@ -11,6 +11,7 @@ pub mod byte_size;
 pub mod common;
 pub mod config_cmd;
 pub mod fetch;
+pub mod gateway;
 pub mod get;
 pub mod key_gen;
 pub mod node;
@@ -30,6 +31,7 @@ pub use common::{
 };
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use fetch::ClientFetchArgs;
+pub use gateway::GatewayArgs;
 pub use get::GetArgs;
 pub use key_gen::KeyGenArgs;
 pub use node::{
@@ -113,6 +115,9 @@ pub enum Command {
     Config(ConfigArgs),
     /// Probe a running node over the `cdn/probe/v1` ALPN.
     Probe(ProbeArgs),
+    /// Serve `decdn:` URIs to a browser from a loopback HTTP gateway, paid
+    /// with the scoped capabilities pages and the token holder register.
+    Gateway(Box<GatewayArgs>),
     /// Pull what a `decdn:` URI names: a blob (`decdn:<hash>`), a whole bundle
     /// (`decdn:<hash>/`), or one bundle entry (`decdn:<hash>/<path>`), over the
     /// paid `cdn/client/v1` path, paying per-MB from a `PaymentPool`.
