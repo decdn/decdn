@@ -121,8 +121,8 @@ CI builds the release archives on GitHub runners; a maintainer verifies the
 published checksums, then signs them. The signature means a named maintainer
 vouches that these are the release artifacts. It is not a reproducible-build
 attestation. To verify the binaries against the source, build from the signed
-tag with `cargo build --release --locked`, which fetches the decdn commit its
-`Cargo.lock` pins.
+tag with `cargo build --release --locked`, which fetches the decdn release
+its `Cargo.lock` holds from crates.io.
 
 Each image is assembled from the same archives rather than compiled
 separately, so its binary is byte-identical to the archived one:

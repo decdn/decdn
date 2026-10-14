@@ -93,19 +93,17 @@ sponsord-api = { path = "crates/sponsord-api", version = "0.0.4" }
 sponsord-core = { path = "crates/sponsord-core", version = "0.0.4" }
 sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.0.4" }
 
-# deCDN, from its public repository, at a release tag. `Cargo.lock` pins the
-# commit every build uses; to move it, change the `tag` on every decdn alias
-# and run `cargo update -p decdn-incentive` (RELEASING.md). The
-# `version` must equal decdn's workspace version at that commit: cargo checks
-# the requirement against the git crate, and it is what a published manifest
-# resolves on crates.io, where `git` is dropped. check_decdn_pin.py enforces
-# both; publish-crates.sh refuses until that version is on crates.io. To build
-# against a local checkout, see CONTRIBUTING.md.
-decdn-client = { git = "https://github.com/decdn/decdn", tag = "v0.1.0", version = "0.1.0" }
-decdn-common = { git = "https://github.com/decdn/decdn", tag = "v0.1.0", version = "0.1.0" }
-decdn-incentive = { git = "https://github.com/decdn/decdn", tag = "v0.1.0", version = "0.1.0" }
-# Dev-only (the anvil fixtures). A dev-dependency without a `version` is
-# stripped from the published manifest, so this one needs none.
+# deCDN, from crates.io. A caret requirement takes every compatible decdn
+# release; `Cargo.lock` decides which one builds, and open-decdn-bump.sh moves
+# it (RELEASING.md § Pinning decdn).
+decdn-client = "0.1"
+decdn-common = "0.1"
+decdn-incentive = "0.1"
+# Dev-only: the anvil fixtures. decdn does not publish decdn-e2e, and it needs
+# decdn's whole checkout (it builds the contracts), so it is a git dependency at
+# the release tag of the decdn version Cargo.lock holds, whose contracts match
+# the crates.io ABI. A dev-dependency without a `version` is stripped from the
+# published manifest. check_decdn_pin.py checks all of this.
 decdn-e2e = { git = "https://github.com/decdn/decdn", tag = "v0.1.0" }
 
 tokio = { version = "1", features = ["full"] }
@@ -118,6 +116,18 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 reqwest = { version = "0.13", features = ["json", "query", "form"] }
+
+# decdn-e2e's own decdn dependencies, taken from crates.io like the ones above,
+# so each decdn crate is built once: a git copy beside the crates.io one would
+# be a different crate, with types that do not match. One entry per decdn crate
+# both sides use; the requirements equal the ones above.
+[patch."https://github.com/decdn/decdn"]
+decdn-bao-range = "0.1"
+decdn-client = "0.1"
+decdn-common = "0.1"
+decdn-config-types = "0.1"
+decdn-incentive = "0.1"
+decdn-protocol = "0.1"
 
 [profile.release]
 # Fat LTO + one codegen unit: smaller, faster release binaries at the cost of

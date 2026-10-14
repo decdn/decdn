@@ -1,6 +1,6 @@
 # Mirrors decdn's hooks, without the Solidity and ADR ones. The CI jobs are
 # authoritative; these give the same signal before a push. The cargo hooks
-# fetch decdn as a git dependency, like every build.
+# fetch decdn from crates.io (and decdn-e2e from git), like every build.
 #
 #   pre-commit install --hook-type pre-commit --hook-type pre-push
 repos:
@@ -83,9 +83,9 @@ repos:
         files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|\.github/scripts/check[-_]workspace[-_]manifests\.(py|sh))$'
         pass_filenames: false
 
-      # The decdn-* versions and the decdn commit Cargo.lock pins agree.
+      # The decdn-* requirements, the [patch] and Cargo.lock agree.
       - id: decdn-pin
-        name: decdn pin agrees with the decdn versions
+        name: decdn pin agrees with the lock
         entry: .github/scripts/check-decdn-pin.sh
         language: system
         files: '^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|\.github/scripts/check[-_]decdn[-_]pin\.(py|sh))$'

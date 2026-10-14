@@ -154,9 +154,9 @@ def check(repo_root: Path) -> list[str]:
             if target in name_by_dir:
                 aliases[name] = spec
             elif not target.is_relative_to(repo_root.resolve()):
-                # A sibling checkout (the decdn crates). Its version is decdn's
-                # to set, so only its presence is checked here; check_decdn_pin.py
-                # compares it with the checkout.
+                # A sibling checkout (a decdn crate). Its version is decdn's to
+                # set, so only its presence is checked here; check_decdn_pin.py
+                # refuses a `../decdn/` path outright.
                 if not isinstance(spec.get("version"), str):
                     errors.append(
                         f"Cargo.toml: [workspace.dependencies] {name} has path = "

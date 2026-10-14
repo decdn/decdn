@@ -17,9 +17,12 @@ release.
 
 ### Changed
 
-- **decdn v0.1.0.** The decdn crates are locked at decdn's `v0.1.0` release tag
-  (`538bf319631cb37854819e43998e4a73da06fd5c`) and require `0.1.0`, which is on
-  crates.io.
+- **decdn v0.1.0.** The decdn crates are locked at `0.1.0` from crates.io and
+  require `0.1`, and the anvil fixtures are at decdn's `v0.1.0` release tag
+  (`538bf319631cb37854819e43998e4a73da06fd5c`).
+- **decdn from crates.io.** The decdn crates are crates.io dependencies at a
+  caret requirement (`0.1`) instead of git dependencies on decdn's repository,
+  so an installed crate takes every compatible decdn release.
 
 ## [0.0.4] - 2026-10-13
 

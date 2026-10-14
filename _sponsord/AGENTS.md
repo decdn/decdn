@@ -4,8 +4,8 @@ This file provides guidance to coding agents working in this repository.
 
 sponsord lets a publisher pay for their users' deCDN downloads. It is a cargo
 workspace (Rust 2024, toolchain pinned to 1.99.0 in `rust-toolchain.toml`)
-that depends on [decdn/decdn](https://github.com/decdn/decdn) through git
-dependencies. Read `docs/architecture.md` first. It covers the flow and the
+that depends on the [decdn](https://github.com/decdn/decdn) crates on
+crates.io. Read `docs/architecture.md` first. It covers the flow and the
 trust boundaries, and this file does not repeat them.
 
 ## Commands
@@ -118,17 +118,17 @@ rather than writing new ones.
   `[workspace.dependencies]` carries that version. `cargo release <level>`
   releases every crate together under one signed `vX.Y.Z` tag (see
   `RELEASING.md`). Changelogs stay per crate.
-- **The decdn pin**: `Cargo.lock` decides which decdn commit gets built. The
-  `version` on each `decdn-*` git dependency must equal decdn's workspace
-  version at that commit (`check-decdn-pin.sh`). The aliases name a decdn
-  release `tag`. To move it, change the `tag` on every `decdn-*` alias (and
-  the `version`, where one is set), then run
-  `cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e`
-  in a PR of its own (`RELEASING.md` § Pinning decdn).
-  `scripts/open-decdn-bump.sh` opens that PR, and decdn's
-  `publish-crates.sh` runs it for each release. To build against a local
-  `../decdn`, use an untracked `.cargo/config.toml` `[patch]` (see `CONTRIBUTING.md`), and do not commit
-  the lockfile changes it causes.
+- **The decdn pin**: the decdn crates are crates.io dependencies at a caret
+  requirement (`"0.1"`), and `Cargo.lock` decides which release gets built.
+  `decdn-e2e` (the anvil fixtures, unpublished) is the one git dependency:
+  dev-only, at the release tag of the locked version, with a
+  `[patch."https://github.com/decdn/decdn"]` that takes the decdn crates it
+  shares with them from crates.io so none builds twice
+  (`check-decdn-pin.sh` checks all of it). Move the lock in a PR of its own
+  (`RELEASING.md` § Pinning decdn): `scripts/open-decdn-bump.sh` opens that
+  PR, and decdn's `publish-crates.sh` runs it for each release. To build
+  against a local `../decdn`, use an untracked `.cargo/config.toml` `[patch]`
+  (see `CONTRIBUTING.md`), and do not commit the lockfile changes it causes.
 - **The toolchain version is written in five places**:
   `rust-toolchain.toml`, `rust-version` in the root `Cargo.toml`, every
   `dtolnay/rust-toolchain` step under `.github/` (its `toolchain:` input, and

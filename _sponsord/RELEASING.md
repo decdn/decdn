@@ -86,28 +86,32 @@ install `decdn` from decdn's own release (`ONRAMP_DECDN_RELEASE`).
 
 ## Pinning decdn
 
-The decdn crates are git dependencies on
-[decdn/decdn](https://github.com/decdn/decdn), at a release `tag` in the root
-`Cargo.toml`, and two places say which decdn a release builds against. They
-must agree:
+The decdn crates come from crates.io, at a caret requirement in the root
+`Cargo.toml` (`decdn-client = "0.1"`): a published sponsord takes every
+compatible decdn release, which decdn's `cargo semver-checks` keeps
+compatible. Three places say which decdn a release builds against:
 
-- `Cargo.lock`: the one decdn commit every build compiles. Every CI job and
+- `Cargo.lock`: the decdn release every build compiles. Every CI job and
   every release build is `--locked`, so it is what ships.
-- The `version` on each `decdn-*` entry in the root `Cargo.toml`'s
-  `[workspace.dependencies]`: what the published crates require from
-  crates.io, where the `git` source is dropped. It must equal decdn's
-  workspace version at the locked commit.
+- `decdn-e2e`, the anvil fixtures, at the decdn release `tag` of that
+  version. decdn does not publish it, and it builds decdn's contracts from
+  its checkout, so it is a git dependency, used only by tests. Its tag must
+  match the locked version, so the contracts it deploys match the ABI of the
+  crates.
+- A `[patch."https://github.com/decdn/decdn"]` that takes the decdn crates
+  decdn-e2e shares with the crates.io dependencies (decdn-client and what it
+  pulls in) from crates.io too, so each builds once. A git copy beside the
+  crates.io one is a different crate, whose types do not match. The crates
+  only decdn-e2e uses (decdn-node, decdn-cache, decdn-reputation) stay on git
+  at its tag.
 
 `.github/scripts/check-decdn-pin.sh` checks them against each other; CI runs it
 on every PR, and `release.yml` runs it on the tag. Every gating CI job builds
-the locked commit, so a decdn change never turns an unrelated sponsord PR red.
-The non-blocking `decdn main canary` job moves the lock to decdn `main` and
-builds and tests there; when it goes red, the next bump needs work.
-
-**A release meant for crates.io must lock a decdn release**: the locked commit
-must be the commit of decdn's `v<version>` tag, and that version must be on
-crates.io. `publish-crates.sh` checks both and refuses until then. Any other
-commit still releases binaries and images; it just cannot go to crates.io.
+the locked release, so a decdn change never turns an unrelated sponsord PR
+red. The non-blocking `decdn main canary` job takes every decdn crate from
+decdn `main` instead (`bump-decdn.sh canary`; `canary-check` fails it if any
+stayed on crates.io), and builds and tests there;
+when it goes red, the next bump needs work.
 
 ### The bump PR
 
@@ -124,42 +128,52 @@ scripts/open-decdn-bump.sh --dry-run  # print the diff, push nothing
 ```
 
 It works in a temporary worktree at `origin/main`, so your checkout and
-branch stay as they are. It checks crates.io up to 10 times, a minute apart,
-until it serves every versioned `decdn-*` crate, then pushes
-`bump/decdn-v<version>` and opens `build: pin decdn to v<version>`. The
-commit adds a changelog entry to every crate the move reaches, replacing an
-unreleased one from an earlier bump
+branch stay as they are. It checks the crates.io index (the one cargo
+resolves from) up to 10 times, a minute apart, until it lists every decdn
+crate the workspace takes from there. Then it moves decdn-e2e's tag, pins the
+requirements to `=<version>` while it runs `cargo update` on every decdn
+crate (so each moves to exactly that release, not to crates.io's newest), and
+sets the requirements back to their caret range, moved when the release
+leaves it (0.1 to 0.2). It pushes
+`bump/decdn-v<version>` and opens `build: pin decdn to v<version>`.
+The commit adds a changelog entry to every crate the move reaches, replacing
+an unreleased one from an earlier bump
 ([`bump_decdn.py`](.github/scripts/bump_decdn.py)). It commits as your git
 identity without the pre-commit hooks, pushes with your `origin` credentials
 and opens the PR with your `gh` login; CI checks the PR.
 
-It does nothing when `main` already pins that release or a later one (by
+It does nothing when `main` already locks that release or a later one (by
 SemVer precedence), or when a PR from that branch exists in any state: a
 closed bump PR is never reopened, so close one to skip that release. When
 `cargo metadata --locked` or `check-decdn-pin.sh` fails on the new lock, it
-still opens the PR, says so in the body, and exits 1. Any other exit 1 opened
-no PR, and the last line says which step failed. Exit 3 means crates.io does
-not serve the release yet; run it again later. A red CI on the PR means the
-new decdn needs code changes; push them to its branch.
+still opens the PR, says so in the body, and exits 1. Any other exit 1
+opened no PR, and the last line says which step failed. Exit 3 means
+the crates.io index does not list the release yet; run it again later.
+
+Dependabot leaves the decdn crates alone (`.github/dependabot.yml`), since it
+would move the lock without the e2e tag.
 
 ### Moving the lock by hand
 
-To move the lock to another decdn release, set `tag = "v<version>"` on every
-`decdn-*` entry in the root `Cargo.toml`, and `version = "<version>"` on each
-entry that has one, then:
+To move the lock to another decdn release, point decdn-e2e's `tag` at it and
+pin every `decdn-*` requirement, in `[workspace.dependencies]` and in the
+`[patch]`, to exactly that version for the update; then put the caret
+requirements back (`"0.2"`, or `"1"` from 1.0, when the release leaves the
+range):
 
 ```bash
-cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e
+.github/scripts/bump-decdn.sh rewrite v<version> --exact
+.github/scripts/bump-decdn.sh locked-crates | sed 's/^/--package=/' | xargs cargo update
+.github/scripts/bump-decdn.sh rewrite v<version>
 cargo metadata --locked --format-version 1 > /dev/null
 .github/scripts/check-decdn-pin.sh
 ```
 
-To build against decdn's current `main` instead, set `branch = "main"` in
-place of the `tag`, and `version` to decdn main's workspace version, and run
-the same commands. That lock can ship binaries and images, not crates.
+Without the `--exact` step, `cargo update` takes crates.io's newest release in
+the range, which the e2e tag then does not match.
 
 Land the move as its own PR before cutting a release against it, with a
-changelog entry naming the new decdn commit in every crate it reaches.
+changelog entry naming the new decdn release in every crate it reaches.
 
 ## Cutting a version
 
@@ -222,7 +236,7 @@ squash-merge subjects conventional; others are left out).
   downloads in progress and clients already deployed.
 - **Config-breaking** changes name the `SPONSORD_*` or `ONRAMP_*` variable
   (rename, new required variable, default shift).
-- A move of the locked decdn names the new commit in every crate it reaches.
+- A move of the locked decdn names the new release in every crate it reaches.
 - Security advisories cite the `RUSTSEC-YYYY-NNNN` id.
 
 ## What CI does with the tag
@@ -258,7 +272,7 @@ Then two jobs run side by side:
    when `release_plan.py <tag> --baseline` prints a tag, use
    `cargo semver-checks --workspace --baseline-rev <that tag> --default-features`.
    It then creates the GitHub Release as a **draft**, with git-cliff notes and
-   the locked decdn commit it was built against.
+   the locked decdn release it was built against.
 2. **`build`** runs one job per target, each building every binary released
    for it, and fails a Linux leg whose binaries need a glibc above 2.35
    (Ubuntu 22.04).
@@ -276,8 +290,8 @@ A release that fails verification therefore leaves no asset on the draft and
 pushes no image.
 
 One check decdn's release run has is absent here: `cargo publish --dry-run`
-resolves the decdn crates from crates.io, where they may not be yet, so it
-runs in `publish-crates.sh` instead.
+verify-builds every packaged crate, a second workspace build, so it runs in
+`publish-crates.sh` instead.
 
 Draft assets need authentication to download, and no image tag exists yet, so
 nothing resolves by name until the release is signed.
@@ -353,11 +367,8 @@ scripts/publish-crates.sh v0.1.2
 
 It verifies the tag against `KEYS` and against `origin` the way
 `sign-release.sh` does, and requires the release to be published **and** to
-carry `SHA256SUMS.asc`. It then lists the decdn crates the uploaded manifests
-require ([`registry_deps.py`](scripts/registry_deps.py)): the decdn
-commit `Cargo.lock` locks at the tag must be decdn's `v<version>` tag, and that
-release must be on crates.io. Until it is, the script stops there, with
-nothing uploaded. The sibling crates need no such check: they go up in the
+carry `SHA256SUMS.asc`. The decdn crates need no check: `Cargo.lock` at the
+tag already resolved them from crates.io. The sibling crates go up in the
 same run.
 
 It then makes a detached worktree of this repo at the tag and publishes from

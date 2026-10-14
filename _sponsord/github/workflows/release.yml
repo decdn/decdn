@@ -10,7 +10,7 @@ name: Release
 #   tag            the fast gate everything needs; compiles nothing. Parses
 #                  the tag, verifies its signature against KEYS on main and
 #                  that it still names the commit this run builds, checks it
-#                  against the workspace version and the decdn lock, and
+#                  against the workspace version and the decdn pin, and
 #                  picks (and verifies) the semver baseline
 #   verify         alongside build: the checks, cargo semver-checks against
 #                  the previous release, then a DRAFT GitHub Release with
@@ -35,8 +35,8 @@ name: Release
 # `packages: write`, or build the bytes that ship, so a moved tag upstream must
 # not reach them. ci.yml and security.yml pin theirs the same way.
 #
-# The decdn crates are git dependencies, and every build here is `--locked`,
-# so a release builds the decdn commit Cargo.lock pins, not decdn main: a tag
+# Every build here is `--locked`, so a release builds the decdn release
+# Cargo.lock holds, not whatever crates.io serves newest or decdn main: a tag
 # always builds the same code.
 
 on:
@@ -67,7 +67,7 @@ jobs:
       images_json: ${{ steps.plan.outputs.images_json }}
       archives: ${{ steps.plan.outputs.archives }}
       matrix: ${{ steps.plan.outputs.matrix }}
-      decdn_ref: ${{ steps.decdn.outputs.ref }}
+      decdn_release: ${{ steps.decdn.outputs.release }}
       baseline: ${{ steps.baseline.outputs.tag }}
       baseline_sha: ${{ steps.baseline.outputs.sha }}
     steps:
@@ -131,18 +131,17 @@ jobs:
             exit 1
           fi
 
-      # For the release notes: the decdn commit Cargo.lock pins, which every
+      # For the release notes: the decdn release Cargo.lock holds, which every
       # build of this tag compiles.
-      - name: Read the locked decdn commit
+      - name: Read the locked decdn release
         id: decdn
         shell: bash
         run: |
           set -euo pipefail
-          DECDN_REF=$(grep -m1 -oE 'git\+https://github\.com/decdn/decdn\?[^#]*#[0-9a-f]{40}' Cargo.lock \
-            | cut -d'#' -f2) || true
-          [[ "$DECDN_REF" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "::error::Cargo.lock pins no decdn commit"; exit 1; }
-          echo "ref=$DECDN_REF" >> "$GITHUB_OUTPUT"
+          DECDN_RELEASE=$(.github/scripts/bump-decdn.sh pinned)
+          [[ "$DECDN_RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] || {
+            echo "::error::Cargo.lock holds no single decdn release"; exit 1; }
+          echo "release=$DECDN_RELEASE" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
@@ -165,7 +164,7 @@ jobs:
           fi
           echo "Every crate is at $VERSION."
 
-      - name: decdn version requirements match the locked decdn
+      - name: decdn requirements, [patch] and lock agree
         run: .github/scripts/check-decdn-pin.sh
 
       # The release verify runs cargo semver-checks against: the highest
@@ -249,9 +248,9 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo nextest run --workspace --locked --no-tests=pass
 
-      # Not here, unlike decdn: `cargo publish --dry-run` resolves the decdn
-      # crates from crates.io, where they are not published yet.
-      # publish-crates.sh runs the dry run at publish time.
+      # Not here, unlike decdn: `cargo publish --dry-run` verify-builds every
+      # packaged crate, a second workspace build; publish-crates.sh runs it at
+      # publish time.
 
       # Every published crate's public Rust API against the previous release
       # (the commit of the baseline `tag` picked and verified, by SHA so the
@@ -283,7 +282,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.tag.outputs.tag }}
           PRERELEASE: ${{ needs.tag.outputs.prerelease }}
-          DECDN_REF: ${{ needs.tag.outputs.decdn_ref }}
+          DECDN_RELEASE: ${{ needs.tag.outputs.decdn_release }}
         run: |
           set -euo pipefail
           NOTES="$RUNNER_TEMP/release-notes.md"
@@ -301,7 +300,8 @@ jobs:
               >> "$NOTES.trunc"
             mv "$NOTES.trunc" "$NOTES"
           fi
-          printf '\nBuilt against decdn/decdn@%s.\n' "$DECDN_REF" >> "$NOTES"
+          printf '\nBuilt against [decdn %s](https://github.com/decdn/decdn/releases/tag/%s) from crates.io.\n' \
+            "$DECDN_RELEASE" "$DECDN_RELEASE" >> "$NOTES"
           if gh release view "$TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/is-draft" 2>/dev/null; then
             if [ "$(cat "$RUNNER_TEMP/is-draft")" != "true" ]; then
               echo "::error::release $TAG is already published; refusing to overwrite it"

@@ -82,5 +82,6 @@ wildcards = "warn"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# deCDN itself: the decdn-* crates are git dependencies, pinned by Cargo.lock.
+# deCDN itself: decdn-e2e, the anvil fixture decdn does not publish, and the
+# decdn crates only it uses. The rest of decdn comes from crates.io.
 allow-git = ["https://github.com/decdn/decdn"]

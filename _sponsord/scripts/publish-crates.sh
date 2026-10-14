@@ -10,11 +10,10 @@
 #
 # Usage:  scripts/publish-crates.sh v0.1.2
 #
-# The uploaded manifests resolve every path and git dependency by its
-# `version`. The siblings go up in this same run, in dependency order; the
-# decdn crates must already be on crates.io, from the decdn release whose tag
-# is the commit Cargo.lock pins (registry_deps.py lists them). The readiness
-# check below refuses until then.
+# The uploaded manifests resolve every path dependency by its `version`; the
+# siblings go up in this same run, in dependency order. The decdn crates are
+# crates.io dependencies already, locked in Cargo.lock to a release crates.io
+# serves, so nothing waits on decdn here.
 #
 # Environment:
 #   SPONSORD_REPO             override the owner/repo (default: decdn/sponsord)
@@ -219,75 +218,11 @@ gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev
 Nothing goes to crates.io that no maintainer signature vouches for.
 Run scripts/sign-release.sh $TAG."
 
-# ---- the decdn crates must be on crates.io first --------------------------
-
-# The uploaded manifests carry each decdn dependency's `version` and no git
-# source, so crates.io must already serve exactly that version. Checked before
-# anything is packaged: the dry run below would also fail, but with a resolver
-# error that does not say what to do about it.
-echo "==> Checking the decdn dependencies are on crates.io"
-# Captured to a variable first: neither `set -e` nor `pipefail` reaches into a
-# process substitution, so a failed listing would otherwise yield an empty list
-# and a vacuous pass.
-DEPS_RAW=$(cd "$REPO_ROOT" && python3 "$SCRIPT_DIR/registry_deps.py" "$TAG") ||
-  die "could not list the workspace's registry dependencies at $TAG"
-DEPS=()
-[[ -z "$DEPS_RAW" ]] || mapfile -t DEPS <<<"$DEPS_RAW"
-
-# The decdn commit this tag builds, from its Cargo.lock. What crates.io
-# serves for decdn must be that same code, so the locked commit has to be the
-# commit of decdn's release tag for the version the aliases require.
-DECDN_SHA=$(git show "${TAG}:Cargo.lock" |
-  grep -m1 -oE 'git\+https://github\.com/decdn/decdn\?[^#]*#[0-9a-f]{40}' |
-  cut -d'#' -f2) || true
-DECDN_VERSION=""
-for entry in "${DEPS[@]}"; do
-  read -r _ ver <<<"$entry"
-  [[ -n "$DECDN_SHA" ]] || die "Cargo.lock at $TAG pins no decdn commit"
-  DECDN_VERSION="$ver"
-  # The commit, not the tag object: ls-remote lists `refs/tags/vX` before its
-  # peeled `refs/tags/vX^{}`, and decdn's signed tags are annotated, so the
-  # first line would be the tag object. A lightweight tag has no `^{}` line.
-  TAG_SHA=$(git ls-remote https://github.com/decdn/decdn \
-    "refs/tags/v${ver}^{}" "refs/tags/v${ver}" |
-    awk '$2 ~ /\^\{\}$/ {peeled = $1} {plain = $1} END {print (peeled != "" ? peeled : plain)}') ||
-    die "cannot reach github.com/decdn/decdn to look up its v${ver} tag"
-  [[ -n "$TAG_SHA" ]] || die \
-    "decdn has no v${ver} tag, so ${ver} is not a decdn release.
-crates.io can only resolve a published decdn version, so a release meant for
-crates.io must lock a decdn release: move Cargo.lock to decdn's v<version> tag
-and set the decdn-* versions to match (RELEASING.md), then cut a new release.
-This tag's binaries and images are unaffected."
-  [[ "$TAG_SHA" == "$DECDN_SHA" ]] || die \
-    "Cargo.lock at $TAG locks decdn at $DECDN_SHA, but decdn v${ver} is $TAG_SHA.
-What crates.io would build is not what this release was built and tested
-against. Move the lock to decdn v${ver} (RELEASING.md) and cut a new release."
-  break
-done
-
-for entry in "${DEPS[@]}"; do
-  read -r name ver <<<"$entry"
-  if [[ "$ver" != "$DECDN_VERSION" ]]; then
-    die "$name requires '$ver' at $TAG, but the other decdn crates require $DECDN_VERSION"
-  fi
-  code=$(curl -s -o /dev/null -w '%{http_code}' -A "sponsord-publish-crates" \
-    "https://crates.io/api/v1/crates/${name}/${ver}") ||
-    die "cannot reach crates.io to check $name $ver"
-  case "$code" in
-    200) echo "    ${name} ${ver} is on crates.io" ;;
-    404) die "${name} ${ver} is not on crates.io.
-Publish decdn v${DECDN_VERSION} first (decdn's scripts/publish-crates.sh),
-then re-run this script. Nothing has been uploaded." ;;
-    *) die "crates.io returned HTTP $code for $name $ver; refusing to guess" ;;
-  esac
-done
-
 # ---- publish from the tagged tree ----------------------------------------
 
 # A detached worktree at the tag, not the current checkout: the working copy
 # may carry uncommitted edits or sit on a different branch, and cargo would
-# happily upload whatever is on disk. Cargo fetches decdn itself, at the
-# commit the tag's Cargo.lock pins.
+# happily upload whatever is on disk.
 WORK_PARENT=$(mktemp -d)
 WORKTREE="$WORK_PARENT/sponsord"
 git -C "$REPO_ROOT" worktree add --detach "$WORKTREE" "$TAG" >/dev/null 2>&1 ||

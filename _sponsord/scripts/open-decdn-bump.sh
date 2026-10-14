@@ -22,8 +22,8 @@
 #
 # Exit: 0 done or nothing to do; 1 error (no PR opened unless the output says
 # so), or the PR is open but the new lock fails `cargo metadata --locked` /
-# check-decdn-pin.sh; 2 usage; 3 crates.io does not serve the release yet (run
-# it again later).
+# check-decdn-pin.sh; 2 usage; 3 the crates.io index does not list the
+# release yet (run it again later).
 set -euo pipefail
 
 DECDN=decdn/decdn
@@ -99,7 +99,8 @@ if [[ -z "$TAG" ]]; then
   TAG=$(bump latest) || die "could not read decdn's latest release"
 fi
 # Never move the pin backwards: not to a patch release on an older line, nor
-# to an older tag given by hand. A pin off a tag (untagged) always moves.
+# to an older tag given by hand. A lock with no single crates.io decdn release
+# (untagged) always moves.
 relation=$(bump compare "$TAG") || die "could not compare the pin with $TAG"
 case "$relation" in
   same)
@@ -122,27 +123,37 @@ if [[ -n "$existing" ]]; then
 fi
 
 # publish-crates.sh runs this right after its uploads, and the crates.io index
-# can trail them by minutes.
+# can trail them by minutes. `ready` reads that index, the one `cargo update`
+# resolves from, so a failing update below is a real failure, not lag.
 attempt=1
 until bump ready "$TAG"; do
   rc=$?
   (( rc == 3 )) || die "could not check crates.io for decdn $TAG; no PR opened"
   if (( attempt >= READY_ATTEMPTS )); then
-    echo "crates.io does not serve decdn $TAG yet; run this again later" >&2
+    echo "the crates.io index does not list decdn $TAG yet; run this again later" >&2
     exit 3
   fi
-  echo "    waiting ${READY_INTERVAL}s for crates.io (attempt $attempt/$READY_ATTEMPTS)" >&2
+  echo "    waiting ${READY_INTERVAL}s for the crates.io index (attempt $attempt/$READY_ATTEMPTS)" >&2
   sleep "$READY_INTERVAL"
   attempt=$((attempt + 1))
 done
 
 # ---- bump ----------------------------------------------------------------
 
-echo "==> Pinning decdn $TAG (from ${CURRENT:-a non-tag ref})"
+echo "==> Pinning decdn $TAG (from ${CURRENT:-no single locked release})"
 OLD_SHA=$(bump locked-sha) || die "could not read the locked decdn commit"
-bump rewrite "$TAG" || die "could not point the decdn aliases at $TAG; no PR opened"
-cargo update --quiet -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e ||
+# `=<version>` for the update, so every decdn crate moves to exactly $TAG and
+# not to crates.io's newest in the range; the caret requirements come back
+# after it, and the lock satisfies them.
+bump rewrite "$TAG" --exact || die "could not point the decdn dependencies at $TAG; no PR opened"
+# Every decdn crate the lock holds, so that none stays behind on the old
+# release.
+crates=$(bump locked-crates) || die "could not list the locked decdn crates; no PR opened"
+[[ -n "$crates" ]] || die "Cargo.lock holds no decdn crate; no PR opened"
+mapfile -t CRATES <<<"$crates"
+cargo update --quiet "${CRATES[@]/#/--package=}" ||
   die "cargo update to decdn $TAG failed; no PR opened"
+bump rewrite "$TAG" || die "could not restore the caret requirements; no PR opened"
 bump changelog "$TAG" || die "could not add the changelog entries; no PR opened"
 NEW_SHA=$(bump locked-sha) || die "could not read the new locked decdn commit"
 
@@ -171,9 +182,9 @@ git add Cargo.toml Cargo.lock crates/*/CHANGELOG.md || die "git add failed; no P
 git commit --quiet --no-verify -F - <<EOF || die "git commit failed; no PR opened"
 build: pin decdn to ${TAG}
 
-Lock the decdn crates at decdn's ${TAG} release tag (${NEW_SHA})
-instead of ${CURRENT:-the previous pin} (${OLD_SHA}), and require ${TAG#v},
-which is on crates.io.
+Lock the decdn crates at ${TAG#v} from crates.io instead of
+${CURRENT:-the previous pin}, and the anvil fixtures (decdn-e2e) at decdn's
+${TAG} release tag (${NEW_SHA}) instead of ${OLD_SHA}.
 EOF
 # No local branch: the commit is pushed from the detached worktree. Forced,
 # because the branch may be left over from a run that pushed it and opened no
@@ -188,8 +199,8 @@ BODY=$(mktemp)
 {
   echo "Moves the decdn pin to [decdn ${TAG}](https://github.com/${DECDN}/releases/tag/${TAG})."
   echo
-  echo "- From: \`${CURRENT:-(not a tag)}\` (\`${OLD_SHA}\`)"
-  echo "- To: \`${TAG}\` (\`${NEW_SHA}\`), on crates.io"
+  echo "- From: \`${CURRENT:-(no single release)}\` (\`${OLD_SHA}\`)"
+  echo "- To: \`${TAG}\` from crates.io; decdn-e2e at \`${NEW_SHA}\`"
   echo "- decdn changes: https://github.com/${DECDN}/compare/${OLD_SHA}...${NEW_SHA}"
   echo
   if [[ "$CHECK" != ok ]]; then

@@ -6,18 +6,18 @@ name: CI
 # Third-party actions are pinned to full commit SHAs (version in the trailing
 # comment; Dependabot bumps both), as in release.yml and security.yml.
 #
-# The decdn crates are git dependencies on github.com/decdn/decdn, so a plain
-# checkout builds: cargo fetches decdn itself.
+# The decdn crates come from crates.io, and decdn-e2e (the anvil fixtures)
+# from github.com/decdn/decdn at the matching release tag, so a plain checkout
+# builds: cargo fetches both itself.
 #
-# The gating jobs build against the decdn commit Cargo.lock pins — the same
-# decdn a release builds, and the one the `decdn-*` version requirements are
-# consistent with. Building them against decdn main would turn every sponsord
-# PR red the moment decdn changes a dependency or bumps its version.
-# `decdn-main` keeps the early warning: it moves the lock to decdn main, builds
-# and tests, and may fail without blocking a merge.
+# The gating jobs build against the decdn release Cargo.lock holds — the same
+# decdn a release builds. Building them against decdn main would turn every
+# sponsord PR red the moment decdn changes a dependency or bumps its version.
+# `decdn-main` keeps the early warning: it moves every decdn crate to decdn
+# main, builds and tests, and may fail without blocking a merge.
 #
-# The decdn commit is never a run input, only the committed lock (or `main` for
-# the canary). An input would let a manual run on main execute an arbitrary
+# The decdn release is never a run input, only the committed lock (or `main`
+# for the canary). An input would let a manual run on main execute an arbitrary
 # ref in jobs that write the cache main builds restore (CodeQL's
 # cache-poisoning finding); to build against another decdn, open a PR that
 # moves the lock (RELEASING.md § Pinning decdn).
@@ -335,9 +335,9 @@ jobs:
       - run: .github/scripts/cargo-deny-warn.sh
 
   # Static checks that keep the release and publish steps from failing late.
-  # There is no `cargo package` here: packaging resolves the decdn crates from
-  # crates.io, where they are not published yet. publish-crates.sh runs the
-  # full `cargo publish --dry-run` at release time.
+  # The full `cargo publish --dry-run` verify-builds every packaged crate, a
+  # second workspace build, so it runs only in publish-crates.sh at release
+  # time; check-package-embeds.sh is the cheap PR-time part of it.
   packaging:
     name: packaging
     runs-on: ubuntu-latest
@@ -354,7 +354,7 @@ jobs:
         run: .github/scripts/check-toolchain-pin.sh
       - name: Every member inherits the version and the lints
         run: .github/scripts/check-workspace-manifests.sh
-      - name: decdn version requirements match the locked decdn
+      - name: decdn requirements, [patch] and lock agree
         run: .github/scripts/check-decdn-pin.sh
       - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
@@ -363,11 +363,12 @@ jobs:
         run: cargo metadata --locked --format-version 1 > /dev/null
 
   # Early warning, not a gate: the next decdn sponsord will move its lock to.
-  # Cargo checks each `decdn-*` version requirement against the git crate, so
-  # each alias is first pointed at `branch = "main"` and its requirement
-  # rewritten to decdn main's workspace version, then the lock moves to decdn
-  # main's head. A failure here means the next
-  # bump needs work; ci-success lets it fail.
+  # `bump-decdn.sh canary` takes every decdn crate from decdn main through a
+  # [patch.crates-io], points decdn-e2e at `branch = "main"`, and moves the
+  # requirements to the caret range of main's workspace version; then the
+  # lock moves to decdn main's head, and `canary-check` fails the job if any
+  # decdn crate stayed on crates.io (a [patch] entry cargo did not use). A
+  # failure here means the next bump needs work; ci-success lets it fail.
   decdn-main:
     name: decdn main canary
     runs-on: ubuntu-latest
@@ -402,9 +403,13 @@ jobs:
           set -euo pipefail
           version=$(curl -fsSL https://raw.githubusercontent.com/decdn/decdn/main/Cargo.toml \
             | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])')
-          sed -i -E "/^decdn-[a-z0-9-]+ = \{ git = /{s/(tag|rev) = \"[^\"]+\"/branch = \"main\"/;s/version = \"[^\"]+\"/version = \"${version}\"/}" Cargo.toml
-          grep -E '^decdn-' Cargo.toml
-          cargo update -p decdn-client -p decdn-common -p decdn-incentive -p decdn-e2e
+          crates=$(.github/scripts/bump-decdn.sh locked-crates)
+          .github/scripts/bump-decdn.sh canary "$version"
+          grep -E '^decdn-|^\[patch' Cargo.toml
+          args=()
+          while read -r crate; do args+=(--package "$crate"); done <<<"$crates"
+          cargo update "${args[@]}"
+          .github/scripts/bump-decdn.sh canary-check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo nextest run --workspace --no-tests=pass
 

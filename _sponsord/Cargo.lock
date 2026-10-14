@@ -2733,7 +2733,8 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 [[package]]
 name = "decdn-bao-range"
 version = "0.1.0"
-source = "git+https://github.com/decdn/decdn?tag=v0.1.0#538bf319631cb37854819e43998e4a73da06fd5c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b40240bed37e3f95a911cae5af2eee9534b6c3ea1bc6c81b788bcd5e227b994"
 dependencies = [
  "bao-tree",
  "bytes",
@@ -2781,7 +2782,8 @@ dependencies = [
 [[package]]
 name = "decdn-client"
 version = "0.1.0"
-source = "git+https://github.com/decdn/decdn?tag=v0.1.0#538bf319631cb37854819e43998e4a73da06fd5c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d91813ffd0fc1749e8b92fc7934e689319f91ba3399d2fd8fd4c09b7ea3ce7c2"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2807,7 +2809,8 @@ dependencies = [
 [[package]]
 name = "decdn-common"
 version = "0.1.0"
-source = "git+https://github.com/decdn/decdn?tag=v0.1.0#538bf319631cb37854819e43998e4a73da06fd5c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac31065e7b382ea1c9f6d0e1ee5b6e34d16e6ba04763a52ae3e77bae611896de"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2830,7 +2833,8 @@ dependencies = [
 [[package]]
 name = "decdn-config-types"
 version = "0.1.0"
-source = "git+https://github.com/decdn/decdn?tag=v0.1.0#538bf319631cb37854819e43998e4a73da06fd5c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2a167034dce9b9074740ac01b1968d48ff5bc7e218d54f914c5390833117be8"
 dependencies = [
  "anyhow",
  "serde",
@@ -2867,7 +2871,8 @@ dependencies = [
 [[package]]
 name = "decdn-incentive"
 version = "0.1.0"
-source = "git+https://github.com/decdn/decdn?tag=v0.1.0#538bf319631cb37854819e43998e4a73da06fd5c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d72b5dce7c301f8b8bd9dc170e7ef5d4b467015166b6a733a9360bc50e21fba4"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2945,7 +2950,8 @@ dependencies = [
 [[package]]
 name = "decdn-protocol"
 version = "0.1.0"
-source = "git+https://github.com/decdn/decdn?tag=v0.1.0#538bf319631cb37854819e43998e4a73da06fd5c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f269336943cd52e62823bcd91e7d1454ea07eb70432a9972a19c5220f543dab0"
 dependencies = [
  "postcard",
  "serde",

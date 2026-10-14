@@ -123,9 +123,9 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-The deCDN crates are git dependencies on
-[decdn/decdn](https://github.com/decdn/decdn), at the commit `Cargo.lock`
-pins, so a fresh clone builds on its own. [CONTRIBUTING.md](CONTRIBUTING.md)
+The deCDN crates come from crates.io, at the
+[decdn](https://github.com/decdn/decdn) release `Cargo.lock` holds, so a
+fresh clone builds on its own. [CONTRIBUTING.md](CONTRIBUTING.md)
 covers the toolchain, the checks, the anvil tests, and building against a
 local deCDN checkout.
 

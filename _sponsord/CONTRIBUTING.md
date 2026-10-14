@@ -69,21 +69,31 @@ never drops out of the analysis.
 
 ## Building against a local deCDN checkout
 
-The deCDN crates are git dependencies on `github.com/decdn/decdn`, at the
-commit `Cargo.lock` pins ([RELEASING.md § Pinning decdn](RELEASING.md#pinning-decdn)
-covers moving it). To build against a local checkout instead (say
-`../decdn`), create an untracked `.cargo/config.toml`:
+The deCDN crates come from crates.io, and the anvil fixtures (`decdn-e2e`)
+from `github.com/decdn/decdn`, at the release `Cargo.lock` holds
+([RELEASING.md § Pinning decdn](RELEASING.md#pinning-decdn) covers moving
+it). To build against a local checkout instead (say `../decdn`), create an
+untracked `.cargo/config.toml` that replaces both sources:
 
 ```toml
-[patch."https://github.com/decdn/decdn"]
+[patch.crates-io]
+decdn-bao-range = { path = "../decdn/crates/bao-range" }
 decdn-client = { path = "../decdn/crates/client" }
 decdn-common = { path = "../decdn/crates/common" }
+decdn-config-types = { path = "../decdn/crates/config-types" }
 decdn-incentive = { path = "../decdn/crates/incentive" }
+decdn-protocol = { path = "../decdn/crates/protocol" }
+
+[patch."https://github.com/decdn/decdn"]
 decdn-e2e = { path = "../decdn/crates/e2e" }
 ```
 
-The override rewrites those packages' sources in `Cargo.lock`; don't commit
-that. Delete the file and run `cargo metadata` to get the pinned lock back.
+With nothing left on git, cargo warns that the `Cargo.toml` `[patch]` entries
+were not used; that is expected. The override rewrites those packages'
+sources in `Cargo.lock`; don't commit that (`check-decdn-pin.sh` refuses
+it). Delete the file and run `git checkout -- Cargo.lock` to get the pinned
+lock back: `cargo metadata` alone would re-resolve to crates.io's newest
+release in the range.
 
 ## Pull requests
 
