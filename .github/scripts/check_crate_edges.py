@@ -118,7 +118,9 @@ EDGE_KINDS = frozenset({None, "build"})
 METADATA_ARGS = ("cargo", "metadata", "--format-version", "1", "--locked", "--no-deps")
 # `{p}` with a depth prefix: one `<depth><name> v<version>[ (…)]` line per edge,
 # ` (*)` marking a crate whose dependencies were already printed. The same
-# `-e normal,build` as EDGE_KINDS.
+# `-e normal,build` as EDGE_KINDS. Unlike the default `--prefix indent`, the
+# depth prefix prints no `[build-dependencies]` headers: a build dependency is
+# an ordinary line one level below the crate whose build script uses it.
 TREE_ARGS = (
     "cargo", "tree", "--locked", "--all-features", "--target", "all",
     "-e", "normal,build", "--prefix", "depth", "--format", "{p}",
