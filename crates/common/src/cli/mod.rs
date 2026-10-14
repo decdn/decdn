@@ -13,6 +13,7 @@ pub mod common;
 pub mod config_cmd;
 pub mod fetch;
 pub mod gateway;
+pub mod get;
 pub mod key_gen;
 pub mod node;
 pub mod origin;
@@ -33,6 +34,7 @@ pub use common::{
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use fetch::{ClientFetchArgs, FetchArgs};
 pub use gateway::GatewayArgs;
+pub use get::GetArgs;
 pub use key_gen::KeyGenArgs;
 pub use node::{
     BondArgs, ChainArgs, DeregisterArgs, DoctorArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs,
@@ -120,8 +122,12 @@ pub enum Command {
     /// deposit.
     Fetch(FetchArgs),
     /// Serve `decdn:` URIs to a browser from a loopback HTTP gateway, paid
-    /// from a sponsored allowance.
+    /// with the scoped capabilities pages and the token holder register.
     Gateway(GatewayArgs),
+    /// Pull what a `decdn:` URI names: a blob (`decdn:<hash>`), a whole bundle
+    /// (`decdn:<hash>/`), or one bundle entry (`decdn:<hash>/<path>`), over the
+    /// paid `cdn/client/v1` path.
+    Get(GetArgs),
     /// Guided node onboarding (ADR 019 Phases 1–2): pre-flight checks,
     /// key generation, bond, and on-chain registration, with a final
     /// readiness summary. Thin orchestration over `key-gen` / `node bond` /

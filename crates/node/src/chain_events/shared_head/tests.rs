@@ -178,6 +178,7 @@ async fn counting_server() -> (
         .mount(&server)
         .await;
     let url = server.uri().parse().expect("mock server uri parses");
+    decdn_common::tls::install_crypto_provider();
     let provider = ProviderBuilder::new().connect_http(url);
     (server, provider, head_hits)
 }

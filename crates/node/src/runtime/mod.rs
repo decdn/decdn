@@ -2407,6 +2407,9 @@ pub async fn run(
     // `decdn-node run` started, not just everything after the admin server
     // bound.
     let started_at = std::time::Instant::now();
+    // Before the RPC preflight's reqwest client; `main` installs it too, but a
+    // test or embedder may call `run` directly.
+    decdn_common::tls::install_crypto_provider();
 
     let infra = build_infra(&cfg, secret_key, &reload_state, node_metrics).await?;
 

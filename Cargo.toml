@@ -120,7 +120,18 @@ ed25519-dalek = { version = "3", features = ["serde"] }
 chacha20poly1305 = "0.11"
 
 # Blockchain / EVM
-alloy = { version = "2", features = ["providers", "signers", "signer-keystore", "contract"] }
+# `default-features = false` drops alloy's `reqwest-rustls-tls`, which turns on
+# reqwest's `rustls` feature and with it aws-lc-rs. The client graph links one
+# TLS backend, ring (#2454); `reqwest` below picks it up.
+alloy = { version = "2", default-features = false, features = [
+    "std",
+    "reqwest",
+    "essentials",
+    "providers",
+    "signers",
+    "signer-keystore",
+    "contract",
+] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -187,22 +198,34 @@ syn = { version = "3", default-features = false, features = ["full", "parsing", 
 # `ChunkSizes::resolve` validates against directly.
 fastcdc = "5"
 
-# HTTP client (used by cache-origin backend)
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
+# HTTP client (cache-origin backend, CLI probes, alloy's JSON-RPC transport).
+# `rustls-no-provider`, not `rustls`: the latter compiles in aws-lc-rs. reqwest
+# then panics in `Client::build` until a process-wide rustls provider is
+# installed — `decdn_common::tls::install_crypto_provider` installs ring.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "stream",
+    "json",
+] }
+# TLS for the reqwest clients above: ring, the provider iroh's QUIC stack
+# already links. `default-features = false`, because rustls's default is
+# aws-lc-rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 
 # AWS SDK (used by the S3 cache-origin backend, #437). All four crates carry
-# `default-features = false` so the workspace stays on one TLS implementation
-# (rustls 0.23 + aws-lc-rs); the SDK's stock rustls 0.21 + ring path is
-# fully suppressed by these flags. Cargo.lock confirms only one `rustls` and
-# one `aws-lc-rs` major after the addition.
+# `default-features = false` so the workspace stays on one rustls (0.23); the
+# SDK's stock rustls 0.21 path is fully suppressed by these flags. Its HTTP
+# client binds aws-lc-rs (`rustls-aws-lc`): the daemon's one use of aws-lc.
+# Every other TLS client, the client SDK and the CLI included, runs on ring
+# (#2454), and `check_crate_edges.py` keeps aws-lc out of the client closures.
 #
 # The production binary `decdn-node` ships hyper-1 only — `cargo tree
 # -p decdn-node --no-dev-dependencies` shows one `hyper` (1.x), one `h2`
 # (0.4), one `socket2` (0.6). Two `http`/`http-body` versions still appear
 # in production because `aws-smithy-types` carries an `http 0.2` shim type
 # alongside its `http 1.x` API; that shim is dead at runtime but cargo
-# can't unify the feature graph across the smithy types crate. No
-# parallel TLS stack and no extra crypto provider in either case.
+# can't unify the feature graph across the smithy types crate. One rustls
+# in either case.
 #
 # In the **test/dev build** (`crates/cache` dev-deps include `aws-smithy-mocks`
 # and `aws-sdk-s3 = { features = ["test-util"] }`), a hyper-0.14 +
@@ -320,7 +343,9 @@ psl = "2"
 socket2 = "0.6"
 
 # Admin JSON-RPC surface (appendix-local-admin-http.md)
-jsonrpsee = { version = "0.26", features = ["server", "http-client", "macros"] }
+# The server half is a `decdn-node` feature, not a workspace one: the client
+# SDK and the CLI only call the admin RPC (#2454).
+jsonrpsee = { version = "0.26", features = ["http-client", "macros"] }
 
 # Embedded persistent KV (used by `node` to fence voucher replay across
 # restarts — issue #527 / ADR 003 §Off-chain voucher state persistence).

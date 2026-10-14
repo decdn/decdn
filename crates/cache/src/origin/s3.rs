@@ -15,7 +15,8 @@
 //!
 //! The SDK is configured to bring its own HTTP client built from
 //! [`aws_smithy_http_client`] over **hyper-1 + rustls 0.23 + aws-lc-rs**,
-//! matching the rest of the workspace. The SDK's stock HTTP stack
+//! the daemon's only use of aws-lc (every other TLS client in the workspace,
+//! the client SDK and the CLI included, runs on ring). The SDK's stock HTTP stack
 //! (hyper-0.14 + rustls 0.21 + ring) is suppressed via `default-features =
 //! false` on `aws-sdk-s3` and `aws-config` — bringing it in would force a
 //! third parallel TLS implementation into the dep tree.

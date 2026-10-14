@@ -314,6 +314,7 @@ pub async fn active_nodes(
     rpc_url: &str,
     capacity_bond_addr: Address,
 ) -> anyhow::Result<Vec<NodeCandidate>> {
+    decdn_common::tls::install_crypto_provider();
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse().with_context(|| {
         // An rpc_url secret commonly lives in the path/query (Infura/Alchemy
         // keys), which userinfo redaction wouldn't scrub — so hide the value

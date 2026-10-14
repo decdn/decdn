@@ -58,7 +58,8 @@ bao-tree = { workspace = true }
 iroh-io = { workspace = true }
 decdn-incentive = { workspace = true, features = ["buyer-store-core"] }
 decdn-reputation = { workspace = true }
-decdn-common = { workspace = true }
+# `admin-server`: the daemon is the one process that serves the admin RPC.
+decdn-common = { workspace = true, features = ["admin-server"] }
 alloy = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
@@ -88,7 +89,7 @@ socket2 = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 indexmap = { workspace = true }
-jsonrpsee = { workspace = true }
+jsonrpsee = { workspace = true, features = ["server"] }
 reqwest = { workspace = true }
 url = { workspace = true }
 governor = { workspace = true }

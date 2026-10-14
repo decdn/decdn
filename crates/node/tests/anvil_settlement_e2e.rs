@@ -546,6 +546,7 @@ async fn run_e2e() -> anyhow::Result<()> {
 
     let url: reqwest::Url = rpc_url.parse()?;
     let admin_signer: PrivateKeySigner = ADMIN_KEY.parse()?;
+    decdn_common::tls::install_crypto_provider();
     let admin = ProviderBuilder::new()
         .wallet(EthereumWallet::from(admin_signer))
         .connect_http(url.clone());

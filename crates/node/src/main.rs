@@ -50,6 +50,8 @@ enum DaemonCommand {
 async fn main() -> std::process::ExitCode {
     // First, so the systemd watchdog also covers bring-up and shutdown drain.
     decdn_node::systemd_watchdog::spawn();
+    // Before any reqwest client: chain RPC, origin pulls, metrics push.
+    decdn_common::tls::install_crypto_provider();
     let parsed = DaemonCli::parse();
     let config_path = parsed.config.map(|p| cli::common::expand_tilde(&p));
     let result = match parsed.command {

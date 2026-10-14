@@ -981,6 +981,7 @@ async fn the_boot_enumeration_pins_its_pages_and_cursor_to_the_snapshot_block() 
         .mount(&server)
         .await;
     let url: reqwest::Url = server.uri().parse().unwrap();
+    decdn_common::tls::install_crypto_provider();
     let provider = ProviderBuilder::new().connect_http(url);
     let head: Arc<dyn HeadSource> = Arc::new(SharedHead::with_ttl(
         provider.clone(),
