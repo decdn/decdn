@@ -3275,7 +3275,7 @@ where
 /// DEPOSIT backs every lane, and every lane draws through one shared view of it.
 /// `ledgers` picks which view: `None` subtracts the committed amount of every
 /// lane this acquire has started; `Some(reg)` subtracts `reg.total_committed()`,
-/// the sum over every lane a `bundle pull` run has registered. Either way the
+/// the sum over every lane a bundle pull has registered. Either way the
 /// funder's view of the whole pool ([`crate::Funder::pool_spent`]) wins when it
 /// is larger. The gate is evaluated at each `fill_gap` leg boundary; the hard
 /// backstop against a node redeeming past the deposit stays on-chain.

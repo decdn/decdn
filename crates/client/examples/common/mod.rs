@@ -215,7 +215,7 @@ impl Buyer {
         &self,
         holders: Vec<Holder>,
     ) -> Result<(Vec<StreamCandidate<PeerSource<'_>>>, Vec<Lane>)> {
-        // `decdn fetch`'s defaults: a 30 s open and stall budget and a 4 KiB/s
+        // `decdn get`'s defaults: a 30 s open and stall budget and a 4 KiB/s
         // throughput floor.
         let deadlines = PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30), 4096)?;
         let contract = PaymentPool::new(

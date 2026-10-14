@@ -36,9 +36,9 @@ the capability runs low, it loads the next key and capability from `DECDN_KEYSTO
 cargo run -p decdn-client --example bundle -- <bundle-hash-hex> <output-dir>
 ```
 
-The `decdn` CLI's `fetch` and `bundle pull` are built on this crate (`bundle pull` is a thin
-caller of `BundlePuller`), and so is a node's own cache-miss pull: a node that misses in its
-cache is a paying client of the node upstream of it.
+The `decdn` CLI's `get` is built on this crate: it parses a `decdn:` URI with `uri::DecdnUri`,
+and its bundle route is a thin caller of `BundlePuller`. So is a node's own cache-miss pull: a
+node that misses in its cache is a paying client of the node upstream of it.
 The crate links no blob store and no AWS SDK, and CI checks that its dependencies stay that way.
 Its public API is snapshot-tested in CI.
 

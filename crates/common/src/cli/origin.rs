@@ -102,10 +102,11 @@ pub struct OriginImportArgs {
     #[arg(long = "exclude", value_name = "GLOB", action = clap::ArgAction::Append)]
     pub exclude: Vec<String>,
 
-    /// Prefix every manifest entry's path with this folder, so a `bundle pull`
-    /// materializes the whole bundle under one directory (`<out>/<subfolder>/…`)
-    /// rather than spilling its files directly into the output root. Must be a
-    /// relative POSIX path with `/` separators — `..`, absolute paths, root
+    /// Prefix every manifest entry's path with this folder, so a bundle
+    /// `decdn get` materializes the whole bundle under one directory
+    /// (`<out>/<subfolder>/…`) rather than spilling its files directly into the
+    /// output root. Must be a relative POSIX path with `/` separators — `..`,
+    /// absolute paths, root
     /// prefixes, and backslashes are rejected; nesting (`a/b`) is allowed.
     /// Applies to a single-file import too (the one entry becomes
     /// `<subfolder>/<name>`).

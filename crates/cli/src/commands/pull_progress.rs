@@ -1,6 +1,6 @@
-//! Multi-bar progress for `decdn bundle pull`.
+//! Multi-bar progress for a bundle `decdn get`.
 //!
-//! A `bundle pull` run fetches many blobs concurrently, so it renders a stack of
+//! A bundle pull fetches many blobs concurrently, so it renders a stack of
 //! per-file bars — one per pull that holds a `--jobs` slot, plus any that wait
 //! for a sibling's donor chunks — above one bottom **total** bar, all sharing
 //! an [`indicatif::MultiProgress`], under a one-line
@@ -81,7 +81,7 @@ fn new_bar(len: u64) -> indicatif::ProgressBar {
     indicatif::ProgressBar::new(len).with_finish(indicatif::ProgressFinish::AndClear)
 }
 
-/// The multi-bar renderer for one `bundle pull` run. Disabled variants (no inner
+/// The multi-bar renderer for one bundle pull. Disabled variants (no inner
 /// state) make every method a no-op and every bar handle silent.
 pub(crate) struct PullProgress {
     inner: Option<Inner>,

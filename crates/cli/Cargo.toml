@@ -31,10 +31,10 @@ url = { workspace = true }
 # the eth keystore via `decdn_incentive::eth_identity` (#406). Lives in
 # `incentive` per `appendix-poc-production-seams.md` §Seam 1 — clients
 # (voucher signers per ADR 003) and nodes share the keystore surface. The
-# `redb` feature backs `decdn fetch`'s persistent buyer pool store (#940),
+# `redb` feature backs `decdn get`'s persistent buyer pool store (#940),
 # so a pool opens once and is reused (each lane's watermark resumed) across invocations.
 decdn-incentive = { workspace = true, features = ["redb"] }
-# `decdn fetch` (issue #391): the standalone client-side paid pull reuses the
+# `decdn get` (issues #391, #2449): the standalone client-side paid pull reuses the
 # shared `cdn/client/v1` requester. `decdn-client` depends only on `blake3` for
 # content verification (NOT iroh-blobs), so the CLI's iroh-blobs-free invariant
 # (#578) holds — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
@@ -78,17 +78,17 @@ tempfile = { workspace = true }
 # publisher file into `fastcdc::v2020` chunks so cross-file dedup can work at
 # chunk granularity instead of whole-file.
 fastcdc = { workspace = true }
-# `decdn fetch` (#1118) renders a delivery progress bar to stderr. TTY-aware, so
+# `decdn get` (#1118) renders a delivery progress bar to stderr. TTY-aware, so
 # a piped/redirected fetch stays silent. Small dep tree (console, unicode-width),
 # unrelated to the iroh-blobs/AWS-free invariant above.
 indicatif = { workspace = true }
-# `decdn bundle pull` mirrors its total bar into the terminal's tab-bar progress
+# A bundle `decdn get` mirrors its total bar into the terminal's tab-bar progress
 # (OSC 9;4) where the terminal supports it. No dependencies of its own.
 anstyle-progress = { workspace = true }
 # Opt-in client-side logging (`--log-level` / `RUST_LOG`): the CLI installs no
 # subscriber by default, so verbose fetch/incentive/iroh spans are diagnosable
-# on demand without disturbing the terminal UI. The `fetch`/`bundle pull`
-# commands emit their own status and warning spans through these macros, so the
+# on demand without disturbing the terminal UI. The `get` command's blob and
+# bundle routes emit their own status and warning spans through these macros, so the
 # routing narration is silent by default and visible at the requested level.
 # Already in this binary's tree via `decdn-node`'s daemon path; env-filter + fmt
 # only.
@@ -99,13 +99,13 @@ tracing-subscriber = { workspace = true }
 # ring) and no default features — the settings `decdn-node` uses.
 reqwest = { workspace = true }
 # `node register` (ADR 019 § Step 2.3) submits `CapacityBond.registerNode`
-# on-chain: it needs alloy's provider/contract/signer surface. `decdn fetch`
+# on-chain: it needs alloy's provider/contract/signer surface. `decdn get`
 # (#391) also uses it to parse on-chain identifiers and build the EIP-712
 # voucher/slash domains. alloy is already in this binary's tree via
 # `decdn-incentive` (a normal dep), so this exposes the existing crate to CLI
 # source without new bloat.
 alloy = { workspace = true }
-# `decdn fetch` auto-discovery (#936) probes its `SELECT_K` sample concurrently
+# `decdn get` auto-discovery (#936) probes its `SELECT_K` sample concurrently
 # via `join_all`, which borrows one shared `&endpoint` instead of cloning it
 # per probe. Combinators only — no iroh-blobs, so the #578 invariant holds.
 futures-util = { workspace = true }

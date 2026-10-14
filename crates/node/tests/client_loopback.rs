@@ -5771,10 +5771,10 @@ async fn client_spent_down_pool_is_refused_pre_serve() -> anyhow::Result<()> {
 }
 
 /// The resume arm of the #1516 gate's span (`byte_offset > 0`, `byte_len == 0`),
-/// which is the shape `decdn fetch --output` sends when continuing a partial
+/// which is the shape `decdn get -o` sends when continuing a partial
 /// download. The gate must price only the remaining tail, not the whole blob.
 ///
-/// This is the arm with teeth. `decdn fetch` treats a `NotFound` on a resume as
+/// This is the arm with teeth. `decdn get` treats a `NotFound` on a resume as
 /// evidence the partial file may belong to another blob, so it rewinds to
 /// `byte_offset = 0` and re-downloads — and re-pays for — everything it already
 /// had (`crates/cli/src/commands/fetch.rs`, `resume_may_be_stale`). A gate that
@@ -5853,7 +5853,7 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
 /// Left uncovered by the four refusal/serve tests — each sits strictly on one
 /// side of the boundary, so flipping `<` to `<=` passes all of them while
 /// refusing every exactly-funded pool with a lossy `NotFound` the CLI renders
-/// as a missing blob. A `decdn fetch --working-deposit-micro-usdc` funded to the
+/// as a missing blob. A `decdn get --working-deposit-micro-usdc` funded to the
 /// computed cost is exactly this case.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> {
@@ -7665,7 +7665,7 @@ async fn buyer_accepts_rate_at_exact_ceiling() -> anyhow::Result<()> {
 /// the callback as verified leaves land with `(content_position, total_bytes)`.
 /// The expected total is the blob's content size, fixed once the signed
 /// `StreamResponse` arrives; received bytes advance monotonically, and the final
-/// observation reaches the full content size — the contract `decdn fetch`'s
+/// observation reaches the full content size — the contract `decdn get`'s
 /// progress bar relies on.
 #[tokio::test(flavor = "multi_thread")]
 async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
@@ -13836,7 +13836,7 @@ fn capture_client_events() -> (
 
 /// Run the production gap-driven fetch — `drive` over a `PeerSource` into a
 /// `ClientRangedStore` — against a [`spawn_stop_send_server_counting`] upstream
-/// serving `payload`, wired as `decdn fetch` wires it. The upstream accepts up to
+/// serving `payload`, wired as `decdn get` wires it. The upstream accepts up to
 /// three connections so a buyer that re-opens the gap fails fast instead of hanging.
 async fn drive_against_stop_send_server(
     payload: Vec<u8>,

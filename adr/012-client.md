@@ -202,7 +202,7 @@ different pools. The whole set marks the dir, not `buyer.redb` alone,
 because that is the file a reset loses — and the window where it is missing is when
 an operator is most likely to reach for `decdn pool`.
 
-`decdn fetch` and `decdn bundle pull` apply a weaker rule to the same dirs. A human
+`decdn get` applies a weaker rule to the same dirs. A human
 who buys content on a node host is a separate client, so an explicit `--data-dir`
 that names a node's dir is accepted. An implicit one is not: `identity.data_dir` in
 the config file resolves to the node's dir with nothing on the command line, and the
@@ -217,7 +217,7 @@ A client and a node share one schema (`decdn_common::config::FileConfig`), and `
 rejects only unknown keys, not node-only sections a client leaves unused. So a client needs no config
 of its own: `decdn config init --chain <name>` writes a ready-to-run file — chain id, RPC endpoint,
 and contract addresses baked in from the shipped deployment manifest — and a client uses the same
-file the node does, ignoring `[cache]`, `[payment]`, and the bond. `decdn fetch` also reads every one
+file the node does, ignoring `[cache]`, `[payment]`, and the bond. `decdn get` also reads every one
 of these values as a flag, so a client can run with no config file at all. The client-relevant shape,
 in current schema terms:
 
@@ -237,7 +237,7 @@ The Ed25519 node key and the peer store have no config keys of their own: both l
 the resolved data dir (see the tree above), so they move with `--data-dir` / `[identity] data_dir`.
 
 **Registry refresh (not yet implemented).** The bootstrap step-8 periodic registry refresh has no
-code behind it: `decdn fetch` is one-shot today and re-reads the registry per invocation. When
+code behind it: `decdn get` is one-shot today and re-reads the registry per invocation. When
 implemented it will be a client knob (a `registry_refresh_secs`-style ~10-minute cadence); it is
 recorded here as intended design, not a live config key.
 
@@ -261,4 +261,4 @@ Splitting a large blob across multiple nodes and fetching byte ranges in paralle
 
 ## Download Resume
 
-A `decdn fetch` interrupted by a crash, kill, or network drop resumes from the partial output file already on disk: the client re-hashes the bytes it has, discards any trailing unverified remainder, and continues the fetch from the last BLAKE3-verified offset via `StreamRequest{byte_offset}`. If the client's pool is still open on-chain, it reuses it — the same deposit backs the resumed fetch; only if the pool is closing or closed does the client open a new one.
+A blob `decdn get` interrupted by a crash, kill, or network drop resumes from the partial output file already on disk: the client re-hashes the bytes it has, discards any trailing unverified remainder, and continues the fetch from the last BLAKE3-verified offset via `StreamRequest{byte_offset}`. If the client's pool is still open on-chain, it reuses it — the same deposit backs the resumed fetch; only if the pool is closing or closed does the client open a new one.

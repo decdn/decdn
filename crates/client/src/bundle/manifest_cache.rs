@@ -1,8 +1,9 @@
-//! The local bundle-manifest cache `decdn bundle pull --hash` keeps under an
-//! output directory. It stores each fetched bundle manifest blob verbatim, keyed
-//! by its BLAKE3 content address, so a repeat pull of the same bundle into the
-//! same directory reads the manifest from disk instead of paying to fetch the
-//! blob again over `cdn/client/v1`.
+//! The local bundle-manifest cache a bundle `decdn get` keeps under an output
+//! directory. A bundle `get` fetches the manifest by its hash, and the cache
+//! stores each fetched bundle manifest blob verbatim, keyed by its BLAKE3
+//! content address, so a repeat pull of the same bundle into the same directory
+//! reads the manifest from disk instead of paying to fetch the blob again over
+//! `cdn/client/v1`.
 //!
 //! The cache is content-addressed and self-verifying: a load re-hashes the bytes
 //! and returns them only when the digest still equals the requested hash, so a
@@ -13,13 +14,10 @@
 //! fetches the manifest fresh, so a bad cache file only costs one manifest
 //! fetch. A write failure prints a warning that names the path and never fails
 //! the pull. A real pull under `--overwrite` skips the read to force a fresh
-//! fetch. The cache also lets `bundle pull --hash --dry-run` list a bundle's
-//! entries with no network; the dry run reads it even under `--overwrite`,
-//! because verified bytes equal what a fresh fetch returns, and it fails on a
-//! cache file it cannot use, because the cache is its whole answer.
-//!
-//! Only the `--hash` path uses it: an `-i` local manifest is already on disk for
-//! free, with nothing to cache or re-pay.
+//! fetch. The cache also lets `decdn get --dry-run` list a bundle's entries
+//! with no network; the dry run reads it even under `--overwrite`, because
+//! verified bytes equal what a fresh fetch returns, and it fails on a cache file
+//! it cannot use, because the cache is its whole answer.
 
 use std::path::{Path, PathBuf};
 

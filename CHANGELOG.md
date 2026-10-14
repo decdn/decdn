@@ -28,6 +28,23 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **CLI: `decdn get <decdn: URI>` replaces `decdn fetch` and `decdn bundle
+  pull` (#2449).** One `decdn:` URI names what to pull
+  (`adr/appendix-bundles.md` § `decdn:` URIs), and `get` routes it:
+  - `fetch --hash H -o file` is `get decdn:H -o file` (`-o -` streams to
+    stdout as before).
+  - `bundle pull --hash H -o dir` is `get decdn:H/ -o dir`.
+  - `get decdn:H/a/b.txt -o dir` pulls the one entry whose manifest path is
+    `a/b.txt`, matched exactly, to `dir/a/b.txt`.
+  - `--namespace N` is `?ns=N` in the URI.
+  - `bundle pull -i <manifest file>` has no replacement: publish the manifest
+    (`origin import` writes it) and pull it by hash.
+  - The bundle flags (`--include`, `--exclude`, `--select`, `--jobs`,
+    `--max-lane-streams`, `--overwrite`, `--dry-run`, `--json`) are an error
+    on a blob URI, and the entry filters are an error on an entry URI.
+  - `decdn:H/` on a blob that is not a manifest fails with a hint to drop the
+    trailing `/`. `decdn_client::bundle::BundleManifest::parse` returns a
+    typed `NotAManifest` for that case.
 - **`decdn_client::buyer_pool::open_pool` takes an `opens` handle (#2418).**
   The new last argument, `Option<&UnconfirmedOpens>`, holds the `openPool`
   from before its submit until its receipt is read. Pass `None` when nothing

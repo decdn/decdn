@@ -59,7 +59,7 @@ const PAGE_SIZE: u64 = 100;
 /// scale with a number the caller cannot see or bound.
 ///
 /// The wait is silent from the caller's point of view — nothing streams
-/// progress out of this loop — so it is time `decdn fetch` appears to hang.
+/// progress out of this loop — so it is time `decdn get` appears to hang.
 /// `--timeout-ms` bounds it from the outside.
 ///
 /// Deliberately not `decdn_config_types::RetryPolicy`: that is a *doubling*
@@ -595,7 +595,7 @@ pub fn select_candidates(
     candidates.shuffle(&mut rand::rng());
     // `client_region` stays a `&str` and is parsed HERE, not assumed valid.
     // `decdn-common`'s `normalize_region` validates the node daemon's config
-    // region, but the client path does not go through it: `decdn fetch`'s
+    // region, but the client path does not go through it: `decdn get`'s
     // `--region` / `[identity] region` reach `ResolvedChain::region` as a raw
     // `String`. So this is the validating boundary for the client, and an
     // unrecognized value means "no locality information" — the ordering is

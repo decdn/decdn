@@ -1,5 +1,5 @@
 //! Live anvil-backed e2e for the persisted [`decdn_client::PeerStore`]
-//! (#1906): proves `decdn fetch` populates the store on a
+//! (#1906): proves `decdn get` populates the store on a
 //! normal auto-discovered fetch, and that a second fetch against the same
 //! `data_dir` can be served straight from the store without a fresh
 //! `CapacityBond` registry read or a `cdn/probe/v1` probe round.
@@ -8,9 +8,9 @@
 //! tests (`crates/cli/src/commands/fetch.rs`) already prove the ranking and
 //! `min_fresh_candidates` floor in isolation, and `PeerStore`'s unit tests
 //! (`crates/client/src/peer_store.rs`) prove the on-disk record shape.
-//! What neither can reach is that a REAL `decdn fetch` subprocess — driven by
-//! `discover_provider` end to end — writes records a SEPARATE later `decdn
-//! fetch` subprocess can read back and act on, against a real `CapacityBond`
+//! What neither can reach is that a REAL `decdn get` subprocess — driven by
+//! `discover_provider` end to end — writes records a SEPARATE later
+//! `decdn get` subprocess can read back and act on, against a real `CapacityBond`
 //! registry and real iroh-dialed nodes. That cross-process round trip through
 //! the filesystem is the thing this file exists to prove.
 //!
@@ -39,14 +39,14 @@
 //!    unit tests plus the structural fact above, and asserts the
 //!    outcome that IS observable end to end: the second fetch succeeds and
 //!    delivers correct bytes without ever touching the registry.
-//! 2. **Cross-process persistence.** The two `decdn fetch` invocations above
+//! 2. **Cross-process persistence.** The two `decdn get` invocations above
 //!    are separate OS processes sharing only `data_dir` on disk — a passing
 //!    fetch #2 that reused the store already demonstrates this, and this
 //!    journey additionally asserts the peer record files are present both
 //!    right after fetch #1 and still present after fetch #2.
 //!
 //! **Registry-outage fallback is NOT covered here —
-//! documented limitation, not a faked test.** `decdn fetch`'s CLI surface has
+//! documented limitation, not a faked test.** `decdn get`'s CLI surface has
 //! no way to break the `CapacityBond` registry read in isolation:
 //! `--capacity-bond-address` is also the ADR 005 client-binding EIP-712
 //! domain's `verifyingContract` (`crates/cli/src/commands/fetch.rs`'s
@@ -104,7 +104,7 @@ use decdn_incentive::eth_identity;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const KEYSTORE_PASSWORD: &str = "peer-store-e2e-password";
-/// Standard tier: three daemons plus a chain plus two sequential `decdn fetch`
+/// Standard tier: three daemons plus a chain plus two sequential `decdn get`
 /// journeys, each with its own retry ladder for the pool-watcher race.
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
@@ -279,7 +279,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- Journey 2 (persistence half): the peer records outlive both ----
     //
-    // Both `decdn fetch` invocations above are separate OS processes; the
+    // Both `decdn get` invocations above are separate OS processes; the
     // store directory (and at least the 3 records fetch #1 wrote) must still
     // be on disk now that both have exited.
     let files_after_fetch2: Vec<_> = std::fs::read_dir(&peers_dir)
@@ -289,7 +289,7 @@ async fn run() -> anyhow::Result<()> {
         .collect();
     anyhow::ensure!(
         files_after_fetch2.len() >= 3,
-        "peer records did not persist across the two separate `decdn fetch` processes: found {} \
+        "peer records did not persist across the two separate `decdn get` processes: found {} \
          record file(s) after fetch #2, expected >= 3",
         files_after_fetch2.len()
     );
@@ -310,25 +310,25 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Run `decdn fetch`, retrying until the node's chain watcher has observed the
-/// freshly-opened pool (`decdn fetch` has no internal retry for that race).
+/// Run `decdn get`, retrying until the node's chain watcher has observed the
+/// freshly-opened pool (`decdn get` has no internal retry for that race).
 /// Mirrors `cli_fetch_resume`/`cli_fetch_multi_source`'s helper of the same
 /// name.
 async fn run_fetch_until_ready(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
-            .arg("fetch")
+            .arg("get")
             .args(args)
             .output()
             .await
-            .context("spawn decdn fetch")?;
+            .context("spawn decdn get")?;
         if output.status.success() {
             return Ok(());
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "decdn fetch never succeeded; last stderr:\n{}",
+            "decdn get never succeeded; last stderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         tracing::debug!(
@@ -339,7 +339,7 @@ async fn run_fetch_until_ready(data_dir: &std::path::Path, args: &[String]) -> a
     }
 }
 
-/// The `decdn fetch` argv (after the `fetch` subcommand) to pull `hash` via
+/// The `decdn get` argv (after the `get` subcommand) to pull `hash` via
 /// AUTO-DISCOVERY — deliberately no `--node-id`/`--addr`/`--provider-address`,
 /// since the peer store only ever gets populated (and consulted) on the
 /// auto-discovery path (`discover_provider`); the pinned `--node-id` path never
@@ -352,8 +352,7 @@ fn fetch_argv(
     out: &std::path::Path,
 ) -> Vec<String> {
     vec![
-        "--hash".into(),
-        hash.to_hex(),
+        format!("decdn:{}", hash.to_hex()),
         "-o".into(),
         out.display().to_string(),
         "--capacity-bond-address".into(),

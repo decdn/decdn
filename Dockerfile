@@ -4,8 +4,8 @@
 #   * `decdn-node` (the default, last stage): the daemon, plus the `decdn` CLI so
 #     an operator can run `docker exec <container> decdn node status` against the
 #     daemon's local admin RPC.
-#   * `decdn`: the CLI only, for publishers and clients (`decdn fetch`,
-#     `decdn bundle pull`, `decdn publish …`).
+#   * `decdn`: the CLI only, for publishers and clients (`decdn get`,
+#     `decdn publish …`).
 #
 # `.github/workflows/release.yml` builds every target once in `build-binaries`,
 # then the `docker` job unpacks the Linux release archives into dist/<arch>/ and
@@ -64,7 +64,7 @@ VOLUME ["/home/decdn/.decdn"]
 
 # The CLI only dials out, so it exposes no port. `CMD ["--help"]` makes a bare
 # `docker run <image>` print usage and exit 0; any arguments replace it
-# (`docker run <image> fetch --hash <hash> -o <path>`).
+# (`docker run <image> get decdn:<hash> -o <path>`).
 ENTRYPOINT ["decdn"]
 CMD ["--help"]
 

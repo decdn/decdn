@@ -1,12 +1,14 @@
-//! `decdn bundle pull` — fetch every blob a bundle manifest references into an
-//! output directory over the paid `cdn/client/v1` path (issue #391).
+//! The bundle route of `decdn get` (`decdn:<hash>/` and
+//! `decdn:<hash>/<path>`): fetch every blob a bundle manifest references, or
+//! the one entry the URI names, into an output directory over the paid
+//! `cdn/client/v1` path (issues #391, #2449).
 //!
 //! The pull itself is [`decdn_client::bundle::BundlePuller`]; this module is
 //! its command line. It resolves the flags and config into the puller's
-//! inputs, reads the manifest from a local file (`-i`) or fetches it by its
-//! own BLAKE3 hash (`--hash`), applies the `--include`/`--exclude` filter and
-//! the `--select` editor, renders progress, maps Ctrl-C to the puller's cancel
-//! token, and prints the summary (or the `--json` report).
+//! inputs, fetches the manifest by its own BLAKE3 hash, keeps the URI's entry
+//! or applies the `--include`/`--exclude` filter and the `--select` editor,
+//! renders progress, maps Ctrl-C to the puller's cancel token, and prints the
+//! summary (or the `--json` report).
 
 use std::collections::HashSet;
 use std::io::IsTerminal as _;
@@ -18,11 +20,14 @@ use anyhow::{Context as _, anyhow, bail};
 use decdn_client::PoolReplaced;
 use decdn_client::bundle::{
     BundleEnd, BundleManifest, BundleObserver, BundlePuller, BundleReport, EntryLanded,
-    FaultContext, FaultHints, FileObserver, Funding, ManifestEntry, STAGING_DIR, select_nodes,
+    FaultContext, FaultHints, FileObserver, Funding, ManifestEntry, NotAManifest, STAGING_DIR,
+    select_nodes,
 };
 use decdn_client::buyer_pool::UnconfirmedOpens;
 use decdn_client::endpoint as client_endpoint;
-use decdn_common::cli::BundlePullArgs;
+use decdn_client::uri::{DecdnUri, UriTarget};
+use decdn_common::cli::GetArgs;
+use decdn_common::cli::get::{DEFAULT_JOBS, DEFAULT_MAX_LANE_STREAMS};
 use decdn_common::config::load_file_config;
 use decdn_incentive::CapabilityGrant;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
@@ -55,16 +60,20 @@ fn run_label(output: &Path) -> String {
     )
 }
 
-/// The compiled `--include`/`--exclude` globs that select which manifest entries
-/// a pull run fetches. Both sets match an entry's POSIX relative `path` — the
-/// manifest field (`models/a.bin`), never the on-disk absolute path — with the
-/// same gitignore glob dialect `origin import --exclude` uses (`*` does not
-/// cross `/`, `**` recurses), via [`build_glob_set`].
+/// What selects the manifest entries a pull run fetches: the one entry an
+/// entry URI names, or the compiled `--include`/`--exclude` globs.
 ///
-/// An entry is kept iff it passes the include gate AND matches no exclude. The
-/// include gate is open when no `--include` was given (every entry passes) and
-/// otherwise requires a match against at least one include pattern; `--exclude`
-/// always wins over `--include`.
+/// An entry URI (`decdn:<hash>/<path>`) keeps exactly the entry whose manifest
+/// `path` equals `<path>`, byte for byte, with no glob semantics.
+///
+/// The globs match an entry's POSIX relative `path` — the manifest field
+/// (`models/a.bin`), never the on-disk absolute path — with the same gitignore
+/// glob dialect `origin import --exclude` uses (`*` does not cross `/`, `**`
+/// recurses), via [`build_glob_set`]. An entry is kept iff it passes the
+/// include gate AND matches no exclude. The include gate is open when no
+/// `--include` was given (every entry passes) and otherwise requires a match
+/// against at least one include pattern; `--exclude` always wins over
+/// `--include`.
 ///
 /// Every pattern matches the whole path from the bundle root, so `metal/*`
 /// matches `metal/model.bin` but not `gpt/metal/model.bin`; `**/metal/*`
@@ -72,6 +81,8 @@ fn run_label(output: &Path) -> String {
 /// so [`Self::apply_and_warn`] names each one.
 #[derive(Debug)]
 struct EntryFilter {
+    /// The manifest path an entry URI names.
+    entry: Option<String>,
     include: globset::GlobSet,
     /// The `--include` patterns as given, in the order [`build_glob_set`]
     /// compiled them, so a [`globset::GlobSet::matches`] index names its
@@ -123,10 +134,16 @@ struct FilterPass {
 }
 
 impl EntryFilter {
-    /// Compile the run's `--include`/`--exclude` patterns. A malformed glob is a
-    /// hard error naming the flag it came from.
-    fn compile(include: &[String], exclude: &[String]) -> anyhow::Result<Self> {
+    /// Compile the run's entry selection: the URI's `entry` path, and the
+    /// `--include`/`--exclude` patterns. A malformed glob is a hard error naming
+    /// the flag it came from.
+    fn compile(
+        entry: Option<String>,
+        include: &[String],
+        exclude: &[String],
+    ) -> anyhow::Result<Self> {
         Ok(Self {
+            entry,
             include: build_glob_set(include, "--include")?,
             include_patterns: include.to_vec(),
             exclude: build_glob_set(exclude, "--exclude")?,
@@ -148,7 +165,8 @@ impl EntryFilter {
                 let p = Path::new(&e.path);
                 let included = mark_hits(&self.include, p, &mut include_hits);
                 let excluded = mark_hits(&self.exclude, p, &mut exclude_hits);
-                (self.include_patterns.is_empty() || included) && !excluded
+                let named = self.entry.as_ref().is_none_or(|entry| *entry == e.path);
+                named && (self.include_patterns.is_empty() || included) && !excluded
             })
             .collect();
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
@@ -180,12 +198,25 @@ impl EntryFilter {
     /// [`Self::apply_reporting`], with one `warning:` line on stderr for each
     /// pattern that matched no entry. Returns the kept entries and how many the
     /// filter dropped.
-    fn apply_and_warn(&self, entries: Vec<ManifestEntry>) -> (Vec<ManifestEntry>, u64) {
+    ///
+    /// # Errors
+    ///
+    /// When an entry URI names a path the manifest does not hold.
+    fn apply_and_warn(
+        &self,
+        entries: Vec<ManifestEntry>,
+    ) -> anyhow::Result<(Vec<ManifestEntry>, u64)> {
         let pass = self.apply_reporting(entries);
         for u in &pass.unmatched {
             eprintln!("warning: {}", u.warning());
         }
-        (pass.kept, pass.excluded)
+        if let Some(entry) = &self.entry {
+            anyhow::ensure!(
+                !pass.kept.is_empty(),
+                "the bundle has no entry {entry:?}; a URI path names one manifest `path` exactly"
+            );
+        }
+        Ok((pass.kept, pass.excluded))
     }
 }
 
@@ -235,7 +266,7 @@ fn anywhere_suggestion(pattern: &str, paths: &[&str]) -> Option<String> {
 /// Header written above the file list in the `--select` editor buffer. Explains
 /// the git-rebase-style convention: commented or deleted lines are skipped.
 const SELECT_HEADER: &str = "\
-# decdn bundle pull --select — choose which files to pull.
+# decdn get --select — choose which files to pull.
 #
 # Comment out (prefix with #) or delete any line to SKIP that file.
 # Save and exit to pull every file still listed below; delete them all to pull
@@ -331,12 +362,12 @@ fn parse_selection(
 /// through unchanged when `--select` is off. Each deselected entry adds to the
 /// excluded count. `Ok(None)` means the user deselected every file:
 /// [`report_nothing_to_fetch`] was already called, so the run is done.
-fn maybe_select(args: &BundlePullArgs, mut kept: Kept) -> anyhow::Result<Option<Kept>> {
+fn maybe_select(args: &GetArgs, uri: &DecdnUri, mut kept: Kept) -> anyhow::Result<Option<Kept>> {
     if args.select {
         kept = apply_selection(kept, select_entries)?;
         if kept.manifest.entries.is_empty() {
             report_nothing_to_fetch(NothingReason::Deselected);
-            warn_leftover_partials(&args.output, &[], args.hash.as_deref());
+            warn_leftover_partials(&args.output, &[], uri.hash);
             return Ok(None);
         }
     }
@@ -362,7 +393,7 @@ fn apply_selection(
 /// needs an interactive terminal (both stdin and stdout) and is incompatible with
 /// the non-interactive `--json` and `--dry-run` modes. A no-op when `--select` is
 /// not set.
-fn check_select_flags(args: &BundlePullArgs) -> anyhow::Result<()> {
+fn check_select_flags(args: &GetArgs) -> anyhow::Result<()> {
     if !args.select {
         return Ok(());
     }
@@ -528,8 +559,13 @@ fn load_buyer_signer(chain: &fetch::ResolvedChain) -> anyhow::Result<Arc<Private
     Ok(Arc::new(load_signer(&chain.keystore, &password)?))
 }
 
-/// Entry point for `decdn bundle pull`.
-pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+/// `decdn get decdn:<hash>/` and `decdn get decdn:<hash>/<path>`: pull the
+/// bundle `uri` names, or its one entry, into `--output`.
+pub(crate) async fn bundle_pull(
+    args: &GetArgs,
+    uri: &DecdnUri,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
     // Validate the flag combination first — BEFORE the dry-run short-circuit — so a
     // bad combo (e.g. `--provider-address` without `--node-id`) or an unusable
     // timeout pair is rejected even for `--dry-run`. This rule does not run at
@@ -537,11 +573,15 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // is cheap and side-effect-free.
     args.common.validate()?;
 
-    // Compile the `--include`/`--exclude` entry filter BEFORE the dry-run
-    // short-circuit — same rationale as `validate()`: a malformed glob is
-    // rejected before any network, chain, or keystore work, and `--dry-run`
-    // reflects the filtered plan too.
-    let filter = EntryFilter::compile(&args.include, &args.exclude)?;
+    // Compile the entry selection BEFORE the dry-run short-circuit — same
+    // rationale as `validate()`: a malformed glob is rejected before any
+    // network, chain, or keystore work, and `--dry-run` reflects the filtered
+    // plan too.
+    let entry = match &uri.target {
+        UriTarget::BundleEntry(path) => Some(path.clone()),
+        _ => None,
+    };
+    let filter = EntryFilter::compile(entry, &args.include, &args.exclude)?;
     let filters_given = !args.include.is_empty() || !args.exclude.is_empty();
 
     // `--select` opens an editor: reject an incompatible combo or a non-terminal
@@ -551,30 +591,8 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
 
     // Dry-run short-circuits before any network/chain/keystore activity.
     if args.dry_run {
-        return dry_run(args, &filter, filters_given);
+        return dry_run(args, uri, &filter, filters_given);
     }
-
-    // A local manifest is read up front (no network) and filtered here, so a
-    // bundle that is empty — or emptied by the filter — needs no endpoint or
-    // keystore password at all.
-    let local_manifest = match &args.input {
-        Some(path) => {
-            let mut m = read_local_manifest(path)?;
-            let raw_empty = m.entries.is_empty();
-            let (entries, excluded) = filter.apply_and_warn(m.entries);
-            m.entries = entries;
-            if m.entries.is_empty() {
-                report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
-                warn_leftover_partials(&args.output, &[], None);
-                return Ok(());
-            }
-            Some(Kept {
-                manifest: m,
-                excluded,
-            })
-        }
-        None => None,
-    };
 
     let common = &args.common;
     let relays = client_endpoint::resolve_relays(common.relay_url.as_deref(), config_path)?;
@@ -589,7 +607,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // deposit in `chain`, so its funding recovery step has nothing to add.
     let grant = fetch::resolve_delegation_grant(common, &mut chain)?;
 
-    // Same guard as `decdn fetch`, for the same reason and before the same
+    // Same guard as the blob route, for the same reason and before the same
     // password prompt: a node's data dir is a buy target only when the
     // operator named it (#2082).
     let store: Arc<dyn BuyerPoolStore> = Arc::new(open_client_store_for_buy(
@@ -603,13 +621,13 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // cleanly instead of being aborted on drop.
     let result = pull_over(
         args,
+        uri,
         &chain,
         grant,
         &store,
         &endpoint,
         &relays,
         (&filter, filters_given),
-        local_manifest,
     )
     .await;
     endpoint.close().await;
@@ -618,18 +636,18 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
 
 /// The part of [`bundle_pull`] that runs over its open `endpoint`: resolve the
 /// providers and the buyer signer, build the puller, obtain the manifest, and
-/// pull it. `filter` is the compiled `--include`/`--exclude` filter and whether
-/// either flag was given.
+/// pull it. `filter` is the compiled entry selection and whether `--include` or
+/// `--exclude` was given.
 #[allow(clippy::too_many_arguments)]
 async fn pull_over(
-    args: &BundlePullArgs,
+    args: &GetArgs,
+    uri: &DecdnUri,
     chain: &fetch::ResolvedChain,
     grant: Option<CapabilityGrant>,
     store: &Arc<dyn BuyerPoolStore>,
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     (filter, filters_given): (&EntryFilter, bool),
-    local_manifest: Option<Kept>,
 ) -> anyhow::Result<()> {
     let common = &args.common;
     // The node selection is resolved BEFORE the keystore prompt, so a failed
@@ -664,9 +682,11 @@ async fn pull_over(
         nodes,
     )
     .relays(relays.to_vec())
-    .namespace(args.namespace)
-    .jobs(args.jobs)
-    .max_lane_streams(usize::from(args.max_lane_streams))
+    .namespace(uri.namespace)
+    .jobs(args.jobs.unwrap_or(DEFAULT_JOBS))
+    .max_lane_streams(usize::from(
+        args.max_lane_streams.unwrap_or(DEFAULT_MAX_LANE_STREAMS),
+    ))
     .max_rate_per_mb(common.max_rate_per_mb)
     .max_blob_bytes(common.max_blob_mb.saturating_mul(1024 * 1024))
     .stop(std::io::stderr().is_terminal(), common.give_up_after())
@@ -676,17 +696,17 @@ async fn pull_over(
     .build()
     .await?;
 
-    // Watched from before the manifest: the `--hash` manifest fetch is paid,
-    // so it can open the run's pool. The first Ctrl-C stops the run where it
-    // is; a second one exits at once.
+    // Watched from before the manifest: the manifest fetch is paid, so it can
+    // open the run's pool. The first Ctrl-C stops the run where it is; a
+    // second one exits at once.
     let mut interrupt = Interrupt::watch(opens.clone());
     let result = pull_manifest(
         &mut puller,
         &mut interrupt,
         &observer,
         args,
+        uri,
         (filter, filters_given),
-        local_manifest,
     )
     .await;
     // Every exit of the manifest or the pull can drop an `openPool` before
@@ -712,17 +732,17 @@ async fn pull_manifest(
     puller: &mut BundlePuller,
     interrupt: &mut Interrupt,
     observer: &PullObserver,
-    args: &BundlePullArgs,
+    args: &GetArgs,
+    uri: &DecdnUri,
     (filter, filters_given): (&EntryFilter, bool),
-    local_manifest: Option<Kept>,
 ) -> anyhow::Result<()> {
-    // Obtain the manifest: the pre-read local one, or the `--hash` bundle blob
-    // fetched and filtered here. `None` => filtered to empty (already reported).
-    // `--select`: let the user trim the (already glob-filtered) list in their
-    // editor. Everything deselected ends the run (reported) like an empty filter.
+    // Obtain the manifest: the bundle blob fetched and filtered here. `None` =>
+    // filtered to empty (already reported). `--select`: let the user trim the
+    // (already glob-filtered) list in their editor. Everything deselected ends
+    // the run (reported) like an empty filter.
     let selected = async {
         let obtained = tokio::select! {
-            obtained = obtain_manifest(puller, args, filter, filters_given, local_manifest) => {
+            obtained = obtain_manifest(puller, args, uri, filter, filters_given) => {
                 obtained?
             }
             () = interrupt.wait() => return Err(Interrupted.into()),
@@ -730,11 +750,11 @@ async fn pull_manifest(
         let Some(kept) = obtained else {
             return Ok(None);
         };
-        maybe_select(args, kept)
+        maybe_select(args, uri, kept)
     }
     .await;
-    // The `--hash` manifest fetch is paid, so a run that ends here still owes
-    // the wallet-shortfall warning the summary below prints otherwise.
+    // The manifest fetch is paid, so a run that ends here still owes the
+    // wallet-shortfall warning the summary below prints otherwise.
     let Some(Kept { manifest, excluded }) = selected.inspect_err(|_| warn_shortfall(puller))?
     else {
         warn_shortfall(puller);
@@ -759,7 +779,7 @@ async fn pull_manifest(
         print_reclaim_note(replaced);
     }
     observer.finish();
-    warn_leftover_partials(&args.output, &manifest.entries, args.hash.as_deref());
+    warn_leftover_partials(&args.output, &manifest.entries, uri.hash);
     let reported = report(&outcome.report, excluded, &args.output, args.json);
     // A fault that ended the whole pull is its result, so `main` maps it to
     // its exit code (75 for a give-up with no `openPool` in flight, 1
@@ -781,36 +801,28 @@ fn print_reclaim_note(replaced: PoolReplaced) {
     );
 }
 
-/// The kept manifest for the run: the pre-read local one (already filtered up
-/// front), or the `--hash` bundle blob fetched and filtered here. The fetch
-/// reads the output root's manifest cache first, unless `--overwrite`.
-/// `Ok(None)` means the manifest is empty after filtering —
+/// The kept manifest for the run: the bundle blob fetched and filtered here.
+/// The fetch reads the output root's manifest cache first, unless
+/// `--overwrite`. `Ok(None)` means the manifest is empty after filtering —
 /// [`report_nothing_to_fetch`] was already called, so the caller returns
 /// `Ok(())`.
 async fn obtain_manifest(
     puller: &BundlePuller,
-    args: &BundlePullArgs,
+    args: &GetArgs,
+    uri: &DecdnUri,
     filter: &EntryFilter,
     filters_given: bool,
-    local_manifest: Option<Kept>,
 ) -> anyhow::Result<Option<Kept>> {
-    if let Some(m) = local_manifest {
-        return Ok(Some(m));
-    }
-    let raw = args
-        .hash
-        .as_deref()
-        .ok_or_else(|| anyhow!("no bundle source (expected -i or --hash)"))?;
-    let hash = fetch::parse_hash(raw)?;
     let mut m = puller
-        .fetch_manifest(hash, &args.output, !args.overwrite)
-        .await?;
+        .fetch_manifest(uri.hash, &args.output, !args.overwrite)
+        .await
+        .map_err(not_a_manifest_hint)?;
     let raw_empty = m.entries.is_empty();
-    let (entries, excluded) = filter.apply_and_warn(m.entries);
+    let (entries, excluded) = filter.apply_and_warn(m.entries)?;
     m.entries = entries;
     if m.entries.is_empty() {
         report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
-        warn_leftover_partials(&args.output, &[], args.hash.as_deref());
+        warn_leftover_partials(&args.output, &[], uri.hash);
         return Ok(None);
     }
     Ok(Some(Kept {
@@ -950,17 +962,10 @@ fn entry_done_line(
         parts.join(", ")
     };
     format!(
-        "bundle pull: {}: {} in {secs:.1}s ({detail})",
+        "get: {}: {} in {secs:.1}s ({detail})",
         blake3::Hash::from_bytes(hash).to_hex(),
         indicatif::HumanBytes(size),
     )
-}
-
-/// Read + parse a local bundle manifest file.
-fn read_local_manifest(path: &Path) -> anyhow::Result<BundleManifest> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("read bundle file {}", path.display()))?;
-    BundleManifest::parse(&bytes)
 }
 
 /// Why a pull ended with no entries to fetch — picks the message
@@ -1003,38 +1008,48 @@ fn report_nothing_to_fetch(reason: NothingReason) {
     println!("{msg}");
 }
 
-/// The manifest a dry run can read with no network: the `-i` file, or the
-/// `--hash` bundle's copy in the output root's manifest cache. `None` when
-/// `--hash` has no cached copy. Errors on a malformed `--hash`, an unreadable
-/// `-i` file, a cache file that cannot be read or fails its hash check (naming
-/// its path), or bytes that do not parse as a v1 manifest. The cache is read even under
-/// `--overwrite`, which makes a real pull fetch the manifest again: the cache
-/// is content-addressed, so its bytes are exactly what that fetch returns.
-fn dry_run_manifest(args: &BundlePullArgs) -> anyhow::Result<Option<BundleManifest>> {
-    match (&args.input, &args.hash) {
-        (Some(path), _) => read_local_manifest(path).map(Some),
-        (None, Some(h)) => BundleManifest::cached(&args.output, fetch::parse_hash(h)?),
-        (None, None) => bail!("no bundle source (expected -i or --hash)"),
+/// The hint for a bundle URI whose hash names a blob that is not a manifest:
+/// the trailing `/` asked for a bundle, and dropping it fetches the raw blob.
+/// Every other error passes through unchanged.
+fn not_a_manifest_hint(err: anyhow::Error) -> anyhow::Error {
+    if err
+        .chain()
+        .any(<dyn std::error::Error + 'static>::is::<NotAManifest>)
+    {
+        err.context(
+            "the URI's trailing `/` names a bundle, but this blob is not a bundle manifest; \
+             drop the trailing `/` to fetch the raw blob",
+        )
+    } else {
+        err
     }
 }
 
 /// Print the would-fetch plan and exit (no network/chain/keystore activity).
-/// The plan lists the entries of the manifest [`dry_run_manifest`] reads: the
-/// `-i` file, or a `--hash` bundle's cached manifest. The `--include`/`--exclude`
+/// The plan lists the entries of the bundle's manifest as cached in the output
+/// root by an earlier pull. The cache is read even under `--overwrite`, which
+/// makes a real pull fetch the manifest again: the cache is content-addressed,
+/// so its bytes are exactly what that fetch returns. The entry selection
 /// `filter` applies to those entries, so the plan is the entry set a real run
 /// starts from and the unmatched-pattern warnings are the ones it prints. A real
 /// run then skips files already present in the output root (unless
 /// `--overwrite`) and warns on leftover partials; the dry run does neither. A
-/// `--hash` bundle with no cached manifest reports only the bundle and the
-/// output root, with `entries: null` under `--json`.
-fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> anyhow::Result<()> {
+/// bundle with no cached manifest reports only the bundle and the output root,
+/// with `entries: null` under `--json`.
+fn dry_run(
+    args: &GetArgs,
+    uri: &DecdnUri,
+    filter: &EntryFilter,
+    filters_given: bool,
+) -> anyhow::Result<()> {
     let out = args.output.display();
-    let Some(mut manifest) = dry_run_manifest(args)? else {
-        let h = args.hash.as_deref().unwrap_or_default();
+    let cached = BundleManifest::cached(&args.output, uri.hash).map_err(not_a_manifest_hint)?;
+    let Some(mut manifest) = cached else {
+        let h = blake3::Hash::from_bytes(uri.hash).to_hex();
         if args.json {
             let plan = serde_json::json!({
                 "output": out.to_string(),
-                "hash": h,
+                "hash": h.as_str(),
                 "count": null,
                 "entries": null,
             });
@@ -1047,18 +1062,18 @@ fn dry_run(args: &BundlePullArgs, filter: &EntryFilter, filters_given: bool) -> 
             ""
         };
         println!(
-            "--dry-run with --hash: would fetch bundle {h} then its entries into {out} \
+            "--dry-run: would fetch bundle {h} then its entries into {out} \
              (no cached manifest: entries are listed once a pull into this directory \
              caches it{filter_note})"
         );
         return Ok(());
     };
     let raw_empty = manifest.entries.is_empty();
-    manifest.entries = filter.apply_and_warn(manifest.entries).0;
+    manifest.entries = filter.apply_and_warn(manifest.entries)?.0;
     if args.json {
         // The `--json` plan stays machine-readable — an empty set is
-        // `count: 0` with an empty `entries` array, no prose line. A `--hash`
-        // bundle with no cached manifest gives `count`/`entries` of `null`.
+        // `count: 0` with an empty `entries` array, no prose line. A bundle
+        // with no cached manifest gives `count`/`entries` of `null`.
         let plan = serde_json::json!({
             "output": args.output.display().to_string(),
             "count": manifest.entries.len(),
@@ -1277,14 +1292,13 @@ fn leftover_warning(dir: &Path, leftovers: &Leftovers) -> Option<String> {
 /// pulled into the same output directory left. They stay for a later run that
 /// selects the entry again, so the warning only names them and never deletes
 /// them. `entries` are the run's selected entries (none when the filter or
-/// `--select` emptied the run), and `bundle_hash` is the `--hash` manifest
-/// blob, which is also this run's own.
-fn warn_leftover_partials(out_root: &Path, entries: &[ManifestEntry], bundle_hash: Option<&str>) {
+/// `--select` emptied the run), and `bundle_hash` is the manifest blob, which
+/// is also this run's own.
+fn warn_leftover_partials(out_root: &Path, entries: &[ManifestEntry], bundle_hash: [u8; 32]) {
     let keep: HashSet<[u8; 32]> = entries
         .iter()
-        .map(|e| e.hash.as_str())
-        .chain(bundle_hash)
-        .filter_map(|h| fetch::parse_hash(h).ok())
+        .filter_map(|e| fetch::parse_hash(&e.hash).ok())
+        .chain([bundle_hash])
         .collect();
     let leftovers = leftover_partials(out_root, &keep);
     if let Some(line) = leftover_warning(&out_root.join(STAGING_DIR), &leftovers) {

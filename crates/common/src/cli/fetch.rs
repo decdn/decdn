@@ -1,10 +1,10 @@
-//! `decdn fetch` — the standalone client-side paid pull of a single
-//! content-addressed blob over `cdn/client/v1` (issues #391, #940).
+//! The retrieval flags of `decdn get`: the client-side paid pull over
+//! `cdn/client/v1` (issues #391, #940, #2449).
 //!
-//! The paying sibling of [`super::probe::ProbeArgs`]: a one-shot client command
+//! The paying sibling of [`super::probe::ProbeArgs`]: a one-shot client pull
 //! that dials a node by explicit `--node-id`/`--addr`/`--relay-url` (or
 //! auto-discovers one, #936) and pays per-MB from the caller's own
-//! `PaymentPool` deposit. The pool is **auto-opened and reused**: `fetch`
+//! `PaymentPool` deposit. The pool is **auto-opened and reused**: the pull
 //! looks up the caller's live pool in its persistent buyer-pool store, resuming
 //! its per-`(signer, provider)` lane watermark for the chosen provider; if none
 //! exists it opens (and funds) one on-chain and records it. One pool fans out
@@ -12,14 +12,10 @@
 //!
 //! The on-chain coordinates (RPC, contract addresses, chain id, keystore, data
 //! dir) resolve **flag > `[blockchain]`/`[identity]` config > default**, so a
-//! configured client runs `decdn fetch --node-id … --addr … --provider-address
-//! … --hash … -o …` with no chain flags. Fields are kept as `String`/`Option`
-//! (mirroring [`super::probe::ProbeArgs`]); the `cli` binary parses addresses
-//! and merges the config.
-//!
-//! The network/chain/target/limit flags live in [`ClientFetchArgs`], shared
-//! (via `#[command(flatten)]`) with `decdn bundle pull` (#391) so both client
-//! commands resolve their coordinates and select a node identically.
+//! configured client runs `decdn get decdn:<hash> -o …` with no chain flags.
+//! Fields are kept as `String`/`Option` (mirroring
+//! [`super::probe::ProbeArgs`]); the `cli` binary parses addresses and merges
+//! the config.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -44,10 +40,10 @@ fn parse_region_flag(raw: &str) -> Result<String, String> {
         .ok_or_else(|| decdn_protocol::InvalidRegion.to_string())
 }
 
-/// The network, chain, target, and per-blob-limit flags shared by the paid
-/// client commands (`decdn fetch` and `decdn bundle pull`, #391). Flattened into
-/// each command's args so the resolution (`flag > config > default`) and
-/// node-selection logic have one definition.
+/// The network, chain, target, and per-blob-limit flags of `decdn get`, for a
+/// blob and a bundle alike. Flattened into [`super::GetArgs`] so the
+/// resolution (`flag > config > default`) and node-selection logic have one
+/// definition.
 ///
 /// Reachability and the required chain coordinates are validated at runtime
 /// rather than by clap, because the relay (`network.relay_urls`, #935) and the
@@ -155,7 +151,7 @@ pub struct ClientFetchArgs {
     /// Cap on concurrently-used holders (ADR 039): a fetch stripes a blob
     /// across at most this many holders at once. Enough to saturate typical
     /// downlinks without paying for marginal lanes. It also caps how many
-    /// holders a `bundle pull` range-dedup entry stripes its ranges across.
+    /// holders a bundle's range-dedup entry stripes its ranges across.
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub max_sources: usize,
 
@@ -201,11 +197,11 @@ pub struct ClientFetchArgs {
 
     /// Client-side size ceiling: refuse a delivery whose claimed total size
     /// exceeds this many MiB before pulling any bytes. Defaults to 1 TiB
-    /// (1,048,576 MiB) — far above any real blob, so `decdn fetch` and
-    /// `bundle pull` download normal content by its hash without tuning, yet low
-    /// enough to bound what a provider's over-claimed `total_bytes` can cost
-    /// locally. Lower it as a tighter budget guard, or set `0` to disable the
-    /// ceiling entirely. For `bundle pull` this is the per-entry ceiling.
+    /// (1,048,576 MiB) — far above any real blob, so `decdn get` downloads
+    /// normal content by its hash without tuning, yet low enough to bound what a
+    /// provider's over-claimed `total_bytes` can cost locally. Lower it as a
+    /// tighter budget guard, or set `0` to disable the ceiling entirely. For a
+    /// bundle this is the per-entry ceiling.
     ///
     /// The cost it bounds is on disk, not memory: the streaming pull buffers only
     /// received bytes in RAM, so RAM stays bounded whatever the claim, and a
@@ -221,7 +217,7 @@ pub struct ClientFetchArgs {
     /// Refuse a provider that quotes a per-MB rate above this many USDC base units
     /// **before** paying any voucher (#1375). Guards against a provider that quotes
     /// low on the probe then high on the stream. `0` (the default) = no ceiling.
-    /// For `bundle pull` this applies per entry. Note: unlike the node's automatic
+    /// For a bundle this applies per entry. Note: unlike the node's automatic
     /// node-to-node pull (which also caps at the candidate's own probe rate), the
     /// CLI applies only this absolute value — set it to opt into buyer rate
     /// protection on the client path.
@@ -266,13 +262,13 @@ impl ClientFetchArgs {
     /// Wall-clock cap on the `CapacityBond` registry read, including its ADR 012 retry
     /// schedule (#1349): the `--timeout-ms` value.
     ///
-    /// A separate budget, not a shared one: sharing would make `bundle pull`'s per-entry
+    /// A separate budget, not a shared one: sharing would make a bundle's per-entry
     /// fetch depend on how long the read took.
     ///
     /// # What this does NOT bound
     ///
-    /// The probe fan-out. `fetch` probes `SELECT_K` candidates after the read, and
-    /// `bundle pull` probes per entry; neither is inside this budget. Named here because
+    /// The probe fan-out. A blob fetch probes `SELECT_K` candidates after the read,
+    /// and a bundle pull probes per entry; neither is inside this budget. Named here because
     /// the obvious reading of "discovery" includes probing, and it does not.
     #[must_use]
     pub const fn discovery_cap(&self) -> Duration {
@@ -328,48 +324,6 @@ impl ClientFetchArgs {
             None => Ok(None),
         }
     }
-}
-
-/// Arguments for `decdn fetch` — one blob to a file, atop [`ClientFetchArgs`].
-#[derive(Debug, Clone, Args)]
-pub struct FetchArgs {
-    /// BLAKE3 hash of the blob to fetch: 64 hex chars (optional `0x` or `b3:`
-    /// prefix — the `b3:` form is what bundle manifests carry).
-    #[arg(long, value_name = "HASH")]
-    pub hash: String,
-
-    /// Destination path for the fetched blob. Written atomically
-    /// (temp-in-dir then rename); an existing file is replaced.
-    #[arg(short = 'o', long, value_name = "PATH")]
-    pub output: PathBuf,
-
-    /// Namespace the content is published under (ADR 002 § Retrieval by
-    /// namespace). When set, the serving node routes a cache-miss origin pull to
-    /// that namespace's DAO-authorized origins. Absent => no namespace: no
-    /// routing to a namespace's authorized origin set — served from cache, from
-    /// peers, or from the serving node's OWN configured origin, which stays a
-    /// serve target either way (`namespace_id` is a routing hint, not a serve
-    /// gate — ADR 002).
-    #[arg(long, value_name = "ID", value_parser = parse_fetch_namespace_id)]
-    pub namespace: Option<u64>,
-
-    /// Retrieval flags shared with `decdn bundle pull`: peer discovery, chain
-    /// and payment-pool coordinates, the source cap and the give-up limit.
-    #[command(flatten)]
-    pub common: ClientFetchArgs,
-}
-
-/// Parse a `--namespace` id (rejecting the reserved `0` — namespace 0 is "no
-/// namespace"; omit the flag for best-effort retrieval). Shared by `decdn fetch`
-/// and `decdn bundle pull`.
-pub(crate) fn parse_fetch_namespace_id(s: &str) -> Result<u64, String> {
-    let id: u64 = s
-        .parse()
-        .map_err(|_| format!("invalid namespace id: {s}"))?;
-    if id == 0 {
-        return Err("namespace id must be >= 1 (omit --namespace for no namespace)".to_string());
-    }
-    Ok(id)
 }
 
 #[cfg(test)]

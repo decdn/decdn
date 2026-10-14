@@ -1,6 +1,6 @@
 //! Run-scoped registry of live per-lane voucher ledgers.
 //!
-//! One `bundle pull` run shares a single [`PoolLedger`] per `(pool_id, signer,
+//! One bundle pull shares a single [`PoolLedger`] per `(pool_id, signer,
 //! provider)` lane across every concurrent entry fetch on that lane, so their
 //! voucher cumulatives advance through one monotonic issuer instead of colliding
 //! across per-fetch instances. `total_committed` is the pool-wide deposit-spend

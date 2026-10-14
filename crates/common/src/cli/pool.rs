@@ -1,6 +1,6 @@
 //! `decdn pool` — client-side payment-pool lifecycle commands.
 //!
-//! Sibling of [`super::fetch`]: where `fetch` opens/reuses the caller's own
+//! Sibling of [`super::fetch`]: where `decdn get` opens/reuses the caller's own
 //! `PaymentPool` deposit and pays for delivery from it, the `pool` subcommands
 //! manage that deposit directly. `list`/`status` is a read-only dump of the
 //! tracked buyer pools and their per-lane voucher watermark; `open` escrows a
@@ -208,7 +208,7 @@ pub struct PoolReclaimArgs {
 ///
 /// The chain coordinates resolve flag > `[blockchain]` config; the keystore and
 /// data dir resolve flag > `[blockchain]`/`[identity]` config > default, exactly
-/// as `decdn fetch` does. Flattened into each subcommand's flags so every
+/// as `decdn get` does. Flattened into each subcommand's flags so every
 /// `pool` command shares one precedence path.
 #[derive(Args, Debug)]
 pub struct PoolChainArgs {

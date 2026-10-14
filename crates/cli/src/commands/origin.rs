@@ -170,7 +170,7 @@ struct ImportCtx {
 ///
 /// A backslash is rejected before that check. `\` is not a POSIX separator, so
 /// on Unix `a\..\evil` collapses to one `Normal` component and slips past the
-/// `..` check — yet a Windows `bundle pull` parses `\` as a separator in
+/// `..` check — yet a bundle `decdn get` on Windows parses `\` as a separator in
 /// `safe_join`, turning that same manifest path into a parent-dir escape.
 /// Requiring `/` keeps the published manifest identical and safe on every
 /// platform.

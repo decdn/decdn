@@ -273,10 +273,10 @@ pub struct BlockchainConfig {
     /// fully withdrawable, so the buyer opens at this amount directly rather
     /// than escrowing a smaller first-contact lock. Both refill legs target
     /// it: the low-water refill, which both binaries run on pool reuse, and
-    /// the funding recovery step, which every fetch path (`decdn fetch`,
-    /// `decdn bundle pull`, and the daemon's node-to-node cache-miss pull)
-    /// runs once no node serves at the current deposit (#1530). Larger values amortize gas across more delivery at
-    /// the cost of more capital locked. Absent => default (10 USDC =
+    /// the funding recovery step, which every fetch path (`decdn get` and the
+    /// daemon's node-to-node cache-miss pull) runs once no node serves at the
+    /// current deposit (#1530). Larger values amortize gas across more delivery
+    /// at the cost of more capital locked. Absent => default (10 USDC =
     /// `10_000_000`). Must be nonzero (the pool's `openPool` reverts on a zero
     /// deposit).
     pub buyer_working_deposit_micro_usdc: Option<u64>,
@@ -284,10 +284,10 @@ pub struct BlockchainConfig {
     /// `PaymentPool` contract so the buyer path can join a pool (#744).
     /// The absent-default is **profile-dependent**: the node daemon defaults to
     /// `true` (a long-lived operator amortizes one unlimited approval across many
-    /// node-to-node miss pulls), while the `decdn` client fetch commands (`fetch`,
-    /// `bundle pull`) default to `false`, i.e. an **exact deposit-sized** approval
-    /// scoped to what each pool escrows. Set `true` on the client to opt a
-    /// power user back into the unlimited allowance.
+    /// node-to-node miss pulls), while `decdn get` defaults to `false`, i.e. an
+    /// **exact deposit-sized** approval scoped to what each pool escrows. Set
+    /// `true` on the client to opt a power user back into the unlimited
+    /// allowance.
     pub buyer_max_approve: Option<bool>,
     /// The node's refundable floor `M` (base units, `µUSDC`): the minimum
     /// remaining on-chain pool balance the node insists on keeping in reserve

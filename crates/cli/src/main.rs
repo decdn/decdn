@@ -1,7 +1,7 @@
 //! deCDN user CLI — `decdn` binary entry point.
 //!
 //! Pairs with the `decdn-node` daemon: this binary carries every command
-//! a human types in a terminal (probe, fetch, pools, publishing, node
+//! a human types in a terminal (probe, get, pools, publishing, node
 //! admin). The `node` subcommand group talks to a running daemon over the
 //! loopback admin RPC surface (`appendix-local-admin-http.md`) and fails
 //! cleanly on a publisher's laptop where no daemon is running.
@@ -84,14 +84,10 @@ async fn run() -> anyhow::Result<()> {
             }
         },
         Command::Probe(args) => commands::probe::probe(&args, config_path.as_deref()).await,
-        Command::Fetch(args) => commands::fetch::fetch(&args, config_path.as_deref()).await,
         Command::Gateway(args) => commands::gateway::gateway(&args, config_path.as_deref()).await,
         Command::Get(args) => commands::get::get(&args, config_path.as_deref()).await,
         Command::Setup(args) => commands::setup::run(&args, config_path.as_deref()).await,
         Command::Node(args) => commands::node::node_dispatch(&args, config_path.as_deref()).await,
-        Command::Bundle(args) => {
-            commands::bundle::bundle_dispatch(&args, config_path.as_deref()).await
-        }
         // `origin` is offline, config-free local filesystem work — it never
         // reads the node config, so `config_path` is intentionally not passed.
         Command::Origin(args) => commands::origin::origin_dispatch(&args).await,

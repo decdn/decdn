@@ -47,7 +47,7 @@ pub(crate) enum BuyerStoreOwner {
 ///
 /// Only [`DataDirSource::Flag`] is a deliberate choice of directory. On a node
 /// host `identity.data_dir` in `~/.decdn/node.toml` is already the node's, and
-/// a bare `decdn fetch` resolves to it without the operator naming anything —
+/// a bare `decdn get` resolves to it without the operator naming anything —
 /// which is how a client store, under the node's own operator address, lands
 /// beside the daemon's (#2082).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,8 +200,8 @@ impl BuyerStoreOwner {
 
     /// Refuse a buy that would escrow into a node data dir nobody named.
     ///
-    /// `decdn fetch` and `decdn bundle pull` are legitimately separate buyers
-    /// when a human runs them on a node host, so an explicit `--data-dir` is a
+    /// `decdn get` is legitimately a separate buyer when a human runs it on a
+    /// node host, so an explicit `--data-dir` is a
     /// real answer here in a way it is not for `pool open`. What is not an
     /// answer is arriving at the node's dir by default: `identity.data_dir`
     /// from `~/.decdn/node.toml` resolves there with nothing on the command

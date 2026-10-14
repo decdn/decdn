@@ -1,7 +1,7 @@
-//! `decdn fetch` and `decdn bundle pull` against a `decdn-node` daemon's data
-//! dir (#2082).
+//! `decdn get` against a `decdn-node` daemon's data dir (#2082), on both its
+//! blob and its bundle route.
 //!
-//! `decdn pool` refuses such a dir outright (#2078). These two are different:
+//! `decdn pool` refuses such a dir outright (#2078). `get` is different:
 //! a human fetching from a node host is a legitimately separate buyer, so an
 //! explicit `--data-dir` is a real answer. What is not is *arriving* there —
 //! `identity.data_dir` in the config file resolves to the node's dir with
@@ -24,8 +24,11 @@ use std::path::Path;
 
 mod common;
 
-/// A hash the fetch never gets far enough to look for.
-const SOME_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+/// A blob URI the fetch never gets far enough to look for.
+const SOME_BLOB: &str = "decdn:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The same hash as a bundle URI.
+const SOME_BUNDLE: &str = "decdn:0000000000000000000000000000000000000000000000000000000000000000/";
 
 /// An isolated HOME at `0o700`, which the buyer store requires of any data dir
 /// beneath it.
@@ -76,12 +79,12 @@ fn run(home: &Path, cfg: &Path, args: &[&str]) -> (bool, String) {
     )
 }
 
-/// The defect: a bare `decdn fetch` on a node host resolves to the daemon's
+/// The defect: a bare `decdn get` on a node host resolves to the daemon's
 /// data dir through the config file and escrows there under the node's own
 /// keystore. It must refuse, name both stores, and — the side effect that
 /// started #2078 — manufacture no client store on the way out.
 #[test]
-fn fetch_refuses_a_node_data_dir_it_was_not_pointed_at() {
+fn a_blob_get_refuses_a_node_data_dir_it_was_not_pointed_at() {
     let home = home();
     let data_dir = home.path().join("decdn-node");
     mark_as_node_dir(&data_dir);
@@ -91,9 +94,8 @@ fn fetch_refuses_a_node_data_dir_it_was_not_pointed_at() {
         home.path(),
         &cfg,
         &[
-            "fetch",
-            "--hash",
-            SOME_HASH,
+            "get",
+            SOME_BLOB,
             "-o",
             home.path().join("out").to_str().unwrap(),
         ],
@@ -109,9 +111,9 @@ fn fetch_refuses_a_node_data_dir_it_was_not_pointed_at() {
     );
 }
 
-/// `bundle pull` shares the resolver, so it shares the guard.
+/// The bundle route shares the resolver, so it shares the guard.
 #[test]
-fn bundle_pull_refuses_a_node_data_dir_it_was_not_pointed_at() {
+fn a_bundle_get_refuses_a_node_data_dir_it_was_not_pointed_at() {
     let home = home();
     let data_dir = home.path().join("decdn-node");
     mark_as_node_dir(&data_dir);
@@ -121,16 +123,14 @@ fn bundle_pull_refuses_a_node_data_dir_it_was_not_pointed_at() {
         home.path(),
         &cfg,
         &[
-            "bundle",
-            "pull",
-            "--hash",
-            SOME_HASH,
+            "get",
+            SOME_BUNDLE,
             "-o",
             home.path().join("out").to_str().unwrap(),
         ],
     );
 
-    assert!(!ok, "a bare bundle pull on a node data dir must refuse");
+    assert!(!ok, "a bare bundle get on a node data dir must refuse");
     assert!(stderr.contains("buyer.redb"), "{stderr}");
     assert!(
         !data_dir.join("buyer-pools.redb").exists(),
@@ -152,9 +152,8 @@ fn an_explicit_data_dir_is_the_operators_call() {
         home.path(),
         &cfg,
         &[
-            "fetch",
-            "--hash",
-            SOME_HASH,
+            "get",
+            SOME_BLOB,
             "-o",
             home.path().join("out").to_str().unwrap(),
             "--data-dir",

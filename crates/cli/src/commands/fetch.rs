@@ -1,5 +1,5 @@
-//! `decdn fetch` — standalone client-side paid pull of a single
-//! content-addressed blob over `cdn/client/v1` (issues #391, #940).
+//! The blob route of `decdn get` (`decdn:<hash>`): the client-side paid pull
+//! of a single content-addressed blob over `cdn/client/v1` (issues #391, #940).
 //!
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discover the holders, #936),
@@ -27,7 +27,7 @@
 //! Discovery, lane building and pool funding are `decdn-client`'s engine
 //! seams ([`decdn_client::targets`], [`decdn_client::lanes`],
 //! [`decdn_client::funding`], [`decdn_client::lane_sources`]), which
-//! `decdn bundle pull` drives too. This module resolves the command's flags
+//! the bundle route ([`super::bundle_pull`]) drives too. This module resolves the command's flags
 //! and config into their inputs, and renders what the fetch did.
 
 use std::path::{Path, PathBuf};
@@ -71,11 +71,12 @@ use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
 use super::tab_progress::TabProgress;
 use decdn_client::ordered_writes::OrderedWrites;
 
-/// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
+/// Parse a manifest entry's BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
 pub(crate) use decdn_client::bundle::parse_hash;
+use decdn_client::uri::DecdnUri;
 
-/// Build the `decdn fetch` delivery progress bar (#1118). Drawn to stderr and
+/// Build the blob `decdn get` delivery progress bar (#1118). Drawn to stderr and
 /// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
 /// so a piped/redirected fetch emits no bar. A steady tick animates the spinner
 /// during the pre-byte connect/handshake so the command never looks hung. The
@@ -466,8 +467,9 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
     }
 }
 
-/// Fetch a single blob over `cdn/client/v1`, auto-opening/reusing the caller's
-/// `PaymentPool` deposit, and write it atomically to `--output`. `config_path`
+/// `decdn get decdn:<hash>`: fetch the blob `uri` names over `cdn/client/v1`,
+/// auto-opening/reusing the caller's `PaymentPool` deposit, and write it
+/// atomically to `--output` (or stream it to stdout for `-o -`). `config_path`
 /// (the global `--config`) supplies relays (#935), discovery (#936), and chain
 /// coordinates.
 ///
@@ -483,8 +485,32 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 /// ends with an `openPool` whose receipt it did not read carries
 /// [`super::interrupt::PendingOpens`], as context on any of those or as the
 /// error of a fetch that otherwise succeeded.
-pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
-    fetch_into(args, config_path, &mut Sink::Output, None).await
+pub(crate) async fn fetch(
+    args: &cli::GetArgs,
+    uri: &DecdnUri,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let blob = BlobFetch {
+        hash: uri.hash,
+        namespace: uri.namespace,
+        output: args.output.clone(),
+        common: args.common.clone(),
+    };
+    fetch_into(&blob, config_path, &mut Sink::Output, None).await
+}
+
+/// One blob fetch: what `decdn get decdn:<hash>` and the gateway each hand
+/// [`fetch_into`].
+pub(crate) struct BlobFetch {
+    /// The blob's BLAKE3 hash.
+    pub(crate) hash: [u8; 32],
+    /// The namespace routing hint (ADR 002).
+    pub(crate) namespace: Option<u64>,
+    /// `-o`: the destination file, or `-` for stdout. Read only for
+    /// [`Sink::Output`].
+    pub(crate) output: PathBuf,
+    /// The retrieval flags.
+    pub(crate) common: cli::ClientFetchArgs,
 }
 
 /// A delegate credential held in memory: the key that signs vouchers and the
@@ -525,13 +551,12 @@ impl Sink {
 ///
 /// As [`fetch`].
 pub(crate) async fn fetch_into(
-    args: &cli::FetchArgs,
+    args: &BlobFetch,
     config_path: Option<&Path>,
     sink: &mut Sink,
     credential: Option<Credential>,
 ) -> anyhow::Result<()> {
     let timings = FetchTimings::start();
-    let hash = parse_hash(&args.hash)?;
     let common = &args.common;
     // Before any network or keystore work, reject a flag combination clap
     // cannot express, naming the flags the user actually typed.
@@ -583,7 +608,7 @@ pub(crate) async fn fetch_into(
     // The command's peer-record and watermark writes, off the runtime thread.
     let writes = OrderedWrites::default();
     let result = tokio::select! {
-        result = fetch_over(args, hash, &relays, &chain, (grant, signer), &store, &endpoint, &writes, &opens, &timings, sink) => {
+        result = fetch_over(args, &relays, &chain, (grant, signer), &store, &endpoint, &writes, &opens, &timings, sink) => {
             result
         }
         () = interrupt.wait() => Err(Interrupted.into()),
@@ -610,8 +635,7 @@ pub(crate) async fn fetch_into(
 /// without progress, and `--give-up-after-secs` overrides both.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn fetch_over(
-    args: &cli::FetchArgs,
-    hash: [u8; 32],
+    args: &BlobFetch,
     relays: &[RelayUrl],
     chain: &ResolvedChain,
     (grant, held_signer): (
@@ -625,6 +649,7 @@ async fn fetch_over(
     timings: &FetchTimings,
     sink: &mut Sink,
 ) -> anyhow::Result<()> {
+    let hash = args.hash;
     let common = &args.common;
     let streams = sink.streams(&args.output);
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
@@ -689,8 +714,9 @@ async fn fetch_over(
     };
 
     let max_blob_bytes = common.max_blob_mb.saturating_mul(1024 * 1024);
-    // The namespace routing hint (ADR 005 § Namespace routing): `--namespace <id>`
-    // → big-endian `uint256`; absent => `NO_NAMESPACE` (best-effort cache/DHT).
+    // The namespace routing hint (ADR 005 § Namespace routing): the URI's
+    // `?ns=<id>` → big-endian `uint256`; absent => `NO_NAMESPACE` (best-effort
+    // cache/DHT).
     let namespace_id = args
         .namespace
         .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
@@ -1166,8 +1192,8 @@ fn wants_stdout(output: &Path) -> bool {
 const RATE_SMOOTHING_TAU_SECS: f64 = 3.0;
 
 /// Rolling delivery-rate estimate behind a progress bar's `{msg}`, and the
-/// running totals the end-of-fetch summary reads back. Single-blob `fetch` feeds
-/// it from the delivery bar; `bundle pull` feeds it from its bottom total bar, so
+/// running totals the end-of-fetch summary reads back. A blob `get` feeds it
+/// from the delivery bar; a bundle `get` feeds it from its bottom total bar, so
 /// the rate there is whole-download throughput rather than one file's.
 ///
 /// The bar's positions are cumulative verified **content** bytes — what the
@@ -1287,7 +1313,7 @@ impl DeliveryMeter {
     }
 }
 
-/// The `decdn fetch` delivery progress bar, the callback that drives it, and a
+/// The blob `decdn get` delivery progress bar, the callback that drives it, and a
 /// [`DeliveryMeter`] the caller reads after `finish_and_clear` for the terminal
 /// summary (#1118). The callback advances the bar, folds each update into the
 /// shared [`SpeedState`] so `{msg}` shows a steady rate/ETA, and mirrors the
@@ -1400,7 +1426,7 @@ pub(crate) fn delegated_slot(
 /// [`CapabilityGrant`], and, when one is present, zero the working deposit
 /// in `chain`: a delegate owns no pool it could `topUp`, so its funding
 /// recovery step has nothing to add ([`decdn_client::funding::PoolFunder`]). `None` selects the
-/// unchanged self-owned pool path. Shared by `decdn fetch` and `bundle pull`.
+/// unchanged self-owned pool path. Shared by the blob and bundle routes of `decdn get`.
 ///
 /// # Errors
 ///

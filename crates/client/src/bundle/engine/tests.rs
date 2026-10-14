@@ -3357,7 +3357,7 @@ async fn materialize_from_donor_preserves_failed_slot() {
     assert!(matches!(outcomes[1], EntryOutcome::Deduped(5)));
 }
 
-/// Cache `manifest` under `out` as `bundle pull --hash` caches it, and return
+/// Cache `manifest` under `out` as a bundle `decdn get` caches it, and return
 /// the bundle's `b3:` hash.
 fn cache_manifest(out: &Path, manifest: &serde_json::Value) -> String {
     let bytes = serde_json::to_vec(manifest).unwrap();

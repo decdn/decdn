@@ -1,4 +1,4 @@
-//! The local, advisory `.decdn-manifest.json` skip-cache `decdn bundle pull`
+//! The local, advisory `.decdn-manifest.json` skip-cache a bundle `decdn get`
 //! writes into an output directory. It indexes every file the bundle(s) have
 //! placed there — keyed by bundle-relative POSIX path, merged across runs — so a
 //! later pull skips unchanged files without re-hashing and splices unchanged

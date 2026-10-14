@@ -972,7 +972,7 @@ fn store_fast_path(
 /// `store_fast_path` rejects; the caller re-probes these records for a fresh
 /// RTT. Returns them projected to [`NodeCandidate`], unranked (the probe orders
 /// them); empty when none qualify, letting the caller fall through to the
-/// registry read. `bundle pull` reads its run-wide candidate list from the same
+/// registry read. A bundle pull reads its run-wide candidate list from the same
 /// set.
 pub fn identity_fresh_candidates(
     store: &crate::PeerStore,
@@ -1238,7 +1238,7 @@ pub async fn resolve_target_node(
         ))
     })?;
     // `--timeout-ms` bounds the registry read (#1349). Nothing did before: its
-    // retry schedule alone can burn 36 s, so `decdn fetch --timeout-ms 5000`
+    // retry schedule alone can burn 36 s, so `decdn get --timeout-ms 5000`
     // could sit far longer than 5 s before the transfer it caps had started.
     //
     // The bound is applied INSIDE `bootstrap_nodes` (around the read alone)

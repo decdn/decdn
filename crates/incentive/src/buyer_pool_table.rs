@@ -6,7 +6,7 @@
 //! they differ only in *which file they own*:
 //!
 //! - `buyer_pool_redb::RedbBuyerPoolStore` owns a buyer-only
-//!   `buyer-pools.redb` for the client (`decdn fetch`, #940). (Code span,
+//!   `buyer-pools.redb` for the client (`decdn get`, #940). (Code span,
 //!   not a link: that module exists only under the `redb` feature, so
 //!   linking it would break a `buyer-store-core`-only doc build.)
 //! - `decdn-node`'s `pool_store::PersistentPoolStateStore` owns the buyer
@@ -68,7 +68,7 @@ use crate::store::StoreError;
 ///
 /// A file that holds no table of this name reads as empty: `open_table`
 /// reports `TableDoesNotExist` and every read path treats the store as having
-/// no rows. The caller (the node, or `decdn fetch` / `bundle pull`) then
+/// no rows. The caller (the node, or `decdn get`) then
 /// re-adopts a live pool on the configured contract from chain where its
 /// adoption rules allow.
 const BUYER_POOL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8]> =

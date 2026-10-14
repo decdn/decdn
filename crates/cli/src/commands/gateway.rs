@@ -38,7 +38,7 @@
 //! content never does, so a page can neither read a response nor set the
 //! token or host headers itself. The token lives in `<data-dir>/token`,
 //! owner-only. The gateway listens on loopback only and checks `Host` against
-//! DNS rebinding. Every pull runs the `decdn fetch` path with its bytes going
+//! DNS rebinding. Every pull runs the blob fetch of `decdn get` with its bytes going
 //! to the HTTP response, one pull at a time.
 
 use std::collections::HashMap;
@@ -57,7 +57,7 @@ use bytes::Bytes;
 use decdn_client::bundle::{BundleManifest, parse_hash};
 use decdn_client::session::ChainConfig;
 use decdn_client::uri::{DecdnUri, UriTarget};
-use decdn_common::cli::{self, ClientFetchArgs, FetchArgs, GatewayArgs};
+use decdn_common::cli::{self, ClientFetchArgs, GatewayArgs};
 use decdn_common::config::load_file_config;
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::PaymentPool;
@@ -72,7 +72,7 @@ use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
 
-use super::fetch::{Credential, Sink, fetch_into, resolve_chain};
+use super::fetch::{BlobFetch, Credential, Sink, fetch_into, resolve_chain};
 use crate::known_chains;
 
 /// The request header carrying the gateway token.
@@ -1109,8 +1109,8 @@ impl Gateway {
         namespace: Option<u64>,
         paying: &Paying,
     ) -> Result<(Bytes, DuplexStream, oneshot::Receiver<anyhow::Result<()>>), PullError> {
-        let args = FetchArgs {
-            hash: alloy::hex::encode(hash),
+        let args = BlobFetch {
+            hash,
             output: PathBuf::from("-"),
             namespace,
             common: self.common.clone(),

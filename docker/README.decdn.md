@@ -4,8 +4,8 @@
 The [deCDN](https://github.com/decdn/decdn) command-line client, for publishers and
 clients. deCDN nodes cache and serve BLAKE3-addressed blobs over
 [iroh](https://iroh.computer/) QUIC. The CLI pays them for every megabyte in USDC and
-verifies every byte against its content hash. It covers `decdn fetch`,
-`decdn bundle pull`, `decdn publish …` and the rest of the `decdn` commands.
+verifies every byte against its content hash. It covers `decdn get`,
+`decdn publish …` and the rest of the `decdn` commands.
 
 The network is a public testnet on Arbitrum Sepolia. Wire, config and storage formats
 change without compatibility shims until the mainnet deployment.
@@ -21,7 +21,7 @@ Mount your key directory and a working directory:
 
 ```bash
 docker run --rm -it -v ~/.decdn:/home/decdn/.decdn -v "$PWD":/work -w /work \
-  decdn/decdn fetch --hash <hash> -o blob.bin
+  decdn/decdn get decdn:<hash> -o blob.bin
 ```
 
 With no arguments the container prints `decdn --help`. Any arguments replace that. The

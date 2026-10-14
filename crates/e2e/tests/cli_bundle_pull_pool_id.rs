@@ -1,20 +1,20 @@
-//! Live anvil-backed e2e for `decdn bundle pull` over a shared payment pool: one
-//! pool funds every entry in the bundle.
+//! Live anvil-backed e2e for `decdn get decdn:<hash>/` over a shared payment
+//! pool: one pool funds the manifest and every entry in the bundle.
 //!
-//! Shape: deploy the protocol, launch a provider node serving two blobs, then
-//! `bundle pull` a two-entry manifest with the buyer's chain coordinates and NO
-//! pool pre-recorded in the client store. The CLI opens one pool on the first
-//! entry, reuses it for the second, and lands both files — proving the whole
-//! bundle pays every provider it touches from the caller's single shared pool
-//! (ADR 003), with no per-provider open.
+//! Shape: deploy the protocol, launch a provider node serving two blobs and the
+//! manifest that names them, then `get` the bundle with the buyer's chain
+//! coordinates and NO pool pre-recorded in the client store. The CLI opens one
+//! pool on the manifest fetch, reuses it for both entries, and lands both files —
+//! proving the whole bundle pays every provider it touches from the caller's
+//! single shared pool (ADR 003), with no per-provider open.
 //!
-//! `--provider-address` is passed alongside `--node-id` to pin every entry to
-//! this one node, so both entries share the same `(signer, provider)` lane. Each
-//! blob is under one `CHUNK_BYTES` of wire but their sum is over it, so the
-//! shared lane watermark crosses a chunk boundary only across the two entries —
-//! and the persisted watermark must be the EXACT aggregate wire bytes (monotone,
-//! never double-paid), the per-provider serialization holding that the two
-//! same-lane pulls do not race the cumulative counter (#1689).
+//! `--provider-address` is passed alongside `--node-id` to pin every fetch to
+//! this one node, so the manifest and both entries share the same `(signer,
+//! provider)` lane. Each blob is under one `CHUNK_BYTES` of wire but their sum is
+//! over it, so the shared lane watermark crosses a chunk boundary only across
+//! the fetches — and the persisted watermark must be the EXACT aggregate wire
+//! bytes (monotone, never double-paid), the per-provider serialization holding
+//! that the same-lane pulls do not race the cumulative counter (#1689).
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH`:
@@ -87,14 +87,25 @@ async fn run() -> anyhow::Result<()> {
     let blob_b = vec![0x42u8; 512 * 1024];
     let hash_a = Hash::new(&blob_a);
     let hash_b = Hash::new(&blob_b);
+    // The v1 manifest naming both blobs, served by the node like any blob and
+    // fetched by its own hash first.
+    let manifest = format!(
+        r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"{}"}},{{"path":"b.bin","hash":"{}"}}]}}"#,
+        hash_a.to_hex(),
+        hash_b.to_hex(),
+    )
+    .into_bytes();
+    let hash_manifest = Hash::new(&manifest);
 
     // The exact wire bytes each whole-blob pull vouchers for: bao content plus its
     // interleaved proof over the 16 KiB chunk-group-aligned whole range (ADR 038),
     // the same quantity the node meters and persists as the lane watermark.
     let wire_a = whole_blob_wire_bytes(blob_a.len() as u64);
     let wire_b = whole_blob_wire_bytes(blob_b.len() as u64);
+    let wire_manifest = whole_blob_wire_bytes(manifest.len() as u64);
     let aggregate_wire = wire_a
         .checked_add(wire_b)
+        .and_then(|w| w.checked_add(wire_manifest))
         .context("aggregate wire-byte overflow")?;
     anyhow::ensure!(
         wire_a < CHUNK_BYTES && wire_b < CHUNK_BYTES,
@@ -106,12 +117,15 @@ async fn run() -> anyhow::Result<()> {
         "the two entries must aggregate past one chunk: {aggregate_wire} <= \
          {CHUNK_BYTES}"
     );
-    let (node, hashes) =
-        NodeFixture::launch_with_blobs(&chain, "US", &[blob_a.as_slice(), blob_b.as_slice()])
-            .await?;
+    let (node, hashes) = NodeFixture::launch_with_blobs(
+        &chain,
+        "US",
+        &[blob_a.as_slice(), blob_b.as_slice(), manifest.as_slice()],
+    )
+    .await?;
     anyhow::ensure!(
-        hashes == vec![hash_a, hash_b],
-        "seeded blob hashes mismatch: {hashes:?} vs [{hash_a}, {hash_b}]"
+        hashes == vec![hash_a, hash_b, hash_manifest],
+        "seeded blob hashes mismatch: {hashes:?} vs [{hash_a}, {hash_b}, {hash_manifest}]"
     );
     let provider_addr = node.operator_addr();
 
@@ -138,21 +152,11 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("mint buyer USDC")?;
 
-    // A local v1 manifest naming both served blobs. `-i` means no manifest blob
-    // is fetched first; the entries are pulled directly.
     let out_dir = client_dir.path().join("out");
-    let manifest_path = client_dir.path().join("bundle.json");
-    let manifest = format!(
-        r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"{}"}},{{"path":"b.bin","hash":"{}"}}]}}"#,
-        hash_a.to_hex(),
-        hash_b.to_hex(),
-    );
-    std::fs::write(&manifest_path, manifest).context("write local manifest")?;
-
-    let args = bundle_pull_argv(
+    let args = bundle_get_argv(
         &chain,
         &node,
-        &manifest_path,
+        &hash_manifest,
         &out_dir,
         client_dir.path(),
         &keystore,
@@ -161,7 +165,7 @@ async fn run() -> anyhow::Result<()> {
     // The node serves the freshly-opened pool once its `getPool` view resolves it
     // (right after `openPool` mines), so the first run can race that resolution.
     // Retry until it lands, exactly as the fetch e2e does.
-    run_bundle_pull_until_ready(client_dir.path(), &args).await?;
+    run_bundle_get_until_ready(client_dir.path(), &args).await?;
 
     // Both entries landed with the served bytes.
     let got_a = std::fs::read(out_dir.join("a.bin")).context("read a.bin")?;
@@ -190,14 +194,15 @@ async fn run() -> anyhow::Result<()> {
     let progress = state
         .lane_progress(lane)
         .ok_or_else(|| anyhow::anyhow!("no lane progress recorded for provider {provider_addr}"))?;
-    // The shared lane watermark is the EXACT aggregate wire bytes of both entries —
-    // not zero, not one entry's, and not double-counted. Since each entry is under
-    // one chunk and their sum is over it, this pins the cumulative accounting
-    // across a chunk boundary: the second same-lane pull resumed from the first's
-    // cumulative watermark rather than racing or restarting it.
+    // The shared lane watermark is the EXACT aggregate wire bytes of the manifest
+    // and both entries — not zero, not one fetch's, and not double-counted. Since
+    // each entry is under one chunk and their sum is over it, this pins the
+    // cumulative accounting across a chunk boundary: each same-lane pull resumed
+    // from the previous one's cumulative watermark rather than racing or
+    // restarting it.
     anyhow::ensure!(
         progress.last_bytes == U256::from(aggregate_wire),
-        "lane watermark must be the exact {aggregate_wire}-byte aggregate of both entries, \
+        "lane watermark must be the exact {aggregate_wire}-byte aggregate of the bundle, \
          got bytes={} (amount={})",
         progress.last_bytes,
         progress.last_amount
@@ -225,55 +230,54 @@ fn whole_blob_wire_bytes(total: u64) -> u64 {
     }
 }
 
-/// Run `decdn bundle pull`, retrying until the node's serve path resolves the
+/// Run `decdn get`, retrying until the node's serve path resolves the
 /// freshly-opened pool (the CLI has no internal retry for that race).
-async fn run_bundle_pull_until_ready(
+async fn run_bundle_get_until_ready(
     data_dir: &std::path::Path,
     args: &[String],
 ) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
-            .arg("bundle")
-            .arg("pull")
+            .arg("get")
             .args(args)
             .output()
             .await
-            .context("spawn decdn bundle pull")?;
+            .context("spawn decdn get")?;
         if output.status.success() {
             return Ok(());
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "decdn bundle pull never succeeded; last stderr:\n{}",
+            "decdn get never succeeded; last stderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         tracing::debug!(
-            "bundle pull not ready; retrying after serve-path catch-up:\n{}",
+            "bundle get not ready; retrying after serve-path catch-up:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
 }
 
-/// The `decdn bundle pull` argv (after the `bundle pull` subcommand) to pull a
-/// local manifest over the explicit-node path, with chain coordinates as flags so
-/// no config file is needed. `--provider-address` pins every entry to this one
-/// node (and one lane). `--capacity-bond-address` is required even on the
-/// explicit-node path: it is the EIP-712 `verifyingContract` the buyer signs its
-/// ADR 005 client identity binding against, and the node refuses to serve a paid
-/// request that carries no verified binding.
-fn bundle_pull_argv(
+/// The `decdn get` argv (after the `get` subcommand) to pull the bundle whose
+/// manifest has hash `manifest` over the explicit-node path, with chain
+/// coordinates as flags so no config file is needed. `--provider-address` pins
+/// every fetch to this one node (and one lane). `--capacity-bond-address` is
+/// required even on the explicit-node path: it is the EIP-712
+/// `verifyingContract` the buyer signs its ADR 005 client identity binding
+/// against, and the node refuses to serve a paid request that carries no
+/// verified binding.
+fn bundle_get_argv(
     chain: &ChainFixture,
     node: &NodeFixture,
-    manifest: &std::path::Path,
+    manifest: &Hash,
     out_dir: &std::path::Path,
     data_dir: &std::path::Path,
     keystore: &std::path::Path,
 ) -> Vec<String> {
     vec![
-        "-i".into(),
-        manifest.display().to_string(),
+        format!("decdn:{}/", manifest.to_hex()),
         "-o".into(),
         out_dir.display().to_string(),
         "--node-id".into(),

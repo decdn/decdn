@@ -269,7 +269,7 @@ pub(crate) fn evaluate_receipts(facts: &FileFacts, path: &Path) -> Finding {
 }
 
 /// Every store file the doctor checks in a data dir: the daemon's own set,
-/// plus the client store a `decdn fetch` / `decdn pool` invocation leaves
+/// plus the client store a `decdn get` / `decdn pool` invocation leaves
 /// behind when it is pointed at the same directory.
 ///
 /// Sourced from [`decdn_common::data_dir`] rather than spelled here, so a fifth

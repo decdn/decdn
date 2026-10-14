@@ -1,4 +1,4 @@
-//! Time-to-first-byte phase marks for one `decdn fetch`.
+//! Time-to-first-byte phase marks for one blob `decdn get`.
 //!
 //! [`FetchTimings`] records when the fetch first reaches each [`Mark`] and
 //! logs every mark as milliseconds since the fetch started, in one `info`

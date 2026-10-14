@@ -1,5 +1,5 @@
 //! The [`SourceProvider`] a paid fetch runs its acquire loop over: where
-//! `decdn fetch` and every entry of a `bundle pull` find a blob's holders and
+//! a blob `decdn get` and every entry of a bundle pull find a blob's holders and
 //! build their paid lanes.
 //!
 //! Discovery is [`resolve_target_node`]; a lane is one provider's pool lane
@@ -95,12 +95,12 @@ pub struct LaneSources<'a, P> {
     seeded: AtomicU64,
     /// Serializes each lane's pool open-or-reuse: across one fetch's
     /// concurrently built lanes, which all open or reuse the one pool, and
-    /// across sibling fetches on that pool (`bundle pull`).
+    /// across sibling fetches on that pool (a bundle pull).
     open_lock: Option<&'a tokio::sync::Mutex<()>>,
-    /// The run's shared voucher-ledger registry (`bundle pull`); `None` for a
+    /// The run's shared voucher-ledger registry (a bundle pull); `None` for a
     /// solo fetch.
     ledgers: Option<&'a LaneLedgers>,
-    /// The run's per-provider stream cap (`bundle pull`): a lane, the first
+    /// The run's per-provider stream cap (a bundle pull): a lane, the first
     /// open's included, holds one of its provider's permits while its own
     /// worker runs, and takes a free one again to start again.
     lane_cap: Option<&'a LaneStreamCap>,

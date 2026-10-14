@@ -7,7 +7,6 @@
 //! `crates/node/src/main.rs` and is not part of this module.
 
 pub mod appeal;
-pub mod bundle;
 pub mod byte_size;
 pub mod common;
 pub mod config_cmd;
@@ -25,14 +24,13 @@ pub mod setup;
 pub mod whoami;
 
 pub use appeal::{AppealArgs, AppealCommand, AppealSlashArgs};
-pub use bundle::{BundleArgs, BundleCommand, BundlePullArgs};
 pub use byte_size::parse_byte_size;
 pub use common::{
     CommonChainArgs, ConfigPathSource, LogFormat, default_client_data_dir, default_config_path,
     default_data_dir,
 };
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
-pub use fetch::{ClientFetchArgs, FetchArgs};
+pub use fetch::ClientFetchArgs;
 pub use gateway::GatewayArgs;
 pub use get::GetArgs;
 pub use key_gen::KeyGenArgs;
@@ -61,16 +59,16 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 /// User-facing deCDN CLI. The daemon lives in the separate `decdn-node`
-/// binary; this CLI is what you type from a terminal — probe, fetch, pools,
+/// binary; this CLI is what you type from a terminal — probe, get, pools,
 /// publishing, node admin.
 #[derive(Parser, Debug)]
 #[command(
     name = "decdn",
     version,
-    about = "deCDN user CLI — probe, fetch, pools, publishing, node admin",
+    about = "deCDN user CLI — probe, get, pools, publishing, node admin",
     long_about = "User-facing deCDN CLI. Pairs with the `decdn-node` daemon: \
                   this binary carries every command a human types in a \
-                  terminal (probe, fetch, payment pools, publishing, \
+                  terminal (probe, get, payment pools, publishing, \
                   origin import, node admin, key-gen, config). The \
                   `node` subcommand group talks to a running daemon over \
                   the loopback admin RPC surface \
@@ -84,7 +82,7 @@ pub struct Cli {
 
     /// Enable client-side logging at this level. Off by default (the CLI is a
     /// terminal UI); `RUST_LOG` overrides this when set. Useful for diagnosing
-    /// a stalled `decdn fetch` from the client side. Deliberately not bound to
+    /// a stalled `decdn get` from the client side. Deliberately not bound to
     /// an environment variable: the CLI stays silent unless logging is asked
     /// for on this invocation, even when the daemon's log-level env is exported.
     #[arg(long, global = true, value_name = "LEVEL")]
@@ -117,17 +115,13 @@ pub enum Command {
     Config(ConfigArgs),
     /// Probe a running node over the `cdn/probe/v1` ALPN.
     Probe(ProbeArgs),
-    /// Fetch a single content-addressed blob from a node over the paid
-    /// `cdn/client/v1` path, paying per-MB from the caller's own `PaymentPool`
-    /// deposit.
-    Fetch(FetchArgs),
     /// Serve `decdn:` URIs to a browser from a loopback HTTP gateway, paid
     /// with the scoped capabilities pages and the token holder register.
-    Gateway(GatewayArgs),
+    Gateway(Box<GatewayArgs>),
     /// Pull what a `decdn:` URI names: a blob (`decdn:<hash>`), a whole bundle
     /// (`decdn:<hash>/`), or one bundle entry (`decdn:<hash>/<path>`), over the
-    /// paid `cdn/client/v1` path.
-    Get(GetArgs),
+    /// paid `cdn/client/v1` path, paying per-MB from a `PaymentPool`.
+    Get(Box<GetArgs>),
     /// Guided node onboarding (ADR 019 Phases 1–2): pre-flight checks,
     /// key generation, bond, and on-chain registration, with a final
     /// readiness summary. Thin orchestration over `key-gen` / `node bond` /
@@ -136,10 +130,6 @@ pub enum Command {
     /// Operator-local admin commands that query a running node
     /// over its loopback HTTP surface (`appendix-local-admin-http.md`).
     Node(NodeArgs),
-    /// Fetch directory bundles — a JSON manifest linking
-    /// BLAKE3-content-addressed blobs by relative path. See
-    /// `appendix-bundles.md` for the format.
-    Bundle(BundleArgs),
     /// Seed a cache origin store from local content (`import`) — offline,
     /// config-free filesystem work that writes each blob's sharded data object
     /// and its `{hex}.obao4` outboard in the layout the daemon reads (ADR 037).

@@ -14,7 +14,7 @@ pub struct GatewayArgs {
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8484")]
     pub listen: SocketAddr,
 
-    /// Discovery and chain flags, as `decdn fetch` takes them. The gateway
+    /// Discovery and chain flags, as `decdn get` takes them. The gateway
     /// holds its own delegate keys and registered capabilities, so the
     /// keystore and capability flags do not apply. Chain coordinates that
     /// neither a flag nor the config file sets default to the built-in

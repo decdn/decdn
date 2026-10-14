@@ -90,6 +90,10 @@ impl decdn_client::bundle::ManifestEntry
 pub fn decdn_client::bundle::ManifestEntry::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, core::option::Option<u64>) -> Self
 pub fn decdn_client::bundle::ManifestEntry::with_chunks(self, alloc::vec::Vec<decdn_client::bundle::ManifestChunk>) -> Self
 pub struct decdn_client::bundle::NodeSelection
+pub struct decdn_client::bundle::NotAManifest(_)
+impl core::error::Error for decdn_client::bundle::NotAManifest
+impl core::fmt::Display for decdn_client::bundle::NotAManifest
+pub fn decdn_client::bundle::NotAManifest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub const decdn_client::bundle::STAGING_DIR: &str
 pub trait decdn_client::bundle::BundleObserver: core::marker::Send + core::marker::Sync
 pub fn decdn_client::bundle::BundleObserver::entry_landed(&self, &decdn_client::bundle::EntryLanded)

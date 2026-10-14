@@ -75,7 +75,7 @@ directory:
 
 ```bash
 docker run --rm -it -v ~/.decdn:/home/decdn/.decdn -v "$PWD":/work -w /work \
-  ghcr.io/decdn/decdn fetch --hash <hash> -o blob.bin
+  ghcr.io/decdn/decdn get decdn:<hash> -o blob.bin
 ```
 
 Both images run as uid 1000. If your user has another uid, add
@@ -157,15 +157,25 @@ USDC.
 ```bash
 decdn config init --client --output ~/.decdn/client.toml
 decdn key-gen --output-dir ~/.decdn/client
-decdn --config ~/.decdn/client.toml fetch --hash <blake3-hash> -o ./blob.bin
+decdn --config ~/.decdn/client.toml get decdn:<blake3-hash> -o ./blob.bin
 ```
 
-`fetch` probes bonded nodes and picks one that holds the blob. When none does, it tries
-bonded non-holders nearest first. Each fills the miss from its own origin, or from a peer
-if it enables pull-through. A node with neither answers not-found, and `fetch` moves to
-the next. `fetch` pays each node it uses from a pool you own.
+A `decdn:` URI names a blob, a whole bundle, or one file of a bundle
+([appendix](adr/appendix-bundles.md#decdn-uris)):
 
-`fetch` reuses your existing pool or opens one with a 10 USDC working deposit, and it tops
+| URI | `get` pulls | `-o` is |
+|-----|-------------|---------|
+| `decdn:<hash>` | the blob | a file, or `-` for stdout |
+| `decdn:<hash>/` | every file of the bundle whose manifest has this hash | a directory |
+| `decdn:<hash>/a/b.txt` | that one file of the bundle | a directory |
+| any of these with `?ns=<id>` | the same, routed to a namespace's origins | the same |
+
+`get` probes bonded nodes and picks one that holds the blob. When none does, it tries
+bonded non-holders nearest first. Each fills the miss from its own origin, or from a peer
+if it enables pull-through. A node with neither answers not-found, and `get` moves to
+the next. `get` pays each node it uses from a pool you own.
+
+`get` reuses your existing pool or opens one with a 10 USDC working deposit, and it tops
 the pool up on-chain without prompting when the balance runs low. Fund the wallet with
 only what you are willing to spend. One pool pays every provider, so there is no
 per-provider setup. Use `decdn pool {…}` to inspect, close, or reclaim a pool.
@@ -174,7 +184,7 @@ per-provider setup. Use `decdn pool {…}` to inspect, close, or reclaim a pool.
 
 A publisher creates a namespace and seats the bonded operators that serve as its origins.
 `publish` moves no bytes: content reaches clients from the seated operators' origin
-backends, and a client routes to them with `fetch --namespace <id>`.
+backends, and a client routes to them with `get decdn:<hash>?ns=<id>`.
 
 The installed vetting policy decides who may seat origins
 ([ADR 011 § Vetting policies](adr/011-content-takedown.md#vetting-policies)). The testnet
@@ -217,8 +227,8 @@ deCDN ships two binaries, split like `dockerd` and `docker`
 | `config {init,validate}` | Write a config file; check one before the daemon reads it |
 | `setup` | Guided operator onboarding over `key-gen`, `node bond`, and `node register` |
 | `node {…}` | Admin of a running daemon (`health`, `status`, `lanes`, `pools`, `top`, `evict`, `reload`, `drain`, `slashes`); the on-chain lifecycle (`bond`, `unbond`, `register`, `deregister`, `rotate-key`, `update-multiaddrs`, `update-region`); diagnostics (`doctor`, `lookup`) |
-| `probe`, `fetch` | Probe a node over `cdn/probe/v1`; paid single-blob fetch over `cdn/client/v1` |
-| `bundle {pull}` | Fetch a directory bundle by manifest ([appendix](adr/appendix-bundles.md)) |
+| `probe` | Probe a node over `cdn/probe/v1` |
+| `get` | Paid pull over `cdn/client/v1` of what a `decdn:` URI names: a blob, a directory bundle, or one file of a bundle ([appendix](adr/appendix-bundles.md)) |
 | `pool {…}` | Client payment-pool lifecycle: `list`, `open`, `top-up`, `close`, `reclaim`, `assign` |
 | `publish {…}` | Publisher control plane: `namespace create`; seat and unseat authorized origins with `assign` and `revoke` |
 | `origin {import}` | Write local content into a local filesystem origin store, offline and config-free |

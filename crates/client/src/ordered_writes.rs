@@ -1,7 +1,7 @@
 //! A command's blocking state writes, run off the runtime thread in the order
 //! they are queued.
 //!
-//! A fetch's lanes share the command's task (a `bundle pull` runs every entry
+//! A fetch's lanes share the command's task (a bundle pull runs every entry
 //! and lane as one future), so a durable write made inline there stops every
 //! lane for as long as the disk takes (#2211). These writes are also order
 //! sensitive across the whole command: an open that landed after a later
