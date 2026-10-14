@@ -186,46 +186,63 @@ fn callers_without_a_page_origin_need_the_token() {
     assert!(Caller::of(Some("null"), true).is_err());
 }
 
-fn registered(scope: &str, origin: Option<&str>, expiry: u64) -> Registered {
+fn registered(scope: &str, origin: Option<&str>, registered: Instant) -> Registered {
     Registered {
         grant: CapabilityGrant {
             pool_id: alloy::primitives::B256::ZERO,
             signer: Address::ZERO,
             spending_cap: 1,
-            expiry,
+            expiry: u64::MAX,
             owner_signature: vec![0; 65],
         },
         scope: Scope::parse(scope).unwrap(),
         origin: origin.map(str::to_owned),
+        since: registered,
         spent: false,
     }
 }
 
 #[test]
 fn the_token_holders_capability_wins_a_tie_with_a_pages() {
-    let own = registered("*", None, 2_000);
-    let page = registered("*", Some("https://evil.example"), 1_000);
+    let now = Instant::now();
+    let page = registered("*", Some("https://evil.example"), now);
+    let own = registered("*", None, now + Duration::from_secs(1));
     assert!(own.preference() > page.preference());
     // A more specific scope still wins over the token holder's `*`.
-    let site = registered("decdn.org", Some("https://decdn.org"), 3_000);
+    let site = registered("decdn.org", Some("https://decdn.org"), now);
     assert!(site.preference() > own.preference());
 }
 
-fn pending(minter: Option<&str>) -> Delegate {
+#[test]
+fn a_later_registration_never_shadows_an_earlier_one() {
+    let now = Instant::now();
+    let incumbent = registered("*.example.com", Some("https://example.com"), now);
+    let newcomer = registered(
+        "*.example.com",
+        Some("https://x.example.com"),
+        now + Duration::from_secs(1),
+    );
+    assert!(incumbent.preference() > newcomer.preference());
+}
+
+fn delegate(minter: Option<&str>, capability: Option<Registered>) -> Delegate {
     Delegate {
         signer: Arc::new(PrivateKeySigner::random()),
         minted: Instant::now(),
         minter: minter.map(str::to_owned),
-        capability: None,
+        capability,
     }
 }
 
+fn insert(delegates: &mut HashMap<Address, Delegate>, d: Delegate) {
+    delegates.insert(d.signer.address(), d);
+}
+
 #[test]
-fn each_minter_keeps_its_own_pending_room() {
+fn each_origin_keeps_its_own_room() {
     let mut delegates = HashMap::new();
-    for _ in 0..MAX_PENDING_PER_MINTER {
-        let d = pending(Some("https://evil.example"));
-        delegates.insert(d.signer.address(), d);
+    for _ in 0..MAX_DELEGATES_PER_ORIGIN {
+        insert(&mut delegates, delegate(Some("https://evil.example"), None));
     }
     assert!(may_mint(&delegates, Some("https://evil.example")).is_err());
     assert!(may_mint(&delegates, Some("https://decdn.org")).is_ok());
@@ -233,13 +250,168 @@ fn each_minter_keeps_its_own_pending_room() {
 }
 
 #[test]
-fn minting_stops_at_the_global_bound() {
+fn registering_does_not_free_an_origins_room() {
+    let origin = "https://evil.example";
     let mut delegates = HashMap::new();
-    for n in 0..MAX_PENDING {
-        let d = pending(Some(&format!("https://{n}.example")));
-        delegates.insert(d.signer.address(), d);
+    for _ in 0..MAX_DELEGATES_PER_ORIGIN {
+        let capability = registered("*", Some(origin), Instant::now());
+        insert(&mut delegates, delegate(Some(origin), Some(capability)));
+    }
+    assert!(may_mint(&delegates, Some(origin)).is_err());
+}
+
+#[test]
+fn pages_stop_at_the_global_bound_and_the_token_holder_does_not() {
+    let mut delegates = HashMap::new();
+    for n in 0..MAX_PAGE_DELEGATES {
+        insert(
+            &mut delegates,
+            delegate(Some(&format!("https://{n}.example")), None),
+        );
     }
     assert!(may_mint(&delegates, Some("https://decdn.org")).is_err());
+    assert!(may_mint(&delegates, None).is_ok());
+}
+
+#[test]
+fn a_capability_must_be_signed_by_its_pools_on_chain_owner() {
+    let owner = PrivateKeySigner::random().address();
+    let other = PrivateKeySigner::random().address();
+    let pool = alloy::primitives::B256::ZERO;
+    assert!(owner_matches(owner, owner, pool).is_ok());
+    assert!(owner_matches(owner, other, pool).is_err());
+    assert!(owner_matches(Address::ZERO, owner, pool).is_err());
+}
+
+const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn test_gateway() -> Arc<Gateway> {
+    let chain = ChainConfig {
+        // Nothing here reaches the chain: every request below stops first.
+        rpc_url: "http://127.0.0.1:1".to_owned(),
+        chain_id: 421_614,
+        payment_pool: Address::repeat_byte(1),
+        slash_judge: Address::repeat_byte(2),
+        capacity_bond: None,
+    };
+    Arc::new(Gateway {
+        common: flags(&[]),
+        config_path: None,
+        token: TEST_TOKEN.to_owned(),
+        domain: voucher_domain(chain.chain_id, chain.payment_pool),
+        chain,
+        delegates: Mutex::new(HashMap::new()),
+        pull: Arc::new(Mutex::new(())),
+        manifests: std::sync::Mutex::new(ManifestCache::default()),
+        manifest_fill: Mutex::new(()),
+        hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
+    })
+}
+
+async fn call(
+    gateway: &Arc<Gateway>,
+    method: Method,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> StatusCode {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, "127.0.0.1:8484");
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let req = req.body(Full::new(Bytes::from(body.to_owned()))).unwrap();
+    Arc::clone(gateway).handle(req).await.status()
+}
+
+#[tokio::test]
+async fn head_never_starts_a_pull() {
+    let gateway = test_gateway();
+    let status = call(
+        &gateway,
+        Method::HEAD,
+        &format!("/{}", "ab".repeat(32)),
+        &[(TOKEN_HEADER, TEST_TOKEN), (HOST_HEADER, "decdn.org")],
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn minting_needs_a_page_origin_or_the_token_and_stops_per_origin() {
+    let gateway = test_gateway();
+    assert_eq!(
+        call(&gateway, Method::GET, "/_delegate", &[], "").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(
+            &gateway,
+            Method::GET,
+            "/_delegate",
+            &[(TOKEN_HEADER, TEST_TOKEN)],
+            ""
+        )
+        .await,
+        StatusCode::OK
+    );
+    let page = [(header::ORIGIN.as_str(), "https://evil.example")];
+    for _ in 0..MAX_DELEGATES_PER_ORIGIN {
+        assert_eq!(
+            call(&gateway, Method::GET, "/_delegate", &page, "").await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        call(&gateway, Method::GET, "/_delegate", &page, "").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[tokio::test]
+async fn a_page_with_the_token_still_registers_only_its_own_scope() {
+    let gateway = test_gateway();
+    let body = r#"{"capability": "dcap1:x", "scope": "netflix.com"}"#;
+    let status = call(
+        &gateway,
+        Method::PUT,
+        "/_capability",
+        &[
+            (header::ORIGIN.as_str(), "https://decdn.org"),
+            (TOKEN_HEADER, TEST_TOKEN),
+        ],
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[derive(clap::Parser)]
+struct Flags {
+    #[command(flatten)]
+    common: cli::ClientFetchArgs,
+}
+
+fn flags(args: &[&str]) -> cli::ClientFetchArgs {
+    <Flags as clap::Parser>::try_parse_from(std::iter::once("gateway").chain(args.iter().copied()))
+        .unwrap()
+        .common
+}
+
+#[test]
+fn a_keystore_password_file_is_dropped_and_key_flags_are_refused() {
+    let common = keyless(&flags(&["--keystore-password-file", "/pw"])).unwrap();
+    assert!(common.keystore_password_file.is_none());
+    for flag in [
+        ["--keystore", "/ks"],
+        ["--capability", "dcap1:x"],
+        ["--capability-file", "/cap"],
+    ] {
+        assert!(keyless(&flags(&flag)).is_err(), "{flag:?}");
+    }
 }
 
 #[test]

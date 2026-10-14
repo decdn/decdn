@@ -9,15 +9,19 @@
 //! browser extension adds both, so page scripts never see the token. The
 //! gateway pays with the registered capability whose scope covers that host:
 //! an exact host first, then `*.<domain>`, then `*`; between equal scopes, the
-//! token holder's own registration before a page's. `HEAD` gets 405, since
-//! answering it would cost a paid pull.
+//! token holder's own registration before a page's, then the earlier
+//! registration. A capability whose pull stops for funding before its first
+//! byte is retired and the next covering one takes the request. `HEAD` gets
+//! 405, since answering it would cost a paid pull.
 //!
 //! **Capabilities.** The gateway holds one delegate key per capability, in
 //! memory only. `GET /_delegate` mints a fresh key and returns its address, so
 //! no two callers see the same address and none can follow the user across
 //! sites; a key no capability claims within [`PENDING_TTL`] is dropped. A
 //! caller is a web page by its `http(s)` `Origin`, or the gateway token holder
-//! from outside any page; each keeps at most a few keys waiting.
+//! from outside any page. Each page origin holds at most a few keys, pending
+//! or registered, within a bound shared by all pages; the token holder mints
+//! outside both bounds.
 //! `PUT /_capability` registers a `dcap1:` capability issued to a minted
 //! address, with a scope. The capability's owner signature must recover the
 //! on-chain owner of its pool on the gateway's deployment. A page registers
@@ -55,10 +59,10 @@ use decdn_common::cli::{self, ClientFetchArgs, FetchArgs, GatewayArgs};
 use decdn_common::config::load_file_config;
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{CapabilityGrant, voucher_domain};
+use decdn_incentive::{CapabilityGrant, PoolId, voucher_domain};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt as _, Full, Limited, StreamBody};
-use hyper::body::{Frame, Incoming};
+use hyper::body::{Body as HttpBody, Frame};
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
@@ -78,13 +82,13 @@ pub const HOST_HEADER: &str = "x-decdn-host";
 /// How long a minted delegate waits for a capability before it is dropped.
 pub const PENDING_TTL: Duration = Duration::from_mins(15);
 
-/// The most minted delegates one minter (a page origin, or the token holder)
-/// keeps waiting for a capability, so no page can use up another's room.
-const MAX_PENDING_PER_MINTER: usize = 4;
+/// The most live delegates, pending or registered, one page origin holds, so
+/// no page can use up another's room or stock capabilities without bound.
+const MAX_DELEGATES_PER_ORIGIN: usize = 8;
 
-/// The most minted delegates waiting for a capability at once, across every
-/// minter: the gateway holds keys within a fixed bound.
-const MAX_PENDING: usize = 1024;
+/// The most live delegates all pages hold together: the gateway holds page
+/// keys within a fixed bound.
+const MAX_PAGE_DELEGATES: usize = 1024;
 
 /// The largest `PUT /_capability` body.
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -123,17 +127,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         args.listen.ip().is_loopback(),
         "--listen must be a loopback address"
     );
-    let mut common = args.common.clone();
-    anyhow::ensure!(
-        common.keystore.is_none()
-            && common.capability.is_none()
-            && common.capability_file.is_none(),
-        "the gateway holds its own delegate keys: register capabilities through \
-         `PUT /_capability` instead of --keystore / --capability / --capability-file"
-    );
-    // A password file (often `DECDN_KEYSTORE_PASSWORD_FILE` in the
-    // environment) has no keystore to open here.
-    common.keystore_password_file = None;
+    let mut common = keyless(&args.common)?;
     fill_chain_defaults(&mut common, config_path)?;
     let chain = resolve_chain(&common, &load_file_config(config_path)?)?.config;
     common.give_up_after_secs = common.give_up_after_secs.or(Some(GIVE_UP_AFTER_SECS));
@@ -195,6 +189,22 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
             }
         });
     }
+}
+
+/// The fetch flags the gateway pulls with. It holds its own delegate keys, so
+/// key and capability flags are refused, and a keystore password file (often
+/// `DECDN_KEYSTORE_PASSWORD_FILE` in the environment) is dropped unread.
+fn keyless(common: &ClientFetchArgs) -> anyhow::Result<ClientFetchArgs> {
+    anyhow::ensure!(
+        common.keystore.is_none()
+            && common.capability.is_none()
+            && common.capability_file.is_none(),
+        "the gateway holds its own delegate keys: register capabilities through \
+         `PUT /_capability` instead of --keystore / --capability / --capability-file"
+    );
+    let mut common = common.clone();
+    common.keystore_password_file = None;
+    Ok(common)
 }
 
 /// Chain coordinates neither a flag nor the config file sets come from the
@@ -434,6 +444,22 @@ fn may_register(caller: &Caller, scope: &Scope) -> Result<(), String> {
     }
 }
 
+/// Whether a pool whose on-chain owner is `on_chain` accepts a capability its
+/// signature recovers to `signed_by`.
+fn owner_matches(on_chain: Address, signed_by: Address, pool_id: PoolId) -> Result<(), String> {
+    if on_chain.is_zero() {
+        Err(format!(
+            "pool {pool_id} does not exist on this deployment\n"
+        ))
+    } else if on_chain != signed_by {
+        Err(format!(
+            "the capability is not signed by the owner of pool {pool_id}\n"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// A delegate key and the capability registered to it, if any.
 struct Delegate {
     signer: Arc<PrivateKeySigner>,
@@ -443,16 +469,25 @@ struct Delegate {
     capability: Option<Registered>,
 }
 
-/// Whether `minter` may mint one more delegate while `delegates` wait.
+/// Whether `minter` may mint one more delegate beside `delegates`. Pages
+/// share [`MAX_PAGE_DELEGATES`] and each origin holds at most
+/// [`MAX_DELEGATES_PER_ORIGIN`], pending or registered; the token holder
+/// mints outside both bounds, so no page can stop the user's own handshake.
 fn may_mint(delegates: &HashMap<Address, Delegate>, minter: Option<&str>) -> Result<(), String> {
-    let pending = || delegates.values().filter(|d| d.capability.is_none());
-    if pending().count() >= MAX_PENDING {
-        return Err("too many delegates are waiting for a capability\n".to_owned());
+    let Some(origin) = minter else {
+        return Ok(());
+    };
+    let pages = || delegates.values().filter(|d| d.minter.is_some());
+    if pages().count() >= MAX_PAGE_DELEGATES {
+        return Err("too many pages hold delegates\n".to_owned());
     }
-    if pending().filter(|d| d.minter.as_deref() == minter).count() >= MAX_PENDING_PER_MINTER {
+    if pages()
+        .filter(|d| d.minter.as_deref() == Some(origin))
+        .count()
+        >= MAX_DELEGATES_PER_ORIGIN
+    {
         return Err(format!(
-            "{} has {MAX_PENDING_PER_MINTER} delegates waiting for a capability\n",
-            minter.unwrap_or("the token holder")
+            "{origin} holds {MAX_DELEGATES_PER_ORIGIN} delegates\n"
         ));
     }
     Ok(())
@@ -463,18 +498,21 @@ struct Registered {
     scope: Scope,
     /// The origin that registered it, or `None` for the token holder.
     origin: Option<String>,
+    /// When it was registered.
+    since: Instant,
     spent: bool,
 }
 
 impl Registered {
     /// The order among capabilities that cover one host, highest first: the
     /// more specific scope, then the token holder's own registration over a
-    /// page's, then the earlier expiry.
-    const fn preference(&self) -> (u8, bool, std::cmp::Reverse<u64>) {
+    /// page's, then the earlier registration, so a later one never shadows
+    /// a capability already in use.
+    const fn preference(&self) -> (u8, bool, std::cmp::Reverse<Instant>) {
         (
             self.scope.rank(),
             self.origin.is_none(),
-            std::cmp::Reverse(self.grant.expiry),
+            std::cmp::Reverse(self.since),
         )
     }
 }
@@ -553,7 +591,11 @@ struct Paying {
 }
 
 impl Gateway {
-    async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<Body> {
+    async fn handle<B>(self: Arc<Self>, req: Request<B>) -> Response<Body>
+    where
+        B: HttpBody<Data = Bytes>,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let host = req
             .headers()
             .get(header::HOST)
@@ -656,7 +698,11 @@ impl Gateway {
         )
     }
 
-    async fn register(&self, req: Request<Incoming>, caller: &Caller) -> Response<Body> {
+    async fn register<B>(&self, req: Request<B>, caller: &Caller) -> Response<Body>
+    where
+        B: HttpBody<Data = Bytes>,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
             .collect()
             .await
@@ -717,14 +763,15 @@ impl Gateway {
             grant,
             scope,
             origin: caller.origin().map(str::to_owned),
+            since: Instant::now(),
             spent: false,
         });
         json(StatusCode::CREATED, &response)
     }
 
     /// Check that `grant` is signed by the on-chain owner of its pool on this
-    /// gateway's deployment, so a capability that cannot pay never takes a
-    /// scope from one that can.
+    /// gateway's deployment. Whether the pool can pay shows only when a pull
+    /// draws on it: a funding stop retires the capability.
     async fn verify_owner(&self, grant: &CapabilityGrant) -> Result<(), (StatusCode, String)> {
         let unprocessable = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
         let signed_by = grant
@@ -743,19 +790,7 @@ impl Gateway {
             .call()
             .await
             .map_err(|e| unreachable(sanitize_error_sources(&e)))?;
-        if pool.owner.is_zero() {
-            return Err(unprocessable(format!(
-                "pool {} does not exist on this deployment\n",
-                grant.pool_id
-            )));
-        }
-        if pool.owner != signed_by {
-            return Err(unprocessable(format!(
-                "the capability is not signed by the owner of pool {}\n",
-                grant.pool_id
-            )));
-        }
-        Ok(())
+        owner_matches(pool.owner, signed_by, grant.pool_id).map_err(unprocessable)
     }
 
     async fn list(&self) -> Response<Body> {
@@ -795,14 +830,20 @@ impl Gateway {
             })
     }
 
+    /// Retire the capability `signer` pays with after a funding stop. A page's
+    /// is dropped, freeing its origin's room; the token holder's stays listed
+    /// as spent.
     async fn mark_spent(&self, signer: Address) {
-        if let Some(registered) = self
-            .delegates
-            .lock()
-            .await
+        let mut delegates = self.delegates.lock().await;
+        let Some(registered) = delegates
             .get_mut(&signer)
             .and_then(|d| d.capability.as_mut())
-        {
+        else {
+            return;
+        };
+        if registered.origin.is_some() {
+            delegates.remove(&signer);
+        } else {
             registered.spent = true;
         }
     }
@@ -827,34 +868,37 @@ impl Gateway {
             Ok(uri) => uri,
             Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
-        let Some(paying) = self.paying_for(&page_host).await else {
-            return text(
-                StatusCode::PAYMENT_REQUIRED,
-                &format!("no capability covers {page_host}\n"),
-            );
-        };
-        let signer = paying.signer.address();
-        let result = match &uri.target {
-            UriTarget::Blob => {
-                self.stream(uri.hash, uri.namespace, &paying, None, None)
-                    .await
-            }
-            UriTarget::BundleEntry(path) => {
-                self.entry(uri.hash, uri.namespace, path, &paying).await
-            }
-            UriTarget::Bundle => self.index(uri.hash, uri.namespace, &paying).await,
-            _ => return text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
-        };
-        match result {
-            Ok(response) => response,
-            Err(PullError::Funding(e)) => {
-                self.mark_spent(signer).await;
-                text(
+        // A funding stop retires the capability and the next covering one
+        // takes the request, so a capability that cannot pay costs a retry,
+        // never a failed load. Each pass retires one, so the loop ends.
+        loop {
+            let Some(paying) = self.paying_for(&page_host).await else {
+                return text(
                     StatusCode::PAYMENT_REQUIRED,
-                    &format!("the capability for {page_host} ran out: {e:#}\n"),
-                )
+                    &format!("no capability covers {page_host}\n"),
+                );
+            };
+            let result = match &uri.target {
+                UriTarget::Blob => {
+                    self.stream(uri.hash, uri.namespace, &paying, None, None)
+                        .await
+                }
+                UriTarget::BundleEntry(path) => {
+                    self.entry(uri.hash, uri.namespace, path, &paying).await
+                }
+                UriTarget::Bundle => self.index(uri.hash, uri.namespace, &paying).await,
+                _ => return text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
+            };
+            match result {
+                Ok(response) => return response,
+                Err(PullError::Funding(e)) => {
+                    tracing::info!(error = %e, host = %page_host, "a capability ran out");
+                    self.mark_spent(paying.signer.address()).await;
+                }
+                Err(PullError::Other(e)) => {
+                    return text(StatusCode::BAD_GATEWAY, &format!("{e:#}\n"));
+                }
             }
-            Err(PullError::Other(e)) => text(StatusCode::BAD_GATEWAY, &format!("{e:#}\n")),
         }
     }
 
@@ -977,26 +1021,36 @@ impl Gateway {
     ) -> Result<Response<Body>, PullError> {
         let (first, reader, done) = self.start_pull(hash, namespace, paying).await?;
         let state = (Some(first), reader, Some(done));
-        let body = futures_util::stream::unfold(state, |(first, mut reader, done)| async move {
-            if let Some(first) = first {
-                return Some((Ok(Frame::data(first)), (None, reader, done)));
-            }
-            let mut buf = vec![0u8; CHUNK_BYTES];
-            match reader.read(&mut buf).await {
-                Ok(0) => match finished(done?).await {
-                    Ok(()) => None,
-                    // The verified prefix is already out: abort the body so the
-                    // browser does not take it for the whole file.
-                    Err(e) => Some((
-                        Err(std::io::Error::other(pull_error_text(&e))),
-                        (None, reader, None),
-                    )),
-                },
-                Ok(n) => {
-                    buf.truncate(n);
-                    Some((Ok(Frame::data(Bytes::from(buf))), (None, reader, done)))
+        let gateway = Arc::clone(self);
+        let signer = paying.signer.address();
+        let body = futures_util::stream::unfold(state, move |(first, mut reader, done)| {
+            let gateway = Arc::clone(&gateway);
+            async move {
+                if let Some(first) = first {
+                    return Some((Ok(Frame::data(first)), (None, reader, done)));
                 }
-                Err(e) => Some((Err(e), (None, reader, None))),
+                let mut buf = vec![0u8; CHUNK_BYTES];
+                match reader.read(&mut buf).await {
+                    Ok(0) => match finished(done?).await {
+                        Ok(()) => None,
+                        // The verified prefix is already out: abort the body so the
+                        // browser does not take it for the whole file.
+                        Err(e) => {
+                            if matches!(e, PullError::Funding(_)) {
+                                gateway.mark_spent(signer).await;
+                            }
+                            Some((
+                                Err(std::io::Error::other(pull_error_text(&e))),
+                                (None, reader, None),
+                            ))
+                        }
+                    },
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some((Ok(Frame::data(Bytes::from(buf))), (None, reader, done)))
+                    }
+                    Err(e) => Some((Err(e), (None, reader, None))),
+                }
             }
         });
         let name = path
@@ -1096,8 +1150,13 @@ async fn first_chunk(
 /// The pull's own result once its bytes are drained.
 async fn finished(done: oneshot::Receiver<anyhow::Result<()>>) -> Result<(), PullError> {
     match done.await {
-        Ok(Ok(())) | Err(_) => Ok(()),
+        Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(classify(e)),
+        // The pull thread ended without a result: it panicked, so the bytes
+        // it wrote may be short.
+        Err(_) => Err(PullError::Other(anyhow::anyhow!(
+            "the pull ended without a result"
+        ))),
     }
 }
 
