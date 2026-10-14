@@ -3,8 +3,8 @@
 Cargo enforces acyclicity and nothing more. The direction the crates depend on
 each other — three leaves, `cli`/`e2e` as sinks, a CLI that links no blob
 store — is a design decision only this check holds, and a bug here degrades to
-a quiet false pass. The tests hand it `cargo metadata`-shaped JSON built by
-hand so they need no toolchain.
+a quiet false pass. The tests hand it `cargo metadata`-shaped JSON and
+`cargo tree`-shaped text built by hand, so they need no toolchain.
 """
 
 from __future__ import annotations
@@ -96,60 +96,73 @@ def metadata(
     external_edges: dict[str, list[str]] = EXTERNAL_EDGES,
     build: dict[str, list[str]] | None = None,
     external: dict[str, list[str]] = EXTERNAL,
-    kind_order: tuple[str | None, ...] = (None, "dev", "build"),
 ) -> dict:
-    """`cargo metadata --format-version 1` shaped output for the given graph.
-
-    Like cargo, one `resolve` entry per (package, dependency) with every kind
-    merged into `dep_kinds`, in `kind_order`.
-    """
+    """`cargo metadata --format-version 1 --no-deps` shaped output for the given graph."""
     build = build or {}
 
     def pkg_id(name: str) -> str:
-        return f"path+file:///w/{name}#0.0.0" if name in graph else f"registry+{name}#1.0.0"
+        return f"path+file:///w/{name}#0.0.0"
 
     packages = []
-    nodes = []
     for name, internal in graph.items():
-        kinds: dict[str, list[str | None]] = {}
-        for d in internal + external_edges.get(name, []):
-            kinds.setdefault(d, []).append(None)
-        for d in dev.get(name, []):
-            kinds.setdefault(d, []).append("dev")
-        for d in build.get(name, []):
-            kinds.setdefault(d, []).append("build")
-        deps = [{"name": d, "kind": k} for d, ks in kinds.items() for k in ks]
+        deps = [{"name": d, "kind": None} for d in internal + external_edges.get(name, [])]
+        deps += [{"name": d, "kind": "dev"} for d in dev.get(name, [])]
+        deps += [{"name": d, "kind": "build"} for d in build.get(name, [])]
         packages.append({"name": name, "id": pkg_id(name), "dependencies": deps})
-        node_deps = [
-            {
-                "pkg": pkg_id(d),
-                "dep_kinds": [{"kind": k} for k in kind_order if k in ks],
-            }
-            for d, ks in kinds.items()
-        ]
-        nodes.append({"id": pkg_id(name), "deps": node_deps})
-    for name, internal in external.items():
-        packages.append(
-            {"name": name, "id": pkg_id(name), "dependencies": [{"name": d, "kind": None} for d in internal]}
-        )
-        nodes.append(
-            {"id": pkg_id(name), "deps": [{"pkg": pkg_id(d), "dep_kinds": [{"kind": None}]} for d in internal]}
-        )
-    return {
-        "packages": packages,
-        "workspace_members": [pkg_id(n) for n in graph],
-        "resolve": {"nodes": nodes},
-    }
+    return {"packages": packages, "workspace_members": [pkg_id(n) for n in graph]}
+
+
+def tree(
+    root: str,
+    graph: dict[str, list[str]] = GRAPH,
+    dev: dict[str, list[str]] = DEV,
+    external_edges: dict[str, list[str]] = EXTERNAL_EDGES,
+    build: dict[str, list[str]] | None = None,
+    external: dict[str, list[str]] = EXTERNAL,
+) -> str:
+    """`cargo tree -p root -e normal,build --prefix depth --format {p}` for the graph.
+
+    Like cargo: depth-first, each crate's dependencies printed once, a repeat
+    marked ` (*)`, dev-dependencies left out.
+    """
+    build = build or {}
+
+    def deps(name: str) -> list[str]:
+        out = graph.get(name, []) + external_edges.get(name, []) + build.get(name, [])
+        return out + external.get(name, [])
+
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    def walk(name: str, depth: int) -> None:
+        suffix = " (/w)" if name in graph else ""
+        if name in seen:
+            lines.append(f"{depth}{name} v1.0.0{suffix} (*)")
+            return
+        seen.add(name)
+        lines.append(f"{depth}{name} v1.0.0{suffix}")
+        for d in deps(name):
+            walk(d, depth + 1)
+
+    walk(root, 0)
+    return "\n".join(lines) + "\n"
+
+
+def run(**kw) -> list[str]:
+    """Both passes over one hand-built graph."""
+    graph = kw.get("graph", GRAPH)
+    trees = {r: tree(r, **kw) for r in cce.FOOTPRINT_GUARDED if r in graph}
+    return cce.check(metadata(**kw), trees)
 
 
 def test_the_current_graph_passes():
-    assert cce.check(metadata()) == []
+    assert run() == []
 
 
 def test_reverse_edge_is_an_error_naming_both_ends():
     graph = {k: list(v) for k, v in GRAPH.items()}
     graph["decdn-protocol"].append("decdn-common")
-    errors = cce.check(metadata(graph))
+    errors = run(graph=graph)
     assert len(errors) == 1, errors
     assert "decdn-protocol" in errors[0] and "decdn-common" in errors[0]
 
@@ -157,7 +170,7 @@ def test_reverse_edge_is_an_error_naming_both_ends():
 def test_leaf_gaining_an_external_looking_internal_edge_is_an_error():
     graph = {k: list(v) for k, v in GRAPH.items()}
     graph["decdn-bao-range"].append("decdn-protocol")
-    errors = cce.check(metadata(graph))
+    errors = run(graph=graph)
     assert len(errors) == 1, errors
     assert "decdn-bao-range" in errors[0]
 
@@ -165,7 +178,7 @@ def test_leaf_gaining_an_external_looking_internal_edge_is_an_error():
 def test_nothing_may_depend_on_a_sink():
     graph = {k: list(v) for k, v in GRAPH.items()}
     graph["decdn-node"].append("decdn-cli")
-    errors = cce.check(metadata(graph))
+    errors = run(graph=graph)
     assert len(errors) == 1, errors
     assert "decdn-cli" in errors[0]
 
@@ -173,9 +186,9 @@ def test_nothing_may_depend_on_a_sink():
 def test_e2e_may_depend_on_anything_but_cli():
     graph = {k: list(v) for k, v in GRAPH.items()}
     graph["decdn-e2e"].append("decdn-reputation")
-    assert cce.check(metadata(graph)) == []
+    assert run(graph=graph) == []
     graph["decdn-e2e"].append("decdn-cli")
-    errors = cce.check(metadata(graph))
+    errors = run(graph=graph)
     assert len(errors) == 1, errors
 
 
@@ -183,14 +196,14 @@ def test_dev_dependencies_are_not_edges():
     """`cli` dev-depends on `node`; that cycle-shaped edge is allowed."""
     dev = {k: list(v) for k, v in DEV.items()}
     dev["decdn-protocol"] = ["decdn-node"]
-    assert cce.check(metadata(dev=dev)) == []
+    assert run(dev=dev) == []
 
 
 def test_closure_must_not_reach_the_blob_store():
     """A leak below the SDK reaches both guarded crates; each gets its own error."""
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-common"].append("iroh-blobs")
-    errors = cce.check(metadata(external_edges=ext))
+    errors = run(external_edges=ext)
     assert len(errors) == 2, errors
     assert [e.split()[0] for e in errors] == ["decdn-cli", "decdn-client"], errors
     for e in errors:
@@ -201,7 +214,7 @@ def test_closure_must_not_reach_the_blob_store():
 def test_client_sdk_edge_to_the_blob_store_is_an_error():
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-client"] = ["iroh-blobs"]
-    errors = cce.check(metadata(external_edges=ext))
+    errors = run(external_edges=ext)
     assert any(
         e.startswith("decdn-client links iroh-blobs via iroh-blobs ← decdn-client") for e in errors
     ), errors
@@ -213,7 +226,7 @@ def test_client_sdk_is_guarded_without_the_cli():
     graph["decdn-cli"].remove("decdn-client")
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-client"] = ["aws-sdk-s3"]
-    errors = [e for e in cce.check(metadata(graph, external_edges=ext)) if " links " in e]
+    errors = [e for e in run(graph=graph, external_edges=ext) if " links " in e]
     assert len(errors) == 1, errors
     assert errors[0].startswith("decdn-client links aws-sdk-s3"), errors[0]
 
@@ -221,7 +234,7 @@ def test_client_sdk_is_guarded_without_the_cli():
 def test_cli_only_leak_does_not_blame_the_sdk():
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-cli"].append("iroh-blobs")
-    errors = cce.check(metadata(external_edges=ext))
+    errors = run(external_edges=ext)
     assert len(errors) == 1, errors
     assert errors[0].startswith("decdn-cli links iroh-blobs"), errors[0]
 
@@ -229,54 +242,102 @@ def test_cli_only_leak_does_not_blame_the_sdk():
 def test_cli_closure_ignores_dev_only_routes():
     """`cli` dev-depends on `cache`, which links iroh-blobs; that is not a leak."""
     dev = {"decdn-cli": ["decdn-cache"]}
-    assert cce.check(metadata(dev=dev)) == []
-
-
-def test_cli_closure_reads_a_normal_kind_listed_after_dev():
-    """cargo merges kinds per edge; the order it lists them in must not matter."""
-    ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
-    ext["decdn-cli"].append("iroh-blobs")
-    dev = {"decdn-cli": ["iroh-blobs"]}
-    errors = cce.check(metadata(external_edges=ext, dev=dev, kind_order=("dev", None)))
-    assert len(errors) == 1, errors
-    assert "iroh-blobs" in errors[0]
+    assert run(dev=dev) == []
 
 
 @pytest.mark.parametrize(
     "forbidden",
-    ["iroh-blobs", "aws-sdk-s3", "aws-config", "aws-smithy-types", "aws-credential-types"],
+    [
+        "iroh-blobs",
+        "aws-sdk-s3",
+        "aws-config",
+        "aws-smithy-types",
+        "aws-credential-types",
+        "aws-lc-rs",
+        "aws-lc-sys",
+        "jsonrpsee-server",
+    ],
 )
 def test_cli_closure_leak_two_hops_through_an_external_crate(forbidden):
     external = {**EXTERNAL, "origin-sdk": [forbidden], forbidden: []}
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-incentive"] = ["origin-sdk"]
-    errors = cce.check(metadata(external_edges=ext, external=external))
+    errors = run(external_edges=ext, external=external)
     assert len(errors) == 2, errors
     assert f"{forbidden} ← origin-sdk ← decdn-incentive ← decdn-cli" in errors[0], errors[0]
     assert f"{forbidden} ← origin-sdk ← decdn-incentive ← decdn-client" in errors[1], errors[1]
 
 
-def test_aws_lc_rs_is_not_the_aws_sdk():
-    """rustls pulls aws-lc-rs into the CLI legitimately; the prefix must not catch it."""
-    external = {**EXTERNAL, "aws-lc-rs": []}
+def test_aws_lc_reached_through_rustls_is_an_error():
+    """The #2454 shape: a reqwest/rustls feature turning aws-lc on under the SDK."""
+    external = {**EXTERNAL, "rustls": ["aws-lc-rs"], "aws-lc-rs": ["aws-lc-sys"], "aws-lc-sys": []}
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
-    ext["decdn-cli"].append("aws-lc-rs")
-    assert cce.check(metadata(external_edges=ext, external=external)) == []
+    ext["decdn-common"].append("rustls")
+    errors = run(external_edges=ext, external=external)
+    assert len(errors) == 4, errors
+    assert "aws-lc-sys ← aws-lc-rs ← rustls ← decdn-common ← decdn-client" in "\n".join(errors)
 
 
-def test_empty_resolve_graph_is_a_failure_not_a_pass():
-    m = metadata()
-    m["resolve"]["nodes"] = []
-    errors = cce.check(m)
+def test_closure_reads_the_per_crate_tree_not_the_workspace_resolve():
+    """The daemon links aws-lc and the JSON-RPC server; the CLI's own tree does not.
+
+    `cargo metadata` resolves features once for the workspace and would put
+    both in every closure. The check reads only the per-crate trees, so a
+    crate the metadata names but the tree does not is no error.
+    """
+    m = metadata(external_edges={**EXTERNAL_EDGES, "decdn-node": ["jsonrpsee-server", "aws-lc-sys"]})
+    trees = {r: tree(r) for r in cce.FOOTPRINT_GUARDED}
+    assert cce.check(m, trees) == []
+
+
+def test_each_guarded_crate_gets_its_own_tree_invocation():
+    """`cargo tree -p a -p b` unifies their features, so one root per command."""
+    for root in cce.FOOTPRINT_GUARDED:
+        cmd = cce.tree_command(root, "/w/Cargo.toml")
+        assert cmd.count("-p") == 1 and cmd[cmd.index("-p") + 1] == root, cmd
+
+
+def test_tree_is_read_with_all_features_all_targets_and_no_dev_deps():
+    """An optional dep or a mobile-only dep still links; a dev-dep does not."""
+    args = cce.TREE_ARGS
+    assert "--all-features" in args
+    assert args[args.index("--target") + 1] == "all"
+    assert args[args.index("-e") + 1] == "normal,build"
+
+
+def test_tree_with_repeats_keeps_every_edge():
+    """A ` (*)` line is still an edge; its subtree was printed where first seen."""
+    text = "0decdn-client v1 (/w)\n1a v1\n2leaf v1\n1b v1\n2a v1 (*)\n"
+    root, deps = cce.parse_tree(text)
+    assert root == "decdn-client"
+    assert deps == {"decdn-client": ["a", "b"], "a": ["leaf"], "b": ["a"]}
+
+
+def test_unparseable_tree_line_is_an_error_not_a_skip():
+    with pytest.raises(ValueError):
+        cce.parse_tree("0decdn-client v1 (/w)\n[build-dependencies]\n1cc v1\n")
+    with pytest.raises(ValueError):
+        cce.parse_tree("0decdn-client v1 (/w)\n2cc v1\n")
+
+
+def test_empty_tree_is_a_failure_not_a_pass():
+    errors = cce.check(metadata(), {r: "" for r in cce.FOOTPRINT_GUARDED})
     assert len(errors) == 2, errors
     assert all("inspected nothing" in e for e in errors), errors
+
+
+def test_tree_for_the_wrong_root_is_an_error():
+    trees = {r: tree("decdn-protocol") for r in cce.FOOTPRINT_GUARDED}
+    errors = cce.check(metadata(), trees)
+    assert len(errors) == 2, errors
+    assert all("rooted at decdn-protocol" in e for e in errors), errors
 
 
 def test_table_row_with_slack_is_an_error():
     """The table is the graph transcribed; an edge the graph lacks is rot too."""
     graph = {k: list(v) for k, v in GRAPH.items()}
     graph["decdn-node"].remove("decdn-reputation")
-    errors = cce.check(metadata(graph))
+    errors = run(graph=graph)
     assert len(errors) == 1, errors
     assert "decdn-node" in errors[0] and "decdn-reputation" in errors[0]
     assert "does not have" in errors[0]
@@ -284,20 +345,15 @@ def test_table_row_with_slack_is_an_error():
 
 def test_build_dependency_is_an_edge():
     """A build script compiles the crate too, so it is not exempt like a dev-dep."""
-    errors = cce.check(metadata(build={"decdn-node": ["decdn-cli"]}))
+    errors = run(build={"decdn-node": ["decdn-cli"]})
     assert len(errors) == 1, errors
     assert "decdn-cli" in errors[0]
-
-
-def test_metadata_is_read_with_all_features():
-    """An optional dep is absent from `resolve` unless its feature is on."""
-    assert "--all-features" in cce.METADATA_ARGS
 
 
 def test_member_missing_from_the_table_is_an_error():
     graph = {k: list(v) for k, v in GRAPH.items()}
     graph["decdn-new"] = ["decdn-protocol"]
-    errors = cce.check(metadata(graph))
+    errors = run(graph=graph)
     assert len(errors) == 1, errors
     assert "decdn-new" in errors[0]
     assert "ALLOWED" in errors[0]
@@ -307,5 +363,5 @@ def test_table_row_for_a_vanished_crate_is_an_error():
     graph = {k: list(v) for k, v in GRAPH.items()}
     del graph["decdn-reputation"]
     graph["decdn-node"].remove("decdn-reputation")
-    errors = cce.check(metadata(graph))
+    errors = run(graph=graph)
     assert any("decdn-reputation" in e and "no longer" in e for e in errors), errors

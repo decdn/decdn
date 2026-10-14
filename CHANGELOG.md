@@ -2920,6 +2920,22 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Client builds link one TLS backend and no JSON-RPC server (#2454).**
+  `decdn-client` and the `decdn` CLI link ring alone: alloy's default
+  `reqwest-rustls-tls` and the workspace's reqwest `rustls` feature each
+  compiled in aws-lc beside the ring that iroh's QUIC stack already uses.
+  reqwest is now built with `rustls-no-provider`, which panics in
+  `Client::build` until a process-wide rustls provider is installed, so
+  `decdn_common::tls::install_crypto_provider` installs ring. Both binaries
+  call it at start, and the SDK's provider builders and registry discovery
+  call it before they build a client; a provider the host application
+  installed first stays in place. The daemon's chain RPC moves from aws-lc to
+  ring as well; its S3 client keeps aws-lc. `decdn-common` puts the admin
+  RPC's server half (`AdminRpcServer`, `jsonrpsee-server`) behind a new
+  `admin-server` feature that only `decdn-node` enables. The crate-edges check
+  now resolves the `decdn-cli` and `decdn-client` closures per crate with
+  `cargo tree` and fails on `aws-lc-*` or `jsonrpsee-server` in either.
+
 - **Published crate docs read for crates.io and docs.rs users (#2442).** The
   crate roots of `decdn-protocol`, `-incentive`, `-node`, `-reputation`,
   `-bao-range`, `-config-types` and `-cache` each open with a one-sentence

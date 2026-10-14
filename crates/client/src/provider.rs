@@ -10,6 +10,11 @@
 //! up, closes and reclaims payment pools with. The daemon's boot chain reads and the
 //! client's registry discovery classify a typed chain error with the same
 //! classifier.
+//!
+//! Both builders install ring as the process-wide rustls provider first
+//! ([`decdn_common::tls::install_crypto_provider`]): alloy's HTTP transport
+//! builds a reqwest client, which panics without one. An SDK host that never
+//! installs a provider itself still gets a working chain client.
 
 use alloy::network::EthereumWallet;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -34,6 +39,7 @@ pub fn build_provider(
     rpc_url: &str,
     signer: &PrivateKeySigner,
 ) -> anyhow::Result<impl Provider + Clone + use<>> {
+    decdn_common::tls::install_crypto_provider();
     Ok(ProviderBuilder::new()
         .with_simple_nonce_management()
         .wallet(EthereumWallet::from(signer.clone()))
@@ -49,6 +55,7 @@ pub fn build_provider(
 /// Fails if `rpc_url` is not a valid URL. The error never echoes the value,
 /// which can carry an API key.
 pub fn build_read_provider(rpc_url: &str) -> anyhow::Result<impl Provider + Clone + use<>> {
+    decdn_common::tls::install_crypto_provider();
     Ok(ProviderBuilder::new().connect_http(parse_rpc_url(rpc_url)?))
 }
 

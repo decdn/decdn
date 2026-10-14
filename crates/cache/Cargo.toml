@@ -37,6 +37,9 @@ chacha20poly1305 = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }
+# reqwest is built with `rustls-no-provider`; `HttpOrigin` installs ring as the
+# process-wide provider before it builds its client.
+rustls = { workspace = true }
 # Streaming primitives for origin pull-through (issue #271). `futures-util`
 # brings `Stream` + combinators; `tokio-util` brings `ReaderStream` /
 # `StreamReader` used by FilesystemOrigin and the HTTP decompression

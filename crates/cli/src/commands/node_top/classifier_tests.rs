@@ -11,6 +11,7 @@ use super::*;
 /// runtime (rather than a hand-constructed mock that could diverge
 /// from reqwest's internal error structure).
 async fn reqwest_send_error(url: &str) -> anyhow::Error {
+    decdn_common::tls::install_crypto_provider();
     let err = reqwest::Client::new()
         .get(url)
         .send()

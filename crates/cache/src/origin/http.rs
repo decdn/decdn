@@ -117,6 +117,12 @@ impl HttpOrigin {
         // `send` runs every request on `io`, so each pooled connection lives
         // on the runtime that built this origin, never on a caller's
         // pull-leg runtime (`super::io_runtime`).
+        //
+        // The workspace builds reqwest with `rustls-no-provider`, so
+        // `build` panics without a process-wide rustls provider. Install
+        // ring, as `decdn_common::tls::install_crypto_provider` does (this
+        // crate does not depend on `decdn-common`); a no-op once installed.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(user_agent)

@@ -9,25 +9,34 @@ Without this check nothing enforces it: an edge added the wrong way compiles
 green, and the first thing to notice is a `decdn` binary that has grown an S3
 client.
 
-Two passes over `cargo metadata --all-features` (all features, because an
-optional dependency is absent from the resolve graph until its feature is on,
-and `cargo install decdn-cli --features x` would still link it):
+Two passes:
 
-* **Direct edges.** Each member's normal and build dependencies on other
-  members must equal its ALLOWED row — equal, not a subset: the table is the
-  graph transcribed, so an edge the graph lacks is rot in the other direction.
+* **Direct edges**, over `cargo metadata --no-deps`. Each member's normal and
+  build dependencies on other members must equal its ALLOWED row — equal, not
+  a subset: the table is the graph transcribed, so an edge the graph lacks is
+  rot in the other direction.
   Dev-dependencies are not constrained; the design accepts dev-only cycles
   (`cli` tests the daemon it is shipped beside). A member with no row fails,
   and a row for a member that does not exist fails too.
-* **Closure.** The transitive normal and build dependencies of each
-  FOOTPRINT_GUARDED crate — the `decdn-cli` binary and the `decdn-client` SDK
-  it builds on — must not include the blob store or the AWS SDK
+* **Closure**, over one `cargo tree -p <crate>` per FOOTPRINT_GUARDED crate —
+  the `decdn-cli` binary and the `decdn-client` SDK it builds on. Their
+  transitive normal and build dependencies must not include the blob store,
+  the AWS SDK, the aws-lc crypto library or the JSON-RPC server
   (MUST_NOT_LINK). The direct table cannot see this: `client → common` is
   allowed, so `common` quietly growing an `iroh-blobs` edge would pass the
   first pass and still put the blob store in the SDK and the CLI. The SDK is
   guarded on its own, not only through the CLI, because a third party links it
   without the CLI. A walk that visits nothing is a failure, not a clean
   closure.
+
+  The closure is resolved per crate, never from `cargo metadata`: metadata
+  resolves features once for the whole workspace, so the daemon's own
+  aws-lc (its S3 client) and JSON-RPC server would show up in every crate's
+  closure. `cargo tree -p` resolves features the way `cargo build -p` and
+  `cargo install` do — the way release.yml builds each binary. It runs with
+  `--all-features`, because `cargo install decdn-cli --features x` would
+  still link an optional dependency, and `--target all`, because the SDK also
+  ships to Android and iOS.
 
 The table is the actual graph, transcribed. Changing it is a design change and
 CLAUDE.md's Dependency flow paragraph moves with it.
@@ -38,6 +47,7 @@ Run: .github/scripts/check-crate-edges.sh
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from collections import deque
@@ -83,29 +93,80 @@ ALLOWED: dict[str, frozenset[str]] = {
 SINKS = frozenset({"decdn-cli", "decdn-e2e"})
 # The publisher CLI and the client SDK are iroh-blobs-free and AWS-free (#578,
 # #1150): neither links a blob store or an S3 SDK, so `cargo install decdn-cli`
-# builds no such thing and a crate built on `decdn-client` inherits none.
+# builds no such thing and a crate built on `decdn-client` inherits none. They
+# also link one TLS backend, ring, and no JSON-RPC server (#2454): aws-lc is a
+# second crypto library and a C build on every client target, and only the
+# daemon serves the admin RPC.
 FOOTPRINT_GUARDED = ("decdn-cli", "decdn-client")
 MUST_NOT_LINK = frozenset(
-    {"iroh-blobs", "aws-config", "aws-credential-types", "aws-runtime", "aws-types", "aws-sigv4"}
+    {
+        "iroh-blobs",
+        "aws-config",
+        "aws-credential-types",
+        "aws-runtime",
+        "aws-types",
+        "aws-sigv4",
+        "jsonrpsee-server",
+    }
 )
-# The SDK's service and smithy crates by prefix. Not a bare `aws-` prefix:
-# `aws-lc-rs` is rustls's crypto provider and legitimately in the CLI tree.
-MUST_NOT_LINK_PREFIXES = ("aws-sdk-", "aws-smithy-")
+# By prefix: the AWS SDK's service and smithy crates, and aws-lc (`aws-lc-rs`,
+# `aws-lc-sys`, `aws-lc-fips-sys`).
+MUST_NOT_LINK_PREFIXES = ("aws-sdk-", "aws-smithy-", "aws-lc-")
 # A build script compiles the crate too, so a build-dependency is an edge the
 # design has to allow; only dev-dependencies are exempt.
 EDGE_KINDS = frozenset({None, "build"})
-METADATA_ARGS = ("cargo", "metadata", "--format-version", "1", "--locked", "--all-features")
+METADATA_ARGS = ("cargo", "metadata", "--format-version", "1", "--locked", "--no-deps")
+# `{p}` with a depth prefix: one `<depth><name> v<version>[ (…)]` line per edge,
+# ` (*)` marking a crate whose dependencies were already printed. The same
+# `-e normal,build` as EDGE_KINDS.
+TREE_ARGS = (
+    "cargo", "tree", "--locked", "--all-features", "--target", "all",
+    "-e", "normal,build", "--prefix", "depth", "--format", "{p}",
+)
+TREE_LINE = re.compile(r"(\d+)(\S+) v\S+")
 
 
 def is_forbidden(name: str) -> bool:
     return name in MUST_NOT_LINK or name.startswith(MUST_NOT_LINK_PREFIXES)
 
 
-def is_edge(dep_kinds: list[dict]) -> bool:
-    return any(k.get("kind") in EDGE_KINDS for k in dep_kinds)
+def tree_command(root: str, manifest: str) -> list[str]:
+    """One crate per invocation: two `-p` flags would resolve their features together."""
+    return [*TREE_ARGS, "--manifest-path", manifest, "-p", root]
 
 
-def check(metadata: dict) -> list[str]:
+def parse_tree(text: str) -> tuple[str | None, dict[str, list[str]]]:
+    """`cargo tree --prefix depth` output → (root, crate → its dependencies).
+
+    A ` (*)` line still records the edge to it; its own dependencies come from
+    the line where it was first printed. A line that does not parse is an
+    error, not a skip: a skipped line is a crate the closure never inspects.
+    """
+    root: str | None = None
+    deps: dict[str, list[str]] = {}
+    stack: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        m = TREE_LINE.match(line)
+        if m is None:
+            raise ValueError(f"unexpected `cargo tree` line: {line!r}")
+        depth, name = int(m.group(1)), m.group(2)
+        if depth > len(stack):
+            raise ValueError(f"`cargo tree` line skips a depth: {line!r}")
+        del stack[depth:]
+        if depth == 0:
+            root = root or name
+        else:
+            children = deps.setdefault(stack[-1], [])
+            if name not in children:
+                children.append(name)
+        stack.append(name)
+    return root, deps
+
+
+def check(metadata: dict, trees: dict[str, str]) -> list[str]:
+    """`trees` maps each FOOTPRINT_GUARDED member to its `cargo tree` output."""
     errors: list[str] = []
     by_id = {p["id"]: p for p in metadata["packages"]}
     members = {by_id[i]["name"]: by_id[i] for i in metadata["workspace_members"]}
@@ -152,41 +213,41 @@ def check(metadata: dict) -> list[str]:
 
     # --- footprint closures -------------------------------------------------
     for root in FOOTPRINT_GUARDED:
-        pkg = members.get(root)
-        if pkg is not None:
-            errors.extend(check_closure(metadata, by_id, root, pkg["id"]))
+        if root in members:
+            errors.extend(check_closure(root, trees.get(root, "")))
 
     return errors
 
 
-def check_closure(metadata: dict, by_id: dict, root: str, root_id: str) -> list[str]:
+def check_closure(root: str, tree: str) -> list[str]:
     """Walk `root`'s normal and build closure; report every forbidden crate in it."""
     errors: list[str] = []
-    nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
-    parent: dict[str, str | None] = {root_id: None}
-    queue = deque([root_id])
+    tree_root, deps = parse_tree(tree)
+    if tree_root not in (None, root):
+        return [f"the `cargo tree` output for {root} is rooted at {tree_root}"]
+    parent: dict[str, str | None] = {root: None}
+    queue = deque([root])
     while queue:
         current = queue.popleft()
-        for dep in nodes.get(current, {}).get("deps", []):
-            if not is_edge(dep["dep_kinds"]) or dep["pkg"] in parent:
+        for dep in deps.get(current, []):
+            if dep in parent:
                 continue
-            parent[dep["pkg"]] = current
-            queue.append(dep["pkg"])
+            parent[dep] = current
+            queue.append(dep)
     if len(parent) <= 1:
         errors.append(
-            f"{root} has no dependencies in the resolve graph — the closure walk inspected nothing"
+            f"{root} has no dependencies in its `cargo tree` — the closure walk inspected nothing"
         )
-    for pkg_id, via in sorted(parent.items()):
-        name = by_id[pkg_id]["name"]
+    for name, via in sorted(parent.items()):
         if is_forbidden(name):
             path = [name]
             while via is not None:
-                path.append(by_id[via]["name"])
+                path.append(via)
                 via = parent[via]
             errors.append(
                 f"{root} links {name} via " + " ← ".join(path) + " — the publisher CLI and "
-                "the client SDK are iroh-blobs-free and AWS-free (#578); the edge that "
-                "introduced it must go"
+                "the client SDK link no blob store or AWS SDK (#578), and no aws-lc or "
+                "JSON-RPC server (#2454); the edge that introduced it must go"
             )
     return errors
 
@@ -197,13 +258,23 @@ def main() -> int:
     ).stdout.strip()
     # stderr passes through: a stale lock under `--locked` is the common local
     # failure, and cargo's own line says how to fix it.
+    manifest = f"{repo_root}/Cargo.toml"
     out = subprocess.run(
-        [*METADATA_ARGS, "--manifest-path", f"{repo_root}/Cargo.toml"],
+        [*METADATA_ARGS, "--manifest-path", manifest],
         check=True,
         stdout=subprocess.PIPE,
         text=True,
     ).stdout
-    errors = check(json.loads(out))
+    metadata = json.loads(out)
+    members = {p["name"] for p in metadata["packages"] if p["id"] in metadata["workspace_members"]}
+    trees = {
+        root: subprocess.run(
+            tree_command(root, manifest), check=True, stdout=subprocess.PIPE, text=True
+        ).stdout
+        for root in FOOTPRINT_GUARDED
+        if root in members
+    }
+    errors = check(metadata, trees)
     if errors:
         print("error: crate dependency direction violates the design:\n", file=sys.stderr)
         for e in errors:
