@@ -92,6 +92,7 @@ async fn daemon_binary_serves_tops_up_and_shuts_down() {
         chain.usdc(),
         owner,
         U256::from(OPEN_DEPOSIT),
+        None,
     )
     .await
     .unwrap();

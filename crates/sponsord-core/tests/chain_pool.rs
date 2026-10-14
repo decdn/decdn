@@ -79,6 +79,7 @@ async fn remaining_grows_after_topup() {
         chain.usdc(),
         owner,
         U256::from(OPEN_DEPOSIT_MICRO_USDC),
+        None,
     )
     .await
     .expect("open pool");
