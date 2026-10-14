@@ -15,6 +15,19 @@ release.
 
 ## [Unreleased]
 
+### Changed (BREAKING)
+
+- **`decdn.sh` and `decdn.ps1` take `get <decdn: URI>` and run `decdn get`
+  (decdn#2449).** The one-liner is
+  `sh -s -- get 'decdn:<hash>/[<path>][?ns=<id>]' [-o <dir>] [<decdn get flags>]`.
+  The URI and every argument after it go to `decdn get` as given, with
+  `-o .` added when no output directory is given. A path after the `/`
+  downloads that one file of the bundle. The download's state stays keyed
+  on the hash. Contract-breaking: `pull <hash>`, the `b3:`/`0x`/bare-hash
+  forms and `--namespace` are refused (the namespace is `?ns=<id>` in the
+  URI), and so is a URI without the trailing `/` (a raw blob). The
+  installers need a `decdn` release that ships `decdn get`.
+
 ## [0.0.4] - 2026-10-13
 
 ### Changed (BREAKING)

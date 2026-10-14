@@ -5,12 +5,13 @@
 # environment variable to run. The Windows twin is assets/decdn.ps1; the two
 # keep the same state.
 #
-# It installs decdn and, given `pull`, downloads a bundle paid for by this
-# onramp's sponsor:
-#   curl -fsSL <onramp>/decdn.sh | sh -s -- pull b3:<hash> [-o <dir>] [--namespace <id>] [<bundle pull flags>]
+# It installs decdn and, given `get`, downloads a bundle, or one file of a
+# bundle, paid for by this onramp's sponsor:
+#   curl -fsSL <onramp>/decdn.sh | sh -s -- get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]
 #
-# The hash comes first. Every argument after it goes to `decdn bundle pull`
-# as given, with `-o .` added when none of them sets the output directory.
+# The `decdn:` URI comes first. It and every argument after it go to
+# `decdn get` as given, with `-o .` added when none of them sets the output
+# directory.
 #
 # Without arguments, it only installs decdn into ~/.local/bin and checks that
 # the directory is on PATH, printing how to add it when it is not:
@@ -68,7 +69,7 @@ die() {
 }
 
 usage() {
-  echo "usage: sh decdn.sh [pull <hash> [-o <dir>] [--namespace <id>] [<bundle pull flags>]]" >&2
+  echo "usage: sh decdn.sh [get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]]" >&2
   exit 2
 }
 
@@ -95,13 +96,16 @@ lock() {
   LOCKS="${LOCKS} $1"
 }
 
-# normalize_hash <raw>: a BLAKE3 hash as the website prints it (`b3:<hex>`,
-# `0x<hex>` or bare hex) as 64 lowercase hex characters.
-normalize_hash() {
-  h="$1"
-  case "$h" in
-    b3:*) h="${h#b3:}" ;;
-    0x*) h="${h#0x}" ;;
+# bundle_hash <uri>: the hash of a bundle URI (`decdn:<hash>/...`) as 64
+# lowercase hex characters, which keys this download's state. Fails on a URI
+# that does not start with `decdn:<hash>/`; decdn get checks the rest.
+bundle_hash() {
+  rest="${1#decdn:}"
+  [ "$rest" != "$1" ] || return 1
+  h="${rest%%[/?]*}"
+  case "${rest#"$h"}" in
+    /*) ;;
+    *) return 1 ;;
   esac
   h="$(printf '%s' "$h" | tr 'A-F' 'a-f')"
   case "$h" in
@@ -273,10 +277,11 @@ ensure_capability() {
   printf '%s' "$TOKEN" >"${STATE}/capability"
 }
 
-# pull <hash> <bundle pull arg>...
-pull() {
+# get <hash> <uri> <decdn get arg>...
+get() {
   hash="$1"
-  shift
+  uri="$2"
+  shift 2
   # Key material is private; the downloaded files keep the user's umask.
   user_umask="$(umask)"
   umask 077
@@ -316,7 +321,7 @@ pull() {
   fi
 
   # The caller's arguments go in unchecked, before the ones this run owns.
-  set -- bundle pull --hash "$hash" "$@" \
+  set -- get "$uri" "$@" \
     --capability "$TOKEN" \
     --keystore "${STATE}/keystore.json" \
     --keystore-password-file "${STATE}/password" \
@@ -340,12 +345,14 @@ pull() {
 
 main() {
   hash=""
+  uri=""
   if [ "$#" -gt 0 ]; then
-    [ "$1" = pull ] && [ "$#" -ge 2 ] || usage
-    hash="$(normalize_hash "$2")" ||
-      die "not a BLAKE3 hash (expected 64 hex characters, optionally b3:-prefixed): $2"
+    [ "$1" = get ] && [ "$#" -ge 2 ] || usage
+    uri="$2"
+    hash="$(bundle_hash "$uri")" ||
+      die "not a bundle URI (expected decdn:<64 hex characters>/, with an optional file path after the /): $uri"
     shift 2
-    # The rest go to decdn bundle pull, which checks them.
+    # The rest go to decdn get, which checks them.
     has_output=""
     for arg in "$@"; do
       case "$arg" in
@@ -364,12 +371,12 @@ main() {
   fetch_bin decdn decdn "$DECDN_RELEASE" "$DECDN_VERSION" "$DECDN_SUMS_SHA256"
 
   if [ -n "$hash" ]; then
-    pull "$hash" "$@"
+    get "$hash" "$uri" "$@"
     return 0
   fi
   echo ""
   echo "decdn is installed at ${DECDN}. Download a bundle with:"
-  echo "  curl -fsSL ${ONRAMP_URL}/decdn.sh | sh -s -- pull b3:<hash> [-o <dir>] [--namespace <id>] [<bundle pull flags>]"
+  echo "  curl -fsSL ${ONRAMP_URL}/decdn.sh | sh -s -- get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]"
   path_hint
 }
 

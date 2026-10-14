@@ -72,7 +72,7 @@ match daemon.issue(&req).await {
 
 The signer is the user's download key. With your own gate you also decide
 how the token reaches the user's `decdn`: write it to a file and run
-`decdn bundle pull --capability-file <file> --keystore <their key> ...`, or
+`decdn get decdn:<hash>/ --capability-file <file> --keystore <their key> ...`, or
 keep using the onramp's installers by putting your gate in the onramp
 (option 2).
 

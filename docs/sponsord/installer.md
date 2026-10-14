@@ -1,18 +1,19 @@
 # The installer
 
 What happens on a user's machine. One command installs `decdn` and
-downloads a bundle, paid for by the onramp's sponsor:
+downloads a bundle, or one file of a bundle, paid for by the onramp's
+sponsor:
 
 ```bash
-curl -fsSL https://<onramp>/decdn.sh | sh -s -- pull b3:<hash> [-o <dir>] [--namespace <id>] [<bundle pull flags>]
+curl -fsSL https://<onramp>/decdn.sh | sh -s -- get 'decdn:<hash>/[<path>][?ns=<id>]' [-o <dir>] [<decdn get flags>]
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://<onramp>/decdn.ps1))) pull b3:<hash> [-o <dir>] [--namespace <id>] [<bundle pull flags>]
+& ([scriptblock]::Create((irm https://<onramp>/decdn.ps1))) get 'decdn:<hash>/[<path>][?ns=<id>]' [-o <dir>] [<decdn get flags>]
 ```
 
 The onramp serves each script with its own URL, the pinned `decdn` release
-and its download profile (chain, RPC, contracts) baked in. Without `pull`,
+and its download profile (chain, RPC, contracts) baked in. Without `get`,
 the script only installs `decdn`.
 
 ## Install
@@ -23,7 +24,7 @@ release's `SHA256SUMS` against the pinned digest and the archive against
 `SHA256SUMS`. A marker in `~/.decdn/installer/` records what is installed,
 so a later run with the same pin downloads nothing.
 
-To install `decdn` without pulling a bundle:
+To install `decdn` without downloading a bundle:
 
 ```bash
 curl -fsSL https://<onramp>/decdn.sh | sh
@@ -39,7 +40,19 @@ on every run. On macOS and Linux it leaves shell startup files alone: when
 user's shell (`~/.zshrc`, `~/.bashrc` or `~/.bash_profile`, `fish_add_path`,
 or `~/.profile`).
 
-## `pull <hash> [-o <dir>] [--namespace <id>] [<bundle pull flags>]`
+## `get <decdn: URI> [-o <dir>] [<decdn get flags>]`
+
+The URI names what to download, in the `decdn:` form `decdn get` takes
+(decdn's `adr/appendix-bundles.md` § `decdn:` URIs):
+
+| URI | Downloads |
+|---|---|
+| `decdn:<hash>/` | every file of the bundle whose manifest has this hash |
+| `decdn:<hash>/a/b.txt` | that one file of the bundle, to `<dir>/a/b.txt` |
+| either with `?ns=<id>` | the same, routed to the namespace's origins |
+
+The trailing `/` is required: the installer downloads bundles. Quote the URI
+when it has a `?`, so the shell does not read it as a pattern.
 
 1. Opens `~/.decdn/sponsored/downloads/<hash>/` and makes a throwaway key
    there with `decdn key-gen`, under a random password. Nothing to manage.
@@ -49,8 +62,8 @@ or `~/.profile`).
    prints a link (and opens it in the browser) to the gate page, then waits
    up to 10 minutes for the person to pass it. The capability and its expiry
    are saved beside the key.
-3. Runs `decdn bundle pull` with the capability and key. `decdn`'s own
-   progress and errors show as they are. `decdn` keeps its peer cache in
+3. Runs `decdn get` with the capability and key. `decdn`'s own progress and
+   errors show as they are. `decdn` keeps its peer cache in
    `~/.decdn/sponsored/decdn/`, which downloads share, so a later download
    finds nodes faster. Downloads run one at a time in that directory; one
    started while another runs gets a directory of its own.
@@ -63,17 +76,18 @@ A capability within about an hour of expiring is replaced by a fresh key
 and a new trip through the gate, so a download never starts on one that
 nodes will refuse midway.
 
-The hash comes first and names the download. Every argument after it goes
-to `decdn bundle pull` unchanged, and `decdn` checks it:
+The download's state is keyed on the hash, so every URI of one bundle shares
+its key and capability. The URI and every argument after it go to
+`decdn get` unchanged, and `decdn` checks them:
 
 ```bash
-curl -fsSL https://<onramp>/decdn.sh | sh -s -- pull b3:<hash> -o out --namespace 7 --jobs 8 --include '*.txt'
+curl -fsSL https://<onramp>/decdn.sh | sh -s -- get 'decdn:<hash>/?ns=7' -o out --jobs 8 --include '*.txt'
 ```
 
-Without `-o` (or `--output`), the script adds `-o .`. `--namespace` lets a
+Without `-o` (or `--output`), the script adds `-o .`. `?ns=<id>` lets a
 node that hasn't cached the bundle fetch it from that namespace's origins;
-it never changes which bytes are accepted. A bad value is reported by
-`decdn` after the gate, and running the fixed command again skips the gate.
-A flag the script already passes (`--capability`, `--keystore`,
-`--data-dir`, the chain and contract flags) can be given again this way,
-and what `decdn` then does is up to `decdn`.
+it never changes which bytes are accepted. A bad URI path or namespace is
+reported by `decdn` after the gate, and running the fixed command again
+skips the gate. A flag the script already passes (`--capability`,
+`--keystore`, `--data-dir`, the chain and contract flags) can be given
+again this way, and what `decdn` then does is up to `decdn`.

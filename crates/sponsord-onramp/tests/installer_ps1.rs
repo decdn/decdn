@@ -1,6 +1,6 @@
 //! `assets/decdn.ps1` as the onramp serves it, run in Windows PowerShell
 //! against that onramp over HTTP (fake daemon and gate), a release served
-//! over HTTP and a stub `decdn.exe` compiled for the test: `pull` passes the
+//! over HTTP and a stub `decdn.exe` compiled for the test: `get` passes the
 //! gate and runs `decdn` with the capability, and a failed download resumes
 //! without the gate.
 //!
@@ -188,16 +188,16 @@ impl Fixture {
         }
     }
 
-    /// Run `pull <HASH> --namespace 1 --jobs 8` and pass the gate for
-    /// whatever key the script prints a gate link for. Returns (success,
-    /// stdout, stderr).
-    async fn pull(&self, stub_exit: &str) -> (bool, String, String) {
+    /// Run `get decdn:<HASH>/?ns=1 --jobs 8` and pass the gate for whatever
+    /// key the script prints a gate link for. Returns (success, stdout,
+    /// stderr).
+    async fn get(&self, stub_exit: &str) -> (bool, String, String) {
         let home = self.root.join("home");
         let local = self.root.join("local");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&local).unwrap();
         let command = format!(
-            "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '{}'))) pull b3:{HASH} --namespace 1 --jobs 8",
+            "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '{}'))) get 'decdn:{HASH}/?ns=1' --jobs 8",
             self.script.display()
         );
         let mut child = tokio::process::Command::new("powershell")
@@ -255,13 +255,13 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn pull_passes_the_gate_and_resumes_a_failed_download_without_it() {
+async fn get_passes_the_gate_and_resumes_a_failed_download_without_it() {
     if std::env::var_os("CI").is_none() {
         return;
     }
-    let fx = Fixture::new("pull").await;
+    let fx = Fixture::new("get").await;
 
-    let (ok, stdout, stderr) = fx.pull("3").await;
+    let (ok, stdout, stderr) = fx.get("3").await;
     let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(!ok, "a failed decdn fails the run\n{both}");
     assert!(stdout.contains("Installing decdn v0.1.0"), "{both}");
@@ -274,7 +274,7 @@ async fn pull_passes_the_gate_and_resumes_a_failed_download_without_it() {
         "{both}"
     );
 
-    let (ok, stdout, stderr) = fx.pull("0").await;
+    let (ok, stdout, stderr) = fx.get("0").await;
     let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(ok, "{both}");
     assert!(
@@ -292,7 +292,7 @@ async fn pull_passes_the_gate_and_resumes_a_failed_download_without_it() {
     for call in &calls {
         assert!(
             call.starts_with(&format!(
-                "bundle pull --hash {HASH} -o . --namespace 1 --jobs 8 --capability dcap1:FAKE1 "
+                "get decdn:{HASH}/?ns=1 -o . --jobs 8 --capability dcap1:FAKE1 "
             )),
             "{call}"
         );

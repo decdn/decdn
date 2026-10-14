@@ -32,7 +32,7 @@ That is why:
 
 ## The download flow
 
-1. **Install.** `curl …/decdn.sh | sh -s -- pull b3:<hash>` (or `decdn.ps1`)
+1. **Install.** `curl …/decdn.sh | sh -s -- get decdn:<hash>/` (or `decdn.ps1`)
    runs the script the onramp serves, with the onramp URL, the pinned
    `decdn` release and the download profile (chain id, RPC URL,
    `PaymentPool`, `CapacityBond`) baked in. The onramp takes the chain id and
@@ -47,7 +47,7 @@ That is why:
    proof with the gate, then calls the daemon's `POST /v1/capabilities` and
    holds the token and its expiry for the script, which saves both beside
    the key.
-4. **Pull.** The script runs `decdn bundle pull --capability <token>` with
+4. **Pull.** The script runs `decdn get <URI> --capability <token>` with
    the key. `decdn` finds nodes, pays them with vouchers signed by the
    throwaway key, and verifies every byte against the hash. Its `--data-dir`
    is `~/.decdn/sponsored/decdn/`, shared across downloads, so peers cached
@@ -62,8 +62,8 @@ That is why:
 Published commands and downloads in progress read these, so a change to any
 of them is called out as contract-breaking in the changelog:
 
-- the installers' arguments (`pull <hash> [-o <dir>] [--namespace <id>]
-  [<bundle pull flags>]`);
+- the installers' arguments (`get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>]
+  [<decdn get flags>]`);
 - the layout under `~/.decdn/sponsored/` (`downloads/<hash>/` with
   `keystore.json`, `password`, `address`, `capability` and `expiry`), which
   an interrupted download resumes from;

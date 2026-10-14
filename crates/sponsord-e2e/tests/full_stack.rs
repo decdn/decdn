@@ -113,7 +113,7 @@ async fn the_installer_gets_a_capability_through_the_gate_and_runs_decdn() {
         Duration::from_secs(60),
         tokio::process::Command::new("sh")
             .arg(&script)
-            .args(["pull", &format!("b3:{HASH}")])
+            .args(["get", &format!("decdn:{HASH}/")])
             .env("HOME", &home)
             .env("STUB_DIR", &stub)
             .stdin(std::process::Stdio::null())
@@ -131,7 +131,7 @@ async fn the_installer_gets_a_capability_through_the_gate_and_runs_decdn() {
     let signer = browser.await.unwrap();
 
     let calls = std::fs::read_to_string(stub.join("calls")).unwrap();
-    assert!(calls.starts_with(&format!("bundle pull --hash {HASH} ")));
+    assert!(calls.starts_with(&format!("get decdn:{HASH}/ ")));
     assert!(calls.contains(&format!("--payment-pool-address {TEST_PAYMENT_POOL}")));
     assert!(calls.contains(&format!("--chain-id {TEST_CHAIN_ID}")));
     assert!(!state_dir.exists(), "state is deleted after a good pull");

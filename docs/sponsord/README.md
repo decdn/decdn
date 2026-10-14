@@ -25,7 +25,7 @@ You run two services next to a `PaymentPool` you fund:
 │ (throwaway key  │ ◀── installers ─── │ gate · hand-off  │    (bearer token)     │ signs,   │     (your pool)
 │  per download)  │                    │                  │                       │ tops up  │
 └────────┬────────┘                    └─────────▲────────┘                       └──────────┘
-         │ decdn bundle pull                     │ POST /v1/fund (gate passed)
+         │ decdn get                             │ POST /v1/fund (gate passed)
          ▼                                       │
     deCDN nodes                           user's browser
 ```
@@ -71,18 +71,20 @@ default) and tops it up whenever it is below the low-water mark.
    default), then give users one line per download:
 
    ```bash
-   curl -fsSL https://downloads.example.org/decdn.sh | sh -s -- pull b3:<hash> --namespace <id>
+   curl -fsSL https://downloads.example.org/decdn.sh | sh -s -- get 'decdn:<hash>/?ns=<id>'
    ```
 
    ```powershell
-   & ([scriptblock]::Create((irm https://downloads.example.org/decdn.ps1))) pull b3:<hash> --namespace <id>
+   & ([scriptblock]::Create((irm https://downloads.example.org/decdn.ps1))) get 'decdn:<hash>/?ns=<id>'
    ```
 
-   `--namespace` is optional. It takes the numeric deCDN namespace the bundle
-   is published under, not your pool id, and lets a node that hasn't cached
-   the bundle fetch it from that namespace's origins. Without it, only nodes
-   that already cache the bundle can serve it. Any other flag goes straight
-   to `decdn bundle pull` ([installer](docs/installer.md)).
+   The `decdn:` URI names the bundle by its manifest hash; a path after the
+   `/` downloads one file of it. `?ns=<id>` is optional. It takes the numeric
+   deCDN namespace the bundle is published under, not your pool id, and lets
+   a node that hasn't cached the bundle fetch it from that namespace's
+   origins. Without it, only nodes that already cache the bundle can serve
+   it. Any flag after the URI goes straight to `decdn get`
+   ([installer](docs/installer.md)).
 
 ## Documentation
 

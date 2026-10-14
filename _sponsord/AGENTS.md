@@ -64,10 +64,11 @@ decdn before it runs the tests (see the `anvil-e2e` job in `ci.yml`).
 - **The installers** (`crates/sponsord-onramp/assets/decdn.{sh,ps1}`) are
   everything that runs on a user's machine (Linux, macOS and Windows). The
   onramp renders them once at startup with its URL, the pinned `decdn`
-  release and the download profile baked in. Given `pull <hash>`, a script
-  installs `decdn`, makes a throwaway key per download with `decdn key-gen`
-  under `~/.decdn/sponsored/downloads/<hash>/`, polls the onramp for the
-  capability, then runs `decdn bundle pull --capability <token>`, which
+  release and the download profile baked in. Given `get decdn:<hash>/...`, a
+  script installs `decdn`, makes a throwaway key per download with
+  `decdn key-gen` under `~/.decdn/sponsored/downloads/<hash>/`, polls the
+  onramp for the capability, then runs `decdn get <URI> --capability <token>`,
+  which
   handles discovery, payment and verification. `tests/installer_sh.rs` runs
   `decdn.sh` against a served onramp and a stub `decdn`;
   `tests/installer_ps1.rs` does the same for `decdn.ps1` on Windows CI.

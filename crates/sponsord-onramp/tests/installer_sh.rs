@@ -1,7 +1,7 @@
 //! `assets/decdn.sh` as the onramp serves it, run for real against that
 //! onramp over HTTP (fake daemon and gate), `file://` releases and a stub
 //! `decdn`: the install skips binaries already at the pin, it says how to
-//! put `~/.local/bin` on PATH when it is missing, and `pull` passes
+//! put `~/.local/bin` on PATH when it is missing, and `get` passes
 //! the gate once per download, resumes a failed one without it, replaces a
 //! capability near expiry, and refuses a second run of the same download.
 
@@ -31,7 +31,8 @@ macro_rules! hash {
     };
 }
 const HASH: &str = hash!();
-const PULL: [&str; 2] = ["pull", concat!("b3:", hash!())];
+const BUNDLE: &str = concat!("decdn:", hash!(), "/");
+const GET: [&str; 2] = ["get", BUNDLE];
 
 /// The address the stub `decdn` prints for the `n`th key it makes.
 fn stub_address(n: u64) -> String {
@@ -277,9 +278,12 @@ async fn install_suggests_adding_the_bin_dir_to_path_only_when_missing() {
 }
 
 #[tokio::test]
-async fn pull_passes_the_gate_and_runs_decdn_with_the_capability() {
-    let fx = Fixture::new("pull").await;
-    let args = [PULL[0], PULL[1], "-o", "out dir", "--namespace", "1"];
+async fn get_passes_the_gate_and_runs_decdn_with_the_capability() {
+    let fx = Fixture::new("get").await;
+    // An entry URI with a namespace: the download's state is keyed on the hash
+    // alone, and the URI reaches decdn as given.
+    let uri = concat!("decdn:", hash!(), "/a%20b.txt?ns=1");
+    let args = [GET[0], uri, "-o", "out dir"];
     let stdout = fx.run_ok(&args, &[]).await;
 
     assert!(
@@ -294,7 +298,7 @@ async fn pull_passes_the_gate_and_runs_decdn_with_the_capability() {
     assert_eq!(
         fx.calls(),
         [format!(
-            "bundle pull --hash {HASH} -o out dir --namespace 1 --capability dcap1:FAKE1 \
+            "get {uri} -o out dir --capability dcap1:FAKE1 \
              --keystore {}/keystore.json --keystore-password-file {}/password \
              --data-dir {} --rpc-url https://rpc.example --payment-pool-address {pool} \
              --capacity-bond-address {bond} --chain-id 421614",
@@ -304,7 +308,7 @@ async fn pull_passes_the_gate_and_runs_decdn_with_the_capability() {
         )]
     );
     assert_eq!(fx.fakes.source.issued_count(), 1);
-    assert!(!state.exists(), "state is deleted after a good pull");
+    assert!(!state.exists(), "state is deleted after a good download");
     assert!(!fx.sponsored().join("decdn.lock").exists());
     assert!(
         !fx.sponsored()
@@ -314,13 +318,13 @@ async fn pull_passes_the_gate_and_runs_decdn_with_the_capability() {
 }
 
 #[tokio::test]
-async fn every_argument_after_the_hash_reaches_decdn_as_given() {
+async fn every_argument_after_the_uri_reaches_decdn_as_given() {
     let fx = Fixture::new("pass_through").await;
 
     // An output flag in any form replaces `-o .`.
     let args = [
-        PULL[0],
-        PULL[1],
+        GET[0],
+        GET[1],
         "--jobs",
         "8",
         "--output=out",
@@ -329,13 +333,13 @@ async fn every_argument_after_the_hash_reaches_decdn_as_given() {
     ];
     fx.run_ok(&args, &[]).await;
     // Without one, the bundle lands in the current directory.
-    fx.run_ok(&[PULL[0], PULL[1], "--jobs", "8"], &[]).await;
+    fx.run_ok(&[GET[0], GET[1], "--jobs", "8"], &[]).await;
 
     let calls = fx.calls();
     assert_eq!(calls.len(), 2, "{calls:?}");
     let expected = [
-        format!("bundle pull --hash {HASH} --jobs 8 --output=out --include *.txt --capability "),
-        format!("bundle pull --hash {HASH} -o . --jobs 8 --capability "),
+        format!("get {BUNDLE} --jobs 8 --output=out --include *.txt --capability "),
+        format!("get {BUNDLE} -o . --jobs 8 --capability "),
     ];
     for (call, start) in calls.iter().zip(&expected) {
         assert!(call.starts_with(start), "{call}");
@@ -344,10 +348,10 @@ async fn every_argument_after_the_hash_reaches_decdn_as_given() {
 }
 
 #[tokio::test]
-async fn a_failed_pull_resumes_with_the_same_key_and_capability() {
+async fn a_failed_download_resumes_with_the_same_key_and_capability() {
     let fx = Fixture::new("resume").await;
 
-    let run = fx.run_with(&PULL, &[("STUB_EXIT", "3")]).await;
+    let run = fx.run_with(&GET, &[("STUB_EXIT", "3")]).await;
     assert_eq!(run.code, Some(3));
     assert!(run.stdout.contains(&fx.gate_link(1)), "{}", run.stdout);
     assert!(
@@ -374,7 +378,7 @@ async fn a_failed_pull_resumes_with_the_same_key_and_capability() {
     assert_eq!(mode(&state.join("password")), 0o600);
 
     // No gate this time: the saved key and capability are reused.
-    let stdout = fx.run_ok(&PULL, &[]).await;
+    let stdout = fx.run_ok(&GET, &[]).await;
     assert!(!stdout.contains("Open this link"), "{stdout}");
     assert_eq!(fx.keys_made(), 1);
     assert_eq!(fx.fakes.source.issued_count(), 1);
@@ -392,11 +396,11 @@ async fn a_failed_pull_resumes_with_the_same_key_and_capability() {
 async fn a_capability_near_expiry_is_replaced_with_a_new_key() {
     let fx = Fixture::new("expiry").await;
 
-    let run = fx.run_with(&PULL, &[("STUB_EXIT", "1")]).await;
+    let run = fx.run_with(&GET, &[("STUB_EXIT", "1")]).await;
     assert!(run.stdout.contains(&fx.gate_link(1)), "{}", run.stdout);
     fs::write(fx.state().join("expiry"), "1").unwrap();
 
-    let stdout = fx.run_ok(&PULL, &[]).await;
+    let stdout = fx.run_ok(&GET, &[]).await;
     assert!(stdout.contains(&fx.gate_link(2)), "{stdout}");
     assert_eq!(fx.keys_made(), 2);
     assert!(fx.calls()[1].contains("--capability dcap1:FAKE2 "));
@@ -409,7 +413,7 @@ async fn a_download_already_running_is_not_started_twice() {
     fs::create_dir_all(&lock).unwrap();
     fs::write(lock.join("pid"), std::process::id().to_string()).unwrap();
 
-    let run = fx.run_with(&PULL, &[]).await;
+    let run = fx.run_with(&GET, &[]).await;
     assert!(!run.ok);
     assert!(run.stderr.contains("already running"), "{}", run.stderr);
     assert_eq!(fx.keys_made(), 0);
@@ -420,7 +424,7 @@ async fn a_download_already_running_is_not_started_twice() {
     let dead_pid = dead.id();
     dead.wait().unwrap();
     fs::write(lock.join("pid"), dead_pid.to_string()).unwrap();
-    fx.run_ok(&PULL, &[]).await;
+    fx.run_ok(&GET, &[]).await;
     assert!(!lock.exists());
 }
 
@@ -431,7 +435,7 @@ async fn a_busy_shared_data_dir_runs_the_download_in_its_own() {
     fs::create_dir_all(&lock).unwrap();
     fs::write(lock.join("pid"), std::process::id().to_string()).unwrap();
 
-    let run = fx.run_with(&PULL, &[("STUB_EXIT", "1")]).await;
+    let run = fx.run_with(&GET, &[("STUB_EXIT", "1")]).await;
     assert!(
         run.stderr.contains("without the shared peer cache"),
         "{}",
@@ -443,12 +447,24 @@ async fn a_busy_shared_data_dir_runs_the_download_in_its_own() {
 #[tokio::test]
 async fn bad_arguments_are_refused_before_installing() {
     let fx = Fixture::new("bad_args").await;
+    let blob = format!("decdn:{HASH}");
+    let blob_ns = format!("decdn:{HASH}?ns=1");
+    let b3 = format!("b3:{HASH}");
+    let upper_scheme = format!("DECDN:{HASH}/");
+    let short = format!("decdn:{}/", &HASH[1..]);
     for args in [
-        &["pull", "--jobs", "8"][..],
-        &["pull", "b3:nothex"],
-        &["pull"],
-        &["fetch", HASH],
-        &["pull", "-o", "out", HASH],
+        &["get", "--jobs", "8"][..],
+        &["get", "decdn:nothex/"],
+        &["get"],
+        &["pull", BUNDLE],
+        &["get", "-o", "out", BUNDLE],
+        // The installer downloads bundles: a blob URI has no trailing `/`.
+        &["get", &blob],
+        &["get", &blob_ns],
+        &["get", &b3],
+        &["get", HASH],
+        &["get", &upper_scheme],
+        &["get", &short],
     ] {
         let run = fx.run_with(args, &[]).await;
         assert!(!run.ok, "{args:?}");

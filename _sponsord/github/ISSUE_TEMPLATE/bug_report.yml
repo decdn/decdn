@@ -37,7 +37,7 @@ body:
       label: Steps to reproduce
       description: The exact commands and configuration. Remove API tokens, keystore passwords, Turnstile secrets and RPC URLs that carry API keys.
       placeholder: |
-        1. curl -fsSL https://<onramp>/decdn.sh | sh -s -- pull b3:...
+        1. curl -fsSL https://<onramp>/decdn.sh | sh -s -- get 'decdn:.../'
         2. ...
     validations:
       required: true

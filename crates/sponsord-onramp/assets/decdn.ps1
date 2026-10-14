@@ -5,11 +5,13 @@
 #
 # Install decdn:
 #   irm <onramp>/decdn.ps1 | iex
-# Install, then download a bundle paid for by this onramp's sponsor:
-#   & ([scriptblock]::Create((irm <onramp>/decdn.ps1))) pull b3:<hash> [-o <dir>] [--namespace <id>] [<bundle pull flags>]
+# Install, then download a bundle, or one file of a bundle, paid for by this
+# onramp's sponsor:
+#   & ([scriptblock]::Create((irm <onramp>/decdn.ps1))) get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]
 #
-# The hash comes first. Every argument after it goes to `decdn bundle pull`
-# as given, with `-o .` added when none of them sets the output directory.
+# The `decdn:` URI comes first. It and every argument after it go to
+# `decdn get` as given, with `-o .` added when none of them sets the output
+# directory.
 #
 # Each download gets a throwaway key under ~\.decdn\sponsored\downloads\<hash>\
 # and a capability for it, issued once the person passes the gate in the
@@ -61,24 +63,22 @@
     # needs an hour on top.
     $ExpiryMarginSecs = 4020
 
-    $Usage = 'usage: decdn.ps1 [pull <hash> [-o <dir>] [--namespace <id>] [<bundle pull flags>]]'
+    $Usage = 'usage: decdn.ps1 [get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]]'
 
     # Parse the arguments before downloading anything.
     $Hash = $null
+    $Uri = $null
     $PassArgs = New-Object System.Collections.Generic.List[string]
     if ($args.Count -gt 0) {
-      if ($args[0] -ne 'pull' -or $args.Count -lt 2) { throw $Usage }
-      # A BLAKE3 hash as the website prints it (`b3:<hex>`, `0x<hex>` or bare
-      # hex), as 64 lowercase hex characters.
-      $a = [string]$args[1]
-      $h = $a.Trim()
-      if ($h.StartsWith('b3:')) { $h = $h.Substring(3) } elseif ($h.StartsWith('0x')) { $h = $h.Substring(2) }
-      $h = $h.ToLowerInvariant()
-      if ($h -notmatch '^[0-9a-f]{64}$') {
-        throw "decdn: not a BLAKE3 hash (expected 64 hex characters, optionally b3:-prefixed): $a"
+      if ($args[0] -ne 'get' -or $args.Count -lt 2) { throw $Usage }
+      # A bundle URI (`decdn:<hash>/...`). Its hash, as 64 lowercase hex
+      # characters, keys this download's state; decdn get checks the rest.
+      $Uri = [string]$args[1]
+      if (-not ($Uri -cmatch '^decdn:([0-9a-fA-F]{64})/')) {
+        throw "decdn: not a bundle URI (expected decdn:<64 hex characters>/, with an optional file path after the /): $Uri"
       }
-      $Hash = $h
-      # The rest go to decdn bundle pull, which checks them.
+      $Hash = $Matches[1].ToLowerInvariant()
+      # The rest go to decdn get, which checks them.
       foreach ($Arg in ($args | Select-Object -Skip 2)) { $PassArgs.Add([string]$Arg) }
       if (-not ($PassArgs | Where-Object { $_ -cmatch '^(-o|--output(=|$))' })) {
         $PassArgs.InsertRange(0, [string[]]@('-o', '.'))
@@ -210,7 +210,7 @@
     if (-not $Hash) {
       Write-Host ''
       Write-Host 'decdn is ready. Download a bundle with:'
-      Write-Host "  & ([scriptblock]::Create((irm $OnrampUrl/decdn.ps1))) pull b3:<hash> [-o <dir>] [--namespace <id>] [<bundle pull flags>]"
+      Write-Host "  & ([scriptblock]::Create((irm $OnrampUrl/decdn.ps1))) get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]"
       return
     }
 
@@ -308,7 +308,7 @@
     }
 
     # The caller's arguments go in unchecked, before the ones this run owns.
-    $PullArgs = @('bundle', 'pull', '--hash', $Hash) + @($PassArgs) + @(
+    $PullArgs = @('get', $Uri) + @($PassArgs) + @(
       '--capability', $Token,
       '--keystore', $KeystoreFile,
       '--keystore-password-file', $PasswordFile,
