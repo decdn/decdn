@@ -29,6 +29,7 @@ async fn run_bails_after_consecutive_failures_cap() {
         timeout_ms: 100,
     };
 
+    decdn_common::tls::install_crypto_provider();
     let err = run(&args, None)
         .await
         .expect_err("loop must bail after the consecutive-failure cap");

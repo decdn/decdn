@@ -95,8 +95,8 @@ anstyle-progress = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # `node top` (issue #275) scrapes the daemon's loopback /metrics HTTP
-# endpoint. Workspace-pinned with rustls + no default features — same
-# settings `decdn-node` uses, so the dep tree stays unified.
+# endpoint. Workspace-pinned: rustls with no built-in provider (`main` installs
+# ring) and no default features — the settings `decdn-node` uses.
 reqwest = { workspace = true }
 # `node register` (ADR 019 § Step 2.3) submits `CapacityBond.registerNode`
 # on-chain: it needs alloy's provider/contract/signer surface. `decdn get`
@@ -123,6 +123,9 @@ decdn-client = { workspace = true, features = ["test-util"] }
 # None of this leaks into the `decdn` binary's release dep tree.
 decdn-node = { workspace = true }
 decdn-cache = { workspace = true }
+# The admin-RPC tests stand up their own jsonrpsee server too; the `decdn`
+# binary links only the client half (#2454).
+jsonrpsee = { workspace = true, features = ["server"] }
 # A mocked chain answers a revert with a JSON-RPC `ErrorPayload`, which `alloy`
 # does not re-export.
 alloy-json-rpc = { workspace = true }

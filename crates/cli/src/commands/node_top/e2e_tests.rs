@@ -36,6 +36,7 @@ async fn e2e_pipeline_reads_real_metrics_server() -> anyhow::Result<()> {
     // Fetch via reqwest, parse, build a Snapshot — the same
     // path the CLI's `run` takes in JSON mode.
     let url = format!("http://{addr}/metrics");
+    decdn_common::tls::install_crypto_provider();
     let body = reqwest::Client::new()
         .get(&url)
         .send()
@@ -105,6 +106,7 @@ async fn fetch_metrics_surfaces_non_2xx_as_error() -> anyhow::Result<()> {
         }
     });
 
+    decdn_common::tls::install_crypto_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;

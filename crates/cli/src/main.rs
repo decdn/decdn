@@ -25,6 +25,8 @@ use decdn_common::cli::{self, Cli, Command, ConfigCommand};
     reason = "process exit boundary; the final user-facing error line, not a log event"
 )]
 async fn main() -> std::process::ExitCode {
+    // Before any reqwest client: chain RPC, `doctor` and `setup` probes.
+    decdn_common::tls::install_crypto_provider();
     // `run()` dispatches every CLI command, so its future aggregates the
     // largest command's locals; box it to keep `main`'s future off the stack
     // (clippy::large_futures).

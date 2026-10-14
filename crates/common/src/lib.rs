@@ -21,3 +21,4 @@ pub mod disk;
 pub mod identity;
 pub mod net;
 pub mod redact;
+pub mod tls;
