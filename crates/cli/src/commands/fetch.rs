@@ -484,7 +484,17 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 /// [`super::interrupt::PendingOpens`], as context on any of those or as the
 /// error of a fetch that otherwise succeeded.
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
-    fetch_into(args, config_path, &mut Sink::Output).await
+    fetch_into(args, config_path, &mut Sink::Output, None).await
+}
+
+/// A delegate credential held in memory: the key that signs vouchers and the
+/// capability issued to it. Takes the place of `--keystore` and
+/// `--capability`.
+pub(crate) struct Credential {
+    /// The delegate key.
+    pub(crate) signer: Arc<alloy::signers::local::PrivateKeySigner>,
+    /// The capability the pool owner issued to `signer`.
+    pub(crate) grant: CapabilityGrant,
 }
 
 /// Where a fetch's verified bytes go.
@@ -508,7 +518,8 @@ impl Sink {
 }
 
 /// [`fetch`] with its verified bytes going to `sink`. `--output` names the
-/// destination only for [`Sink::Output`].
+/// destination only for [`Sink::Output`]. A `credential` pays in place of the
+/// keystore and capability the flags name.
 ///
 /// # Errors
 ///
@@ -517,6 +528,7 @@ pub(crate) async fn fetch_into(
     args: &cli::FetchArgs,
     config_path: Option<&Path>,
     sink: &mut Sink,
+    credential: Option<Credential>,
 ) -> anyhow::Result<()> {
     let timings = FetchTimings::start();
     let hash = parse_hash(&args.hash)?;
@@ -537,7 +549,14 @@ pub(crate) async fn fetch_into(
     // caller does NOT own and a capability authorizing this client's key to
     // spend against it. `None` => the unchanged self-owned pool path. Zeroes
     // the working deposit in `chain` (a delegate cannot fund an owner's pool).
-    let grant = resolve_delegation_grant(common, &mut chain)?;
+    // An in-memory `credential` is the same delegation, with its key in hand.
+    let (grant, signer) = match credential {
+        Some(Credential { signer, grant }) => {
+            chain.working_deposit = U256::ZERO;
+            (Some(grant), Some(signer))
+        }
+        None => (resolve_delegation_grant(common, &mut chain)?, None),
+    };
 
     // The buyer-pool store, opened once and recorded into by open-or-reuse.
     // The guard runs here, before the keystore password prompt: the answer
@@ -564,7 +583,7 @@ pub(crate) async fn fetch_into(
     // The command's peer-record and watermark writes, off the runtime thread.
     let writes = OrderedWrites::default();
     let result = tokio::select! {
-        result = fetch_over(args, hash, &relays, &chain, grant, &store, &endpoint, &writes, &opens, &timings, sink) => {
+        result = fetch_over(args, hash, &relays, &chain, (grant, signer), &store, &endpoint, &writes, &opens, &timings, sink) => {
             result
         }
         () = interrupt.wait() => Err(Interrupted.into()),
@@ -595,7 +614,10 @@ async fn fetch_over(
     hash: [u8; 32],
     relays: &[RelayUrl],
     chain: &ResolvedChain,
-    grant: Option<CapabilityGrant>,
+    (grant, held_signer): (
+        Option<CapabilityGrant>,
+        Option<Arc<alloy::signers::local::PrivateKeySigner>>,
+    ),
     store: &Arc<dyn BuyerPoolStore>,
     endpoint: &Endpoint,
     writes: &OrderedWrites,
@@ -627,18 +649,23 @@ async fn fetch_over(
     )?;
     timings.mark(Mark::Resolved);
 
-    // Buyer signer (vouchers + the openPool/topUp tx). Loaded after selection so a
-    // failed discovery never prompts for a keystore password. Password from env,
-    // else `--keystore-password-file`, else TTY.
-    let password = super::chain_ctx::read_keystore_password(
-        &super::chain_ctx::password_sources(
-            chain.keystore_password_file.as_deref(),
-            PasswordUse::Unlock,
-        ),
-        "eth keystore password",
-    )?
-    .into_secret();
-    let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+    // Buyer signer (vouchers + the openPool/topUp tx): the held one, else the
+    // keystore, loaded after selection so a failed discovery never prompts for a
+    // keystore password. Password from env, else `--keystore-password-file`,
+    // else TTY.
+    let signer = if let Some(signer) = held_signer {
+        signer
+    } else {
+        let password = super::chain_ctx::read_keystore_password(
+            &super::chain_ctx::password_sources(
+                chain.keystore_password_file.as_deref(),
+                PasswordUse::Unlock,
+            ),
+            "eth keystore password",
+        )?
+        .into_secret();
+        Arc::new(load_signer(&chain.keystore, &password)?)
+    };
     timings.mark(Mark::Unlocked);
     let self_address = signer.address();
 
