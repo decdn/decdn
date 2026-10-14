@@ -81,6 +81,13 @@ const GIVE_UP_AFTER_SECS: u64 = 120;
 /// The largest bundle manifest the gateway reads into memory.
 const MAX_MANIFEST_BYTES: usize = 64 << 20;
 
+/// The most parsed manifests the gateway keeps.
+const MAX_CACHED_MANIFESTS: usize = 16;
+
+/// The manifest bytes the cache keeps across all its entries. The newest
+/// entry stays even when it alone exceeds this.
+const MANIFEST_CACHE_BYTES: usize = 64 << 20;
+
 /// The duplex buffer between a pull and its HTTP response.
 const PIPE_BYTES: usize = 1 << 20;
 
@@ -133,7 +140,8 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         token,
         delegates: Mutex::new(HashMap::new()),
         pull: Arc::new(Mutex::new(())),
-        manifests: Mutex::new(HashMap::new()),
+        manifests: std::sync::Mutex::new(ManifestCache::default()),
+        manifest_fill: Mutex::new(()),
         hosts: allowed_hosts(args.listen),
     });
 
@@ -393,8 +401,47 @@ struct Gateway {
     delegates: Mutex<HashMap<Address, Delegate>>,
     /// One pull at a time: every pull opens the one buyer-pool store.
     pull: Arc<Mutex<()>>,
-    manifests: Mutex<HashMap<[u8; 32], BundleManifest>>,
+    manifests: std::sync::Mutex<ManifestCache>,
+    /// Held while a missing manifest is pulled, so concurrent requests for it
+    /// pull and pay once. Cache hits never wait on it.
+    manifest_fill: Mutex<()>,
     hosts: Vec<String>,
+}
+
+/// Parsed bundle manifests by hash, least recently used first out, within
+/// [`MAX_CACHED_MANIFESTS`] entries and [`MANIFEST_CACHE_BYTES`].
+#[derive(Default)]
+struct ManifestCache {
+    /// Oldest first: each entry is the hash, the manifest and its JSON size.
+    entries: std::collections::VecDeque<([u8; 32], Arc<BundleManifest>, usize)>,
+    bytes: usize,
+}
+
+impl ManifestCache {
+    fn get(&mut self, hash: &[u8; 32]) -> Option<Arc<BundleManifest>> {
+        let at = self.entries.iter().position(|(h, _, _)| h == hash)?;
+        let entry = self.entries.remove(at)?;
+        let manifest = Arc::clone(&entry.1);
+        self.entries.push_back(entry);
+        Some(manifest)
+    }
+
+    fn insert(&mut self, hash: [u8; 32], manifest: Arc<BundleManifest>, size: usize) {
+        if let Some(at) = self.entries.iter().position(|(h, _, _)| *h == hash)
+            && let Some((_, _, old)) = self.entries.remove(at)
+        {
+            self.bytes = self.bytes.saturating_sub(old);
+        }
+        self.entries.push_back((hash, manifest, size));
+        self.bytes = self.bytes.saturating_add(size);
+        while self.entries.len() > 1
+            && (self.entries.len() > MAX_CACHED_MANIFESTS || self.bytes > MANIFEST_CACHE_BYTES)
+        {
+            if let Some((_, _, evicted)) = self.entries.pop_front() {
+                self.bytes = self.bytes.saturating_sub(evicted);
+            }
+        }
+    }
 }
 
 /// What a pull that ended badly means for the gateway.
@@ -730,15 +777,28 @@ impl Gateway {
         ))
     }
 
-    /// The bundle manifest `hash`, read once and kept.
+    fn cached_manifest(&self, hash: &[u8; 32]) -> Option<Arc<BundleManifest>> {
+        self.manifests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(hash)
+    }
+
+    /// The bundle manifest `hash`, from the cache or pulled once.
     async fn manifest(
         self: &Arc<Self>,
         hash: [u8; 32],
         namespace: Option<u64>,
         paying: &Paying,
-    ) -> Result<BundleManifest, PullError> {
-        if let Some(manifest) = self.manifests.lock().await.get(&hash) {
-            return Ok(manifest.clone());
+    ) -> Result<Arc<BundleManifest>, PullError> {
+        if let Some(manifest) = self.cached_manifest(&hash) {
+            return Ok(manifest);
+        }
+        let _fill = self.manifest_fill.lock().await;
+        // A request that waited on the fill lock finds what the one before it
+        // pulled.
+        if let Some(manifest) = self.cached_manifest(&hash) {
+            return Ok(manifest);
         }
         let (first, mut reader, done) = self.start_pull(hash, namespace, paying).await?;
         let mut bytes = first.to_vec();
@@ -759,10 +819,15 @@ impl Gateway {
             }
         }
         finished(done).await?;
-        let manifest = BundleManifest::parse(&bytes)
-            .context("not a bundle manifest; drop the trailing `/` to fetch the raw blob")
-            .map_err(PullError::Other)?;
-        self.manifests.lock().await.insert(hash, manifest.clone());
+        let manifest = Arc::new(
+            BundleManifest::parse(&bytes)
+                .context("not a bundle manifest; drop the trailing `/` to fetch the raw blob")
+                .map_err(PullError::Other)?,
+        );
+        self.manifests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(hash, Arc::clone(&manifest), bytes.len());
         Ok(manifest)
     }
 

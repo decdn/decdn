@@ -1,5 +1,59 @@
 use super::*;
 
+fn manifest() -> Arc<BundleManifest> {
+    Arc::new(BundleManifest::new(Vec::new()))
+}
+
+fn hash(n: u8) -> [u8; 32] {
+    [n; 32]
+}
+
+#[test]
+fn manifest_cache_evicts_the_least_recently_used_past_the_count() {
+    let mut cache = ManifestCache::default();
+    for n in 0..u8::try_from(MAX_CACHED_MANIFESTS).unwrap() {
+        cache.insert(hash(n), manifest(), 1);
+    }
+    // Reading the oldest makes it the newest, so the next insert evicts 1.
+    assert!(cache.get(&hash(0)).is_some());
+    cache.insert(hash(200), manifest(), 1);
+    assert_eq!(cache.entries.len(), MAX_CACHED_MANIFESTS);
+    assert!(cache.get(&hash(0)).is_some());
+    assert!(cache.get(&hash(1)).is_none());
+    assert!(cache.get(&hash(200)).is_some());
+}
+
+#[test]
+fn manifest_cache_evicts_past_the_byte_budget() {
+    let mut cache = ManifestCache::default();
+    cache.insert(hash(1), manifest(), MANIFEST_CACHE_BYTES / 2);
+    cache.insert(hash(2), manifest(), MANIFEST_CACHE_BYTES / 2);
+    assert_eq!(cache.bytes, MANIFEST_CACHE_BYTES);
+    cache.insert(hash(3), manifest(), 1);
+    assert!(cache.get(&hash(1)).is_none());
+    assert!(cache.get(&hash(2)).is_some());
+    assert!(cache.get(&hash(3)).is_some());
+    assert_eq!(cache.bytes, MANIFEST_CACHE_BYTES / 2 + 1);
+}
+
+#[test]
+fn manifest_cache_keeps_the_newest_entry_even_over_budget() {
+    let mut cache = ManifestCache::default();
+    cache.insert(hash(1), manifest(), 1);
+    cache.insert(hash(2), manifest(), MANIFEST_CACHE_BYTES + 1);
+    assert_eq!(cache.entries.len(), 1);
+    assert!(cache.get(&hash(2)).is_some());
+}
+
+#[test]
+fn manifest_cache_reinsert_replaces_without_double_counting() {
+    let mut cache = ManifestCache::default();
+    cache.insert(hash(1), manifest(), 10);
+    cache.insert(hash(1), manifest(), 30);
+    assert_eq!(cache.entries.len(), 1);
+    assert_eq!(cache.bytes, 30);
+}
+
 #[test]
 fn allowed_hosts_name_the_listen_port_under_every_loopback_name() {
     let hosts = allowed_hosts("127.0.0.1:8484".parse().unwrap());
