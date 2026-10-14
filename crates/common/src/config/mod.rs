@@ -929,7 +929,7 @@ fn resolve_network_into(
 }
 
 /// Resolve just `[network.discovery]` from a loaded [`FileConfig`], for the
-/// one-shot client commands (`decdn fetch`/`probe`) that dial nodes by their
+/// one-shot client commands (`decdn get`/`probe`) that dial nodes by their
 /// iroh `NodeId` via discovery but do not run the full node `resolve_config`
 /// pass. Applies the exact same shape validation as `resolve_config` does for
 /// this section; an absent `[network]`/`[network.discovery]` yields the empty

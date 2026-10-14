@@ -221,8 +221,8 @@ keystore consults the same three, and takes the first one that is **present**:
 
 1. The `DECDN_KEYSTORE_PASSWORD` environment variable.
 2. A password file: `--keystore-password-file` (env
-   `DECDN_KEYSTORE_PASSWORD_FILE`) on `decdn-node run`, `decdn fetch`,
-   `decdn bundle pull`, `decdn pool`, the operator commands, and
+   `DECDN_KEYSTORE_PASSWORD_FILE`) on `decdn-node run`, `decdn get`,
+   `decdn pool`, the operator commands, and
    `decdn key-gen`. One trailing newline is stripped; other whitespace is
    part of the password.
 3. An interactive prompt, when `stdin` is a TTY.
@@ -576,7 +576,7 @@ for recovering deposits an older build stranded before it did.
 
 **Read the node's pools with `decdn node pools`, not `decdn pool list`.** Two
 unrelated buyer stores can sit under `identity.data_dir`: the daemon's
-`buyer.redb`, and a client-owned `buyer-pools.redb` that `decdn fetch` and
+`buyer.redb`, and a client-owned `buyer-pools.redb` that `decdn get` and
 `decdn pool` use. On a clean node host only the first exists. A running daemon holds an exclusive lock on its file, so
 nothing can read it from disk; `decdn node pools` asks the daemon over the admin
 RPC. `decdn pool list --config /etc/decdn/node.toml` routes to the same place and
@@ -661,7 +661,7 @@ deposit the node does not track until the next restart adopts or reports it.
 ## Refusing paying clients (insufficient deposit)
 
 **Symptoms:** clients report a blob as missing that this node holds; delivery
-revenue flat while requests arrive; `decdn fetch` against this node returns
+revenue flat while requests arrive; `decdn get` against this node returns
 `delivery refused: NotFound`.
 
 **Detect:**

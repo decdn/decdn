@@ -137,7 +137,7 @@ pub enum LanePayer<'a> {
 }
 
 /// Shared pull/funding deps every lane of one fetch borrows for its lifetime
-/// (`build_multi_lane`). A `decdn fetch` and every entry of a `bundle pull`
+/// (`build_multi_lane`). A blob fetch and every entry of a bundle pull
 /// build their lanes from the same shape. Every field is a borrow or a `Copy`
 /// scalar.
 pub struct LaneDeps<'a, P> {
@@ -202,7 +202,7 @@ impl<P> std::fmt::Debug for LaneDeps<'_, P> {
 
 /// The lane's shared ledger + context: from the run registry when bundle pull
 /// supplies one (so every entry/chunk on the lane shares one monotonic issuer),
-/// else a fresh pair for a standalone `decdn fetch`.
+/// else a fresh pair for a standalone blob fetch.
 ///
 /// On a registry reuse (an already-registered lane, second+ touch), `ctx` — this
 /// call's freshly built context, which may reflect an `open_or_reuse_pool`
@@ -485,7 +485,7 @@ fn write_watermarks(store: &dyn BuyerPoolStore, row: WatermarkRow, writes: Vec<L
 /// landing after a rebase, would leave the next run signing from the wrong
 /// progress. The read and the queueing are one synchronous call for that
 /// reason, and the order holds only while every caller polls on one task, as
-/// a fetch and a `bundle pull` do.
+/// a fetch and a bundle pull do.
 ///
 /// A drop guard, which cannot wait, drops the receiver. The command then waits
 /// for the queue before it returns ([`OrderedWrites::settle`]), on a Ctrl-C

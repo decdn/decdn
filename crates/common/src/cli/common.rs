@@ -128,7 +128,7 @@ pub fn default_config_path() -> Option<PathBuf> {
 
 /// Returns the client-scoped default data directory (`~/.decdn/client`).
 ///
-/// The `decdn` client commands (`fetch`, `bundle pull`, `pool`)
+/// The `decdn` client commands (`get`, `pool`)
 /// keep their spending keystore and buyer pool store here rather than in the
 /// node-shaped `~/.decdn`, so a pure client install does not masquerade as a
 /// node. An explicit `--data-dir` / `identity.data_dir` still wins.

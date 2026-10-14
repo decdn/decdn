@@ -863,14 +863,14 @@ fn toml_basic_string(value: &str) -> anyhow::Result<String> {
 
 /// Trimmed TOML template `decdn config init --client` writes.
 ///
-/// A client is a fetch-only consumer (`decdn fetch`, `decdn bundle pull`): it
+/// A client is a fetch-only consumer (`decdn get`): it
 /// needs an identity, chain coordinates, and USDC to deposit — none of the
 /// cache/origin/serving sections a `decdn-node` daemon reads. The
 /// `client_config_template_is_trimmed_and_parses` guard keeps this template
 /// parsing against the live `FileConfig` schema with only the `[identity]`
 /// and `[blockchain]` sections present.
 const CLIENT_CONFIG: &str = r#"# deCDN client configuration — fetch-only consumer.
-# A client fetches and pays (`decdn fetch`, `decdn bundle pull`); it needs an
+# A client fetches and pays (`decdn get`); it needs an
 # identity, chain coordinates, and USDC to deposit. The cache/origin/serving
 # sections a `decdn-node` daemon reads do not apply and are omitted.
 # CLI flags override values in this file.
@@ -1110,7 +1110,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # denied_origins = ["0x000000000000000000000000000000000000dEaD"]   # operator addresses whose pools are refused (the zero address is rejected)
 
 [client]
-# `decdn fetch`/`decdn bundle pull` discovery pre-filter (independent of the
+# `decdn get` discovery pre-filter (independent of the
 # node-scoped [network.discovery] address discovery above). Narrows which
 # registered nodes are probed/discovered; never ranks them. Absent/empty =>
 # no filter, every registered node is eligible.

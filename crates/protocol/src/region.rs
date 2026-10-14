@@ -107,7 +107,7 @@ pub struct Region([u8; 2]);
 
 /// Hand-written so the code renders as text, not as its bytes. A derived
 /// `Debug` over the `[u8; 2]` payload prints `Region([85, 83])`, and this type
-/// IS formatted with `{:?}` on an operator-facing path — `decdn fetch`'s
+/// IS formatted with `{:?}` on an operator-facing path — `decdn get`'s
 /// "discovered node … (region {:?})" line — as well as into `tracing` fields
 /// and `anyhow` context. The derive turned that line's output from `"US"` into
 /// `Some(Region([85, 83]))`.

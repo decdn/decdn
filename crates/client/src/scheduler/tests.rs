@@ -5791,7 +5791,7 @@ async fn a_refused_grow_is_asked_again_every_growth_retry() -> anyhow::Result<()
 
 /// A pass arms the growth retry when a `grow` granted nothing, or when a
 /// range had no lane to ask while a running lane has a [`LaneWiden`]. A
-/// fetch with no `LaneWiden`, such as `decdn fetch`, arms none for a range
+/// fetch with no `LaneWiden`, such as a blob `decdn get`, arms none for a range
 /// with no lane to ask, and a pass with nothing waiting clears the wait.
 #[test]
 fn a_pass_retries_while_a_lane_can_still_grow() {

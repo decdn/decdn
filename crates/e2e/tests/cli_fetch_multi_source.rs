@@ -1,4 +1,4 @@
-//! Live anvil-backed e2e for the CLI `decdn fetch` **multi-source parallel
+//! Live anvil-backed e2e for the CLI `decdn get` **multi-source parallel
 //! fetch** path (ADR 039), driving the shipped `decdn` binary against TWO real
 //! nodes over real paid `cdn/client/v1` streams.
 //!
@@ -15,7 +15,7 @@
 //!
 //! Two independently-bonded nodes ("holder A" and "holder B") are launched,
 //! each pre-warmed with the SAME blob (so they share a hash and are both
-//! admissible sources). The client never pins `--node-id`, so `decdn fetch`
+//! admissible sources). The client never pins `--node-id`, so `decdn get`
 //! auto-discovers both via the on-chain `CapacityBond` registry, probes them,
 //! and runs the acquire loop (`decdn_client::acquire`, through the
 //! `Downloader` face in `crates/cli/src/commands/fetch.rs`) with one lane per
@@ -279,13 +279,13 @@ fn distinct_pool_ids(
         .collect())
 }
 
-/// Run `decdn fetch` until ONE invocation bills BOTH holders, returning the
+/// Run `decdn get` until ONE invocation bills BOTH holders, returning the
 /// per-operator billed-bytes baselines that invocation started from.
 ///
 /// The nodes' chain watchers observe the freshly-opened pool asynchronously, and
 /// a holder whose watcher has not caught up refuses the stream pre-serve. That
 /// holder's lane cools while the other lane carries on, and a small blob can
-/// finish on the other lane before the cooled one returns. So `decdn fetch`
+/// finish on the other lane before the cooled one returns. So `decdn get`
 /// exits 0 either way, and exit status is not a readiness signal for this
 /// journey — the thing to wait for is one invocation that bills both lanes.
 ///
@@ -309,11 +309,11 @@ async fn run_fetch_until_both_lanes_bill(
         let before_b = billed_bytes(data_dir, op_b)?;
 
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
-            .arg("fetch")
+            .arg("get")
             .args(args)
             .output()
             .await
-            .context("spawn decdn fetch")?;
+            .context("spawn decdn get")?;
         if output.status.success() {
             let billed_a = billed_bytes(data_dir, op_a)?.saturating_sub(before_a);
             let billed_b = billed_bytes(data_dir, op_b)?.saturating_sub(before_b);
@@ -334,7 +334,7 @@ async fn run_fetch_until_both_lanes_bill(
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "no single `decdn fetch` billed both holders; last stderr:\n{}",
+            "no single `decdn get` billed both holders; last stderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         tokio::time::sleep(Duration::from_millis(750)).await;
@@ -364,7 +364,7 @@ fn reset_fetch_artifacts(out: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `decdn fetch` argv (after the `fetch` subcommand) to pull `hash` via
+/// The `decdn get` argv (after the `get` subcommand) to pull `hash` via
 /// AUTO-DISCOVERY — deliberately no `--node-id`/`--addr`/`--provider-address`,
 /// so discovery finds both holders. `--capacity-bond-address` is what
 /// `resolve_target_node` reads to enumerate the active registry instead.
@@ -378,8 +378,7 @@ fn fetch_argv(
     out: &std::path::Path,
 ) -> Vec<String> {
     vec![
-        "--hash".into(),
-        hash.to_hex(),
+        format!("decdn:{}", hash.to_hex()),
         "-o".into(),
         out.display().to_string(),
         "--capacity-bond-address".into(),

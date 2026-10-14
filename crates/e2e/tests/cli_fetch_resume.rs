@@ -1,4 +1,4 @@
-//! Live anvil-backed e2e for the CLI `decdn fetch` **streaming + resumable
+//! Live anvil-backed e2e for the CLI `decdn get` **streaming + resumable
 //! download** path (#1120, #1122), driving the shipped `decdn` binary against a
 //! real node over a real paid `cdn/client/v1` stream.
 //!
@@ -323,11 +323,11 @@ async fn run() -> anyhow::Result<()> {
 
     let output =
         tokio::process::Command::from(decdn_command(client_dir.path(), KEYSTORE_PASSWORD)?)
-            .arg("fetch")
+            .arg("get")
             .args(&args)
             .output()
             .await
-            .context("spawn decdn fetch over a corrupt checkpoint")?;
+            .context("spawn decdn get over a corrupt checkpoint")?;
     anyhow::ensure!(
         output.status.success(),
         "one fetch over a corrupt checkpoint must heal and succeed; stderr:\n{}",
@@ -463,23 +463,23 @@ fn billed_bytes(
     Ok(u64::try_from(billed).unwrap_or(u64::MAX))
 }
 
-/// Run `decdn fetch`, retrying until the node's chain watcher has observed the
-/// freshly-opened pool (`decdn fetch` has no internal retry for that race).
+/// Run `decdn get`, retrying until the node's chain watcher has observed the
+/// freshly-opened pool (`decdn get` has no internal retry for that race).
 async fn run_fetch_until_ready(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
-            .arg("fetch")
+            .arg("get")
             .args(args)
             .output()
             .await
-            .context("spawn decdn fetch")?;
+            .context("spawn decdn get")?;
         if output.status.success() {
             return Ok(());
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "decdn fetch never succeeded; last stderr:\n{}",
+            "decdn get never succeeded; last stderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         tracing::debug!(
@@ -490,7 +490,7 @@ async fn run_fetch_until_ready(data_dir: &std::path::Path, args: &[String]) -> a
     }
 }
 
-/// The `decdn fetch` argv (after the `fetch` subcommand) to pull `hash` from
+/// The `decdn get` argv (after the `get` subcommand) to pull `hash` from
 /// `node` over the explicit-node path, with chain coordinates as flags so no
 /// config file is needed. `--capacity-bond-address` is required: it is the
 /// EIP-712 `verifyingContract` the buyer signs its ADR 005 client identity
@@ -505,8 +505,7 @@ fn fetch_argv(
     out: &std::path::Path,
 ) -> Vec<String> {
     vec![
-        "--hash".into(),
-        hash.to_hex(),
+        format!("decdn:{}", hash.to_hex()),
         "-o".into(),
         out.display().to_string(),
         "--node-id".into(),

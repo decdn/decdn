@@ -180,7 +180,7 @@ async fn the_stream_ends_at_the_proven_size_when_the_claim_was_small() -> anyhow
 /// A sink that reports `caches() == false` is NEVER teed the whole blob on a
 /// clean finish — the `Streamer` skips the whole-blob read (and the memory it
 /// would cost) that only exists to populate a cache. This is what keeps a
-/// `decdn fetch -o -` of a huge blob from spiking its whole size into RAM at
+/// `decdn get decdn:<hash> -o -` of a huge blob from spiking its whole size into RAM at
 /// the end.
 #[tokio::test]
 async fn a_non_caching_sink_is_not_teed_the_whole_blob() -> anyhow::Result<()> {

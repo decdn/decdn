@@ -1,5 +1,4 @@
-//! The terminal's own progress indicator (OSC 9;4) for `decdn fetch` and
-//! `decdn bundle pull`.
+//! The terminal's own progress indicator (OSC 9;4) for `decdn get`.
 //!
 //! Terminals that support the sequence (iTerm2, Ghostty, `WezTerm`, Windows
 //! Terminal, and others) show a command's percent in the tab bar or dock, as they

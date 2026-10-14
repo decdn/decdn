@@ -2,8 +2,8 @@
 //! them per megabyte from a USDC payment pool, and verify every byte against
 //! its BLAKE3 hash as it arrives.
 //!
-//! The `decdn` CLI's `fetch` and `bundle pull` are built on this crate, and
-//! `bundle pull` is a thin caller of [`bundle::BundlePuller`]. So is the node's
+//! The `decdn` CLI's `get` is built on this crate, and its bundle route is a
+//! thin caller of [`bundle::BundlePuller`]. So is the node's
 //! own cache-miss pull: a node that misses in its cache is a paying client of
 //! the node upstream of it.
 //!
@@ -1760,12 +1760,12 @@ pub async fn stream_fetch_tracked(
 }
 
 /// Delivery-progress callback: invoked with `(received, expected)` after each
-/// verified leaf lands, so a caller (e.g. `decdn fetch`) can render a progress
+/// verified leaf lands, so a caller (e.g. `decdn get`) can render a progress
 /// bar. Both slots are **content** bytes: `received` is the content position the
 /// verifying decoder has reached and `expected` is the blob's content
 /// `total_bytes`, constant across the pull — so a bar keyed on the two fills to
 /// exactly 100%. `drive` / `acquire` (the resumable [`crate::driver`]
-/// path the CLI `fetch` and `bundle pull` use) additionally emit the
+/// path the CLI `get` uses) additionally emit the
 /// already-present resume base (`base_present`) once before streaming begins; the
 /// `test-util` `stream_fetch_tracked_with_progress` wrapper reports the same
 /// unit from its in-memory decoder.

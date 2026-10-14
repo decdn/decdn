@@ -75,7 +75,7 @@ tracing = { workspace = true }
 alloy-json-rpc = { workspace = true }
 decdn-bao-range = { workspace = true, features = ["test-util"] }
 # The examples keep the buyer's pool and lane records in the same redb store
-# `decdn fetch` uses, and print their warnings through a subscriber.
+# `decdn get` uses, and print their warnings through a subscriber.
 decdn-incentive = { workspace = true, features = ["redb"] }
 tracing-subscriber = { workspace = true }
 # A scripted RPC transport that answers some methods and hangs on the rest, so a

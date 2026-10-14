@@ -388,7 +388,7 @@ fn config_fills_unset_flags_and_defaults() {
 /// `resolve_chain` must enforce the same deposit invariant the daemon
 /// resolver does. It reads the raw `[blockchain]` table plus the
 /// CLI flags rather than going through `resolve_blockchain_into`, so without
-/// its own check `decdn fetch` would accept a config file that
+/// its own check `decdn get` would accept a config file that
 /// `decdn config validate` rejects — a validator that does not validate what
 /// actually runs — and `--working-deposit-micro-usdc 0` would reach the chain
 /// and surface as an opaque `openPool` `ZeroAmount` revert.

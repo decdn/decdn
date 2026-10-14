@@ -35,8 +35,8 @@ fn state(byte: u8, bytes: u64, amount: u64) -> anyhow::Result<(BuyerPoolState, L
 
 #[test]
 fn second_concurrent_open_is_already_open_not_raw_backend() -> anyhow::Result<()> {
-    // #942: a second opener on the same data dir (a concurrent `decdn
-    // fetch` / `bundle pull`) trips redb's process-exclusive write
+    // #942: a second opener on the same data dir (a concurrent
+    // `decdn get`) trips redb's process-exclusive write
     // lock. It must fail with the dedicated, user-facing `AlreadyOpen`
     // — never a raw redb backend string — and recover once the first
     // handle drops.
@@ -155,7 +155,7 @@ fn record_then_reuse_resumes_watermark_across_reopen() -> anyhow::Result<()> {
         let store = store(&dir)?;
         store.record(&s)?;
     }
-    // A later `decdn fetch` on the same data dir resumes the watermark
+    // A later `decdn get` on the same data dir resumes the watermark
     // instead of re-signing stale totals (#940).
     let reopened = store(&dir)?;
     let got = reopened

@@ -1,62 +1,37 @@
-use std::path::Path;
-
 use clap::Parser as _;
+use decdn_client::uri::UriTarget;
 use decdn_common::cli::{Cli, Command, GetArgs};
 
-use super::{Route, literal_glob, route};
-use crate::commands::manifest::build_glob_set;
+use super::parse_and_check;
 
 const HEX: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
 
 fn get_args(argv: &[&str]) -> GetArgs {
     let cli = Cli::try_parse_from(["decdn", "get"].iter().chain(argv)).unwrap();
     match cli.command {
-        Command::Get(get) => get,
+        Command::Get(get) => *get,
         other => panic!("parsed {other:?}"),
     }
 }
 
-fn route_of(argv: &[&str]) -> anyhow::Result<Route> {
-    route(&get_args(argv))
-}
-
 fn err_of(argv: &[&str]) -> String {
-    route_of(argv).unwrap_err().to_string()
+    format!("{:#}", parse_and_check(&get_args(argv)).unwrap_err())
 }
 
 #[test]
-fn blob_uri_routes_to_fetch() {
+fn blob_uri_takes_a_file_or_stdout() {
     let uri = format!("decdn:{}?ns=7", HEX.to_uppercase());
-    let Route::Fetch(f) = route_of(&[&uri, "-o", "out.bin"]).unwrap() else {
-        panic!("not a fetch");
-    };
-    assert_eq!(f.hash, HEX);
-    assert_eq!(f.output, Path::new("out.bin"));
-    assert_eq!(f.namespace, Some(7));
+    for out in ["out.bin", "-"] {
+        let parsed = parse_and_check(&get_args(&[&uri, "-o", out])).unwrap();
+        assert_eq!(parsed.target, UriTarget::Blob);
+        assert_eq!(parsed.namespace, Some(7));
+        assert_eq!(parsed.to_string(), format!("decdn:{HEX}?ns=7"));
+    }
 }
 
 #[test]
-fn blob_uri_streams_to_stdout() {
-    let uri = format!("decdn:{HEX}");
-    let Route::Fetch(f) = route_of(&[&uri, "-o", "-"]).unwrap() else {
-        panic!("not a fetch");
-    };
-    assert_eq!(f.output, Path::new("-"));
-    assert_eq!(f.namespace, None);
-}
-
-#[test]
-fn shared_flags_carry_over() {
-    let uri = format!("decdn:{HEX}");
-    let Route::Fetch(f) = route_of(&[&uri, "-o", "x", "--max-sources", "9"]).unwrap() else {
-        panic!("not a fetch");
-    };
-    assert_eq!(f.common.max_sources, 9);
-}
-
-#[test]
-fn bundle_uri_routes_to_bundle_pull() {
-    let uri = format!("decdn:{HEX}/?ns=3");
+fn bundle_uri_takes_the_bundle_flags() {
+    let uri = format!("decdn:{HEX}/");
     let argv = [
         &uri,
         "-o",
@@ -67,47 +42,30 @@ fn bundle_uri_routes_to_bundle_pull() {
         "2",
         "--json",
     ];
-    let Route::Bundle(b) = route_of(&argv).unwrap() else {
-        panic!("not a bundle pull");
-    };
-    assert_eq!(b.hash.as_deref(), Some(HEX));
-    assert!(b.input.is_none());
-    assert_eq!(b.output, Path::new("dir"));
-    assert_eq!(b.include, ["*.bin"]);
-    assert_eq!(b.jobs, 2);
-    assert_eq!(b.max_lane_streams, 4);
-    assert!(b.json);
-    assert_eq!(b.namespace, Some(3));
+    let parsed = parse_and_check(&get_args(&argv)).unwrap();
+    assert_eq!(parsed.target, UriTarget::Bundle);
 }
 
 #[test]
-fn entry_uri_includes_exactly_that_path() {
+fn entry_uri_takes_the_run_flags() {
     let uri = format!("decdn:{HEX}/models/a%20b%5B1%5D.bin");
-    let Route::Bundle(b) = route_of(&[&uri, "-o", "dir", "--dry-run"]).unwrap() else {
-        panic!("not a bundle pull");
-    };
-    assert_eq!(b.include, [literal_glob("models/a b[1].bin")]);
-    assert!(b.exclude.is_empty());
-    assert!(b.dry_run);
+    let argv = [&uri, "-o", "dir", "--dry-run", "--overwrite", "--jobs", "1"];
+    let parsed = parse_and_check(&get_args(&argv)).unwrap();
+    assert_eq!(
+        parsed.target,
+        UriTarget::BundleEntry("models/a b[1].bin".to_owned())
+    );
 }
 
 #[test]
-fn literal_glob_matches_only_its_path() {
-    for path in [
-        "a*.bin",
-        "dir/f?le",
-        "x[1].txt",
-        "{a,b}.txt",
-        "back\\slash",
-        "plain/path.txt",
-    ] {
-        let set = build_glob_set(&[literal_glob(path)], "--include").unwrap();
-        assert!(set.is_match(Path::new(path)), "{path} must match itself");
-    }
-    let star = build_glob_set(&[literal_glob("a*.bin")], "--include").unwrap();
-    assert!(!star.is_match(Path::new("abc.bin")));
-    let class = build_glob_set(&[literal_glob("x[1].txt")], "--include").unwrap();
-    assert!(!class.is_match(Path::new("x1.txt")));
+fn shared_flags_reach_the_args() {
+    let uri = format!("decdn:{HEX}");
+    assert_eq!(
+        get_args(&[&uri, "-o", "x", "--max-sources", "9"])
+            .common
+            .max_sources,
+        9
+    );
 }
 
 #[test]
@@ -135,9 +93,17 @@ fn stdout_rejected_on_bundle_uri() {
 
 #[test]
 fn bad_uri_is_an_error() {
-    let err = format!(
-        "{:#}",
-        route_of(&[&format!("b3:{HEX}"), "-o", "x"]).unwrap_err()
-    );
+    let err = err_of(&[&format!("b3:{HEX}"), "-o", "x"]);
     assert!(err.contains("not a decdn URI"), "{err}");
+}
+
+#[test]
+fn the_old_commands_are_gone() {
+    let argvs: [&[&str]; 2] = [
+        &["decdn", "fetch", "--hash", HEX, "-o", "x"],
+        &["decdn", "bundle", "pull", "--hash", HEX, "-o", "x"],
+    ];
+    for argv in argvs {
+        assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+    }
 }

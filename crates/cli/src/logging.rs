@@ -4,7 +4,7 @@
 //! its output is only the command's own stdout result and the stderr progress
 //! bar. That keeps the common case clean, but it also means every
 //! `tracing::debug!/info!/warn!` in `decdn-client`, `decdn-incentive`, and
-//! `iroh` goes to a no-op collector — a stalled `decdn fetch` is silent on the
+//! `iroh` goes to a no-op collector — a stalled `decdn get` is silent on the
 //! side that is actually failing.
 //!
 //! [`init`] turns logging on only when the operator asks for it, through
@@ -15,7 +15,7 @@
 //!
 //! # Progress-bar coexistence
 //!
-//! `decdn fetch` draws an [`indicatif`] progress bar to stderr, and a plain
+//! `decdn get` draws an [`indicatif`] progress bar to stderr, and a plain
 //! stderr subscriber would shred it. When [`init`] installs a subscriber it
 //! also creates one process-global [`indicatif::MultiProgress`]: log lines are
 //! written through [`indicatif::MultiProgress::suspend`], and the fetch bar is
@@ -126,7 +126,7 @@ pub fn attach_progress_bar(bar: indicatif::ProgressBar) -> indicatif::ProgressBa
     }
 }
 
-/// The [`indicatif::MultiProgress`] a multi-bar command (`bundle pull`) draws its
+/// The [`indicatif::MultiProgress`] a multi-bar command (a bundle `decdn get`) draws its
 /// bars into: the process-global one when a subscriber is installed — so its bars
 /// share stderr with log lines through [`indicatif::MultiProgress::suspend`] — or
 /// a fresh standalone container on the default silent path, where there are no log

@@ -901,7 +901,7 @@ impl ClientHandler {
                 // the proxy-abuse / griefing vector where an unpaid client
                 // drains the buyer deposit. (Multi-hop node→node pulls therefore require the
                 // downstream requester to send a binding; both the direct-client
-                // `decdn fetch` (#1115) and the node→node requester
+                // `decdn get` (#1115) and the node→node requester
                 // (`node_origin`, #1117) do, so chained pull-through works.)
                 // On a successful fill, fall through to the normal size-gate +
                 // delivery path; otherwise it stays a `NotFound`.
@@ -934,7 +934,7 @@ impl ClientHandler {
                 // comfortably pay for the range it asked for, and it would do so
                 // ONLY on a cache miss — the serve gate prices the same request at
                 // the aligned span — so the same request would be served warm and
-                // refused cold. Worse, `decdn fetch` reads a refused resume as a
+                // refused cold. Worse, `decdn get` reads a refused resume as a
                 // possibly-stale partial, rewinds to zero and re-pays for the whole
                 // blob, so mispricing a bounded request doubles a user's bill.
                 //

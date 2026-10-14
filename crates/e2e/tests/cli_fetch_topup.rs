@@ -1,4 +1,4 @@
-//! Live anvil-backed e2e for the CLI `decdn fetch` buyer auto-`topUp` path
+//! Live anvil-backed e2e for the CLI `decdn get` buyer auto-`topUp` path
 //! (issue #1103). The mirror of `crates/node/tests/anvil_settlement_e2e.rs:937`
 //! (which asserts the *node* buyer's `top_up` raises the on-chain deposit and
 //! persists it) but for the CLI fetch buyer's stack: the shared
@@ -253,7 +253,7 @@ fn billed_bytes(data_dir: &std::path::Path, provider: Address) -> anyhow::Result
     Ok(u64::try_from(billed).unwrap_or(u64::MAX))
 }
 
-/// The `decdn fetch` argv (after the `fetch` subcommand) for a recovery top-up
+/// The `decdn get` argv (after the `get` subcommand) for a recovery top-up
 /// journey, with the pool's single `--working-deposit-micro-usdc` as a parameter.
 /// The pool opens at this deposit and every recovery top-up restores it back
 /// toward it, so a blob whose cost exceeds it exhausts the deposit mid-stream and
@@ -271,8 +271,7 @@ fn topup_fetch_argv_with_deposits(
     working_deposit_micro_usdc: u64,
 ) -> Vec<String> {
     vec![
-        "--hash".into(),
-        hash.to_hex(),
+        format!("decdn:{}", hash.to_hex()),
         "-o".into(),
         out.display().to_string(),
         "--node-id".into(),
@@ -461,13 +460,13 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 
     // Pre-open the pool ourselves and wait for the node to observe it, rather
     // than letting the CLI's own `open_or_reuse` race the node's chain watcher.
-    // A blind retry loop that re-invokes the WHOLE `decdn fetch` process on ANY
+    // A blind retry loop that re-invokes the WHOLE `decdn get` process on ANY
     // failure — including ones unrelated to the race — would let a second
     // invocation resume from whatever the first one flushed via the
     // function-ENTRY `resume_offset(existing_partial_len(...))` path (unrelated
     // to this fix, and pre-existing), which would corrupt the very cost
     // measurement this test exists to take. Pre-clearing the race keeps this
-    // test to exactly ONE `decdn fetch` invocation, so the recovery top-up
+    // test to exactly ONE `decdn get` invocation, so the recovery top-up
     // branch is the only thing that can move the byte offset.
     let deployment = Deployment {
         chain_id: chain.chain_id(),
@@ -506,7 +505,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     {
         // Scoped: the CLI subprocess below opens its OWN handle on the same
         // redb file, and the store enforces single-writer access — this
-        // handle must be dropped before spawning `decdn fetch`.
+        // handle must be dropped before spawning `decdn get`.
         let store = RedbBuyerPoolStore::open(client_dir.path()).context("open buyer store")?;
         store.record(&opened.state).context("record pool")?;
     }
@@ -549,11 +548,11 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
             client_dir.path(),
             TOPUP_KEYSTORE_PASSWORD,
         )?)
-        .arg("fetch")
+        .arg("get")
         .args(&args)
         .output()
         .await
-        .context("spawn decdn fetch")?;
+        .context("spawn decdn get")?;
         if output.status.success() {
             break;
         }
@@ -563,7 +562,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
         let progressed = out.exists() || std::fs::metadata(&partial).is_ok_and(|m| m.len() > 0);
         anyhow::ensure!(
             !progressed && tokio::time::Instant::now() < deadline,
-            "decdn fetch failed (delivered bytes on disk = {progressed}): {}",
+            "decdn get failed (delivered bytes on disk = {progressed}): {}",
             String::from_utf8_lossy(&output.stderr)
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -668,7 +667,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
 // The multi-interval test above sizes its blob to land just over the working
 // deposit. This test drives the opposite extreme: a blob whose whole-blob WIRE
 // cost is ~2.5x the pool's opening deposit. The buyer opens one self-owned pool at
-// `DEPOSIT_SHORT_WORKING_MICRO_USDC`, and the single `decdn fetch` streams the
+// `DEPOSIT_SHORT_WORKING_MICRO_USDC`, and the single `decdn get` streams the
 // whole blob against it — proving the gap-driven driver's paid-frontier accounting
 // stays exact when the deposit is far short of the blob: the lane settles the
 // whole-blob wire cost delivered ONCE, never below it (under-pay) and never a
@@ -775,7 +774,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
 
     // Pre-open and pre-record the pool, and never restart the daemon — same
     // reasoning as the multi-interval test above: this keeps the journey to
-    // exactly ONE `decdn fetch` invocation, so the recovery top-up branch is the
+    // exactly ONE `decdn get` invocation, so the recovery top-up branch is the
     // only thing that can move the byte offset, and the settle measurement below
     // is not corrupted by a cross-invocation resume.
     let deployment = Deployment {
@@ -846,11 +845,11 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
             client_dir.path(),
             TOPUP_KEYSTORE_PASSWORD,
         )?)
-        .arg("fetch")
+        .arg("get")
         .args(&args)
         .output()
         .await
-        .context("spawn decdn fetch")?;
+        .context("spawn decdn get")?;
         if output.status.success() {
             break;
         }
@@ -866,7 +865,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         let progressed = out.exists() || std::fs::metadata(&partial).is_ok_and(|m| m.len() > 0);
         anyhow::ensure!(
             readiness_race && !progressed && tokio::time::Instant::now() < deadline,
-            "decdn fetch failed (readiness race = {readiness_race}, delivered bytes on disk = \
+            "decdn get failed (readiness race = {readiness_race}, delivered bytes on disk = \
              {progressed}): {stderr}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;

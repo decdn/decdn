@@ -57,7 +57,7 @@ pub struct ConfigInitArgs {
     pub origin: Option<String>,
 
     /// Write a fetch-only CLIENT config: identity + chain coordinates for a
-    /// consumer that fetches and pays (`decdn fetch`), with none of the
+    /// consumer that fetches and pays (`decdn get`), with none of the
     /// cache/origin/serving sections a `decdn-node` daemon reads.
     #[arg(long)]
     pub client: bool,

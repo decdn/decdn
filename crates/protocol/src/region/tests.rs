@@ -60,7 +60,7 @@ fn parse_normalizes_case_and_whitespace_into_one_value() {
 }
 
 /// `Debug` renders the code, not the byte payload. This is not cosmetic:
-/// `decdn fetch` prints the discovered node's region with `{:?}`, so a
+/// `decdn get` prints the discovered node's region with `{:?}`, so a
 /// derived `Debug` shows the operator `Some(Region([85, 83]))`.
 #[test]
 fn debug_renders_the_code_not_the_bytes() {

@@ -23,10 +23,8 @@ fn max_lane_streams_is_bounded_to_1_through_64() {
     let parse = |n: &str| {
         Cli::try_parse_from([
             "decdn",
-            "bundle",
-            "pull",
-            "-i",
-            "m.json",
+            "get",
+            "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262/",
             "-o",
             "out",
             "--max-lane-streams",
@@ -34,9 +32,7 @@ fn max_lane_streams_is_bounded_to_1_through_64() {
         ])
     };
     let lanes = |cli: Cli| match cli.command {
-        Command::Bundle(BundleArgs {
-            cmd: BundleCommand::Pull(args),
-        }) => Some(args.max_lane_streams),
+        Command::Get(args) => args.max_lane_streams,
         _ => None,
     };
     assert_eq!(parse("64").ok().and_then(lanes), Some(64));

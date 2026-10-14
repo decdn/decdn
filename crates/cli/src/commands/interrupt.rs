@@ -1,4 +1,4 @@
-//! Graceful Ctrl-C for `decdn fetch`, `decdn bundle pull` and `decdn pool open`.
+//! Graceful Ctrl-C for `decdn get` and `decdn pool open`.
 //!
 //! The first Ctrl-C resolves `Interrupt::wait`: the command stops its
 //! transfers, writes what it must keep (the bundle skip-cache, the progress

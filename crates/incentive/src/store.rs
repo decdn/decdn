@@ -317,7 +317,7 @@ pub enum StoreError {
         source: std::io::Error,
     },
     /// The store's database file is already opened (write-locked) by another
-    /// process — typically a second `decdn fetch`/`bundle pull` against the same
+    /// process — typically a second `decdn get` against the same
     /// `--data-dir`. redb holds a process-exclusive lock for the lifetime of the
     /// open `Database`, so the second opener fails fast rather than letting two
     /// processes corrupt the shared voucher watermark (#942). Run one process

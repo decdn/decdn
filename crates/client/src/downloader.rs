@@ -17,7 +17,7 @@
 //! lanes and drops the consumer pacing. Bundles are the main scenario: a bundle
 //! is a set of blobs, so both entry points take a slice and write one file per
 //! blob. `fetch_to_paths` writes each blob to a caller-chosen destination (a
-//! bundle's manifest paths, or a single `decdn fetch -o` target); `fetch_to_dir`
+//! bundle's manifest paths, or a single `decdn get -o` target); `fetch_to_dir`
 //! is the convenience over it that names each file by its content-address hex
 //! under a directory. A single blob is a bundle of one.
 

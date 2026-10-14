@@ -30,7 +30,7 @@ fn ctx_with_deposit(
 /// A registry-backed `lane_ledger` call for the same lane must return the
 /// SAME ledger `Arc` on a second call (no fresh mint per fetch/chunk) — the
 /// invariant `LaneLedgers::get_or_insert` exists to guarantee. A `None`
-/// registry (standalone `decdn fetch`) must mint a distinct ledger every
+/// registry (a standalone blob `decdn get`) must mint a distinct ledger every
 /// call.
 #[test]
 fn lane_ledger_shares_one_arc_through_the_registry_but_not_without_one() {

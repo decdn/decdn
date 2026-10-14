@@ -15,8 +15,8 @@
 //!    node, or every active registered node for each entry to sample.
 //! 2. Build a [`BundlePuller`] over the chain, the local site, an endpoint, a
 //!    buyer-pool store and the [`Funding`] the pull pays from.
-//! 3. Get the manifest: [`BundleManifest::parse`] a local file, or
-//!    [`BundlePuller::fetch_manifest`] it by its hash.
+//! 3. Get the manifest: [`BundlePuller::fetch_manifest`] it by its hash, or
+//!    [`BundleManifest::parse`] bytes you already hold.
 //! 4. Drop the entries you do not want, then [`BundlePuller::pull`] the rest.
 //!    Progress reaches a [`BundleObserver`]; the result is a [`BundleOutcome`].
 //! 5. [`BundlePuller::finish`] waits for the lanes' watermark writes.
@@ -31,7 +31,7 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use alloy::providers::{DynProvider, Provider as _};
 use alloy::signers::local::PrivateKeySigner;
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{slash_judge_domain, voucher_domain};
@@ -110,15 +110,17 @@ impl BundleManifest {
     ///
     /// # Errors
     ///
-    /// When the bytes are not a manifest, or name a version other than 1.
+    /// [`NotAManifest`] when the bytes are not a manifest, or name a version
+    /// other than 1.
     pub fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
-        let manifest: ManifestV1 =
-            serde_json::from_slice(bytes).context("parse bundle JSON (expected v1 manifest)")?;
+        let manifest: ManifestV1 = serde_json::from_slice(bytes)
+            .map_err(|e| NotAManifest(format!("parse bundle JSON (expected v1 manifest): {e}")))?;
         if manifest.version != 1 {
-            bail!(
+            return Err(NotAManifest(format!(
                 "unsupported bundle version {} (this build supports v1)",
                 manifest.version
-            );
+            ))
+            .into());
         }
         Ok(Self {
             entries: manifest.entries,
@@ -152,6 +154,19 @@ impl BundleManifest {
         manifest_cache::cache_path(out_dir, hash)
     }
 }
+
+/// Bytes that are not a v1 bundle manifest: [`BundleManifest::parse`]'s error,
+/// so a caller can tell a blob that is not a manifest from a failed fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotAManifest(String);
+
+impl std::fmt::Display for NotAManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotAManifest {}
 
 /// One file of a [`BundleManifest`].
 #[derive(Debug, Clone, Deserialize)]

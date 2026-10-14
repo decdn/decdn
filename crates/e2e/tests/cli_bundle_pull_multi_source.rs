@@ -1,22 +1,23 @@
-//! Live anvil-backed e2e for `decdn bundle pull`'s **multi-source parallel
-//! fetch** path (ADR 039, #1774): a bundle whose large blob is held by TWO
-//! nodes pulls that blob fanned out across both, while each small entry in the
-//! same bundle pulls from its one holder.
+//! Live anvil-backed e2e for the bundle route of `decdn get`'s **multi-source
+//! parallel fetch** path (ADR 039, #1774): a bundle whose large blob is held by
+//! TWO nodes pulls that blob fanned out across both, while each small entry in
+//! the same bundle pulls from its one holder.
 //!
 //! Shape: two independently-bonded nodes ("holder A" and "holder B") are each
 //! pre-warmed with the SAME large blob; A additionally holds `small-a.bin` and
-//! B `small-b.bin`. A local three-entry manifest is pulled with `--jobs 3` and
-//! no `--node-id`, so every entry auto-discovers its holders. Every entry runs
-//! the same acquire loop: the large blob has two admissible holders, so its
-//! loop runs a lane on each; each small blob has exactly ONE holder, so its
-//! loop runs one lane.
+//! the bundle manifest, and B `small-b.bin`. The three-entry bundle is pulled by
+//! its manifest hash with `--jobs 3` and no `--node-id`, so every fetch
+//! auto-discovers its holders. Every entry runs the same acquire loop: the large
+//! blob has two admissible holders, so its loop runs a lane on each; each small
+//! blob has exactly ONE holder, so its loop runs one lane.
 //!
 //! What this test asserts:
 //!   1. All three outputs are byte-identical to their source blobs.
-//!   2. ONE pull invocation bills holder A MORE than `small-a.bin`'s wire bytes
-//!      AND holder B more than `small-b.bin`'s — since each small blob can only
-//!      be served by its one holder, the excess on each lane is large-blob
-//!      delivery: proof the large blob was genuinely split across both.
+//!   2. ONE pull invocation bills holder A MORE than the wire bytes of
+//!      `small-a.bin` and the manifest AND holder B more than `small-b.bin`'s —
+//!      since each of those blobs can only be served by its one holder, the
+//!      excess on each lane is large-blob delivery: proof the large blob was
+//!      genuinely split across both.
 //!   3. Both nodes' admin `lanes()` report a non-zero settled claim from the
 //!      client.
 //!   4. The client's persisted buyer-pool store shows ONE pool id — the whole
@@ -124,14 +125,27 @@ async fn run() -> anyhow::Result<()> {
     let large_hash = Hash::new(&large);
     let small_a_hash = Hash::new(&small_a);
     let small_b_hash = Hash::new(&small_b);
+    // The v1 manifest naming all three blobs, served by holder A alone.
+    let manifest = format!(
+        r#"{{"version":1,"entries":[{{"path":"large.bin","hash":"{}"}},{{"path":"small-a.bin","hash":"{}"}},{{"path":"small-b.bin","hash":"{}"}}]}}"#,
+        large_hash.to_hex(),
+        small_a_hash.to_hex(),
+        small_b_hash.to_hex(),
+    )
+    .into_bytes();
+    let manifest_hash = Hash::new(&manifest);
 
     // BOTH holders carry the large blob (two admissible sources for it); each
-    // small blob lives on exactly one, so its entry cannot fan out.
-    let (holder_a, hashes_a) =
-        NodeFixture::launch_with_blobs(&chain, "US", &[large.as_slice(), small_a.as_slice()])
-            .await?;
+    // small blob, and the manifest, lives on exactly one, so its fetch cannot
+    // fan out.
+    let (holder_a, hashes_a) = NodeFixture::launch_with_blobs(
+        &chain,
+        "US",
+        &[large.as_slice(), small_a.as_slice(), manifest.as_slice()],
+    )
+    .await?;
     anyhow::ensure!(
-        hashes_a == vec![large_hash, small_a_hash],
+        hashes_a == vec![large_hash, small_a_hash, manifest_hash],
         "holder A seeded blob hashes mismatch: {hashes_a:?}"
     );
     let (holder_b, hashes_b) =
@@ -174,31 +188,22 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("mint buyer USDC")?;
 
-    // A local v1 manifest naming all three blobs. `-i` means no manifest blob
-    // is fetched first; the entries are pulled directly.
     let out_dir = client_dir.path().join("out");
-    let manifest_path = client_dir.path().join("bundle.json");
-    let manifest = format!(
-        r#"{{"version":1,"entries":[{{"path":"large.bin","hash":"{}"}},{{"path":"small-a.bin","hash":"{}"}},{{"path":"small-b.bin","hash":"{}"}}]}}"#,
-        large_hash.to_hex(),
-        small_a_hash.to_hex(),
-        small_b_hash.to_hex(),
-    );
-    std::fs::write(&manifest_path, manifest).context("write local manifest")?;
-
-    let args = bundle_pull_argv(
+    let args = bundle_get_argv(
         &chain,
-        &manifest_path,
+        &manifest_hash,
         &out_dir,
         client_dir.path(),
         &keystore,
     );
 
-    // The wire bytes each small blob bills its one holder. A single pull
-    // invocation must bill EACH operator MORE than its exclusive small blob:
-    // the excess can only be large-blob delivery, which proves the large entry
-    // fanned out across both lanes.
-    let wire_small_a = whole_blob_wire_bytes(small_a.len() as u64);
+    // The wire bytes each holder's exclusive blobs bill it. A single pull
+    // invocation must bill EACH operator MORE than those: the excess can only
+    // be large-blob delivery, which proves the large entry fanned out across
+    // both lanes. Each attempt starts from an empty output dir, so it fetches
+    // the manifest from holder A again.
+    let wire_small_a =
+        whole_blob_wire_bytes(small_a.len() as u64) + whole_blob_wire_bytes(manifest.len() as u64);
     let wire_small_b = whole_blob_wire_bytes(small_b.len() as u64);
     run_pull_until_large_blob_splits(
         client_dir.path(),
@@ -319,9 +324,9 @@ fn billed_bytes(
     Ok(u64::try_from(billed).unwrap_or(u64::MAX))
 }
 
-/// Run `decdn bundle pull` until ONE invocation bills each holder MORE than
-/// its exclusive small blob's wire bytes — the excess is large-blob delivery,
-/// so that invocation genuinely fanned the large entry out across both lanes.
+/// Run `decdn get` until ONE invocation bills each holder MORE than its
+/// exclusive blobs' wire bytes — the excess is large-blob delivery, so that
+/// invocation genuinely fanned the large entry out across both lanes.
 ///
 /// The nodes' chain watchers observe the freshly-opened pool asynchronously,
 /// and a holder whose watcher has not caught up refuses the stream pre-serve;
@@ -356,12 +361,11 @@ async fn run_pull_until_large_blob_splits(
         let before_b = billed_bytes(data_dir, op_b)?;
 
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
-            .arg("bundle")
-            .arg("pull")
+            .arg("get")
             .args(args)
             .output()
             .await
-            .context("spawn decdn bundle pull")?;
+            .context("spawn decdn get")?;
         if output.status.success() {
             let billed_a = billed_bytes(data_dir, op_a)?.saturating_sub(before_a);
             let billed_b = billed_bytes(data_dir, op_b)?.saturating_sub(before_b);
@@ -379,13 +383,13 @@ async fn run_pull_until_large_blob_splits(
             );
         } else {
             tracing::debug!(
-                "bundle pull not ready; retrying after watcher catch-up:\n{}",
+                "bundle get not ready; retrying after watcher catch-up:\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "no single `decdn bundle pull` split the large blob across both holders; last \
+            "no single `decdn get` split the large blob across both holders; last \
              stderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -393,24 +397,23 @@ async fn run_pull_until_large_blob_splits(
     }
 }
 
-/// The `decdn bundle pull` argv (after the `bundle pull` subcommand) to pull a
-/// local manifest via AUTO-DISCOVERY — deliberately no
+/// The `decdn get` argv (after the `get` subcommand) to pull the bundle whose
+/// manifest has hash `manifest` via AUTO-DISCOVERY — deliberately no
 /// `--node-id`/`--addr`/`--provider-address`, since multi-source only ever runs
 /// on the auto-discovered candidate set. `--capacity-bond-address` is what
 /// discovery enumerates the active registry from (and the EIP-712
 /// `verifyingContract` the buyer signs its ADR 005 client identity binding
 /// against). Carries an explicit `--max-sources`/`--jobs` so the journey's
 /// intent is visible in the argv rather than relying on defaults.
-fn bundle_pull_argv(
+fn bundle_get_argv(
     chain: &ChainFixture,
-    manifest: &std::path::Path,
+    manifest: &Hash,
     out_dir: &std::path::Path,
     data_dir: &std::path::Path,
     keystore: &std::path::Path,
 ) -> Vec<String> {
     vec![
-        "-i".into(),
-        manifest.display().to_string(),
+        format!("decdn:{}/", manifest.to_hex()),
         "-o".into(),
         out_dir.display().to_string(),
         "--jobs".into(),

@@ -1,7 +1,7 @@
-//! Live anvil-backed e2e for `decdn fetch -o -` (#1848 4b): the CLI's STDOUT
-//! streaming path over the `decdn_client::Streamer` consumption face,
-//! driving the shipped `decdn` binary against a real node over a real paid
-//! `cdn/client/v1` stream.
+//! Live anvil-backed e2e for `decdn get decdn:<hash> -o -` (#1848 4b): the
+//! CLI's STDOUT streaming path over the `decdn_client::Streamer` consumption
+//! face, driving the shipped `decdn` binary against a real node over a real
+//! paid `cdn/client/v1` stream.
 //!
 //! Why the whole binary rather than a unit test: the `Streamer` /
 //! `VerifiedReader` unit tests in `decdn-client` already prove verified,
@@ -73,7 +73,7 @@ fn make_blob() -> Vec<u8> {
 async fn cli_fetch_dash_streams_verified_bytes_to_stdout() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
-        .context("cli fetch -o - e2e exceeded the overall timeout")??;
+        .context("cli get -o - e2e exceeded the overall timeout")??;
     Ok(())
 }
 
@@ -145,7 +145,7 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `decdn fetch ... -o -` until one invocation streams the whole blob to
+/// Run `decdn get ... -o -` until one invocation streams the whole blob to
 /// stdout, returning the captured stdout bytes.
 async fn run_fetch_until_streamed(
     data_dir: &std::path::Path,
@@ -155,21 +155,21 @@ async fn run_fetch_until_streamed(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
-            .arg("fetch")
+            .arg("get")
             .args(args)
             .output()
             .await
-            .context("spawn decdn fetch -o -")?;
+            .context("spawn decdn get -o -")?;
         if output.status.success() && output.stdout.len() == expected_len {
             return Ok(output.stdout);
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "no `decdn fetch -o -` streamed the whole blob; last stderr:\n{}",
+            "no `decdn get -o -` streamed the whole blob; last stderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         tracing::debug!(
-            "fetch -o - not ready (status {:?}, {} stdout bytes); retrying:\n{}",
+            "get -o - not ready (status {:?}, {} stdout bytes); retrying:\n{}",
             output.status.code(),
             output.stdout.len(),
             String::from_utf8_lossy(&output.stderr)
@@ -199,7 +199,7 @@ fn billed_bytes(
     Ok(u64::try_from(billed).unwrap_or(u64::MAX))
 }
 
-/// The `decdn fetch` argv (after the `fetch` subcommand) to stream `hash` to
+/// The `decdn get` argv (after the `get` subcommand) to stream `hash` to
 /// stdout via auto-discovery, writing to `-o -`.
 fn fetch_argv(
     chain: &ChainFixture,
@@ -208,8 +208,7 @@ fn fetch_argv(
     keystore: &std::path::Path,
 ) -> Vec<String> {
     vec![
-        "--hash".into(),
-        hash.to_hex(),
+        format!("decdn:{}", hash.to_hex()),
         "-o".into(),
         "-".into(),
         "--capacity-bond-address".into(),

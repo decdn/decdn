@@ -65,7 +65,7 @@ pub fn cached_pool_token(
 }
 
 /// What the lane builds of one run learn about funding its pool, shared by
-/// every fetch of the run: one `decdn fetch`, or every entry of a `bundle pull`.
+/// every fetch of the run: one blob fetch, or every entry of a bundle pull.
 ///
 /// It holds two facts. The first is the pool's spend across every lane: a
 /// baseline for the lanes the run does not drive, plus what each lane the run
@@ -665,7 +665,7 @@ where
 /// [`PoolContext`] (#1115): sign our OWN iroh `NodeId` with the buyer key so
 /// the serving node can prove we own the pool and reactively pull a
 /// cache-missed blob from its configured origin. Separate from
-/// [`build_pool_ctx`] so `decdn bundle pull` — which takes the `open_lock`
+/// [`build_pool_ctx`] so a bundle pull — which takes the `open_lock`
 /// itself around [`open_or_reuse_pool`] — can attach the same binding outside
 /// that critical section.
 ///
@@ -1042,7 +1042,7 @@ where
             // fetch on a `state.deposit` that understates the chain — so the
             // low-water check re-fires on every later fetch while nobody
             // reconciles the escrow. No bytes have been paid for on *this* entry
-            // yet — `bundle pull` reaches this once per entry, through
+            // yet — a bundle pull reaches this once per entry, through
             // `open_or_reuse_pool`, so earlier entries may already be paid for and
             // written — and only the escrow moved, so failing here strands nothing
             // in flight. The funding recovery step takes the same disposition

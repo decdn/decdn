@@ -1,5 +1,5 @@
 //! Buyer-side `PaymentPool` open kernel, shared by the node's node-to-node
-//! cache-miss buyer (#744) and the CLI (`decdn fetch`, #940).
+//! cache-miss buyer (#744) and the CLI (`decdn get`, #940).
 //!
 //! The genuinely duplication-prone part — the `openPool` transaction, the
 //! authoritative `PoolOpened`-from-receipt decode, the self-owned capability the

@@ -1411,7 +1411,7 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
     Ok(())
 }
 
-/// The shape `decdn fetch` / `decdn bundle pull` actually send on a cold miss:
+/// The shape `decdn get` actually sends on a cold miss:
 /// `byte_offset == 0, byte_len == total_bytes` — a BOUNDED request that covers the
 /// whole blob. It must take the same two-leg streaming tier as the unbounded
 /// `(0, 0)` request: the signed response goes out before the origin download
@@ -1783,7 +1783,7 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
     Ok(())
 }
 
-/// The `bundle pull` splice shape against a STALLED owner: a `(0, 0)` open whose
+/// The bundle-pull splice shape against a STALLED owner: a `(0, 0)` open whose
 /// client stays connected but never pays (the CLI's throwaway open before the
 /// node notices its close, or any client that stops paying), then the real open
 /// for only the CHANGED TAIL at an offset far past anything that fill will draw

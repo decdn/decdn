@@ -11,14 +11,28 @@ fn entry(path: &str, hash: &str) -> ManifestEntry {
 }
 
 /// Write `manifest` to `out`'s manifest cache, as a pull that fetched it
-/// leaves it, and return its `b3:` hash.
+/// leaves it, and return its hash as bare hex.
 fn cache_manifest(out: &Path, manifest: &serde_json::Value) -> String {
     let bytes = serde_json::to_vec(manifest).unwrap();
     let hash = *blake3::hash(&bytes).as_bytes();
     let path = BundleManifest::cache_path(out, hash);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, &bytes).unwrap();
-    format!("b3:{}", blake3::Hash::from_bytes(hash).to_hex())
+    blake3::Hash::from_bytes(hash).to_hex().to_string()
+}
+
+/// Parse `decdn get <uri> <extra…>` into its args and URI.
+fn get_args(uri: &str, extra: &[&str]) -> (GetArgs, DecdnUri) {
+    use clap::Parser as _;
+    let argv = ["decdn", "get", uri]
+        .into_iter()
+        .chain(extra.iter().copied());
+    let decdn_common::cli::Command::Get(get) = decdn_common::cli::Cli::parse_from(argv).command
+    else {
+        panic!("not a get");
+    };
+    let parsed = get.uri.parse().unwrap();
+    (*get, parsed)
 }
 
 /// A report of `fetched` fetched, `linked` linked and `skipped` skipped
@@ -57,14 +71,12 @@ fn sample() -> Vec<ManifestEntry> {
 #[test]
 fn entry_retries_flag_is_gone() {
     use clap::Parser as _;
-    #[derive(clap::Parser)]
-    struct T {
-        #[command(flatten)]
-        args: BundlePullArgs,
-    }
-    let base = ["t", "-o", "out", "--hash", "b3:aa"];
-    assert!(T::try_parse_from(base).is_ok());
-    let parsed = T::try_parse_from(base.iter().copied().chain(["--entry-retries", "2"]));
+    let uri = format!("decdn:{}/", "ab".repeat(32));
+    let base = ["decdn", "get", uri.as_str(), "-o", "out"];
+    assert!(decdn_common::cli::Cli::try_parse_from(base).is_ok());
+    let parsed = decdn_common::cli::Cli::try_parse_from(
+        base.iter().copied().chain(["--entry-retries", "2"]),
+    );
     assert!(parsed.is_err());
 }
 
@@ -254,13 +266,47 @@ fn transfer_line_shows_paid_unless_nothing_moved() {
 }
 
 fn filtered_paths(include: &[&str], exclude: &[&str], entries: Vec<ManifestEntry>) -> Vec<String> {
-    let filter = EntryFilter::compile(&strs(include), &strs(exclude)).unwrap();
+    let filter = EntryFilter::compile(None, &strs(include), &strs(exclude)).unwrap();
     filter
         .apply_reporting(entries)
         .kept
         .into_iter()
         .map(|e| e.path)
         .collect()
+}
+
+/// An entry URI keeps exactly the entry whose path it names, byte for byte:
+/// glob metacharacters in a real filename match only themselves.
+#[test]
+fn entry_filter_keeps_exactly_the_named_entry() {
+    let entries = vec![
+        entry("x[1].txt", "b3:1"),
+        entry("x1.txt", "b3:2"),
+        entry("a*.bin", "b3:3"),
+        entry("abc.bin", "b3:4"),
+        entry("dir/{a,b}.txt", "b3:5"),
+        entry("dir/a.txt", "b3:6"),
+    ];
+    for path in ["x[1].txt", "a*.bin", "dir/{a,b}.txt", "x1.txt"] {
+        let filter = EntryFilter::compile(Some(path.to_owned()), &[], &[]).unwrap();
+        let (kept, excluded) = filter.apply_and_warn(entries.clone()).unwrap();
+        assert_eq!(
+            kept.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec![path]
+        );
+        assert_eq!(excluded, 5);
+    }
+}
+
+/// An entry URI that names no manifest entry is an error, not an empty run.
+#[test]
+fn entry_filter_rejects_a_missing_entry() {
+    let filter = EntryFilter::compile(Some("models/c.bin".to_owned()), &[], &[]).unwrap();
+    let err = filter.apply_and_warn(sample()).unwrap_err();
+    assert!(
+        err.to_string().contains("no entry \"models/c.bin\""),
+        "{err}"
+    );
 }
 
 /// Each pattern that matches no entry is reported with its flag, and one
@@ -271,6 +317,7 @@ fn entry_filter_reports_each_pattern_that_matched_nothing() {
     let mut entries = sample();
     entries.push(entry("gpt/metal/model.bin", "b3:5"));
     let filter = EntryFilter::compile(
+        None,
         &strs(&["models/*", "no/such/*"]),
         &strs(&["metal/*", "**/*.md"]),
     )
@@ -315,7 +362,7 @@ fn entry_filter_reports_each_pattern_that_matched_nothing() {
 /// `**` gets no hint.
 #[test]
 fn entry_filter_hints_an_anchored_pattern_without_a_slash() {
-    let filter = EntryFilter::compile(&[], &strs(&["*.txt", "**/*.png"])).unwrap();
+    let filter = EntryFilter::compile(None, &[], &strs(&["*.txt", "**/*.png"])).unwrap();
     let pass = filter.apply_reporting(sample());
     assert_eq!(pass.excluded, 0);
     assert_eq!(
@@ -331,12 +378,12 @@ fn entry_filter_hints_an_anchored_pattern_without_a_slash() {
 /// that matches only entries the include gate already dropped.
 #[test]
 fn entry_filter_reports_nothing_when_every_pattern_matches() {
-    let filter = EntryFilter::compile(&strs(&["models/*"]), &strs(&["docs/**"])).unwrap();
+    let filter = EntryFilter::compile(None, &strs(&["models/*"]), &strs(&["docs/**"])).unwrap();
     let pass = filter.apply_reporting(sample());
     assert!(pass.unmatched.is_empty(), "{:?}", pass.unmatched);
     assert_eq!(pass.excluded, 2);
 
-    let pass = EntryFilter::compile(&[], &[])
+    let pass = EntryFilter::compile(None, &[], &[])
         .unwrap()
         .apply_reporting(sample());
     assert!(pass.unmatched.is_empty());
@@ -460,7 +507,7 @@ fn leftover_partials_count_a_sparse_partial_by_its_allocated_space() {
 /// A malformed glob is a hard error naming the flag it came from.
 #[test]
 fn entry_filter_rejects_bad_glob() {
-    let err = EntryFilter::compile(&strs(&["["]), &[]).unwrap_err();
+    let err = EntryFilter::compile(None, &strs(&["["]), &[]).unwrap_err();
     assert!(
         format!("{err:#}").contains("--include"),
         "error should name the offending flag: {err:#}"
@@ -474,31 +521,6 @@ fn report_counts_linked_without_failing() {
     assert!(report(&rep, 0, Path::new("/out"), false).is_ok());
 }
 
-/// `--namespace` on bundle pull is bundle-level: one id for the whole run. It
-/// rejects the reserved `0` (the `NO_NAMESPACE` sentinel — omit the flag instead),
-/// reusing the same parser as `decdn fetch`.
-#[test]
-fn bundle_pull_namespace_flag_parses_and_rejects_zero() {
-    use clap::Parser;
-    #[derive(Parser)]
-    struct T {
-        #[command(flatten)]
-        a: decdn_common::cli::BundlePullArgs,
-    }
-    let ok = T::try_parse_from(["t", "-o", "out", "--hash", "b3:aa", "--namespace", "7"])
-        .expect("valid namespace parses");
-    assert_eq!(ok.a.namespace, Some(7));
-
-    assert!(
-        T::try_parse_from(["t", "-o", "out", "--hash", "b3:aa", "--namespace", "0"]).is_err(),
-        "namespace 0 is the reserved sentinel and must be rejected"
-    );
-
-    let none =
-        T::try_parse_from(["t", "-o", "out", "--hash", "b3:aa"]).expect("namespace is optional");
-    assert_eq!(none.a.namespace, None, "absent flag stays None");
-}
-
 /// `--dry-run` must still enforce the flag-combination rule: a dangling
 /// `--provider-address` (no `--node-id`) is rejected even for `--dry-run`,
 /// which does not run at parse time — so `bundle_pull` calls `validate()`
@@ -507,25 +529,13 @@ fn bundle_pull_namespace_flag_parses_and_rejects_zero() {
 /// `validate()` fails first).
 #[tokio::test]
 async fn dry_run_still_rejects_a_dangling_provider_address() {
-    use clap::Parser;
-    #[derive(Parser)]
-    struct T {
-        #[command(flatten)]
-        a: decdn_common::cli::BundlePullArgs,
-    }
     let addr = "0x0000000000000000000000000000000000000001";
-    let args = T::parse_from([
-        "t",
-        "-o",
-        "out",
-        "--hash",
-        "b3:aa",
-        "--dry-run",
-        "--provider-address",
-        addr,
-    ])
-    .a;
-    let err = super::bundle_pull(&args, None)
+    let uri = format!("decdn:{}/", "ab".repeat(32));
+    let (args, uri) = get_args(
+        &uri,
+        &["-o", "out", "--dry-run", "--provider-address", addr],
+    );
+    let err = super::bundle_pull(&args, &uri, None)
         .await
         .expect_err("a dangling --provider-address must be rejected even for --dry-run");
     assert!(
@@ -534,21 +544,11 @@ async fn dry_run_still_rejects_a_dangling_provider_address() {
     );
 }
 
-/// Parse `bundle pull` args from `extra`, behind a placeholder program name.
-fn pull_args(extra: &[&str]) -> BundlePullArgs {
-    use clap::Parser;
-    #[derive(Parser)]
-    struct T {
-        #[command(flatten)]
-        a: decdn_common::cli::BundlePullArgs,
-    }
-    T::parse_from(std::iter::once("t").chain(extra.iter().copied())).a
-}
-
-/// `--hash --dry-run` reads the bundle's cached manifest, even under
-/// `--overwrite`, so the filters run against its entries (#2327).
-#[test]
-fn dry_run_reads_a_cached_hash_manifest() {
+/// `--dry-run` reads the bundle's cached manifest, even under `--overwrite`,
+/// so the entry selection runs against its entries (#2327): an entry URI
+/// naming a cached entry plans it, and one naming no entry fails.
+#[tokio::test]
+async fn dry_run_reads_a_cached_manifest() {
     let tmp = tempfile::tempdir().expect("tmp");
     let out = tmp.path().to_str().expect("utf-8 tmp path");
     let hash = cache_manifest(
@@ -562,43 +562,42 @@ fn dry_run_reads_a_cached_hash_manifest() {
         }),
     );
     for overwrite in [false, true] {
-        let mut argv = vec!["-o", out, "--hash", &hash, "--dry-run"];
+        let mut extra = vec!["-o", out, "--dry-run"];
         if overwrite {
-            argv.push("--overwrite");
+            extra.push("--overwrite");
         }
-        let manifest = dry_run_manifest(&pull_args(&argv))
-            .unwrap()
-            .expect("the cached manifest is read");
-        assert_eq!(
-            manifest
-                .entries
-                .iter()
-                .map(|e| e.path.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "openai-gpt-oss-20b/config.json",
-                "openai-gpt-oss-20b/metal/model.bin"
-            ],
-            "overwrite={overwrite}"
+        let (args, uri) = get_args(
+            &format!("decdn:{hash}/openai-gpt-oss-20b/config.json"),
+            &extra,
         );
+        super::bundle_pull(&args, &uri, None)
+            .await
+            .unwrap_or_else(|e| panic!("overwrite={overwrite}: {e:#}"));
+
+        let (args, uri) = get_args(&format!("decdn:{hash}/openai-gpt-oss-20b/no.json"), &extra);
+        let err = super::bundle_pull(&args, &uri, None)
+            .await
+            .expect_err("the cached manifest has no such entry");
+        assert!(format!("{err:#}").contains("no entry"), "{err:#}");
     }
 }
 
-/// `--hash --dry-run` with no cached manifest has no entries to list, and the
-/// full dry run still finishes with no endpoint, chain, or keystore.
+/// A dry run with no cached manifest has no entries to list, and still
+/// finishes with no endpoint, chain, or keystore.
 #[tokio::test]
 async fn dry_run_has_no_manifest_for_an_uncached_hash() {
     let tmp = tempfile::tempdir().expect("tmp");
     let out = tmp.path().to_str().expect("utf-8 tmp path");
-    let hash = format!("b3:{}", "ab".repeat(32));
-    let args = pull_args(&["-o", out, "--hash", &hash, "--dry-run"]);
-    assert!(dry_run_manifest(&args).unwrap().is_none());
-    super::bundle_pull(&args, None).await.unwrap();
+    let (args, uri) = get_args(
+        &format!("decdn:{}/", "ab".repeat(32)),
+        &["-o", out, "--dry-run"],
+    );
+    super::bundle_pull(&args, &uri, None).await.unwrap();
 }
 
-/// The full `bundle_pull --dry-run` reads the cached `--hash` manifest: a
-/// cached blob that hashes to the bundle but is not a v1 manifest fails the
-/// dry run, naming the cache file, as it would fail a real pull.
+/// The full dry run reads the cached manifest: a cached blob that hashes to
+/// the bundle but is not a v1 manifest fails the dry run, naming the cache
+/// file and the drop-the-trailing-`/` hint, as it would fail a real pull.
 #[tokio::test]
 async fn dry_run_fails_on_a_cached_manifest_that_does_not_parse() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -607,13 +606,25 @@ async fn dry_run_fails_on_a_cached_manifest_that_does_not_parse() {
         tmp.path(),
         &serde_json::json!({"version": 2, "entries": []}),
     );
-    let args = pull_args(&["-o", out, "--hash", &hash, "--dry-run"]);
-    let err = super::bundle_pull(&args, None)
+    let (args, uri) = get_args(&format!("decdn:{hash}/"), &["-o", out, "--dry-run"]);
+    let err = super::bundle_pull(&args, &uri, None)
         .await
         .expect_err("a cached non-v1 manifest fails the dry run");
     let msg = format!("{err:#}");
     assert!(msg.contains("unsupported bundle version 2"), "{msg}");
     assert!(msg.contains(".decdn-bundles"), "{msg}");
+    assert!(msg.contains("drop the trailing `/`"), "{msg}");
+}
+
+/// Only a blob that is not a manifest gets the drop-the-trailing-`/` hint.
+#[test]
+fn only_a_non_manifest_gets_the_trailing_slash_hint() {
+    let not_manifest = BundleManifest::parse(b"plain bytes").unwrap_err();
+    let hinted = format!("{:#}", not_a_manifest_hint(not_manifest));
+    assert!(hinted.contains("drop the trailing `/`"), "{hinted}");
+
+    let other = format!("{:#}", not_a_manifest_hint(anyhow!("no holder answered")));
+    assert_eq!(other, "no holder answered");
 }
 
 /// A cached manifest file that exists but cannot be read fails the dry run,
@@ -626,9 +637,8 @@ async fn dry_run_fails_naming_an_unreadable_cached_manifest() {
     let hex = blake3::Hash::from_bytes(raw).to_hex();
     // A directory at the cache path is unreadable as a file, even as root.
     std::fs::create_dir_all(BundleManifest::cache_path(tmp.path(), raw)).expect("mkdir");
-    let hash = format!("b3:{hex}");
-    let args = pull_args(&["-o", out, "--hash", &hash, "--dry-run"]);
-    let err = super::bundle_pull(&args, None)
+    let (args, uri) = get_args(&format!("decdn:{hex}/"), &["-o", out, "--dry-run"]);
+    let err = super::bundle_pull(&args, &uri, None)
         .await
         .expect_err("an unreadable cached manifest fails the dry run");
     let msg = format!("{err:#}");
@@ -650,25 +660,13 @@ async fn dry_run_fails_naming_a_cached_manifest_that_fails_its_hash_check() {
     );
     let raw = fetch::parse_hash(&hash).expect("hash");
     std::fs::write(BundleManifest::cache_path(tmp.path(), raw), b"tampered").expect("tamper");
-    let args = pull_args(&["-o", out, "--hash", &hash, "--dry-run"]);
-    let err = super::bundle_pull(&args, None)
+    let (args, uri) = get_args(&format!("decdn:{hash}/"), &["-o", out, "--dry-run"]);
+    let err = super::bundle_pull(&args, &uri, None)
         .await
         .expect_err("a tampered cached manifest fails the dry run");
     let msg = format!("{err:#}");
     assert!(msg.contains("does not hash to the bundle"), "{msg}");
     assert!(msg.contains(".decdn-bundles"), "{msg}");
-}
-
-/// A malformed `--hash` fails the dry run, as it fails a real pull.
-#[tokio::test]
-async fn dry_run_rejects_a_malformed_hash() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let out = tmp.path().to_str().expect("utf-8 tmp path");
-    let args = pull_args(&["-o", out, "--hash", "b3:aa", "--dry-run"]);
-    let err = super::bundle_pull(&args, None)
-        .await
-        .expect_err("a malformed --hash fails the dry run");
-    assert!(format!("{err:#}").contains("invalid hash"), "{err:#}");
 }
 
 /// A plain entry's line keeps its one rate, taken from what it downloaded.

@@ -498,8 +498,8 @@ const fn no_longer_open(status: PaymentPool::Status) -> bool {
 
 /// Grade the local row-clear that follows a mined `closePool`.
 ///
-/// `pool close` drops the local record *so that* a later `fetch` / `bundle pull`
-/// opens a fresh pool rather than reusing one that is winding down. Only the
+/// `pool close` drops the local record *so that* a later `decdn get` opens a
+/// fresh pool rather than reusing one that is winding down. Only the
 /// `Err` leaves that in doubt.
 ///
 /// The clear is compare-and-delete on this deployment (see [`forget_on`]), and
@@ -877,7 +877,7 @@ where
         TxOutcome::Landed => {
             // The dispute deadline is only known post-close; read it best-effort
             // and never print the pre-close `0` if that read fails. The local
-            // record is dropped so a later `fetch`/`bundle pull` opens a fresh
+            // record is dropped so a later `decdn get` opens a fresh
             // pool rather than reusing one that is winding down. Any transport
             // error is redacted here, since the caller may print it directly
             // rather than through `main`'s error boundary.

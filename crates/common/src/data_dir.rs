@@ -25,7 +25,7 @@ pub const NODE_SETTLE_DB_FILE: &str = "settle.redb";
 /// The daemon's settlement-watcher checkpoint store.
 pub const NODE_CHECKPOINT_DB_FILE: &str = "checkpoint.redb";
 
-/// The standalone client's buyer-only pool store (`decdn fetch`, `decdn pool`).
+/// The standalone client's buyer-only pool store (`decdn get`, `decdn pool`).
 pub const CLIENT_BUYER_DB_FILE: &str = "buyer-pools.redb";
 
 /// Every store file a `decdn-node` daemon owns in its data dir.

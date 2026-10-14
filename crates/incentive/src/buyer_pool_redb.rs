@@ -1,6 +1,6 @@
 //! `redb`-backed persistent [`BuyerPoolStore`] for client-side use (#940).
 //!
-//! A client (`decdn fetch`) has no seller state, so it gets a **buyer-only**
+//! A client (`decdn get`) has no seller state, so it gets a **buyer-only**
 //! store: its own `buyer-pools.redb`, one table. The node keeps its buyer table
 //! in its own `buyer.redb` — one of the per-family files its lane store opens,
 //! so a buyer top-up commits on a writer slot separate from the seller lane
@@ -74,7 +74,7 @@ impl RedbBuyerPoolStore {
                 ),
             });
         }
-        // A second concurrent opener (another `decdn fetch`/`bundle pull`
+        // A second concurrent opener (another `decdn get`
         // on the same data dir) trips redb's process-exclusive write lock.
         // Surface that as a clear, dedicated error instead of a raw backend
         // string — two processes must not share one pool's voucher

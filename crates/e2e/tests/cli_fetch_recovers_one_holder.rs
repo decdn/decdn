@@ -1,4 +1,4 @@
-//! Live anvil-backed e2e: `decdn fetch` recovers when its sole holder is down,
+//! Live anvil-backed e2e: `decdn get` recovers when its sole holder is down,
 //! without a rerun (#1174).
 //!
 //! The fetch runs one `acquire` loop over a `SourceSet`: a source that stops
@@ -13,7 +13,7 @@
 //!   auto-discovering fetch while the only holder is stopped, then starts the
 //!   holder.
 //!
-//! Either way the in-flight `decdn fetch` process completes with the correct
+//! Either way the in-flight `decdn get` process completes with the correct
 //! bytes rather than erroring out or hanging past its give-up bound.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
@@ -124,7 +124,7 @@ async fn run() -> anyhow::Result<()> {
 
     let mut cmd =
         tokio::process::Command::from(decdn_command(client_dir.path(), KEYSTORE_PASSWORD)?);
-    cmd.arg("fetch").args(&args).kill_on_drop(true);
+    cmd.arg("get").args(&args).kill_on_drop(true);
     let fetch = tokio::spawn(async move { cmd.output().await });
 
     // Let the transfer get solidly underway before pulling the rug: wait for
@@ -140,12 +140,12 @@ async fn run() -> anyhow::Result<()> {
 
     let output = tokio::time::timeout(Duration::from_secs(300), fetch)
         .await
-        .context("decdn fetch did not finish within 300s of the node coming back")?
-        .context("decdn fetch task panicked")?
-        .context("spawn/await decdn fetch")?;
+        .context("decdn get did not finish within 300s of the node coming back")?
+        .context("decdn get task panicked")?
+        .context("spawn/await decdn get")?;
     anyhow::ensure!(
         output.status.success(),
-        "decdn fetch did not recover from the node restart; stderr:\n{}",
+        "decdn get did not recover from the node restart; stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
     let got = std::fs::read(&out).context("read fetch output")?;
@@ -221,16 +221,16 @@ async fn run_holder_down_at_start() -> anyhow::Result<()> {
     args.push(GIVE_UP_AFTER_SECS.to_string());
     let mut cmd =
         tokio::process::Command::from(decdn_command(client_dir.path(), KEYSTORE_PASSWORD)?);
-    cmd.arg("fetch").args(&args).kill_on_drop(true);
+    cmd.arg("get").args(&args).kill_on_drop(true);
     let fetch = tokio::spawn(async move { cmd.output().await });
 
     // Past one whole probe round (a 5 s probe timeout), so the first probe
     // has failed before the holder comes up.
     tokio::time::sleep(Duration::from_secs(12)).await;
     if fetch.is_finished() {
-        let output = fetch.await.context("decdn fetch task panicked")??;
+        let output = fetch.await.context("decdn get task panicked")??;
         anyhow::bail!(
-            "decdn fetch must keep looking for a holder while the sole holder is down; \
+            "decdn get must keep looking for a holder while the sole holder is down; \
              it exited with {} and stderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
@@ -242,12 +242,12 @@ async fn run_holder_down_at_start() -> anyhow::Result<()> {
 
     let output = tokio::time::timeout(Duration::from_secs(300), fetch)
         .await
-        .context("decdn fetch did not finish within 300s of the holder coming up")?
-        .context("decdn fetch task panicked")?
-        .context("spawn/await decdn fetch")?;
+        .context("decdn get did not finish within 300s of the holder coming up")?
+        .context("decdn get task panicked")?
+        .context("spawn/await decdn get")?;
     anyhow::ensure!(
         output.status.success(),
-        "decdn fetch did not find the holder once it came up; stderr:\n{}",
+        "decdn get did not find the holder once it came up; stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
     let got = std::fs::read(&out).context("read fetch output")?;
@@ -262,7 +262,7 @@ async fn run_holder_down_at_start() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `decdn fetch` argv (after the `fetch` subcommand) to pull `hash` by
+/// The `decdn get` argv (after the `get` subcommand) to pull `hash` by
 /// auto-discovery: no `--node-id`, so the CLI reads the `CapacityBond`
 /// registry and probes each node.
 fn discovery_fetch_argv(
@@ -273,8 +273,7 @@ fn discovery_fetch_argv(
     out: &Path,
 ) -> Vec<String> {
     vec![
-        "--hash".into(),
-        hash.to_hex(),
+        format!("decdn:{}", hash.to_hex()),
         "-o".into(),
         out.display().to_string(),
         "--capacity-bond-address".into(),
@@ -320,7 +319,7 @@ async fn wait_for_partial_bytes(
     }
 }
 
-/// The `decdn fetch` argv (after the `fetch` subcommand) to pull `hash` from
+/// The `decdn get` argv (after the `get` subcommand) to pull `hash` from
 /// `node` over the explicit-node path, with chain coordinates as flags so no
 /// config file is needed. `--capacity-bond-address` is required: it is the
 /// EIP-712 `verifyingContract` the buyer signs its ADR 005 client identity
@@ -335,8 +334,7 @@ fn fetch_argv(
     out: &Path,
 ) -> Vec<String> {
     vec![
-        "--hash".into(),
-        hash.to_hex(),
+        format!("decdn:{}", hash.to_hex()),
         "-o".into(),
         out.display().to_string(),
         "--node-id".into(),

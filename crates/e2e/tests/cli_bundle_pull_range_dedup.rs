@@ -1,4 +1,5 @@
-//! Live anvil-backed e2e for `decdn bundle pull`'s **range-dedup** path: an
+//! Live anvil-backed e2e for the bundle route of `decdn get`'s **range-dedup**
+//! path: an
 //! optimized bundle whose two files share a large byte run dedups the shared
 //! range — splices it locally from the first file's already-materialized
 //! blob — instead of re-downloading (and re-paying for) it from the node.
@@ -10,7 +11,8 @@
 //! two whole files directly via [`NodeFixture::launch_with_blobs`] — exactly
 //! what an `--optimize` import would have produced on disk. The manifest is
 //! hand-built, with each entry's `chunks` hints naming the shared run and
-//! each file's distinct tail as separate BLAKE3-addressed spans.
+//! each file's distinct tail as separate BLAKE3-addressed spans, and placed in
+//! the output root's manifest cache, so a pull pays only for the entries.
 //!
 //! What this test proves:
 //! 1. **Correct assembly** — both output files are byte-exact and whole-file
@@ -183,7 +185,7 @@ async fn run() -> anyhow::Result<()> {
         ),
     )
     .context("write lone manifest")?;
-    let lone_args = bundle_pull_argv(
+    let lone_args = bundle_get_argv(
         &chain,
         &node,
         &lone_manifest_path,
@@ -232,7 +234,7 @@ async fn run() -> anyhow::Result<()> {
         tail_sz = TAIL_BYTES,
     );
     std::fs::write(&ab_manifest_path, ab_manifest).context("write a/b manifest")?;
-    let ab_args = bundle_pull_argv(
+    let ab_args = bundle_get_argv(
         &chain,
         &node,
         &ab_manifest_path,
@@ -294,7 +296,7 @@ async fn run() -> anyhow::Result<()> {
 /// `<hex>`), so the guard must recognize completion and skip calling
 /// `hash_partial` on the now-absent `.partial` file, rather than surfacing an
 /// `Err(open: No such file)` that would fail the entry spuriously. With the
-/// guard the pull succeeds; a regression here makes `bundle pull` exit
+/// guard the pull succeeds; a regression here makes `decdn get` exit
 /// non-zero and `run_bundle_pull_until_ready` never succeed (the test times
 /// out).
 #[tokio::test(flavor = "multi_thread")]
@@ -397,7 +399,7 @@ async fn run_self_heal() -> anyhow::Result<()> {
     // failure leaves the blob finalized at staging, so the retry recovers). The
     // measured run below is the SINGLE-shot pull that must not fail at all.
     let warm_out = client_dir.path().join("warm");
-    let warm_args = bundle_pull_argv(
+    let warm_args = bundle_get_argv(
         &chain,
         &node,
         &manifest_path,
@@ -415,12 +417,12 @@ async fn run_self_heal() -> anyhow::Result<()> {
 
     // The measured run: a fresh output dir (so `a.bin` is re-pulled and
     // re-registers `hash_donor`, arming `b.bin`'s self-heal) and EXACTLY ONE
-    // `bundle pull` invocation. The pool is already open, so the only way this
+    // `decdn get` invocation. The pool is already open, so the only way this
     // exits non-zero is the self-heal bug — a `.partial` `drive` already renamed
     // to `staging` after the whole-file re-drive. Without the finalize-aware
     // guard the entry fails here; the retry loop is deliberately not used.
     let out_dir = client_dir.path().join("out");
-    let out_args = bundle_pull_argv(
+    let out_args = bundle_get_argv(
         &chain,
         &node,
         &manifest_path,
@@ -431,15 +433,14 @@ async fn run_self_heal() -> anyhow::Result<()> {
     );
     let output =
         tokio::process::Command::from(decdn_command(client_dir.path(), KEYSTORE_PASSWORD)?)
-            .arg("bundle")
-            .arg("pull")
+            .arg("get")
             .args(&out_args)
             .output()
             .await
-            .context("spawn single-shot self-heal bundle pull")?;
+            .context("spawn single-shot self-heal get")?;
     anyhow::ensure!(
         output.status.success(),
-        "self-heal bundle pull must succeed in one attempt; without the finalize-aware guard the \
+        "self-heal get must succeed in one attempt; without the finalize-aware guard the \
          re-driven entry fails spuriously. stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -598,7 +599,7 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
     // shared chunk is a donor for `b`. `--max-lane-streams 4` bounds how many
     // entries stream from the one provider at once; `b`'s one lane fills its
     // complement ranges one at a time.
-    let mut args = bundle_pull_argv(
+    let mut args = bundle_get_argv(
         &chain,
         &node,
         &manifest_path,
@@ -774,7 +775,7 @@ async fn run_striped_complement() -> anyhow::Result<()> {
     // Discovered, not pinned, so `b`'s drives see both holders. `--jobs 1`
     // lands `a` before `b` plans, and `a` stays below the multi-source floor,
     // so it pulls whole from one holder.
-    let args = discovered_pull_argv(
+    let args = discovered_get_argv(
         &chain,
         &manifest_path,
         &out_dir,
@@ -974,7 +975,7 @@ async fn run_concurrent_same_lane() -> anyhow::Result<()> {
 
     // `--jobs 2` runs both entries at once; `--max-lane-streams 2` lets both
     // share the one lane concurrently instead of serializing on it.
-    let mut args = bundle_pull_argv(
+    let mut args = bundle_get_argv(
         &chain,
         &node,
         &manifest_path,
@@ -1019,10 +1020,10 @@ async fn run_concurrent_same_lane() -> anyhow::Result<()> {
 
 /// Live seam test: the two journeys above seed whole-file blobs directly and
 /// hand-build the manifest, so the `origin import --optimize` -> chunk-hint ->
-/// `bundle pull` seam is never exercised end-to-end. This journey runs the
+/// `decdn get` seam is never exercised end-to-end. This journey runs the
 /// REAL `decdn origin import --optimize` over an on-disk source tree, serves
 /// the manifest + whole-file blobs it actually wrote (read back from the
-/// import store, not the in-memory originals), and `bundle pull --hash`es the
+/// import store, not the in-memory originals), and `decdn get`s the
 /// import-emitted bundle hash — asserting the same dedup money property as
 /// [`cli_bundle_pull_dedups_an_overlapping_range`].
 ///
@@ -1251,7 +1252,7 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
         .context("mint buyer USDC")?;
 
     let out_dir = client_dir.path().join("out");
-    let mut args = bundle_pull_hash_argv(
+    let mut args = bundle_get_fetched_manifest_argv(
         &chain,
         &node,
         &bundle_hex,
@@ -1276,7 +1277,7 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
     anyhow::ensure!(Hash::new(&got_a) == whole_a, "a.bin BLAKE3 mismatch");
     anyhow::ensure!(Hash::new(&got_b) == whole_b, "b.bin BLAKE3 mismatch");
 
-    // (2) Dedup happened. `--hash` fetches the manifest blob itself over the
+    // (2) Dedup happened. The run fetches the manifest blob itself over the
     // SAME paid lane before any entry (`fetch_to_memory`), so the exact
     // watermark is the manifest's own whole-file wire cost PLUS the same money
     // property the hand-built manifest journey asserts: `a`'s whole file plus
@@ -1417,7 +1418,7 @@ async fn run_delta_update() -> anyhow::Result<()> {
         tail_sz = TAIL_BYTES,
     );
     std::fs::write(&manifest_v1_path, manifest_v1).context("write v1 manifest")?;
-    let mut args_v1 = bundle_pull_argv(
+    let mut args_v1 = bundle_get_argv(
         &chain,
         &node,
         &manifest_v1_path,
@@ -1503,7 +1504,7 @@ async fn run_delta_update() -> anyhow::Result<()> {
         tail_sz = TAIL_BYTES,
     );
     std::fs::write(&manifest_v2_path, manifest_v2).context("write v2 manifest")?;
-    let mut args_v2 = bundle_pull_argv(
+    let mut args_v2 = bundle_get_argv(
         &chain,
         &node,
         &manifest_v2_path,
@@ -1678,7 +1679,7 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
         ),
     )
     .context("write bundle 1 manifest")?;
-    let mut args1 = bundle_pull_argv(
+    let mut args1 = bundle_get_argv(
         &chain,
         &node,
         &manifest1_path,
@@ -1736,7 +1737,7 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
         ),
     )
     .context("write bundle 2 manifest")?;
-    let mut args2 = bundle_pull_argv(
+    let mut args2 = bundle_get_argv(
         &chain,
         &node,
         &manifest2_path,
@@ -1809,12 +1810,11 @@ async fn run_bundle_pull_json_until_ready(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
-            .arg("bundle")
-            .arg("pull")
+            .arg("get")
             .args(args)
             .output()
             .await
-            .context("spawn decdn bundle pull --json")?;
+            .context("spawn decdn get --json")?;
         if output.status.success() {
             let line = output
                 .stdout
@@ -1829,16 +1829,14 @@ async fn run_bundle_pull_json_until_ready(
             !stderr.contains("does not match its whole-file hash")
                 && !stderr.contains("No such file")
                 && !stderr.contains(".partial"),
-            "decdn bundle pull --json failed with a non-transient reconstruction fault; \
+            "decdn get --json failed with a non-transient reconstruction fault; \
              stderr:\n{stderr}"
         );
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "decdn bundle pull --json never succeeded; last stderr:\n{stderr}"
+            "decdn get --json never succeeded; last stderr:\n{stderr}"
         );
-        tracing::debug!(
-            "bundle pull --json not ready; retrying after serve-path catch-up:\n{stderr}"
-        );
+        tracing::debug!("get --json not ready; retrying after serve-path catch-up:\n{stderr}");
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
 }
@@ -1855,10 +1853,10 @@ fn import_obao4_path(store: &std::path::Path, hex: &str) -> std::path::PathBuf {
     store.join(&hex[..2]).join(format!("{hex}.obao4"))
 }
 
-/// `decdn bundle pull --hash <bundle_hex>` argv — the `--hash` twin of
-/// [`bundle_pull_argv`], fetching the manifest blob itself first instead of
-/// reading it from a local file.
-fn bundle_pull_hash_argv(
+/// `decdn get decdn:<bundle_hex>/` argv — the twin of [`bundle_get_argv`]
+/// that fetches the manifest blob itself from the node first instead of
+/// reading it from the output root's manifest cache.
+fn bundle_get_fetched_manifest_argv(
     chain: &ChainFixture,
     node: &NodeFixture,
     bundle_hex: &str,
@@ -1868,8 +1866,7 @@ fn bundle_pull_hash_argv(
     jobs: u32,
 ) -> Vec<String> {
     vec![
-        "--hash".into(),
-        bundle_hex.to_string(),
+        format!("decdn:{bundle_hex}/"),
         "-o".into(),
         out_dir.display().to_string(),
         "--jobs".into(),
@@ -1960,7 +1957,7 @@ fn billed_bytes(
     Ok(u64::try_from(billed).unwrap_or(u64::MAX))
 }
 
-/// Run `decdn bundle pull`, retrying until the node's serve path resolves the
+/// Run `decdn get`, retrying until the node's serve path resolves the
 /// (possibly freshly-opened) pool — the CLI has no internal retry for that
 /// race, matching every sibling bundle-pull e2e.
 async fn run_bundle_pull_until_ready(
@@ -1970,12 +1967,11 @@ async fn run_bundle_pull_until_ready(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
-            .arg("bundle")
-            .arg("pull")
+            .arg("get")
             .args(args)
             .output()
             .await
-            .context("spawn decdn bundle pull")?;
+            .context("spawn decdn get")?;
         if output.status.success() {
             return Ok(());
         }
@@ -1989,24 +1985,38 @@ async fn run_bundle_pull_until_ready(
             !stderr.contains("does not match its whole-file hash")
                 && !stderr.contains("No such file")
                 && !stderr.contains(".partial"),
-            "decdn bundle pull failed with a non-transient reconstruction fault; \
+            "decdn get failed with a non-transient reconstruction fault; \
              stderr:\n{stderr}"
         );
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "decdn bundle pull never succeeded; last stderr:\n{stderr}"
+            "decdn get never succeeded; last stderr:\n{stderr}"
         );
-        tracing::debug!("bundle pull not ready; retrying after serve-path catch-up:\n{stderr}");
+        tracing::debug!("get not ready; retrying after serve-path catch-up:\n{stderr}");
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
 }
 
-/// The `decdn bundle pull` argv (after the `bundle pull` subcommand) to pull a
-/// local manifest through discovery: no `--node-id`, so every entry probes the
-/// active registry and sees every holder. `--jobs 1` keeps the donor ahead of
-/// its recipient. `--max-lane-streams 4` bounds how many entries stream from
-/// one provider at once; each lane fills one range at a time.
-fn discovered_pull_argv(
+/// Cache the manifest file `manifest` in `out_dir`'s manifest cache, as a pull
+/// that fetched it leaves it, and return the bundle's `decdn:<hash>/` URI. The
+/// pull reads the manifest from that cache and pays only for the entries, so
+/// each journey's billing assertions cover the entries alone.
+fn cached_bundle_uri(manifest: &std::path::Path, out_dir: &std::path::Path) -> String {
+    let bytes = std::fs::read(manifest).expect("read manifest file");
+    let hash = Hash::new(&bytes);
+    let cache = decdn_client::bundle::BundleManifest::cache_path(out_dir, *hash.as_bytes());
+    std::fs::create_dir_all(cache.parent().expect("cache dir")).expect("create cache dir");
+    std::fs::write(&cache, &bytes).expect("cache manifest");
+    format!("decdn:{}/", hash.to_hex())
+}
+
+/// The `decdn get` argv (after the `get` subcommand) to pull the bundle of the
+/// manifest file `manifest` through discovery: no `--node-id`, so every entry
+/// probes the active registry and sees every holder. The manifest is read from
+/// the output root's cache ([`cached_bundle_uri`]). `--jobs 1` keeps the donor
+/// ahead of its recipient. `--max-lane-streams 4` bounds how many entries
+/// stream from one provider at once; each lane fills one range at a time.
+fn discovered_get_argv(
     chain: &ChainFixture,
     manifest: &std::path::Path,
     out_dir: &std::path::Path,
@@ -2014,8 +2024,7 @@ fn discovered_pull_argv(
     keystore: &std::path::Path,
 ) -> Vec<String> {
     vec![
-        "-i".into(),
-        manifest.display().to_string(),
+        cached_bundle_uri(manifest, out_dir),
         "-o".into(),
         out_dir.display().to_string(),
         "--jobs".into(),
@@ -2041,14 +2050,15 @@ fn discovered_pull_argv(
     ]
 }
 
-/// The `decdn bundle pull` argv (after the `bundle pull` subcommand) to pull a
-/// local manifest over the explicit-node path, with chain coordinates as
-/// flags so no config file is needed. `--provider-address` pins every entry
-/// to this one node (and one lane) — required so both `a.bin` and `b.bin`
-/// land on the SAME lane the dedup assertion reads. `--jobs` is explicit
-/// (rather than relying on the default) so the sequential-donor-before-
-/// recipient ordering this journey depends on is visible in the argv.
-fn bundle_pull_argv(
+/// The `decdn get` argv (after the `get` subcommand) to pull the bundle of the
+/// manifest file `manifest` over the explicit-node path, with chain
+/// coordinates as flags so no config file is needed. The manifest is read from
+/// the output root's cache ([`cached_bundle_uri`]). `--provider-address` pins
+/// every entry to this one node (and one lane) — required so both `a.bin` and
+/// `b.bin` land on the SAME lane the dedup assertion reads. `--jobs` is
+/// explicit (rather than relying on the default) so the sequential-donor-
+/// before-recipient ordering this journey depends on is visible in the argv.
+fn bundle_get_argv(
     chain: &ChainFixture,
     node: &NodeFixture,
     manifest: &std::path::Path,
@@ -2058,8 +2068,7 @@ fn bundle_pull_argv(
     jobs: u32,
 ) -> Vec<String> {
     vec![
-        "-i".into(),
-        manifest.display().to_string(),
+        cached_bundle_uri(manifest, out_dir),
         "-o".into(),
         out_dir.display().to_string(),
         "--jobs".into(),

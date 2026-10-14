@@ -35,7 +35,7 @@ buyer-store-core = ["dep:redb"]
 # Persistent buyer-only store (`buyer_pool_redb`): adds `RedbBuyerPoolStore`
 # (its own `buyer-pools.redb` file + open guards) on top of the shared table.
 # Off by default so the contracts/voucher logic doesn't link `redb`; the CLI
-# (`decdn fetch`, #940) enables it for cross-invocation pool reuse. (Only
+# (`decdn get`, #940) enables it for cross-invocation pool reuse. (Only
 # `redb` is avoided — `postcard` arrives unconditionally via
 # `decdn-protocol` no matter what is enabled here.)
 redb = ["buyer-store-core"]

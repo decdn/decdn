@@ -7,7 +7,7 @@
 //!      signer key via an owner-signed EIP-712 capability (`decdn pool assign`,
 //!      whose `dcap1:` token is captured), and
 //!   3. the DELEGATE — a distinct keystore that owns no pool and never opens or
-//!      tops one up — fetches a blob with that capability (`decdn fetch
+//!      tops one up — fetches a blob with that capability (`decdn get
 //!      --capability`), paying voucher-only from the owner's deposit.
 //!
 //! It is the delegated twin of `anvil_pool_redeem` (the self-owned journey where
@@ -25,7 +25,7 @@
 //! CLI-driven rather than a programmatic `ClientFixture` journey because the
 //! fixture's client is hardwired to `signer == owner` (it self-issues the
 //! `U256::MAX` capability), so it cannot express a distinct delegate; and because
-//! the newly-added `pool assign` / `fetch --capability` surface is exactly what
+//! the `pool assign` / `get --capability` surface is exactly what
 //! the delegation flow ships as, so driving the real subprocesses validates the
 //! token round-trip end to end (owner signs → `dcap1:` token → delegate adopts).
 //!
@@ -232,7 +232,7 @@ async fn run() -> anyhow::Result<()> {
         "token owner does not recover to the pool owner {owner_addr}"
     );
 
-    // ---- DELEGATE fetches with the capability (`decdn fetch --capability`) ----
+    // ---- DELEGATE fetches with the capability (`decdn get --capability`) ----
     //
     // Pin the log scan's lower bound BEFORE the fetch. The redemption this journey
     // asserts on lands in some block after this one, and an `eth_getLogs` filter
@@ -468,8 +468,8 @@ async fn run_cli_capture(
     String::from_utf8(output.stdout).with_context(|| format!("{what} stdout was not UTF-8"))
 }
 
-/// Run `decdn fetch`, retrying until the node's chain watcher has observed the
-/// owner's freshly-opened pool (`decdn fetch` has no internal retry for that
+/// Run `decdn get`, retrying until the node's chain watcher has observed the
+/// owner's freshly-opened pool (`decdn get` has no internal retry for that
 /// race). The only expected transient here is the readiness `NotFound`; the
 /// delegated cap is far larger than one delivery costs, so a `SpendingCapExhausted` cannot
 /// arise to be masked by the retry.
@@ -477,17 +477,17 @@ async fn run_fetch_until_ready(home: &std::path::Path, args: &[String]) -> anyho
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let output = tokio::process::Command::from(decdn_command(home, KEYSTORE_PASSWORD)?)
-            .arg("fetch")
+            .arg("get")
             .args(args)
             .output()
             .await
-            .context("spawn decdn fetch")?;
+            .context("spawn decdn get")?;
         if output.status.success() {
             return Ok(());
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "delegated decdn fetch never succeeded; last stderr:\n{}",
+            "delegated decdn get never succeeded; last stderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         tracing::debug!(
@@ -559,7 +559,7 @@ fn pool_assign_argv(
     ]
 }
 
-/// The `decdn fetch --capability` argv (after the `fetch` subcommand) for the
+/// The `decdn get --capability` argv (after the `get` subcommand) for the
 /// DELEGATE: it adopts the owner's pool via the `dcap1:` token, opens nothing, and
 /// never tops up. `--capacity-bond-address` is still required — it is the EIP-712
 /// `verifyingContract` the delegate signs its ADR 005 client identity binding
@@ -575,8 +575,7 @@ fn delegate_fetch_argv(
     out: &std::path::Path,
 ) -> Vec<String> {
     vec![
-        "--hash".into(),
-        hash.to_hex(),
+        format!("decdn:{}", hash.to_hex()),
         "-o".into(),
         out.display().to_string(),
         "--capability".into(),
@@ -795,7 +794,7 @@ async fn run_clamp() -> anyhow::Result<()> {
         let fetched = tokio::time::timeout(
             Duration::from_secs(60),
             tokio::process::Command::from(decdn_command(delegate_dir.path(), KEYSTORE_PASSWORD)?)
-                .arg("fetch")
+                .arg("get")
                 .args(&fetch_args)
                 .kill_on_drop(true)
                 .output(),
@@ -886,7 +885,7 @@ async fn run_clamp() -> anyhow::Result<()> {
     let drained = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::process::Command::from(decdn_command(delegate_dir.path(), KEYSTORE_PASSWORD)?)
-            .arg("fetch")
+            .arg("get")
             .args(&fetch_args)
             .kill_on_drop(true)
             .output(),

@@ -1,4 +1,4 @@
-# Appendix: Directory Bundles (`decdn bundle`)
+# Appendix: Directory Bundles
 
 > **This is an appendix, not a core protocol ADR.** Bundles are a
 > publisher-side convenience for grouping multiple BLAKE3-content-addressed
@@ -8,7 +8,7 @@
 > cases.
 
 **Date:** 2026-05-07 — **Status:** Accepted (`decdn origin import`
-generates manifests and `bundle pull` consumes them; both ship).
+generates manifests and `decdn get` consumes them; both ship).
 **Touches:** `decdn` CLI, `decdn-client` bundle API, content publishing
 workflow.
 
@@ -50,7 +50,7 @@ order — field declaration order is load-bearing, see
 - `hash`: `b3:` followed by the 64-character lowercase hex of the
   file's BLAKE3. See [Hash format](#hash-format).
 - `size`: file size in bytes, unsigned 64-bit integer. Optional and a
-  hint on the read side. `bundle pull` uses it for the dry-run plan and as
+  hint on the read side. A bundle pull uses it for the dry-run plan and as
   the first size claim of the entry, and fetches without it. The fetch
   proves the true size ([ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)).
   When the proven size differs from `size`, the entry succeeds and the
@@ -260,7 +260,7 @@ with hints computed over that file alone. A shared range between two
 files is recognized at pull time, by hash equality between their hint
 lists, not at import time.
 
-`bundle pull` consumes a chunked manifest exactly as it consumes an
+A bundle pull consumes a chunked manifest exactly as it consumes an
 unchunked one — see [Chunked entries](#chunked-entries) under Pull.
 
 `--to <dir>` writes blobs into a local filesystem cache origin store and
@@ -289,7 +289,7 @@ sees the folder.
 ## Pull
 
 The pull engine is `decdn_client::bundle::BundlePuller` in the client SDK.
-`decdn bundle pull` is one caller of it, and an application that embeds
+`decdn get` is one caller of it, and an application that embeds
 deCDN is another. The engine takes typed inputs: the chain, the local data
 directory, a buyer-pool store, and the funding source. The funding source is
 the buyer's own pool, or a delegated `CredentialSlot` that the application
@@ -304,10 +304,12 @@ into the slot during the pull. The swap applies as
 describes. The running-low signal prices the work that the whole bundle has
 left, not the work of one entry. The CLI swaps in no new credential.
 
-`decdn bundle pull` reads a manifest — from a local file (`-i`) or by
-fetching its own blob hash first (`--hash`, mutually exclusive) — and
-fetches every entry over the paid `cdn/client/v1` path (the same kernel
-as `decdn fetch`):
+`decdn get decdn:<hash>/` fetches the manifest blob by its hash. It then
+fetches every entry over the paid `cdn/client/v1` path, with the same
+kernel as the blob fetch of `decdn get decdn:<hash>`.
+`decdn get decdn:<hash>/<path>` keeps only the entry whose `path` is
+`<path>` (see [`decdn:` URIs](#decdn-uris)). A URI path that names no
+entry is an error. The rules below apply to every pull:
 
 - **Node selection is per distinct blob.** With an explicit `--node-id`
   every entry is pulled from that one node; otherwise each distinct blob
@@ -387,8 +389,7 @@ as `decdn fetch`):
   file by its hash. A saved record whose size and mtime match is a fast
   path. Without a match, the pull hashes the file against the manifest.
 - **`--dry-run`** reports the plan without any network/chain activity.
-  With `-i`, the plan lists the entries of the file. With `--hash`, the
-  plan lists entries only when an earlier pull into the same `-o`
+  The plan lists entries only when an earlier pull into the same `-o`
   directory cached the bundle manifest under `.decdn-bundles/`. Without
   that cache, the dry run prints only the bundle hash and the output
   directory. A cache file that the dry run cannot read, or that fails its

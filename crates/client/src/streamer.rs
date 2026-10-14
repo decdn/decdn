@@ -334,9 +334,10 @@ where
         // stream. The store is left at `.partial` (a stream is not kept as a
         // file), and reading its fully-present content needs no finalize.
         //
-        // Only when the cache actually stores it: a `NoCache` (the `decdn fetch
-        // -o -` path) reports `caches() == false`, so a huge blob is never read
-        // whole into memory just to be dropped — the stream stays memory-bounded.
+        // Only when the cache actually stores it: a `NoCache` (the
+        // `decdn get decdn:<hash> -o -` path) reports `caches() == false`, so a
+        // huge blob is never read whole into memory just to be dropped — the
+        // stream stays memory-bounded.
         if cache.caches()
             && let Some(proven) = state.store.proven()
             && let Ok(whole) = state.store.read(0, proven).await
