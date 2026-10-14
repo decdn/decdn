@@ -8,7 +8,8 @@
 //! gateway token) and [`HOST_HEADER`] (the host of the page it serves); the
 //! browser extension adds both, so page scripts never see the token. The
 //! gateway pays with the registered capability whose scope covers that host:
-//! an exact host first, then `*.<domain>`, then `*`. `HEAD` gets 405, since
+//! an exact host first, then `*.<domain>`, then `*`; between equal scopes, the
+//! token holder's own registration before a page's. `HEAD` gets 405, since
 //! answering it would cost a paid pull.
 //!
 //! **Capabilities.** The gateway holds one delegate key per capability, in
@@ -465,6 +466,19 @@ struct Registered {
     spent: bool,
 }
 
+impl Registered {
+    /// The order among capabilities that cover one host, highest first: the
+    /// more specific scope, then the token holder's own registration over a
+    /// page's, then the earlier expiry.
+    const fn preference(&self) -> (u8, bool, std::cmp::Reverse<u64>) {
+        (
+            self.scope.rank(),
+            self.origin.is_none(),
+            std::cmp::Reverse(self.grant.expiry),
+        )
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct RegisterRequest {
     capability: String,
@@ -765,7 +779,8 @@ impl Gateway {
         json(StatusCode::OK, &serde_json::Value::Array(list))
     }
 
-    /// The live capability whose scope covers `host` most specifically.
+    /// The live capability whose scope covers `host` most specifically, by
+    /// [`Registered::preference`].
     async fn paying_for(&self, host: &str) -> Option<Paying> {
         let mut delegates = self.delegates.lock().await;
         Self::prune(&mut delegates);
@@ -773,7 +788,7 @@ impl Gateway {
             .values()
             .filter_map(|d| d.capability.as_ref().map(|r| (d, r)))
             .filter(|(_, r)| !r.spent && r.scope.covers(host))
-            .max_by_key(|(_, r)| (r.scope.rank(), std::cmp::Reverse(r.grant.expiry)))
+            .max_by_key(|(_, r)| r.preference())
             .map(|(d, r)| Paying {
                 signer: Arc::clone(&d.signer),
                 grant: r.grant.clone(),

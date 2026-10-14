@@ -186,6 +186,31 @@ fn callers_without_a_page_origin_need_the_token() {
     assert!(Caller::of(Some("null"), true).is_err());
 }
 
+fn registered(scope: &str, origin: Option<&str>, expiry: u64) -> Registered {
+    Registered {
+        grant: CapabilityGrant {
+            pool_id: alloy::primitives::B256::ZERO,
+            signer: Address::ZERO,
+            spending_cap: 1,
+            expiry,
+            owner_signature: vec![0; 65],
+        },
+        scope: Scope::parse(scope).unwrap(),
+        origin: origin.map(str::to_owned),
+        spent: false,
+    }
+}
+
+#[test]
+fn the_token_holders_capability_wins_a_tie_with_a_pages() {
+    let own = registered("*", None, 2_000);
+    let page = registered("*", Some("https://evil.example"), 1_000);
+    assert!(own.preference() > page.preference());
+    // A more specific scope still wins over the token holder's `*`.
+    let site = registered("decdn.org", Some("https://decdn.org"), 3_000);
+    assert!(site.preference() > own.preference());
+}
+
 fn pending(minter: Option<&str>) -> Delegate {
     Delegate {
         signer: Arc::new(PrivateKeySigner::random()),
