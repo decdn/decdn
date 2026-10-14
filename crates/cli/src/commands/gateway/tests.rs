@@ -163,6 +163,28 @@ fn a_page_registers_only_scopes_that_cover_itself() {
 }
 
 #[test]
+fn a_page_may_not_register_a_public_suffix_wildcard() {
+    for (origin, scope) in [
+        ("https://attacker.io", "*.io"),
+        ("https://attacker.github.io", "*.github.io"),
+        ("https://shop.example.co.uk", "*.co.uk"),
+    ] {
+        assert!(
+            may_register(&page(origin), &Scope::parse(scope).unwrap()).is_err(),
+            "{scope}"
+        );
+    }
+    // The site's own wildcard and `*` stay open to it.
+    let origin = page("https://attacker.github.io");
+    assert!(may_register(&origin, &Scope::parse("*.attacker.github.io").unwrap()).is_ok());
+    assert!(may_register(&origin, &Scope::Any).is_ok());
+    let origin = page("https://shop.example.co.uk");
+    assert!(may_register(&origin, &Scope::parse("*.example.co.uk").unwrap()).is_ok());
+    // The token holder registers any scope.
+    assert!(may_register(&Caller::Token, &Scope::parse("*.io").unwrap()).is_ok());
+}
+
+#[test]
 fn a_page_stays_a_page_with_the_token() {
     let caller = Caller::of(Some("https://decdn.org"), true).unwrap();
     assert_eq!(caller.origin(), Some("https://decdn.org"));

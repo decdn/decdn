@@ -28,7 +28,8 @@
 //! on-chain owner of its pool on the gateway's deployment. A page registers
 //! through CORS, and its scope must cover its own origin's host, whether or
 //! not the request also carries the token: `example.com` may register
-//! `example.com`, `*.example.com` or `*`, never another host. The token
+//! `example.com`, `*.example.com` or `*`, never another host, and never a
+//! wildcard over a public suffix such as `*.com` or `*.github.io`. The token
 //! holder registers any scope. `GET /_capability` lists the registrations to
 //! the token holder. A restart drops every key, and with it every capability
 //! issued to one.
@@ -453,15 +454,25 @@ fn site(host: &str) -> String {
 }
 
 /// Whether `caller` may register `scope`: a page only a scope that covers its
-/// own host, the token holder any scope.
+/// own host and is no wildcard over a public suffix (`*.io`, `*.github.io`),
+/// the token holder any scope.
 fn may_register(caller: &Caller, scope: &Scope) -> Result<(), String> {
-    match caller {
-        Caller::Token => Ok(()),
-        Caller::Page { host, .. } if scope.covers(host) => Ok(()),
-        Caller::Page { host, .. } => Err(format!(
+    let Caller::Page { host, .. } = caller else {
+        return Ok(());
+    };
+    if !scope.covers(host) {
+        return Err(format!(
             "{host} may not register scope `{scope}`: it does not cover {host}"
-        )),
+        ));
     }
+    if let Scope::Domain(domain) = scope
+        && psl::suffix_str(domain) == Some(domain.as_str())
+    {
+        return Err(format!(
+            "{host} may not register scope `{scope}`: {domain} is a public suffix"
+        ));
+    }
+    Ok(())
 }
 
 /// Whether a pool whose on-chain owner is `on_chain` accepts a capability its
