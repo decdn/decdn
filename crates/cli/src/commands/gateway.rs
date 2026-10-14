@@ -38,8 +38,13 @@
 //! content never does, so a page can neither read a response nor set the
 //! token or host headers itself. The token lives in `<data-dir>/token`,
 //! owner-only. The gateway listens on loopback only and checks `Host` against
-//! DNS rebinding. Every pull runs the blob fetch of `decdn get` with its bytes going
-//! to the HTTP response, one pull at a time.
+//! DNS rebinding.
+//!
+//! **Pulls.** Every pull runs the blob fetch of `decdn get` with its bytes
+//! going to the HTTP response, on one long-lived worker thread: the endpoint,
+//! the buyer-pool store and the connections to nodes are built once per
+//! gateway run, and up to 16 pulls stream at once, so a response whose reader
+//! stops holds only its own pull.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -72,8 +77,12 @@ use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
 
-use super::fetch::{BlobFetch, Credential, Sink, fetch_into, resolve_chain};
+use super::fetch::{BlobFetch, Credential, resolve_chain};
 use crate::known_chains;
+
+mod worker;
+
+use worker::{FetchBackend, Job, PullWorker};
 
 /// The request header carrying the gateway token.
 pub const TOKEN_HEADER: &str = "x-decdn-token";
@@ -97,8 +106,13 @@ const MAX_PAGE_DELEGATES: usize = 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// A gateway pull that makes no verified progress for this long gives up, so
-/// a stuck request does not hold the one pull slot.
+/// a stuck request does not hold its pull slot.
 const GIVE_UP_AFTER_SECS: u64 = 120;
+
+/// The most pulls that run at once; a request past it waits for a slot. Each
+/// pull stripes across up to `--max-sources` holders, so this also bounds the
+/// streams the gateway opens on one node's connection.
+const MAX_PULLS: usize = 16;
 
 /// The largest bundle manifest the gateway reads into memory.
 const MAX_MANIFEST_BYTES: usize = 64 << 20;
@@ -149,34 +163,50 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     private_dir(store_dir.path())?;
     common.data_dir = Some(store_dir.path().to_path_buf());
 
+    let listener = TcpListener::bind(args.listen)
+        .await
+        .with_context(|| format!("listen on {}", args.listen))?;
+    let pulls = PullWorker::start(
+        FetchBackend {
+            common: common.clone(),
+            config_path: config_path.map(Path::to_path_buf),
+        },
+        MAX_PULLS,
+    )
+    .await
+    .context("start the gateway's pull worker")?;
     let gateway = Arc::new(Gateway {
         common,
-        config_path: config_path.map(Path::to_path_buf),
         token,
         domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
         delegates: Mutex::new(HashMap::new()),
-        pull: Arc::new(Mutex::new(())),
+        pulls,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts(args.listen),
     });
 
-    let listener = TcpListener::bind(args.listen)
-        .await
-        .with_context(|| format!("listen on {}", args.listen))?;
     println!(
         "decdn gateway on http://{}/ (Ctrl-C to stop)\ngateway token: {} (also in {})",
         args.listen,
         gateway.token,
         root.join("token").display()
     );
+    let served = serve(&gateway, &listener).await;
+    // The worker's queued lane writes land before the store dir is removed.
+    gateway.pulls.stop().await;
+    served
+}
+
+/// Accept connections on `listener` until Ctrl-C.
+async fn serve(gateway: &Arc<Gateway>, listener: &TcpListener) -> anyhow::Result<()> {
     loop {
         let (stream, _) = tokio::select! {
             accepted = listener.accept() => accepted.context("accept a connection")?,
             _ = tokio::signal::ctrl_c() => return Ok(()),
         };
-        let gateway = Arc::clone(&gateway);
+        let gateway = Arc::clone(gateway);
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let gateway = Arc::clone(&gateway);
@@ -553,15 +583,14 @@ struct RegisterRequest {
 
 struct Gateway {
     common: ClientFetchArgs,
-    config_path: Option<PathBuf>,
     token: String,
     /// The chain a registered capability's pool must live on.
     chain: ChainConfig,
     /// The EIP-712 domain a capability's owner signs under.
     domain: Eip712Domain,
     delegates: Mutex<HashMap<Address, Delegate>>,
-    /// One pull at a time: every pull opens the one buyer-pool store.
-    pull: Arc<Mutex<()>>,
+    /// Runs every pull, on one endpoint and one buyer-pool store.
+    pulls: PullWorker,
     manifests: std::sync::Mutex<ManifestCache>,
     /// Held while a missing manifest is pulled, so concurrent requests for it
     /// pull and pay once. Cache hits never wait on it.
@@ -1101,51 +1130,32 @@ impl Gateway {
             .map_err(|e| PullError::Other(e.into()))
     }
 
-    /// Start the pull of `hash` on its own thread, holding the pull slot until
-    /// it ends, and wait for its first verified bytes.
+    /// Hand the pull of `hash` to the worker, and wait for its first verified
+    /// bytes. The pull writes into a pipe the response reads from.
     async fn start_pull(
         self: &Arc<Self>,
         hash: [u8; 32],
         namespace: Option<u64>,
         paying: &Paying,
     ) -> Result<(Bytes, DuplexStream, oneshot::Receiver<anyhow::Result<()>>), PullError> {
-        let args = BlobFetch {
-            hash,
-            output: PathBuf::from("-"),
-            namespace,
-            common: self.common.clone(),
-        };
-        let credential = Credential {
-            signer: Arc::clone(&paying.signer),
-            grant: paying.grant.clone(),
-        };
-        let config_path = self.config_path.clone();
-        let slot = Arc::clone(&self.pull).lock_owned().await;
         let (writer, mut reader) = tokio::io::duplex(PIPE_BYTES);
         let (done_tx, done_rx) = oneshot::channel();
-        // The fetch future is not `Send`, so it runs on a thread of its own
-        // with a current-thread runtime, and talks to the response through the
-        // duplex pipe.
-        std::thread::Builder::new()
-            .name("decdn-gateway-pull".to_owned())
-            .spawn(move || {
-                let _slot = slot;
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(anyhow::Error::from)
-                    .and_then(|runtime| {
-                        let mut sink = Sink::Writer(Box::new(writer));
-                        runtime.block_on(fetch_into(
-                            &args,
-                            config_path.as_deref(),
-                            &mut sink,
-                            Some(credential),
-                        ))
-                    });
-                let _ = done_tx.send(result);
+        self.pulls
+            .pull(Job {
+                blob: BlobFetch {
+                    hash,
+                    output: PathBuf::from("-"),
+                    namespace,
+                    common: self.common.clone(),
+                },
+                paying: Credential {
+                    signer: Arc::clone(&paying.signer),
+                    grant: paying.grant.clone(),
+                },
+                writer,
+                done: done_tx,
             })
-            .map_err(|e| PullError::Other(e.into()))?;
+            .map_err(PullError::Other)?;
         let (first, done_rx) = first_chunk(&mut reader, done_rx).await?;
         Ok((first, reader, done_rx))
     }
