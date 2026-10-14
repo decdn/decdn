@@ -7442,7 +7442,7 @@ dependencies = [
 
 [[package]]
 name = "sponsord"
-version = "0.0.4"
+version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -7467,7 +7467,7 @@ dependencies = [
 
 [[package]]
 name = "sponsord-api"
-version = "0.0.4"
+version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "anyhow",
@@ -7485,7 +7485,7 @@ dependencies = [
 
 [[package]]
 name = "sponsord-core"
-version = "0.0.4"
+version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -7504,7 +7504,7 @@ dependencies = [
 
 [[package]]
 name = "sponsord-e2e"
-version = "0.0.4"
+version = "0.1.0"
 dependencies = [
  "alloy",
  "axum",
@@ -7525,7 +7525,7 @@ dependencies = [
 
 [[package]]
 name = "sponsord-onramp"
-version = "0.0.4"
+version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "anyhow",

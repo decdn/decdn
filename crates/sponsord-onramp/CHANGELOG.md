@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-14
+
 ### Changed (BREAKING)
 
 - **`decdn.sh` and `decdn.ps1` take `get <decdn: URI>` and run `decdn get`
