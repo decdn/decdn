@@ -82,23 +82,99 @@ const CHUNK_BYTES: u64 = 1024;
 /// A `String` message rather than `anyhow::Error` because the outcome must be
 /// `Clone` (every observer reads it) and `anyhow::Error` is not.
 #[derive(Debug, Clone)]
-pub struct FillError(String);
+pub struct FillError {
+    msg: String,
+    held_bytes_cap: bool,
+}
 
 impl FillError {
     /// Wrap a flattened terminal message.
     #[must_use]
     pub fn new(msg: impl Into<String>) -> Self {
-        Self(msg.into())
+        Self {
+            msg: msg.into(),
+            held_bytes_cap: false,
+        }
+    }
+
+    /// A fill that ended because storing more of its range would push the
+    /// bytes this node holds for the blob past its `max_blob_size` cap. The
+    /// node serves what it holds and refuses the rest, so a serve that reads
+    /// past it ends as a refusal, not as a node fault.
+    #[must_use]
+    pub fn held_bytes_cap(msg: impl Into<String>) -> Self {
+        Self {
+            msg: msg.into(),
+            held_bytes_cap: true,
+        }
+    }
+
+    /// Whether the fill ended at the cap on bytes held ([`Self::held_bytes_cap`]).
+    #[must_use]
+    pub const fn is_held_bytes_cap(&self) -> bool {
+        self.held_bytes_cap
+    }
+
+    /// The I/O error a serve read raises for bytes this ended fill did not
+    /// land, prefixed by `context`. The fill's error stays in the error's
+    /// source chain, so [`ended_at_held_bytes_cap`] finds it.
+    #[must_use]
+    pub fn unlanded(&self, context: impl Into<String>) -> io::Error {
+        io::Error::other(Unlanded {
+            context: context.into(),
+            cause: self.clone(),
+        })
     }
 }
 
 impl std::fmt::Display for FillError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.msg)
     }
 }
 
 impl std::error::Error for FillError {}
+
+/// A serve read of bytes an ended fill did not land ([`FillError::unlanded`]).
+#[derive(Debug)]
+struct Unlanded {
+    context: String,
+    cause: FillError,
+}
+
+impl std::fmt::Display for Unlanded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.context, self.cause)
+    }
+}
+
+impl std::error::Error for Unlanded {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// Whether `err` or an error in its source chain, including the payload of an
+/// [`io::Error`], is a fill that ended at the cap on bytes held
+/// ([`FillError::held_bytes_cap`]).
+#[must_use]
+pub fn ended_at_held_bytes_cap(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(err);
+    while let Some(e) = next {
+        if e.downcast_ref::<FillError>()
+            .is_some_and(FillError::is_held_bytes_cap)
+        {
+            return true;
+        }
+        if let Some(payload) = e.downcast_ref::<io::Error>().and_then(io::Error::get_ref)
+            && ended_at_held_bytes_cap(payload)
+        {
+            return true;
+        }
+        next = e.source();
+    }
+    false
+}
 
 /// The pre-order outboard buffer + a per-node "captured" flag. Guarded together;
 /// the lock is never held across an await.
@@ -986,8 +1062,8 @@ impl SessionOutboardReader {
     /// generic one when the covering fills were siblings.
     fn dead_range_error(&self, node: TreeNode) -> io::Error {
         match self.session.outcome() {
-            Some(Err(msg)) => io::Error::other(format!(
-                "upstream pull failed before supplying outboard node {node:?}: {msg}"
+            Some(Err(msg)) => msg.unlanded(format!(
+                "upstream pull failed before supplying outboard node {node:?}"
             )),
             Some(Ok(())) => io::Error::other(format!(
                 "upstream pull completed but outboard node {node:?} was never captured"

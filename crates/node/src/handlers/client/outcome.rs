@@ -105,6 +105,10 @@ pub(super) enum ServeStop {
     Takedown,
     /// The payer spent its per-chunk proof budget without settling the chunk.
     ProofBudgetExhausted,
+    /// The pull-through fill ended at this node's cap on bytes held for the
+    /// blob (`max_blob_size`), so the rest of the range cannot land here. The
+    /// node sends a `Declined` refusal, and the requester asks another node.
+    BlobTooLarge,
 }
 
 impl ServeStop {
@@ -116,6 +120,7 @@ impl ServeStop {
             Self::SignerCapExhausted => "signer_cap_exhausted",
             Self::Takedown => "takedown",
             Self::ProofBudgetExhausted => "proof_budget_exhausted",
+            Self::BlobTooLarge => "blob_too_large",
         }
     }
 }
@@ -146,6 +151,7 @@ impl ServeEnd {
                 }
                 ServeStop::Takedown => metrics.serve_stream_terminated_takedown(),
                 ServeStop::ProofBudgetExhausted => metrics.serve_stream_proof_budget_exhausted(),
+                ServeStop::BlobTooLarge => metrics.serve_stream_midstream_blob_too_large(),
             },
             Self::Reset(cause) => match cause {
                 ResetCause::StreamCapFull => metrics.serve_stream_rejected_stream_cap_full(),

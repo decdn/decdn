@@ -69,10 +69,10 @@ fn the_predicted_leg_cuts_the_request_like_the_first_drive_leg() {
         short.predicted_leg(total, &full, 0),
         align_range(CHUNK_GROUP_BYTES, 3 * CHUNK_GROUP_BYTES, total).ok()
     );
-    // The received-byte ceiling caps the draw one group past it.
+    // The cap on bytes held cuts the draw to the cap's worth.
     assert_eq!(
         prime.predicted_leg(total, &full, CHUNK_GROUP_BYTES),
-        align_range(0, 2 * CHUNK_GROUP_BYTES, total).ok()
+        align_range(0, CHUNK_GROUP_BYTES, total).ok()
     );
     // An open ramp is cut to the source's covered span.
     let open = PrimeLeg::new(0, 0, 0, PULL_WINDOW_FLOOR, 4 * DISCOVERY_BLOCK_BYTES, 0);
@@ -104,7 +104,7 @@ async fn the_predicted_leg_is_the_first_runs_first_leg() {
     let head = Coverage::from_block_indices(blocks, [0].into_iter());
     let group = CHUNK_GROUP_BYTES;
     let floor = PULL_WINDOW_FLOOR;
-    // (offset, len, divisor, credit_max, received-byte ceiling, coverages)
+    // (offset, len, divisor, credit_max, cap on bytes held, coverages)
     let cases: Vec<(u64, u64, u64, u64, u64, Vec<Coverage>)> = vec![
         (0, 0, 2, 64 * MIB, 0, vec![full.clone()]),
         (group + 5, 3 * group, 2, 64 * MIB, 0, vec![full.clone()]),

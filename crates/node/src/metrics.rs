@@ -90,6 +90,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_request_unreadable_total",
     "decdn_serve_stream_midstream_pool_exhausted_total",
     "decdn_serve_stream_midstream_signer_cap_exhausted_total",
+    "decdn_serve_stream_midstream_blob_too_large_total",
     "decdn_serve_stream_terminated_takedown_total",
     "decdn_serve_stream_voucher_rejected_total",
     "decdn_serve_stream_proof_budget_exhausted_total",
@@ -1184,9 +1185,9 @@ pub struct DecdnMetrics {
     /// with the two reverting counters above to tell "operator under-funded the
     /// wallet" from "the RPC endpoint is flaky".
     pub pool_open_failures_rpc_error: Counter,
-    /// `decdn_node_pull_too_large_total` (#840): the bytes received from a
-    /// selected upstream crossed this node's `max_blob_size` ceiling, so the buyer
-    /// aborted the pull (#1895). The upstream's `total_bytes` claim plays no part.
+    /// `decdn_node_pull_too_large_total` (#840): a pull from a selected upstream
+    /// ended at this node's `max_blob_size` cap on bytes held for one blob (#1895).
+    /// The upstream's `total_bytes` claim plays no part.
     /// Like a pool-open failure this is a buyer-side policy decision, NOT
     /// necessarily provider misbehavior (the provider may legitimately serve
     /// larger blobs to nodes with a higher ceiling), so it does not tar the
@@ -1765,6 +1766,15 @@ pub struct DecdnMetrics {
     /// as `Unfunded` from this node. Visible name:
     /// `decdn_serve_stream_midstream_signer_cap_exhausted_total`.
     pub serve_stream_midstream_signer_cap_exhausted: Counter,
+    /// A pull-through serve stopped MID-STREAM because its fill ended at this
+    /// node's cap on bytes held for one blob (`max_blob_size`, ADR 005
+    /// §`max_blob_size` enforcement): the node served the bytes that landed and
+    /// refuses the rest with a mid-stream `Declined`, so the requester asks
+    /// another node. The mid-stream twin of `serve_stream_rejected_blob_too_large`
+    /// (the open-time refusal of a node that already holds the cap's worth). A
+    /// rising value means clients ask this node for more of a blob than its cap
+    /// lets it hold. Visible name: `decdn_serve_stream_midstream_blob_too_large_total`.
+    pub serve_stream_midstream_blob_too_large: Counter,
     /// Delivery refused because ONE capability signer hit its per-signer live
     /// concurrency cap of un-vouchered reservation, while the pool itself can still
     /// pay (ADR 003 §Pool solvency, per-signer floor isolation).
@@ -1791,11 +1801,12 @@ pub struct DecdnMetrics {
     /// or nodes that disagree on a blob's size. Visible name:
     /// `decdn_serve_stream_rejected_range_not_satisfiable_total`.
     pub serve_stream_rejected_range_not_satisfiable: Counter,
-    /// Delivery refused because a pull-through request starts at or past this
-    /// node's `max_blob_size` ceiling (ADR 005 §`max_blob_size` enforcement).
-    /// The node refuses before it commits to the stream, so no byte is bought
-    /// upstream. Signed as `Declined`. A rising value means clients ask
-    /// this node for blobs above its ceiling. Visible name:
+    /// Delivery refused because a pull-through request needs a byte this node
+    /// lacks while it already holds its `max_blob_size` cap's worth of the blob
+    /// (ADR 005 §`max_blob_size` enforcement). The node refuses before it
+    /// commits to the stream, so no byte is bought upstream. Signed as
+    /// `Declined`. A rising value means clients ask this node for more of a
+    /// blob than its cap lets it hold. Visible name:
     /// `decdn_serve_stream_rejected_blob_too_large_total`.
     pub serve_stream_rejected_blob_too_large: Counter,
     /// Delivery refused because the blob is on this operator's local denylist
@@ -3131,9 +3142,9 @@ recorders! {
     /// A buyer pool open/reuse failed before a pull could start (#831).
     node_pull_pool_open_failure => node_pull_pool_open_failures.inc();
 
-    /// A selected upstream claimed a `total_bytes` above this node's
-    /// `max_blob_size` ceiling and the buyer rejected it before buffering
-    /// (#840). A buyer-side policy decision, so it does not score the provider.
+    /// A pull from a selected upstream ended at this node's `max_blob_size` cap
+    /// on bytes held for one blob (#840). A buyer-side policy decision, so it
+    /// does not score the provider.
     node_pull_too_large => node_pull_too_large.inc();
 
     /// A selected upstream quoted a per-MB rate above this node's effective buyer
@@ -3198,6 +3209,10 @@ recorders! {
     /// node holds on the lane no longer covers a serve floor.
     serve_stream_midstream_signer_cap_exhausted => serve_stream_midstream_signer_cap_exhausted.inc();
 
+    /// Record a pull-through serve stopped mid-stream with `Declined` because its
+    /// fill ended at this node's cap on bytes held for the blob.
+    serve_stream_midstream_blob_too_large => serve_stream_midstream_blob_too_large.inc();
+
     /// Record a `serve_stream` delivery refused because this capability signer hit its
     /// per-signer live concurrency cap of un-vouchered reservation, while the pool as a
     /// whole can still pay.
@@ -3212,8 +3227,8 @@ recorders! {
     serve_stream_rejected_range_not_satisfiable
         => serve_stream_rejected_range_not_satisfiable.inc();
 
-    /// Record a `serve_stream` pull-through refused because the requested range
-    /// starts at or past the node's `max_blob_size` ceiling (ADR 005
+    /// Record a `serve_stream` pull-through refused because the node already
+    /// holds its `max_blob_size` cap's worth of the blob (ADR 005
     /// §`max_blob_size` enforcement).
     serve_stream_rejected_blob_too_large => serve_stream_rejected_blob_too_large.inc();
 

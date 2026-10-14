@@ -771,8 +771,9 @@ async fn a_not_found_bar_ends_after_its_time_and_the_count_restarts() {
     assert!(set.no_pull_through(A), "barred again");
 }
 
-/// A size-ceiling bar on a partial holder stays for the blob: neither an
-/// uncovered byte nor a rediscovery with wider coverage lifts it.
+/// A held-bytes cap bar on a partial holder stays for the blob: neither an
+/// uncovered byte nor a rediscovery with wider coverage lifts it. Wider
+/// coverage means the holder holds more of the blob, never less.
 #[tokio::test(start_paused = true)]
 async fn a_size_ceiling_bar_survives_pull_through_and_wider_coverage() {
     let p = provider(vec![]);
@@ -1010,7 +1011,7 @@ async fn a_proxy_refusing_the_blob_as_too_large_is_excluded() -> anyhow::Result<
     Ok(())
 }
 
-/// A node applies its size ceiling only to a pull-through. So a partial
+/// A node applies its cap on bytes held only to a pull-through. So a partial
 /// holder that refuses the blob as too large is barred from pull-through
 /// only: once its cooldown ends it starts again for the blocks it covers.
 /// A whole holder that refuses it never starts again.

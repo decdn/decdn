@@ -235,6 +235,19 @@ pub(crate) fn grown_bound(bound: u64, c0: u64, extra: u64) -> u64 {
     want.div_ceil(SEED).saturating_mul(SEED)
 }
 
+/// The furthest a size claim can usefully reach for `ranges` under a cap of
+/// `cap` bytes held (`0` is no cap, and reaches `u64::MAX`): the furthest
+/// range start plus the cap. A store that holds no more than the cap holds no
+/// byte past it, so a claim beyond it sizes no work or coverage bitmap. A
+/// whole-blob fetch, from offset `0`, reaches the cap itself.
+pub(crate) fn claim_reach(ranges: &[(u64, u64)], cap: u64) -> u64 {
+    if cap == 0 {
+        return u64::MAX;
+    }
+    let furthest = ranges.iter().map(|&(start, _)| start).max().unwrap_or(0);
+    furthest.saturating_add(cap)
+}
+
 /// The end of the blob as the fetch knows it: the proven size, or with none
 /// proven the smaller of the first claim `c0` and the store's bound. A piece
 /// that starts at or past it can lie past the true end.
@@ -361,10 +374,12 @@ pub struct AcquireEnv<'a, Pc, F> {
     /// Bounds every lane to a read-ahead window ahead of a live consumer, or
     /// `None` for the eager fetch. See [`ConsumptionPacing`].
     pub pacing: Option<&'a ConsumptionPacing<'a>>,
-    /// The largest blob the caller accepts, in bytes, or `0` for no cap. A
-    /// size claim above it is clamped to it before any work is sized, and the
-    /// bound never grows past it: a blob that holds bytes past it ends the
-    /// acquire with [`crate::BlobTooLarge`].
+    /// The most bytes of the blob the caller holds, or `0` for no cap. The cap
+    /// bounds the bytes the store holds, not the offsets fetched: a range
+    /// anywhere in a larger blob is fetched while the bytes held fit. A size
+    /// claim is clamped to the furthest range start plus the cap before any
+    /// work is sized, and the bound never grows past that. Ranges that would
+    /// hold more than the cap end the acquire with [`crate::BlobTooLarge`].
     pub max_blob_bytes: u64,
     /// What the caller's run still needs, or `None` when this acquire is
     /// the whole run. A delegated fetch prices the running-low signal on the
@@ -3358,23 +3373,18 @@ where
         ranges,
     } = target;
     let health = Arc::clone(sources.health());
-    // A claim is peer- or manifest-controlled: clamp it to the caller's cap
-    // before it sizes any work or coverage bitmap.
+    // A claim is peer- or manifest-controlled: clamp it to the furthest the
+    // cap on held bytes lets the ranges reach before it sizes any work or
+    // coverage bitmap. A proven size stands: it is verified.
     let cap = env.max_blob_bytes;
-    let capped = |size: u64| if cap > 0 { size.min(cap) } else { size };
+    let reach = claim_reach(ranges, cap);
+    let capped = |size: u64| size.min(reach);
     let c0 = capped(c0);
-    if cap > 0 && store.total_bytes() > cap {
-        store.set_bound(cap);
+    if store.total_bytes() > reach {
+        store.set_bound(reach);
     }
     // A resumed record's bound wins over the caller's hint.
     let first_bound = store.total_bytes();
-    if cap > 0 && first_bound > cap {
-        // Only a proven size is past the cap after the clamp above.
-        return Err(anyhow::Error::new(crate::BlobTooLarge {
-            reached: first_bound,
-            ceiling: cap,
-        }));
-    }
     let mut want = Want::new(ranges, first_bound, c0);
     let mut pending = VecDeque::new();
     for (start, len) in
@@ -3563,14 +3573,17 @@ where
                 && extras_running == 0
                 && all_present(store, &want.ranges, &work).await?
             {
-                if let Some(proven) = store.proven()
-                    && cap > 0
-                    && proven > cap
-                {
-                    // A cap off the chunk-group grid lets a leg that ends at
-                    // it prove a size up to one group past it.
+                // The bytes the store holds for the blob. A leg widens to whole
+                // chunk groups, so a cap off the grid can be passed by up to
+                // one group.
+                let held = if cap > 0 {
+                    ranges_content_len(&store.present_ranges().await?, bound)
+                } else {
+                    0
+                };
+                if cap > 0 && held > cap {
                     let too_large = crate::BlobTooLarge {
-                        reached: proven,
+                        reached: held,
                         ceiling: cap,
                     };
                     return Err(anyhow::Error::new(too_large));
@@ -3593,11 +3606,12 @@ where
                 }
                 // Every byte below the bound is present and no leg proved a
                 // size: the claim was short. Grow and plan the new region, but
-                // never past the cap: a bound already at the cap with no proof
-                // means the blob holds bytes past it.
-                if cap > 0 && bound >= cap {
+                // never past the cap: a store already holding the cap's worth,
+                // or a bound at the claim's reach, with no proof means the blob
+                // holds bytes the store cannot take.
+                if cap > 0 && (held >= cap || bound >= reach) {
                     let too_large = crate::BlobTooLarge {
-                        reached: bound.saturating_add(1),
+                        reached: held.saturating_add(1),
                         ceiling: cap,
                     };
                     return Err(anyhow::Error::new(too_large));
@@ -3985,7 +3999,7 @@ where
                         // still runs, and it asks for no growth at once: the
                         // lane waits, from `GROWTH_RETRY` and doubling up to
                         // `EXTRA_RETRY_CAP`, before it is asked again. A
-                        // `NotFound` or size-ceiling refusal of a range outside
+                        // `NotFound` or held-bytes cap refusal of a range outside
                         // the lane's coverage counts toward barring it from
                         // pull-through, as on its own stream. A lane's last
                         // live worker faults for the lane, so once the own

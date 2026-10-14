@@ -337,7 +337,8 @@ pub struct SourceSet<'p, P: SourceProvider> {
     pull_through_bars: HashMap<Address, u32>,
     /// Probed partial holders that refused a range outside their coverage
     /// `Declined` (ADR 005 §Open-time refusal classes), most often for their
-    /// size ceiling, which a node applies only to a pull-through. Neither a
+    /// cap on bytes held for the blob, which a node applies only to a
+    /// pull-through: it holds that much already, so it lands no more. Neither a
     /// verified byte nor a rediscovery lifts this bar for the fetch. Each one
     /// serves only the blocks it covers.
     declined_pull_through: HashSet<Address>,
@@ -815,8 +816,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// Record that `provider` declined this fetch for `reason`. A partial
-    /// holder's `Declined` refusal is most often its size ceiling, which a
-    /// node applies only when it pulls the blob through, so a partial holder
+    /// holder's `Declined` refusal is most often its cap on bytes held for the
+    /// blob, which a node applies only when it pulls the blob through, so a
+    /// partial holder
     /// is barred from pull-through only and keeps the blocks it covers. Any
     /// other source, and any source that rejected this client's voucher,
     /// never starts again for this blob in this fetch. Returns whether the
@@ -977,7 +979,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// Lift each `NotFound` bar from pull-through whose time ended by `now`,
     /// and restart its holder's count of refusals. The holder takes one
     /// uncovered range again as a probe; [`ABSENT_AFTER_NOT_FOUND`] more
-    /// refusals bar it again. A size-ceiling bar does not end. Each block
+    /// refusals bar it again. A held-bytes cap bar does not end. Each block
     /// dropped from a holder's coverage whose time ended returns to it the
     /// same way, with its count restarted.
     pub fn expire_pull_through_bars(&mut self, now: Instant) {

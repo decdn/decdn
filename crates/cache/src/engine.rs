@@ -827,6 +827,13 @@ impl PresentRanges {
     pub const fn size(&self) -> u64 {
         self.size
     }
+
+    /// The content bytes of the blob this node holds: the present ranges
+    /// counted against [`Self::size`]. `0` for an absent/evicted/refused hash.
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
+        present_byte_count(&self.ranges, self.size)
+    }
 }
 
 /// Bytes of a `size`-byte blob that `ranges` marks present.

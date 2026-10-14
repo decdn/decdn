@@ -10649,20 +10649,20 @@ async fn window_pull_through_leaf_drop_after_paying_is_a_serve_abandon() -> Resu
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
-async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Result<()> {
+async fn window_pull_through_oversized_upstream_stops_at_the_held_cap() -> Result<()> {
     // #1895: the fused serve does not refuse on the upstream's signed `total_bytes`
     // claim. B signs `ok: true`, opens the upstream pull, and forwards while filling —
-    // but the pull leg's receive loop enforces `max_blob_size_bytes` on the bytes that
-    // ACTUALLY arrive, so it ABORTS once cumulative received bytes cross the ceiling.
-    // The regression this guards: a claim-based refusal would let a holder inflate a
-    // small blob's size to make B (and every finite-ceiling relay) refuse to
-    // cache/serve while it monopolises the traffic; enforcing on received bytes makes
-    // the lie inert while still capping an honest giant. A forgotten tee release on
-    // the abort arm would strand the in-flight claim for the hash. We assert: the
-    // leaf's fetch fails (B aborted mid-serve), B's upstream spend stays bounded to
-    // roughly one ceiling (NOT the whole blob), nothing is promoted into B's cache,
-    // the too-large pull counter moves, and the aborted fill releases its tee claim so
-    // an identical retry is not wedged.
+    // but the pull leg meters `max_blob_size_bytes` on the bytes it stores for the
+    // blob, so the fill ENDS once no room is left under the cap, and the serve stops
+    // with a mid-stream `Declined`. The regression this guards: a claim-based refusal
+    // would let a holder inflate a small blob's size to make B (and every finite-cap
+    // relay) refuse to cache/serve while it monopolises the traffic; metering stored
+    // bytes makes the lie inert while still capping an honest giant. A forgotten tee
+    // release on the abort arm would strand the in-flight claim for the hash. We
+    // assert: the leaf's fetch fails (B stopped mid-serve), B's upstream spend stays
+    // bounded to the cap (NOT the whole blob), nothing is promoted into B's cache,
+    // the too-large pull counter moves, no node fault is counted, and the ended fill
+    // releases its tee claim so an identical retry is not wedged.
     let payload = vec![0xB1u8; 4 * 1024 * 1024];
     let hash = Hash::new(&payload);
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
@@ -10679,12 +10679,10 @@ async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Re
     // from zero and be refused as a regression rather than reach the ceiling.
     let retry_eth = Arc::new(PrivateKeySigner::random());
     let retry_pool_id = B256::repeat_byte(0x70);
-    // A two-interval ceiling, far below the 4 MiB blob, so the RECEIVED bytes cross
-    // it well before the whole blob is pulled. B pays only for verified bytes, one
-    // interval at a time, and the frame that crosses the ceiling aborts the pull
-    // before it is verified. Two intervals leave a whole interval verified, and so
-    // paid, before that frame. The deposit guard passes against the funded leaf, so
-    // we exercise the received-byte cap, not a deposit refusal.
+    // A two-interval cap, far below the 4 MiB blob, so B's stored bytes reach it
+    // well before the whole blob is pulled. B pays only for verified bytes, and the
+    // fill opens no leg past the cap. The deposit guard passes against the funded
+    // leaf, so we exercise the held-bytes cap, not a deposit refusal.
     let max_blob_size_bytes = 2 * CHUNK_BYTES;
     let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, b_operator) =
         build_node_b_with_leaves(
@@ -10756,13 +10754,15 @@ async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Re
         !cache_b.has(hash).await?,
         "an oversized-upstream abort must not promote the blob into B's cache"
     );
-    // B paid the upstream for the verified prefix — bounded to the ceiling's own
-    // wire, never the whole 4 MiB blob: the receive loop's received-byte ceiling
-    // aborts BEFORE the crossing frame is verified, so the speculative pull window
-    // cannot push the spend past it.
+    // B paid the upstream for the bytes it stored — bounded to the cap's own wire,
+    // never the whole 4 MiB blob: the fill opens no leg past the cap, so the
+    // speculative pull window cannot push the spend past it.
     let upstream_bytes: u64 = u64::try_from(settled).unwrap_or(u64::MAX);
     let bound_content = max_blob_size_bytes;
-    let bound_wire = support::bao_wire_len(total_bytes, 0, bound_content);
+    // Each leg carries its own proof path from the root, so the window's several
+    // legs pay a few proof pairs more than one leg over the same content would.
+    let proof_slack = 64 * 64;
+    let bound_wire = support::bao_wire_len(total_bytes, 0, bound_content) + proof_slack;
     anyhow::ensure!(
         upstream_bytes > 0,
         "B must pay the upstream for the bytes it actually received before aborting"
@@ -10774,9 +10774,15 @@ async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Re
     );
     assert_counter(&b_metrics, "node_pull_too_large_total", 1)?;
 
+    // B served the bytes that landed and stopped the stream with a clean `Declined`,
+    // never a node fault.
+    assert_counter(&b_metrics, "serve_stream_midstream_blob_too_large_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
+
     // The tee claim was released on the abort arm: an identical retry is not wedged on
-    // a stranded in-flight entry — it reaches the received-byte cap again and aborts
-    // identically (a leaked tee would instead hang/coalesce).
+    // a stranded in-flight entry. B already holds the cap's worth of the blob, so it
+    // refuses the retry `Declined` before it commits, and opens no new upstream pull
+    // (a leaked tee would instead hang/coalesce).
     let retry_sk = fresh_key();
     let retry_node_id = B256::from(*retry_sk.public().as_bytes());
     let (retry_ep, _) = local_endpoint(retry_sk, vec![]).await?;
@@ -10795,29 +10801,29 @@ async fn window_pull_through_oversized_upstream_aborts_on_received_bytes() -> Re
     .is_err();
     anyhow::ensure!(
         refused_again,
-        "a repeat request for the same hash must abort again, not wedge on a stranded tee claim"
+        "a repeat request for the same hash must be refused, not wedge on a stranded tee claim"
     );
-    assert_counter(&b_metrics, "node_pull_too_large_total", 2)?;
+    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_too_large_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
 
     shutdown([task_a, task_b], [&retry_ep, &leaf_ep, &ep_b, &ep_a]).await?;
     Ok(())
 }
 
 /// What a leaf's bounded pull through B's fused window path left behind, for the
-/// size-ceiling gate tests (#2256).
+/// held-bytes cap tests.
 struct CeilingRun {
     /// The leaf's decoded span, or the error it saw.
     leaf: Result<Vec<u8>>,
     /// B's metrics.
     b_metrics: Arc<Metrics>,
-    /// A's metrics: A serves every paid stream B opens upstream.
-    a_metrics: Arc<Metrics>,
     /// B's upstream voucher watermarks.
     upstream: Vec<ProgressEntry>,
 }
 
 /// Run one leaf pull of `[byte_offset, +byte_len)` for `payload` through a B whose
-/// buyer-side size ceiling is `ceiling`, then shut every node down.
+/// cap on the bytes it holds for one blob is `ceiling`, then shut every node down.
 async fn ranged_pull_under_ceiling(
     payload: &[u8],
     ceiling: u64,
@@ -10827,8 +10833,8 @@ async fn ranged_pull_under_ceiling(
     let hash = Hash::new(payload);
     let ab_pool_id = B256::repeat_byte(0xC7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
-    let (a_id, a_addr, a_eth, ep_a, task_a, a_metrics) =
-        spawn_node_a_metered(payload, ab_pool_id, b_buyer.address()).await?;
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(payload, ab_pool_id, b_buyer.address()).await?;
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_pool_id = B256::repeat_byte(0x7C);
@@ -10870,90 +10876,196 @@ async fn ranged_pull_under_ceiling(
     Ok(CeilingRun {
         leaf,
         b_metrics,
-        a_metrics,
         upstream,
     })
 }
 
-/// Assert `run` is a `Declined` size-ceiling refusal the leaf read before any byte, metered
-/// once on its own reason and never on the received-byte abort.
-async fn assert_refused_too_large(run: &CeilingRun) -> Result<()> {
-    let err = match &run.leaf {
-        Ok(got) => anyhow::bail!(
-            "an over-ceiling range must be refused, got {} bytes",
-            got.len()
-        ),
-        Err(e) => format!("{e:#}"),
-    };
-    anyhow::ensure!(
-        err.contains("delivery refused: Some(Declined)"),
-        "the leaf must read a signed Declined refusal, got: {err}"
-    );
-    assert_counter(
-        &run.b_metrics,
-        "serve_stream_rejected_blob_too_large_total",
-        1,
-    )?;
-    assert_counter(&run.b_metrics, "node_pull_too_large_total", 0)?;
-    support::assert_inbound_failures_attributed(&run.b_metrics, 1).await?;
-    anyhow::ensure!(
-        run.upstream.iter().all(|(_, amount, _)| amount.is_zero()),
-        "B must pay the upstream nothing for a range it refuses: {:?}",
-        run.upstream
-    );
-    Ok(())
-}
-
-/// A request that starts at B's size ceiling is refused `Declined` for its
-/// size ceiling before B commits (#2256). The gate reads the request's own offset, so B skips
-/// discovery and the upstream handshake: A serves no stream and B pays nothing.
-/// A start exactly AT the ceiling is already past it, as the client's resume
-/// guard draws the line.
+/// B's cap bounds the bytes it holds for a blob, not the offsets it serves: a
+/// range that starts past the cap's offset is pulled through and served while
+/// the bytes B holds stay within the cap. This is the testnet shape of a 30 GB
+/// blob read past 16 GiB on a node with a 16 GiB cap.
 #[tokio::test(flavor = "multi_thread")]
-async fn window_pull_through_offset_at_the_ceiling_is_refused_before_commit() -> Result<()> {
-    let payload = vec![0xC1u8; 256 * 1024];
-    let ceiling = 64 * 1024;
-    let run = ranged_pull_under_ceiling(&payload, ceiling, ceiling, 16 * 1024).await?;
-    assert_refused_too_large(&run).await?;
-    let a_served = counter_value(&run.a_metrics, "serve_cache_hit_total")?;
+async fn window_pull_through_past_the_cap_offset_is_served_while_held_bytes_fit() -> Result<()> {
+    let payload: Vec<u8> = (0..256 * 1024usize)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let cap = 64 * 1024;
+    let (offset, len) = (128 * 1024u64, 32 * 1024u64);
+    let run = ranged_pull_under_ceiling(&payload, cap, offset, len).await?;
+    let got = run
+        .leaf
+        .map_err(|e| anyhow::anyhow!("a range within the held-bytes cap must be served: {e:#}"))?;
+    let want = payload
+        .get(usize::try_from(offset)?..usize::try_from(offset + len)?)
+        .ok_or_else(|| anyhow::anyhow!("range out of bounds"))?;
     anyhow::ensure!(
-        a_served == 0,
-        "B must refuse before it opens any upstream stream: A served {a_served}"
-    );
-    Ok(())
-}
-
-/// A bounded request that starts below B's size ceiling and ends past it is not
-/// refused on its end: only the upstream's unverified total says where the blob
-/// ends, and #1895 forbids refusing on that. B commits, and the received-byte
-/// ceiling aborts the pull once it crosses (#2256).
-#[tokio::test(flavor = "multi_thread")]
-async fn window_pull_through_end_past_the_ceiling_commits_and_aborts_on_received_bytes()
--> Result<()> {
-    let payload = vec![0xC2u8; 256 * 1024];
-    let ceiling = 64 * 1024;
-    let run = ranged_pull_under_ceiling(&payload, ceiling, 32 * 1024, 64 * 1024).await?;
-    let err = match &run.leaf {
-        Ok(got) => anyhow::bail!(
-            "a range past the ceiling cannot complete, got {} bytes",
-            got.len()
-        ),
-        Err(e) => format!("{e:#}"),
-    };
-    anyhow::ensure!(
-        !err.contains("delivery refused"),
-        "B must commit to a range that starts below its ceiling, got: {err}"
+        got.as_slice() == want,
+        "the range must be served byte-exact"
     );
     assert_counter(
         &run.b_metrics,
         "serve_stream_rejected_blob_too_large_total",
         0,
     )?;
-    let aborts = counter_value(&run.b_metrics, "node_pull_too_large_total")?;
+    assert_counter(&run.b_metrics, "node_pull_too_large_total", 0)?;
+    assert_counter(&run.b_metrics, "serve_stream_node_fault_total", 0)?;
+    Ok(())
+}
+
+/// A range with more missing bytes than B's cap is served up to the cap, and
+/// then B stops the stream with a mid-stream `Declined`: a clean refusal the
+/// requester fails over on, counted on the size-cap reason and never as a
+/// node fault. B pays its upstream for no more than the cap's worth.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_over_the_held_cap_ends_declined_without_a_node_fault() -> Result<()> {
+    let payload = vec![0xC2u8; 256 * 1024];
+    let cap = 64 * 1024;
+    let run = ranged_pull_under_ceiling(&payload, cap, 32 * 1024, 128 * 1024).await?;
+    let err = match &run.leaf {
+        Ok(got) => anyhow::bail!(
+            "a range over the held-bytes cap cannot complete, got {} bytes",
+            got.len()
+        ),
+        Err(e) => format!("{e:#}"),
+    };
     anyhow::ensure!(
-        aborts >= 1,
-        "the received-byte ceiling must abort the pull, counted {aborts}"
+        err.contains("leaf saw stream error: Declined"),
+        "B must commit, then end the stream with a Declined refusal, got: {err}"
     );
+    assert_counter(
+        &run.b_metrics,
+        "serve_stream_midstream_blob_too_large_total",
+        1,
+    )?;
+    assert_counter(
+        &run.b_metrics,
+        "serve_stream_rejected_blob_too_large_total",
+        0,
+    )?;
+    assert_counter(&run.b_metrics, "serve_stream_node_fault_total", 0)?;
+    support::assert_inbound_failures_attributed(&run.b_metrics, 1).await?;
+    let aborts = counter_value(&run.b_metrics, "node_pull_too_large_total")?;
+    anyhow::ensure!(aborts >= 1, "the cap must end the pull, counted {aborts}");
+    let bound_wire = support::bao_wire_len(u64::try_from(payload.len())?, 32 * 1024, cap);
+    anyhow::ensure!(
+        run.upstream
+            .iter()
+            .all(|(_, bytes, _)| *bytes <= U256::from(bound_wire)),
+        "B's upstream spend must stay within the cap's wire ({bound_wire}): {:?}",
+        run.upstream
+    );
+    Ok(())
+}
+
+/// A B that already holds its cap's worth of a blob refuses a request for a
+/// byte it lacks `Declined` before it commits: its own store says the pull
+/// could not land, so it opens no upstream stream and pays nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_with_the_cap_already_held_is_refused_before_commit() -> Result<()> {
+    let payload: Vec<u8> = (0..256 * 1024usize)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let hash = Hash::new(&payload);
+    let cap = 64 * 1024u64;
+    let ab_pool_id = B256::repeat_byte(0xC8);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a, a_metrics) =
+        spawn_node_a_metered(&payload, ab_pool_id, b_buyer.address()).await?;
+    let first_eth = Arc::new(PrivateKeySigner::random());
+    let first_pool = B256::repeat_byte(0x7D);
+    let second_eth = Arc::new(PrivateKeySigner::random());
+    let second_pool = B256::repeat_byte(0x7E);
+    let (handler_b, b_target, ep_b, recorded, _cache_b, b_metrics, _local_rep, b_operator) =
+        build_node_b_with_leaves(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_pool_id,
+            &b_buyer,
+            &[
+                (
+                    first_pool,
+                    first_eth.address(),
+                    first_eth.address(),
+                    U256::from(DEPOSIT_MICRO_USDC),
+                ),
+                (
+                    second_pool,
+                    second_eth.address(),
+                    second_eth.address(),
+                    U256::from(DEPOSIT_MICRO_USDC),
+                ),
+            ],
+            cap,
+            64,
+            None,
+            DEFAULT_TEST_PULL_DEADLINES,
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    // The first leaf fills B with exactly the cap's worth.
+    let first_sk = fresh_key();
+    let first_id = B256::from(*first_sk.public().as_bytes());
+    let (first_ep, _) = local_endpoint(first_sk, vec![]).await?;
+    let got = leaf_ranged_paid_pull(
+        &first_ep,
+        b_target.clone(),
+        first_id,
+        &first_eth,
+        b_operator,
+        first_pool,
+        hash,
+        0,
+        cap,
+        RATE,
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_slice() == payload.get(..usize::try_from(cap)?).unwrap_or_default(),
+        "the first range fits the cap and is served"
+    );
+    let a_streams = counter_value(&a_metrics, "serve_cache_hit_total")?;
+    let paid_before = progress_log(&recorded)?.len();
+
+    // The second asks for bytes past them: B's held bytes leave no room.
+    let second_sk = fresh_key();
+    let second_id = B256::from(*second_sk.public().as_bytes());
+    let (second_ep, _) = local_endpoint(second_sk, vec![]).await?;
+    let refused = leaf_ranged_paid_pull(
+        &second_ep,
+        b_target,
+        second_id,
+        &second_eth,
+        b_operator,
+        second_pool,
+        hash,
+        128 * 1024,
+        16 * 1024,
+        RATE,
+    )
+    .await;
+    let err = match refused {
+        Ok(got) => anyhow::bail!("a full cap must refuse, got {} bytes", got.len()),
+        Err(e) => format!("{e:#}"),
+    };
+    anyhow::ensure!(
+        err.contains("delivery refused: Some(Declined)"),
+        "the leaf must read a signed Declined refusal, got: {err}"
+    );
+    assert_counter(&b_metrics, "serve_stream_rejected_blob_too_large_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
+    anyhow::ensure!(
+        counter_value(&a_metrics, "serve_cache_hit_total")? == a_streams,
+        "B must refuse before it opens another upstream stream"
+    );
+    anyhow::ensure!(
+        progress_log(&recorded)?.len() == paid_before,
+        "B must pay the upstream nothing for the refused range"
+    );
+
+    shutdown([task_a, task_b], [&second_ep, &first_ep, &ep_b, &ep_a]).await?;
     Ok(())
 }
 

@@ -67,7 +67,7 @@ pub use error::{
 };
 pub use fill_session::{
     Demand, DemandSlot, DownstreamWatch, FillClaim, FillError, FillRegistry, FillSession, Frontier,
-    HashOutboard, ObserverLease, SessionOutboardReader,
+    HashOutboard, ObserverLease, SessionOutboardReader, ended_at_held_bytes_cap,
 };
 /// The blob-store hash: `decdn_cache::Hash` is `iroh_blobs::Hash`, the BLAKE3
 /// digest the iroh-blobs store keys on. The *config-vocabulary* hash that crosses

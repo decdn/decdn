@@ -182,8 +182,8 @@ impl PrimeLeg {
     /// `total_bytes` long, or `None` when the source does not cover the pull's
     /// first block. The run is the source's contiguous covered span from that
     /// block, cut to the request; the leg is the run cut to the window and to
-    /// the received-byte ceiling `max_blob_size_bytes` (`0` = none), as
-    /// [`decdn_client::first_leg`] cuts it.
+    /// the cap on held bytes `max_blob_size_bytes` (`0` = none), as
+    /// [`decdn_client::first_leg`] cuts it for a store holding none of the blob.
     fn predicted_leg(
         &self,
         total_bytes: u64,
@@ -219,8 +219,8 @@ impl PrimeLeg {
             .min(request_end);
         let mut draw = (span_end - start).min(self.window);
         if max_blob_size_bytes > 0 {
-            let cap_end = max_blob_size_bytes.saturating_add(CHUNK_GROUP_BYTES);
-            draw = draw.min(cap_end.saturating_sub(start));
+            // The node holds none of the range, so the cap's whole worth is room.
+            draw = draw.min(max_blob_size_bytes);
         }
         align_range(start, draw, total_bytes).ok()
     }
@@ -1654,7 +1654,11 @@ impl PeerRunSink<'_> {
                         &err,
                     );
                 }
-                if ends_the_assembly(&err) {
+                if err.downcast_ref::<decdn_client::BlobTooLarge>().is_some() {
+                    // This node's cap on bytes held: the serve leg delivers what
+                    // landed and refuses the rest.
+                    RunOutcome::Terminal(FillError::held_bytes_cap(format!("{err:#}")))
+                } else if ends_the_assembly(&err) {
                     RunOutcome::Terminal(FillError::new(format!("{err:#}")))
                 } else if classify(&err) == Fault::Unaffordable {
                     RunOutcome::Unfunded

@@ -418,10 +418,12 @@ pub struct NodeOriginConfig {
     /// Minimum sustained upstream throughput (bytes/sec) over [`Self::stall_window`]; `0`
     /// disables the throughput test and leaves idle detection (#1797).
     pub min_throughput_bps: u64,
-    /// Buyer-side blob-size ceiling (`cache.max_blob_size_mb` × MB), `0` = unlimited.
-    /// Enforced on the bytes that ACTUALLY arrive on the miss-pull leg, never on the
-    /// peer's unverified `total_bytes` claim: the pull aborts with `BlobTooLarge`
-    /// once cumulative received bytes cross it (#1895).
+    /// Buyer-side cap on the bytes this node holds for one blob
+    /// (`cache.max_blob_size_mb` × MB), `0` = unlimited. It bounds bytes held, not
+    /// offsets served: the miss-pull leg lands a range anywhere in a larger blob
+    /// while the bytes held fit, and ends with `BlobTooLarge` once a missing byte
+    /// could only land past the cap. Metered on the bytes that ACTUALLY arrive and
+    /// are stored, never on the peer's unverified `total_bytes` claim (#1895).
     pub max_blob_size_bytes: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling (`cache.max_rate_per_mb`), `0` =
     /// unlimited (#1375). Combined via [`effective_rate_ceiling`] with the
@@ -799,7 +801,7 @@ impl NodeOrigin {
         })
     }
 
-    /// The buyer-side blob-size ceiling in bytes
+    /// The buyer-side cap on bytes held for one blob
     /// ([`NodeOriginConfig::max_blob_size_bytes`]). `0` means unlimited, and an
     /// unprovisioned origin reads as unlimited.
     pub(crate) fn max_blob_size_bytes(&self) -> u64 {
@@ -2689,9 +2691,9 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
 /// means "which arm does this error land in?" is a question a test can just ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullVerdict {
-    /// The bytes that actually arrived crossed OUR configured ceiling (#1895) — the
-    /// blob may be fine for other nodes with a wider cap. The peer's `total_bytes`
-    /// claim never triggers this; only received bytes do.
+    /// The pull ended at OUR cap on bytes held for one blob (#1895) — the blob may
+    /// be fine for other nodes with a wider cap. The peer's `total_bytes` claim
+    /// never triggers this; only bytes received and stored do.
     Oversize,
     /// The provider quoted a per-MB rate above the buyer's effective ceiling — the lower
     /// of its own probe rate and our configured absolute cap (#1375). We refused before
@@ -3152,11 +3154,11 @@ fn classify_pull_failure(
     match verdict {
         // OUR ceiling, not the provider's fault — it may legitimately serve larger blobs to
         // nodes configured with a higher `max_blob_size`. Metered, not scored (#1895). The
-        // abort fires once the RECEIVED bytes cross the ceiling, so we paid the upstream for
-        // the prefix we took (bounded to roughly one ceiling), never for the peer's claim.
+        // pull ends once no room is left under the cap on bytes held, so we paid the
+        // upstream for at most the cap's worth, never for the peer's claim.
         PullVerdict::Oversize => {
             deps.metrics.node_pull_too_large();
-            debug!(%provider_addr, error = %err, "node-origin: upstream blob crossed our size ceiling on received bytes; pull aborted");
+            debug!(%provider_addr, error = %err, "node-origin: pull ended at our cap on bytes held for the blob");
         }
         // The provider quoted above our effective rate ceiling (#1375). We refused before
         // paying; the signed over-quote is retained ON the `RateAboveCeiling` error for a

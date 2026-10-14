@@ -7188,16 +7188,16 @@ fn sign_binding_for(signer: &PrivateKeySigner, client_node_id: B256) -> anyhow::
 /// *claimed* `total_bytes` — the claim is peer-controlled and unverified
 /// (`StreamResponse::validate()` does not bound it). Instead it enters the receive
 /// loop and aborts with `BlobTooLarge` once the cumulative RECEIVED bytes cross
-/// `max_blob_size_bytes`. Here the whole 8 KiB blob crosses a 4 KiB ceiling inside
-/// a single sub-interval frame, so the cap trips before the first 1 MiB payment
-/// boundary: the buyer aborts having paid nothing, but only because no voucher
-/// interval elapsed — not because it pre-judged the claim.
+/// the wire of `max_blob_size_bytes` of content. The bound is whole 16 KiB chunk
+/// groups, so here a 64 KiB blob crosses a one-group cap well inside the first
+/// 1 MiB payment interval: the buyer aborts having paid nothing, but only because
+/// no voucher interval elapsed — not because it pre-judged the claim.
 #[tokio::test(flavor = "multi_thread")]
 async fn buyer_aborts_oversized_small_blob_without_paying() -> anyhow::Result<()> {
-    let payload = vec![0x5Au8; 8192];
+    let payload = vec![0x5Au8; 64 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    // The server has no size ceiling — it honestly serves all 8192 bytes; the
+    // The server has no size ceiling — it honestly serves all 64 KiB; the
     // ceiling under test is the buyer's received-byte cap.
     let (target, server_eth, server_ep, server_task) =
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
@@ -7205,8 +7205,8 @@ async fn buyer_aborts_oversized_small_blob_without_paying() -> anyhow::Result<()
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = pool_context(&client_ep, signer, deposit);
     let mut progress = VoucherProgress::default();
-    // Buyer ceiling 4096 < the 8192 bytes that actually arrive → the received
-    // bytes trip the cap.
+    // Buyer cap of one 16 KiB group < the 64 KiB that actually arrive → the
+    // received bytes trip the cap.
     let err = stream_fetch_tracked(
         &client_ep,
         target,
@@ -7218,7 +7218,7 @@ async fn buyer_aborts_oversized_small_blob_without_paying() -> anyhow::Result<()
         0,
         0x00c1,
         PullDeadlines::whole_transfer(Duration::from_secs(10)),
-        4096,
+        16 * 1024,
         0,
         &mut progress,
     )
@@ -7529,15 +7529,16 @@ async fn a_pull_stopped_at_a_split_pays_what_it_verified_and_the_lane_pulls_on()
     Ok(())
 }
 
-/// The received-byte ceiling on a GAP-scoped leg (`byte_len > 0`), the shape the
-/// gap-driven driver opens through `PeerSource`. The bound is anchored at the
-/// leg's own offset and measured against a ceiling-sized tree, so (a) a leg
-/// entirely under the ceiling completes even though the blob's signed
-/// `total_bytes` exceeds it — the claim never drives a refusal (#1895) — and (b)
-/// the leg that crosses the ceiling aborts with [`BlobTooLarge`] having paid
-/// nothing: it verifies less than one metering interval before the abort.
+/// The per-stream bound on a GAP-scoped leg (`byte_len > 0`), the shape the
+/// gap-driven driver opens through `PeerSource`. One stream carries at most the
+/// cap's worth of content from its own offset, so (a) a leg that starts past the
+/// cap's offset completes when its own span fits the cap — the cap bounds the
+/// bytes held, not the offsets read, and the blob's signed `total_bytes` above
+/// the cap never drives a refusal (#1895) — and (b) a leg whose span holds more
+/// than the cap aborts with [`BlobTooLarge`] once the received bytes cross the
+/// cap's wire from its offset, having paid for no byte past it.
 #[tokio::test(flavor = "multi_thread")]
-async fn gap_scoped_leg_enforces_the_received_byte_ceiling_from_its_own_offset()
+async fn gap_scoped_leg_bounds_its_received_bytes_by_the_cap_from_its_own_offset()
 -> anyhow::Result<()> {
     use decdn_client::PeerSource;
     use decdn_client::sink::StashedFault as _;
@@ -7553,7 +7554,8 @@ async fn gap_scoped_leg_enforces_the_received_byte_ceiling_from_its_own_offset()
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = pool_context(&client_ep, signer, deposit);
     let ledger = Arc::new(ctx.new_ledger());
-    let ceiling: u64 = 2_500_000;
+    let mib: u64 = 1024 * 1024;
+    let ceiling: u64 = 3 * mib / 2;
     let slash = slash_domain();
     let source = PeerSource::new(
         &client_ep,
@@ -7569,34 +7571,31 @@ async fn gap_scoped_leg_enforces_the_received_byte_ceiling_from_its_own_offset()
         None,
     );
 
-    // (a) `[0, 2 MiB)` of a 4 MiB blob under a ~2.4 MiB ceiling: completes.
-    let range = decdn_bao_range::align_range(0, 2 * 1024 * 1024, total)?;
+    // (a) `[2 MiB, 3 MiB)` of a 4 MiB blob under a 1.5 MiB cap: the leg starts
+    // past the cap's offset and its span fits the cap, so it completes.
+    let range = decdn_bao_range::align_range(2 * mib, mib, total)?;
     let (header, mut reader) = source.open(*hash.as_bytes(), range).await?;
     anyhow::ensure!(
         header.total_bytes == total,
-        "the signed claim exceeds the ceiling by design"
+        "the signed claim exceeds the cap by design"
     );
-    let expected = support::bao_wire_len(total, 0, 2 * 1024 * 1024);
+    let expected = support::bao_wire_len(total, 2 * mib, mib);
     let received = read_groups(&mut reader, expected, u64::MAX).await?;
     anyhow::ensure!(
         received == expected,
-        "the under-ceiling leg must deliver its whole wire ({received} of {expected})"
+        "a leg past the cap's offset must deliver its whole wire ({received} of {expected})"
     );
     let paid_first = source.finish(reader).await?;
     let (paid_first, _) = paid_first
         .advanced()
         .ok_or_else(|| anyhow::anyhow!("the completed leg must have paid"))?;
 
-    // (b) `[2 MiB, 4 MiB)`: the ceiling's wire from this offset is ~0.4 MiB, under
-    // one metering interval, so the leg aborts before any payment comes due.
-    let ceiling_wire_from_offset = support::bao_wire_len(ceiling, 2 * 1024 * 1024, 0);
-    anyhow::ensure!(
-        ceiling_wire_from_offset < HARNESS_INTERVAL_BYTES,
-        "the ceiling's wire from the offset must sit under one interval"
-    );
-    let range = decdn_bao_range::align_range(2 * 1024 * 1024, 2 * 1024 * 1024, total)?;
+    // (b) `[mib, 4 MiB)`: 3 MiB of content from one stream, twice the cap. The
+    // leg aborts once its received bytes cross the cap's wire from its offset.
+    let cap_wire_from_offset = support::bao_wire_len(total, mib, ceiling);
+    let range = decdn_bao_range::align_range(mib, 3 * mib, total)?;
     let (_header, mut reader) = source.open(*hash.as_bytes(), range).await?;
-    let wire_len = support::bao_wire_len(total, 2 * 1024 * 1024, 2 * 1024 * 1024);
+    let wire_len = support::bao_wire_len(total, mib, 3 * mib);
     read_groups(&mut reader, wire_len, u64::MAX).await?;
     let err = reader
         .take_fault()
@@ -7608,9 +7607,9 @@ async fn gap_scoped_leg_enforces_the_received_byte_ceiling_from_its_own_offset()
     drop(reader);
     let paid_total = ledger.settlement().bytes;
     anyhow::ensure!(
-        paid_total == paid_first,
-        "the crossing leg paid {} past the first leg's {paid_first}; it verified less than \
-         one interval ({ceiling_wire_from_offset} wire bytes at most) and owes nothing",
+        paid_total <= paid_first + U256::from(cap_wire_from_offset),
+        "the crossing leg paid {} past the first leg's {paid_first}, more than the cap's \
+         {cap_wire_from_offset} wire bytes from its offset",
         paid_total - paid_first
     );
 

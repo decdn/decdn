@@ -201,10 +201,13 @@ impl AsyncSliceReader for AwaitingDataReader {
                                  landed: {msg}; the hash is refused"
                             )));
                         }
+                        // The fill's error rides in the source chain, so a fill that
+                        // ended at the cap on held bytes reaches the serve leg as
+                        // that refusal.
                         return self.store.read(offset, need).await.map_err(|err| {
-                            io::Error::other(format!(
+                            msg.unlanded(format!(
                                 "upstream pull failed before content [{offset}, +{len}) \
-                                 landed: {msg}; the store read failed: {}",
+                                 landed (the store read failed: {})",
                                 decdn_cache::ErrorChain::new(&err)
                             ))
                         });

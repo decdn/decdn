@@ -196,6 +196,24 @@ impl ClientHandler {
         Ok(())
     }
 
+    /// Write a mid-stream `StreamError` carrying `reason`'s wire class
+    /// ([`ServeRejectReason::wire_error`]) and finish the stream cleanly, so the
+    /// client reads the refusal and asks another node. A write that fails
+    /// because the peer left returns `Ok`, as in [`Self::write_reject`].
+    pub(super) async fn write_midstream_refusal(
+        &self,
+        send: &mut SendStream,
+        reason: ServeRejectReason,
+    ) -> anyhow::Result<()> {
+        tolerate_departed_peer(
+            self.write_message(send, &ClientMessage::StreamError(reason.wire_error()))
+                .await,
+            "mid-stream refusal",
+        )?;
+        let _ = send.finish();
+        Ok(())
+    }
+
     pub(super) async fn write_message(
         &self,
         send: &mut SendStream,

@@ -71,9 +71,7 @@ use std::time::Duration;
 
 use alloy::primitives::U256;
 use bao_tree::ChunkRanges;
-use decdn_bao_range::{
-    AlignedRange, CHUNK_GROUP_BYTES, RangedStore, RangedStoreError, align_range,
-};
+use decdn_bao_range::{AlignedRange, RangedStore, RangedStoreError, align_range};
 use decdn_protocol::VoucherRejectReason;
 
 use crate::fault::HealExhausted;
@@ -766,16 +764,12 @@ where
 }
 
 /// The aligned range one paid leg opens: the unpaid tail `[resume_start,
-/// gap_end)` of a gap, clamped to the `up_to_bytes` the pacer authorized.
-///
-/// The received-byte ceiling (#1895) caps the leg too, so the delivered frontier
-/// can pass `max_blob_size_bytes` by at most one chunk group, at which point
-/// [`fill_gap`]'s loop-top check aborts. Without this a [`crate::BudgetPacer`],
-/// which draws the whole gap remainder, would pull an entire oversized blob before
-/// that check ever runs. `resume_start` is always at or below the ceiling here (a
-/// `resume_start` past it means the loop-top check already aborted), so
-/// `cap_end - resume_start` is at least one chunk group and never collapses the
-/// length to the `0` ("to end") sentinel. `max_blob_size_bytes == 0` is unlimited.
+/// gap_end)` of a gap, clamped to the `up_to_bytes` the pacer authorized and to
+/// `max_len`, the most content the cap on held bytes lets the leg span
+/// ([`held_room`]; `u64::MAX` is no cap). A caller passes a nonzero `max_len`,
+/// so the length never collapses to the `0` ("to end") sentinel. Alignment
+/// widens the leg to whole chunk groups, so a leg can land up to one chunk
+/// group past the cap.
 ///
 /// The one computation both [`fill_gap`] and [`first_leg`] use, so a caller that
 /// opens the first leg ahead of the drive opens exactly the range the drive asks
@@ -784,17 +778,23 @@ pub(crate) fn leg_range(
     resume_start: u64,
     gap_end: u64,
     up_to_bytes: u64,
-    max_blob_size_bytes: u64,
+    max_len: u64,
     total_bytes: u64,
 ) -> anyhow::Result<AlignedRange> {
-    let draw_len = gap_end.saturating_sub(resume_start).min(up_to_bytes);
-    let draw_len = if max_blob_size_bytes > 0 {
-        let cap_end = max_blob_size_bytes.saturating_add(CHUNK_GROUP_BYTES);
-        draw_len.min(cap_end.saturating_sub(resume_start))
-    } else {
-        draw_len
-    };
+    let draw_len = gap_end
+        .saturating_sub(resume_start)
+        .min(up_to_bytes)
+        .min(max_len);
     Ok(align_range(resume_start, draw_len, total_bytes)?)
+}
+
+/// The new bytes the cap on held bytes still lets the store take for the
+/// blob: `max_blob_size_bytes` less the content bytes the store `held`. `None`
+/// when there is no cap (`0`). The cap bounds how many bytes of one blob a
+/// store holds, never which offsets it reads, so a range anywhere in a blob
+/// larger than the cap lands while it fits.
+fn held_room(max_blob_size_bytes: u64, held: u64) -> Option<u64> {
+    (max_blob_size_bytes > 0).then(|| max_blob_size_bytes.saturating_sub(held))
 }
 
 /// A store query's error, marked [`crate::LocalPullFault`] when the store itself
@@ -839,8 +839,10 @@ async fn range_set_gaps<St: RangedStore + ?Sized>(
 /// first decision is `Draw { up_to_bytes }`: a fresh drive's paid frontier
 /// starts at the gap start, so the leg is the gap cut to `up_to_bytes`. A
 /// [`crate::BudgetPacer`] draws the whole unpaid gap, so pass `u64::MAX` for it.
-/// `max_blob_size_bytes` is the source's received-byte ceiling
-/// ([`BlobSource::max_blob_size_bytes`]).
+/// `max_blob_size_bytes` is the source's cap on the bytes held for one blob
+/// ([`BlobSource::max_blob_size_bytes`]): the leg spans at most the room the
+/// store's held bytes leave under it, and a store with no room left opens no
+/// leg (`None`), as the drive ends without one.
 ///
 /// # Errors
 ///
@@ -856,11 +858,22 @@ pub async fn first_leg<St: RangedStore + ?Sized>(
     let Some(&(start, len)) = gaps.first() else {
         return Ok(None);
     };
+    let max_len = if max_blob_size_bytes > 0 {
+        let present = store.present_ranges().await.map_err(store_query_fault)?;
+        let room =
+            max_blob_size_bytes.saturating_sub(ranges_content_len(&present, store.total_bytes()));
+        if room == 0 {
+            return Ok(None);
+        }
+        room
+    } else {
+        u64::MAX
+    };
     leg_range(
         start,
         start.saturating_add(len),
         up_to_bytes,
-        max_blob_size_bytes,
+        max_len,
         store.total_bytes(),
     )
     .map(Some)
@@ -1045,23 +1058,24 @@ where
             ranges_content_len(&still_missing, total_bytes),
         );
 
-        // Received-byte ceiling (#1895): enforce the source's `max_blob_size_bytes`
-        // on the content that has ACTUALLY been received and BLAKE3-verified into the
-        // store, never on the peer's unverified signed `total_bytes`.
-        // The store holds every byte of `[gap_start, delivered_frontier)`, so once
-        // `delivered_frontier` crosses the ceiling the blob is genuinely oversized —
-        // abort. A hole below the ceiling holds the frontier at the hole, so the
-        // check waits until a later leg fills it. The Draw arm clamps each leg so
-        // this fires within one chunk group of the ceiling rather than after a
-        // whole-gap `BudgetPacer` draw. `0` = unlimited (and own-origin, whose
-        // engine store applies its own cap).
+        // The cap on bytes held (#1895): the source's `max_blob_size_bytes` bounds
+        // the content of this blob the store holds, BLAKE3-verified, never the
+        // offsets a leg reads and never the peer's unverified signed `total_bytes`.
+        // `room` is the new bytes the store may still take. The Draw arm cuts
+        // each leg to it, so a range anywhere in a blob larger than the cap lands
+        // while it fits. `None` = no cap (and own-origin, whose engine store
+        // applies its own cap).
         let max_blob_size_bytes = source.max_blob_size_bytes();
-        if max_blob_size_bytes > 0 && delivered_frontier > max_blob_size_bytes {
-            return Err(anyhow::Error::new(crate::BlobTooLarge {
-                reached: delivered_frontier,
-                ceiling: max_blob_size_bytes,
-            }));
-        }
+        let held = if max_blob_size_bytes > 0 {
+            let present = store
+                .present_ranges()
+                .await
+                .map_err(|e| anyhow::Error::new(e).context(crate::LocalPullFault))?;
+            ranges_content_len(&present, total_bytes)
+        } else {
+            0
+        };
+        let room = held_room(max_blob_size_bytes, held);
 
         let committed = ledger.committed();
         let deposit = locked_deposit(ctx)?;
@@ -1118,6 +1132,17 @@ where
             )
         }) {
             return Err(anyhow::Error::new(stuck));
+        }
+
+        // No room left under the cap, every present byte below the delivered
+        // frontier paid, and bytes still missing: the next leg could only add
+        // bytes past the cap. End before it opens, so nothing past the cap is
+        // pulled or paid for.
+        if room == Some(0) && paid_frontier >= delivered_frontier && delivered_frontier < gap_end {
+            return Err(anyhow::Error::new(crate::BlobTooLarge {
+                reached: held.saturating_add(ranges_content_len(&still_missing, total_bytes)),
+                ceiling: max_blob_size_bytes,
+            }));
         }
 
         let downstream_now = downstream.map_or(
@@ -1206,13 +1231,15 @@ where
                     return Ok(());
                 }
                 let resume_start = paid_frontier;
-                let aligned = leg_range(
-                    resume_start,
-                    gap_end,
-                    up_to_bytes,
-                    max_blob_size_bytes,
-                    total_bytes,
-                )?;
+                // The present bytes `[resume_start, delivered_frontier)` a leg
+                // re-delivers to bill them add nothing to the bytes held, so the
+                // cap's room starts past them.
+                let max_len = room.map_or(u64::MAX, |room| {
+                    delivered_frontier
+                        .saturating_sub(resume_start)
+                        .saturating_add(room)
+                });
+                let aligned = leg_range(resume_start, gap_end, up_to_bytes, max_len, total_bytes)?;
 
                 // Whole-blob content already present, so `ingest_stream`'s
                 // per-range progress can be offset into overall progress: the bar
