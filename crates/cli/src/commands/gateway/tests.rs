@@ -135,32 +135,137 @@ fn origin_host_reads_the_host_of_an_origin() {
     );
     assert_eq!(origin_host("null"), None);
     assert_eq!(origin_host("https://"), None);
+    assert_eq!(origin_host("chrome-extension://abcdefgh"), None);
+}
+
+fn page(origin: &str) -> Caller {
+    Caller::of(Some(origin), false).unwrap()
 }
 
 #[test]
 fn a_page_registers_only_scopes_that_cover_itself() {
-    let origin = Some("https://decdn.org");
+    let origin = page("https://decdn.org");
     for scope in ["decdn.org", "*.decdn.org", "*"] {
         assert!(
-            may_register(origin, &Scope::parse(scope).unwrap()).is_ok(),
+            may_register(&origin, &Scope::parse(scope).unwrap()).is_ok(),
             "{scope}"
         );
     }
     for scope in ["netflix.com", "*.netflix.com", "up.decdn.org"] {
         assert!(
-            may_register(origin, &Scope::parse(scope).unwrap()).is_err(),
+            may_register(&origin, &Scope::parse(scope).unwrap()).is_err(),
             "{scope}"
         );
     }
-    let sub = Some("https://up.decdn.org");
-    assert!(may_register(sub, &Scope::parse("*.decdn.org").unwrap()).is_ok());
-    assert!(may_register(sub, &Scope::parse("decdn.org").unwrap()).is_err());
+    let sub = page("https://up.decdn.org");
+    assert!(may_register(&sub, &Scope::parse("*.decdn.org").unwrap()).is_ok());
+    assert!(may_register(&sub, &Scope::parse("decdn.org").unwrap()).is_err());
 }
 
 #[test]
-fn registering_without_an_origin_needs_the_token() {
-    assert!(may_register(None, &Scope::Any).is_err());
-    assert!(may_register(Some("null"), &Scope::Any).is_err());
+fn a_page_stays_a_page_with_the_token() {
+    let caller = Caller::of(Some("https://decdn.org"), true).unwrap();
+    assert_eq!(caller.origin(), Some("https://decdn.org"));
+    assert!(may_register(&caller, &Scope::parse("netflix.com").unwrap()).is_err());
+}
+
+#[test]
+fn the_token_holder_registers_any_scope_outside_a_page() {
+    for origin in [None, Some("chrome-extension://abcdefgh")] {
+        let caller = Caller::of(origin, true).unwrap();
+        assert_eq!(caller, Caller::Token);
+        assert!(may_register(&caller, &Scope::parse("netflix.com").unwrap()).is_ok());
+    }
+}
+
+#[test]
+fn callers_without_a_page_origin_need_the_token() {
+    assert!(Caller::of(None, false).is_err());
+    assert!(Caller::of(Some("chrome-extension://abcdefgh"), false).is_err());
+    assert!(Caller::of(Some("null"), false).is_err());
+    assert!(Caller::of(Some("null"), true).is_err());
+}
+
+fn pending(minter: Option<&str>) -> Delegate {
+    Delegate {
+        signer: Arc::new(PrivateKeySigner::random()),
+        minted: Instant::now(),
+        minter: minter.map(str::to_owned),
+        capability: None,
+    }
+}
+
+#[test]
+fn each_minter_keeps_its_own_pending_room() {
+    let mut delegates = HashMap::new();
+    for _ in 0..MAX_PENDING_PER_MINTER {
+        let d = pending(Some("https://evil.example"));
+        delegates.insert(d.signer.address(), d);
+    }
+    assert!(may_mint(&delegates, Some("https://evil.example")).is_err());
+    assert!(may_mint(&delegates, Some("https://decdn.org")).is_ok());
+    assert!(may_mint(&delegates, None).is_ok());
+}
+
+#[test]
+fn minting_stops_at_the_global_bound() {
+    let mut delegates = HashMap::new();
+    for n in 0..MAX_PENDING {
+        let d = pending(Some(&format!("https://{n}.example")));
+        delegates.insert(d.signer.address(), d);
+    }
+    assert!(may_mint(&delegates, Some("https://decdn.org")).is_err());
+}
+
+#[test]
+fn classify_finds_funding_attached_as_context() {
+    let funding = decdn_client::FundingNeeded::PublisherPool {
+        pool: alloy::primitives::B256::ZERO,
+    };
+    let e = anyhow::anyhow!("refused").context(funding).context("outer");
+    assert!(matches!(classify(e), PullError::Funding(_)));
+    assert!(matches!(
+        classify(anyhow::anyhow!("no node")),
+        PullError::Other(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_pull_that_fails_before_any_byte_is_an_error() {
+    let (writer, mut reader) = tokio::io::duplex(64);
+    let (done_tx, done_rx) = oneshot::channel();
+    drop(writer);
+    done_tx.send(Err(anyhow::anyhow!("not found"))).unwrap();
+    let Err(PullError::Other(e)) = first_chunk(&mut reader, done_rx).await else {
+        panic!("expected the pull's error");
+    };
+    assert_eq!(e.to_string(), "not found");
+}
+
+#[tokio::test]
+async fn an_empty_successful_pull_is_an_empty_body() {
+    let (writer, mut reader) = tokio::io::duplex(64);
+    let (done_tx, done_rx) = oneshot::channel();
+    drop(writer);
+    done_tx.send(Ok(())).unwrap();
+    let Ok((first, done)) = first_chunk(&mut reader, done_rx).await else {
+        panic!("expected an empty body");
+    };
+    assert!(first.is_empty());
+    assert!(finished(done).await.is_ok());
+}
+
+#[tokio::test]
+async fn the_first_bytes_come_back_before_the_pull_ends() {
+    let (mut writer, mut reader) = tokio::io::duplex(64);
+    let (_done_tx, done_rx) = oneshot::channel::<anyhow::Result<()>>();
+    tokio::io::AsyncWriteExt::write_all(&mut writer, b"abc")
+        .await
+        .unwrap();
+    let Ok((first, _)) = first_chunk(&mut reader, done_rx).await else {
+        panic!("expected the first bytes");
+    };
+    assert_eq!(&first[..], b"abc");
 }
 
 #[test]
@@ -231,6 +336,7 @@ fn prune_drops_stale_pending_and_expired_delegates() {
             Delegate {
                 signer: Arc::new(signer.clone()),
                 minted,
+                minter: None,
                 capability: None,
             },
         );

@@ -8,18 +8,24 @@
 //! gateway token) and [`HOST_HEADER`] (the host of the page it serves); the
 //! browser extension adds both, so page scripts never see the token. The
 //! gateway pays with the registered capability whose scope covers that host:
-//! an exact host first, then `*.<domain>`, then `*`.
+//! an exact host first, then `*.<domain>`, then `*`. `HEAD` gets 405, since
+//! answering it would cost a paid pull.
 //!
 //! **Capabilities.** The gateway holds one delegate key per capability, in
 //! memory only. `GET /_delegate` mints a fresh key and returns its address, so
 //! no two callers see the same address and none can follow the user across
-//! sites; a key no capability claims within [`PENDING_TTL`] is dropped.
+//! sites; a key no capability claims within [`PENDING_TTL`] is dropped. A
+//! caller is a web page by its `http(s)` `Origin`, or the gateway token holder
+//! from outside any page; each keeps at most a few keys waiting.
 //! `PUT /_capability` registers a `dcap1:` capability issued to a minted
-//! address, with a scope. A page registers through CORS, and its scope must
-//! cover its own origin's host: `example.com` may register `example.com`,
-//! `*.example.com` or `*`, never another host. The gateway token registers any
-//! scope. `GET /_capability` lists the registrations to the token holder. A
-//! restart drops every key, and with it every capability issued to one.
+//! address, with a scope. The capability's owner signature must recover the
+//! on-chain owner of its pool on the gateway's deployment. A page registers
+//! through CORS, and its scope must cover its own origin's host, whether or
+//! not the request also carries the token: `example.com` may register
+//! `example.com`, `*.example.com` or `*`, never another host. The token
+//! holder registers any scope. `GET /_capability` lists the registrations to
+//! the token holder. A restart drops every key, and with it every capability
+//! issued to one.
 //!
 //! **Boundaries.** Only `/_delegate` and `/_capability` answer cross-origin;
 //! content never does, so a page can neither read a response nor set the
@@ -38,13 +44,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::sol_types::Eip712Domain;
 use anyhow::Context as _;
 use bytes::Bytes;
 use decdn_client::bundle::{BundleManifest, parse_hash};
+use decdn_client::session::ChainConfig;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::{self, ClientFetchArgs, FetchArgs, GatewayArgs};
 use decdn_common::config::load_file_config;
-use decdn_incentive::CapabilityGrant;
+use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
+use decdn_incentive::payment_pool::PaymentPool;
+use decdn_incentive::{CapabilityGrant, voucher_domain};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt as _, Full, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -55,7 +65,7 @@ use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
 
-use super::fetch::{Credential, Sink, fetch_into};
+use super::fetch::{Credential, Sink, fetch_into, resolve_chain};
 use crate::known_chains;
 
 /// The request header carrying the gateway token.
@@ -67,9 +77,13 @@ pub const HOST_HEADER: &str = "x-decdn-host";
 /// How long a minted delegate waits for a capability before it is dropped.
 pub const PENDING_TTL: Duration = Duration::from_mins(15);
 
-/// The most minted delegates waiting for a capability at once: a page cannot
-/// make the gateway hold keys without bound.
-const MAX_PENDING: usize = 32;
+/// The most minted delegates one minter (a page origin, or the token holder)
+/// keeps waiting for a capability, so no page can use up another's room.
+const MAX_PENDING_PER_MINTER: usize = 4;
+
+/// The most minted delegates waiting for a capability at once, across every
+/// minter: the gateway holds keys within a fixed bound.
+const MAX_PENDING: usize = 1024;
 
 /// The largest `PUT /_capability` body.
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -111,13 +125,16 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     let mut common = args.common.clone();
     anyhow::ensure!(
         common.keystore.is_none()
-            && common.keystore_password_file.is_none()
             && common.capability.is_none()
             && common.capability_file.is_none(),
         "the gateway holds its own delegate keys: register capabilities through \
-         `PUT /_capability` instead of --keystore / --capability"
+         `PUT /_capability` instead of --keystore / --capability / --capability-file"
     );
+    // A password file (often `DECDN_KEYSTORE_PASSWORD_FILE` in the
+    // environment) has no keystore to open here.
+    common.keystore_password_file = None;
     fill_chain_defaults(&mut common, config_path)?;
+    let chain = resolve_chain(&common, &load_file_config(config_path)?)?.config;
     common.give_up_after_secs = common.give_up_after_secs.or(Some(GIVE_UP_AFTER_SECS));
     let root = common
         .data_dir
@@ -138,6 +155,8 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         common,
         config_path: config_path.map(Path::to_path_buf),
         token,
+        domain: voucher_domain(chain.chain_id, chain.payment_pool),
+        chain,
         delegates: Mutex::new(HashMap::new()),
         pull: Arc::new(Mutex::new(())),
         manifests: std::sync::Mutex::new(ManifestCache::default()),
@@ -349,27 +368,68 @@ fn valid_host(host: &str) -> Result<(), String> {
     }
 }
 
-/// The host of a browser `Origin` header (`https://example.com:8443` gives
-/// `example.com`). `None` for an opaque origin.
+/// The host of a web page's `Origin` header (`https://example.com:8443` gives
+/// `example.com`). `None` for an opaque origin and for every scheme other
+/// than `http` and `https`, such as an extension's.
 fn origin_host(origin: &str) -> Option<String> {
-    let rest = origin.split_once("://")?.1;
+    let rest = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))?;
     let host = rest.split(['/', ':']).next()?;
     let host = host.to_ascii_lowercase();
     valid_host(&host).ok().map(|()| host)
 }
 
-/// Whether the page at `origin` may register `scope`: the scope must cover
-/// the origin's own host.
-fn may_register(origin: Option<&str>, scope: &Scope) -> Result<(), String> {
-    let host = origin.and_then(origin_host).ok_or_else(|| {
-        "a page registers with its Origin; use the gateway token otherwise".to_owned()
-    })?;
-    if scope.covers(&host) {
-        Ok(())
-    } else {
-        Err(format!(
+/// Who calls `/_delegate` or `/_capability`.
+#[derive(Debug, PartialEq, Eq)]
+enum Caller {
+    /// A web page, by its `Origin` and that origin's host. A page stays a
+    /// page when its request also carries the token.
+    Page { origin: String, host: String },
+    /// The token holder, from outside any web page.
+    Token,
+}
+
+impl Caller {
+    fn of(origin: Option<&str>, authorized: bool) -> Result<Self, &'static str> {
+        match origin {
+            Some(origin) => {
+                if let Some(host) = origin_host(origin) {
+                    Ok(Self::Page {
+                        origin: origin.to_owned(),
+                        host,
+                    })
+                } else if origin == "null" {
+                    Err("an opaque origin may not call the gateway\n")
+                } else if authorized {
+                    Ok(Self::Token)
+                } else {
+                    Err("token required\n")
+                }
+            }
+            None if authorized => Ok(Self::Token),
+            None => Err("a page calls with its Origin; use the gateway token otherwise\n"),
+        }
+    }
+
+    /// The page origin, or `None` for the token holder.
+    fn origin(&self) -> Option<&str> {
+        match self {
+            Self::Page { origin, .. } => Some(origin),
+            Self::Token => None,
+        }
+    }
+}
+
+/// Whether `caller` may register `scope`: a page only a scope that covers its
+/// own host, the token holder any scope.
+fn may_register(caller: &Caller, scope: &Scope) -> Result<(), String> {
+    match caller {
+        Caller::Token => Ok(()),
+        Caller::Page { host, .. } if scope.covers(host) => Ok(()),
+        Caller::Page { host, .. } => Err(format!(
             "{host} may not register scope `{scope}`: it does not cover {host}"
-        ))
+        )),
     }
 }
 
@@ -377,7 +437,24 @@ fn may_register(origin: Option<&str>, scope: &Scope) -> Result<(), String> {
 struct Delegate {
     signer: Arc<PrivateKeySigner>,
     minted: Instant,
+    /// The page origin that minted it, or `None` for the token holder.
+    minter: Option<String>,
     capability: Option<Registered>,
+}
+
+/// Whether `minter` may mint one more delegate while `delegates` wait.
+fn may_mint(delegates: &HashMap<Address, Delegate>, minter: Option<&str>) -> Result<(), String> {
+    let pending = || delegates.values().filter(|d| d.capability.is_none());
+    if pending().count() >= MAX_PENDING {
+        return Err("too many delegates are waiting for a capability\n".to_owned());
+    }
+    if pending().filter(|d| d.minter.as_deref() == minter).count() >= MAX_PENDING_PER_MINTER {
+        return Err(format!(
+            "{} has {MAX_PENDING_PER_MINTER} delegates waiting for a capability\n",
+            minter.unwrap_or("the token holder")
+        ));
+    }
+    Ok(())
 }
 
 struct Registered {
@@ -398,6 +475,10 @@ struct Gateway {
     common: ClientFetchArgs,
     config_path: Option<PathBuf>,
     token: String,
+    /// The chain a registered capability's pool must live on.
+    chain: ChainConfig,
+    /// The EIP-712 domain a capability's owner signs under.
+    domain: Eip712Domain,
     delegates: Mutex<HashMap<Address, Delegate>>,
     /// One pull at a time: every pull opens the one buyer-pool store.
     pull: Arc<Mutex<()>>,
@@ -484,14 +565,31 @@ impl Gateway {
                  the token <code>decdn gateway</code> printed when it started.</p>",
             ),
             (Method::GET, "/favicon.ico") => text(StatusCode::NOT_FOUND, ""),
-            (Method::GET, "/_delegate") => with_cors(self.mint().await, origin.as_deref()),
+            (Method::GET, "/_delegate") => {
+                let response = match Caller::of(origin.as_deref(), authorized) {
+                    Ok(caller) => self.mint(&caller).await,
+                    Err(e) => text(StatusCode::FORBIDDEN, e),
+                };
+                with_cors(response, origin.as_deref())
+            }
             (Method::PUT, "/_capability") => {
-                let response = self.register(req, origin.as_deref(), authorized).await;
+                let response = match Caller::of(origin.as_deref(), authorized) {
+                    Ok(caller) => self.register(req, &caller).await,
+                    Err(e) => text(StatusCode::FORBIDDEN, e),
+                };
                 with_cors(response, origin.as_deref())
             }
             (Method::GET, "/_capability") if authorized => self.list().await,
             (Method::GET, "/_capability") => text(StatusCode::UNAUTHORIZED, "token required\n"),
-            (Method::GET | Method::HEAD, _) => {
+            // A HEAD answer would cost a paid pull and then drop its bytes.
+            (Method::HEAD, _) => {
+                let mut response = text(StatusCode::METHOD_NOT_ALLOWED, "");
+                response
+                    .headers_mut()
+                    .insert(header::ALLOW, header::HeaderValue::from_static("GET"));
+                response
+            }
+            (Method::GET, _) => {
                 let target = req
                     .uri()
                     .path_and_query()
@@ -521,18 +619,11 @@ impl Gateway {
         });
     }
 
-    async fn mint(&self) -> Response<Body> {
+    async fn mint(&self, caller: &Caller) -> Response<Body> {
         let mut delegates = self.delegates.lock().await;
         Self::prune(&mut delegates);
-        let pending = delegates
-            .values()
-            .filter(|d| d.capability.is_none())
-            .count();
-        if pending >= MAX_PENDING {
-            return text(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many delegates are waiting for a capability\n",
-            );
+        if let Err(e) = may_mint(&delegates, caller.origin()) {
+            return text(StatusCode::TOO_MANY_REQUESTS, &e);
         }
         let signer = PrivateKeySigner::random();
         let address = signer.address();
@@ -541,6 +632,7 @@ impl Gateway {
             Delegate {
                 signer: Arc::new(signer),
                 minted: Instant::now(),
+                minter: caller.origin().map(str::to_owned),
                 capability: None,
             },
         );
@@ -550,12 +642,7 @@ impl Gateway {
         )
     }
 
-    async fn register(
-        &self,
-        req: Request<Incoming>,
-        origin: Option<&str>,
-        authorized: bool,
-    ) -> Response<Body> {
+    async fn register(&self, req: Request<Incoming>, caller: &Caller) -> Response<Body> {
         let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
             .collect()
             .await
@@ -576,7 +663,7 @@ impl Gateway {
             Ok(scope) => scope,
             Err(e) => return text(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e}\n")),
         };
-        if !authorized && let Err(e) = may_register(origin, &scope) {
+        if let Err(e) = may_register(caller, &scope) {
             return text(StatusCode::FORBIDDEN, &format!("{e}\n"));
         }
         let grant = match CapabilityGrant::from_token(request.capability.trim()) {
@@ -589,8 +676,8 @@ impl Gateway {
                 "the capability has expired\n",
             );
         }
-        if let Err(e) = grant.to_signed_capability() {
-            return text(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e}\n"));
+        if let Err((status, e)) = self.verify_owner(&grant).await {
+            return text(status, &e);
         }
         let mut delegates = self.delegates.lock().await;
         Self::prune(&mut delegates);
@@ -615,14 +702,46 @@ impl Gateway {
         delegate.capability = Some(Registered {
             grant,
             scope,
-            origin: if authorized {
-                None
-            } else {
-                origin.map(str::to_owned)
-            },
+            origin: caller.origin().map(str::to_owned),
             spent: false,
         });
         json(StatusCode::CREATED, &response)
+    }
+
+    /// Check that `grant` is signed by the on-chain owner of its pool on this
+    /// gateway's deployment, so a capability that cannot pay never takes a
+    /// scope from one that can.
+    async fn verify_owner(&self, grant: &CapabilityGrant) -> Result<(), (StatusCode, String)> {
+        let unprocessable = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
+        let signed_by = grant
+            .owner(&self.domain)
+            .map_err(|e| unprocessable(format!("{e}\n")))?;
+        let unreachable = |e: String| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("could not read the capability's pool on-chain: {e}\n"),
+            )
+        };
+        let rpc = decdn_client::provider::build_read_provider(&self.chain.rpc_url)
+            .map_err(|e| unreachable(sanitize_err_chain(&e)))?;
+        let pool = PaymentPool::new(self.chain.payment_pool, rpc)
+            .getPool(grant.pool_id)
+            .call()
+            .await
+            .map_err(|e| unreachable(sanitize_error_sources(&e)))?;
+        if pool.owner.is_zero() {
+            return Err(unprocessable(format!(
+                "pool {} does not exist on this deployment\n",
+                grant.pool_id
+            )));
+        }
+        if pool.owner != signed_by {
+            return Err(unprocessable(format!(
+                "the capability is not signed by the owner of pool {}\n",
+                grant.pool_id
+            )));
+        }
+        Ok(())
     }
 
     async fn list(&self) -> Response<Body> {
@@ -905,7 +1024,7 @@ impl Gateway {
         let config_path = self.config_path.clone();
         let slot = Arc::clone(&self.pull).lock_owned().await;
         let (writer, mut reader) = tokio::io::duplex(PIPE_BYTES);
-        let (done_tx, mut done_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
         // The fetch future is not `Send`, so it runs on a thread of its own
         // with a current-thread runtime, and talks to the response through the
         // duplex pipe.
@@ -929,34 +1048,34 @@ impl Gateway {
                 let _ = done_tx.send(result);
             })
             .map_err(|e| PullError::Other(e.into()))?;
-
-        let mut first = vec![0u8; CHUNK_BYTES];
-        let mut done: Option<anyhow::Result<()>> = None;
-        let n = loop {
-            tokio::select! {
-                biased;
-                n = reader.read(&mut first) => break n.map_err(|e| PullError::Other(e.into()))?,
-                result = &mut done_rx, if done.is_none() => {
-                    let result = result.unwrap_or_else(|_| Err(anyhow::anyhow!("the pull ended")));
-                    if let Err(e) = result {
-                        return Err(classify(e));
-                    }
-                    done = Some(Ok(()));
-                }
-            }
-        };
-        first.truncate(n);
-        // A pull that already ended hands back a spent receiver; the body's
-        // end-of-stream check then finds it closed and the bytes complete.
-        let (spent_tx, spent_rx) = oneshot::channel();
-        let done_rx = if done.is_some() {
-            let _ = spent_tx.send(Ok(()));
-            spent_rx
-        } else {
-            done_rx
-        };
-        Ok((Bytes::from(first), reader, done_rx))
+        let (first, done_rx) = first_chunk(&mut reader, done_rx).await?;
+        Ok((first, reader, done_rx))
     }
+}
+
+/// The pull's first verified bytes, or the error it ended with before any.
+///
+/// The pull closes the pipe before it reports its result, so an end of
+/// stream with no bytes waits for that result: a failed pull is an error
+/// here, and a successful one is an empty body.
+async fn first_chunk(
+    reader: &mut DuplexStream,
+    done_rx: oneshot::Receiver<anyhow::Result<()>>,
+) -> Result<(Bytes, oneshot::Receiver<anyhow::Result<()>>), PullError> {
+    let mut first = vec![0u8; CHUNK_BYTES];
+    let n = reader
+        .read(&mut first)
+        .await
+        .map_err(|e| PullError::Other(e.into()))?;
+    if n > 0 {
+        first.truncate(n);
+        return Ok((Bytes::from(first), done_rx));
+    }
+    finished(done_rx).await?;
+    // The body's end-of-stream check then finds the pull already done.
+    let (spent_tx, spent_rx) = oneshot::channel();
+    let _ = spent_tx.send(Ok(()));
+    Ok((Bytes::new(), spent_rx))
 }
 
 /// The pull's own result once its bytes are drained.
@@ -967,12 +1086,10 @@ async fn finished(done: oneshot::Receiver<anyhow::Result<()>>) -> Result<(), Pul
     }
 }
 
+/// A pull error is a funding stop when [`decdn_client::FundingNeeded`] is
+/// attached anywhere on it, as context or as the error itself.
 fn classify(e: anyhow::Error) -> PullError {
-    if e.chain().any(|cause| {
-        cause
-            .downcast_ref::<decdn_client::FundingNeeded>()
-            .is_some()
-    }) {
+    if e.downcast_ref::<decdn_client::FundingNeeded>().is_some() {
         PullError::Funding(e)
     } else {
         PullError::Other(e)
