@@ -165,6 +165,54 @@ the bundle hash; clients fetch the bundle hash, parse the JSON, then
 fetch every `entries[].hash` separately. The bundle is leaf data, not a
 manifest in the protocol sense.
 
+## `decdn:` URIs
+
+A `decdn:` URI is one string that names a blob, a whole bundle, or one
+entry of a bundle. `decdn get <URI>` takes it. The parser is
+`decdn_client::uri::DecdnUri`.
+
+```text
+decdn:<hash>[/<path>][?ns=<id>]
+```
+
+| URI | Names |
+|---|---|
+| `decdn:<hash>` | the raw blob |
+| `decdn:<hash>/` | the whole bundle whose manifest has this hash |
+| `decdn:<hash>/<path>` | the manifest entry whose `path` is `<path>` |
+| any of the above with `?ns=<id>` | the same, with a namespace routing hint |
+
+- **`<hash>`** is the BLAKE3 hash as 64 hex characters. It has no `b3:`
+  or `0x` prefix. A parser accepts uppercase hex. The canonical form is
+  lowercase.
+- **No `//`.** The URI has no authority part, the same as `magnet:` and
+  `urn:`. A 64-character hash is longer than the 63-character limit of a
+  DNS label, so it cannot be a host.
+- **A trailing `/` marks a bundle.** The URI author knows if the hash is
+  a bundle manifest. The client does not examine the content to decide,
+  because a manifest is plain JSON and other JSON can look the same.
+- **`<path>`** is the manifest entry's relative POSIX path. Each segment
+  is percent-encoded as an RFC 3986 `pchar`. After decoding, the path
+  obeys the [path-safety rules](#path-safety-rules-creation-time-invariants):
+  it is relative, UTF-8, and has no empty, `.` or `..` segment. It
+  matches exactly one manifest `path`, byte for byte, with no glob
+  semantics.
+- **`ns`** is the namespace id in decimal. It is a routing hint, not part
+  of the identity ([ADR 002](002-content-addressing.md#adr-002-content-addressing)),
+  so it is in the query and not in the path. No `ns` means no namespace.
+  `ns=0` is an error. Any other query key is an error.
+
+The URI is client-side syntax only. It resolves to the hash and the
+`namespace_id` that the wire already carries. Nodes and the protocol do
+not see it.
+
+A URI with the wrong form gives a clear result:
+
+- `decdn:<hash>/` on a blob that is not a manifest fails when the client
+  parses the manifest.
+- `decdn:<hash>` on a manifest returns the manifest JSON bytes. Use this
+  form to fetch a raw manifest.
+
 ## Relationship to [ADR 002](002-content-addressing.md#adr-002-content-addressing) / [ADR 013](013-schema-evolution.md#adr-013-schema-evolution)
 
 - [ADR 002](002-content-addressing.md#adr-002-content-addressing) declares multi-file an

@@ -20,6 +20,12 @@ use clap::{ArgGroup, Args, Subcommand};
 
 use super::fetch::ClientFetchArgs;
 
+/// The default `--jobs` of a bundle pull.
+pub const DEFAULT_JOBS: usize = 4;
+
+/// The default `--max-lane-streams` of a bundle pull.
+pub const DEFAULT_MAX_LANE_STREAMS: u16 = 4;
+
 /// Top-level `decdn bundle` group.
 #[derive(Args, Debug)]
 pub struct BundleArgs {
@@ -77,7 +83,7 @@ pub struct BundlePullArgs {
     /// chunks it splices gives its slot to a queued entry until then. A byte
     /// range a sibling entry already holds is spliced from disk, not fetched, so
     /// it never takes a slot of its own.
-    #[arg(long, value_name = "N", default_value_t = 4)]
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_JOBS)]
     pub jobs: usize,
 
     /// Maximum concurrent streams to one `(pool, signer, provider)` lane.
@@ -94,7 +100,7 @@ pub struct BundlePullArgs {
     #[arg(
         long,
         value_name = "N",
-        default_value_t = 4,
+        default_value_t = DEFAULT_MAX_LANE_STREAMS,
         value_parser = clap::value_parser!(u16).range(1..=64)
     )]
     pub max_lane_streams: u16,

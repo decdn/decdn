@@ -12,6 +12,7 @@ pub mod byte_size;
 pub mod common;
 pub mod config_cmd;
 pub mod fetch;
+pub mod get;
 pub mod key_gen;
 pub mod node;
 pub mod origin;
@@ -31,6 +32,7 @@ pub use common::{
 };
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
 pub use fetch::{ClientFetchArgs, FetchArgs};
+pub use get::GetArgs;
 pub use key_gen::KeyGenArgs;
 pub use node::{
     BondArgs, ChainArgs, DeregisterArgs, DoctorArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs,
@@ -117,6 +119,10 @@ pub enum Command {
     /// `cdn/client/v1` path, paying per-MB from the caller's own `PaymentPool`
     /// deposit.
     Fetch(FetchArgs),
+    /// Pull what a `decdn:` URI names: a blob (`decdn:<hash>`), a whole bundle
+    /// (`decdn:<hash>/`), or one bundle entry (`decdn:<hash>/<path>`), over the
+    /// paid `cdn/client/v1` path.
+    Get(GetArgs),
     /// Guided node onboarding (ADR 019 Phases 1–2): pre-flight checks,
     /// key generation, bond, and on-chain registration, with a final
     /// readiness summary. Thin orchestration over `key-gen` / `node bond` /
