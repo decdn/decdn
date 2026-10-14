@@ -686,6 +686,7 @@ async fn n_routes_share_one_getlogs_per_tick() {
             .unwrap_or_default()
     );
     let Ok(url) = parsed_url else { return };
+    decdn_common::tls::install_crypto_provider();
     let provider = ProviderBuilder::new().connect_http(url);
 
     let head: Arc<dyn HeadSource> = Arc::new(SharedHead::new(provider.clone(), INTERVAL));
@@ -2532,6 +2533,7 @@ async fn a_capped_provider_backfill_recovers_and_the_span_sticks() {
     let parsed_url = server.uri().parse();
     assert!(parsed_url.is_ok(), "mock server uri must parse");
     let Ok(url) = parsed_url else { return };
+    decdn_common::tls::install_crypto_provider();
     let provider = ProviderBuilder::new().connect_http(url);
 
     let head_block = Arc::new(std::sync::atomic::AtomicU64::new(2_000));

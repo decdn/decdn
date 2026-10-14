@@ -1,12 +1,13 @@
 //! Wire types for the loopback admin JSON-RPC surface (`appendix-local-admin-http.md`).
 //!
-//! Shared between the daemon (which implements [`AdminRpcServer`] over a
+//! Shared between the daemon (which implements `AdminRpcServer` over a
 //! local cache + peer table) and the user CLI (which speaks
-//! [`AdminRpcClient`] from `decdn node …`). jsonrpsee's
-//! `#[rpc(server, client)]` macro consumes the source `AdminRpc` trait
-//! and emits separate `AdminRpcServer` / `AdminRpcClient` traits in its
-//! place; the original `AdminRpc` name is not a linkable rustdoc item,
-//! hence the bare backticks.
+//! [`AdminRpcClient`] from `decdn node …`). jsonrpsee's `#[rpc]` macro
+//! consumes the source `AdminRpc` trait and emits `AdminRpcClient` in its
+//! place, plus `AdminRpcServer` under the `admin-server` feature, which only
+//! the daemon enables: the client SDK and the CLI link no JSON-RPC server.
+//! The original `AdminRpc` name is not a linkable rustdoc item, hence the
+//! bare backticks.
 //!
 //! DTO fields are deliberately wire-only: no engine handles, no
 //! peer-table types, no daemon runtime types. They use simple owned
@@ -23,6 +24,9 @@
 //! handler today.
 
 use decdn_config_types::Hash;
+// The trait's `RpcResult<T>` returns are read by the macro, and only the
+// server half it emits names the type.
+#[cfg(feature = "admin-server")]
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObjectOwned;
@@ -649,7 +653,8 @@ pub const BUYER_POOL_UNAVAILABLE_CODE: i32 = -32_011;
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
 /// within `v1`, a breaking change cuts over to `admin_v2_...`.
-#[rpc(server, client, namespace = "admin_v1")]
+#[cfg_attr(feature = "admin-server", rpc(server, client, namespace = "admin_v1"))]
+#[cfg_attr(not(feature = "admin-server"), rpc(client, namespace = "admin_v1"))]
 pub trait AdminRpc {
     /// Return this node's identity and process uptime.
     #[method(name = "health")]

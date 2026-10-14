@@ -28,6 +28,8 @@ use crate::metrics::{Metrics, RpcMethod, RpcOutcome};
 /// [`RpcMetricsLayer`] in front of the transport, so the localhost poll
 /// default alloy derives from the URL is unchanged.
 pub(crate) fn metered_http_client(url: Url, metrics: &Arc<Metrics>) -> RpcClient {
+    // `.http` builds a reqwest client, which needs a rustls provider.
+    decdn_common::tls::install_crypto_provider();
     ClientBuilder::default()
         .layer(RpcMetricsLayer::new(Arc::clone(metrics)))
         .http(url)

@@ -228,6 +228,7 @@ async fn reset_broadcast_lane_survives_a_straggler_from_a_killed_forge() {
         .expect("parse anvil rpc url");
     let deployer: PrivateKeySigner = DEPLOYER_KEY.parse().expect("parse deployer key");
     let deployer_addr = deployer.address();
+    decdn_common::tls::install_crypto_provider();
     let provider: DynProvider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(deployer))
         .connect_http(url)

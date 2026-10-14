@@ -288,6 +288,8 @@ async fn spawn_anvil(manifest: Option<PathBuf>) -> anyhow::Result<AnvilProcess> 
             manifest: manifest.clone(),
         };
 
+        // Every provider this fixture hands out builds a reqwest client.
+        decdn_common::tls::install_crypto_provider();
         let url: reqwest::Url = rpc_url.parse().context("parse anvil rpc url")?;
         let admin: DynProvider = ProviderBuilder::new()
             .with_simple_nonce_management()

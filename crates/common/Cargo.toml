@@ -26,9 +26,16 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 jsonrpsee = { workspace = true }
+# `tls::install_crypto_provider`: ring as the process-wide rustls provider.
+rustls = { workspace = true }
 # Free-space probing (`disk.rs`): `statvfs` on Unix, `GetDiskFreeSpaceExW` on
 # Windows, behind one safe API (the workspace forbids `unsafe`).
 fs4 = { workspace = true }
+
+[features]
+# The admin RPC's server half (`AdminRpcServer`): only `decdn-node` serves it,
+# so the client SDK and the CLI link the client half alone (#2454).
+admin-server = ["jsonrpsee/server"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -12,6 +12,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn with_poll_interval_overrides_alloy_local_default() {
     let url: alloy::transports::http::reqwest::Url =
         "http://127.0.0.1:8545".parse().expect("static URL parses");
+    decdn_common::tls::install_crypto_provider();
     let bare = ProviderBuilder::new().connect_http(url.clone());
     // Precondition: alloy seeds the 250 ms localhost default we are fixing.
     assert_eq!(bare.client().poll_interval(), Duration::from_millis(250));
@@ -681,6 +682,7 @@ async fn rpc_watchdog_tracks_endpoint_transitions() {
     let server = MockServer::start().await;
     mount_healthy(&server).await;
 
+    decdn_common::tls::install_crypto_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -734,6 +736,7 @@ async fn rpc_watchdog_tracks_endpoint_transitions() {
 /// node on a transient startup 429 or retry a genuine misconfig to budget.
 #[tokio::test]
 async fn preflight_classifier_maps_statuses_to_verdicts() {
+    decdn_common::tls::install_crypto_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -799,6 +802,7 @@ impl wiremock::Respond for FlakyThenHealthy {
 
 /// Build the 5s-timeout preflight client the production path uses.
 fn preflight_client() -> reqwest::Client {
+    decdn_common::tls::install_crypto_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

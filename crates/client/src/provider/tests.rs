@@ -133,3 +133,19 @@ fn invalid_rpc_url_is_redacted_from_both_builders() {
         assert!(!msg.contains("SECRETKEY123"), "the URL leaked: {msg}");
     }
 }
+
+/// reqwest is built with `rustls-no-provider` and panics in `Client::build`
+/// with no process-wide rustls provider. An SDK host that installs none must
+/// still get a chain client, so each builder installs ring itself. nextest
+/// runs each test in its own process, so nothing installed one beforehand.
+#[test]
+fn read_builder_works_with_no_provider_installed() {
+    assert!(build_read_provider("https://rpc.example").is_ok());
+}
+
+/// The wallet-filled builder installs the provider too; see
+/// [`read_builder_works_with_no_provider_installed`].
+#[test]
+fn wallet_builder_works_with_no_provider_installed() {
+    assert!(build_provider("https://rpc.example", &PrivateKeySigner::random()).is_ok());
+}
