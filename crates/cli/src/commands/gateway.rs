@@ -19,9 +19,10 @@
 //! no two callers see the same address and none can follow the user across
 //! sites; a key no capability claims within [`PENDING_TTL`] is dropped. A
 //! caller is a web page by its `http(s)` `Origin`, or the gateway token holder
-//! from outside any page. Each page origin holds at most a few keys, pending
-//! or registered, within a bound shared by all pages; the token holder mints
-//! outside both bounds.
+//! from outside any page. The pages of one site (a registrable domain by the
+//! Public Suffix List, so subdomains share it) hold at most a few keys,
+//! pending or registered, within a bound shared by all pages; the token
+//! holder mints outside both bounds.
 //! `PUT /_capability` registers a `dcap1:` capability issued to a minted
 //! address, with a scope. The capability's owner signature must recover the
 //! on-chain owner of its pool on the gateway's deployment. A page registers
@@ -82,9 +83,10 @@ pub const HOST_HEADER: &str = "x-decdn-host";
 /// How long a minted delegate waits for a capability before it is dropped.
 pub const PENDING_TTL: Duration = Duration::from_mins(15);
 
-/// The most live delegates, pending or registered, one page origin holds, so
-/// no page can use up another's room or stock capabilities without bound.
-const MAX_DELEGATES_PER_ORIGIN: usize = 8;
+/// The most live delegates, pending or registered, the pages of one site
+/// hold, so no site can use up another's room or stock capabilities without
+/// bound, however many subdomains it serves pages from.
+const MAX_DELEGATES_PER_SITE: usize = 8;
 
 /// The most live delegates all pages hold together: the gateway holds page
 /// keys within a fixed bound.
@@ -430,6 +432,24 @@ impl Caller {
             Self::Token => None,
         }
     }
+
+    /// The page's site, or `None` for the token holder.
+    fn site(&self) -> Option<String> {
+        match self {
+            Self::Page { host, .. } => Some(site(host)),
+            Self::Token => None,
+        }
+    }
+}
+
+/// The site `host` belongs to: its registrable domain by the Public Suffix
+/// List (`a.b.example.co.uk` gives `example.co.uk`), or the host itself for an
+/// IP address and a name with no registrable domain, such as `localhost`.
+fn site(host: &str) -> String {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host.to_owned();
+    }
+    psl::domain_str(host).unwrap_or(host).to_owned()
 }
 
 /// Whether `caller` may register `scope`: a page only a scope that covers its
@@ -464,30 +484,27 @@ fn owner_matches(on_chain: Address, signed_by: Address, pool_id: PoolId) -> Resu
 struct Delegate {
     signer: Arc<PrivateKeySigner>,
     minted: Instant,
-    /// The page origin that minted it, or `None` for the token holder.
-    minter: Option<String>,
+    /// The site of the page that minted it, or `None` for the token holder.
+    site: Option<String>,
     capability: Option<Registered>,
 }
 
-/// Whether `minter` may mint one more delegate beside `delegates`. Pages
-/// share [`MAX_PAGE_DELEGATES`] and each origin holds at most
-/// [`MAX_DELEGATES_PER_ORIGIN`], pending or registered; the token holder
-/// mints outside both bounds, so no page can stop the user's own handshake.
-fn may_mint(delegates: &HashMap<Address, Delegate>, minter: Option<&str>) -> Result<(), String> {
-    let Some(origin) = minter else {
+/// Whether a page of `site` may mint one more delegate beside `delegates`.
+/// Pages share [`MAX_PAGE_DELEGATES`] and each site holds at most
+/// [`MAX_DELEGATES_PER_SITE`], pending or registered; the token holder
+/// (`None`) mints outside both bounds, so no page can stop the user's own
+/// handshake.
+fn may_mint(delegates: &HashMap<Address, Delegate>, site: Option<&str>) -> Result<(), String> {
+    let Some(site) = site else {
         return Ok(());
     };
-    let pages = || delegates.values().filter(|d| d.minter.is_some());
+    let pages = || delegates.values().filter(|d| d.site.is_some());
     if pages().count() >= MAX_PAGE_DELEGATES {
         return Err("too many pages hold delegates\n".to_owned());
     }
-    if pages()
-        .filter(|d| d.minter.as_deref() == Some(origin))
-        .count()
-        >= MAX_DELEGATES_PER_ORIGIN
-    {
+    if pages().filter(|d| d.site.as_deref() == Some(site)).count() >= MAX_DELEGATES_PER_SITE {
         return Err(format!(
-            "{origin} holds {MAX_DELEGATES_PER_ORIGIN} delegates\n"
+            "pages of {site} hold {MAX_DELEGATES_PER_SITE} delegates\n"
         ));
     }
     Ok(())
@@ -678,7 +695,8 @@ impl Gateway {
     async fn mint(&self, caller: &Caller) -> Response<Body> {
         let mut delegates = self.delegates.lock().await;
         Self::prune(&mut delegates);
-        if let Err(e) = may_mint(&delegates, caller.origin()) {
+        let site = caller.site();
+        if let Err(e) = may_mint(&delegates, site.as_deref()) {
             return text(StatusCode::TOO_MANY_REQUESTS, &e);
         }
         let signer = PrivateKeySigner::random();
@@ -688,7 +706,7 @@ impl Gateway {
             Delegate {
                 signer: Arc::new(signer),
                 minted: Instant::now(),
-                minter: caller.origin().map(str::to_owned),
+                site,
                 capability: None,
             },
         );

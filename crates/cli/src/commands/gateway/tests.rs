@@ -225,11 +225,11 @@ fn a_later_registration_never_shadows_an_earlier_one() {
     assert!(incumbent.preference() > newcomer.preference());
 }
 
-fn delegate(minter: Option<&str>, capability: Option<Registered>) -> Delegate {
+fn delegate(site: Option<&str>, capability: Option<Registered>) -> Delegate {
     Delegate {
         signer: Arc::new(PrivateKeySigner::random()),
         minted: Instant::now(),
-        minter: minter.map(str::to_owned),
+        site: site.map(str::to_owned),
         capability,
     }
 }
@@ -239,25 +239,44 @@ fn insert(delegates: &mut HashMap<Address, Delegate>, d: Delegate) {
 }
 
 #[test]
-fn each_origin_keeps_its_own_room() {
+fn a_site_is_the_registrable_domain() {
+    assert_eq!(site("decdn.org"), "decdn.org");
+    assert_eq!(site("a.b.decdn.org"), "decdn.org");
+    assert_eq!(site("www.example.co.uk"), "example.co.uk");
+    // A public suffix that hosts user sites keeps each user apart.
+    assert_eq!(site("alice.github.io"), "alice.github.io");
+    assert_eq!(site("x.alice.github.io"), "alice.github.io");
+    assert_eq!(site("127.0.0.1"), "127.0.0.1");
+    assert_eq!(site("localhost"), "localhost");
+}
+
+#[test]
+fn the_pages_of_one_site_share_its_room() {
+    let page = |origin| page(origin).site();
+    assert_eq!(
+        page("https://a.evil.example.com"),
+        page("https://b.evil.example.com")
+    );
     let mut delegates = HashMap::new();
-    for _ in 0..MAX_DELEGATES_PER_ORIGIN {
-        insert(&mut delegates, delegate(Some("https://evil.example"), None));
+    for _ in 0..MAX_DELEGATES_PER_SITE {
+        insert(&mut delegates, delegate(Some("example.com"), None));
     }
-    assert!(may_mint(&delegates, Some("https://evil.example")).is_err());
-    assert!(may_mint(&delegates, Some("https://decdn.org")).is_ok());
+    assert!(may_mint(&delegates, Some("example.com")).is_err());
+    assert!(may_mint(&delegates, Some("decdn.org")).is_ok());
     assert!(may_mint(&delegates, None).is_ok());
 }
 
 #[test]
-fn registering_does_not_free_an_origins_room() {
-    let origin = "https://evil.example";
+fn registering_does_not_free_a_sites_room() {
     let mut delegates = HashMap::new();
-    for _ in 0..MAX_DELEGATES_PER_ORIGIN {
-        let capability = registered("*", Some(origin), Instant::now());
-        insert(&mut delegates, delegate(Some(origin), Some(capability)));
+    for _ in 0..MAX_DELEGATES_PER_SITE {
+        let capability = registered("*", Some("https://evil.example"), Instant::now());
+        insert(
+            &mut delegates,
+            delegate(Some("evil.example"), Some(capability)),
+        );
     }
-    assert!(may_mint(&delegates, Some(origin)).is_err());
+    assert!(may_mint(&delegates, Some("evil.example")).is_err());
 }
 
 #[test]
@@ -266,10 +285,10 @@ fn pages_stop_at_the_global_bound_and_the_token_holder_does_not() {
     for n in 0..MAX_PAGE_DELEGATES {
         insert(
             &mut delegates,
-            delegate(Some(&format!("https://{n}.example")), None),
+            delegate(Some(&format!("site{n}.example")), None),
         );
     }
-    assert!(may_mint(&delegates, Some("https://decdn.org")).is_err());
+    assert!(may_mint(&delegates, Some("decdn.org")).is_err());
     assert!(may_mint(&delegates, None).is_ok());
 }
 
@@ -341,7 +360,7 @@ async fn head_never_starts_a_pull() {
 }
 
 #[tokio::test]
-async fn minting_needs_a_page_origin_or_the_token_and_stops_per_origin() {
+async fn minting_needs_a_page_origin_or_the_token_and_stops_per_site() {
     let gateway = test_gateway();
     assert_eq!(
         call(&gateway, Method::GET, "/_delegate", &[], "").await,
@@ -358,15 +377,20 @@ async fn minting_needs_a_page_origin_or_the_token_and_stops_per_origin() {
         .await,
         StatusCode::OK
     );
-    let page = [(header::ORIGIN.as_str(), "https://evil.example")];
-    for _ in 0..MAX_DELEGATES_PER_ORIGIN {
-        assert_eq!(
-            call(&gateway, Method::GET, "/_delegate", &page, "").await,
-            StatusCode::OK
-        );
+    // Every page is a fresh subdomain of one site, as with wildcard DNS.
+    let mint = |n: usize| {
+        let gateway = Arc::clone(&gateway);
+        async move {
+            let origin = format!("https://p{n}.evil.com");
+            let page = [(header::ORIGIN.as_str(), origin.as_str())];
+            call(&gateway, Method::GET, "/_delegate", &page, "").await
+        }
+    };
+    for n in 0..MAX_DELEGATES_PER_SITE {
+        assert_eq!(mint(n).await, StatusCode::OK);
     }
     assert_eq!(
-        call(&gateway, Method::GET, "/_delegate", &page, "").await,
+        mint(MAX_DELEGATES_PER_SITE).await,
         StatusCode::TOO_MANY_REQUESTS
     );
 }
@@ -533,7 +557,7 @@ fn prune_drops_stale_pending_and_expired_delegates() {
             Delegate {
                 signer: Arc::new(signer.clone()),
                 minted,
-                minter: None,
+                site: None,
                 capability: None,
             },
         );
