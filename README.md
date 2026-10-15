@@ -10,6 +10,8 @@
 [![MSRV](https://img.shields.io/crates/msrv/decdn-client?logo=rust&label=MSRV)](Cargo.toml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Docs](https://img.shields.io/badge/docs-docs.decdn.org-informational)](https://docs.decdn.org)
+[![Website](https://img.shields.io/badge/web-decdn.org-informational)](https://decdn.org)
+[![Stats](https://img.shields.io/badge/stats-stats.decdn.org-informational)](https://stats.decdn.org)
 
 A decentralized CDN. Bonded operators cache and serve BLAKE3-addressed blobs over
 [iroh](https://iroh.computer/) QUIC, and clients pay for every megabyte in USDC through
@@ -19,6 +21,8 @@ byte against its content hash, so any node can serve any blob without being trus
 The implementation is Rust. The test network runs on Arbitrum Sepolia; production targets
 Arbitrum One. The contracts ship at full production shape, with governance-tunable
 economics from day one ([ADR 016](adr/016-contract-interactions.md)).
+
+**[Website](https://decdn.org)** · **[Documentation](https://docs.decdn.org)** · **[Network stats](https://stats.decdn.org)**
 
 ## Status
 
@@ -297,6 +301,9 @@ and [`adr/architecture.md`](adr/architecture.md) is the living overview.
 
 | Topic | Where |
 |-------|-------|
+| Project overview | [decdn.org](https://decdn.org) |
+| User and operator docs | [docs.decdn.org](https://docs.decdn.org) |
+| Live testnet statistics | [stats.decdn.org](https://stats.decdn.org) |
 | Protocol specification (ADRs) and glossary | [`adr/`](adr/), [`adr/glossary.md`](adr/glossary.md) |
 | Operating a node | [Operator runbook](docs/runbook.md), [key rotation](adr/appendix-operator-key-rotation.md), [upgrade path](adr/appendix-operator-upgrade-path.md) |
 | Monitoring | [Dashboards and alert rules](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring) (in `decdn/devops`); [metric surface](adr/appendix-observability.md) |
