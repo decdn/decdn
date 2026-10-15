@@ -10,8 +10,13 @@
 //! - `decdn:<hash>/<path>` runs the bundle pull for exactly that entry.
 //!
 //! The URI's `ns` is the namespace hint of either route.
+//!
+//! Without `-o`, the destination follows the target: `./<hash>` for a blob,
+//! `.` for a bundle, and `./<name>` for an entry, where `<name>` is the last
+//! segment of the entry's path. The command then names the destination on
+//! stderr before the pull starts.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use decdn_client::uri::{DecdnUri, UriTarget};
@@ -25,9 +30,62 @@ use decdn_common::cli::GetArgs;
 /// route fails.
 pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let uri = parse_and_check(args)?;
+    let dest = Destination::of(args, &uri);
+    if args.output.is_none() && !args.json && !args.dry_run {
+        eprintln!("Downloading to {}", dest.shown(&uri).display());
+    }
     match uri.target {
-        UriTarget::Blob => super::fetch::fetch(args, &uri, config_path).await,
-        _ => super::bundle_pull::bundle_pull(args, &uri, config_path).await,
+        UriTarget::Blob => super::fetch::fetch(args, &dest.root, &uri, config_path).await,
+        _ => super::bundle_pull::bundle_pull(args, &dest, &uri, config_path).await,
+    }
+}
+
+/// Where a `decdn get` run writes: `-o`, or the default for the URI's target.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Destination {
+    /// The blob's destination file, or the bundle's output root.
+    pub(crate) root: PathBuf,
+    /// Whether the entry an entry URI names lands at its file name directly in
+    /// `root`, not at its full path under `root`. Set only without `-o`.
+    pub(crate) flatten: bool,
+}
+
+impl Destination {
+    /// The destination of `args` for `uri`: `-o` as given, or else
+    /// `./<hash>` for a blob, and `.` for a bundle or an entry, with the entry
+    /// flattened to its file name.
+    pub(crate) fn of(args: &GetArgs, uri: &DecdnUri) -> Self {
+        if let Some(output) = &args.output {
+            return Self {
+                root: output.clone(),
+                flatten: false,
+            };
+        }
+        match &uri.target {
+            UriTarget::Blob => Self {
+                root: Path::new(".").join(blake3::Hash::from_bytes(uri.hash).to_hex().as_str()),
+                flatten: false,
+            },
+            UriTarget::BundleEntry(_) => Self {
+                root: PathBuf::from("."),
+                flatten: true,
+            },
+            _ => Self {
+                root: PathBuf::from("."),
+                flatten: false,
+            },
+        }
+    }
+
+    /// The path to name for the user: the entry's file for a flattened entry,
+    /// and `root` otherwise.
+    fn shown(&self, uri: &DecdnUri) -> PathBuf {
+        match &uri.target {
+            UriTarget::BundleEntry(path) if self.flatten => Path::new(path)
+                .file_name()
+                .map_or_else(|| self.root.clone(), |name| self.root.join(name)),
+            _ => self.root.clone(),
+        }
     }
 }
 
@@ -60,7 +118,7 @@ fn parse_and_check(args: &GetArgs) -> anyhow::Result<DecdnUri> {
         _ => {}
     }
     anyhow::ensure!(
-        args.output != Path::new("-"),
+        args.output.as_deref() != Some(Path::new("-")),
         "`-o -` (stdout) takes a blob URI (`decdn:<hash>`); a bundle needs an output directory"
     );
     Ok(uri)

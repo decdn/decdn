@@ -2,7 +2,9 @@ use clap::Parser as _;
 use decdn_client::uri::UriTarget;
 use decdn_common::cli::{Cli, Command, GetArgs};
 
-use super::parse_and_check;
+use std::path::PathBuf;
+
+use super::{Destination, parse_and_check};
 
 const HEX: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
 
@@ -106,4 +108,51 @@ fn the_old_commands_are_gone() {
     for argv in argvs {
         assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
     }
+}
+
+#[test]
+fn output_defaults_follow_the_uri_target() {
+    let cases = [
+        (
+            format!("decdn:{HEX}"),
+            format!("./{HEX}"),
+            false,
+            format!("./{HEX}"),
+        ),
+        (
+            format!("decdn:{HEX}/"),
+            ".".to_owned(),
+            false,
+            ".".to_owned(),
+        ),
+        (
+            format!("decdn:{HEX}/models/a.bin"),
+            ".".to_owned(),
+            true,
+            "./a.bin".to_owned(),
+        ),
+    ];
+    for (uri, root, flatten, shown) in cases {
+        let args = get_args(&[&uri]);
+        let parsed = parse_and_check(&args).unwrap();
+        let dest = Destination::of(&args, &parsed);
+        assert_eq!(dest.root, PathBuf::from(&root), "{uri}");
+        assert_eq!(dest.flatten, flatten, "{uri}");
+        assert_eq!(dest.shown(&parsed), PathBuf::from(&shown), "{uri}");
+    }
+}
+
+#[test]
+fn an_explicit_output_is_kept_as_given() {
+    let uri = format!("decdn:{HEX}/models/a.bin");
+    let args = get_args(&[&uri, "-o", "dir"]);
+    let parsed = parse_and_check(&args).unwrap();
+    let dest = Destination::of(&args, &parsed);
+    assert_eq!(
+        dest,
+        Destination {
+            root: PathBuf::from("dir"),
+            flatten: false
+        }
+    );
 }

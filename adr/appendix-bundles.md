@@ -388,6 +388,11 @@ entry is an error. The rules below apply to every pull:
   resume), and `--overwrite` forces a re-fetch. The skip check accepts a
   file by its hash. A saved record whose size and mtime match is a fast
   path. Without a match, the pull hashes the file against the manifest.
+- **Default destination.** `-o` is optional. Without it, a blob lands at
+  `./<hash>` and a bundle lands in `.`. An entry URI lands at `./<name>`.
+  `<name>` is the last segment of the entry's path. The pull does not make
+  the entry's parent directories. The command names the destination on
+  stderr before the pull starts.
 - **`--dry-run`** reports the plan without any network/chain activity.
   The plan lists entries only when an earlier pull into the same `-o`
   directory cached the bundle manifest under `.decdn-bundles/`. Without

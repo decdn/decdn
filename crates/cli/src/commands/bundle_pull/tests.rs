@@ -535,7 +535,7 @@ async fn dry_run_still_rejects_a_dangling_provider_address() {
         &uri,
         &["-o", "out", "--dry-run", "--provider-address", addr],
     );
-    let err = super::bundle_pull(&args, &uri, None)
+    let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
         .await
         .expect_err("a dangling --provider-address must be rejected even for --dry-run");
     assert!(
@@ -570,12 +570,12 @@ async fn dry_run_reads_a_cached_manifest() {
             &format!("decdn:{hash}/openai-gpt-oss-20b/config.json"),
             &extra,
         );
-        super::bundle_pull(&args, &uri, None)
+        super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
             .await
             .unwrap_or_else(|e| panic!("overwrite={overwrite}: {e:#}"));
 
         let (args, uri) = get_args(&format!("decdn:{hash}/openai-gpt-oss-20b/no.json"), &extra);
-        let err = super::bundle_pull(&args, &uri, None)
+        let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
             .await
             .expect_err("the cached manifest has no such entry");
         assert!(format!("{err:#}").contains("no entry"), "{err:#}");
@@ -592,7 +592,9 @@ async fn dry_run_has_no_manifest_for_an_uncached_hash() {
         &format!("decdn:{}/", "ab".repeat(32)),
         &["-o", out, "--dry-run"],
     );
-    super::bundle_pull(&args, &uri, None).await.unwrap();
+    super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
+        .await
+        .unwrap();
 }
 
 /// The full dry run reads the cached manifest: a cached blob that hashes to
@@ -607,7 +609,7 @@ async fn dry_run_fails_on_a_cached_manifest_that_does_not_parse() {
         &serde_json::json!({"version": 2, "entries": []}),
     );
     let (args, uri) = get_args(&format!("decdn:{hash}/"), &["-o", out, "--dry-run"]);
-    let err = super::bundle_pull(&args, &uri, None)
+    let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
         .await
         .expect_err("a cached non-v1 manifest fails the dry run");
     let msg = format!("{err:#}");
@@ -638,7 +640,7 @@ async fn dry_run_fails_naming_an_unreadable_cached_manifest() {
     // A directory at the cache path is unreadable as a file, even as root.
     std::fs::create_dir_all(BundleManifest::cache_path(tmp.path(), raw)).expect("mkdir");
     let (args, uri) = get_args(&format!("decdn:{hex}/"), &["-o", out, "--dry-run"]);
-    let err = super::bundle_pull(&args, &uri, None)
+    let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
         .await
         .expect_err("an unreadable cached manifest fails the dry run");
     let msg = format!("{err:#}");
@@ -661,7 +663,7 @@ async fn dry_run_fails_naming_a_cached_manifest_that_fails_its_hash_check() {
     let raw = fetch::parse_hash(&hash).expect("hash");
     std::fs::write(BundleManifest::cache_path(tmp.path(), raw), b"tampered").expect("tamper");
     let (args, uri) = get_args(&format!("decdn:{hash}/"), &["-o", out, "--dry-run"]);
-    let err = super::bundle_pull(&args, &uri, None)
+    let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
         .await
         .expect_err("a tampered cached manifest fails the dry run");
     let msg = format!("{err:#}");
@@ -868,4 +870,15 @@ fn entry_filter_double_star_recurses() {
 #[test]
 fn entry_filter_can_empty_the_set() {
     assert!(filtered_paths(&["no/such/*"], &[], sample()).is_empty());
+}
+
+#[test]
+fn a_flattened_entry_filter_keeps_the_file_name_only() {
+    let mut filter = EntryFilter::compile(Some("models/v1/c.bin".to_owned()), &[], &[]).unwrap();
+    filter.flatten = true;
+    let entries = vec![sel_entry("models/v1/c.bin", 3), sel_entry("d.bin", 4)];
+    let (kept, excluded) = filter.apply_and_warn(entries).unwrap();
+    let paths: Vec<&str> = kept.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["c.bin"]);
+    assert_eq!(excluded, 1);
 }
