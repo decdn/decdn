@@ -12,6 +12,8 @@
 [![Docs](https://img.shields.io/badge/docs-docs.decdn.org-informational)](https://docs.decdn.org)
 [![Website](https://img.shields.io/badge/web-decdn.org-informational)](https://decdn.org)
 [![Stats](https://img.shields.io/badge/stats-stats.decdn.org-informational)](https://stats.decdn.org)
+[![Discord](https://img.shields.io/badge/chat-Discord-5865F2?logo=discord&logoColor=white)](https://discord.gg/vVbNswKVGX)
+[![X](https://img.shields.io/badge/follow-@decdn__-black?logo=x)](https://x.com/decdn_)
 
 A decentralized CDN. Bonded operators cache and serve BLAKE3-addressed blobs over
 [iroh](https://iroh.computer/) QUIC, and clients pay for every megabyte in USDC through
@@ -22,7 +24,7 @@ The implementation is Rust. The test network runs on Arbitrum Sepolia; productio
 Arbitrum One. The contracts ship at full production shape, with governance-tunable
 economics from day one ([ADR 016](adr/016-contract-interactions.md)).
 
-**[Website](https://decdn.org)** · **[Documentation](https://docs.decdn.org)** · **[Network stats](https://stats.decdn.org)**
+**[Website](https://decdn.org)** · **[Documentation](https://docs.decdn.org)** · **[Network stats](https://stats.decdn.org)** · **[Discord](https://discord.gg/vVbNswKVGX)** · **[X](https://x.com/decdn_)**
 
 ## Status
 
