@@ -3456,6 +3456,12 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: `decdn get` takes `-o` as optional.** Without it, a blob lands at
+  `./<hash>`, a bundle in `.`, and an entry URI (`decdn:<hash>/<path>`) at
+  `./<name>`, the last segment of its path, with no parent directories. The
+  command prints `Downloading to <path>` on stderr before the pull starts
+  (not under `--json` or `--dry-run`). An explicit `-o` keeps its meaning.
+
 - **Release: Docker Hub overviews for `decdn/decdn-node` and `decdn/decdn`
   (#2440).** Each image's Hub short description and overview live in
   `docker/README.<stage>.md`. `sign-release.sh` pushes them after the Docker
