@@ -77,7 +77,7 @@ use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
 
-use super::fetch::{BlobFetch, Credential, resolve_chain};
+use super::fetch::{BlobFetch, Credential, MAX_MANIFEST_BYTES, resolve_chain};
 use crate::known_chains;
 
 mod worker;
@@ -113,9 +113,6 @@ const GIVE_UP_AFTER_SECS: u64 = 120;
 /// pull stripes across up to `--max-sources` holders, so this also bounds the
 /// streams the gateway opens on one node's connection.
 const MAX_PULLS: usize = 16;
-
-/// The largest bundle manifest the gateway reads into memory.
-const MAX_MANIFEST_BYTES: usize = 64 << 20;
 
 /// The most parsed manifests the gateway keeps.
 const MAX_CACHED_MANIFESTS: usize = 16;

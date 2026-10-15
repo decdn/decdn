@@ -71,13 +71,33 @@ fn make_blob() -> Vec<u8> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_fetch_dash_streams_verified_bytes_to_stdout() -> anyhow::Result<()> {
-    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run(Target::Blob)))
         .await
         .context("cli get -o - e2e exceeded the overall timeout")??;
     Ok(())
 }
 
-async fn run() -> anyhow::Result<()> {
+/// `decdn get decdn:<manifest>/<path> -o -`: the CLI reads the manifest, then
+/// streams that one entry's verified bytes to stdout.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_get_entry_dash_streams_the_entry_to_stdout() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run(Target::Entry)))
+        .await
+        .context("cli get entry -o - e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+/// What the URI names: the blob itself, or the blob as an entry of a bundle.
+#[derive(Clone, Copy)]
+enum Target {
+    Blob,
+    Entry,
+}
+
+/// The manifest path the entry test names.
+const ENTRY_PATH: &str = "clips/clip.bin";
+
+async fn run(target: Target) -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .try_init();
@@ -87,12 +107,23 @@ async fn run() -> anyhow::Result<()> {
 
     let blob = make_blob();
     let blob_hash = Hash::new(&blob);
-    let (holder, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice()]).await?;
+    let manifest = format!(
+        r#"{{"version":1,"entries":[{{"path":"{ENTRY_PATH}","hash":"{}"}}]}}"#,
+        blob_hash.to_hex(),
+    )
+    .into_bytes();
+    let manifest_hash = Hash::new(&manifest);
+    let (holder, hashes) =
+        NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice(), manifest.as_slice()])
+            .await?;
     anyhow::ensure!(
-        hashes.first() == Some(&blob_hash),
-        "holder seeded blob hash mismatch: {:?} vs {blob_hash}",
-        hashes.first()
+        hashes == [blob_hash, manifest_hash],
+        "holder seeded hashes mismatch: {hashes:?} vs [{blob_hash}, {manifest_hash}]"
     );
+    let uri = match target {
+        Target::Blob => format!("decdn:{}", blob_hash.to_hex()),
+        Target::Entry => format!("decdn:{}/{ENTRY_PATH}", manifest_hash.to_hex()),
+    };
 
     // Funded buyer with an on-disk keystore under a `0o700` client data dir (the
     // `RedbBuyerPoolStore` the CLI opens enforces the mode; `tempdir` is `0o755`).
@@ -117,7 +148,7 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("mint buyer USDC")?;
 
-    let args = fetch_argv(&chain, &blob_hash, client_dir.path(), &keystore);
+    let args = fetch_argv(&chain, &uri, client_dir.path(), &keystore);
 
     // The node's chain watcher observes the freshly-opened pool asynchronously; a
     // pre-serve refusal before it catches up is retryable, so retry until one
@@ -199,16 +230,16 @@ fn billed_bytes(
     Ok(u64::try_from(billed).unwrap_or(u64::MAX))
 }
 
-/// The `decdn get` argv (after the `get` subcommand) to stream `hash` to
-/// stdout via auto-discovery, writing to `-o -`.
+/// The `decdn get` argv (after the `get` subcommand) to stream what `uri`
+/// names to stdout via auto-discovery, writing to `-o -`.
 fn fetch_argv(
     chain: &ChainFixture,
-    hash: &Hash,
+    uri: &str,
     data_dir: &std::path::Path,
     keystore: &std::path::Path,
 ) -> Vec<String> {
     vec![
-        format!("decdn:{}", hash.to_hex()),
+        uri.to_owned(),
         "-o".into(),
         "-".into(),
         "--capacity-bond-address".into(),

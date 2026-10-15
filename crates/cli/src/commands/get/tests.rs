@@ -4,7 +4,7 @@ use decdn_common::cli::{Cli, Command, GetArgs};
 
 use std::path::PathBuf;
 
-use super::{Destination, parse_and_check};
+use super::{Destination, parse_and_check, streams_one_blob};
 
 const HEX: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
 
@@ -87,10 +87,29 @@ fn entry_filters_rejected_on_entry_uri() {
 
 #[test]
 fn stdout_rejected_on_bundle_uri() {
-    for uri in [format!("decdn:{HEX}/"), format!("decdn:{HEX}/a.txt")] {
-        let err = err_of(&[&uri, "-o", "-"]);
-        assert!(err.contains("stdout"), "{err}");
-    }
+    let err = err_of(&[&format!("decdn:{HEX}/"), "-o", "-"]);
+    assert!(err.contains("stdout"), "{err}");
+}
+
+#[test]
+fn entry_uri_streams_to_stdout_as_one_blob() {
+    let uri = format!("decdn:{HEX}/sintel/Sintel.mkv?ns=1");
+    let args = get_args(&[&uri, "-o", "-"]);
+    let parsed = parse_and_check(&args).unwrap();
+    assert!(streams_one_blob(&args, &parsed));
+    let to_dir = get_args(&[&uri, "-o", "dir"]);
+    assert!(!streams_one_blob(
+        &to_dir,
+        &parse_and_check(&to_dir).unwrap()
+    ));
+}
+
+#[test]
+fn bundle_flags_rejected_on_entry_uri_to_stdout() {
+    let uri = format!("decdn:{HEX}/a.txt");
+    let err = err_of(&[&uri, "-o", "-", "--jobs", "2", "--overwrite"]);
+    assert!(err.contains("--jobs, --overwrite"), "{err}");
+    assert!(err.contains("-o -"), "{err}");
 }
 
 #[test]
