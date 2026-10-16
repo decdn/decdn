@@ -151,23 +151,27 @@ async fn server_upstream_pool_id(
 ) -> anyhow::Result<B256> {
     let admin = seeder.admin_client()?;
     let payer_hex = server_operator.to_string();
-    let pool_hex = decdn_e2e::poll(Duration::from_secs(30), || async {
+    // A node buyer signs with its operator key, so find the lane by signer, then
+    // check the seeder names the same key as the pool's owner.
+    let lane = decdn_e2e::poll(Duration::from_secs(30), || async {
         let resp = admin.lanes().await.context("admin lanes")?;
         Ok(resp
             .lanes
             .into_iter()
-            .find(|s| {
-                s.counterparty
-                    .as_deref()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&payer_hex))
-            })
-            .map(|s| s.pool_id))
+            .find(|s| s.voucher_signer.eq_ignore_ascii_case(&payer_hex)))
     })
     .await?
-    .with_context(|| format!("seeder never reported a buyer lane funded by {payer_hex}"))?;
-    pool_hex
+    .with_context(|| format!("seeder never reported a buyer lane signed by {payer_hex}"))?;
+    anyhow::ensure!(
+        lane.counterparty
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&payer_hex)),
+        "the lane signed by {payer_hex} must report it as the pool owner, got {:?}",
+        lane.counterparty
+    );
+    lane.pool_id
         .parse::<B256>()
-        .with_context(|| format!("seeder lane pool_id is not a B256: {pool_hex}"))
+        .with_context(|| format!("seeder lane pool_id is not a B256: {}", lane.pool_id))
 }
 
 /// A client fetch whose node-to-node pull costs more than the SERVER's working

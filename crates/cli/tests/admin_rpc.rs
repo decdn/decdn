@@ -35,6 +35,7 @@ use decdn_common::cli::{
 };
 use decdn_incentive::buyer_pool::{BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::{LaneState, MemoryBuyerPoolStore, MemoryPoolStateStore, PoolStateStore};
+use decdn_node::admin::pool_owners::PoolOwners;
 use decdn_node::admin::{
     self, AdminState, DhtStatusHandles, DrainTrigger, LaneActivityClock, LaneStatusHandles,
 };
@@ -228,8 +229,8 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
     store.record(&mk(1, 0xAA, 2_000_000))?;
     store.record(&mk(2, 0xBB, 100_000))?;
 
-    // The node has seen pool 1 open; pool 2 opened before its watcher's anchor
-    // and has admitted no request since, so its owner is unknown.
+    // The node has seen pool 1 open. Pool 2 is not in its pool view, and this
+    // state wires no chain source to read it from, so its owner is unknown.
     let owner = Address::repeat_byte(0x0F);
     let pool_view = PoolProjection::new();
     pool_view.record_opened(pool_id(1), owner, U256::from(10_000_000u64));
@@ -247,7 +248,7 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
         pool_store: store as Arc<dyn PoolStateStore>,
         lane_activity: LaneActivityClock::empty(),
         redeem_threshold_micro_usdc: 1_000_000,
-        pool_view,
+        pool_owners: PoolOwners::new(pool_view, None),
     });
     let (url, stop_tx, join) = spawn_admin(state).await?;
 

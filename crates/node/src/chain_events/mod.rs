@@ -107,7 +107,8 @@ pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// This helper guarantees only that a call is *bounded*. What a timeout **means**
 /// is the call site's decision, and each documents its own. The serve-admission
 /// reads in `ResolvingPoolView` (`getPool`, `getAuthorization`) refuse the
-/// request.
+/// request. The `admin_v1_lanes` owner read (`ChainPoolOwners`) reports that
+/// lane's owner as unknown for the one call.
 ///
 /// Takes `IntoFuture`, not `Future`, so an alloy `.call()` (which returns an
 /// `EthCall`, not a future) can be wrapped directly rather than each caller

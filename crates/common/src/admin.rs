@@ -394,19 +394,20 @@ pub struct LaneSnapshot {
     /// public key (a different identity type, not an EVM address). It is
     /// *not* necessarily the voucher signer — see [`Self::voucher_signer`].
     ///
-    /// Read from the node's event-fed pool view, with no chain call. `None`
-    /// when that view holds no entry for the pool: a pool opened before the
-    /// settlement watcher's anchor with no request admitted on it since the
-    /// node started, or a pool its owner has reclaimed. The node never
-    /// reports the signer in its place.
+    /// The node names the owner from its event-fed pool view, then from an
+    /// owner cache, then with one bounded `getPool` read. A lane the node
+    /// carries across a restart takes the read path on the first call. `None`
+    /// when that read fails or finds no such pool; the node logs the failure
+    /// and reads again on the next call. The node never reports the signer
+    /// in its place.
     pub counterparty: Option<String>,
     /// The capability signer authorizing vouchers on this lane
     /// (`LaneKey::signer`): the EIP-712 recovery target for every voucher,
     /// in the same EIP-55 rendering as [`Self::counterparty`]. Equal to the
     /// pool owner only when the owner signs its own vouchers, as a node buyer
-    /// does. A `decdn get` signs with a lane key derived for its data dir,
-    /// and a `--capability` client signs with the delegate key, so both
-    /// differ from the owner.
+    /// does. A `decdn get` on its own wallet's pool signs with a lane key
+    /// derived for its data dir, and a `decdn get --capability` signs with
+    /// the delegate key the capability names, so both differ from the owner.
     pub voucher_signer: String,
     /// Sequence number of the most-recently-accepted voucher. Not tracked
     /// in the shared-pool model (a pool has no per-lane nonce), so this

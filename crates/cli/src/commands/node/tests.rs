@@ -769,6 +769,13 @@ fn lanes_json_renders_an_unknown_counterparty_as_null() -> anyhow::Result<()> {
         .as_array()
         .and_then(|lanes| lanes.first())
         .ok_or_else(|| anyhow::anyhow!("one lane: {pretty}"))?;
+    // Present as `null`, not absent: `Value` indexing reads a missing key as
+    // `Null` too, so check the key itself.
+    assert!(
+        c0.as_object()
+            .is_some_and(|lane| lane.contains_key("counterparty")),
+        "counterparty key must be present: {pretty}"
+    );
     assert!(
         c0["counterparty"].is_null(),
         "counterparty must be null: {pretty}"

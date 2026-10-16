@@ -17,7 +17,8 @@
 //!
 //! - **Admission** ([`PoolView::status`]) MAY block. The production wrapper
 //!   ([`crate::payment_settlement::ResolvingPoolView`]) reads the projection first
-//!   and, on a miss (a pool opened before the watcher's cold-start head), does ONE
+//!   and, on a miss (a pool whose `PoolOpened` lies below the watcher's scan
+//!   start: the head on a first boot, the rewound checkpoint after a restart), does ONE
 //!   `getPool` to confirm the pool exists and is solvent BEFORE a serve is
 //!   admitted. An absent, closed, or errored pool yields `None` and the admit gate
 //!   refuses — it does not fail open.
@@ -344,13 +345,14 @@ impl PoolProjection {
     }
 
     /// Seed a pool the projection has NOT observed through the event log, from a
-    /// direct `getPool` snapshot (the lazy cold-start backfill). The settlement
-    /// watcher anchors at head (`ColdStart::Head`), so a pool opened before this
-    /// node's first-ever boot never appears in the
-    /// forward-only `PoolOpened` scan. A node onboarding as a NEW provider to such
-    /// a pool would then have no owner to verify a presented capability against and
-    /// could never register the serve lane; the background pool-owner resolver
-    /// resolves the owner off the serve hot path and folds it here.
+    /// direct `getPool` snapshot (the lazy backfill). The projection lives in
+    /// memory, and the settlement watcher's forward-only `PoolOpened` scan starts
+    /// at head on a first boot (`ColdStart::Head`) and at the rewound checkpoint
+    /// after a restart. A pool opened below that start never appears in the scan.
+    /// A node serving such a pool would then have no owner to verify a presented
+    /// capability against and could never register the serve lane; the admit
+    /// path's [`ResolvingPoolView`](crate::payment_settlement::ResolvingPoolView)
+    /// resolves the owner with one `getPool` and folds it here.
     ///
     /// Inserts ONLY IF the pool is still absent, so a concurrent event fold — the
     /// projection's authoritative writer — always wins and this never clobbers a

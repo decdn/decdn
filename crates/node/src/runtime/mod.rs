@@ -833,10 +833,10 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// the same live policy.
     shed_controller: Arc<crate::load_shed::LoadShedController>,
     payment_service: PoolSettlementService<P>,
-    /// A read clone of the event-fed pool view the settlement watcher writes,
-    /// carried to `AdminState` so `admin_v1_lanes` can name each lane's pool
-    /// owner without a chain read.
-    pool_projection: crate::pool_view::PoolProjection,
+    /// Names each lane's pool owner for `admin_v1_lanes`: the event-fed pool
+    /// view the settlement watcher writes, then an owner cache, then its own
+    /// `getPool` reads (never the serve path's negative-caching resolver).
+    pool_owners: admin::pool_owners::PoolOwners,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     /// Bring-up node-id binding self-check (#1034), carried through to
     /// `AdminState` so `admin_v1_health` can report it. A plain value, not a
@@ -1356,6 +1356,17 @@ async fn build_chain_and_handlers(
         pool_view.clone(),
         Arc::clone(&infra.node_metrics),
     );
+    // Lane owner lookup for `admin_v1_lanes`. Its own binding and reads, so an
+    // operator's `node lanes` never negative-caches a pool the serve path reads.
+    let pool_owners = admin::pool_owners::PoolOwners::new(
+        pool_view.clone(),
+        Some(Arc::new(admin::pool_owners::ChainPoolOwners::new(
+            decdn_incentive::payment_pool::PaymentPool::new(
+                payment_pool_addr,
+                wallet_provider.clone(),
+            ),
+        ))),
+    );
     // ADR 041 serve-credit inputs: a non-blocking sink in front of the SAME warming
     // allowance the buy loop debits and the eviction path forgets, plus the live
     // operator fee-share cell. The background aggregator behind the sink is what
@@ -1449,7 +1460,7 @@ async fn build_chain_and_handlers(
         Duration::from_secs(cfg.blockchain.redeem_interval_secs),
         Arc::clone(&infra.node_metrics),
         &boot,
-        pool_view.clone(),
+        pool_view,
         redeem_tx,
         redeem_rx,
     )
@@ -1577,7 +1588,7 @@ async fn build_chain_and_handlers(
         client_handler,
         shed_controller,
         payment_service,
-        pool_projection: pool_view,
+        pool_owners,
         blacklist_ready_rx,
         binding_report,
         serve_economics,
@@ -2281,13 +2292,13 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // Lane introspection for `admin_v1_lanes` (issue #749). Shares the
         // same persistent lane-state store the client handler and settlement
         // service use, plus a read handle over the handler's live lane
-        // registry for the last-voucher clock (issue #1733) and the pool view
+        // registry for the last-voucher clock (issue #1733) and the resolver
         // that names each lane's pool owner — read-only here.
         .with_lanes(admin::LaneStatusHandles {
             pool_store: Arc::clone(&infra.pool_state_store),
             lane_activity: ch.client_handler.lane_activity_clock(),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
-            pool_view: ch.pool_projection.clone(),
+            pool_owners: ch.pool_owners.clone(),
         })
         // Buyer-pool introspection for `admin_v1_pools` (#2078). The SAME store
         // handle `BuyerPoolService` records into, so the admin surface reports

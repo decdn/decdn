@@ -32,12 +32,16 @@ since project inception and will roll into the first tagged release.
   signer (#2484).** `admin_v1_lanes` filled `LaneSnapshot.counterparty` with
   the lane signer, so every `decdn get` lane (signed by a key derived for its
   data dir) and every `--capability` lane showed that key instead of the
-  wallet that funds the pool. The node now reads the owner (`getPool.owner`)
-  from its event-fed pool view, with no chain call. **Wire-breaking:**
-  `counterparty` is `Option<String>`, `null` when the node's pool view holds no
-  entry for the pool (a pool opened before the settlement watcher's anchor
-  with no request admitted on it since the node started, or a reclaimed
-  pool). It never falls back to the signer.
+  wallet that funds the pool. The node now names the owner (`getPool.owner`)
+  from its event-fed pool view, then from an owner cache, then with one bounded
+  `getPool` read per pool in neither, at most eight at once. A pool's owner
+  never changes, so the cache keeps every owner it reads. The first
+  `decdn node lanes` after a restart reads the owner of each carried-over pool.
+  The read is separate from the serve path's pool resolver, so a failed read
+  never makes the node refuse serves on that pool. **Wire-breaking:**
+  `counterparty` is `Option<String>`, `null` when the read fails or finds no
+  such pool. The node logs one warning per call that has failed reads, and
+  reads those pools again on the next call. It never falls back to the signer.
   `decdn node lanes` prints `unknown` in that case, and `--json` prints
   `null`. `voucher_signer` is unchanged. To find a client by its funding
   wallet, match on `counterparty`; to find a lane by its signing key, match
@@ -3478,8 +3482,9 @@ since project inception and will roll into the first tagged release.
   signer — the key whose signature is required on every voucher — next to
   `COUNTERPARTY` (the pool owner, and the address the ADR 011 compliance gates
   check). The two are equal only when the owner signs its own vouchers, as a
-  node buyer does: a `decdn get` lane signs with a key derived for its data
-  dir, and a `--capability` client signs with its delegate. **Output-breaking for scripts:**
+  node buyer does. A `decdn get` on its own wallet's pool signs with a key
+  derived for its data dir, and a `decdn get --capability` signs with the
+  delegate key the capability names. **Output-breaking for scripts:**
   the table is ~15 characters wider and column positions after `COUNTERPARTY`
   have shifted, so positional parsers (`awk '{print $N}'`, fixed-offset `cut`)
   need updating.

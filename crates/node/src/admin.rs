@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
     AdminRpcServer, BUYER_POOL_STORE_ERROR_CODE, BUYER_POOL_UNAVAILABLE_CODE, BucketStat,
@@ -36,10 +36,10 @@ use jsonrpsee::types::ErrorObjectOwned;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
 
+use crate::admin::pool_owners::PoolOwners;
 use crate::binding_check::BindingReport;
 use crate::dht::{RecordStore, RepublishScheduler, RoutingTable, StakerSet};
 use crate::metrics::Metrics;
-use crate::pool_view::PoolProjection;
 
 // Wire types live in `decdn_common::admin`. We import the server-side
 // trait, the request DTO, and the few error codes the server impl
@@ -47,6 +47,8 @@ use crate::pool_view::PoolProjection;
 // directly.
 
 use crate::runtime::RuntimeReloadState;
+
+pub mod pool_owners;
 
 /// Cap concurrent admin connections. The surface is local-operator-only,
 /// but an errant operator script looping requests must not be able to
@@ -188,10 +190,10 @@ pub struct LaneStatusHandles {
     /// (`blockchain.redeem_threshold_micro_usdc`). A lane whose accrued
     /// claim has reached this is reported `settlement_eligible`.
     pub redeem_threshold_micro_usdc: u64,
-    /// The event-fed pool view the serve gates read (same projection the
-    /// settlement watcher folds). Read for each lane's pool owner, the
-    /// reported `counterparty`; a pool it has not seen reports `None`.
-    pub pool_view: PoolProjection,
+    /// Names each lane's pool owner, the reported `counterparty`: the serve
+    /// gates' pool view first, then an owner cache, then one `getPool` per
+    /// pool in neither. A pool it cannot name reports `None`.
+    pub pool_owners: PoolOwners,
 }
 
 // `AdminState` derives `Debug`, so the bundled handles must too. The
@@ -834,7 +836,11 @@ impl AdminRpcServer for AdminRpcImpl {
         // (issue #1733); lanes with no voucher since restart are absent from the
         // map and read back as `None`.
         let ages = ch.lane_activity.ages().await;
-        let lanes = build_lane_snapshots(&states, threshold, &ages, &ch.pool_view);
+        let owners = ch
+            .pool_owners
+            .resolve(states.iter().map(|s| s.pool_id))
+            .await;
+        let lanes = build_lane_snapshots(&states, threshold, &ages, &owners);
         Ok(LanesResponse {
             lanes,
             redeem_threshold_micro_usdc: ch.redeem_threshold_micro_usdc,
@@ -976,10 +982,9 @@ fn build_buyer_pools_response(
 /// Build the wire `LaneSnapshot` list from loaded lane states, the
 /// redemption `threshold` (in micro-USDC as a `U256`), each live lane's
 /// whole-seconds last-voucher age (`ages`, keyed by [`LaneKey`]; absent ⇒
-/// `None`), and the pool view that names each pool's owner (`pools`; a pool it
-/// has not seen ⇒ `None`). Pure (no I/O, no locks — the pool view read is one
-/// atomic load) so it's unit-testable without a store, an async runtime, or a
-/// live lane registry.
+/// `None`), and each pool's owner (`owners`, keyed by pool id; absent ⇒
+/// `None`). Pure (no I/O, no locks) so it's unit-testable without a store, an
+/// async runtime, a chain, or a live lane registry.
 ///
 /// Ordering: lanes with a known last-voucher age first (most recently
 /// active ahead of those with `None`), then by descending outstanding
@@ -991,7 +996,7 @@ fn build_lane_snapshots(
     states: &[LaneState],
     threshold: U256,
     ages: &HashMap<LaneKey, u64>,
-    pools: &PoolProjection,
+    owners: &HashMap<B256, Address>,
 ) -> Vec<LaneSnapshot> {
     let mut snapshots: Vec<LaneSnapshot> = states
         .iter()
@@ -1001,16 +1006,14 @@ fn build_lane_snapshots(
                 // A lane is keyed by `(pool_id, signer, provider)`. The admin
                 // surface reports the pool id as the lane id, the pool owner as
                 // the counterparty, and the lane signer as the voucher signer.
-                // The owner comes from the pool view, not the lane: a lane
-                // signer is often a derived lane key or a delegate, never a
-                // stand-in for the owner. There is no per-voucher nonce —
+                // The owner comes from the pool, not the lane: a lane signer
+                // is often a derived lane key or a delegate, never a stand-in
+                // for the owner. There is no per-voucher nonce —
                 // cumulative amount is the sole ordering key — so `last_nonce`
                 // reports 0, and the pool-level deposit is not carried per lane
                 // so `deposit_micro_usdc` reports 0.
                 pool_id: state.pool_id.to_string(),
-                counterparty: pools
-                    .snapshot(state.pool_id)
-                    .map(|status| status.owner.to_string()),
+                counterparty: owners.get(&state.pool_id).map(ToString::to_string),
                 voucher_signer: state.signer.to_string(),
                 last_nonce: 0,
                 outstanding_micro_usdc: u64::try_from(outstanding).unwrap_or(u64::MAX),
