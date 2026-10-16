@@ -473,6 +473,23 @@ impl<'a> PeerSource<'a> {
         self
     }
 
+    /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end)
+    /// as a raw pull, unaligned, for a caller that reads only the signed
+    /// header and then aborts the pull.
+    ///
+    /// # Errors
+    ///
+    /// The same faults as [`BlobSource::open`].
+    #[doc(hidden)]
+    pub fn open_span(
+        &self,
+        hash: [u8; 32],
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> SourceFuture<'_, (UpstreamPullHeader, UpstreamPull)> {
+        Box::pin(self.open_pull(hash, byte_offset, byte_len))
+    }
+
     /// Open the whole blob (`byte_len == 0`, "to end") from offset 0.
     ///
     /// For a caller that must read the signed `total_bytes` before it can size

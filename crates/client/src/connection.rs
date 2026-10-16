@@ -274,6 +274,17 @@ impl Connections {
         self.inner
             .dials
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The connection outlives this caller, and its driver keeps the span
+        // it was dialled under open for the connection's life. So the dial
+        // runs under a root span of the connection's own, linked to the
+        // caller's, and the caller's span closes when the caller ends.
+        let span = tracing::debug_span!(
+            parent: None,
+            "pooled_connection",
+            peer = %target.id,
+            alpn = %String::from_utf8_lossy(self.inner.alpn),
+        );
+        span.follows_from(tracing::Span::current());
         let conn = dial(
             &self.inner.endpoint,
             target.clone(),
@@ -281,6 +292,7 @@ impl Connections {
             self.inner.dial_runtime.as_ref(),
             "connect failed",
         )
+        .instrument(span)
         .await?;
         let warm = Arc::new(WarmConnection { conn });
         *held = Some(Arc::clone(&warm));
