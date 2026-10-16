@@ -2784,7 +2784,6 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
- "console 0.16.6",
  "decdn-bao-range",
  "decdn-cache",
  "decdn-client",

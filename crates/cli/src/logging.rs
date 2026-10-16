@@ -23,7 +23,6 @@
 //! the two share stderr without corrupting each other. When no subscriber is
 //! installed the bar draws straight to stderr as it always has.
 
-use std::io::IsTerminal as _;
 use std::sync::OnceLock;
 
 use decdn_common::cli::common::LogLevel;
@@ -145,79 +144,12 @@ pub fn progress_container() -> indicatif::MultiProgress {
 /// erased. A multi-bar `decdn get` redraws many lines several times a second,
 /// and an erase-then-write redraw shows as flicker in tmux and recordings.
 ///
-/// An in-place redraw leaves the rows a shrunk stack (a finished file's bar
-/// clears) no longer covers. The stack is bottom-aligned, so a shrunk stack
-/// keeps its rows and pads its top with blank lines, and [`ErasingStderr`]
-/// erases each padding row as it writes it.
-///
-/// A stderr that is not a terminal gets indicatif's own stderr target, which
-/// hides every bar.
+/// An in-place redraw never erases the rows below a stack that shrank, so a
+/// multi-bar renderer keeps its stack's height (`pull_progress`'s pad bar).
 fn new_container() -> indicatif::MultiProgress {
-    let progress = if std::io::stderr().is_terminal() {
-        indicatif::MultiProgress::with_draw_target(
-            indicatif::ProgressDrawTarget::term_like_with_hz(
-                Box::new(ErasingStderr(console::Term::buffered_stderr())),
-                REFRESH_HZ,
-            ),
-        )
-    } else {
-        indicatif::MultiProgress::new()
-    };
+    let progress = indicatif::MultiProgress::new();
     progress.set_move_cursor(true);
-    progress.set_alignment(indicatif::MultiProgressAlignment::Bottom);
     progress
-}
-
-/// The bars' redraw cap, indicatif's own default for a stderr target.
-const REFRESH_HZ: u8 = 20;
-
-/// Buffered stderr whose `write_line` erases the row before it writes, so a
-/// bottom-aligned stack's blank padding rows overwrite what a taller stack
-/// left there. Every other call passes through.
-#[derive(Debug)]
-struct ErasingStderr(console::Term);
-
-impl indicatif::TermLike for ErasingStderr {
-    fn width(&self) -> u16 {
-        indicatif::TermLike::width(&self.0)
-    }
-
-    fn height(&self) -> u16 {
-        indicatif::TermLike::height(&self.0)
-    }
-
-    fn move_cursor_up(&self, n: usize) -> std::io::Result<()> {
-        indicatif::TermLike::move_cursor_up(&self.0, n)
-    }
-
-    fn move_cursor_down(&self, n: usize) -> std::io::Result<()> {
-        indicatif::TermLike::move_cursor_down(&self.0, n)
-    }
-
-    fn move_cursor_right(&self, n: usize) -> std::io::Result<()> {
-        indicatif::TermLike::move_cursor_right(&self.0, n)
-    }
-
-    fn move_cursor_left(&self, n: usize) -> std::io::Result<()> {
-        indicatif::TermLike::move_cursor_left(&self.0, n)
-    }
-
-    fn write_line(&self, s: &str) -> std::io::Result<()> {
-        indicatif::TermLike::clear_line(&self.0)?;
-        indicatif::TermLike::write_line(&self.0, s)
-    }
-
-    fn write_str(&self, s: &str) -> std::io::Result<()> {
-        indicatif::TermLike::write_str(&self.0, s)
-    }
-
-    fn clear_line(&self) -> std::io::Result<()> {
-        indicatif::TermLike::clear_line(&self.0)
-    }
-
-    fn flush(&self) -> std::io::Result<()> {
-        indicatif::TermLike::flush(&self.0)
-    }
 }
 
 /// [`tracing_subscriber::fmt::MakeWriter`] that emits each log line through
