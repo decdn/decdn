@@ -470,19 +470,24 @@ async fn a_page_with_the_token_still_registers_only_its_own_scope() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
-/// What [`Recording`] answers every pull with.
-#[derive(Clone, Copy)]
+/// What [`Recording`] answers a pull of one blob with.
+#[derive(Clone)]
 enum Reply {
-    /// The pull ends at its cap, as a blob larger than the cap does.
+    /// The pull ends at its cap before any byte, as a blob that the store
+    /// already shows to be past the cap does.
     TooLarge,
+    /// The pull writes these bytes, then ends at its cap, as a blob larger
+    /// than the cap does once the cap's worth has landed.
+    BytesThenTooLarge(Vec<u8>),
     /// The pull writes these bytes and succeeds.
-    Bytes(&'static [u8]),
+    Bytes(Vec<u8>),
 }
 
-/// A pull backend that records the `--max-blob-mb` each pull runs with.
+/// A pull backend that answers each blob by its hash and records the
+/// `--max-blob-mb` each pull runs with.
 struct Recording {
     caps: Arc<std::sync::Mutex<Vec<u64>>>,
-    reply: Reply,
+    replies: HashMap<[u8; 32], Reply>,
 }
 
 impl worker::Backend for Recording {
@@ -505,16 +510,23 @@ impl worker::Backend for Recording {
         sink: &mut super::super::fetch::Sink,
     ) -> anyhow::Result<()> {
         self.caps.lock().unwrap().push(blob.common.max_blob_mb);
-        match self.reply {
-            Reply::TooLarge => Err(decdn_client::BlobTooLarge {
+        let too_large = || {
+            anyhow::Error::new(decdn_client::BlobTooLarge {
                 reached: (blob.common.max_blob_mb << 20) + 1,
                 ceiling: blob.common.max_blob_mb << 20,
+            })
+        };
+        let super::super::fetch::Sink::Writer(writer) = sink else {
+            anyhow::bail!("the gateway pulls into a writer");
+        };
+        match self.replies.get(&blob.hash) {
+            None => anyhow::bail!("no node holds the blob"),
+            Some(Reply::TooLarge) => Err(too_large()),
+            Some(Reply::BytesThenTooLarge(bytes)) => {
+                tokio::io::AsyncWriteExt::write_all(writer, bytes).await?;
+                Err(too_large())
             }
-            .into()),
-            Reply::Bytes(bytes) => {
-                let super::super::fetch::Sink::Writer(writer) = sink else {
-                    anyhow::bail!("the gateway pulls into a writer");
-                };
+            Some(Reply::Bytes(bytes)) => {
                 tokio::io::AsyncWriteExt::write_all(writer, bytes).await?;
                 Ok(())
             }
@@ -524,16 +536,27 @@ impl worker::Backend for Recording {
     async fn close(&self, (): ()) {}
 }
 
-/// A gateway on [`Recording`] whose token holder pays for every host, and
-/// the caps its pulls record.
+/// The blob the single-reply gateways serve.
+const BLOB: [u8; 32] = [0xab; 32];
+
+/// A gateway on [`Recording`] that answers [`BLOB`] with `reply`, whose token
+/// holder pays for every host, and the caps its pulls record.
 async fn recording_gateway(
     reply: Reply,
+    args: &[&str],
+) -> (Arc<Gateway>, Arc<std::sync::Mutex<Vec<u64>>>) {
+    recording_gateway_of(HashMap::from([(BLOB, reply)]), args).await
+}
+
+/// A gateway on [`Recording`] that answers each blob in `replies`.
+async fn recording_gateway_of(
+    replies: HashMap<[u8; 32], Reply>,
     args: &[&str],
 ) -> (Arc<Gateway>, Arc<std::sync::Mutex<Vec<u64>>>) {
     let caps = Arc::default();
     let backend = Recording {
         caps: Arc::clone(&caps),
-        reply,
+        replies,
     };
     let gateway = test_gateway_with(backend, flags(args)).await;
     insert(
@@ -543,50 +566,101 @@ async fn recording_gateway(
     (gateway, caps)
 }
 
-async fn get(gateway: &Arc<Gateway>, path: &str) -> StatusCode {
-    let headers = [(TOKEN_HEADER, TEST_TOKEN), (HOST_HEADER, "decdn.org")];
-    call(gateway, Method::GET, path, &headers, "").await
+/// A paid `GET path`: the status and the body as text.
+async fn get(gateway: &Arc<Gateway>, path: &str) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header(header::HOST, "127.0.0.1:8484")
+        .header(TOKEN_HEADER, TEST_TOKEN)
+        .header(HOST_HEADER, "decdn.org")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = Arc::clone(gateway).handle(req).await;
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(body.to_vec()).unwrap())
 }
 
 #[tokio::test]
 async fn a_manifest_pull_is_capped_and_an_oversize_blob_is_not_found() {
-    let blob = "ab".repeat(32);
+    let blob = alloy::hex::encode(BLOB);
     let (gateway, caps) = recording_gateway(Reply::TooLarge, &[]).await;
-    assert_eq!(
-        get(&gateway, &format!("/{blob}/")).await,
-        StatusCode::NOT_FOUND
+    let (status, body) = get(&gateway, &format!("/{blob}/?ns=7")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.contains(&format!("fetch `/{blob}?ns=7` for the raw blob")),
+        "the gateway serves the raw blob past the manifest cap: {body}"
     );
-    assert_eq!(
-        get(&gateway, &format!("/{blob}/a.bin")).await,
-        StatusCode::NOT_FOUND
-    );
+    let (status, _) = get(&gateway, &format!("/{blob}/a.bin")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB, MAX_MANIFEST_MB]);
 
     let (gateway, caps) = recording_gateway(Reply::TooLarge, &["--max-blob-mb", "10"]).await;
-    assert_eq!(
-        get(&gateway, &format!("/{blob}/")).await,
-        StatusCode::NOT_FOUND
+    let (status, body) = get(&gateway, &format!("/{blob}/")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        !body.contains("raw blob"),
+        "the raw blob takes the same cap, so no hint names it: {body}"
     );
     assert_eq!(*caps.lock().unwrap(), [10], "a lower gateway cap stays");
 }
 
+/// The client ends a pull at its cap only after the cap's worth of bytes
+/// has landed, so the stop arrives after the manifest bytes start.
+#[tokio::test]
+async fn a_cap_stop_after_the_first_bytes_is_not_found() {
+    let reply = Reply::BytesThenTooLarge(b"{\"version\": 1, ".to_vec());
+    let (gateway, _) = recording_gateway(reply, &["--max-blob-mb", "10"]).await;
+    let (status, body) = get(&gateway, &format!("/{}/", alloy::hex::encode(BLOB))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
 #[tokio::test]
 async fn a_raw_blob_pull_keeps_the_gateway_cap() {
-    let (gateway, caps) = recording_gateway(Reply::Bytes(b"raw"), &[]).await;
-    assert_eq!(
-        get(&gateway, &format!("/{}", "ab".repeat(32))).await,
-        StatusCode::OK
-    );
+    let (gateway, caps) = recording_gateway(Reply::Bytes(b"raw".to_vec()), &[]).await;
+    let (status, _) = get(&gateway, &format!("/{}", alloy::hex::encode(BLOB))).await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(*caps.lock().unwrap(), [flags(&[]).max_blob_mb]);
     assert_ne!(flags(&[]).max_blob_mb, MAX_MANIFEST_MB);
 }
 
 #[tokio::test]
 async fn a_blob_that_is_not_a_manifest_is_not_found() {
-    let (gateway, _) = recording_gateway(Reply::Bytes(b"not json"), &[]).await;
+    let (gateway, _) = recording_gateway(Reply::Bytes(b"not json".to_vec()), &[]).await;
+    let blob = alloy::hex::encode(BLOB);
+    let (status, body) = get(&gateway, &format!("/{blob}/")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.contains(&format!("fetch `/{blob}` for the raw blob")),
+        "{body}"
+    );
+}
+
+/// A bundle reads its manifest under the manifest cap, once, and serves its
+/// entries under the gateway's own cap.
+#[tokio::test]
+async fn a_bundle_serves_its_index_and_entries() {
+    let entry = [0xe0; 32];
+    let manifest = format!(
+        r#"{{"version": 1, "entries": [{{"path": "a.bin", "hash": "{}", "size": 3}}]}}"#,
+        alloy::hex::encode(entry)
+    );
+    let replies = HashMap::from([
+        (BLOB, Reply::Bytes(manifest.into_bytes())),
+        (entry, Reply::Bytes(b"abc".to_vec())),
+    ]);
+    let (gateway, caps) = recording_gateway_of(replies, &[]).await;
+    let blob = alloy::hex::encode(BLOB);
+    let (status, body) = get(&gateway, &format!("/{blob}/a.bin")).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "abc"));
+    let (status, body) = get(&gateway, &format!("/{blob}/")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("a.bin"), "{body}");
     assert_eq!(
-        get(&gateway, &format!("/{}/", "ab".repeat(32))).await,
-        StatusCode::NOT_FOUND
+        *caps.lock().unwrap(),
+        [MAX_MANIFEST_MB, flags(&[]).max_blob_mb],
+        "the index reads the cached manifest"
     );
 }
 
@@ -599,15 +673,15 @@ fn only_a_cap_stop_marks_a_manifest_pull_not_a_manifest() {
         })
     };
     assert!(matches!(
-        over_manifest_cap(PullError::Other(too_large()), 64),
+        over_manifest_cap(PullError::Other(too_large()), 64, None),
         PullError::NotManifest(_)
     ));
     assert!(matches!(
-        over_manifest_cap(PullError::Other(anyhow::anyhow!("no node")), 64),
+        over_manifest_cap(PullError::Other(anyhow::anyhow!("no node")), 64, None),
         PullError::Other(_)
     ));
     assert!(matches!(
-        over_manifest_cap(PullError::Funding(too_large()), 64),
+        over_manifest_cap(PullError::Funding(too_large()), 64, None),
         PullError::Funding(_)
     ));
 }

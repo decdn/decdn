@@ -1032,11 +1032,12 @@ since project inception and will roll into the first tagged release.
   (1 TiB by default), so for a large blob that is not a manifest, the
   gateway paid for 64 MiB plus the lanes' read-ahead before it failed. Anyone
   who could reach the gateway could spend the operator's funds this way. The
-  manifest pull now runs under the manifest cap (64 MiB, or a lower
+  manifest pull now runs under the manifest cap (64 MiB, or a lower nonzero
   `--max-blob-mb`), as `decdn get decdn:<hash>/<path> -o -` does, and its
   lanes request no byte past it. A blob over that cap, or one that does not
   parse as a manifest, answers 404 instead of 502, because nothing upstream
-  failed.
+  failed. The 404 names the raw blob's gateway path when the gateway serves
+  that blob.
 - **CLI: a command that ends before an `openPool` confirms names the tx
   (#2418).** A Ctrl-C during the `openPool` submit or receipt wait in `decdn
   fetch` or `decdn bundle pull` printed only "run the same command again", and

@@ -1043,10 +1043,15 @@ impl Gateway {
             return Ok(manifest);
         }
         let cap_mb = manifest_cap_mb(self.common.max_blob_mb);
+        let raw = raw_blob_hint(hash, namespace);
+        // The raw blob pulls under the gateway's own cap, so it is a way past
+        // the manifest cap only when that cap is higher.
+        let raw_past_cap = (self.common.max_blob_mb == 0 || cap_mb < self.common.max_blob_mb)
+            .then_some(raw.as_str());
         let (first, mut reader, done) = self
             .start_pull(hash, namespace, paying, cap_mb)
             .await
-            .map_err(|e| over_manifest_cap(e, cap_mb))?;
+            .map_err(|e| over_manifest_cap(e, cap_mb, raw_past_cap))?;
         let mut bytes = first.to_vec();
         let mut buf = vec![0u8; CHUNK_BYTES];
         loop {
@@ -1058,18 +1063,21 @@ impl Gateway {
                 break;
             }
             bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
+            // A backstop: the manifest cap ends the pull before this.
             if bytes.len() > MAX_MANIFEST_BYTES {
                 return Err(PullError::NotManifest(anyhow::anyhow!(
-                    "the manifest is larger than {MAX_MANIFEST_BYTES} bytes"
+                    "the blob is larger than {MAX_MANIFEST_BYTES} bytes, the most this \
+                     gateway reads as a bundle manifest"
                 )));
             }
         }
         finished(done)
             .await
-            .map_err(|e| over_manifest_cap(e, cap_mb))?;
+            .map_err(|e| over_manifest_cap(e, cap_mb, raw_past_cap))?;
+        // The blob fits under the manifest cap, so it fits under the gateway's.
         let manifest = Arc::new(
             BundleManifest::parse(&bytes)
-                .context("not a bundle manifest; fetch `/<hash>` for the raw blob")
+                .with_context(|| format!("not a bundle manifest; {raw}"))
                 .map_err(PullError::NotManifest)?,
         );
         self.manifests
@@ -1227,17 +1235,27 @@ fn classify(e: anyhow::Error) -> PullError {
     }
 }
 
-/// A manifest pull that the cap of `cap_mb` ended is not a manifest.
-fn over_manifest_cap(e: PullError, cap_mb: u64) -> PullError {
+/// Mark a manifest pull that the cap of `cap_mb` ended as
+/// [`PullError::NotManifest`]: the gateway reads no larger blob as a manifest.
+/// `raw` is the hint to fetch the raw blob, when the gateway serves it.
+fn over_manifest_cap(e: PullError, cap_mb: u64, raw: Option<&str>) -> PullError {
     match e {
         PullError::Other(e) if e.downcast_ref::<decdn_client::BlobTooLarge>().is_some() => {
+            let hint = raw.map_or_else(String::new, |raw| format!("; {raw}"));
             PullError::NotManifest(e.context(format!(
                 "the blob is larger than {cap_mb} MiB, the most this gateway reads as a \
-                 bundle manifest; fetch `/<hash>` for the raw blob"
+                 bundle manifest{hint}"
             )))
         }
         e => e,
     }
+}
+
+/// The hint to fetch blob `hash` raw, at its gateway path.
+fn raw_blob_hint(hash: [u8; 32], namespace: Option<u64>) -> String {
+    let uri = DecdnUri::new(hash, UriTarget::Blob, namespace).to_string();
+    let path = uri.strip_prefix(decdn_client::uri::SCHEME).unwrap_or(&uri);
+    format!("fetch `/{path}` for the raw blob")
 }
 
 fn pull_error_text(e: &PullError) -> String {
