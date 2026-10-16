@@ -20,8 +20,8 @@ use anyhow::{Context as _, anyhow, bail};
 use decdn_client::PoolReplaced;
 use decdn_client::bundle::{
     BundleEnd, BundleManifest, BundleObserver, BundlePuller, BundleReport, EntryLanded,
-    FaultContext, FaultHints, FileObserver, Funding, ManifestEntry, NotAManifest, STAGING_DIR,
-    select_nodes,
+    FaultContext, FaultHints, FileObserver, ForeignReason, Funding, ManifestEntry, NotAManifest,
+    STAGING_DIR, select_nodes,
 };
 use decdn_client::buyer_pool::UnconfirmedOpens;
 use decdn_client::endpoint as client_endpoint;
@@ -209,8 +209,9 @@ impl EntryFilter {
     }
 
     /// [`Self::apply_reporting`], with one `warning:` line on stderr for each
-    /// pattern that matched no entry. Returns the kept entries and how many the
-    /// filter dropped.
+    /// pattern that matched no entry. Returns the kept entries, each moved to
+    /// `land_as` with [`ManifestEntry::land_at`] when it is set, and how many
+    /// the filter dropped.
     ///
     /// # Errors
     ///
@@ -237,11 +238,12 @@ impl EntryFilter {
     }
 }
 
-/// Refuse a pull into a default destination (no `-o`) that would replace a
-/// file this pull did not write there: one no earlier pull wrote, or one an
-/// earlier pull wrote from another bundle or entry path. A pull fetches over a
-/// file whose bytes differ from its entry's, and the user did not choose this
-/// directory. `--overwrite` asks for the replacement, so it passes.
+/// Refuse a pull into a default destination (no `-o`) that may replace a file
+/// no earlier pull of the same entry left there unchanged: one no pull wrote,
+/// one that changed after a pull wrote it, or one a pull wrote from another
+/// bundle entry. A pull fetches over a file whose bytes differ from its
+/// entry's, and the user did not choose this directory. `--overwrite` asks for
+/// the replacement, so it passes.
 ///
 /// # Errors
 ///
@@ -259,12 +261,28 @@ fn refuse_foreign(args: &GetArgs, out: &Path, manifest: &BundleManifest) -> anyh
         1 => String::new(),
         n => format!(" (and {} more)", n.saturating_sub(1)),
     };
-    let writer = first.written_from.as_ref().map_or_else(
-        || "no earlier `decdn get` wrote it".to_owned(),
-        |uri| format!("an earlier `decdn get` wrote it from {uri}"),
-    );
+    let from = |uri: &Option<DecdnUri>| {
+        uri.as_ref().map_or_else(
+            || "a source this build cannot read".to_owned(),
+            ToString::to_string,
+        )
+    };
+    let why = match &first.reason {
+        ForeignReason::Unrecorded => "no earlier `decdn get` wrote it".to_owned(),
+        ForeignReason::UnreadableCache(cause) => {
+            format!("the skip-cache cannot say which `decdn get` wrote it ({cause})")
+        }
+        ForeignReason::Changed(uri) => format!(
+            "it changed after an earlier `decdn get` wrote it from {}",
+            from(uri)
+        ),
+        ForeignReason::OtherSource(uri) => {
+            format!("an earlier `decdn get` wrote it from {}", from(uri))
+        }
+        _ => "no earlier `decdn get` of this entry wrote it".to_owned(),
+    };
     anyhow::bail!(
-        "refusing to replace {}{more}: {writer}; pass `-o <dir>` to pull into another \
+        "refusing to replace {}{more}: {why}; pass `-o <dir>` to pull into another \
          directory, or `-o .` to pull here and replace each such file whose bytes differ",
         out.join(&first.path).display()
     )
@@ -1105,9 +1123,10 @@ fn not_a_manifest_hint(err: anyhow::Error) -> anyhow::Error {
 /// starts from and the unmatched-pattern warnings are the ones it prints. A real
 /// run then skips files already present in the output root (unless
 /// `--overwrite`) and warns on leftover partials; the dry run does neither. It
-/// does refuse a default destination that holds a file no pull wrote, as a
-/// real run does. A bundle with no cached manifest reports only the bundle and
-/// the output root, with `entries: null` under `--json`.
+/// does refuse a default destination that holds a file the pull may replace
+/// ([`refuse_foreign`]), as a real run does. A bundle with no cached manifest
+/// reports only the bundle and the output root, with `entries: null` under
+/// `--json`.
 fn dry_run(
     args: &GetArgs,
     output: &Path,

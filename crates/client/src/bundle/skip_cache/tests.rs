@@ -13,10 +13,7 @@ fn sample() -> SavedFile {
             hash: "b3:bb".into(),
             size: 10,
         }]),
-        source: SavedSource {
-            bundle: bundle_key([3u8; 32]),
-            path: "src/b.txt".into(),
-        },
+        source: SavedSource::new([3; 32], "src/b.txt"),
     }
 }
 
@@ -63,14 +60,37 @@ fn an_earlier_version_loads_empty() {
     )
     .expect("write");
     assert!(load(tmp.path()).get("a.txt").is_none());
+    let err = load_checked(tmp.path()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("has version 1; this build reads version 2"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn load_checked_passes_a_missing_file_and_names_a_corrupt_one() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    assert!(
+        load_checked(tmp.path())
+            .expect("missing is empty")
+            .get("a")
+            .is_none()
+    );
+    std::fs::write(tmp.path().join(SAVED_MANIFEST_NAME), b"{not json").expect("write");
+    let err = load_checked(tmp.path()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("is not a skip-cache"),
+        "{err:#}"
+    );
 }
 
 #[test]
 fn source_matches_only_its_bundle_and_path_and_prints_its_uri() {
     let src = sample().source;
-    assert!(src.is(&bundle_key([3u8; 32]), "src/b.txt"));
-    assert!(!src.is(&bundle_key([4u8; 32]), "src/b.txt"));
-    assert!(!src.is(&bundle_key([3u8; 32]), "b.txt"));
+    assert!(src.is([3; 32], "src/b.txt"));
+    assert!(!src.is([4; 32], "src/b.txt"));
+    assert!(!src.is([3; 32], "b.txt"));
+    assert_eq!(src.bundle, bundle_key([3; 32]));
     let uri = src.uri().expect("a hash");
     assert_eq!(uri.hash, [3u8; 32]);
     assert_eq!(uri.target, UriTarget::BundleEntry("src/b.txt".into()));
@@ -117,7 +137,6 @@ fn saved_hints_places_offsets_and_validates_sum() {
                 size: 20,
             },
         ]),
-
         source: sample().source,
     };
     let got = saved_hints(&rec).expect("hints");
@@ -146,7 +165,6 @@ fn saved_hints_rejects_bad_sum_and_absent_chunks() {
             hash: "b3:c0".into(),
             size: 10,
         }]),
-
         source: sample().source,
     };
     assert!(saved_hints(&rec).is_none()); // 10 != 99

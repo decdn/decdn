@@ -507,14 +507,11 @@ fn build_completed_updates_omits_entry_absent_from_outcomes() {
 }
 
 /// The bundle key tests record their skip-cache files under.
-const TEST_BUNDLE: &str = "b3:0000000000000000000000000000000000000000000000000000000000000000";
+const TEST_BUNDLE: [u8; 32] = [0; 32];
 
 /// A skip-cache source in [`TEST_BUNDLE`], for records whose source no check reads.
 fn test_source() -> skip_cache::SavedSource {
-    skip_cache::SavedSource {
-        bundle: TEST_BUNDLE.to_owned(),
-        path: "test".to_owned(),
-    }
+    skip_cache::SavedSource::new(TEST_BUNDLE, "test")
 }
 
 fn saved_file(hash: &str, size: u64) -> skip_cache::SavedFile {
@@ -2768,28 +2765,44 @@ fn plan_slots_rejects_the_pull_state_paths() {
 /// does once each one lands.
 fn record_landed(out: &std::path::Path, bundle: [u8; 32], entries: &[&ManifestEntry]) {
     let outcomes = vec![EntryOutcome::Skipped; entries.len()];
-    let updates = build_completed_updates(entries, &outcomes, &skip_cache::bundle_key(bundle), out);
+    let updates = build_completed_updates(entries, &outcomes, bundle, out);
     let mut saved = skip_cache::load(out);
     skip_cache::merge(&mut saved, updates);
     skip_cache::write_bytes(out, &skip_cache::serialize(&saved).unwrap()).unwrap();
 }
 
-/// `foreign_paths` names each entry path that holds something no pull
-/// recorded, or that a pull recorded from another bundle or manifest path. It
-/// passes an absent path and a file this bundle entry wrote.
+/// `foreign_paths` names each entry path that no record vouches for: one no
+/// pull recorded, one that changed after a pull wrote it, and one a pull wrote
+/// from another bundle entry with other bytes. It passes an absent path, a
+/// file this entry wrote, a file another entry wrote with the same bytes, and
+/// a path the pull reserves for its own state.
 #[test]
-fn foreign_paths_names_unrecorded_and_other_source_paths() {
+fn foreign_paths_names_each_path_no_record_vouches_for() {
+    use crate::bundle::ForeignReason::{Changed, OtherSource, Unrecorded};
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path();
     let (this, other) = ([1u8; 32], [2u8; 32]);
-    for name in ["mine.txt", "pulled.bin", "renamed.json", "shared.txt"] {
+    for name in [
+        "mine.txt",
+        "pulled.bin",
+        "renamed.json",
+        "shared.txt",
+        "same.txt",
+        "edited.txt",
+    ] {
         std::fs::write(out.join(name), b"abc").unwrap();
     }
     std::fs::create_dir(out.join("sub")).unwrap();
     let pulled = entry("pulled.bin", "b3:h");
     let landed = entry("a/config.json", "b3:h").land_at("renamed.json");
-    record_landed(out, this, &[&pulled, &landed]);
-    record_landed(out, other, &[&entry("shared.txt", "b3:h")]);
+    let edited = entry("edited.txt", "b3:h");
+    record_landed(out, this, &[&pulled, &landed, &edited]);
+    record_landed(
+        out,
+        other,
+        &[&entry("shared.txt", "b3:h"), &entry("same.txt", "b3:same")],
+    );
+    std::fs::write(out.join("edited.txt"), b"abcd").unwrap();
 
     let manifest = BundleManifest::new(
         this,
@@ -2798,12 +2811,14 @@ fn foreign_paths_names_unrecorded_and_other_source_paths() {
             entry("sub", "b3:h"),
             pulled,
             landed,
-            entry("b/config.json", "b3:h").land_at("renamed.json"),
-            entry("shared.txt", "b3:h"),
+            entry("b/config.json", "b3:b-bytes").land_at("renamed.json"),
+            entry("shared.txt", "b3:other-bytes"),
+            entry("same.txt", "b3:same"),
+            edited,
+            entry(".decdn-manifest.json", "b3:h"),
             entry("absent.bin", "b3:h"),
         ],
     );
-    let found = crate::bundle::foreign_paths(&manifest, out);
     let from = |hash, path: &str| {
         Some(crate::uri::DecdnUri::new(
             hash,
@@ -2811,19 +2826,73 @@ fn foreign_paths_names_unrecorded_and_other_source_paths() {
             None,
         ))
     };
-    let got: Vec<_> = found
-        .iter()
-        .map(|f| (f.path.as_str(), f.written_from.clone()))
+    let got: Vec<_> = crate::bundle::foreign_paths(&manifest, out)
+        .into_iter()
+        .map(|f| (f.path, f.reason))
         .collect();
     assert_eq!(
         got,
         [
-            ("mine.txt", None),
-            ("sub", None),
-            ("renamed.json", from(this, "a/config.json")),
-            ("shared.txt", from(other, "shared.txt")),
+            ("mine.txt".to_owned(), Unrecorded),
+            ("sub".to_owned(), Unrecorded),
+            (
+                "renamed.json".to_owned(),
+                OtherSource(from(this, "a/config.json"))
+            ),
+            (
+                "shared.txt".to_owned(),
+                OtherSource(from(other, "shared.txt"))
+            ),
+            ("edited.txt".to_owned(), Changed(from(this, "edited.txt"))),
         ]
     );
+}
+
+/// A skip-cache that is there but cannot be used vouches for no path, and
+/// says why; a record whose manifest hash cannot be read still refuses, with
+/// no source to name.
+#[test]
+fn foreign_paths_reports_an_unusable_cache_and_an_unreadable_source() {
+    use crate::bundle::ForeignReason::{OtherSource, UnreadableCache};
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path();
+    std::fs::write(out.join("a.txt"), b"abc").unwrap();
+    let manifest = BundleManifest::new([1; 32], vec![entry("a.txt", "b3:h")]);
+
+    std::fs::write(
+        out.join(".decdn-manifest.json"),
+        br#"{"version":1,"files":{}}"#,
+    )
+    .unwrap();
+    let found = crate::bundle::foreign_paths(&manifest, out);
+    let [only] = found.as_slice() else {
+        panic!("one foreign path: {found:?}");
+    };
+    let UnreadableCache(cause) = &only.reason else {
+        panic!("an unusable cache: {only:?}");
+    };
+    assert!(cause.contains("version 1"), "{cause}");
+
+    let mut rec = record_one(out, [1; 32], &entry("a.txt", "b3:other")).unwrap();
+    rec.source.bundle = "not-a-hash".to_owned();
+    let mut saved = SavedManifest::default();
+    skip_cache::merge(&mut saved, BTreeMap::from([("a.txt".to_owned(), rec)]));
+    skip_cache::write_bytes(out, &skip_cache::serialize(&saved).unwrap()).unwrap();
+    assert_eq!(
+        crate::bundle::foreign_paths(&manifest, out)
+            .into_iter()
+            .map(|f| f.reason)
+            .collect::<Vec<_>>(),
+        [OtherSource(None)]
+    );
+}
+
+/// A second `land_at` keeps the first manifest path.
+#[test]
+fn land_at_twice_keeps_the_first_manifest_path() {
+    let en = entry("a/x", "b3:h").land_at("x").land_at("y");
+    assert_eq!(en.path, "y");
+    assert_eq!(en.manifest_path(), "a/x");
 }
 
 /// A record names the entry's manifest path, not the name `land_at` gave it,
@@ -2835,15 +2904,12 @@ fn record_one_names_the_manifest_path_of_a_landed_entry() {
     let en = entry("text_encoder/config.json", "b3:h").land_at("config.json");
     assert_eq!(en.path, "config.json");
     assert_eq!(en.manifest_path(), "text_encoder/config.json");
-    let bundle = skip_cache::bundle_key([7u8; 32]);
-    let rec = record_one(tmp.path(), &bundle, &en).expect("record");
+    let rec = record_one(tmp.path(), [7; 32], &en).expect("record");
     assert_eq!(
         rec.source,
-        skip_cache::SavedSource {
-            bundle,
-            path: "text_encoder/config.json".to_owned(),
-        }
+        skip_cache::SavedSource::new([7; 32], "text_encoder/config.json")
     );
+    assert!(rec.source.is([7; 32], "text_encoder/config.json"));
 }
 
 /// An unrecorded (empty saved manifest) file still skips via the re-hash gate

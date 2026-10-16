@@ -922,32 +922,52 @@ fn a_default_destination_refuses_an_unrecorded_file() {
     super::refuse_foreign(&args, out, &manifest("absent.json")).unwrap();
 }
 
-/// Without `-o`, an entry pull that lands at a name an earlier pull wrote
-/// from another entry of the bundle is refused, naming that entry's URI (#2472).
-/// The same entry passes, and so do `-o` and `--overwrite`.
-#[test]
-fn a_default_destination_refuses_a_file_another_entry_wrote() {
-    let tmp = tempfile::tempdir().unwrap();
-    let out = tmp.path();
-    let hex = "ab".repeat(32);
-    std::fs::write(out.join("config.json"), b"{}").unwrap();
-    // The record a pull of `decdn:<hex>/text_encoder/config.json` leaves.
-    let saved = serde_json::json!({"version": 2, "files": {"config.json": {
-        "hash": "b3:00", "size": 2, "mtime": {"secs": 1, "nanos": 0},
-        "source": {"bundle": format!("b3:{hex}"), "path": "text_encoder/config.json"},
+/// Write the skip-cache record a pull of `decdn:<bundle_hex>/<manifest_path>`
+/// leaves for the file at `out/<name>`, with the file's own size and mtime and
+/// the whole-file hash `hash`.
+fn record_pull(out: &Path, name: &str, hash: &str, bundle_hex: &str, manifest_path: &str) {
+    let meta = std::fs::symlink_metadata(out.join(name)).unwrap();
+    let mtime = meta
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let saved = serde_json::json!({"version": 2, "files": {name: {
+        "hash": hash, "size": meta.len(),
+        "mtime": {"secs": mtime.as_secs(), "nanos": mtime.subsec_nanos()},
+        "source": {"bundle": format!("b3:{bundle_hex}"), "path": manifest_path},
     }}});
     std::fs::write(
         out.join(".decdn-manifest.json"),
         serde_json::to_vec(&saved).unwrap(),
     )
     .unwrap();
+}
+
+/// Without `-o`, an entry pull that lands at a name an earlier pull wrote
+/// from another entry of the bundle, with other bytes, is refused, naming that
+/// entry's URI (#2472). The same entry passes, and so do `-o` and
+/// `--overwrite`.
+#[test]
+fn a_default_destination_refuses_a_file_another_entry_wrote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path();
+    let hex = "ab".repeat(32);
+    std::fs::write(out.join("config.json"), b"{}").unwrap();
+    record_pull(
+        out,
+        "config.json",
+        "b3:11",
+        &hex,
+        "text_encoder/config.json",
+    );
     let landed = |path: &str| {
         let filter = EntryFilter::compile(Some(path.to_owned()), &[], &[])
             .unwrap()
             .landing_as(Some("config.json".to_owned()));
         let entries = vec![
-            sel_entry("text_encoder/config.json", 2),
-            sel_entry("tokenizer/config.json", 2),
+            ManifestEntry::new("text_encoder/config.json", "b3:11", Some(2)),
+            ManifestEntry::new("tokenizer/config.json", "b3:22", Some(2)),
         ];
         BundleManifest::new([0xab; 32], filter.apply_and_warn(entries).unwrap().0)
     };
@@ -970,9 +990,44 @@ fn a_default_destination_refuses_a_file_another_entry_wrote() {
     super::refuse_foreign(&args, out, &landed("text_encoder/config.json")).unwrap();
 }
 
+/// Without `-o`, a file that changed after a pull wrote it is refused, and the
+/// error says so; a skip-cache an older build wrote is refused naming its
+/// version.
+#[test]
+fn a_default_destination_refuses_a_changed_file_and_an_old_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path();
+    let hex = "ab".repeat(32);
+    std::fs::write(out.join("a.txt"), b"abc").unwrap();
+    record_pull(out, "a.txt", "b3:00", &hex, "a.txt");
+    std::fs::write(out.join("a.txt"), b"abcd").unwrap();
+    let manifest = BundleManifest::new([0xab; 32], vec![sel_entry("a.txt", 3)]);
+    let (args, _) = get_args(&format!("decdn:{hex}/"), &[]);
+    let err = super::refuse_foreign(&args, out, &manifest).unwrap_err();
+    assert!(
+        format!("{err:#}").contains(&format!(
+            "it changed after an earlier `decdn get` wrote it from decdn:{hex}/a.txt"
+        )),
+        "{err:#}"
+    );
+
+    std::fs::write(
+        out.join(".decdn-manifest.json"),
+        br#"{"version":1,"files":{}}"#,
+    )
+    .unwrap();
+    let err = super::refuse_foreign(&args, out, &manifest).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("the skip-cache cannot say which `decdn get` wrote it")
+            && msg.contains("has version 1"),
+        "{msg}"
+    );
+}
+
 /// The dry run of a default entry pull plans the entry at its file name and
-/// refuses an unrecorded file there, as the live pull does; `-o` keeps the
-/// full manifest path.
+/// refuses a file no record of this entry vouches for, as the live pull does;
+/// `-o` keeps the full manifest path.
 #[tokio::test]
 async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -997,6 +1052,21 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
         .await
         .expect_err("an unrecorded c.bin must be refused");
     assert!(format!("{err:#}").contains("c.bin"), "{err:#}");
+
+    // A record from this entry vouches for c.bin; one from another entry
+    // with other bytes does not, and the refusal names that entry.
+    record_pull(out, "c.bin", "b3:bb", &hash, "models/v1/c.bin");
+    super::bundle_pull(&args, &dest, &parsed, None)
+        .await
+        .unwrap();
+    record_pull(out, "c.bin", "b3:bb", &hash, "models/v2/c.bin");
+    let err = super::bundle_pull(&args, &dest, &parsed, None)
+        .await
+        .expect_err("a c.bin another entry wrote must be refused");
+    assert!(
+        format!("{err:#}").contains(&format!("wrote it from decdn:{hash}/models/v2/c.bin")),
+        "{err:#}"
+    );
 
     let out_s = out.to_str().unwrap();
     let (args, parsed) = get_args(&uri, &["--dry-run", "-o", out_s]);

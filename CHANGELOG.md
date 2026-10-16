@@ -3477,13 +3477,19 @@ since project inception and will roll into the first tagged release.
   lands at `./<hash>`, a bundle in `.`, and an entry URI
   (`decdn:<hash>/<path>`) at `./<name>`, the last segment of its path, with
   no parent directories. A bundle or entry pull without `-o` refuses a path
-  that holds a file no earlier pull wrote, or that one wrote from another
-  bundle or entry path, unless `--overwrite` (#2472). The error names that
-  source as a `decdn:` URI. So `decdn get decdn:<h>/tokenizer/config.json`
-  does not replace the `./config.json` that `decdn:<h>/text_encoder/config.json`
-  wrote. Each `.decdn-manifest.json` record names its manifest hash and
-  manifest path, and a `.decdn-manifest.json` an older build wrote reads as
-  empty. The pull leaves its `.decdn-bundles/`, `.decdn-manifest.json` and
+  that holds a file no earlier pull left there unchanged, unless
+  `--overwrite` (#2472). The earlier pull must be of the same entry (the
+  same manifest hash and manifest path), or have written the same bytes, so
+  a new version of a bundle replaces only the files it changes. The error
+  says why: no pull wrote the file, it changed after a pull wrote it, or a
+  pull wrote it from another entry, named as a `decdn:` URI. So `decdn get
+  decdn:<h>/tokenizer/config.json` does not replace the `./config.json`
+  that `decdn:<h>/text_encoder/config.json` wrote. Each
+  `.decdn-manifest.json` record names its manifest hash and manifest path.
+  A `.decdn-manifest.json` an older build wrote vouches for no file, so the
+  first pull without `-o` into such a directory refuses its files, and the
+  error names the version mismatch; pass `-o .` once to pull there. The
+  pull leaves its `.decdn-bundles/`, `.decdn-manifest.json` and
   `.decdn-partial/` in `.`.
   Without `-o`, the command prints `Downloading to <absolute path>` on stderr
   before the pull starts (not under `--json` or `--dry-run`). With `-o`, each

@@ -176,8 +176,9 @@ A `decdn:` URI names a blob, a whole bundle, or one file of a bundle
 | `decdn:<hash>/a/b.txt` | that one file of the bundle | a directory, or `-` for stdout | `./b.txt` |
 | any of these with `?ns=<id>` | the same, routed to a namespace's origins | the same | the same |
 
-Without `-o`, a bundle or entry pull refuses to replace a file that no earlier pull wrote, or
-that an earlier pull wrote from another bundle or entry path.
+Without `-o`, a bundle or entry pull refuses to replace a file unless an earlier pull wrote it
+there and it has not changed since. That earlier pull must be of the same entry, or have
+written the same bytes. A new version of a bundle replaces only the files it changes.
 
 `get` probes bonded nodes and picks one that holds the blob. When none does, it tries
 bonded non-holders nearest first. Each fills the miss from its own origin, or from a peer

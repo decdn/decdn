@@ -103,14 +103,17 @@ struct ManifestV1 {
 }
 
 impl BundleManifest {
-    /// A manifest of `entries` whose blob has the BLAKE3 hash `hash`.
+    /// A manifest of `entries` whose blob has the BLAKE3 hash `hash`. A pull
+    /// records `hash` as the source of each file it writes, so a wrong one
+    /// makes a later pull of the same entry see its own files as foreign.
     #[must_use]
     pub const fn new(hash: [u8; 32], entries: Vec<ManifestEntry>) -> Self {
         Self { hash, entries }
     }
 
     /// The manifest blob's BLAKE3 hash. A pull records it as the source of
-    /// each file it writes.
+    /// each file it writes. Filtering `entries` keeps it: it names the whole
+    /// manifest.
     #[must_use]
     pub const fn hash(&self) -> [u8; 32] {
         self.hash
@@ -167,45 +170,76 @@ impl BundleManifest {
 }
 
 /// The entries of `manifest` whose path under `out_dir` holds something that
-/// this pull did not write: a file, directory or link at the entry's path that
-/// the skip-cache in `out_dir` has no record of, or that an earlier pull wrote
-/// from another bundle or another manifest path. A pull replaces such a file
-/// when its bytes differ from the entry's, so a caller that did not choose
-/// `out_dir` can refuse the pull first.
+/// a pull of the same entry may replace without the user's say: a file,
+/// directory or link that no record in the skip-cache in `out_dir` vouches
+/// for. A record vouches for a path when the file there still has the
+/// recorded size and mtime, and the record names this entry (this manifest
+/// hash and manifest path) or holds this entry's bytes. A caller that did not
+/// choose `out_dir` can refuse the pull first.
+///
+/// An entry whose path escapes `out_dir`, or that lands on the pull's own
+/// state, is not named: the pull fails that entry and writes nothing there.
 #[must_use]
 pub fn foreign_paths(manifest: &BundleManifest, out_dir: &Path) -> Vec<ForeignPath> {
-    let saved = skip_cache::load(out_dir);
-    let bundle = skip_cache::bundle_key(manifest.hash);
+    let saved = skip_cache::load_checked(out_dir);
     manifest
         .entries
         .iter()
-        .filter(|en| {
-            engine::safe_join(out_dir, &en.path)
-                .is_ok_and(|dest| std::fs::symlink_metadata(dest).is_ok())
-        })
         .filter_map(|en| {
-            let written_from = match saved.get(&en.path) {
-                None => None,
-                Some(rec) if rec.source.is(&bundle, en.manifest_path()) => return None,
-                Some(rec) => rec.source.uri(),
+            let dest = engine::writable_dest(out_dir, &en.path).ok()?;
+            let meta = std::fs::symlink_metadata(dest).ok()?;
+            let reason = match &saved {
+                Err(e) => ForeignReason::UnreadableCache(format!("{e:#}")),
+                Ok(saved) => match saved.get(&en.path) {
+                    None => ForeignReason::Unrecorded,
+                    Some(rec) if !rec.still_matches(&meta) => {
+                        ForeignReason::Changed(rec.source.uri())
+                    }
+                    Some(rec)
+                        if rec.source.is(manifest.hash, en.manifest_path())
+                            || rec.hash == en.hash =>
+                    {
+                        return None;
+                    }
+                    Some(rec) => ForeignReason::OtherSource(rec.source.uri()),
+                },
             };
             Some(ForeignPath {
                 path: en.path.clone(),
-                written_from,
+                reason,
             })
         })
         .collect()
 }
 
-/// A path a pull would replace that it did not write ([`foreign_paths`]).
+/// A path a pull may replace that no record vouches for ([`foreign_paths`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ForeignPath {
     /// The entry's path under the output directory.
     pub path: String,
-    /// The bundle entry an earlier pull wrote at `path`, or `None` when no
-    /// pull recorded writing it.
-    pub written_from: Option<DecdnUri>,
+    /// Why no record vouches for `path`.
+    pub reason: ForeignReason,
+}
+
+/// Why no skip-cache record vouches for a [`ForeignPath`].
+///
+/// A held [`DecdnUri`] is the bundle entry an earlier pull wrote the path
+/// from. It is `None` when the record names no readable manifest hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForeignReason {
+    /// No pull recorded writing the path.
+    Unrecorded,
+    /// The skip-cache file is there, but it cannot be used: it cannot be
+    /// read, it is not a skip-cache, or another build wrote it. Holds the
+    /// cause.
+    UnreadableCache(String),
+    /// A pull wrote the path, and it changed after: its size, its mtime, or
+    /// its kind differs from the record.
+    Changed(Option<DecdnUri>),
+    /// A pull wrote the path from another bundle entry, with other bytes.
+    OtherSource(Option<DecdnUri>),
 }
 
 /// Bytes that are not a v1 bundle manifest: [`BundleManifest::parse`]'s error,
@@ -260,7 +294,9 @@ impl ManifestEntry {
 
     /// This entry, landing at `path` under the output directory in place of
     /// its manifest path. The pull records the manifest path as the source of
-    /// the file it writes. Setting the `path` field directly loses that source.
+    /// the file it writes. A second `land_at` keeps the first manifest path.
+    /// Setting the `path` field directly makes the pull record that path as
+    /// the manifest path.
     #[must_use]
     pub fn land_at(mut self, path: impl Into<String>) -> Self {
         let manifest_path = std::mem::replace(&mut self.path, path.into());

@@ -11,6 +11,11 @@ pub decdn_client::bundle::BundleEnd::FundingNeeded::error: anyhow::Error
 pub decdn_client::bundle::BundleEnd::FundingNeeded::needed: decdn_client::credential::FundingNeeded
 pub decdn_client::bundle::BundleEnd::Interrupted
 pub decdn_client::bundle::BundleEnd::Stopped(anyhow::Error)
+#[non_exhaustive] pub enum decdn_client::bundle::ForeignReason
+pub decdn_client::bundle::ForeignReason::Changed(core::option::Option<decdn_client::uri::DecdnUri>)
+pub decdn_client::bundle::ForeignReason::OtherSource(core::option::Option<decdn_client::uri::DecdnUri>)
+pub decdn_client::bundle::ForeignReason::UnreadableCache(alloc::string::String)
+pub decdn_client::bundle::ForeignReason::Unrecorded
 #[non_exhaustive] pub enum decdn_client::bundle::Funding
 pub decdn_client::bundle::Funding::Delegated
 pub decdn_client::bundle::Funding::Delegated::slot: decdn_client::credential::CredentialSlot
@@ -79,7 +84,7 @@ pub decdn_client::bundle::EntryLanded::size: u64
 pub decdn_client::bundle::EntryLanded::spliced: u64
 #[non_exhaustive] pub struct decdn_client::bundle::ForeignPath
 pub decdn_client::bundle::ForeignPath::path: alloc::string::String
-pub decdn_client::bundle::ForeignPath::written_from: core::option::Option<decdn_client::uri::DecdnUri>
+pub decdn_client::bundle::ForeignPath::reason: decdn_client::bundle::ForeignReason
 #[non_exhaustive] pub struct decdn_client::bundle::ManifestChunk
 pub decdn_client::bundle::ManifestChunk::hash: alloc::string::String
 pub decdn_client::bundle::ManifestChunk::size: u64
