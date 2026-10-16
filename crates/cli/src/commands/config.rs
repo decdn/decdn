@@ -965,7 +965,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # cache_dir = "~/.decdn/cache"
 # cache_size_mb = 102400                  # UPPER bound on the cache; the eviction driver clamps it down to keep disk_headroom_mb free on the volume (#1930). Set it large to let free disk size the cache.
 # disk_headroom_mb = 8192                  # free disk (MiB) the eviction driver keeps unused on the cache_dir volume, defended against ANY process (#1930); default 8 GiB. 0 opts out (only cache_size_mb binds)
-# max_blob_size_mb = 51200             # largest single blob admitted; unset => 50 GB capped to cache_size_mb. Must be <= cache_size_mb; 0 = unlimited
+# max_blob_size_mb = 51200             # cap on the bytes of one blob held (an own-origin blob over it is refused; a pull-through serves any offset while the bytes held fit); unset => 50 GB capped to cache_size_mb. Must be <= cache_size_mb; 0 = unlimited
 # max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. A buyer-side ceiling only; the node never bounds its own sell rate
 # pinned_hashes = []                       # blob hashes (hex) exempted from LRU eviction (#276)
 # user_agent = "decdn-node/<version>"      # User-Agent on HTTP origin pull-through (#435); default embeds the crate version

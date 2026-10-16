@@ -328,13 +328,34 @@ async fn first_leg_is_the_range_the_drive_opens_first() {
         Some((want.fetch_start(), want.fetch_len()))
     );
 
-    // The received-byte ceiling caps the first leg exactly as it caps a
-    // drawn leg: one chunk group past the ceiling.
+    // The cap on held bytes cuts the first leg exactly as it cuts a drawn
+    // leg: to the room left under the cap, at any offset.
     assert_eq!(
         first_leg(&fresh, &[(0, 0)], u64::MAX, GROUP)
             .await
             .expect("first leg"),
-        Some(align_range(0, 2 * GROUP, total).expect("align"))
+        Some(align_range(0, GROUP, total).expect("align"))
+    );
+    assert_eq!(
+        first_leg(&fresh, &[(2 * GROUP, 0)], u64::MAX, GROUP)
+            .await
+            .expect("first leg"),
+        Some(align_range(2 * GROUP, GROUP, total).expect("align"))
+    );
+    // A store already holding the cap's worth opens no first leg.
+    let at_cap = fresh_store(root, total);
+    preadmit(
+        &at_cap,
+        &plaintext,
+        &outboard,
+        &align_range(0, GROUP, total).expect("align"),
+    )
+    .await;
+    assert_eq!(
+        first_leg(&at_cap, &[(0, 0)], u64::MAX, GROUP)
+            .await
+            .expect("first leg"),
+        None
     );
     let full = fresh_store(root, total);
     preadmit(
@@ -2890,6 +2911,107 @@ async fn re_delivered_bytes_report_no_progress() {
         owed_end,
         "the re-delivered bytes moved the position past the present base"
     );
+}
+
+/// Drive `[offset, +len)` of `plaintext` from a paying source capped at `cap`
+/// held bytes, into `store`. Returns the drive's result and the source.
+async fn drive_capped(
+    store: &ClientRangedStore,
+    plaintext: &[u8],
+    cap: u64,
+    offset: u64,
+    len: u64,
+) -> (anyhow::Result<()>, ScriptedSource) {
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let source = ScriptedSource::new(plaintext.to_vec())
+        .expect("source")
+        .paying(Arc::clone(&ledger))
+        .capped(cap);
+    let result = drive(
+        store,
+        &source,
+        &BudgetPacer::new(),
+        &Arc::new(Mutex::new(healthy_ctx())),
+        &ledger,
+        store.root(),
+        offset,
+        len,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    (result, source)
+}
+
+/// The cap bounds the bytes held for a blob, not the offsets read from it: a
+/// range that lies wholly past the cap's offset is pulled while the bytes
+/// held stay within the cap.
+#[tokio::test]
+async fn a_range_past_the_cap_offset_is_pulled_while_held_bytes_fit() {
+    let total = 8 * GROUP;
+    let (root, plaintext, _) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let (result, source) = drive_capped(&store, &plaintext, 2 * GROUP, 5 * GROUP, 2 * GROUP).await;
+    result.expect("a range within the cap's held bytes is pulled at any offset");
+    assert_eq!(source.opened_ranges(), vec![(5 * GROUP, 2 * GROUP)]);
+    assert_eq!(
+        store
+            .read(5 * GROUP, 2 * GROUP)
+            .await
+            .expect("read")
+            .as_ref(),
+        &plaintext[(5 * GROUP) as usize..(7 * GROUP) as usize]
+    );
+}
+
+/// A store that already holds the cap's worth of a blob opens no leg for a
+/// missing range: the drive ends with `BlobTooLarge` before any byte is
+/// pulled or paid for.
+#[tokio::test]
+async fn a_pull_into_a_full_cap_ends_before_it_opens() {
+    let total = 8 * GROUP;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    preadmit(
+        &store,
+        &plaintext,
+        &outboard,
+        &align_range(0, 2 * GROUP, total).expect("align"),
+    )
+    .await;
+    let (result, source) = drive_capped(&store, &plaintext, 2 * GROUP, 5 * GROUP, GROUP).await;
+    let err = result.expect_err("no room is left under the cap");
+    let too_large = err
+        .downcast_ref::<crate::BlobTooLarge>()
+        .unwrap_or_else(|| panic!("the cap ends the drive as BlobTooLarge: {err:#}"));
+    assert_eq!(too_large.ceiling, 2 * GROUP);
+    assert_eq!(
+        too_large.reached,
+        3 * GROUP,
+        "held bytes once the gap lands"
+    );
+    assert!(source.opened_ranges().is_empty(), "no leg opens");
+}
+
+/// A gap with more missing bytes than the cap leaves room for pulls up to
+/// the cap and then ends with `BlobTooLarge`: the legs stop at the cap's
+/// worth of new bytes rather than at an offset.
+#[tokio::test]
+async fn a_gap_over_the_cap_pulls_up_to_the_cap_then_ends() {
+    let total = 8 * GROUP;
+    let (root, plaintext, _) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let (result, source) = drive_capped(&store, &plaintext, 2 * GROUP, 4 * GROUP, 4 * GROUP).await;
+    let err = result.expect_err("the gap holds more than the cap");
+    assert!(
+        err.downcast_ref::<crate::BlobTooLarge>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(source.opened_ranges(), vec![(4 * GROUP, 2 * GROUP)]);
+    let held = ranges_content_len(&store.present_ranges().await.expect("present"), total);
+    assert_eq!(held, 2 * GROUP, "the store holds exactly the cap");
 }
 
 /// Owed spans merge into disjoint ascending ranges.

@@ -65,7 +65,7 @@ use super::wire::chunk_frame_bufs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, ClientMessage,
     Connection, FloorReservation, Hash, LaneDeliveryState, LaneKey, Mutex, RecvStream, SendStream,
-    U256, VecDeque, VoucherRejectReason, VoucherStop,
+    ServeRejectReason, U256, VecDeque, VoucherRejectReason, VoucherStop,
 };
 
 impl ClientHandler {
@@ -184,6 +184,53 @@ impl ClientHandler {
         }
     }
 
+    /// End the stream for a frame read of `hash` that failed with `e`. A read
+    /// of bytes the node cannot land under its cap on bytes held for the blob
+    /// is a refusal, not a fault: the node served the `delivered` bytes that
+    /// landed, refuses the rest with a mid-stream `Declined`, and the requester
+    /// asks another node. Such a read is one this serve's own fill ended at the
+    /// cap ([`decdn_cache::FillError::held_bytes_cap`]), or one of bytes no fill
+    /// landed ([`decdn_cache::is_unlanded`]) while the store already holds the
+    /// cap's worth of the blob: a sibling fill that covered them ended at the
+    /// cap. Every other error passes through unchanged.
+    async fn stop_at_held_cap(
+        &self,
+        send: &mut SendStream,
+        e: anyhow::Error,
+        hash: Hash,
+        delivered: u64,
+    ) -> anyhow::Result<ServeEnd> {
+        let cap = self
+            .pull_through_origin
+            .as_ref()
+            .map_or(0, |origin| origin.max_blob_size_bytes());
+        let at_cap = e.chain().any(decdn_cache::ended_at_held_bytes_cap)
+            || (cap > 0
+                && e.chain().any(decdn_cache::is_unlanded)
+                && self
+                    .cache
+                    .present_ranges(hash)
+                    .await
+                    .is_ok_and(|present| present.held_bytes() >= cap));
+        if !at_cap {
+            return Err(e);
+        }
+        tracing::info!(
+            %hash,
+            delivered,
+            cap,
+            error = %format_args!("{e:#}"),
+            "pull-through fill ended at this node's cap on bytes held; refusing the rest"
+        );
+        self.write_midstream_refusal(send, ServeRejectReason::BlobTooLarge)
+            .await
+            .map_err(|write| write.context(format!("{e:#}")))?;
+        Ok(ServeEnd::Stopped {
+            stop: ServeStop::BlobTooLarge,
+            bytes: delivered,
+        })
+    }
+
     /// The body of [`Self::serve_leg`]. `paid` counts the bytes accepted vouchers
     /// credited; the caller reads it when the loop ends.
     // One linear, ADR-ordered miss-leg serve loop; splitting it would scatter the
@@ -295,7 +342,7 @@ impl ClientHandler {
         // forfeits its ramp credit (ADR 003 §Credit window).
         carry.start_delivery();
         let opening_window = self.credit_window(chunk_bytes, carry.ramp_paid(0));
-        let mut next_chunk = waits
+        let mut next_chunk = match waits
             .time(
                 Wait::Store,
                 self.frame_unless_client_left(
@@ -304,7 +351,11 @@ impl ClientHandler {
                     client_left.as_mut(),
                 ),
             )
-            .await?;
+            .await
+        {
+            Ok(next) => next,
+            Err(e) => return self.stop_at_held_cap(send, e, hash, delivered).await,
+        };
 
         // Wall-clock cadence for the mid-stream pool-solvency re-check below (ADR
         // 003 §Pool solvency). Start the clock at loop entry — admission already
@@ -376,7 +427,7 @@ impl ClientHandler {
                 // what keeps this from parking on upstream bytes that this loop must
                 // exit to recoup before they can be pulled.
                 let room = window.saturating_sub(delivered.saturating_sub(*paid));
-                next_chunk = waits
+                next_chunk = match waits
                     .time(
                         Wait::Store,
                         self.frame_unless_client_left(
@@ -388,7 +439,11 @@ impl ClientHandler {
                             client_left.as_mut(),
                         ),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(next) => next,
+                    Err(e) => return self.stop_at_held_cap(send, e, hash, delivered).await,
+                };
             }
             let done_delivering = next_chunk.is_none();
 

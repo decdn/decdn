@@ -209,14 +209,29 @@ impl ClientHandler {
                 .await;
         }
 
-        // Size-ceiling gate on the request's start (ADR 005 §`BlobTooLarge`
-        // enforcement). A start at or past this node's buyer-side ceiling cannot
-        // deliver a byte below it, so the node refuses before discovery and the
-        // upstream handshake. The gate reads only the requester's own offset. The
-        // client's resume guard draws the same line: a start AT the ceiling is
-        // already past it. `0` is unlimited.
-        let ceiling = origin.max_blob_size_bytes();
-        if ceiling > 0 && req.byte_offset >= ceiling {
+        // Held-bytes gate (ADR 005 §`max_blob_size` enforcement). The cap bounds
+        // the bytes this node holds for one blob, not the offsets it serves. This
+        // path runs only for a range with a byte the node lacks, so a node that
+        // already holds the cap's worth of the blob cannot land it: it refuses
+        // before discovery and the upstream handshake. The gate reads only this
+        // node's own store, never the upstream's unverified size claim. A store
+        // that cannot answer leaves the gate open; the pull's own meter on the
+        // bytes it stores still binds. `0` is unlimited.
+        let cap = origin.max_blob_size_bytes();
+        if cap > 0
+            && self
+                .cache
+                .present_ranges(hash)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        %hash,
+                        error = %decdn_cache::ErrorChain::new(e),
+                        "held-bytes gate: the store read failed; the gate stays open"
+                    );
+                })
+                .is_ok_and(|present| present.held_bytes() >= cap)
+        {
             release_reservation_unspent(floor_reservation.as_ref());
             return self
                 .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
@@ -336,18 +351,18 @@ impl ClientHandler {
         // signed but unverified handshake value, so refusing on it would let a holder
         // inflate a small blob's size to make every finite-ceiling relay refuse to
         // pull/cache/serve while it monopolises the traffic. The `max_blob_size_bytes`
-        // ceiling is enforced instead on the bytes that ACTUALLY arrive, inside the
-        // pull leg's receive loop (`UpstreamPull::next_chunk`), which aborts the fill
-        // once received bytes cross it. A lie is inert (it cannot produce bytes that
-        // verify against the true root); an honest giant is streamed and paid for only
-        // up to one ceiling before the fill aborts and the serve fails a gap.
+        // cap is enforced instead on the bytes the pull leg stores for the blob
+        // (`decdn_client::drive`), which cuts each leg to the room left under the cap
+        // and ends the fill once no room is left. A lie is inert (it cannot produce
+        // bytes that verify against the true root); an honest giant is served up to
+        // the cap's worth of held bytes, at any offset.
         //
         // The request's end has no gate either. A request's `byte_len` may run past
         // the blob, and only the claimed total says where the blob ends, so an end
-        // gate would again let an inflated claim refuse a small blob. A request that
-        // starts below the ceiling and ends past it commits. The received-byte abort
-        // stops it near the ceiling, and a remainder that starts past the ceiling
-        // meets the start gate above.
+        // gate would again let an inflated claim refuse a small blob. A request with
+        // more missing bytes than the cap leaves room for commits: the serve leg
+        // delivers what the pull lands, then stops the stream with a `Declined`
+        // refusal once the pull ends at the cap.
 
         // (5) The signed `StreamResponse` commits to `total_bytes` (now known). It is
         // deferred to step (7), AFTER the fill is claimed — so a peeked geometry that
@@ -766,8 +781,7 @@ impl ClientHandler {
         // for wire-parity with the peer path. Its local pull leg's admission enforces
         // the engine cap on the bytes it actually stores, so an over-ceiling origin
         // blob fails the fill there rather than being refused up front on the probe
-        // size. Keeping both legs' ceiling-on-received keeps `max_blob_size_mb` one
-        // consistent rule across the serve-miss tiers.
+        // size.
 
         // (4) Sign + send the response up front — it commits to `total_bytes`,
         // which the caller already read from the origin size probe, and to the

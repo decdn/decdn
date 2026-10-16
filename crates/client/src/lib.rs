@@ -782,38 +782,36 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
     Ok(())
 }
 
-/// Typed sentinel for a pull aborted because the bytes that ACTUALLY arrived
-/// crossed the buyer's `max_blob_size_bytes` ceiling (#1895). The peer's signed
-/// `total_bytes` claim never drives a refusal — it is peer-controlled and
-/// unverified (`StreamResponse::validate()` does not bound it) — so the ceiling
-/// binds on cumulative RECEIVED, BLAKE3-verified bytes instead. Returned (not a
-/// bare string) so the pull orchestrator can `downcast_ref` and classify it as a
-/// buyer-side policy rejection — distinct from a hash mismatch or an unreachable
-/// peer — rather than mis-attributing it to the provider's reputation. `Display`
-/// carries `BlobTooLarge` so logs and the requester tests can match on it.
+/// Typed sentinel for a pull ended by the buyer's `max_blob_size_bytes` cap
+/// (#1895). The cap bounds how many bytes of one blob the buyer holds, not which
+/// offsets it reads: a range anywhere in a blob larger than the cap lands while
+/// the bytes held stay within it. The peer's signed `total_bytes` claim never
+/// drives a refusal — it is peer-controlled and unverified
+/// (`StreamResponse::validate()` does not bound it) — so the cap binds on
+/// RECEIVED, BLAKE3-verified bytes instead. Returned (not a bare string) so the
+/// pull orchestrator can `downcast_ref` and classify it as a buyer-side policy
+/// rejection — distinct from a hash mismatch or an unreachable peer — rather than
+/// mis-attributing it to the provider's reputation. `Display` carries
+/// `BlobTooLarge` so logs and the requester tests can match on it.
 ///
 /// **Units.** `reached` and `ceiling` are ALWAYS the same unit within one error —
 /// the comparison at each enforcement site is apples-to-apples — but that unit
-/// differs by site, so neither field is a raw `max_blob_size_bytes` config value
-/// across all call sites. The receive loop ([`UpstreamPull::next_chunk`]) meters bao
-/// WIRE bytes (content plus interleaved proof, ADR 038) and compares against the
-/// wire size of a ceiling-sized blob. The gap-driven driver (`fill_gap`) meters
-/// CONTENT bytes (the store's delivered frontier) and the resume-offset guard in
-/// [`open_progressive_pull`] meters a CONTENT offset, both against the configured
-/// `max_blob_size_bytes` directly. [`acquire`] meters CONTENT bytes against
-/// [`AcquireEnv::max_blob_bytes`]: it clamps a size claim to the cap and
-/// reports a blob whose bytes run past it once every byte below the cap is
-/// present and no leg proved a size within it. Every one is a faithful "the
-/// byte position crossed the ceiling" report.
+/// differs by site. The receive loop ([`UpstreamPull::next_chunk`]) meters bao
+/// WIRE bytes (content plus interleaved proof, ADR 038) one stream received,
+/// against the wire size of the cap's worth of content from the stream's
+/// offset. The gap-driven driver (`fill_gap`) meters the CONTENT bytes the store
+/// would hold once the gap lands, against `max_blob_size_bytes`, and ends before
+/// it opens a leg that could only add bytes past the cap. [`acquire`] meters the
+/// CONTENT bytes the store holds against [`AcquireEnv::max_blob_bytes`].
 #[derive(Debug)]
 #[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct BlobTooLarge {
-    /// The byte position that crossed `ceiling` — wire bytes taken off the stream
-    /// (receive loop), the store's content frontier (gap-driven driver), or a
-    /// content resume offset already past it. Same unit as `ceiling` (see the
-    /// type's **Units** note).
+    /// The byte count past `ceiling` — wire bytes one stream received (receive
+    /// loop), or content bytes the store holds or would hold for the blob
+    /// (driver, [`acquire`]). Same unit as `ceiling` (see the type's **Units**
+    /// note).
     pub reached: u64,
-    /// The ceiling `reached` crossed, in the same unit as `reached`.
+    /// The cap `reached` passed, in the same unit as `reached`.
     pub ceiling: u64,
 }
 
@@ -859,7 +857,8 @@ impl std::fmt::Display for BlobTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "reached byte {}, crossing the {}-byte size ceiling (BlobTooLarge)",
+            "reached {} bytes, past the {}-byte cap on bytes held for one blob \
+             (max_blob_size: --max-blob-mb or cache.max_blob_size_mb) (BlobTooLarge)",
             self.reached, self.ceiling
         )
     }
@@ -2969,10 +2968,10 @@ pub struct UpstreamPull {
     /// chunk-group-aligned range (content plus interleaved proof, ADR 038), not
     /// the content-byte remainder. Bounds the receive loop and the closing voucher.
     expected_wire_bytes: u64,
-    /// The buyer's received-byte ceiling (#1895) as a WIRE bound: the wire size of a
-    /// ceiling-sized blob's content from this stream's offset, so `next_chunk` can
-    /// enforce `max_blob_size_bytes` on the bytes that ACTUALLY arrive without
-    /// decoding. `0` = unlimited.
+    /// The per-stream received-byte bound (#1895) as WIRE: the wire size of the
+    /// cap's worth of content from this stream's offset, so `next_chunk` holds one
+    /// stream to `max_blob_size_bytes` of content on the bytes that ACTUALLY
+    /// arrive, without decoding. `0` = unlimited.
     max_received_wire: u64,
     /// Wire bytes received so far on this stream.
     cumulative: u64,
@@ -3009,17 +3008,18 @@ impl std::fmt::Debug for UpstreamPull {
 /// [`UpstreamPull`] to drive. Zero-rate rejection, `slash_sig` recovery, echoed
 /// field checks, the buyer's rate ceiling, and the `total_bytes >= byte_offset`
 /// floor are all enforced BEFORE the first chunk. The `max_blob_size_bytes`
-/// ceiling is NOT one of them (#1895): the peer's `total_bytes` claim is
-/// unverified, so the ceiling is enforced on the bytes that ACTUALLY arrive,
-/// inside [`UpstreamPull::next_chunk`], as [`BlobTooLarge`]. `0` = unlimited.
+/// cap is NOT one of them (#1895): the peer's `total_bytes` claim is
+/// unverified, so the cap binds on the bytes that ACTUALLY arrive. One stream
+/// carries at most the cap's worth of content from its own offset, enforced
+/// inside [`UpstreamPull::next_chunk`] as [`BlobTooLarge`]; the offset itself is
+/// never refused. `0` = unlimited.
 ///
 /// # Errors
 ///
 /// Connect / transport faults, a refused or zero-rate response, a bad `slash_sig`,
-/// a mismatched echoed field, a [`RateAboveCeiling`] quote, a
-/// [`ResumeOffsetPastEnd`] offset, or a resume offset already at/past the size
-/// ceiling ([`BlobTooLarge`]). The size ceiling otherwise surfaces later, as a
-/// [`BlobTooLarge`] abort once received bytes cross it.
+/// a mismatched echoed field, a [`RateAboveCeiling`] quote, or a
+/// [`ResumeOffsetPastEnd`] offset. The cap surfaces later, as a [`BlobTooLarge`]
+/// abort once the stream's received bytes cross the cap's worth from its offset.
 ///
 /// The open stage is bounded by `deadlines.open`, inside the shared `open_stream`
 /// helper — NOT left to the caller (#1134). `node_origin` additionally wraps this
@@ -3224,12 +3224,12 @@ async fn open_progressive_pull_impl(
         }
         // The peer's signed `total_bytes` never drives a refusal (#1895): it is
         // peer-controlled and unverified (`StreamResponse::validate()` does not bound
-        // it), so the `max_blob_size_bytes` ceiling is enforced on the bytes that
+        // it), so the `max_blob_size_bytes` cap is enforced on the bytes that
         // ACTUALLY arrive, inside `UpstreamPull::next_chunk`, not on the claim. Refusing
         // on an inflated claim would let a holder centralise a small blob's traffic
-        // across every finite-ceiling relay; a lie cannot produce bytes that verify
-        // against the true root, and an honest giant is streamed and paid for only up
-        // to one ceiling.
+        // across every finite-cap relay; a lie cannot produce bytes that verify
+        // against the true root, and one stream of an honest giant is streamed and
+        // paid for only up to the cap's worth.
         // Buyer-side rate ceiling (#1375): refuse an over-ceiling quote before the
         // first paid interval, carrying the signed quote out as rate-manipulation
         // evidence. `0` = unbounded.
@@ -3242,21 +3242,19 @@ async fn open_progressive_pull_impl(
         // bytes (ADR 038 §Payment metering).
         let total_bytes = resp.body.total_bytes;
         let expected_wire_bytes = served_wire_len(byte_offset, byte_len, total_bytes)?;
-        // Received-byte ceiling (#1895), expressed as a WIRE bound so `next_chunk` can
-        // enforce it without decoding: the wire size of a ceiling-sized blob's content
-        // from this offset. Enforced on the bytes that ACTUALLY arrive, never on the
-        // peer's unverified `total_bytes` claim. A resume offset already at/past the
-        // ceiling means the blob is genuinely oversized — abort before the first chunk.
-        // `0` = unlimited.
-        let max_received_wire = if max_blob_size_bytes == 0 {
+        // Per-stream bound on received bytes (#1895), as WIRE so `next_chunk` can
+        // enforce it without decoding: the wire size of the cap's worth of content
+        // from this offset. The cap bounds the bytes held for one blob, so one
+        // stream never carries more content than the cap, wherever in the blob it
+        // starts. Enforced on the bytes that ACTUALLY arrive, never on the peer's
+        // unverified `total_bytes` claim. The caller's driver meters the bytes the
+        // store holds across streams (`driver::fill_gap`). `0` = unlimited. The
+        // empty blob carries no content, so a cap has nothing to bound and no
+        // range to size against a signed size of zero.
+        let max_received_wire = if max_blob_size_bytes == 0 || total_bytes == 0 {
             0
-        } else if byte_offset >= max_blob_size_bytes {
-            return Err(anyhow::Error::new(BlobTooLarge {
-                reached: byte_offset,
-                ceiling: max_blob_size_bytes,
-            }));
         } else {
-            aligned_wire_len(byte_offset, 0, max_blob_size_bytes)?
+            aligned_wire_len(byte_offset, max_blob_size_bytes, total_bytes)?
         };
         let header = UpstreamPullHeader {
             total_bytes,
@@ -3503,8 +3501,9 @@ impl UpstreamPull {
     ///
     /// # Errors
     ///
-    /// More bytes than promised, received bytes crossing the buyer's size ceiling
-    /// ([`BlobTooLarge`], raised before the crossing chunk is paid), a mid-stream `StreamError`
+    /// More bytes than promised, received bytes crossing the cap's worth of content
+    /// from this stream's offset ([`BlobTooLarge`], raised before the crossing chunk is
+    /// paid), a mid-stream `StreamError`
     /// (typed [`UpstreamRefused`]), an unexpected message, a [`UpstreamVoucherRejected`] /
     /// transport error while paying, or —
     /// on the throughput floor — [`PullStalled`] once bytes have flowed, or [`PullTimeout`] if
@@ -3558,13 +3557,14 @@ impl UpstreamPull {
                             self.expected_wire_bytes
                         );
                     }
-                    // Received-byte ceiling (#1895): enforce the size cap on the bytes
-                    // that ACTUALLY arrive, never on the peer's unverified `total_bytes`
-                    // claim. `max_received_wire` is the wire size of a ceiling-sized
-                    // blob's content, so this is the wire form of "received content >
-                    // ceiling" — distinct from the claim-derived `expected_wire_bytes`
-                    // overrun guard above. Abort BEFORE paying for the chunk that
-                    // crosses it, so the spend stays bounded to roughly one ceiling.
+                    // Per-stream received-byte bound (#1895): enforce the cap on the
+                    // bytes that ACTUALLY arrive, never on the peer's unverified
+                    // `total_bytes` claim. `max_received_wire` is the wire size of the
+                    // cap's worth of content from this stream's offset, so this is the
+                    // wire form of "this stream carried more content than the cap" —
+                    // distinct from the claim-derived `expected_wire_bytes` overrun
+                    // guard above. Abort BEFORE paying for the chunk that crosses it,
+                    // so one stream's spend stays bounded to the cap's worth.
                     // `0` = unlimited.
                     if self.max_received_wire > 0 && self.cumulative > self.max_received_wire {
                         return Err(anyhow::Error::new(BlobTooLarge {

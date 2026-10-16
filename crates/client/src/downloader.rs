@@ -226,10 +226,11 @@ impl<P, F> Downloader<P, F> {
         self.refetched.load(Ordering::Relaxed)
     }
 
-    /// Cap every target at `max_blob_bytes` (`0` for no cap). A target's size
-    /// claim above the cap is clamped to it before its store is sized, and a
-    /// blob that holds bytes past the cap fails with [`crate::BlobTooLarge`]
-    /// ([`crate::AcquireEnv::max_blob_bytes`]).
+    /// Cap the bytes held for every target at `max_blob_bytes` (`0` for no
+    /// cap). A target's ranges are fetched at any offset while the bytes held
+    /// fit; ranges that would hold more fail with [`crate::BlobTooLarge`]
+    /// ([`crate::AcquireEnv::max_blob_bytes`]). A size claim past the
+    /// furthest range start plus the cap never sizes the store.
     #[must_use]
     pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
         self.max_blob_bytes = max_blob_bytes;
@@ -375,16 +376,15 @@ where
             tokio::fs::create_dir_all(&dir)
                 .await
                 .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
+            let whole = [(0, target.total_bytes)];
+            let ranges = target.ranges.unwrap_or(&whole);
             // Off the runtime: opening a finalized blob hashes its final file.
             let store = {
                 let (dir, stem) = (dir.clone(), stem.clone());
                 let (hash, total) = (target.hash, target.total_bytes);
-                // A claim above the cap never sizes the store.
-                let total = if self.max_blob_bytes > 0 {
-                    total.min(self.max_blob_bytes)
-                } else {
-                    total
-                };
+                // A claim past what the cap on held bytes lets the ranges
+                // reach never sizes the store.
+                let total = total.min(crate::scheduler::claim_reach(ranges, self.max_blob_bytes));
                 tokio::task::spawn_blocking(move || {
                     ClientRangedStore::open_or_create(&dir, &stem, hash, total)
                 })
@@ -394,8 +394,6 @@ where
                     anyhow::anyhow!("open ranged store for {}: {e}", target.dest.display())
                 })?
             };
-            let whole = [(0, target.total_bytes)];
-            let ranges = target.ranges.unwrap_or(&whole);
             let mut sources = SourceSet::new(
                 &self.provider,
                 target.hash,

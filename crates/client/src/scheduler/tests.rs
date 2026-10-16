@@ -4994,6 +4994,197 @@ async fn a_proven_size_past_an_unaligned_cap_ends_the_item() -> anyhow::Result<(
     Ok(())
 }
 
+/// Acquire `ranges` of `data`'s blob from one honest lane whose source
+/// carries the same `cap`, into a store sized by the blob's own length.
+async fn acquire_ranges_capped(
+    data: &[u8],
+    ranges: &[(u64, u64)],
+    cap: u64,
+) -> anyhow::Result<(anyhow::Result<()>, ClientRangedStore, ScriptedSource)> {
+    let root = ScriptedSource::new(data.to_vec())?.root();
+    let total = u64::try_from(data.len())?;
+    let (store, dir) = fresh_store(root, total);
+    std::mem::forget(dir);
+    let (result, mut sources) = acquire_capped_into(&store, data, ranges, cap, 1).await?;
+    let source = sources.pop().ok_or_else(|| anyhow::anyhow!("one source"))?;
+    Ok((result, store, source))
+}
+
+/// Acquire `ranges` of `data`'s blob into `store` from `lanes` honest
+/// sources, each carrying the same `cap`, with up to `lanes` lanes at once.
+async fn acquire_capped_into(
+    store: &ClientRangedStore,
+    data: &[u8],
+    ranges: &[(u64, u64)],
+    cap: u64,
+    lanes: u8,
+) -> anyhow::Result<(anyhow::Result<()>, Vec<ScriptedSource>)> {
+    let mut sources = Vec::new();
+    let mut candidates = Vec::new();
+    for provider in 0..lanes {
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(data.to_vec())?
+            .paying(Arc::clone(&ledger))
+            .capped(cap);
+        candidates.push(candidate(
+            source.clone(),
+            ledger,
+            0xA1_u8.saturating_add(provider),
+            None,
+        ));
+        sources.push(source);
+    }
+    let root = store.root();
+    let provider = StaticSources::new(candidates)?;
+    let mut set = SourceSet::new(&provider, root, Arc::default(), provider.holders());
+    let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+    let gate = recovery_gate();
+    let result = acquire(
+        AcquireTarget {
+            store,
+            hash: root,
+            total_bytes: u64::try_from(data.len())?,
+            ranges,
+        },
+        &mut set,
+        &AcquireEnv {
+            pacer: &BudgetPacer::new(),
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
+            max_lanes: usize::from(lanes),
+            stop: &stop,
+            on_progress: None,
+            ledgers: None,
+            pacing: None,
+            max_blob_bytes: cap,
+            run: None,
+        },
+    )
+    .await;
+    Ok((result, sources))
+}
+
+/// The cap bounds the bytes held for the blob, not the offsets read: a range
+/// that lies wholly past the cap's offset is fetched while the bytes held
+/// stay within the cap.
+#[tokio::test(start_paused = true)]
+async fn a_range_past_the_cap_offset_is_fetched_while_held_bytes_fit() -> anyhow::Result<()> {
+    let data = blob(6 * MIB as usize);
+    let cap = 2 * MIB;
+    let (result, store, _source) = acquire_ranges_capped(&data, &[(4 * MIB, MIB)], cap).await?;
+    result?;
+    let held = ranges_content_len(&store.present_ranges().await?, store.total_bytes());
+    assert_eq!(held, MIB);
+    assert_eq!(
+        store.read(4 * MIB, MIB).await?.as_ref(),
+        data.get((4 * MIB) as usize..(5 * MIB) as usize)
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// Ranges that together hold more than the cap end the item with
+/// `BlobTooLarge`, and the legs stop near the cap's worth of bytes.
+#[tokio::test(start_paused = true)]
+async fn ranges_over_the_cap_end_the_item() -> anyhow::Result<()> {
+    let data = blob(6 * MIB as usize);
+    let cap = 2 * MIB;
+    let ranges = [(0, 3 * MIB / 2), (4 * MIB, 3 * MIB / 2)];
+    let (result, store, source) = acquire_ranges_capped(&data, &ranges, cap).await?;
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("ranges over the cap must fail"))?;
+    assert!(
+        err.downcast_ref::<crate::BlobTooLarge>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
+    let held = ranges_content_len(&store.present_ranges().await?, store.total_bytes());
+    assert!(held <= cap, "the store holds at most the cap: {held}");
+    assert!(
+        source.opened_bytes() <= cap,
+        "the legs open at most the cap: {}",
+        source.opened_bytes()
+    );
+    Ok(())
+}
+
+/// Lanes share one cap: two lanes on two ranges that together hold more than
+/// the cap open, between them, no more than the cap's worth. Each leg's room
+/// is the room the store's held bytes leave, which a sibling lane's leg in
+/// flight does not yet count in, so such a fetch runs one stream at a time.
+#[tokio::test(start_paused = true)]
+async fn ranges_over_the_cap_stay_within_it_across_lanes() -> anyhow::Result<()> {
+    let data = blob(6 * MIB as usize);
+    let cap = 2 * MIB;
+    let ranges = [(0, 3 * MIB / 2), (4 * MIB, 3 * MIB / 2)];
+    let root = ScriptedSource::new(data.clone())?.root();
+    let (store, _dir) = fresh_store(root, 6 * MIB);
+    let (result, sources) = acquire_capped_into(&store, &data, &ranges, cap, 2).await?;
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("ranges over the cap must fail"))?;
+    assert!(
+        err.downcast_ref::<crate::BlobTooLarge>().is_some(),
+        "{err:#}"
+    );
+    let opened: u64 = sources.iter().map(ScriptedSource::opened_bytes).sum();
+    assert!(opened <= cap, "the lanes open at most the cap: {opened}");
+    let held = ranges_content_len(&store.present_ranges().await?, store.total_bytes());
+    assert!(held <= cap, "the store holds at most the cap: {held}");
+    Ok(())
+}
+
+/// Ranges whose bytes fit the cap keep every lane: two lanes split them, as
+/// an uncapped fetch does.
+#[tokio::test(start_paused = true)]
+async fn ranges_within_the_cap_run_on_every_lane() -> anyhow::Result<()> {
+    let data = blob(6 * MIB as usize);
+    let cap = 2 * MIB;
+    let ranges = [(0, MIB), (4 * MIB, MIB)];
+    let root = ScriptedSource::new(data.clone())?.root();
+    let (store, _dir) = fresh_store(root, 6 * MIB);
+    let (result, sources) = acquire_capped_into(&store, &data, &ranges, cap, 2).await?;
+    result?;
+    assert!(
+        sources.iter().all(|s| s.opened_bytes() > 0),
+        "both lanes open a leg: {:?}",
+        sources
+            .iter()
+            .map(ScriptedSource::opened_bytes)
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+/// A resumed store whose verified size needs more than the cap to complete
+/// ends the item before it opens a leg: the size is proven, so nothing the
+/// fetch could pull would fit.
+#[tokio::test(start_paused = true)]
+async fn a_proven_size_over_the_cap_ends_before_any_leg() -> anyhow::Result<()> {
+    let data = blob(6 * MIB as usize);
+    let root = ScriptedSource::new(data.clone())?.root();
+    let (store, _dir) = fresh_store(root, 6 * MIB);
+    // An uncapped earlier run pulls the last MiB, which proves the size.
+    let (first, _) = acquire_capped_into(&store, &data, &[(5 * MIB, MIB)], 0, 1).await?;
+    first?;
+    assert_eq!(store.proven(), Some(6 * MIB));
+    let cap = 2 * MIB;
+    let (result, sources) = acquire_capped_into(&store, &data, &[(0, 0)], cap, 1).await?;
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a proven size over the cap must fail"))?;
+    assert!(
+        err.downcast_ref::<crate::BlobTooLarge>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(classify(&err), Fault::Fatal(FatalScope::Item));
+    let opened: u64 = sources.iter().map(ScriptedSource::opened_bytes).sum();
+    assert_eq!(opened, 0, "no leg opens");
+    Ok(())
+}
+
 // ---- a busy lane grows for a faulted lane's remainder (#2231) ----
 
 /// Counts what a [`super::LaneWiden`] granted and got back.

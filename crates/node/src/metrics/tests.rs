@@ -682,6 +682,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
         "decdn_serve_stream_rejected_pool_closing_total",
         "decdn_serve_stream_rejected_signer_cap_exhausted_total",
         "decdn_serve_stream_midstream_signer_cap_exhausted_total",
+        "decdn_serve_stream_midstream_blob_too_large_total",
         "decdn_serve_stream_rejected_signer_floor_at_cap_total",
         "decdn_serve_stream_rejected_pull_loop_guard_total",
         // Completed in #1520. These four always exported (the fields have
@@ -714,6 +715,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
     metrics.serve_stream_rejected_pool_closing();
     metrics.serve_stream_rejected_signer_cap_exhausted();
     metrics.serve_stream_midstream_signer_cap_exhausted();
+    metrics.serve_stream_midstream_blob_too_large();
     metrics.serve_stream_rejected_signer_floor_at_cap();
     metrics.serve_stream_rejected_pull_loop_guard();
     metrics.serve_stream_rejected_range_not_satisfiable();

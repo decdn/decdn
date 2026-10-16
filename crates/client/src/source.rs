@@ -125,12 +125,13 @@ pub trait BlobSource: Send + Sync {
     /// on our side ([`crate::UpstreamPull::stop`]).
     fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress>;
 
-    /// The buyer's received-byte ceiling (#1895): the driver aborts with
-    /// [`crate::BlobTooLarge`] once the content BLAKE3-verified into the store
-    /// crosses this, enforcing the size cap on the bytes that ACTUALLY arrive rather
-    /// than on the peer's unverified signed `total_bytes`. `0` = unlimited — the
-    /// default, and correct for an own-origin source whose engine store already caps
-    /// on stored bytes.
+    /// The buyer's cap on bytes held for one blob (#1895). The driver cuts each
+    /// leg to the room the store's BLAKE3-verified bytes leave under it, and ends
+    /// with [`crate::BlobTooLarge`] once a missing byte could only land past it.
+    /// The cap bounds bytes held, never the offsets read, and never reads the
+    /// peer's unverified signed `total_bytes`. `0` = unlimited — the default, and
+    /// correct for an own-origin source whose engine store already caps on stored
+    /// bytes.
     fn max_blob_size_bytes(&self) -> u64 {
         0
     }
@@ -411,8 +412,9 @@ impl<'a> PeerSource<'a> {
     /// `ledger` over `ctx`'s lane. `namespace_id`, `max_rate_per_mb`, and
     /// `deadlines` are the same buyer-side policy knobs
     /// [`crate::open_progressive_pull`] takes directly — see its docs.
-    /// `max_blob_size_bytes` is the received-byte ceiling (#1895) the driver reads
-    /// back via [`BlobSource::max_blob_size_bytes`] to abort a fill that crosses it;
+    /// `max_blob_size_bytes` is the cap on bytes held for one blob (#1895): each
+    /// stream carries at most that much content, and the driver reads it back via
+    /// [`BlobSource::max_blob_size_bytes`] to end a fill that would hold more;
     /// `0` = unlimited.
     ///
     /// `connections` is the command's map of one connection per node: with
@@ -907,6 +909,9 @@ mod doubles {
         /// A delay before every `read_bytes` of every reader: a source with a
         /// steady delivery rate, on the runtime's clock.
         read_delay: Option<Duration>,
+        /// The cap on bytes held for the blob this source reports to the
+        /// driver ([`super::BlobSource::max_blob_size_bytes`]); `0` is none.
+        max_blob_size: u64,
     }
 
     impl std::fmt::Debug for ScriptedSource {
@@ -950,7 +955,17 @@ mod doubles {
                 ledger: None,
                 stops: Arc::new(AtomicU32::new(0)),
                 read_delay: None,
+                max_blob_size: 0,
             })
+        }
+
+        #[cfg(test)]
+        /// Report a cap of `bytes` held for the blob to the driver, as a
+        /// buyer's `max_blob_size_bytes` does.
+        #[must_use]
+        pub(crate) const fn capped(mut self, bytes: u64) -> Self {
+            self.max_blob_size = bytes;
+            self
         }
 
         #[cfg(test)]
@@ -1346,6 +1361,10 @@ mod doubles {
                 let wire = reader.wire_len.saturating_sub(reader.wire.len() as u64);
                 self.settle(&reader, wire).await
             })
+        }
+
+        fn max_blob_size_bytes(&self) -> u64 {
+            self.max_blob_size
         }
     }
 
