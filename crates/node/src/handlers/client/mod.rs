@@ -124,7 +124,7 @@ const FIRST_FRAME_BYTES: u64 = 4 * decdn_bao_range::CHUNK_GROUP_BYTES;
 /// reaper here: vouchers only ever flow *inside* a stream, so a connection with
 /// no stream in flight has no voucher in flight either (sent or received), and
 /// the rule reduces to purely stream-idle.
-const APP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const APP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // QUIC application error codes (ADR 013 §Application Error Codes). A clean
 // voucher rejection does NOT use these — it writes a `StreamError` frame and

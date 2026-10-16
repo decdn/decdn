@@ -46,7 +46,15 @@ use crate::dht::{
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 
-const ACCEPT_BI_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a fresh connection may sit before its first stream. A peer that
+/// dials and sends nothing frees its dispatch permit quickly.
+const FIRST_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a connection that has served a request stays open for the next
+/// one. The requester pools one `cdn/dht/v1` connection per peer, so bursty
+/// lookups and republish drains reuse it instead of redialling. It equals the
+/// `cdn/client/v1` idle reaper (`handlers::client::APP_IDLE_TIMEOUT`), so a
+/// parked DHT peer holds its dispatch permit no longer than an idle client.
+const IDLE_BETWEEN_STREAMS: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -71,6 +79,17 @@ const MAX_DHT_CONN_AGE: Duration = Duration::from_mins(5);
 /// than a re-implementation of it.
 fn accept_budget_reached(served: u32, conn_age: Duration) -> bool {
     served >= MAX_DHT_REQUESTS_PER_CONN || conn_age >= MAX_DHT_CONN_AGE
+}
+
+/// How long the accept loop waits for the next stream after serving
+/// `served` of them: [`FIRST_STREAM_TIMEOUT`] for the first,
+/// [`IDLE_BETWEEN_STREAMS`] for every later one.
+const fn accept_timeout(served: u32) -> Duration {
+    if served == 0 {
+        FIRST_STREAM_TIMEOUT
+    } else {
+        IDLE_BETWEEN_STREAMS
+    }
 }
 
 // ADR 013 application error codes (also defined in `handlers::probe`; the
@@ -259,11 +278,14 @@ impl DhtHandler {
                 );
                 break;
             }
-            // Peer closed the connection (`Ok(Err)`) or we hit the idle
-            // accept timeout (`Err`) — both mean we're done serving this
-            // connection; break the per-stream loop.
+            // Peer closed the connection (`Ok(Err)`) or the accept window
+            // elapsed (`Err`): done serving this connection. The window is
+            // short before the first stream and the client idle window
+            // after it (`accept_timeout`), so a requester's pooled
+            // connection stays warm between requests while an idle one
+            // still releases its permit within `APP_IDLE_TIMEOUT`.
             let Ok(Ok((send, recv))) =
-                tokio::time::timeout(ACCEPT_BI_TIMEOUT, conn.accept_bi()).await
+                tokio::time::timeout(accept_timeout(served), conn.accept_bi()).await
             else {
                 break;
             };

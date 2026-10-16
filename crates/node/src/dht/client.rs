@@ -43,7 +43,7 @@ use iroh::EndpointAddr;
 use iroh::endpoint::Connection;
 
 /// Per-request hard timeout for outbound DHT exchanges. Shorter than
-/// the sum of the server-side accept-bi timeout (5s) and read
+/// the sum of the server-side first-stream timeout (5s) and read
 /// timeout (5s) in [`crate::handlers::dht`] so a hung peer doesn't
 /// wedge a republish sweep.
 pub const DHT_CLIENT_TIMEOUT: Duration = Duration::from_secs(8);
