@@ -22,11 +22,12 @@ pub const DEFAULT_MAX_LANE_STREAMS: u16 = 4;
 /// path.
 ///
 /// - `decdn:<hash>`: the raw blob. `-o` is the destination file, or `-` for
-///   stdout.
+///   stdout. Without `-o`, the blob lands at `./<hash>`.
 /// - `decdn:<hash>/`: every entry of the bundle whose manifest has this hash.
-///   `-o` is the output directory.
+///   `-o` is the output directory. Without `-o`, it is `.`.
 /// - `decdn:<hash>/<path>`: that one bundle entry. `-o` is the output
-///   directory, and the file lands at `<OUT>/<path>`.
+///   directory, and the file lands at `<OUT>/<path>`. Without `-o`, the file
+///   lands at `./<name>`, where `<name>` is the last segment of `<path>`.
 ///
 /// A `?ns=<id>` in the URI is the namespace routing hint (ADR 002) for every
 /// request of the run: the manifest blob and each entry. The bundle-only flags
@@ -46,9 +47,12 @@ pub struct GetArgs {
     /// in the same directory, then rename), or `-` to stream verified bytes to
     /// stdout. For a bundle or entry URI, the output directory (created if
     /// absent); each entry's relative path resolves within it, and
-    /// `..`/absolute/escaping paths are rejected.
+    /// `..`/absolute/escaping paths are rejected. Without `-o`, a blob lands at
+    /// `./<hash>`, a bundle in `.`, and an entry at `./<name>` (the last
+    /// segment of its path); a bundle or entry pull then refuses a path that
+    /// holds a file no earlier pull wrote, unless `--overwrite`.
     #[arg(short = 'o', long, value_name = "PATH")]
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
 
     /// Bundle only: maximum concurrent entry fetches across the whole run
     /// [default: 4]. Each distinct blob is one unit of work holding one slot:

@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::buyer_store::open_client_store_for_buy;
 use super::fetch;
+use super::get::Destination;
 use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
 use super::manifest::build_glob_set;
 use super::pull_progress::{self, PullProgress};
@@ -91,6 +92,9 @@ struct EntryFilter {
     exclude: globset::GlobSet,
     /// The `--exclude` patterns as given, indexed like `include_patterns`.
     exclude_patterns: Vec<String>,
+    /// The file name the entry an entry URI names lands at, directly in the
+    /// output root, in place of its manifest `path`. Set only with `entry`.
+    land_as: Option<String>,
 }
 
 /// A `--include` or `--exclude` pattern that matched no entry of the manifest.
@@ -148,7 +152,16 @@ impl EntryFilter {
             include_patterns: include.to_vec(),
             exclude: build_glob_set(exclude, "--exclude")?,
             exclude_patterns: exclude.to_vec(),
+            land_as: None,
         })
+    }
+
+    /// This filter with the entry the URI names landing at `name`, directly in
+    /// the output root. A filter with no entry URI has no entry to rename, so
+    /// it drops `name`.
+    fn landing_as(mut self, name: Option<String>) -> Self {
+        self.land_as = name.filter(|_| self.entry.is_some());
+        self
     }
 
     /// Retain only the entries the filter keeps, preserving manifest order, and
@@ -216,8 +229,43 @@ impl EntryFilter {
                 "the bundle has no entry {entry:?}; a URI path names one manifest `path` exactly"
             );
         }
-        Ok((pass.kept, pass.excluded))
+        let mut kept = pass.kept;
+        if let Some(name) = &self.land_as {
+            for e in &mut kept {
+                e.path.clone_from(name);
+            }
+        }
+        Ok((kept, pass.excluded))
     }
+}
+
+/// Refuse a pull into a default destination (no `-o`) that would replace a
+/// file no earlier pull wrote there: a pull fetches over a file whose bytes
+/// differ from its entry's, and the user did not choose this directory.
+/// `--overwrite` asks for the replacement, so it passes.
+///
+/// # Errors
+///
+/// When an entry path of `entries` under `out` holds a file, directory or link
+/// that the skip-cache in `out` has no record of.
+fn refuse_unrecorded(args: &GetArgs, out: &Path, entries: &[ManifestEntry]) -> anyhow::Result<()> {
+    if args.output.is_some() || args.overwrite {
+        return Ok(());
+    }
+    let found = decdn_client::bundle::unrecorded_paths(entries, out);
+    let Some(first) = found.first() else {
+        return Ok(());
+    };
+    let more = match found.len() {
+        1 => String::new(),
+        n => format!(" (and {} more)", n.saturating_sub(1)),
+    };
+    anyhow::bail!(
+        "refusing to replace {}{more}: no earlier `decdn get` wrote it; pass `-o <dir>` to \
+         pull into another directory, or `-o .` to pull here and replace each such file \
+         whose bytes differ",
+        out.join(first).display()
+    )
 }
 
 /// Mark in `hits` every pattern of `set` that matches `path`, and return
@@ -362,12 +410,17 @@ fn parse_selection(
 /// through unchanged when `--select` is off. Each deselected entry adds to the
 /// excluded count. `Ok(None)` means the user deselected every file:
 /// [`report_nothing_to_fetch`] was already called, so the run is done.
-fn maybe_select(args: &GetArgs, uri: &DecdnUri, mut kept: Kept) -> anyhow::Result<Option<Kept>> {
+fn maybe_select(
+    args: &GetArgs,
+    out: &Path,
+    uri: &DecdnUri,
+    mut kept: Kept,
+) -> anyhow::Result<Option<Kept>> {
     if args.select {
         kept = apply_selection(kept, select_entries)?;
         if kept.manifest.entries.is_empty() {
             report_nothing_to_fetch(NothingReason::Deselected);
-            warn_leftover_partials(&args.output, &[], uri.hash);
+            warn_leftover_partials(out, &[], uri.hash);
             return Ok(None);
         }
     }
@@ -560,9 +613,11 @@ fn load_buyer_signer(chain: &fetch::ResolvedChain) -> anyhow::Result<Arc<Private
 }
 
 /// `decdn get decdn:<hash>/` and `decdn get decdn:<hash>/<path>`: pull the
-/// bundle `uri` names, or its one entry, into `--output`.
+/// bundle `uri` names, or its one entry, into `dest.path`. With
+/// `dest.entry_name`, the entry lands at that name directly in `dest.path`.
 pub(crate) async fn bundle_pull(
     args: &GetArgs,
+    dest: &Destination,
     uri: &DecdnUri,
     config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
@@ -581,7 +636,9 @@ pub(crate) async fn bundle_pull(
         UriTarget::BundleEntry(path) => Some(path.clone()),
         _ => None,
     };
-    let filter = EntryFilter::compile(entry, &args.include, &args.exclude)?;
+    let filter = EntryFilter::compile(entry, &args.include, &args.exclude)?
+        .landing_as(dest.entry_name.clone());
+    let out = dest.path.as_path();
     let filters_given = !args.include.is_empty() || !args.exclude.is_empty();
 
     // `--select` opens an editor: reject an incompatible combo or a non-terminal
@@ -591,7 +648,7 @@ pub(crate) async fn bundle_pull(
 
     // Dry-run short-circuits before any network/chain/keystore activity.
     if args.dry_run {
-        return dry_run(args, uri, &filter, filters_given);
+        return dry_run(args, out, uri, &filter, filters_given);
     }
 
     let common = &args.common;
@@ -621,6 +678,7 @@ pub(crate) async fn bundle_pull(
     // cleanly instead of being aborted on drop.
     let result = pull_over(
         args,
+        out,
         uri,
         &chain,
         grant,
@@ -641,6 +699,7 @@ pub(crate) async fn bundle_pull(
 #[allow(clippy::too_many_arguments)]
 async fn pull_over(
     args: &GetArgs,
+    out: &Path,
     uri: &DecdnUri,
     chain: &fetch::ResolvedChain,
     grant: Option<CapabilityGrant>,
@@ -668,7 +727,7 @@ async fn pull_over(
         },
     };
 
-    let observer = Arc::new(PullObserver::new(args.json, run_label(&args.output)));
+    let observer = Arc::new(PullObserver::new(args.json, run_label(out)));
     // Outlives the puller's passes, so an `openPool` that a Ctrl-C or a fault
     // dropped before its receipt was read is still named.
     let opens = UnconfirmedOpens::default();
@@ -704,7 +763,7 @@ async fn pull_over(
         &mut puller,
         &mut interrupt,
         &observer,
-        args,
+        (args, out),
         uri,
         (filter, filters_given),
     )
@@ -732,7 +791,7 @@ async fn pull_manifest(
     puller: &mut BundlePuller,
     interrupt: &mut Interrupt,
     observer: &PullObserver,
-    args: &GetArgs,
+    (args, out): (&GetArgs, &Path),
     uri: &DecdnUri,
     (filter, filters_given): (&EntryFilter, bool),
 ) -> anyhow::Result<()> {
@@ -742,7 +801,7 @@ async fn pull_manifest(
     // the run (reported) like an empty filter.
     let selected = async {
         let obtained = tokio::select! {
-            obtained = obtain_manifest(puller, args, uri, filter, filters_given) => {
+            obtained = obtain_manifest(puller, (args, out), uri, filter, filters_given) => {
                 obtained?
             }
             () = interrupt.wait() => return Err(Interrupted.into()),
@@ -750,7 +809,11 @@ async fn pull_manifest(
         let Some(kept) = obtained else {
             return Ok(None);
         };
-        maybe_select(args, uri, kept)
+        let kept = maybe_select(args, out, uri, kept)?;
+        if let Some(Kept { manifest, .. }) = &kept {
+            refuse_unrecorded(args, out, &manifest.entries)?;
+        }
+        anyhow::Ok(kept)
     }
     .await;
     // The manifest fetch is paid, so a run that ends here still owes the
@@ -771,7 +834,7 @@ async fn pull_manifest(
             std::future::pending::<std::convert::Infallible>().await
         };
         tokio::select! {
-            outcome = puller.pull(&manifest, &args.output, args.overwrite, &cancel) => outcome,
+            outcome = puller.pull(&manifest, out, args.overwrite, &cancel) => outcome,
             never = watch => match never {},
         }
     };
@@ -779,8 +842,8 @@ async fn pull_manifest(
         print_reclaim_note(replaced);
     }
     observer.finish();
-    warn_leftover_partials(&args.output, &manifest.entries, uri.hash);
-    let reported = report(&outcome.report, excluded, &args.output, args.json);
+    warn_leftover_partials(out, &manifest.entries, uri.hash);
+    let reported = report(&outcome.report, excluded, out, args.json);
     // A fault that ended the whole pull is its result, so `main` maps it to
     // its exit code (75 for a give-up with no `openPool` in flight, 1
     // otherwise).
@@ -808,13 +871,13 @@ fn print_reclaim_note(replaced: PoolReplaced) {
 /// `Ok(())`.
 async fn obtain_manifest(
     puller: &BundlePuller,
-    args: &GetArgs,
+    (args, out): (&GetArgs, &Path),
     uri: &DecdnUri,
     filter: &EntryFilter,
     filters_given: bool,
 ) -> anyhow::Result<Option<Kept>> {
     let mut m = puller
-        .fetch_manifest(uri.hash, &args.output, !args.overwrite)
+        .fetch_manifest(uri.hash, out, !args.overwrite)
         .await
         .map_err(not_a_manifest_hint)?;
     let raw_empty = m.entries.is_empty();
@@ -822,7 +885,7 @@ async fn obtain_manifest(
     m.entries = entries;
     if m.entries.is_empty() {
         report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
-        warn_leftover_partials(&args.output, &[], uri.hash);
+        warn_leftover_partials(out, &[], uri.hash);
         return Ok(None);
     }
     Ok(Some(Kept {
@@ -1033,17 +1096,19 @@ fn not_a_manifest_hint(err: anyhow::Error) -> anyhow::Error {
 /// `filter` applies to those entries, so the plan is the entry set a real run
 /// starts from and the unmatched-pattern warnings are the ones it prints. A real
 /// run then skips files already present in the output root (unless
-/// `--overwrite`) and warns on leftover partials; the dry run does neither. A
-/// bundle with no cached manifest reports only the bundle and the output root,
-/// with `entries: null` under `--json`.
+/// `--overwrite`) and warns on leftover partials; the dry run does neither. It
+/// does refuse a default destination that holds a file no pull wrote, as a
+/// real run does. A bundle with no cached manifest reports only the bundle and
+/// the output root, with `entries: null` under `--json`.
 fn dry_run(
     args: &GetArgs,
+    output: &Path,
     uri: &DecdnUri,
     filter: &EntryFilter,
     filters_given: bool,
 ) -> anyhow::Result<()> {
-    let out = args.output.display();
-    let cached = BundleManifest::cached(&args.output, uri.hash).map_err(not_a_manifest_hint)?;
+    let out = output.display();
+    let cached = BundleManifest::cached(output, uri.hash).map_err(not_a_manifest_hint)?;
     let Some(mut manifest) = cached else {
         let h = blake3::Hash::from_bytes(uri.hash).to_hex();
         if args.json {
@@ -1070,12 +1135,13 @@ fn dry_run(
     };
     let raw_empty = manifest.entries.is_empty();
     manifest.entries = filter.apply_and_warn(manifest.entries)?.0;
+    refuse_unrecorded(args, output, &manifest.entries)?;
     if args.json {
         // The `--json` plan stays machine-readable — an empty set is
         // `count: 0` with an empty `entries` array, no prose line. A bundle
         // with no cached manifest gives `count`/`entries` of `null`.
         let plan = serde_json::json!({
-            "output": args.output.display().to_string(),
+            "output": out.to_string(),
             "count": manifest.entries.len(),
             "entries": manifest.entries.iter().map(|e| serde_json::json!({
                 "path": e.path, "hash": e.hash, "size": e.size,

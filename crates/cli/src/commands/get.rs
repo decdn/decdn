@@ -10,8 +10,15 @@
 //! - `decdn:<hash>/<path>` runs the bundle pull for exactly that entry.
 //!
 //! The URI's `ns` is the namespace hint of either route.
+//!
+//! Without `-o`, the destination follows the target: `./<hash>` for a blob,
+//! `.` for a bundle, and `./<name>` for an entry, where `<name>` is the last
+//! segment of the entry's path. The command then writes the absolute
+//! destination to stderr before the pull starts, except under `--json` or
+//! `--dry-run`. A bundle or entry pull into a default destination refuses a
+//! path that already holds a file no earlier pull wrote there.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use decdn_client::uri::{DecdnUri, UriTarget};
@@ -25,9 +32,70 @@ use decdn_common::cli::GetArgs;
 /// route fails.
 pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let uri = parse_and_check(args)?;
+    let dest = Destination::of(args, &uri);
+    if args.output.is_none() && !args.json && !args.dry_run {
+        let shown = dest.shown();
+        let shown = std::path::absolute(&shown).unwrap_or(shown);
+        eprintln!("Downloading to {}", shown.display());
+    }
     match uri.target {
-        UriTarget::Blob => super::fetch::fetch(args, &uri, config_path).await,
-        _ => super::bundle_pull::bundle_pull(args, &uri, config_path).await,
+        UriTarget::Blob => super::fetch::fetch(args, &dest.path, &uri, config_path).await,
+        _ => super::bundle_pull::bundle_pull(args, &dest, &uri, config_path).await,
+    }
+}
+
+/// Where a `decdn get` run writes: `-o`, or the default for the URI's target.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Destination {
+    /// The blob's destination file, or the bundle's output directory.
+    pub(crate) path: PathBuf,
+    /// The file name the entry an entry URI names lands at, directly in
+    /// `path`, in place of its full manifest path under `path`. Set only for
+    /// an entry URI without `-o`.
+    pub(crate) entry_name: Option<String>,
+}
+
+impl Destination {
+    /// The destination of `args` for `uri`: `-o` as given, or else
+    /// `./<hash>` for a blob, `.` for a bundle, and `.` for an entry with the
+    /// entry landing at the last segment of its path.
+    pub(crate) fn of(args: &GetArgs, uri: &DecdnUri) -> Self {
+        if let Some(output) = &args.output {
+            return Self {
+                path: output.clone(),
+                entry_name: None,
+            };
+        }
+        match &uri.target {
+            UriTarget::Blob => Self {
+                path: Path::new(".").join(blake3::Hash::from_bytes(uri.hash).to_hex().as_str()),
+                entry_name: None,
+            },
+            // The URI parser holds every segment non-empty and free of `/`,
+            // so the last segment is a plain name. The pull still checks it
+            // against the path-safety rules, like any manifest path.
+            UriTarget::BundleEntry(entry) => Self {
+                path: PathBuf::from("."),
+                entry_name: Some(
+                    entry
+                        .rsplit_once('/')
+                        .map_or(entry.as_str(), |(_, name)| name)
+                        .to_owned(),
+                ),
+            },
+            _ => Self {
+                path: PathBuf::from("."),
+                entry_name: None,
+            },
+        }
+    }
+
+    /// The path to name for the user: the entry's file when it lands at its
+    /// name, and `path` otherwise.
+    fn shown(&self) -> PathBuf {
+        self.entry_name
+            .as_ref()
+            .map_or_else(|| self.path.clone(), |name| self.path.join(name))
     }
 }
 
@@ -60,7 +128,7 @@ fn parse_and_check(args: &GetArgs) -> anyhow::Result<DecdnUri> {
         _ => {}
     }
     anyhow::ensure!(
-        args.output != Path::new("-"),
+        args.output.as_deref() != Some(Path::new("-")),
         "`-o -` (stdout) takes a blob URI (`decdn:<hash>`); a bundle needs an output directory"
     );
     Ok(uri)

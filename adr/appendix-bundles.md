@@ -380,16 +380,29 @@ entry is an error. The rules below apply to every pull:
   verified byte. `--give-up-after-secs` overrides both limits. When the limit
   expires, the pull stops all entries and exits with code 75. Each entry
   keeps its `.partial`, so a rerun pays for no byte twice.
-- **Output** files are written under `-o <dir>` at each entry's relative
-  path, resolved with the § Path-safety rules above (`..`, absolute, and
-  escaping paths rejected). Writes are atomic (temp-then-rename after the
-  BLAKE3 check the fetch path already performs), so a present file is
-  verified-good: pull **skips existing files** by default (re-runs
-  resume), and `--overwrite` forces a re-fetch. The skip check accepts a
-  file by its hash. A saved record whose size and mtime match is a fast
-  path. Without a match, the pull hashes the file against the manifest.
+- **Output** files are written under the output directory at each entry's
+  relative path, resolved with the § Path-safety rules above (`..`,
+  absolute, and escaping paths rejected). Writes are atomic
+  (temp-then-rename after the BLAKE3 check the fetch path already
+  performs), so a present file is verified-good: pull **skips existing
+  files** by default (re-runs resume), and `--overwrite` forces a re-fetch.
+  The skip check accepts a file by its hash. A saved record whose size and
+  mtime match is a fast path. Without a match, the pull hashes the file
+  against the manifest.
+- **Output directory.** `-o <dir>` names the output directory. Without
+  `-o`, the output directory is `.`. An entry URI without `-o` writes the
+  entry to `./<name>`. `<name>` is the last segment of the entry's path.
+  The pull does not make the entry's parent directories. A pull without `-o`
+  refuses an entry path that holds a file with no skip-cache record, because
+  the user did not choose that directory. `--overwrite` disables this check.
+  The manifest cache (`.decdn-bundles/`), the skip-cache
+  (`.decdn-manifest.json`) and the staging directory (`.decdn-partial/`) go
+  into the output directory. An entry at one of these paths fails. Without
+  `-o`, `--json` and `--dry-run`, the command writes the absolute
+  destination to stderr before the pull starts. A blob URI without `-o`
+  writes the blob to `./<hash>`, in lowercase hex.
 - **`--dry-run`** reports the plan without any network/chain activity.
-  The plan lists entries only when an earlier pull into the same `-o`
+  The plan lists entries only when an earlier pull into the same output
   directory cached the bundle manifest under `.decdn-bundles/`. Without
   that cache, the dry run prints only the bundle hash and the output
   directory. A cache file that the dry run cannot read, or that fails its
