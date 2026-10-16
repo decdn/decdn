@@ -395,6 +395,23 @@ async fn answer_probe_with_coverage(
     Ok(())
 }
 
+/// Serve every bi-stream `conn` carries, each on its own task, until the
+/// connection closes — the shape of the real `ClientHandler`. A node's pull legs
+/// share one pooled `cdn/client/v1` connection per upstream and open a fresh
+/// bi-stream for every leg (handshake, first leg, gap legs, retries), so a
+/// fixture that answered only the first stream would leave every later leg
+/// unanswered. The loop holds the connection open for as long as the requester
+/// keeps it.
+async fn serve_each_stream<F, Fut>(conn: Connection, serve: F)
+where
+    F: Fn(iroh::endpoint::SendStream, iroh::endpoint::RecvStream) -> Fut,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    while let Ok((send, recv)) = conn.accept_bi().await {
+        tokio::spawn(serve(send, recv));
+    }
+}
+
 /// Spawn A's accept loop, dispatching each connection by negotiated ALPN: the
 /// real `ClientHandler` for paid pulls, the hand-rolled responder for probes.
 fn spawn_a_server(
@@ -868,7 +885,11 @@ async fn build_origin_with_discovery(
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
-        dial_runtime: tokio::runtime::Handle::current(),
+        connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_CLIENT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         dht_connections: decdn_client::Connections::with_options(
             ep_b.clone(),
             decdn_protocol::ALPN_DHT,
@@ -1027,7 +1048,11 @@ async fn build_origin_multi_hash(
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
-        dial_runtime: tokio::runtime::Handle::current(),
+        connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_CLIENT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         dht_connections: decdn_client::Connections::with_options(
             ep_b.clone(),
             decdn_protocol::ALPN_DHT,
@@ -1637,7 +1662,11 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
     dir.insert(U256::ZERO, providers.clone());
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
-        dial_runtime: tokio::runtime::Handle::current(),
+        connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_CLIENT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         dht_connections: decdn_client::Connections::with_options(
             ep_b.clone(),
             decdn_protocol::ALPN_DHT,
@@ -1709,16 +1738,13 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
 /// whole-blob integrity check (modelled on `node_to_node_pull_through`'s
 /// `lying_upstream`).
 async fn serve_wrong_bytes(
-    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
     served: &[u8],
     rate: u64,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req_msg = {
         let frame = read_frame(&mut recv)
             .await
@@ -1775,7 +1801,7 @@ async fn serve_wrong_bytes(
         .await
         .map_err(|e| anyhow::anyhow!("write end: {e}"))?;
     let _ = send.finish();
-    conn.closed().await;
+    let _ = send.stopped().await;
     Ok(())
 }
 
@@ -1803,9 +1829,10 @@ fn spawn_a_lying_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ = serve_wrong_bytes(conn, &eth, &dom, &served, rate).await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
+                    async move { serve_wrong_bytes(send, recv, &eth, &dom, &served, rate).await }
+                }));
             }
         }
     })
@@ -2035,17 +2062,14 @@ fn spawn_server_concurrent(
 /// [`serve_wrong_bytes`] but serving the correct payload so the failure is
 /// unambiguously the voucher leg, not corruption.
 async fn serve_then_reject_voucher(
-    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
     served: &[u8],
     rate: u64,
     reason: VoucherRejectReason,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req_msg = {
         let frame = read_frame(&mut recv)
             .await
@@ -2111,7 +2135,7 @@ async fn serve_then_reject_voucher(
     .await
     .map_err(|e| anyhow::anyhow!("write voucher rejection: {e}"))?;
     let _ = send.finish();
-    conn.closed().await;
+    let _ = send.stopped().await;
     Ok(())
 }
 
@@ -2122,17 +2146,14 @@ async fn serve_then_reject_voucher(
 /// `NotFound` (a load shed) in reply to a voucher must be metered as a refusal, not
 /// stringified into the `Unreachable` catch-all.
 async fn serve_then_error_on_voucher(
-    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
     served: &[u8],
     rate: u64,
     error: StreamError,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req_msg = {
         let frame = read_frame(&mut recv)
             .await
@@ -2191,7 +2212,7 @@ async fn serve_then_error_on_voucher(
     .await
     .map_err(|e| anyhow::anyhow!("write voucher-reply error: {e}"))?;
     let _ = send.finish();
-    conn.closed().await;
+    let _ = send.stopped().await;
     Ok(())
 }
 
@@ -2221,10 +2242,14 @@ fn spawn_a_voucher_erroring_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ =
-                        serve_then_error_on_voucher(conn, &eth, &dom, &served, rate, error).await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
+                    let error = error.clone();
+                    async move {
+                        serve_then_error_on_voucher(send, recv, &eth, &dom, &served, rate, error)
+                            .await
+                    }
+                }));
             }
         }
     })
@@ -2255,10 +2280,13 @@ fn spawn_a_voucher_rejecting_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, advertised_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ =
-                        serve_then_reject_voucher(conn, &eth, &dom, &served, rate, reason).await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
+                    async move {
+                        serve_then_reject_voucher(send, recv, &eth, &dom, &served, rate, reason)
+                            .await
+                    }
+                }));
             }
         }
     })
@@ -2297,11 +2325,14 @@ fn spawn_a_voucher_rejecting_server_with_counters(
                 });
             } else {
                 let streams = Arc::clone(&streams);
-                tokio::spawn(async move {
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
                     streams.fetch_add(1, Ordering::SeqCst);
-                    let _ =
-                        serve_then_reject_voucher(conn, &eth, &dom, &served, rate, reason).await;
-                });
+                    let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
+                    async move {
+                        serve_then_reject_voucher(send, recv, &eth, &dom, &served, rate, reason)
+                            .await
+                    }
+                }));
             }
         }
     })
@@ -2366,23 +2397,15 @@ fn spawn_a_stalling_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    // `_send` is held (not `_`) so the response stream is neither
-                    // finished nor reset — the buyer keeps blocking on its read
-                    // rather than seeing EOF. Read the request, then go quiet
-                    // until the buyer gives up and drops the connection.
-                    if let Ok((_send, mut recv)) = conn.accept_bi().await {
-                        let _ = read_frame(&mut recv).await;
-                        conn.closed().await;
-                    }
-                });
+                tokio::spawn(serve_each_stream(conn, stall_stream));
             }
         }
     })
 }
 
-/// [`spawn_a_stalling_server`] that also counts the `cdn/client/v1` connections it
-/// accepts, so a test can see how many upstream opens reached it.
+/// [`spawn_a_stalling_server`] that also counts the `cdn/client/v1` streams it
+/// accepts, so a test can see how many upstream opens reached it. Each open is a
+/// stream on the requester's pooled connection.
 fn spawn_a_counting_stalling_server(
     ep: iroh::Endpoint,
     s_eth: Arc<PrivateKeySigner>,
@@ -2404,16 +2427,26 @@ fn spawn_a_counting_stalling_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
                 });
             } else {
-                streams.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    if let Ok((_send, mut recv)) = conn.accept_bi().await {
-                        let _ = read_frame(&mut recv).await;
-                        conn.closed().await;
-                    }
-                });
+                let streams = Arc::clone(&streams);
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    streams.fetch_add(1, Ordering::SeqCst);
+                    stall_stream(send, recv)
+                }));
             }
         }
     })
+}
+
+/// Read one client stream's request, then go quiet. `send` is held (neither
+/// finished nor reset), so the buyer keeps blocking on its read rather than
+/// seeing EOF, until it gives up and stops the stream or closes the connection.
+async fn stall_stream(
+    send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+) -> Result<()> {
+    let _ = read_frame(&mut recv).await;
+    let _ = send.stopped().await;
+    Ok(())
 }
 
 /// #859: when the best-ranked candidate *stalls* (answers the probe, then never
@@ -3896,16 +3929,13 @@ fn encode_empty_chunk_frame() -> Result<Vec<u8>> {
 }
 
 async fn serve_empty_chunks(
-    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
     total_bytes: u64,
     rate: u64,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
     let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
@@ -3943,9 +3973,10 @@ fn spawn_an_empty_chunk_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ = serve_empty_chunks(conn, &eth, &dom, total_bytes, rate).await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom) = (Arc::clone(&eth), dom.clone());
+                    async move { serve_empty_chunks(send, recv, &eth, &dom, total_bytes, rate).await }
+                }));
             }
         }
     })
@@ -3966,8 +3997,10 @@ fn spawn_an_empty_chunk_server(
 /// `prefix_chunks` frames are sent (under the voucher accounting interval, so no
 /// voucher round trip intrudes) against a much larger advertised `total_bytes`,
 /// so the receive loop is left genuinely waiting for more.
+#[allow(clippy::too_many_arguments)]
 async fn serve_then_go_silent(
-    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
     wire: Arc<Vec<u8>>,
@@ -3975,10 +4008,6 @@ async fn serve_then_go_silent(
     rate: u64,
     prefix_chunks: usize,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
     let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
@@ -3998,7 +4027,7 @@ async fn serve_then_go_silent(
     // Go quiet. `send` is held (never finished, never reset), so the buyer sees no
     // EOF and no error — only silence. Nothing but the inactivity deadline ends
     // this.
-    conn.closed().await;
+    let _ = send.stopped().await;
     Ok(())
 }
 
@@ -4043,18 +4072,22 @@ fn spawn_a_mid_stream_silent_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ = serve_then_go_silent(
-                        conn,
-                        &eth,
-                        &dom,
-                        wire,
-                        total_bytes,
-                        rate,
-                        prefix_chunks,
-                    )
-                    .await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
+                    async move {
+                        serve_then_go_silent(
+                            send,
+                            recv,
+                            &eth,
+                            &dom,
+                            wire,
+                            total_bytes,
+                            rate,
+                            prefix_chunks,
+                        )
+                        .await
+                    }
+                }));
             }
         }
     })
@@ -4072,17 +4105,14 @@ fn spawn_a_mid_stream_silent_server(
 /// What the buyer does with the pull from that moment decides whether the money it
 /// just spent is recorded or thrown away.
 async fn serve_a_paid_interval_then_go_silent(
-    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
     wire: Arc<Vec<u8>>,
     total_bytes: u64,
     rate: u64,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
     let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
@@ -4122,7 +4152,7 @@ async fn serve_a_paid_interval_then_go_silent(
     // Paid — and now quiet. `send` is held open (never finished, never
     // reset), so the buyer sees no EOF and no error, and keeps waiting for the rest
     // of a blob that advertised more than it got.
-    conn.closed().await;
+    let _ = send.stopped().await;
     Ok(())
 }
 
@@ -4150,17 +4180,21 @@ fn spawn_a_paid_then_silent_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ = serve_a_paid_interval_then_go_silent(
-                        conn,
-                        &eth,
-                        &dom,
-                        wire,
-                        total_bytes,
-                        rate,
-                    )
-                    .await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
+                    async move {
+                        serve_a_paid_interval_then_go_silent(
+                            send,
+                            recv,
+                            &eth,
+                            &dom,
+                            wire,
+                            total_bytes,
+                            rate,
+                        )
+                        .await
+                    }
+                }));
             }
         }
     })
@@ -4321,8 +4355,10 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
 /// `downcast_ref` in `classify_pull_failure` to the catch-all and scored the peer
 /// `Unreachable`. Same code, same meaning, opposite verdict, decided by nothing but which
 /// frame it rode in on.
+#[allow(clippy::too_many_arguments)]
 async fn serve_then_error_mid_stream(
-    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
     wire: Arc<Vec<u8>>,
@@ -4330,10 +4366,6 @@ async fn serve_then_error_mid_stream(
     rate: u64,
     error: StreamError,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
     // An HONEST open: ok == true, signed. The peer has proven it is reachable and
     // answering — everything after this is about how it stops.
@@ -4357,12 +4389,13 @@ async fn serve_then_error_mid_stream(
     )
     .await
     .map_err(|e| anyhow::anyhow!("write stream error: {e}"))?;
-    // Flush and hold the connection until the peer closes it. Dropping `conn` here would
-    // RESET the stream, and the requester would see a transport error instead of the frame
-    // — which lands in the catch-all and scores `Unreachable`, i.e. it would look exactly
-    // like the bug this test is here to catch, for entirely the wrong reason.
+    // Flush and hold the stream until the peer has read it to the end. Dropping the
+    // connection here would RESET the stream, and the requester would see a transport
+    // error instead of the frame — which lands in the catch-all and scores
+    // `Unreachable`, i.e. it would look exactly like the bug this test is here to
+    // catch, for entirely the wrong reason.
     let _ = send.finish();
-    conn.closed().await;
+    let _ = send.stopped().await;
     Ok(())
 }
 
@@ -4392,11 +4425,23 @@ fn spawn_a_mid_stream_error_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ =
-                        serve_then_error_mid_stream(conn, &eth, &dom, wire, total_bytes, rate, err)
-                            .await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
+                    let err = err.clone();
+                    async move {
+                        serve_then_error_mid_stream(
+                            send,
+                            recv,
+                            &eth,
+                            &dom,
+                            wire,
+                            total_bytes,
+                            rate,
+                            err,
+                        )
+                        .await
+                    }
+                }));
             }
         }
     })
@@ -4429,18 +4474,20 @@ fn spawn_a_refusing_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ = serve_refusal(conn, &eth, &dom, total_bytes, rate, error).await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom, error) = (Arc::clone(&eth), dom.clone(), error.clone());
+                    async move { serve_refusal(send, recv, &eth, &dom, total_bytes, rate, error).await }
+                }));
             }
         }
     })
 }
 
 /// Like [`spawn_a_refusing_server`], but counts both `cdn/probe/v1` requests and
-/// `cdn/client/v1` stream attempts — the instrument for the probe-cache
+/// `cdn/client/v1` streams — the instrument for the probe-cache
 /// negative-cache-interaction test (#1165), which must show this refusing
-/// provider probed and streamed to exactly ONCE across two fetches.
+/// provider probed and streamed to exactly ONCE across two fetches. Each pull
+/// attempt is one stream on the requester's pooled connection.
 #[allow(clippy::too_many_arguments)]
 fn spawn_a_refusing_server_with_counters(
     ep: iroh::Endpoint,
@@ -4469,36 +4516,34 @@ fn spawn_a_refusing_server_with_counters(
                 });
             } else {
                 let streams = Arc::clone(&streams);
-                tokio::spawn(async move {
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
                     streams.fetch_add(1, Ordering::SeqCst);
-                    let _ = serve_refusal(conn, &eth, &dom, total_bytes, rate, error).await;
-                });
+                    let (eth, dom, error) = (Arc::clone(&eth), dom.clone(), error.clone());
+                    async move { serve_refusal(send, recv, &eth, &dom, total_bytes, rate, error).await }
+                }));
             }
         }
     })
 }
 
 /// Answer the client stream with a signed refusal (`ok: false`, `error`), then
-/// close — the wire shape of every `UpstreamRefused` (#1144).
+/// finish it — the wire shape of every `UpstreamRefused` (#1144).
 async fn serve_refusal(
-    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
     total_bytes: u64,
     rate: u64,
     error: StreamError,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
     let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, Some(error))?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
         .await
         .map_err(|e| anyhow::anyhow!("write refusal: {e}"))?;
     let _ = send.finish();
-    conn.closed().await;
+    let _ = send.stopped().await;
     Ok(())
 }
 
@@ -4520,6 +4565,7 @@ fn spawn_a_slow_but_healthy_server(
     rate: u64,
     gap: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    let wire = Arc::new(wire);
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             let Ok(connecting) = incoming.accept() else {
@@ -4528,15 +4574,19 @@ fn spawn_a_slow_but_healthy_server(
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
-            let wire = wire.clone();
+            let wire = Arc::clone(&wire);
             if conn.alpn() == ALPN_PROBE {
                 tokio::spawn(async move {
                     let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ = serve_wire_paced(conn, &eth, &dom, &wire, total_bytes, rate, gap).await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
+                    async move {
+                        serve_wire_paced(send, recv, &eth, &dom, &wire, total_bytes, rate, gap)
+                            .await
+                    }
+                }));
             }
         }
     })
@@ -9533,7 +9583,8 @@ async fn read_voucher(recv: &mut iroh::endpoint::RecvStream) -> Result<()> {
 /// could move a transfer past a deadline at all.
 #[allow(clippy::too_many_arguments)]
 async fn serve_wire_paced(
-    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
     wire: &[u8],
@@ -9541,10 +9592,6 @@ async fn serve_wire_paced(
     rate: u64,
     gap: Duration,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req_msg = {
         let frame = read_frame(&mut recv)
             .await
@@ -9599,7 +9646,7 @@ async fn serve_wire_paced(
         .await
         .map_err(|e| anyhow::anyhow!("write end: {e}"))?;
     let _ = send.finish();
-    conn.closed().await;
+    let _ = send.stopped().await;
     Ok(())
 }
 
@@ -9624,6 +9671,7 @@ async fn spawn_paced_lying_node_a(
     let slash = slash_domain();
     let eth = Arc::clone(&a_eth);
     let accept_ep = ep_a.clone();
+    let wire = Arc::new(wire);
     let task_a = tokio::spawn(async move {
         while let Some(incoming) = accept_ep.accept().await {
             let Ok(connecting) = incoming.accept() else {
@@ -9632,24 +9680,28 @@ async fn spawn_paced_lying_node_a(
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&eth);
             let dom = slash.clone();
-            let wire = wire.clone();
+            let wire = Arc::clone(&wire);
             if conn.alpn() == ALPN_PROBE {
                 tokio::spawn(async move {
                     let _ = answer_probe(conn, &eth, &dom, RATE, total_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ = serve_wire_paced(
-                        conn,
-                        &eth,
-                        &dom,
-                        &wire,
-                        total_bytes,
-                        RATE,
-                        Duration::ZERO,
-                    )
-                    .await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
+                    async move {
+                        serve_wire_paced(
+                            send,
+                            recv,
+                            &eth,
+                            &dom,
+                            &wire,
+                            total_bytes,
+                            RATE,
+                            Duration::ZERO,
+                        )
+                        .await
+                    }
+                }));
             }
         }
     });
@@ -11248,7 +11300,11 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
-        dial_runtime: tokio::runtime::Handle::current(),
+        connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_CLIENT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         dht_connections: decdn_client::Connections::with_options(
             ep_b.clone(),
             decdn_protocol::ALPN_DHT,
@@ -12786,50 +12842,6 @@ impl OriginDirectory for MutableOriginDirectory {
     }
 }
 
-/// Like [`spawn_a_probe_counting_server`], but also counts client-ALPN opens in
-/// `streams`, so a test can witness AT THE WIRE whether A was asked to serve. A
-/// serves the real blob through `client_handler`; the stream counter is what proves
-/// a provider dropped on a probe-cache hit sees NO new client stream (#1223).
-#[allow(clippy::too_many_arguments)]
-fn spawn_a_serving_server_with_counters(
-    ep: iroh::Endpoint,
-    client_handler: Arc<decdn_node::handlers::client::ClientHandler>,
-    a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
-    total_bytes: u64,
-    rate: u64,
-    probes: Arc<AtomicUsize>,
-    streams: Arc<AtomicUsize>,
-) -> tokio::task::JoinHandle<()> {
-    use iroh::protocol::ProtocolHandler;
-    tokio::spawn(async move {
-        while let Some(incoming) = ep.accept().await {
-            let Ok(connecting) = incoming.accept() else {
-                continue;
-            };
-            let Ok(conn) = connecting.await else { continue };
-            if conn.alpn() == ALPN_PROBE {
-                let eth = Arc::clone(&a_eth);
-                let dom = slash.clone();
-                let probes = Arc::clone(&probes);
-                tokio::spawn(async move {
-                    probes.fetch_add(1, Ordering::SeqCst);
-                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
-                });
-            } else {
-                let handler = Arc::clone(&client_handler);
-                let streams = Arc::clone(&streams);
-                tokio::spawn(async move {
-                    streams.fetch_add(1, Ordering::SeqCst);
-                    let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
-                        .accept(conn)
-                        .await;
-                });
-            }
-        }
-    })
-}
-
 /// A cached entry can be disowned INSIDE its own 15s: a node ejected from the active
 /// set (chain ejection / unbonding) while its probe-cache entry is still live. The
 /// cold path denies it via `filter_active_stakers`; the hit path bypasses
@@ -12890,8 +12902,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     let (ep_a, addr_a) =
         local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
     let a_probes = Arc::new(AtomicUsize::new(0));
-    let a_streams = Arc::new(AtomicUsize::new(0));
-    let task_a = spawn_a_serving_server_with_counters(
+    let task_a = spawn_a_probe_counting_server(
         ep_a.clone(),
         handler_a,
         Arc::clone(&a_eth),
@@ -12899,8 +12910,13 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         total_bytes,
         RATE,
         Arc::clone(&a_probes),
-        Arc::clone(&a_streams),
     );
+    // A's own handler counts every `cdn/client/v1` stream it ends, so the test
+    // witnesses AT THE WIRE whether A was asked to serve: the stream count is what
+    // proves a provider dropped on a probe-cache hit sees NO new client stream
+    // (#1223). Streams, not connections, because B's pull legs share one pooled
+    // connection to A.
+    let a_streams = || inbound_streams_ended(&metrics_a);
 
     // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
     let b_sk = fresh_key();
@@ -12917,7 +12933,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     )
     .await?;
     a_probes.store(0, Ordering::SeqCst);
-    a_streams.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
@@ -12950,7 +12965,11 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
-        dial_runtime: tokio::runtime::Handle::current(),
+        connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_CLIENT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         dht_connections: decdn_client::Connections::with_options(
             ep_b.clone(),
             decdn_protocol::ALPN_DHT,
@@ -13016,15 +13035,22 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         "A must be probed exactly once on the cold path, got {}",
         a_probes.load(Ordering::SeqCst)
     );
-    // One logical pull to A opens ONE connection: `pull_from_candidate`'s
-    // whole-blob header handshake is also the drive's first and only leg, which
-    // adopts it (#2063). The assertion pins the connection count, so it also
-    // proves the handshake was not thrown away.
+    // One logical pull to A opens ONE stream: `pull_from_candidate`'s whole-blob
+    // header handshake is also the drive's first and only leg, which adopts it
+    // (#2063). The assertion pins the stream count, so it also proves the
+    // handshake was not thrown away. A records a stream's end after its last
+    // frame, which can trail the fetch's return, so wait for it.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while a_streams().unwrap_or(0) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
     anyhow::ensure!(
-        a_streams.load(Ordering::SeqCst) == 1,
+        a_streams()? == 1,
         "A must be pulled exactly once (the handshake the drive adopts) on the cold path, \
          got {}",
-        a_streams.load(Ordering::SeqCst)
+        a_streams()?
     );
     assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
     assert_counter(&b_metrics, "probe_cache_hits_total", 0)?;
@@ -13047,13 +13073,13 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         matches!(second, OriginFetch::NotFound),
         "second fetch must miss — the only cached provider was ejected inside the TTL"
     );
-    // Still 1 — the one connection from fetch #1's single pull. If the hit path
+    // Still 1 — the one stream from fetch #1's single pull. If the hit path
     // re-served the ejected A, this would climb.
     anyhow::ensure!(
-        a_streams.load(Ordering::SeqCst) == 1,
+        a_streams()? == 1,
         "the hit re-served an EJECTED A — `is_active` must deny it on the hit path, got {} \
          streams",
-        a_streams.load(Ordering::SeqCst)
+        a_streams()?
     );
     anyhow::ensure!(
         a_probes.load(Ordering::SeqCst) == 1,
@@ -13268,7 +13294,8 @@ impl PoolOpener for FundingOpener {
 /// it asks to resume.
 #[allow(clippy::too_many_arguments)]
 async fn serve_with_deposit_ceiling(
-    conn: Connection,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
     payloads: &[Arc<Vec<u8>>],
@@ -13278,10 +13305,6 @@ async fn serve_with_deposit_ceiling(
     initial_ceiling: U256,
     lane: &Mutex<ScriptedLane>,
 ) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
     // Route on the requested hash, so one server can hold several blobs — the
     // concurrent-pulls regression test needs two pulls on ONE lane.
@@ -13341,10 +13364,11 @@ async fn serve_with_deposit_ceiling(
             )
             .await?
             {
-                // Refused: hold the connection so the buyer reads the rejection frame
-                // rather than a transport reset (which would score as unreachable).
+                // Refused: hold the stream until the buyer reads the rejection frame,
+                // so it sees the frame rather than a reset (which would score as
+                // unreachable).
                 let _ = send.finish();
-                conn.closed().await;
+                let _ = send.stopped().await;
                 return Ok(());
             }
             settled = settled.saturating_add(served);
@@ -13354,7 +13378,7 @@ async fn serve_with_deposit_ceiling(
         .await
         .map_err(|e| anyhow::anyhow!("write end: {e}"))?;
     let _ = send.finish();
-    conn.closed().await;
+    let _ = send.stopped().await;
     Ok(())
 }
 
@@ -13537,20 +13561,29 @@ fn spawn_deposit_capped_server(
                     let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
                 });
             } else {
-                tokio::spawn(async move {
-                    let _ = serve_with_deposit_ceiling(
-                        conn,
-                        &eth,
-                        &dom,
-                        &payloads,
-                        rate,
-                        &deposit,
-                        resume_delay,
-                        initial_ceiling,
-                        &lane,
-                    )
-                    .await;
-                });
+                tokio::spawn(serve_each_stream(conn, move |send, recv| {
+                    let (eth, dom) = (Arc::clone(&eth), dom.clone());
+                    let (payloads, deposit, lane) = (
+                        Arc::clone(&payloads),
+                        Arc::clone(&deposit),
+                        Arc::clone(&lane),
+                    );
+                    async move {
+                        serve_with_deposit_ceiling(
+                            send,
+                            recv,
+                            &eth,
+                            &dom,
+                            &payloads,
+                            rate,
+                            &deposit,
+                            resume_delay,
+                            initial_ceiling,
+                            &lane,
+                        )
+                        .await
+                    }
+                }));
             }
         }
     })
@@ -14484,7 +14517,11 @@ async fn build_origin_economics(
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
-        dial_runtime: tokio::runtime::Handle::current(),
+        connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_CLIENT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         dht_connections: decdn_client::Connections::with_options(
             ep_b.clone(),
             decdn_protocol::ALPN_DHT,
@@ -15247,15 +15284,15 @@ fn two_providers(
 /// holder's own operator address, so a test can read back exactly what this
 /// holder was paid.
 ///
-/// The holder answers its first `refuse_client_conns` `cdn/client/v1`
-/// connections with a signed `NotFound` instead of serving — the wire shape of a
+/// The holder answers its first `refuse_client_streams` `cdn/client/v1`
+/// streams with a signed `NotFound` instead of serving — the wire shape of a
 /// seller's collapsed per-signer cap refusal (#2178).
 async fn spawn_partial_holder(
     payload: &[u8],
     ab_pool_id: B256,
     s_buyer_addr: Address,
     coverage: Coverage,
-    refuse_client_conns: usize,
+    refuse_client_streams: usize,
 ) -> Result<(
     iroh::PublicKey,
     std::net::SocketAddr,
@@ -15274,7 +15311,7 @@ async fn spawn_partial_holder(
         ab_pool_id,
         s_buyer_addr,
         coverage,
-        refuse_client_conns,
+        refuse_client_streams,
     )
     .await?;
     Ok((id, addr, eth, ep, task, store))
@@ -15343,7 +15380,7 @@ async fn spawn_holder_on(
     ab_pool_id: B256,
     s_buyer_addr: Address,
     coverage: Coverage,
-    refuse_client_conns: usize,
+    refuse_client_streams: usize,
 ) -> Result<(
     iroh::PublicKey,
     std::net::SocketAddr,
@@ -15398,33 +15435,16 @@ async fn spawn_holder_on(
         let ep = ep.clone();
         let eth = Arc::clone(&eth);
         let slash = slash_domain();
+        // Refusals spent so far, across every client connection: the holder
+        // refuses its first `refuse_client_streams` streams, whichever pooled
+        // connection carries them.
+        let refused = Arc::new(AtomicUsize::new(0));
         tokio::spawn(async move {
-            let mut client_conns = 0usize;
             while let Some(incoming) = ep.accept().await {
                 let Ok(connecting) = incoming.accept() else {
                     continue;
                 };
                 let Ok(conn) = connecting.await else { continue };
-                if conn.alpn() == ALPN_CLIENT {
-                    let nth = client_conns;
-                    client_conns += 1;
-                    if nth < refuse_client_conns {
-                        let eth = Arc::clone(&eth);
-                        let dom = slash.clone();
-                        tokio::spawn(async move {
-                            let _ = serve_refusal(
-                                conn,
-                                &eth,
-                                &dom,
-                                total_bytes,
-                                RATE,
-                                StreamError::NotFound,
-                            )
-                            .await;
-                        });
-                        continue;
-                    }
-                }
                 if conn.alpn() == ALPN_PROBE {
                     let eth = Arc::clone(&eth);
                     let dom = slash.clone();
@@ -15442,7 +15462,33 @@ async fn spawn_holder_on(
                     });
                 } else {
                     let handler = Arc::clone(&handler);
+                    let (eth, dom) = (Arc::clone(&eth), slash.clone());
+                    let refused = Arc::clone(&refused);
                     tokio::spawn(async move {
+                        // Answer this connection's streams with a signed refusal
+                        // while refusals remain, then hand the connection to the
+                        // real handler, which accepts every later stream on it.
+                        // A slot is reserved before the accept, so concurrent
+                        // connections never refuse more than the budget.
+                        while refused.fetch_add(1, Ordering::SeqCst) < refuse_client_streams {
+                            let Ok((send, recv)) = conn.accept_bi().await else {
+                                refused.fetch_sub(1, Ordering::SeqCst);
+                                return;
+                            };
+                            let (eth, dom) = (Arc::clone(&eth), dom.clone());
+                            tokio::spawn(async move {
+                                let _ = serve_refusal(
+                                    send,
+                                    recv,
+                                    &eth,
+                                    &dom,
+                                    total_bytes,
+                                    RATE,
+                                    StreamError::NotFound,
+                                )
+                                .await;
+                            });
+                        }
                         let _ = decdn_node::handlers::client::ClientProtocol::new(handler)
                             .accept(conn)
                             .await;
@@ -16188,7 +16234,7 @@ struct HolderPull {
     /// The leaf pulls from the first-ranked holder's own endpoint, so it is the
     /// requester S discovers.
     leaf_is_first: bool,
-    /// How many `cdn/client/v1` connections the full holder O answers with a
+    /// How many `cdn/client/v1` streams the full holder O answers with a
     /// signed `NotFound` before it serves.
     full_holder_refusals: usize,
 }
@@ -16367,7 +16413,7 @@ async fn a_serve_miss_asks_a_partial_holder_only_for_blocks_it_holds() -> Result
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_first_run_handshake_asks_the_partial_holder_only_for_blocks_it_holds()
 -> Result<()> {
-    // The full holder refuses two connections: a signed `NotFound` on the
+    // The full holder refuses two streams: a signed `NotFound` on the
     // primed open reads as a range past the blob's end, so the handshake asks
     // the full holder again for the whole blob, and that refusal fails it.
     let seen = holder_pull_case(HolderPull {
@@ -16622,9 +16668,9 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
 /// leaf stream on the hash completes; none ends short after payment.
 ///
 /// Holder A covers block 0 only and holder B block 1 only, so B is the sole
-/// coverer of its run. B refuses its first TWO `cdn/client/v1` connections. The
+/// coverer of its run. B refuses its first TWO `cdn/client/v1` streams. The
 /// live-probe ranking decides whether S's handshake goes to A or to B, so B's
-/// first connection is either its run or the handshake; with two refusals, B's
+/// first stream is either its run or the handshake; with two refusals, B's
 /// run is refused at least once on either order. Dropping B on that refusal
 /// would end the assembly `Unavailable` with block 1 unfetched, and suppressing
 /// B would take it out of every other stream's candidate walk on the hash.

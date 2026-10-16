@@ -2189,7 +2189,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             if let Some(resolver) = resolver_opt.as_ref() {
                 origin.provision(crate::node_origin::NodeOriginDeps {
                     endpoint: ep_for_buyer.clone(),
-                    dial_runtime: tokio::runtime::Handle::current(),
+                    connections: Connections::with_options(
+                        ep_for_buyer.clone(),
+                        decdn_protocol::ALPN_CLIENT,
+                        Some(tokio::runtime::Handle::current()),
+                    ),
                     dht_connections: dht_conns_c,
                     routing_table: dht_routing_c,
                     staker_set: staker_set_c,
