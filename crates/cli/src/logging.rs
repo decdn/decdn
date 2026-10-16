@@ -102,7 +102,7 @@ pub fn init(log_level: Option<LogLevel>) {
         }
     };
 
-    let progress = indicatif::MultiProgress::new();
+    let progress = new_container();
     // A second `init` call would be a bug (dispatch runs once), but guard
     // against clobbering the shared handle regardless.
     let _ = PROGRESS.set(progress.clone());
@@ -135,8 +135,18 @@ pub fn attach_progress_bar(bar: indicatif::ProgressBar) -> indicatif::ProgressBa
 pub fn progress_container() -> indicatif::MultiProgress {
     match PROGRESS.get() {
         Some(progress) => progress.clone(),
-        None => indicatif::MultiProgress::new(),
+        None => new_container(),
     }
+}
+
+/// A bar container that redraws in place: each redraw moves the cursor back to
+/// the first bar line and overwrites every line, so no frame shows the stack
+/// erased. A multi-bar `decdn get` redraws many lines several times a second,
+/// and an erase-then-write redraw shows as flicker in tmux and recordings.
+fn new_container() -> indicatif::MultiProgress {
+    let progress = indicatif::MultiProgress::new();
+    progress.set_move_cursor(true);
+    progress
 }
 
 /// [`tracing_subscriber::fmt::MakeWriter`] that emits each log line through
