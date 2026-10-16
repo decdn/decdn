@@ -28,7 +28,7 @@ pub const DEFAULT_MAX_LANE_STREAMS: u16 = 4;
 /// - `decdn:<hash>/<path>`: that one bundle entry. `-o` is the output
 ///   directory, and the file lands at `<OUT>/<path>`. Without `-o`, the file
 ///   lands at `./<name>`, where `<name>` is the last segment of `<path>`.
-///   `-o -` streams the entry to stdout as one blob and takes no
+///   With `-o -`, the entry streams to stdout as one blob and takes no
 ///   bundle-only flag.
 ///
 /// A `?ns=<id>` in the URI is the namespace routing hint (ADR 002) for every
@@ -50,7 +50,7 @@ pub struct GetArgs {
     /// stdout. For a bundle or entry URI, the output directory (created if
     /// absent); each entry's relative path resolves within it, and
     /// `..`/absolute/escaping paths are rejected. An entry URI also takes `-`,
-    /// to stream that entry to stdout. Without `-o`, a blob lands at
+    /// to stream that one entry to stdout. Without `-o`, a blob lands at
     /// `./<hash>`, a bundle in `.`, and an entry at `./<name>` (the last
     /// segment of its path); a bundle or entry pull then refuses a path that
     /// holds a file no earlier pull wrote, unless `--overwrite`.

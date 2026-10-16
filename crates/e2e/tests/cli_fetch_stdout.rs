@@ -1,20 +1,27 @@
-//! Live anvil-backed e2e for `decdn get decdn:<hash> -o -` (#1848 4b): the
-//! CLI's STDOUT streaming path over the `decdn_client::Streamer` consumption
-//! face, driving the shipped `decdn` binary against a real node over a real
-//! paid `cdn/client/v1` stream.
+//! Live anvil-backed e2e for `decdn get decdn:<hash> -o -` (#1848 4b) and
+//! `decdn get decdn:<manifest>/<path> -o -`: the CLI's STDOUT streaming path
+//! over the `decdn_client::Streamer` consumption face, driving the shipped
+//! `decdn` binary against a real node over a real paid `cdn/client/v1` stream.
+//! The entry form reads the bundle manifest into memory, then streams that one
+//! entry.
 //!
 //! Why the whole binary rather than a unit test: the `Streamer` /
 //! `VerifiedReader` unit tests in `decdn-client` already prove verified,
 //! consumption-paced streaming against a `ScriptedSource`. What only exists on
-//! the real wire is that the CLI routes `-o -` to `stream_to_stdout`, opens a
+//! the real wire is that the CLI routes `-o -` to the blob fetch, opens a
 //! real `(signer, provider)` payment lane, streams the bao-verified bytes to the
 //! process's stdout (nothing but verified bytes — safe to pipe), and persists
 //! the lane's voucher watermark afterward exactly like the file path.
 //!
 //! What this test asserts:
-//!   1. The captured stdout is byte-identical to the source blob.
-//!   2. The client's persisted buyer-pool store shows a non-zero cumulative
-//!      watermark against the holder — the stream was paid for and settled.
+//!   1. The captured stdout is byte-identical to the source blob. For the entry
+//!      form, the manifest names a decoy entry before the target, so stdout
+//!      shows the fetch picked the named entry.
+//!   2. The client's persisted buyer-pool store shows a cumulative watermark
+//!      against the holder of at least every byte fetched (the manifest
+//!      included) — each stream was paid for and settled.
+//!   3. The run reads the keystore password once, though the entry form
+//!      fetches twice.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a prior build of both `decdn` and `decdn-node`:
@@ -97,6 +104,13 @@ enum Target {
 /// The manifest path the entry test names.
 const ENTRY_PATH: &str = "clips/clip.bin";
 
+/// A manifest path listed before [`ENTRY_PATH`], whose blob no node holds.
+const DECOY_PATH: &str = "clips/decoy.bin";
+
+/// The warning each password read prints for the unused password file the
+/// argv names, since the env password takes precedence.
+const UNUSED_PASSWORD_FILE: &str = "was not used";
+
 async fn run(target: Target) -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -108,7 +122,8 @@ async fn run(target: Target) -> anyhow::Result<()> {
     let blob = make_blob();
     let blob_hash = Hash::new(&blob);
     let manifest = format!(
-        r#"{{"version":1,"entries":[{{"path":"{ENTRY_PATH}","hash":"{}"}}]}}"#,
+        r#"{{"version":1,"entries":[{{"path":"{DECOY_PATH}","hash":"{}"}},{{"path":"{ENTRY_PATH}","hash":"{}"}}]}}"#,
+        Hash::new(b"decoy").to_hex(),
         blob_hash.to_hex(),
     )
     .into_bytes();
@@ -153,7 +168,7 @@ async fn run(target: Target) -> anyhow::Result<()> {
     // The node's chain watcher observes the freshly-opened pool asynchronously; a
     // pre-serve refusal before it catches up is retryable, so retry until one
     // invocation streams the whole blob to stdout.
-    let stdout = run_fetch_until_streamed(client_dir.path(), &args, blob.len()).await?;
+    let (stdout, stderr) = run_fetch_until_streamed(client_dir.path(), &args, blob.len()).await?;
 
     // (1) stdout is byte-identical to the source blob — nothing but verified
     // bytes reached the pipe.
@@ -164,12 +179,25 @@ async fn run(target: Target) -> anyhow::Result<()> {
         blob.len()
     );
 
-    // (2) The client's persisted store shows a non-zero watermark against the
-    // holder — the stream was paid for and settled, exactly like the file path.
+    // (2) The client's persisted store shows a watermark against the holder of
+    // at least every byte fetched — each stream was paid for and settled,
+    // exactly like the file path.
+    let fetched = match target {
+        Target::Blob => blob.len(),
+        Target::Entry => blob.len() + manifest.len(),
+    };
     let billed = billed_bytes(client_dir.path(), holder.operator_addr())?;
     anyhow::ensure!(
-        billed > 0,
-        "the client's persisted buyer-pool store must show bytes billed to the holder"
+        billed >= u64::try_from(fetched)?,
+        "the client's persisted buyer-pool store shows {billed} bytes billed to the holder, \
+         expected at least {fetched}"
+    );
+
+    // (3) One password read for the run, the entry form's two fetches included.
+    let reads = stderr.matches(UNUSED_PASSWORD_FILE).count();
+    anyhow::ensure!(
+        reads == 1,
+        "the run read the keystore password {reads} times, expected once; stderr:\n{stderr}"
     );
 
     drop(holder);
@@ -177,12 +205,12 @@ async fn run(target: Target) -> anyhow::Result<()> {
 }
 
 /// Run `decdn get ... -o -` until one invocation streams the whole blob to
-/// stdout, returning the captured stdout bytes.
+/// stdout, returning that invocation's stdout bytes and stderr text.
 async fn run_fetch_until_streamed(
     data_dir: &std::path::Path,
     args: &[String],
     expected_len: usize,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<(Vec<u8>, String)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
@@ -192,7 +220,10 @@ async fn run_fetch_until_streamed(
             .await
             .context("spawn decdn get -o -")?;
         if output.status.success() && output.stdout.len() == expected_len {
-            return Ok(output.stdout);
+            return Ok((
+                output.stdout,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
@@ -231,7 +262,9 @@ fn billed_bytes(
 }
 
 /// The `decdn get` argv (after the `get` subcommand) to stream what `uri`
-/// names to stdout via auto-discovery, writing to `-o -`.
+/// names to stdout via auto-discovery, writing to `-o -`. It names a password
+/// file that does not exist, so each password read warns that the env password
+/// took precedence.
 fn fetch_argv(
     chain: &ChainFixture,
     uri: &str,
@@ -256,6 +289,8 @@ fn fetch_argv(
         data_dir.display().to_string(),
         "--keystore".into(),
         keystore.display().to_string(),
+        "--keystore-password-file".into(),
+        data_dir.join("unused-password").display().to_string(),
         "--working-deposit-micro-usdc".into(),
         DEPOSIT_MICRO_USDC.to_string(),
     ]

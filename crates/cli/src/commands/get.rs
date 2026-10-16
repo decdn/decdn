@@ -111,7 +111,7 @@ fn streams_one_blob(args: &GetArgs, uri: &DecdnUri) -> bool {
     }
 }
 
-/// Whether `-o -` names stdout.
+/// Whether `-o` is `-` (stdout).
 fn is_stdout(args: &GetArgs) -> bool {
     args.output.as_deref() == Some(Path::new("-"))
 }
@@ -157,7 +157,7 @@ fn parse_and_check(args: &GetArgs) -> anyhow::Result<DecdnUri> {
     anyhow::ensure!(
         !is_stdout(args),
         "`-o -` (stdout) takes a blob or one bundle entry (`decdn:<hash>/<path>`); \
-         a whole bundle needs an output directory"
+         a whole bundle writes to a directory"
     );
     Ok(uri)
 }

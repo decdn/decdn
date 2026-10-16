@@ -41,7 +41,8 @@ since project inception and will roll into the first tagged release.
     (`origin import` writes it) and pull it by hash.
   - The bundle flags (`--include`, `--exclude`, `--select`, `--jobs`,
     `--max-lane-streams`, `--overwrite`, `--dry-run`, `--json`) are an error
-    on a blob URI, and the entry filters are an error on an entry URI.
+    on a blob URI and on an entry URI with `-o -`, and the entry filters are
+    an error on an entry URI.
   - `decdn:H/` on a blob that is not a manifest fails with a hint to drop the
     trailing `/`. `decdn_client::bundle::BundleManifest::parse` returns a
     typed `NotAManifest` for that case.
@@ -3466,6 +3467,12 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: `decdn get decdn:<hash>/<path> -o -` streams one bundle entry to
+  stdout (#2467).** The command reads the bundle manifest into memory (at
+  most 64 MiB, and the manifest fetch requests and pays for no more), then
+  streams the entry's verified blob to stdout. Both fetches share one payer,
+  so the keystore password is read once. The bundle flags are an error with
+  `-o -`, and `-o -` on a whole bundle (`decdn:<hash>/`) stays an error.
 - **CLI: `-o` is optional on `decdn get` (#2466).** Without `-o`, a blob
   lands at `./<hash>`, a bundle in `.`, and an entry URI
   (`decdn:<hash>/<path>`) at `./<name>`, the last segment of its path, with

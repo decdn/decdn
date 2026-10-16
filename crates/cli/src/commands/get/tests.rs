@@ -88,20 +88,32 @@ fn entry_filters_rejected_on_entry_uri() {
 #[test]
 fn stdout_rejected_on_bundle_uri() {
     let err = err_of(&[&format!("decdn:{HEX}/"), "-o", "-"]);
-    assert!(err.contains("stdout"), "{err}");
+    assert!(
+        err.contains("a whole bundle writes to a directory"),
+        "{err}"
+    );
+}
+
+/// Whether `flags` run the blob fetch.
+fn routes_to_blob_fetch(flags: &[&str]) -> bool {
+    let args = get_args(flags);
+    streams_one_blob(&args, &parse_and_check(&args).unwrap())
 }
 
 #[test]
 fn entry_uri_streams_to_stdout_as_one_blob() {
-    let uri = format!("decdn:{HEX}/sintel/Sintel.mkv?ns=1");
-    let args = get_args(&[&uri, "-o", "-"]);
-    let parsed = parse_and_check(&args).unwrap();
-    assert!(streams_one_blob(&args, &parsed));
-    let to_dir = get_args(&[&uri, "-o", "dir"]);
-    assert!(!streams_one_blob(
-        &to_dir,
-        &parse_and_check(&to_dir).unwrap()
-    ));
+    let entry = format!("decdn:{HEX}/sintel/Sintel.mkv?ns=1");
+    assert!(routes_to_blob_fetch(&[&entry, "-o", "-"]));
+    assert!(!routes_to_blob_fetch(&[&entry, "-o", "dir"]));
+    assert!(!routes_to_blob_fetch(&[&entry]));
+    let blob = format!("decdn:{HEX}");
+    assert!(routes_to_blob_fetch(&[&blob, "-o", "-"]));
+    assert!(routes_to_blob_fetch(&[&blob]));
+    assert!(!routes_to_blob_fetch(&[
+        &format!("decdn:{HEX}/"),
+        "-o",
+        "dir"
+    ]));
 }
 
 #[test]
