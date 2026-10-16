@@ -1,5 +1,5 @@
 use super::*;
-use alloy::primitives::Bytes;
+use alloy::primitives::{B256, Bytes};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 
 use crate::Cumulative;
@@ -80,14 +80,17 @@ async fn run_in(
     }
     let rpc = ProviderBuilder::new().connect_mocked_client(asserter.clone());
     let contract = PaymentPool::new(PP, rpc.clone());
+    let payer = match OwnedPayer::for_store(Arc::clone(signer), store) {
+        Ok(payer) => payer,
+        Err(err) => return (Err(err), asserter.read_q().is_empty()),
+    };
     let result = open_or_reuse_pool(
         store,
         &contract,
         &rpc,
         funding,
-        signer,
+        &payer,
         PROVIDER,
-        signer.address(),
         DEPLOYMENT,
         DepositPolicy {
             working_deposit: U256::from(WORKING),
@@ -340,8 +343,8 @@ async fn a_tracked_pool_is_reused_only_while_the_chain_shows_it_open() {
 }
 
 /// A buy from a node's data dir never adopts, even though the chain would
-/// hand it a pool: that pool is the daemon's, and adopting it would put a
-/// second voucher series on the daemon's own lanes.
+/// hand it a pool: that pool is the daemon's, and adopting it would spend the
+/// daemon's deposit from a buyer the daemon cannot see.
 ///
 /// The queue holds only the `usdc()` answer the open path reads first. Were
 /// adoption attempted, `getPools` would consume that word, fail to decode it,
@@ -375,9 +378,15 @@ async fn a_node_data_dir_never_adopts_the_daemons_pool() {
 const LIVE_LANES: [u64; 6] = [2_374_000, 2_360_000, 2_147_000, 1_043_000, 483_000, 248_000];
 
 /// A tracked row on [`DEPLOYMENT`] holding `deposit`, with one lane per
-/// `amounts` entry: the first is [`PROVIDER`]'s, each later one another
-/// provider's. A lane's bytes are its amount times 1000.
-fn tracked_row(id: B256, owner: Address, deposit: u64, amounts: &[u64]) -> BuyerPoolState {
+/// `amounts` entry signed by `lane_signer`: the first is [`PROVIDER`]'s, each
+/// later one another provider's. A lane's bytes are its amount times 1000.
+fn tracked_row(
+    id: B256,
+    owner: Address,
+    lane_signer: Address,
+    deposit: u64,
+    amounts: &[u64],
+) -> BuyerPoolState {
     let lanes = amounts
         .iter()
         .zip(0u8..)
@@ -388,7 +397,7 @@ fn tracked_row(id: B256, owner: Address, deposit: u64, amounts: &[u64]) -> Buyer
                 Address::repeat_byte(0x40 + i)
             };
             (
-                lane_key(id, owner, provider),
+                lane_key(id, lane_signer, provider),
                 decdn_incentive::BuyerLaneProgress {
                     last_amount: U256::from(amount),
                     last_bytes: U256::from(amount) * U256::from(1000u64),
@@ -405,6 +414,14 @@ fn tracked_row(id: B256, owner: Address, deposit: u64, amounts: &[u64]) -> Buyer
         lanes,
         U256::ZERO,
     )
+}
+
+/// The key `store`'s data dir signs `signer`'s owned lanes with.
+fn lane_of(store: &RedbBuyerPoolStore, signer: &Arc<PrivateKeySigner>) -> Address {
+    OwnedPayer::for_store(Arc::clone(signer), store)
+        .unwrap()
+        .lane()
+        .address()
 }
 
 fn lane_key(id: B256, owner: Address, provider: Address) -> LaneKey {
@@ -428,7 +445,7 @@ fn refill_fails_with_wallet(usdc: u64) -> Vec<Option<Bytes>> {
 fn pool_spend_sums_every_tracked_lane() {
     let owner = Address::repeat_byte(0x01);
     let id = B256::repeat_byte(0xEE);
-    let row = tracked_row(id, owner, WORKING, &LIVE_LANES);
+    let row = tracked_row(id, owner, owner, WORKING, &LIVE_LANES);
     let working = U256::from(WORKING);
     let low_water = working / U256::from(LOW_WATER_DIVISOR);
 
@@ -455,7 +472,7 @@ fn pool_spend_sums_every_tracked_lane() {
 fn a_seeded_lanes_chain_prior_counts_toward_the_pool_spend() {
     let owner = Address::repeat_byte(0x01);
     let id = B256::repeat_byte(0xEE);
-    let mut row = tracked_row(id, owner, WORKING, &[1_000]);
+    let mut row = tracked_row(id, owner, owner, WORKING, &[1_000]);
     let new_lane = lane_key(id, owner, Address::repeat_byte(0x55));
     row.seed_lane(new_lane, U256::from(250_000u64), U256::from(250u64))
         .unwrap();
@@ -513,7 +530,13 @@ async fn a_pool_spent_across_lanes_refills_and_fails_when_nothing_is_left() {
     let signer = Arc::new(PrivateKeySigner::random());
     let id = B256::repeat_byte(0xEE);
     store
-        .record(&tracked_row(id, signer.address(), WORKING, &[2_000_000; 5]))
+        .record(&tracked_row(
+            id,
+            signer.address(),
+            lane_of(&store, &signer),
+            WORKING,
+            &[2_000_000; 5],
+        ))
         .unwrap();
 
     let mut calls = vec![Some(still_open(signer.address()))];
@@ -551,7 +574,7 @@ async fn an_untracked_lanes_chain_watermark_counts_toward_the_pool_spend() {
     let store = client_store(&dir);
     let signer = Arc::new(PrivateKeySigner::random());
     let id = B256::repeat_byte(0xEE);
-    let other = lane_key(id, signer.address(), Address::repeat_byte(0x55));
+    let other = lane_key(id, lane_of(&store, &signer), Address::repeat_byte(0x55));
     let progress = decdn_incentive::BuyerLaneProgress {
         last_amount: U256::from(9_000_000u64),
         last_bytes: U256::from(9_000_000_000u64),
@@ -601,7 +624,13 @@ async fn a_wallet_short_of_usdc_keeps_the_lane_while_the_pool_can_still_pay() {
     let signer = Arc::new(PrivateKeySigner::random());
     let id = B256::repeat_byte(0xEE);
     store
-        .record(&tracked_row(id, signer.address(), WORKING, &LIVE_LANES))
+        .record(&tracked_row(
+            id,
+            signer.address(),
+            lane_of(&store, &signer),
+            WORKING,
+            &LIVE_LANES,
+        ))
         .unwrap();
     let funding = RunFunding::default();
 
@@ -644,7 +673,13 @@ async fn a_later_lane_build_skips_the_refill_after_a_wallet_shortfall() {
     let signer = Arc::new(PrivateKeySigner::random());
     let id = B256::repeat_byte(0xEE);
     store
-        .record(&tracked_row(id, signer.address(), WORKING, &LIVE_LANES))
+        .record(&tracked_row(
+            id,
+            signer.address(),
+            lane_of(&store, &signer),
+            WORKING,
+            &LIVE_LANES,
+        ))
         .unwrap();
     let funding = RunFunding::default();
     let (first, _) = run_in(
@@ -675,7 +710,13 @@ async fn a_refill_failure_with_a_funded_wallet_fails_the_lane_build() {
     let signer = Arc::new(PrivateKeySigner::random());
     let id = B256::repeat_byte(0xEE);
     store
-        .record(&tracked_row(id, signer.address(), WORKING, &LIVE_LANES))
+        .record(&tracked_row(
+            id,
+            signer.address(),
+            lane_of(&store, &signer),
+            WORKING,
+            &LIVE_LANES,
+        ))
         .unwrap();
     let funding = RunFunding::default();
 
@@ -804,7 +845,7 @@ async fn a_reused_adopted_row_keeps_the_pools_redeemed_spend() {
     );
 
     // The lane pays on to 1.5 USDC: the pool has spent 3.5 USDC.
-    let a = lane_key(id, owner, PROVIDER);
+    let a = lane_key(id, lane_of(&store, &signer), PROVIDER);
     let outcome = store
         .advance_progress(
             owner,
@@ -819,6 +860,92 @@ async fn a_reused_adopted_row_keeps_the_pools_redeemed_spend() {
         store.get_by_owner(owner).unwrap().unwrap().pool_spend(),
         U256::from(3_500_000u64)
     );
+}
+
+/// #2468: two data dirs on one wallet adopt the same live pool, and each
+/// signs on its own lanes. Signing with the wallet key in both would put two
+/// processes on one `(pool, signer, provider)` lane, each from its own
+/// watermark, and the provider rejects whichever falls behind as `UnderFold`.
+#[tokio::test]
+async fn two_data_dirs_adopt_one_pool_on_disjoint_lanes() {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let owner = signer.address();
+    let id = B256::repeat_byte(0xDE);
+    let adopt_calls = || {
+        vec![
+            Some(vec![id].abi_encode().into()),
+            Some(pool(owner, WORKING, 0).abi_encode().into()),
+            Some(TOKEN.abi_encode().into()),
+            Some(lane(0, 0)),
+        ]
+    };
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (store_a, store_b) = (client_store(&dir_a), client_store(&dir_b));
+    let a = run(&store_a, &signer, ChainAdoption::Allowed, adopt_calls())
+        .await
+        .expect("data dir A adopts the pool");
+    let b = run(&store_b, &signer, ChainAdoption::Allowed, adopt_calls())
+        .await
+        .expect("data dir B adopts the pool");
+
+    assert_eq!(a.pool_id, id);
+    assert_eq!(b.pool_id, id);
+    let (lane_a, lane_b) = (a.client_signer.address(), b.client_signer.address());
+    assert_ne!(lane_a, lane_b, "two data dirs share a lane signer");
+    assert_ne!(lane_a, owner, "data dir A signs with the wallet key");
+    assert_ne!(lane_b, owner, "data dir B signs with the wallet key");
+    for ctx in [&a, &b] {
+        let cap = ctx.capability.as_ref().expect("a self capability");
+        assert_eq!(
+            cap.recover_owner(&DEPLOYMENT.voucher_domain()).unwrap(),
+            owner
+        );
+        assert_eq!(cap.capability.signer, ctx.client_signer.address());
+    }
+}
+
+/// #2468 review: data dir A opened the pool and tracks it, and another data
+/// dir on the wallet has since redeemed 9 of its 10 USDC on lanes A does not
+/// track. A's next run reads that spend from chain, so the pool reads 1 USDC
+/// remaining and the low-water refill fires. Read from A's row alone, the pool
+/// would read full: no refill, and a funding recovery that never tops up.
+#[tokio::test]
+async fn a_tracked_row_counts_what_another_data_dir_redeemed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let owner = signer.address();
+    let id = B256::repeat_byte(0xEE);
+    store
+        .record(&tracked_row(
+            id,
+            owner,
+            lane_of(&store, &signer),
+            WORKING,
+            &[],
+        ))
+        .unwrap();
+
+    let mut calls = vec![
+        Some(pool(owner, WORKING, 9_000_000).abi_encode().into()),
+        Some(lane(0, 0)),
+    ];
+    calls.extend(refill_fails_with_wallet(0));
+    let (result, drained) = run_in(
+        &store,
+        &signer,
+        ChainAdoption::Allowed,
+        calls,
+        &RunFunding::default(),
+    )
+    .await;
+    let (_, spend) = result.expect("1 USDC remains, so the lane builds");
+    assert_eq!(
+        spend.outside,
+        U256::from(9_000_000u64),
+        "the other data dir's redemptions count as spend"
+    );
+    assert!(drained, "the low pool fired the refill");
 }
 
 /// A ledger seeded at `amount`.
@@ -929,7 +1056,13 @@ async fn a_lane_build_reports_the_pools_other_spend() {
     let signer = Arc::new(PrivateKeySigner::random());
     let id = B256::repeat_byte(0xEE);
     store
-        .record(&tracked_row(id, signer.address(), 2 * WORKING, &LIVE_LANES))
+        .record(&tracked_row(
+            id,
+            signer.address(),
+            lane_of(&store, &signer),
+            2 * WORKING,
+            &LIVE_LANES,
+        ))
         .unwrap();
 
     let (result, drained) = run_in(
@@ -960,7 +1093,6 @@ async fn a_lane_build_reports_the_pools_other_spend() {
 /// the step no funding path.
 #[tokio::test]
 async fn the_cli_funder_reads_the_run_funding() {
-    let signer = Arc::new(PrivateKeySigner::random());
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
     let rpc = ProviderBuilder::new().connect_mocked_client(Asserter::new());
@@ -981,7 +1113,6 @@ async fn the_cli_funder_reads_the_run_funding() {
         rpc: &rpc,
         store: &store,
         owner: Address::repeat_byte(0x01),
-        signer: Arc::clone(&signer),
         deployment: DEPLOYMENT,
         token: TOKEN,
         payment_pool_addr: PP,
@@ -1014,18 +1145,39 @@ async fn the_cli_funder_reads_the_run_funding() {
     );
 }
 
-/// Run a recovery step for a self-funded pool that already holds its working
-/// deposit, with the chain's `topUp` estimate answered by `estimate`. Also
-/// returns the opens the step left unconfirmed in the run's handle.
+/// The owner key of [`step_on_a_full_pool`]'s pool, so a test can script its
+/// `getPool` answer.
+fn full_pool_owner() -> Arc<PrivateKeySigner> {
+    Arc::new(PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42)).unwrap())
+}
+
+/// The `getPool` answer a recovery step reads first: [`full_pool_owner`]'s
+/// open pool at the working deposit, `redeemed` of it paid out.
+fn full_pool_on_chain(redeemed: u64) -> Bytes {
+    pool(full_pool_owner().address(), WORKING, redeemed)
+        .abi_encode()
+        .into()
+}
+
+/// Run a recovery step for a self-funded pool that, as far as the run knows,
+/// already holds its working deposit. The step reads the pool on chain first
+/// (`asserter`'s first answer, see [`full_pool_on_chain`]). Also returns the
+/// opens the step left unconfirmed in the run's handle.
 async fn step_on_a_full_pool(
     asserter: Asserter,
 ) -> (anyhow::Result<Recovery>, Vec<OpenUnconfirmed>) {
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
-    let signer = Arc::new(PrivateKeySigner::random());
+    let signer = full_pool_owner();
     let id = B256::repeat_byte(0xEE);
     store
-        .record(&tracked_row(id, signer.address(), WORKING, &[]))
+        .record(&tracked_row(
+            id,
+            signer.address(),
+            lane_of(&store, &signer),
+            WORKING,
+            &[],
+        ))
         .unwrap();
     let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
     let contract = PaymentPool::new(PP, rpc.clone());
@@ -1037,7 +1189,6 @@ async fn step_on_a_full_pool(
         rpc: &rpc,
         store: &store,
         owner: signer.address(),
-        signer: Arc::clone(&signer),
         deployment: DEPLOYMENT,
         token: TOKEN,
         payment_pool_addr: PP,
@@ -1054,10 +1205,39 @@ async fn step_on_a_full_pool(
 #[tokio::test]
 async fn a_full_open_pool_settles_without_a_top_up() {
     let asserter = Asserter::new();
+    asserter.push_success(&full_pool_on_chain(0));
     asserter.push_success(&alloy::primitives::U64::from(50_000u64));
     let stepped = step_on_a_full_pool(asserter.clone()).await.0.unwrap();
     assert_matches!(stepped, Recovery::ToppedUp(d) if d == U256::from(WORKING));
-    assert!(asserter.read_q().is_empty(), "only the estimate ran");
+    assert!(
+        asserter.read_q().is_empty(),
+        "only the pool read and the estimate ran"
+    );
+}
+
+/// #2468 review: another data dir on the wallet redeemed 9 of the pool's 10
+/// USDC while this run went on. The run's own view reads the pool full, but
+/// the step reads the chain and tops up rather than only settling. Here the
+/// wallet holds no USDC, so the top-up ends in a shortfall.
+#[tokio::test]
+async fn a_pool_another_data_dir_drained_tops_up() {
+    let asserter = Asserter::new();
+    asserter.push_success(&full_pool_on_chain(9_000_000));
+    // The allowance read faults, and the wallet holds no USDC.
+    asserter.push_failure_msg("allowance read faulted");
+    asserter.push_success(&U256::ZERO.abi_encode());
+    let err = step_on_a_full_pool(asserter.clone())
+        .await
+        .0
+        .expect_err("a wallet with no USDC cannot top up");
+    assert!(
+        err.downcast_ref::<WalletShortfall>().is_some(),
+        "the step tried a top-up rather than settling: {err:#}"
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "the pool, allowance and wallet reads ran"
+    );
 }
 
 /// A full pool that is closing or closed still needs a replacement: its
@@ -1067,6 +1247,7 @@ async fn a_full_open_pool_settles_without_a_top_up() {
 async fn a_full_closing_pool_is_replaced() {
     let selector = alloy::primitives::keccak256("PoolNotOpen()");
     let asserter = Asserter::new();
+    asserter.push_success(&full_pool_on_chain(0));
     asserter.push_failure(
         serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
             "code": 3,
@@ -1116,9 +1297,8 @@ async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_opens() {
         &contract,
         &rpc,
         &funding,
-        &signer,
+        &OwnedPayer::for_store(Arc::clone(&signer), &store).unwrap(),
         PROVIDER,
-        signer.address(),
         DEPLOYMENT,
         DepositPolicy {
             working_deposit: U256::from(WORKING),
@@ -1338,6 +1518,12 @@ impl BuyerPoolStore for UnreadableDelegateLanes {
     ) -> Result<AdvanceOutcome, decdn_incentive::StoreError> {
         self.0
             .rebase_delegate_progress(deployment, lane, anchor, totals)
+    }
+
+    fn lane_salt(
+        &self,
+    ) -> Result<decdn_incentive::lane_signer::LaneSalt, decdn_incentive::StoreError> {
+        self.0.lane_salt()
     }
 }
 

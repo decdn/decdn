@@ -1590,6 +1590,12 @@ impl BuyerPoolStore for ForgetFaults {
         self.0
             .rebase_delegate_progress(deployment, lane, anchor, totals)
     }
+
+    fn lane_salt(
+        &self,
+    ) -> Result<decdn_incentive::lane_signer::LaneSalt, decdn_incentive::StoreError> {
+        self.0.lane_salt()
+    }
 }
 
 /// A faulted row-clear on a skipped pool fails the sweep as "row not cleared",

@@ -745,7 +745,7 @@ async fn pull_over(
     let signer = load_buyer_signer(chain)?;
     let funding = match &grant {
         None => Funding::SelfOwned {
-            signer,
+            owner: signer,
             deposit: chain.deposit_policy(false)?,
         },
         Some(grant) => Funding::Delegated {

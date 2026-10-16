@@ -28,6 +28,7 @@ use crate::buyer_pool::{
 use crate::buyer_pool_table::{BuyerPoolTable, load_all_from};
 use crate::deployment::Deployment;
 use crate::lane::{LaneKey, PoolId};
+use crate::lane_signer::LaneSalt;
 use crate::store::StoreError;
 
 /// File name of the buyer-pool redb database within the data dir. Named in
@@ -301,6 +302,10 @@ impl BuyerPoolStore for RedbBuyerPoolStore {
     ) -> Result<AdvanceOutcome, StoreError> {
         self.table()
             .rebase_delegate_progress(deployment, lane, anchor, totals)
+    }
+
+    fn lane_salt(&self) -> Result<LaneSalt, StoreError> {
+        self.table().lane_salt()
     }
 }
 

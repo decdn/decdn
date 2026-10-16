@@ -584,8 +584,13 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
     );
     drop(entry);
 
-    // A fetch that pays from its own pool writes to its pool row.
-    let owner = Arc::new(first.clone());
+    // A fetch that pays from its own pool writes to the pool row of the payer's
+    // owner key: not the lane key its vouchers sign under (#2468), and read
+    // from the payer the lanes sign under rather than from the deps.
+    let owner = crate::buyer_pool::OwnedPayer::for_store(
+        Arc::new(alloy::signers::local::PrivateKeySigner::random()),
+        store.as_ref(),
+    )?;
     let self_owned = super::LaneSources::new(
         &deps,
         &discovery,
@@ -597,7 +602,10 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         None,
         &recovery,
     );
-    anyhow::ensure!(self_owned.watermark_row() == WatermarkRow::Owned(deps.self_address));
+    let row = WatermarkRow::Owned(owner.owner().address());
+    anyhow::ensure!(owner.lane().address() != owner.owner().address());
+    anyhow::ensure!(self_owned.watermark_row() == row);
+    anyhow::ensure!(self_owned.funder().owner == owner.owner().address());
     drop(self_owned);
     ep.close().await;
     Ok(())

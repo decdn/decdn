@@ -47,10 +47,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use decdn_client::buyer_pool::{
-    LOW_WATER_DIVISOR, OpenUnconfirmed, OpenedPool, PoolNotOpen, ProgressWrite, ToppedUpPool,
-    WatermarkRow, ensure_allowance, grade_deposit_credit, open_pool, opened_from_receipt,
-    pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool, top_up as pool_top_up,
-    topped_up_effect,
+    LOW_WATER_DIVISOR, OpenUnconfirmed, OpenedPool, OwnedPayer, PoolNotOpen, ProgressWrite,
+    ToppedUpPool, WatermarkRow, ensure_allowance, grade_deposit_credit, open_pool,
+    opened_from_receipt, pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool,
+    top_up as pool_top_up, topped_up_effect,
 };
 use decdn_client::{LocalPullFault, PoolContext, PoolReplaced, Recovery};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
@@ -603,6 +603,8 @@ fn refill_decision(deposit: U256, spent: U256, working_deposit: U256) -> U256 {
 
 /// Build the [`PoolContext`] paying `provider_addr` from this pool's state,
 /// resuming the lane at its recorded cumulative totals ([`self_owned_lane_ctx`]).
+/// The node key both owns the pool and signs its lanes ([`OwnedPayer::sole`]):
+/// one daemon runs per node data dir, so its lanes have one signer.
 ///
 /// # Errors
 ///
@@ -623,7 +625,7 @@ fn pin_ctx(
         .map_or((U256::ZERO, U256::ZERO), |p| (p.last_bytes, p.last_amount));
     self_owned_lane_ctx(
         state,
-        signer,
+        &OwnedPayer::sole(Arc::clone(signer)),
         voucher_domain,
         provider_addr,
         prior_bytes,
@@ -1337,7 +1339,6 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         let contract = self.contract.clone();
         let store = Arc::clone(&self.store);
         let open = OpenRequest {
-            signer: Arc::clone(&self.signer),
             deployment: self.deployment,
             token: self.token,
             owner: self.owner,
@@ -2432,7 +2433,6 @@ async fn run_open<P: Provider + Clone>(
     // this node is unable to pay — another candidate may still deliver.
     let landed = match open_pool(
         contract,
-        Arc::clone(&open.signer),
         open.deployment,
         open.token,
         open.owner,
@@ -2500,7 +2500,6 @@ async fn run_open<P: Provider + Clone>(
 /// The `openPool` an open task sends: what [`open_pool`] sends, and what
 /// [`opened_from_receipt`] needs to rebuild its result from a receipt read later.
 struct OpenRequest {
-    signer: Arc<PrivateKeySigner>,
     deployment: Deployment,
     token: Address,
     owner: Address,
@@ -2767,7 +2766,6 @@ impl Settling {
                     opened_from_receipt(
                         &receipt,
                         tx,
-                        Arc::clone(&open.signer),
                         open.deployment,
                         open.token,
                         open.owner,

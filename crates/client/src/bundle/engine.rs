@@ -73,7 +73,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
 use alloy::providers::Provider;
-use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context as _, anyhow, bail};
 use decdn_bao_range::CHUNK_GROUP_BYTES;
 use decdn_common::redact::sanitize_err_chain;
@@ -88,6 +87,7 @@ use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
     FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, manifest_cache, parse_hash,
 };
+use crate::buyer_pool::OwnedPayer;
 use crate::discovery::{self, NodeCandidate};
 use crate::funding::RunFunding;
 use crate::lane_sources::LaneSources;
@@ -1234,6 +1234,16 @@ impl<'g> FetchSlot<'g> {
     }
 }
 
+/// What a bundle run's lanes sign under.
+pub(super) enum RunPayer {
+    /// The buyer's own pool: the owner key owns it, the lane key signs.
+    Owned(OwnedPayer),
+    /// The delegated credential slot, read at each lane build so a swapped-in
+    /// credential takes over at the next voucher boundary. A funding recovery
+    /// step has no funding path: the delegate owns no pool to fund.
+    Delegated(CredentialSlot),
+}
+
 /// The run's state, shared by the entry fetch loop. Borrowed by every
 /// in-flight entry future, and every entry must be polled on one task, as
 /// `buffer_unordered` does: each entry reads its lanes' ledgers and queues
@@ -1244,7 +1254,8 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     pub(super) store: Arc<dyn BuyerPoolStore>,
     pub(super) contract: PaymentPool::PaymentPoolInstance<P>,
     pub(super) rpc: P,
-    pub(super) signer: Arc<PrivateKeySigner>,
+    /// The keys every entry's lanes sign under.
+    pub(super) payer: RunPayer,
     pub(super) self_address: Address,
     /// The pool's settlement token (USDC), read once via `PaymentPool.usdc()`.
     pub(super) token: Address,
@@ -1264,12 +1275,6 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     pub(super) max_blob_bytes: u64,
     /// How the run funds its pool.
     pub(super) deposit: DepositPolicy,
-    /// The delegated credential slot every entry's lanes sign under, read
-    /// at each lane build so a swapped-in credential takes over at the next
-    /// voucher boundary; `None` for the self-owned pool path. With a slot, a
-    /// funding recovery step has no funding path (the delegate owns no pool
-    /// to fund).
-    pub(super) slot: Option<CredentialSlot>,
     /// Bundle-level namespace id (ADR 002) applied to every paid pull in the run —
     /// the namespace as a big-endian `uint256`; `NO_NAMESPACE` when the
     /// caller names none.
@@ -1470,9 +1475,9 @@ impl<P: Provider + Clone> PullCtx<P> {
             &deps,
             &self.discovery,
             &self.relays,
-            match &self.slot {
-                Some(slot) => LanePayer::Delegated(slot),
-                None => LanePayer::Owned(&self.signer),
+            match &self.payer {
+                RunPayer::Delegated(slot) => LanePayer::Delegated(slot),
+                RunPayer::Owned(payer) => LanePayer::Owned(payer),
             },
             &self.voucher_dom,
             Some(&self.open_lock),

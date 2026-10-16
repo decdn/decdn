@@ -30,7 +30,6 @@
     clippy::duration_suboptimal_units
 )]
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
@@ -45,12 +44,30 @@ use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity;
+use decdn_incentive::lane_signer::derive_lane_signer;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{Deployment, LaneKey};
 // The denominator of `next_voucher`'s `ceil(bytes * rate / MB)` pricing, taken
 // from the protocol rather than re-spelled locally: a hand-copied 1024 * 1024
 // would keep passing if the protocol constant ever moved.
 use decdn_protocol::MB_BYTES;
+
+/// The lane `decdn get` pays `provider` on from `store`'s data dir: signed by
+/// the key derived from the wallet and the store's salt, not by the wallet key
+/// itself (#2468).
+fn cli_lane(
+    store: &RedbBuyerPoolStore,
+    wallet: &PrivateKeySigner,
+    pool_id: B256,
+    provider: Address,
+) -> anyhow::Result<LaneKey> {
+    let signer = derive_lane_signer(wallet, &store.lane_salt()?)?;
+    Ok(LaneKey {
+        pool_id,
+        signer: signer.address(),
+        provider,
+    })
+}
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 /// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
@@ -117,20 +134,13 @@ async fn run() -> anyhow::Result<()> {
         payment_pool: chain.addrs().payment_pool,
     };
 
-    let opened = open_pool(
-        &pool,
-        Arc::new(buyer_signer.clone()),
-        deployment,
-        chain.usdc(),
-        buyer_addr,
-        deposit,
-        None,
-    )
-    .await
-    .context("open buyer pool")?;
+    let opened = open_pool(&pool, deployment, chain.usdc(), buyer_addr, deposit, None)
+        .await
+        .context("open buyer pool")?;
     let pool_id = opened.state.pool_id;
-    // The buyer self-signs, so the lane's signer is its own address; the provider
-    // is the node the lane pays.
+    // A synthetic lane signed by the wallet key: this scenario drives the top-up
+    // kernel only, and any recorded lane counts as pool spend. The provider is
+    // the node the lane pays.
     let lane = LaneKey {
         pool_id,
         signer: buyer_addr,
@@ -487,7 +497,6 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     let working_deposit = U256::from(MULTI_WORKING_DEPOSIT_MICRO_USDC);
     let opened = open_pool(
         &pool,
-        Arc::new(buyer.clone()),
         deployment,
         chain.usdc(),
         buyer_addr,
@@ -496,19 +505,14 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     )
     .await
     .context("open buyer pool")?;
-    // The buyer self-signs, so the lane's signer is its own address.
-    let lane = LaneKey {
-        pool_id: opened.state.pool_id,
-        signer: buyer_addr,
-        provider: node.operator_addr(),
-    };
-    {
+    let lane = {
         // Scoped: the CLI subprocess below opens its OWN handle on the same
         // redb file, and the store enforces single-writer access — this
         // handle must be dropped before spawning `decdn get`.
         let store = RedbBuyerPoolStore::open(client_dir.path()).context("open buyer store")?;
         store.record(&opened.state).context("record pool")?;
-    }
+        cli_lane(&store, &buyer, opened.state.pool_id, node.operator_addr())?
+    };
     // No node-side readiness wait: a pool has no on-chain-observed lane until its
     // first voucher lands, and the node serves it as soon as its `getPool` view
     // resolves the deposit — which is already on-chain (the `open_pool` receipt is
@@ -793,7 +797,6 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     let pool = PaymentPool::new(chain.addrs().payment_pool, chain.provider_for(&buyer));
     let opened = open_pool(
         &pool,
-        Arc::new(buyer.clone()),
         deployment,
         chain.usdc(),
         buyer_addr,
@@ -802,18 +805,13 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     )
     .await
     .context("open buyer pool")?;
-    // The buyer self-signs, so the lane's signer is its own address.
-    let lane = LaneKey {
-        pool_id: opened.state.pool_id,
-        signer: buyer_addr,
-        provider: node.operator_addr(),
-    };
-    {
+    let lane = {
         // Scoped: the CLI subprocess opens its own handle on the same redb file
         // and the store is single-writer.
         let store = RedbBuyerPoolStore::open(client_dir.path()).context("open buyer store")?;
         store.record(&opened.state).context("record pool")?;
-    }
+        cli_lane(&store, &buyer, opened.state.pool_id, node.operator_addr())?
+    };
     // No node-side readiness wait: the node serves the pool as soon as its
     // `getPool` view resolves the on-chain deposit (the `open_pool` receipt is
     // awaited above); a lane only appears in the node's store on the first voucher.

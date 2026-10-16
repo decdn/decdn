@@ -1,15 +1,16 @@
 use super::{
-    AllowanceShortfall, LOW_WATER_DIVISOR, OpenUnconfirmed, PaymentPool, TopUpUnconfirmed,
-    UnconfirmedOpens, approval_floor, approve_decision, ensure_allowance, escrowed_but_untracked,
-    grade_deposit_credit, issue_self_capability, open_pool, pool_accepts_funds, refill_amount,
-    send_open_pool, top_up,
+    AllowanceShortfall, LOW_WATER_DIVISOR, OpenUnconfirmed, OwnedPayer, PaymentPool,
+    TopUpUnconfirmed, UnconfirmedOpens, approval_floor, approve_decision, ensure_allowance,
+    escrowed_but_untracked, grade_deposit_credit, issue_self_capability, open_pool,
+    pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool, top_up,
 };
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
-use decdn_incentive::{DepositOutcome, StoreError};
+use decdn_incentive::{BuyerPoolState, DepositOutcome, MemoryBuyerPoolStore, StoreError};
 use decdn_incentive::{SignedCapability, voucher_domain};
+use std::sync::Arc;
 
 const CHAIN_ID: u64 = 421_614;
 
@@ -86,7 +87,6 @@ async fn open_tracked(
     };
     open_pool(
         &contract,
-        std::sync::Arc::new(PrivateKeySigner::random()),
         deployment,
         Address::repeat_byte(0x44),
         Address::repeat_byte(0x22),
@@ -392,22 +392,84 @@ async fn a_rejected_top_up_submit_is_not_unconfirmed() {
 
 // ---- self-owned capability (#966 / ADR 003 §Capability delegation) ---
 
-/// The capability [`open_pool`] signs must recover to the OWNER — the buyer
-/// signs its own key as the delegate, so `recover_owner` returns the buyer's
-/// address.
+/// A data dir's payer: a random owner key, and the lane key derived from it
+/// and `store`'s salt.
+fn store_payer(store: &MemoryBuyerPoolStore) -> anyhow::Result<OwnedPayer> {
+    OwnedPayer::for_store(Arc::new(PrivateKeySigner::random()), store)
+}
+
+/// The self capability recovers to the OWNER, which the contract checks
+/// against `pool.owner`, and authorizes the LANE key, which signs the
+/// vouchers (#2468).
 #[test]
 fn issue_self_capability_recovers_to_owner() -> anyhow::Result<()> {
-    let owner = PrivateKeySigner::random();
+    let payer = store_payer(&MemoryBuyerPoolStore::new())?;
     let pool_id = B256::repeat_byte(0x11);
     let cap: SignedCapability =
-        issue_self_capability(&owner, pool_id, 1_000_000u64, u64::MAX, &domain())?;
-    assert_eq!(cap.recover_owner(&domain())?, owner.address());
+        issue_self_capability(&payer, pool_id, 1_000_000u64, u64::MAX, &domain())?;
+    assert_eq!(cap.recover_owner(&domain())?, payer.owner().address());
     assert_eq!(
         cap.capability.signer,
-        owner.address(),
-        "the delegated signer is the owner's own key"
+        payer.lane().address(),
+        "the capability authorizes the lane key"
     );
+    assert_ne!(payer.lane().address(), payer.owner().address());
     assert_eq!(cap.capability.pool_id, pool_id);
+    Ok(())
+}
+
+/// A sole payer's one key owns the pool and signs its lanes: the node's
+/// upstream buyer.
+#[test]
+fn sole_payer_signs_with_the_owner_key() -> anyhow::Result<()> {
+    let payer = OwnedPayer::sole(Arc::new(PrivateKeySigner::random()));
+    assert_eq!(payer.lane().address(), payer.owner().address());
+    let cap = issue_self_capability(&payer, B256::ZERO, 1, u64::MAX, &domain())?;
+    assert_eq!(cap.capability.signer, payer.owner().address());
+    Ok(())
+}
+
+/// One store derives one lane key for an owner, on every call: a data dir
+/// resumes its lanes across runs. Another store derives another key, so two
+/// data dirs on one wallet sign on disjoint lanes (#2468).
+#[test]
+fn for_store_is_stable_per_store_and_differs_across_stores() -> anyhow::Result<()> {
+    let owner = Arc::new(PrivateKeySigner::random());
+    let a = MemoryBuyerPoolStore::new();
+    let b = MemoryBuyerPoolStore::new();
+    let lane = |store: &MemoryBuyerPoolStore| -> anyhow::Result<Address> {
+        Ok(OwnedPayer::for_store(Arc::clone(&owner), store)?
+            .lane()
+            .address())
+    };
+    assert_eq!(lane(&a)?, lane(&a)?);
+    assert_ne!(lane(&a)?, lane(&b)?);
+    Ok(())
+}
+
+/// A self-owned lane signs its vouchers with the lane key and carries a
+/// capability for that key.
+#[test]
+fn self_owned_lane_ctx_signs_with_the_lane_key() -> anyhow::Result<()> {
+    let payer = store_payer(&MemoryBuyerPoolStore::new())?;
+    let state = BuyerPoolState::new(
+        B256::repeat_byte(0x11),
+        decdn_incentive::Deployment {
+            chain_id: CHAIN_ID,
+            payment_pool: Address::repeat_byte(0x01),
+        },
+        payer.owner().address(),
+        Address::repeat_byte(0x44),
+        U256::from(1_000u64),
+    );
+    let provider = Address::repeat_byte(0xaa);
+    let ctx = self_owned_lane_ctx(&state, &payer, &domain(), provider, U256::ZERO, U256::ZERO)?;
+    assert_eq!(ctx.client_signer.address(), payer.lane().address());
+    let cap = ctx
+        .capability
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("the lane context carries no capability"))?;
+    assert_eq!(cap.capability.signer, payer.lane().address());
     Ok(())
 }
 
@@ -416,10 +478,10 @@ fn issue_self_capability_recovers_to_owner() -> anyhow::Result<()> {
 /// regeneration (never stored) yields byte-identical signatures.
 #[test]
 fn regenerated_capability_is_deterministic_for_same_params() -> anyhow::Result<()> {
-    let owner = PrivateKeySigner::random();
+    let payer = store_payer(&MemoryBuyerPoolStore::new())?;
     let pool_id = B256::repeat_byte(0x22);
-    let a = issue_self_capability(&owner, pool_id, 5_000u64, 1_900_000_000, &domain())?;
-    let b = issue_self_capability(&owner, pool_id, 5_000u64, 1_900_000_000, &domain())?;
+    let a = issue_self_capability(&payer, pool_id, 5_000u64, 1_900_000_000, &domain())?;
+    let b = issue_self_capability(&payer, pool_id, 5_000u64, 1_900_000_000, &domain())?;
     assert_eq!(
         a.signature, b.signature,
         "regenerated signatures must match"

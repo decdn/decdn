@@ -28,6 +28,15 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **SDK: an owned pool pays through `decdn_client::buyer_pool::OwnedPayer`
+  (#2468).** `OwnedPayer::for_store(owner, store)` pairs the owner key with
+  the lane key the store's salt derives; `OwnedPayer::sole(owner)` signs with
+  the owner key alone. `self_owned_lane_ctx` and `issue_self_capability` take
+  an `&OwnedPayer`, and `lanes::LanePayer::Owned` holds one.
+  `buyer_pool::open_pool` and `opened_from_receipt` no longer take a signer,
+  and `OpenedPool` drops its `ctx` and `capability`: build a lane on the new
+  pool with `self_owned_lane_ctx`. `bundle::Funding::SelfOwned` names its key
+  `owner`. `BuyerPoolStore` gains the required `lane_salt` method.
 - **CLI: `decdn get <decdn: URI>` replaces `decdn fetch` and `decdn bundle
   pull` (#2449).** One `decdn:` URI names what to pull
   (`adr/appendix-bundles.md` § `decdn:` URIs), and `get` routes it:
@@ -1026,6 +1035,25 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: two `decdn get` runs with separate `--data-dir`s on one wallet no
+  longer pay on the same lanes (#2468).** A fresh data dir adopts the
+  wallet's live pool, and both runs signed vouchers with the wallet key, so
+  they shared each `(pool, signer, provider)` lane from separate watermarks.
+  Providers rejected the run that fell behind as `UnderFold`, and the runs
+  spent their resume budget re-fetching bytes elsewhere. Each client data dir
+  now signs with a key derived from the wallet key and a random salt that its
+  `buyer-pools.redb` keeps in the new `buyer_lane_salt_v1` table. The derived
+  key is never stored, and the wallet key signs the capability that authorizes
+  it. Data dirs keep sharing the pool, but each pays on its own lanes, so the
+  `AlreadyOpen` advice to give each concurrent run its own `--data-dir` is
+  safe on the wallet's own pool. Two data dirs on one `--capability` delegate
+  key still sign with that key and share its lanes. A data dir tracks only its
+  own lanes, so its funding reads the pool's deposit and `totalRedeemed` from
+  chain at the run's first lane build and before each funding recovery step:
+  a pool another data dir drained gets a top-up instead of a settle wait that
+  ends the run "funding needed". The daemon still signs its
+  own buyer lanes with the node key. An existing pool row keeps its
+  wallet-signed lanes as spend; new vouchers sign on fresh lanes.
 - **CLI: `decdn gateway` pays for at most 64 MiB to read a bundle manifest
   (#2474).** A `/<hash>/` or `/<hash>/<path>` request reads the manifest
   `<hash>` into memory. That pull ran under the gateway's `--max-blob-mb`

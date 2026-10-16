@@ -202,16 +202,7 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
     let opens = UnconfirmedOpens::default();
     let mut interrupt = Interrupt::watch(opens.clone());
     let opened = async {
-        let opened = open_pool(
-            &contract,
-            Arc::clone(&signer),
-            deployment,
-            token,
-            owner,
-            deposit,
-            Some(&opens),
-        )
-        .await?;
+        let opened = open_pool(&contract, deployment, token, owner, deposit, Some(&opens)).await?;
         // The deposit is escrowed on-chain; a failed local record leaves it
         // untracked (reconcile against the tx).
         store

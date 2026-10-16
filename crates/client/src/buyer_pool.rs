@@ -3,7 +3,8 @@
 //!
 //! The genuinely duplication-prone part — the `openPool` transaction, the
 //! authoritative `PoolOpened`-from-receipt decode, the self-owned capability the
-//! single-user buyer signs for its own key, and the [`BuyerPoolState`] /
+//! owner key signs for its lane key
+//! ([`OwnedPayer`](crate::buyer_pool::OwnedPayer)), and the [`BuyerPoolState`] /
 //! [`PoolContext`] construction for a self-owned lane
 //! ([`self_owned_lane_ctx`](crate::buyer_pool::self_owned_lane_ctx)) —
 //! lives here, with the rule that picks a lane's progress write
@@ -21,6 +22,7 @@ use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
+use decdn_incentive::lane_signer::derive_lane_signer;
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::{
     AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, Capability, Deployment,
@@ -71,25 +73,18 @@ fn approve_decision(current: U256, amount: Option<U256>) -> Option<U256> {
 /// of the next run makes the re-approve idempotent, so no funds are stranded.
 const APPROVE_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
-/// A freshly opened buyer pool: the persistable [`BuyerPoolState`], a
-/// ready-to-sign [`PoolContext`], the self-owned [`SignedCapability`] the buyer
-/// registers on its first redemption, and the open transaction hash. The deposit
-/// is on-chain the moment `openPool` mines, so a caller whose subsequent
+/// A freshly opened buyer pool: the persistable [`BuyerPoolState`] and the open
+/// transaction hash. A lane on it signs under [`self_owned_lane_ctx`]. The
+/// deposit is on-chain the moment `openPool` mines, so a caller whose subsequent
 /// `store.record` fails names that tx for manual reconciliation — an error in the
 /// CLI, an `error!` in the daemon.
 #[derive(Debug)]
 #[non_exhaustive]
 #[must_use = "the open tx is the only handle to an escrowed-but-untracked deposit"]
 pub struct OpenedPool {
-    /// Persist this via `BuyerPoolStore::record`.
+    /// Persist this via `BuyerPoolStore::record`. A lane on the new pool
+    /// signs under [`self_owned_lane_ctx`].
     pub state: BuyerPoolState,
-    /// Use this to sign vouchers for the new pool. The fetch target's provider
-    /// address and the lane priors are pinned per-pull via
-    /// [`PoolContext::with_provider`].
-    pub ctx: PoolContext,
-    /// The owner-signed grant delegating spend on this pool to the buyer's own
-    /// signing key, regenerated per open and never stored.
-    pub capability: SignedCapability,
     /// The `openPool` transaction hash.
     pub tx: TxHash,
 }
@@ -198,53 +193,132 @@ pub fn grade_deposit_credit(
     }
 }
 
+/// The two keys a buyer pays its own pool with.
+///
+/// - The **owner** key owns the pool. It sends `openPool`, `topUp` and the
+///   USDC approval, keys the buyer-store row, and signs the capability that
+///   authorizes the lane key.
+/// - The **lane** key signs the vouchers and the client identity binding, so
+///   every lane of this payer is `(pool, lane key, provider)`.
+///
+/// A client data dir uses [`OwnedPayer::for_store`]: its lane key is derived
+/// from the owner key and the store's salt ([`decdn_incentive::lane_signer`]),
+/// so two data dirs on one wallet sign on disjoint lanes of one pool (ADR 003
+/// § Capability delegation, ADR 012 § Ethereum Key). The node's upstream buyer
+/// uses [`OwnedPayer::sole`]: one process per node data dir, so the node key
+/// signs both roles.
+#[derive(Clone)]
+pub struct OwnedPayer {
+    owner: Arc<PrivateKeySigner>,
+    lane: Arc<PrivateKeySigner>,
+}
+
+impl OwnedPayer {
+    /// The payer for `store`'s data dir: `owner` owns the pool, and the lane
+    /// key derives from `owner` and the store's lane salt.
+    ///
+    /// # Errors
+    ///
+    /// The store cannot read or record its salt, marked [`crate::LocalPullFault`]
+    /// because only a repair of the store clears it, or the derivation gives an
+    /// invalid key.
+    pub fn for_store(owner: Arc<PrivateKeySigner>, store: &dyn BuyerPoolStore) -> Result<Self> {
+        let salt = store.lane_salt().map_err(|e| {
+            anyhow::anyhow!(
+                "read or record this data dir's lane salt in the buyer store: {e}; the store \
+                 needs repair before a fetch on the wallet's own pool can run"
+            )
+            .context(crate::LocalPullFault)
+        })?;
+        let lane = derive_lane_signer(owner.as_ref(), &salt)?;
+        Ok(Self {
+            owner,
+            lane: Arc::new(lane),
+        })
+    }
+
+    /// The payer whose one key both owns the pool and signs its lanes. Use it
+    /// only when one process ever signs for this owner, as the node does. Two
+    /// processes on one sole key share every lane and fold over each other's
+    /// watermarks, so a client data dir uses [`Self::for_store`].
+    #[must_use]
+    pub fn sole(owner: Arc<PrivateKeySigner>) -> Self {
+        Self {
+            lane: Arc::clone(&owner),
+            owner,
+        }
+    }
+
+    /// The key that owns the pool.
+    #[must_use]
+    pub const fn owner(&self) -> &Arc<PrivateKeySigner> {
+        &self.owner
+    }
+
+    /// The key that signs this payer's vouchers.
+    #[must_use]
+    pub const fn lane(&self) -> &Arc<PrivateKeySigner> {
+        &self.lane
+    }
+}
+
+// Addresses only: the keys never reach a log.
+impl std::fmt::Debug for OwnedPayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedPayer")
+            .field("owner", &self.owner.address())
+            .field("lane", &self.lane.address())
+            .finish()
+    }
+}
+
 /// Sign a self-owned [`SignedCapability`]: the pool owner delegates spend on
-/// `pool_id` to its OWN signing key, up to `spending_cap`, until `expiry`. This
-/// is the single-user case — the owner and the voucher signer are the same key —
-/// so the capability is regenerated from the key per connection and never stored.
+/// `pool_id` to the payer's lane key, up to `spending_cap`, until `expiry`.
+/// The lane key derives from the owner key or is the owner key, so the
+/// capability is regenerated per connection and never stored.
 ///
 /// The serving node registers it on the buyer's first on-chain redemption
-/// (`redeemMany`'s `CapabilityReg`), then accepts vouchers from this signer up to
-/// the cap (ADR 003 §Capability delegation).
+/// (`redeemMany`'s `CapabilityReg`), then accepts vouchers from the lane key up
+/// to the cap (ADR 003 §Capability delegation).
 ///
 /// # Errors
 ///
 /// Propagates a signing error from the owner signer.
 #[doc(hidden)]
 pub fn issue_self_capability(
-    owner_signer: &PrivateKeySigner,
+    payer: &OwnedPayer,
     pool_id: B256,
     spending_cap: u64,
     expiry: u64,
     voucher_domain: &Eip712Domain,
 ) -> Result<SignedCapability> {
     Capability {
-        signer: owner_signer.address(),
+        signer: payer.lane().address(),
         spending_cap,
         pool_id,
         expiry,
     }
-    .sign(owner_signer, voucher_domain)
+    .sign(payer.owner().as_ref(), voucher_domain)
     .map_err(|e| anyhow::anyhow!("sign self capability: {e}"))
 }
 
-/// The [`PoolContext`] one lane of a self-owned pool signs under: `signer` pays
-/// `provider` from `state`'s pool, resuming at the lane's prior cumulative
-/// `(prior_bytes, prior_amount)`.
+/// The [`PoolContext`] one lane of a self-owned pool signs under: `payer`'s
+/// lane key pays `provider` from `state`'s pool, resuming at the lane's prior
+/// cumulative `(prior_bytes, prior_amount)`.
 ///
 /// The context carries a freshly issued self-owned capability. The capability
 /// is node-agnostic (valid at every provider this pool pays) and cheap to
 /// regenerate, so a fresh open and a reused pool both present one without a
-/// stored copy. An upstream registers the signer from it on the first on-chain
-/// redemption.
+/// stored copy. An upstream registers the lane key from it on the first
+/// on-chain redemption.
 ///
-/// The cap is [`SELF_CAPABILITY_CAP`], not the deposit. The delegate IS the
-/// owner, so the pool deposit is the real spending bound. A cap at the deposit
-/// would freeze the on-chain cap at the opening deposit (`_registerCapability` is
-/// idempotent past the first redemption) and reject spend past a later `topUp`.
-/// It is not `U256::MAX` either: the pool's `spendingCap` is a `uint64`, so a
-/// wider cap hashes to a word the contract cannot reconstruct and every
-/// redemption on the lane reverts.
+/// The cap is [`SELF_CAPABILITY_CAP`], not the deposit. The lane key is the
+/// owner key or derives from it, so the pool deposit is the real spending
+/// bound. A cap at the deposit would freeze the on-chain cap at the opening
+/// deposit (`_registerCapability` is idempotent past the first redemption) and
+/// reject spend past a later `topUp`. It is not `U256::MAX` either: the pool's
+/// `spendingCap` is a `uint64`, so a wider cap hashes to a word the contract
+/// cannot reconstruct and every redemption on the lane reverts.
 ///
 /// The provider pin is mandatory: a voucher signed with `provider ==
 /// Address::ZERO` fails at signing, so a context left at
@@ -252,24 +326,24 @@ pub fn issue_self_capability(
 ///
 /// # Errors
 ///
-/// Propagates a signing error from `signer` while issuing the capability.
+/// Propagates a signing error from the owner key while issuing the capability.
 pub fn self_owned_lane_ctx(
     state: &BuyerPoolState,
-    signer: &Arc<PrivateKeySigner>,
+    payer: &OwnedPayer,
     voucher_domain: &Eip712Domain,
     provider: Address,
     prior_bytes: U256,
     prior_amount: U256,
 ) -> Result<PoolContext> {
     let capability = issue_self_capability(
-        signer.as_ref(),
+        payer,
         state.pool_id,
         SELF_CAPABILITY_CAP,
         SELF_CAPABILITY_EXPIRY,
         voucher_domain,
     )?;
     Ok(
-        PoolContext::for_pool(state, Arc::clone(signer), voucher_domain.clone())
+        PoolContext::for_pool(state, Arc::clone(payer.lane()), voucher_domain.clone())
             .with_provider(provider, prior_bytes, prior_amount)
             .with_capability(capability),
     )
@@ -462,9 +536,8 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 ///
 /// `openPool` names no provider and no signer — a pool is bound to no payee at
 /// open, and fans out to many `(signer, provider)` lanes off-chain (ADR 003).
-/// The returned [`OpenedPool`] carries a self-owned capability the buyer signs
-/// for its own key (`spending_cap == credited deposit`, no expiry), which the
-/// serving node registers on the first redemption.
+/// Build a lane on the new pool with [`self_owned_lane_ctx`], which signs the
+/// self-owned capability the serving node registers on the first redemption.
 ///
 /// Decoding from the receipt (rather than a follow-up `getPool`) is atomic with
 /// the open: a mined tx guarantees the event, so the caller can always persist —
@@ -527,7 +600,6 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// [`top_up`].
 pub async fn open_pool<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
-    signer: Arc<PrivateKeySigner>,
     deployment: Deployment,
     token: Address,
     owner: Address,
@@ -602,7 +674,7 @@ pub async fn open_pool<P: Provider + Clone>(
             .context(PoolOpenFailureReason::RpcError)
     })?;
     opens.remove(unconfirmed);
-    opened_from_receipt(&receipt, tx, signer, deployment, token, owner, deposit)
+    opened_from_receipt(&receipt, tx, deployment, token, owner, deposit)
 }
 
 /// Build the [`OpenedPool`] an `openPool` tx bought, from its mined `receipt`.
@@ -615,19 +687,17 @@ pub async fn open_pool<P: Provider + Clone>(
 ///
 /// # Errors
 ///
-/// The tx reverted ([`PoolOpenFailureReason::ContractRevert`]), the receipt
+/// The tx reverted ([`PoolOpenFailureReason::ContractRevert`]), or the receipt
 /// holds no `PoolOpened` event for `owner` (the deposit is escrowed but
-/// untracked; logged here), or the self capability could not be signed.
+/// untracked; logged here).
 pub fn opened_from_receipt(
     receipt: &alloy::rpc::types::TransactionReceipt,
     tx: TxHash,
-    signer: Arc<PrivateKeySigner>,
     deployment: Deployment,
     token: Address,
     owner: Address,
     deposit: U256,
 ) -> Result<OpenedPool> {
-    let voucher_domain = deployment.voucher_domain();
     if !receipt.status() {
         // A mined revert: the reason is not recoverable from the receipt (no
         // trace), so it folds into `ContractRevert`.
@@ -668,20 +738,6 @@ pub fn opened_from_receipt(
     // over-state a pool against the shared USDC balance.
     let credited = opened.deposit;
     let state = BuyerPoolState::new(pool_id, deployment, owner, token, credited);
-    // A self-owned capability delegates spend to the owner's OWN key, so the cap
-    // bounds nothing a delegated capability would: the pool deposit is already
-    // the real spending bound (redemption pays min(desired, cap-spent,
-    // remaining), and `remaining` is the pool balance). Leave it at the widest
-    // cap the pool's `uint64` field can hold, so a later `topUp` beyond the
-    // opening deposit is redeemable too.
-    let capability = issue_self_capability(
-        signer.as_ref(),
-        pool_id,
-        SELF_CAPABILITY_CAP,
-        SELF_CAPABILITY_EXPIRY,
-        &voucher_domain,
-    )?;
-    let ctx = PoolContext::for_pool(&state, signer, voucher_domain);
     info!(
         %owner,
         %pool_id,
@@ -689,18 +745,14 @@ pub fn opened_from_receipt(
         credited = %credited,
         "opened buyer payment pool"
     );
-    Ok(OpenedPool {
-        state,
-        ctx,
-        capability,
-        tx,
-    })
+    Ok(OpenedPool { state, tx })
 }
 
-/// Expiry stamped on the self-owned capability [`open_pool`] signs. The
-/// single-user buyer owns both keys, so there is no delegation to time-box —
-/// `u64::MAX` means "never expires", and the pool's own grace-window close is the
-/// only lifecycle gate (there is no pool expiry, ADR 003).
+/// Expiry stamped on the self-owned capability [`self_owned_lane_ctx`] signs.
+/// The buyer holds the owner key, and the lane key is that key or derives from
+/// it, so there is no delegation to time-box: `u64::MAX` means "never expires",
+/// and the pool's own grace-window close is the only lifecycle gate (there is
+/// no pool expiry, ADR 003).
 const SELF_CAPABILITY_EXPIRY: u64 = u64::MAX;
 
 /// Cap stamped on a self-owned capability — the widest value the pool's

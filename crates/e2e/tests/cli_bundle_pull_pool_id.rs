@@ -47,6 +47,7 @@ use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity;
 use decdn_incentive::lane::LaneKey;
+use decdn_incentive::lane_signer::derive_lane_signer;
 use decdn_protocol::client::CHUNK_BYTES;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
@@ -176,6 +177,8 @@ async fn run() -> anyhow::Result<()> {
     // The CLI opened exactly one pool for this owner, recorded it in the client
     // store, and paid the bundle from it: the pool's `(signer, provider)` lane
     // watermark advanced past zero for the one provider both entries share.
+    // The lane's signer is the key derived from the wallet and this store's
+    // salt, not the wallet key itself (#2468).
     let store = RedbBuyerPoolStore::open(client_dir.path()).context("reopen client store")?;
     let state = store
         .get_by_owner(buyer_addr)
@@ -186,11 +189,20 @@ async fn run() -> anyhow::Result<()> {
         "recorded pool owner {} != buyer {buyer_addr}",
         state.owner
     );
+    let lane_signer = derive_lane_signer(&buyer, &store.lane_salt()?)?.address();
     let lane = LaneKey {
         pool_id: state.pool_id,
-        signer: buyer_addr,
+        signer: lane_signer,
         provider: provider_addr,
     };
+    let wallet_lane = LaneKey {
+        signer: buyer_addr,
+        ..lane
+    };
+    anyhow::ensure!(
+        state.lane_progress(wallet_lane).is_none(),
+        "the CLI recorded a lane signed by the wallet key"
+    );
     let progress = state
         .lane_progress(lane)
         .ok_or_else(|| anyhow::anyhow!("no lane progress recorded for provider {provider_addr}"))?;

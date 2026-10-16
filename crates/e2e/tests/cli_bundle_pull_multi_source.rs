@@ -57,6 +57,7 @@ use decdn_e2e::poll;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity;
+use decdn_incentive::lane_signer::derive_lane_signer;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const KEYSTORE_PASSWORD: &str = "bundle-multi-source-e2e-password";
@@ -233,10 +234,15 @@ async fn run() -> anyhow::Result<()> {
 
     // (2) was the retry-loop condition (see run_pull_until_large_blob_splits).
 
-    // (3) BOTH nodes' admin lanes report a non-zero settled claim funded by
-    // the client.
-    let paid_a = settled_outstanding(&holder_a, buyer_addr).await?;
-    let paid_b = settled_outstanding(&holder_b, buyer_addr).await?;
+    // (3) BOTH nodes' admin lanes report a non-zero settled claim on the
+    // client's lane. The lanes are signed by the key this data dir derives from the wallet
+    // and its store's salt, not by the wallet key itself (#2468).
+    let lane_signer = {
+        let store = RedbBuyerPoolStore::open(client_dir.path()).context("open buyer store")?;
+        derive_lane_signer(&buyer, &store.lane_salt()?)?.address()
+    };
+    let paid_a = settled_outstanding(&holder_a, lane_signer).await?;
+    let paid_b = settled_outstanding(&holder_b, lane_signer).await?;
     anyhow::ensure!(
         paid_a > 0 && paid_b > 0,
         "both holders must report a non-zero settled claim from the client (A={paid_a}, \
@@ -278,26 +284,27 @@ fn whole_blob_wire_bytes(total: u64) -> u64 {
     }
 }
 
-/// Poll a node's admin `lanes()` for the lane funded by `payer` (the client's
-/// address) until it reports a non-zero settled claim, or the budget expires.
+/// Poll a node's admin `lanes()` for the lane `signer` signs vouchers on (the
+/// client data dir's lane key) until it reports a non-zero settled claim, or
+/// the budget expires.
 /// Mirrors `cli_fetch_multi_source`'s `settled_outstanding`.
 async fn settled_outstanding(
     node: &NodeFixture,
-    payer: alloy::primitives::Address,
+    signer: alloy::primitives::Address,
 ) -> anyhow::Result<u64> {
     let admin = node.admin_client()?;
-    let payer_hex = payer.to_string();
+    let signer_hex = signer.to_string();
     let snapshot = poll(Duration::from_secs(30), || async {
         let resp = admin.lanes().await.context("admin lanes")?;
         Ok(resp
             .lanes
             .into_iter()
-            .find(|s| s.counterparty.eq_ignore_ascii_case(&payer_hex))
+            .find(|s| s.voucher_signer.eq_ignore_ascii_case(&signer_hex))
             .filter(|s| s.outstanding_micro_usdc > 0))
     })
     .await?
     .with_context(|| {
-        format!("node never reported a non-zero settled claim funded by {payer_hex}")
+        format!("node never reported a non-zero settled claim signed by {signer_hex}")
     })?;
     Ok(snapshot.outstanding_micro_usdc)
 }

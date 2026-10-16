@@ -165,8 +165,11 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "ID")]
     pub chain_id: Option<u64>,
 
-    /// Path to the buyer's Ethereum keystore that signs vouchers and the
-    /// `openPool` tx. Overrides `blockchain.eth_keystore`; when unset defaults
+    /// Path to the buyer's Ethereum keystore. On the buyer's own pool this key
+    /// owns the pool and signs its transactions, and the vouchers sign under a
+    /// key derived from it and the data dir, so each data dir pays on its own
+    /// lanes. Under `--capability` it is the delegate key, which signs the
+    /// vouchers itself. Overrides `blockchain.eth_keystore`; when unset defaults
     /// to `keystore.json` under the (client-scoped) data dir. Password from
     /// `$DECDN_KEYSTORE_PASSWORD`, else `--keystore-password-file`, else a TTY
     /// prompt.

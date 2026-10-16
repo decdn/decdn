@@ -18,7 +18,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_client::buyer_pool::open_pool;
+use decdn_client::buyer_pool::{OwnedPayer, open_pool, self_owned_lane_ctx};
 use decdn_client::{
     BlobTooLarge, HashMismatch, PoolContext, PullDeadlines, UpstreamRefused,
     UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch_tracked,
@@ -615,13 +615,12 @@ impl ClientFixture {
         let contract = PaymentPool::new(self.payment_pool, provider);
         let deposit = U256::from(DEPOSIT_MICRO_USDC);
 
-        // The shared open kernel escrows the deposit, decodes the authoritative
-        // `poolId` from the `PoolOpened` receipt, and signs the self-owned
-        // capability the node registers on the first redemption.
+        // The shared open kernel escrows the deposit and decodes the
+        // authoritative `poolId` from the `PoolOpened` receipt.
+        let deployment = self.deployment(chain);
         let opened = open_pool(
             &contract,
-            Arc::clone(&self.signer),
-            self.deployment(chain),
+            deployment,
             chain.usdc(),
             self.signer.address(),
             deposit,
@@ -630,21 +629,27 @@ impl ClientFixture {
         .await
         .context("open buyer pool")?;
 
-        // Pin the delivering provider (voucher lane target), attach the client
-        // identity binding (proves pool ownership for reactive origin fill), and
-        // carry the owner capability so the node can register this signer on its
-        // first on-chain redemption.
+        // Pin the delivering provider (voucher lane target), carry the owner
+        // capability so the node can register this signer on its first
+        // on-chain redemption, and attach the client identity binding (ties the
+        // request to the lane's signer for reactive origin fill). The fixture's
+        // one key owns the pool and signs its lanes.
         let bind_domain = bind_node_id_domain(chain.chain_id(), chain.addrs().capacity_bond);
         let own_node_id = B256::from(*self.endpoint.id().as_bytes());
-        let ctx = opened
-            .ctx
-            .with_provider(node.operator_addr(), U256::ZERO, U256::ZERO)
-            .with_client_binding(sign_client_binding(
-                &self.signer,
-                own_node_id,
-                &bind_domain,
-            )?)
-            .with_capability(opened.capability);
+        let ctx = self_owned_lane_ctx(
+            &opened.state,
+            &OwnedPayer::sole(Arc::clone(&self.signer)),
+            &deployment.voucher_domain(),
+            node.operator_addr(),
+            U256::ZERO,
+            U256::ZERO,
+        )
+        .context("sign self capability")?
+        .with_client_binding(sign_client_binding(
+            &self.signer,
+            own_node_id,
+            &bind_domain,
+        )?);
 
         let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
         // Pinned into the session at open time, at the identity the daemon is
@@ -860,11 +865,12 @@ impl ClientFixture {
             chain.usdc(),
             U256::from(DEPOSIT_MICRO_USDC),
         );
-        // Uncapped, matching production self-issue: the delegate IS the pool
-        // owner, so the pool deposit — not the capability cap — is the real
-        // spending bound.
+        // Uncapped, matching production self-issue. The fixture's one key owns
+        // the pool and signs its lanes (`OwnedPayer::sole`, unlike the CLI's
+        // derived lane key), so the pool deposit — not the capability cap — is
+        // the real spending bound.
         let capability = decdn_client::buyer_pool::issue_self_capability(
-            self.signer.as_ref(),
+            &OwnedPayer::sole(Arc::clone(&self.signer)),
             pool_id,
             decdn_client::buyer_pool::SELF_CAPABILITY_CAP,
             u64::MAX,

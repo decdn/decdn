@@ -31,8 +31,10 @@
 //! node that holds the blob. The `download` and `stream` examples in this
 //! crate's `examples/` directory run the whole sequence:
 //!
-//! 1. **Load the buyer key.** Vouchers and pool transactions are signed with a
-//!    [`PrivateKeySigner`].
+//! 1. **Load the buyer key** as a [`PrivateKeySigner`]. It owns the pool and
+//!    signs the pool transactions. Open the buyer store, and derive the key
+//!    this data dir signs vouchers with ([`buyer_pool::OwnedPayer::for_store`]):
+//!    two data dirs on one wallet then pay on disjoint lanes of one pool.
 //! 2. **Reuse or open a pool.** Read the pool the buyer store already records
 //!    ([`decdn_incentive::BuyerPoolStore::get_by_owner`]). If there is none,
 //!    approve the deposit ([`buyer_pool::ensure_allowance`]), open a pool
@@ -50,7 +52,8 @@
 //!    bytes land.
 //! 5. **Build one lane per holder.** Pin a [`PoolContext`] to the holder's
 //!    provider address with [`buyer_pool::self_owned_lane_ctx`], resuming at
-//!    what the lane has already paid, and bind it to your endpoint
+//!    what the `(pool, lane key, provider)` lane has already paid, and bind it
+//!    to your endpoint
 //!    ([`PoolContext::bind_endpoint`]). A node that misses the blob in its
 //!    cache serves an unbound lane nothing. Create its ledger with
 //!    [`PoolContext::new_ledger`], and wrap both in a [`PeerSource`] inside a
@@ -388,8 +391,10 @@ use sink::{PullReader, StashedFault};
 ///
 /// A voucher is scoped to a `(pool_id, signer, provider)` lane. `pool_id` is the
 /// on-chain deposit, the signer is `client_signer.address()` (the capability key
-/// the pool owner delegated spend to — the owner's own key in the single-user
-/// case), and `provider` is the delivering node this stream pays.
+/// the pool owner delegated spend to — by default a key derived for the client
+/// data dir ([`buyer_pool::OwnedPayer::for_store`]), or the owner key itself for
+/// [`buyer_pool::OwnedPayer::sole`]), and `provider` is the delivering node this
+/// stream pays.
 ///
 /// The `prior_*` fields capture the lane's cumulative state from earlier streams
 /// so a **reused** lane resumes correctly: vouchers are cumulative across the
@@ -423,14 +428,15 @@ pub struct PoolContext {
     /// Optional ADR 005 client identity binding (address + `BindNodeId`
     /// signature over the requester's own iroh `NodeId`, see
     /// [`sign_client_binding`]). Attached to every `cdn/client/v1` request's
-    /// `ext` so the serving node can recover the buyer address, confirm it owns
-    /// the pool (`pull_authorized`), and reactively populate from its configured
-    /// origin (#1115). `None` ⇒ no binding is sent (an unconfigured
+    /// `ext` so the serving node can recover the signing address, tie the
+    /// request to the `(pool, signer, provider)` lane its vouchers pay on
+    /// (`pull_authorized`), and reactively populate from its configured origin
+    /// (#1115). `None` ⇒ no binding is sent (an unconfigured
     /// `capacity_bond` on the client, or an on-chain/registered requester).
     pub client_binding: Option<ClientBinding>,
     /// Optional pool owner capability delegating spend to `client_signer`
-    /// (ADR 003 §Capability delegation, `issue_self_capability` /
-    /// `buyer_pool::open_pool`). Attached to every `cdn/client/v1` request's
+    /// (ADR 003 §Capability delegation, `buyer_pool::self_owned_lane_ctx` /
+    /// `issue_self_capability`). Attached to every `cdn/client/v1` request's
     /// `ext` alongside `client_binding` so the serving node can register the
     /// signer on that signer's first on-chain redemption. Node-agnostic — the
     /// same `SignedCapability` is valid at every node this context streams
@@ -525,13 +531,13 @@ impl PoolContext {
     }
 
     /// Attach an ADR 005 client identity binding so this context's
-    /// `cdn/client/v1` requests prove pool ownership to the serving node,
-    /// enabling reactive cache-miss origin pull-through (#1115).
-    /// [`Self::bind_endpoint`] signs and attaches one in a single call. A
-    /// hand-built `ClientBinding` whose
-    /// `ethereum_address` and signature don't correspond (or that doesn't own the
-    /// pool) is rejected by the serving node, so this only ever hurts the caller
-    /// itself.
+    /// `cdn/client/v1` requests tie the requester to the lane its vouchers pay
+    /// on, enabling reactive cache-miss origin pull-through (#1115).
+    /// [`Self::bind_endpoint`] signs and attaches one with `client_signer` in a
+    /// single call. A hand-built `ClientBinding` whose `ethereum_address` and
+    /// signature don't correspond, or that names a signer other than
+    /// `client_signer`, earns no lane at the serving node, so this only ever
+    /// hurts the caller itself.
     #[must_use]
     pub fn with_client_binding(mut self, binding: ClientBinding) -> Self {
         self.client_binding = Some(binding);
@@ -560,7 +566,7 @@ impl PoolContext {
     /// requests carry it to the serving node at session start, letting the
     /// node register `client_signer` on that signer's first on-chain
     /// redemption (ADR 003 §Capability delegation). Pass the
-    /// `SignedCapability` produced by `buyer_pool::open_pool` /
+    /// `SignedCapability` produced by `buyer_pool::self_owned_lane_ctx` /
     /// `issue_self_capability`; a capability whose `signer` doesn't match
     /// `client_signer` or that fails owner-signature recovery only ever hurts
     /// the caller itself, exactly like [`Self::with_client_binding`].
@@ -573,7 +579,8 @@ impl PoolContext {
 
 /// Sign an ADR 005 ephemeral client identity binding: an EIP-712
 /// `BindNodeId(nodeId, nonce = 0)` attestation over the requester's OWN iroh
-/// `NodeId`, signed with the buyer key. The serving node recovers the signer via
+/// `NodeId`, signed with the lane's voucher signer key
+/// ([`PoolContext::client_signer`]). The serving node recovers the signer via
 /// `ecrecover` (`verify_binding`) and checks it signs for a known lane on the named pool before
 /// honoring a cache-miss origin pull (`pull_authorized`, ADR 003 §Off-Chain
 /// Ephemeral Binding). Used by the CLI client fetch (#1115) and by node-to-node

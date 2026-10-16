@@ -207,8 +207,8 @@ impl BuyerStoreOwner {
     /// from `~/.decdn/node.toml` resolves there with nothing on the command
     /// line, and the keystore defaults to the same dir — so the pool is opened
     /// under the node's OWN operator address. The daemon then reports it as a
-    /// stranded deposit, and on a store reset can adopt it, which puts two
-    /// independent watermarks on one lane (#2082).
+    /// stranded deposit, and on a store reset can adopt it and spend the same
+    /// deposit beside the client (#2082).
     ///
     /// # Errors
     ///
@@ -237,8 +237,8 @@ impl BuyerStoreOwner {
             "refusing to {verb}: {} came from {named}, and it belongs to a decdn-node daemon (it \
              holds {marker}). Buying from here opens a client pool ({}) under the node's own \
              operator keystore, beside the daemon's own store ({}) — the daemon would report \
-             that deposit as stranded, and could adopt it and sign a second voucher series on \
-             one lane. Pass --data-dir <client dir> to buy as a separate client, or pass \
+             that deposit as stranded, and could adopt it and spend from it beside you. Pass \
+             --data-dir <client dir> to buy as a separate client, or pass \
              --data-dir {} to say you really mean the node's dir.",
             data_dir.display(),
             client_buyer_db(data_dir).display(),
