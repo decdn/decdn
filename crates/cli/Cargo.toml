@@ -82,9 +82,6 @@ fastcdc = { workspace = true }
 # a piped/redirected fetch stays silent. Small dep tree (console, unicode-width),
 # unrelated to the iroh-blobs/AWS-free invariant above.
 indicatif = { workspace = true }
-# The stderr terminal the progress bars draw to through `logging`'s in-place
-# draw target. Already in the tree under `indicatif`.
-console = { workspace = true }
 # A bundle `decdn get` mirrors its total bar into the terminal's tab-bar progress
 # (OSC 9;4) where the terminal supports it. No dependencies of its own.
 anstyle-progress = { workspace = true }

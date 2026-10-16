@@ -138,9 +138,6 @@ clap = { version = "4", features = ["derive", "env"] }
 # `decdn get` delivery progress bar (#1118). TTY-aware by default (drawn to
 # stderr, hidden when piped/CI), so it never pollutes scripted output.
 indicatif = "0.18"
-# The terminal handle behind the progress bars' in-place draw target; the
-# `console` major that `indicatif` 0.18 itself uses.
-console = "0.16"
 # The terminal's own progress indicator (OSC 9;4: tab bar / dock badge) for
 # a bundle `decdn get`, with the per-terminal support detection Cargo uses.
 anstyle-progress = "0.1"
