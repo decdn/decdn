@@ -156,7 +156,10 @@ async fn provider_lanes_from(
     poll(Duration::from_secs(30), || async {
         let resp = admin.lanes().await.context("admin lanes")?;
         let any_paid = resp.lanes.iter().any(|s| {
-            s.counterparty.eq_ignore_ascii_case(&payer_hex) && s.outstanding_micro_usdc > 0
+            s.counterparty
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&payer_hex))
+                && s.outstanding_micro_usdc > 0
         });
         Ok(any_paid.then_some(()))
     })
@@ -176,7 +179,10 @@ async fn provider_lanes_from(
             .lanes
             .into_iter()
             .filter(|s| {
-                s.counterparty.eq_ignore_ascii_case(&payer_hex) && s.outstanding_micro_usdc > 0
+                s.counterparty
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&payer_hex))
+                    && s.outstanding_micro_usdc > 0
             })
             .map(|s| s.outstanding_micro_usdc)
             .collect();

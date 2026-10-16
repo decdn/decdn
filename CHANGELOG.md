@@ -28,6 +28,20 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Admin/CLI: a lane's `counterparty` is its pool owner, not its voucher
+  signer (#2484).** `admin_v1_lanes` filled `LaneSnapshot.counterparty` with
+  the lane signer, so every `decdn get` lane (signed by a key derived for its
+  data dir) and every `--capability` lane showed that key instead of the
+  wallet that funds the pool. The node now reads the owner (`getPool.owner`)
+  from its event-fed pool view, with no chain call. **Wire-breaking:**
+  `counterparty` is `Option<String>`, `null` when the node's pool view holds no
+  entry for the pool (a pool opened before the settlement watcher's anchor
+  with no request admitted on it since the node started, or a reclaimed
+  pool). It never falls back to the signer.
+  `decdn node lanes` prints `unknown` in that case, and `--json` prints
+  `null`. `voucher_signer` is unchanged. To find a client by its funding
+  wallet, match on `counterparty`; to find a lane by its signing key, match
+  on `voucher_signer`.
 - **SDK: an owned pool pays through `decdn_client::buyer_pool::OwnedPayer`
   (#2468).** `OwnedPayer::for_store(owner, store)` pairs the owner key with
   the lane key the store's salt derives; `OwnedPayer::sole(owner)` signs with
@@ -3460,12 +3474,12 @@ since project inception and will roll into the first tagged release.
     and on mismatch discards the partial and fails rather than writing a wrong
     output file. A fetch that started at byte 0 skips this — every byte was
     verified on the wire as it landed.
-- **`decdn node channels` gained a `SIGNER` column.** It reports the channel's
-  pinned `voucherSigner` — the key whose signature is required on every voucher —
-  next to `COUNTERPARTY` (the funder, and the address the ADR 011 compliance
-  gates check). For every channel opened today the two are equal, because a zero
-  `voucherSigner` argument to `openChannel` resolves on-chain to `msg.sender`;
-  they diverge only when a funder pins a delegate. **Output-breaking for scripts:**
+- **`decdn node lanes` has a `SIGNER` column.** It reports the lane's voucher
+  signer — the key whose signature is required on every voucher — next to
+  `COUNTERPARTY` (the pool owner, and the address the ADR 011 compliance gates
+  check). The two are equal only when the owner signs its own vouchers, as a
+  node buyer does: a `decdn get` lane signs with a key derived for its data
+  dir, and a `--capability` client signs with its delegate. **Output-breaking for scripts:**
   the table is ~15 characters wider and column positions after `COUNTERPARTY`
   have shifted, so positional parsers (`awk '{print $N}'`, fixed-offset `cut`)
   need updating.

@@ -156,7 +156,11 @@ async fn server_upstream_pool_id(
         Ok(resp
             .lanes
             .into_iter()
-            .find(|s| s.counterparty.eq_ignore_ascii_case(&payer_hex))
+            .find(|s| {
+                s.counterparty
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&payer_hex))
+            })
             .map(|s| s.pool_id))
     })
     .await?

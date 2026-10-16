@@ -241,8 +241,8 @@ async fn run() -> anyhow::Result<()> {
         let store = RedbBuyerPoolStore::open(client_dir.path()).context("open buyer store")?;
         derive_lane_signer(&buyer, &store.lane_salt()?)?.address()
     };
-    let paid_a = settled_outstanding(&holder_a, lane_signer).await?;
-    let paid_b = settled_outstanding(&holder_b, lane_signer).await?;
+    let paid_a = settled_outstanding(&holder_a, lane_signer, buyer_addr).await?;
+    let paid_b = settled_outstanding(&holder_b, lane_signer, buyer_addr).await?;
     anyhow::ensure!(
         paid_a > 0 && paid_b > 0,
         "both holders must report a non-zero settled claim from the client (A={paid_a}, \
@@ -288,9 +288,13 @@ fn whole_blob_wire_bytes(total: u64) -> u64 {
 /// client data dir's lane key) until it reports a non-zero settled claim, or
 /// the budget expires.
 /// Mirrors `cli_fetch_multi_source`'s `settled_outstanding`.
+///
+/// The lane signer is a derived key, not the wallet, so the node must still
+/// name the wallet that owns the pool as the lane's counterparty (#2484).
 async fn settled_outstanding(
     node: &NodeFixture,
     signer: alloy::primitives::Address,
+    owner: alloy::primitives::Address,
 ) -> anyhow::Result<u64> {
     let admin = node.admin_client()?;
     let signer_hex = signer.to_string();
@@ -306,6 +310,12 @@ async fn settled_outstanding(
     .with_context(|| {
         format!("node never reported a non-zero settled claim signed by {signer_hex}")
     })?;
+    anyhow::ensure!(
+        snapshot.counterparty == Some(owner.to_string()),
+        "the lane signed by {signer_hex} must report its pool owner {owner} as the \
+         counterparty, got {:?}",
+        snapshot.counterparty
+    );
     Ok(snapshot.outstanding_micro_usdc)
 }
 

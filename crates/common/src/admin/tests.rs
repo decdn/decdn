@@ -120,7 +120,7 @@ fn lanes_response_round_trips() {
         lanes: vec![
             LaneSnapshot {
                 pool_id: "0xabcd".to_string(),
-                counterparty: "0x00aa".to_string(),
+                counterparty: Some("0x00aa".to_string()),
                 voucher_signer: "0x00cc".to_string(),
                 last_nonce: 7,
                 outstanding_micro_usdc: 2_500_000,
@@ -130,7 +130,8 @@ fn lanes_response_round_trips() {
             },
             LaneSnapshot {
                 pool_id: "0xbeef".to_string(),
-                counterparty: "0x00bb".to_string(),
+                // The node has not seen this pool, so the owner is unknown.
+                counterparty: None,
                 voucher_signer: "0x00bb".to_string(),
                 last_nonce: 0,
                 outstanding_micro_usdc: 0,
@@ -146,7 +147,7 @@ fn lanes_response_round_trips() {
     assert_eq!(back.lanes.len(), 2);
     let first = back.lanes.first().expect("first lane");
     assert_eq!(first.pool_id, "0xabcd");
-    assert_eq!(first.counterparty, "0x00aa");
+    assert_eq!(first.counterparty.as_deref(), Some("0x00aa"));
     assert_eq!(
         first.voucher_signer, "0x00cc",
         "a delegated signer must survive the round trip distinct from the funder"
@@ -158,5 +159,9 @@ fn lanes_response_round_trips() {
     assert!(first.settlement_eligible);
     let second = back.lanes.get(1).expect("second lane");
     assert_eq!(second.seconds_since_last_voucher, None);
+    assert_eq!(
+        second.counterparty, None,
+        "an unknown owner must survive the round trip as None"
+    );
     assert!(!second.settlement_eligible);
 }

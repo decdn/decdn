@@ -110,7 +110,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- Cross-layer: the daemon reports a lane on *the* pool we paid through —
     // not merely that some lane exists. Match on the exact on-chain poolId, then
-    // check the signer (reported as the snapshot counterparty) it names. The poll
+    // check the pool owner and voucher signer it names. The poll
     // closure propagates the real admin error rather than swallowing it into a
     // generic timeout. The admin surface keys each snapshot by the lane's pool id.
     let expected_pid = outcome.pool_id;
@@ -124,10 +124,17 @@ async fn run() -> anyhow::Result<()> {
     .with_context(|| {
         format!("daemon admin RPC never reported a lane on the paid pool {expected_pid}")
     })?;
+    // The fixture client owns its pool and signs its own vouchers, so it is
+    // both the pool owner the node reports and the lane's voucher signer.
     assert_eq!(
         snapshot.counterparty,
+        Some(client.address().to_string()),
+        "reported counterparty must be the pool owner"
+    );
+    assert_eq!(
+        snapshot.voucher_signer,
         client.address().to_string(),
-        "reported lane signer must be the buyer"
+        "reported voucher signer must be the buyer"
     );
 
     // The pool deposit lives on-chain, not per-lane in the node's store, so the

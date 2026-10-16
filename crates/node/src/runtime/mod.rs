@@ -833,6 +833,10 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// the same live policy.
     shed_controller: Arc<crate::load_shed::LoadShedController>,
     payment_service: PoolSettlementService<P>,
+    /// A read clone of the event-fed pool view the settlement watcher writes,
+    /// carried to `AdminState` so `admin_v1_lanes` can name each lane's pool
+    /// owner without a chain read.
+    pool_projection: crate::pool_view::PoolProjection,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     /// Bring-up node-id binding self-check (#1034), carried through to
     /// `AdminState` so `admin_v1_health` can report it. A plain value, not a
@@ -1445,7 +1449,7 @@ async fn build_chain_and_handlers(
         Duration::from_secs(cfg.blockchain.redeem_interval_secs),
         Arc::clone(&infra.node_metrics),
         &boot,
-        pool_view,
+        pool_view.clone(),
         redeem_tx,
         redeem_rx,
     )
@@ -1573,6 +1577,7 @@ async fn build_chain_and_handlers(
         client_handler,
         shed_controller,
         payment_service,
+        pool_projection: pool_view,
         blacklist_ready_rx,
         binding_report,
         serve_economics,
@@ -2276,11 +2281,13 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // Lane introspection for `admin_v1_lanes` (issue #749). Shares the
         // same persistent lane-state store the client handler and settlement
         // service use, plus a read handle over the handler's live lane
-        // registry for the last-voucher clock (issue #1733) — read-only here.
+        // registry for the last-voucher clock (issue #1733) and the pool view
+        // that names each lane's pool owner — read-only here.
         .with_lanes(admin::LaneStatusHandles {
             pool_store: Arc::clone(&infra.pool_state_store),
             lane_activity: ch.client_handler.lane_activity_clock(),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
+            pool_view: ch.pool_projection.clone(),
         })
         // Buyer-pool introspection for `admin_v1_pools` (#2078). The SAME store
         // handle `BuyerPoolService` records into, so the admin surface reports

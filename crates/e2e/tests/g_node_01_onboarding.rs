@@ -302,10 +302,17 @@ async fn run_journey() -> anyhow::Result<()> {
     })
     .await?
     .with_context(|| format!("daemon never reported a lane on the paid pool {expected_pid}"))?;
+    // The fixture client owns its pool and signs its own vouchers, so it is
+    // both the pool owner the node reports and the lane's voucher signer.
     assert_eq!(
         snapshot.counterparty,
+        Some(client.address().to_string()),
+        "reported counterparty must be the pool owner"
+    );
+    assert_eq!(
+        snapshot.voucher_signer,
         client.address().to_string(),
-        "reported lane signer must be the buyer"
+        "reported voucher signer must be the buyer"
     );
     let pool =
         e2e_assert::read_pool(chain.admin(), chain.addrs().payment_pool, expected_pid).await?;

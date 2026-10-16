@@ -386,19 +386,27 @@ pub struct LaneSnapshot {
     /// `0x`-prefixed — same 32-byte encoding `alloy`'s `B256` `Display`
     /// produces. Shared by every lane drawing from the same pool.
     pub pool_id: String,
-    /// The pool owner's Ethereum address — the deposit owner and refund
-    /// destination, and the subject of the ADR-011 blacklist gates.
+    /// The pool owner's Ethereum address (`getPool.owner`) — the deposit owner
+    /// and refund destination, and the subject of the ADR-011 blacklist gates.
     /// Rendered as an EIP-55 mixed-case checksummed hex string
     /// (`0x`-prefixed) — `alloy`'s `Address` `Display`. Note this differs
     /// from an iroh node id, which is plain lowercase hex of an Ed25519
     /// public key (a different identity type, not an EVM address). It is
     /// *not* necessarily the voucher signer — see [`Self::voucher_signer`].
-    pub counterparty: String,
+    ///
+    /// Read from the node's event-fed pool view, with no chain call. `None`
+    /// when that view holds no entry for the pool: a pool opened before the
+    /// settlement watcher's anchor with no request admitted on it since the
+    /// node started, or a pool its owner has reclaimed. The node never
+    /// reports the signer in its place.
+    pub counterparty: Option<String>,
     /// The capability signer authorizing vouchers on this lane
     /// (`LaneKey::signer`): the EIP-712 recovery target for every voucher,
-    /// in the same EIP-55 rendering as [`Self::counterparty`]. Equal to
-    /// `counterparty` for the ordinary self-signing case, and a distinct
-    /// delegate key when the pool owner delegated signing.
+    /// in the same EIP-55 rendering as [`Self::counterparty`]. Equal to the
+    /// pool owner only when the owner signs its own vouchers, as a node buyer
+    /// does. A `decdn get` signs with a lane key derived for its data dir,
+    /// and a `--capability` client signs with the delegate key, so both
+    /// differ from the owner.
     pub voucher_signer: String,
     /// Sequence number of the most-recently-accepted voucher. Not tracked
     /// in the shared-pool model (a pool has no per-lane nonce), so this
