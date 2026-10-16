@@ -1,4 +1,5 @@
 use super::*;
+use crate::commands::fetch::MAX_MANIFEST_MB;
 
 fn manifest() -> Arc<BundleManifest> {
     Arc::new(BundleManifest::new([0; 32], Vec::new()))
@@ -355,6 +356,13 @@ impl worker::Backend for NoPulls {
 }
 
 async fn test_gateway() -> Arc<Gateway> {
+    test_gateway_with(NoPulls, flags(&[])).await
+}
+
+async fn test_gateway_with(
+    backend: impl worker::Backend,
+    common: cli::ClientFetchArgs,
+) -> Arc<Gateway> {
     let chain = ChainConfig {
         // Nothing here reaches the chain: every request below stops first.
         rpc_url: "http://127.0.0.1:1".to_owned(),
@@ -364,12 +372,12 @@ async fn test_gateway() -> Arc<Gateway> {
         capacity_bond: None,
     };
     Arc::new(Gateway {
-        common: flags(&[]),
+        common,
         token: TEST_TOKEN.to_owned(),
         domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
         delegates: Mutex::new(HashMap::new()),
-        pulls: PullWorker::start(NoPulls, 1).await.unwrap(),
+        pulls: PullWorker::start(backend, 1).await.unwrap(),
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
@@ -460,6 +468,148 @@ async fn a_page_with_the_token_still_registers_only_its_own_scope() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// What [`Recording`] answers every pull with.
+#[derive(Clone, Copy)]
+enum Reply {
+    /// The pull ends at its cap, as a blob larger than the cap does.
+    TooLarge,
+    /// The pull writes these bytes and succeeds.
+    Bytes(&'static [u8]),
+}
+
+/// A pull backend that records the `--max-blob-mb` each pull runs with.
+struct Recording {
+    caps: Arc<std::sync::Mutex<Vec<u64>>>,
+    reply: Reply,
+}
+
+impl worker::Backend for Recording {
+    type Host = ();
+    type Payer = ();
+
+    async fn open(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn payer(&self, _credential: Credential) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn pull(
+        &self,
+        (): &(),
+        (): &(),
+        blob: &BlobFetch,
+        sink: &mut super::super::fetch::Sink,
+    ) -> anyhow::Result<()> {
+        self.caps.lock().unwrap().push(blob.common.max_blob_mb);
+        match self.reply {
+            Reply::TooLarge => Err(decdn_client::BlobTooLarge {
+                reached: (blob.common.max_blob_mb << 20) + 1,
+                ceiling: blob.common.max_blob_mb << 20,
+            }
+            .into()),
+            Reply::Bytes(bytes) => {
+                let super::super::fetch::Sink::Writer(writer) = sink else {
+                    anyhow::bail!("the gateway pulls into a writer");
+                };
+                tokio::io::AsyncWriteExt::write_all(writer, bytes).await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn close(&self, (): ()) {}
+}
+
+/// A gateway on [`Recording`] whose token holder pays for every host, and
+/// the caps its pulls record.
+async fn recording_gateway(
+    reply: Reply,
+    args: &[&str],
+) -> (Arc<Gateway>, Arc<std::sync::Mutex<Vec<u64>>>) {
+    let caps = Arc::default();
+    let backend = Recording {
+        caps: Arc::clone(&caps),
+        reply,
+    };
+    let gateway = test_gateway_with(backend, flags(args)).await;
+    insert(
+        &mut *gateway.delegates.lock().await,
+        delegate(None, Some(registered("*", None, Instant::now()))),
+    );
+    (gateway, caps)
+}
+
+async fn get(gateway: &Arc<Gateway>, path: &str) -> StatusCode {
+    let headers = [(TOKEN_HEADER, TEST_TOKEN), (HOST_HEADER, "decdn.org")];
+    call(gateway, Method::GET, path, &headers, "").await
+}
+
+#[tokio::test]
+async fn a_manifest_pull_is_capped_and_an_oversize_blob_is_not_found() {
+    let blob = "ab".repeat(32);
+    let (gateway, caps) = recording_gateway(Reply::TooLarge, &[]).await;
+    assert_eq!(
+        get(&gateway, &format!("/{blob}/")).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(&gateway, &format!("/{blob}/a.bin")).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB, MAX_MANIFEST_MB]);
+
+    let (gateway, caps) = recording_gateway(Reply::TooLarge, &["--max-blob-mb", "10"]).await;
+    assert_eq!(
+        get(&gateway, &format!("/{blob}/")).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(*caps.lock().unwrap(), [10], "a lower gateway cap stays");
+}
+
+#[tokio::test]
+async fn a_raw_blob_pull_keeps_the_gateway_cap() {
+    let (gateway, caps) = recording_gateway(Reply::Bytes(b"raw"), &[]).await;
+    assert_eq!(
+        get(&gateway, &format!("/{}", "ab".repeat(32))).await,
+        StatusCode::OK
+    );
+    assert_eq!(*caps.lock().unwrap(), [flags(&[]).max_blob_mb]);
+    assert_ne!(flags(&[]).max_blob_mb, MAX_MANIFEST_MB);
+}
+
+#[tokio::test]
+async fn a_blob_that_is_not_a_manifest_is_not_found() {
+    let (gateway, _) = recording_gateway(Reply::Bytes(b"not json"), &[]).await;
+    assert_eq!(
+        get(&gateway, &format!("/{}/", "ab".repeat(32))).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[test]
+fn only_a_cap_stop_marks_a_manifest_pull_not_a_manifest() {
+    let too_large = || {
+        anyhow::Error::new(decdn_client::BlobTooLarge {
+            reached: 2,
+            ceiling: 1,
+        })
+    };
+    assert!(matches!(
+        over_manifest_cap(PullError::Other(too_large()), 64),
+        PullError::NotManifest(_)
+    ));
+    assert!(matches!(
+        over_manifest_cap(PullError::Other(anyhow::anyhow!("no node")), 64),
+        PullError::Other(_)
+    ));
+    assert!(matches!(
+        over_manifest_cap(PullError::Funding(too_large()), 64),
+        PullError::Funding(_)
+    ));
 }
 
 #[derive(clap::Parser)]

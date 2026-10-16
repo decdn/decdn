@@ -477,7 +477,17 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 pub(crate) const MAX_MANIFEST_BYTES: usize = 64 << 20;
 
 /// [`MAX_MANIFEST_BYTES`] in MiB, the unit of `--max-blob-mb`.
-const MAX_MANIFEST_MB: u64 = 64;
+pub(crate) const MAX_MANIFEST_MB: u64 = 64;
+
+/// The `--max-blob-mb` a manifest fetch runs with, given the caller's. The cap
+/// bounds what the lanes request, and so pay for, to the largest manifest.
+/// `0` is no cap, so it takes the manifest cap too.
+pub(crate) fn manifest_cap_mb(max_blob_mb: u64) -> u64 {
+    match max_blob_mb {
+        0 => MAX_MANIFEST_MB,
+        mb => mb.min(MAX_MANIFEST_MB),
+    }
+}
 
 /// `decdn get decdn:<hash>`: fetch the blob `uri` names over `cdn/client/v1`,
 /// auto-opening/reusing the caller's `PaymentPool` deposit, and write it
@@ -579,12 +589,7 @@ async fn fetch_entry_hash(
     path: &str,
 ) -> anyhow::Result<[u8; 32]> {
     let mut common = args.common.clone();
-    // The cap bounds what the lanes request, and so pay for, to the largest
-    // manifest. `0` is no cap, so it takes the manifest cap too.
-    common.max_blob_mb = match common.max_blob_mb {
-        0 => MAX_MANIFEST_MB,
-        mb => mb.min(MAX_MANIFEST_MB),
-    };
+    common.max_blob_mb = manifest_cap_mb(common.max_blob_mb);
     let manifest = BlobFetch {
         hash: uri.hash,
         namespace: uri.namespace,

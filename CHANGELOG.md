@@ -1026,6 +1026,17 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: `decdn gateway` pays for at most 64 MiB to read a bundle manifest
+  (#2474).** A `/<hash>/` or `/<hash>/<path>` request reads the manifest
+  `<hash>` into memory. That pull ran under the gateway's `--max-blob-mb`
+  (1 TiB by default), so for a large blob that is not a manifest, the
+  gateway paid for 64 MiB plus the lanes' read-ahead before it failed. Anyone
+  who could reach the gateway could spend the operator's funds this way. The
+  manifest pull now runs under the manifest cap (64 MiB, or a lower
+  `--max-blob-mb`), as `decdn get decdn:<hash>/<path> -o -` does, and its
+  lanes request no byte past it. A blob over that cap, or one that does not
+  parse as a manifest, answers 404 instead of 502, because nothing upstream
+  failed.
 - **CLI: a command that ends before an `openPool` confirms names the tx
   (#2418).** A Ctrl-C during the `openPool` submit or receipt wait in `decdn
   fetch` or `decdn bundle pull` printed only "run the same command again", and
