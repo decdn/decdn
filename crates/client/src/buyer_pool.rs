@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
+use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256, TxHash, U256};
-use alloy::providers::Provider;
+use alloy::providers::{PendingTransactionBuilder, Provider};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
@@ -1032,56 +1033,18 @@ const TOPUP_NONCE_RETRIES: u32 = 3;
 /// pending-nonce read skips past it.
 const TOPUP_NONCE_BACKOFF: Duration = Duration::from_millis(250);
 
-/// Add `additional` USDC to the buyer pool `pool_id` on-chain and return the
-/// credited amount and the mining transaction as a [`ToppedUpPool`] — the shared
-/// mechanism behind the node's cache-miss buyer (#744) and the CLI fetch buyer's
-/// auto-refill (#1103). `topUp` does not extend any lifecycle deadline; the caller
-/// credits `credited` into its local [`BuyerPoolState`] via `add_deposit`, and
-/// names `tx` if that credit fails — see [`escrowed_but_untracked`].
-///
-/// The amount credited is read back from `PoolToppedUp.additionalDeposit`, not
-/// assumed to equal `additional`: the contract credits a measured balance delta,
-/// so the two differ under a fee-on-transfer token and the local row must not
-/// over-state the on-chain deposit. If the event is absent (an ABI skew), the
-/// requested `additional` is returned as the best available estimate and the
-/// fallback is logged — an over-stated local row is the mirror of the hazard
-/// [`escrowed_but_untracked`] guards, so it must not be reached silently.
-///
-/// `owner` is the pool owner, which signs the `topUp` (`topUp` is owner-only
-/// on-chain). `top_up` reads `owner`'s pending nonce and sends the `topUp` with
-/// it, so an unconfirmed `topUp` names the nonce it holds. The provider's own
-/// nonce manager does not see that nonce, so `contract`'s provider must read
-/// the pending nonce on every send (alloy's `with_simple_nonce_management`).
-///
-/// A submit rejected as a same-account nonce collision
-/// ([`decdn_incentive::tx::is_nonce_collision`]) broadcast nothing, so it is
-/// re-sent up to three more times, a quarter second apart, each time on a fresh
-/// pending nonce.
-/// A node signs its sellers' redemptions and its buyer top-ups with one key, so a
-/// top-up can lose its nonce to a redemption sent at the same moment.
-///
-/// `receipt_timeout` bounds the receipt wait when it is `Some`, as for
-/// [`open_pool`]. The CLI passes [`RECEIPT_TIMEOUT`]. The node passes `None`:
-/// the task that runs this holds the node's top-up slot until it returns, so a
-/// lapse would free the slot while the `topUp` may still mine.
-///
-/// # Errors
-///
-/// Errors if the nonce read or the `topUp` transaction fails (submit, revert, or
-/// receipt). A submit that fails in transport
-/// ([`decdn_incentive::tx::send_broadcast_unknown`]) and a receipt that is not
-/// read (a failed read, or none within `receipt_timeout`) both carry
-/// [`TopUpUnconfirmed`], because the `topUp` may still mine.
-pub async fn top_up<P: Provider + Clone>(
+/// Send `topUp(pool_id, amount)` from `owner` at its pending nonce, re-sent on
+/// a fresh nonce after a same-account nonce collision, and return the pending
+/// transaction with the nonce it holds. The errors are [`top_up`]'s submit
+/// errors.
+async fn send_top_up<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
     pool_id: B256,
-    additional: U256,
-    receipt_timeout: Option<Duration>,
-) -> Result<ToppedUpPool> {
-    let amount = to_pool_u64(additional, "top-up")?;
+    amount: u64,
+) -> Result<(PendingTransactionBuilder<Ethereum>, u64)> {
     let mut nonce_retries = 0u32;
-    let (pending, nonce) = loop {
+    loop {
         let nonce = contract
             .provider()
             .get_transaction_count(owner)
@@ -1090,7 +1053,7 @@ pub async fn top_up<P: Provider + Clone>(
             .context("read the pending nonce for topUp")?;
         let call = contract.topUp(pool_id, amount).from(owner).nonce(nonce);
         let err = match call.send().await {
-            Ok(pending) => break (pending, nonce),
+            Ok(pending) => return Ok((pending, nonce)),
             Err(err) => err,
         };
         if nonce_retries < TOPUP_NONCE_RETRIES && decdn_incentive::tx::is_nonce_collision(&err) {
@@ -1126,11 +1089,66 @@ pub async fn top_up<P: Provider + Clone>(
         } else {
             submit_err
         });
-    };
+    }
+}
+
+/// Add `additional` USDC to the buyer pool `pool_id` on-chain and return the
+/// credited amount and the mining transaction as a [`ToppedUpPool`] — the shared
+/// mechanism behind the node's cache-miss buyer (#744) and the CLI fetch buyer's
+/// auto-refill (#1103). `topUp` does not extend any lifecycle deadline; the caller
+/// credits `credited` into its local [`BuyerPoolState`] via `add_deposit`, and
+/// names `tx` if that credit fails — see [`escrowed_but_untracked`].
+///
+/// The amount credited is read back from `PoolToppedUp.additionalDeposit`, not
+/// assumed to equal `additional`: the contract credits a measured balance delta,
+/// so the two differ under a fee-on-transfer token and the local row must not
+/// over-state the on-chain deposit. If the event is absent (an ABI skew), the
+/// requested `additional` is returned as the best available estimate and the
+/// fallback is logged — an over-stated local row is the mirror of the hazard
+/// [`escrowed_but_untracked`] guards, so it must not be reached silently.
+///
+/// `owner` is the pool owner, which signs the `topUp` (`topUp` is owner-only
+/// on-chain). `top_up` reads `owner`'s pending nonce and sends the `topUp` with
+/// it, so an unconfirmed `topUp` names the nonce it holds. The provider's own
+/// nonce manager does not see that nonce, so `contract`'s provider must read
+/// the pending nonce on every send (alloy's `with_simple_nonce_management`).
+///
+/// A submit rejected as a same-account nonce collision
+/// ([`decdn_incentive::tx::is_nonce_collision`]) broadcast nothing, so it is
+/// re-sent up to three more times, a quarter second apart, each time on a fresh
+/// pending nonce.
+/// A node signs its sellers' redemptions and its buyer top-ups with one key, so a
+/// top-up can lose its nonce to a redemption sent at the same moment.
+///
+/// `receipt_timeout` bounds the receipt wait when it is `Some`, as for
+/// [`open_pool`]. The CLI passes [`RECEIPT_TIMEOUT`]. A caller that bounds the
+/// wait must not send another `topUp` on the pool while this one is
+/// unconfirmed: `decdn get` holds the first for the run and refuses the rest.
+/// The node passes `None`:
+/// the task that runs this holds the node's top-up slot until it returns, so a
+/// lapse would free the slot while the `topUp` may still mine.
+///
+/// # Errors
+///
+/// Errors if the nonce read or the `topUp` transaction fails (submit, revert, or
+/// receipt). A submit that fails in transport
+/// ([`decdn_incentive::tx::send_broadcast_unknown`]) and a receipt that is not
+/// read (a failed read, or none within `receipt_timeout`) both carry
+/// [`TopUpUnconfirmed`], because the `topUp` may still mine.
+pub async fn top_up<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
+    pool_id: B256,
+    additional: U256,
+    receipt_timeout: Option<Duration>,
+) -> Result<ToppedUpPool> {
+    let amount = to_pool_u64(additional, "top-up")?;
+    let (pending, nonce) = send_top_up(contract, owner, pool_id, amount).await?;
     // Capture the hash before the wait consumes `pending`: past this point the
     // transaction is broadcast and may mine, so every receipt failure names it
     // (see [`TopUpUnconfirmed`]). A lapse does not cancel the transaction.
     let tx = *pending.tx_hash();
+    info!(%tx, %owner, %pool_id, %additional, nonce, "topUp broadcast; awaiting its receipt");
     let receipt = await_receipt(pending, receipt_timeout)
         .await
         .map_err(|err| {

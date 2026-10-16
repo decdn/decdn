@@ -1078,7 +1078,8 @@ since project inception and will roll into the first tagged release.
   that is stuck rather than dropped holds its nonce, so each later pool's
   transaction queues behind it and lapses in turn. A `decdn get` whose
   `openPool` or `topUp` lapsed never sends a second one in the same run, so
-  another bundle entry cannot escrow a second deposit beside it.
+  no other lane, bundle entry or funding recovery step escrows a second
+  deposit beside it. The run sends one `topUp` at a time.
 - **Node: an `openPool` dropped from the mempool is re-sent (#2433).** The
   node waited for the receipt of its own `openPool` with no bound, so a
   dropped open held the open slot forever, and every miss that joined it

@@ -3,9 +3,10 @@
 //! that runs low; and the funding recovery step the acquire loop asks for at
 //! an exhausted candidate set ([`PoolFunder`]).
 //!
-//! The run's funding facts ([`RunFunding`]) are shared by every lane build:
-//! the pool's spend outside the run's lanes, the pool the run pays from, and a
-//! wallet too short of USDC to top it up.
+//! The run's funding facts ([`RunFunding`]) are shared by every lane build and
+//! funding recovery step: the pool's spend outside the run's lanes, the pool
+//! the run pays from, a wallet too short of USDC to top it up, and the run's
+//! unconfirmed `openPool`s and `topUp`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -66,7 +67,8 @@ pub fn cached_pool_token(
 /// What the lane builds of one run learn about funding its pool, shared by
 /// every fetch of the run: one blob fetch, or every entry of a bundle pull.
 ///
-/// It holds two facts. The first is the pool's spend across every lane: a
+/// It holds what the run's lane builds and recovery steps share. The first is
+/// the pool's spend across every lane: a
 /// baseline for the lanes the run does not drive, plus what each lane the run
 /// built has committed since. The deposit gate reads it
 /// ([`Funder::pool_spent`]), so a pool shared across many providers gates on its
@@ -78,15 +80,19 @@ pub fn cached_pool_token(
 /// lane pays from, which a funding recovery step tops up: every entry of a
 /// bundle pull shares it, the entries that have built no lane yet included.
 /// Every `openPool` a lane build or a recovery step sends is held in its
-/// [`UnconfirmedOpens`] until its receipt is read. The first `topUp` whose
-/// receipt is not read is held too, and the run sends no further `topUp`.
+/// [`UnconfirmedOpens`] until its receipt is read. The run sends one `topUp` at
+/// a time, and the first that may have been broadcast but is not known to have
+/// mined ([`TopUpUnconfirmed`]) stays in the run's state, not in that handle:
+/// every later `topUp` of the run is refused with it.
 #[derive(Debug, Default)]
 pub struct RunFunding {
     spend: Mutex<RunSpend>,
     shortfall: Mutex<Option<String>>,
     pool_id: OnceLock<PoolId>,
     opens: UnconfirmedOpens,
-    top_up: Mutex<Option<TopUpUnconfirmed>>,
+    /// Held across each `topUp` of the run, so one runs at a time; it holds
+    /// the first [`TopUpUnconfirmed`].
+    top_up: tokio::sync::Mutex<Option<TopUpUnconfirmed>>,
 }
 
 /// What a lane build learned about the pool's spend, for
@@ -193,20 +199,6 @@ impl RunFunding {
         }))
     }
 
-    /// The run's `topUp` whose receipt was not read, if one was sent.
-    fn unconfirmed_top_up(&self) -> Option<TopUpUnconfirmed> {
-        *self.top_up.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Hold `top_up`, a `topUp` whose receipt was not read, unless the run
-    /// already holds one.
-    fn hold_top_up(&self, top_up: TopUpUnconfirmed) {
-        self.top_up
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert(top_up);
-    }
-
     /// The warning for a wallet seen to hold too little USDC for a top-up in
     /// this run, if one was.
     pub fn shortfall(&self) -> Option<String> {
@@ -287,8 +279,10 @@ impl RunFunding {
 
 /// A self-owned pool's [`Funder`]: the funding recovery step (ADR 003 § Funding
 /// recovery). A self-funded owner tops its current pool up toward the working
-/// deposit through the same `ensure_allowance -> top_up -> add_deposit` path
-/// as the proactive low-water refill (`refill_if_low`). A pool that is
+/// deposit through the same allowance → `topUp` → `add_deposit` path as the
+/// proactive low-water refill (`escrow_top_up`, then `add_deposit`). Once a
+/// `topUp` of the run is unconfirmed, the step sends none and fails with it.
+/// A pool that is
 /// `Closing` or `Closed` reverts that `topUp` with `PoolNotOpen`; the owner
 /// then opens a new pool at the working deposit and records it as the current
 /// pool in the buyer store, and the step reports [`Recovery::Replaced`]. The
@@ -316,8 +310,8 @@ pub struct PoolFunder<'a, P> {
     pub(crate) working_deposit: U256,
     pub(crate) max_approve: bool,
     /// The run's funding facts: its outside spend, a wallet shortfall that
-    /// makes a further top-up pointless, and the pool to top up
-    /// ([`RunFunding::pool_id`]).
+    /// makes a further top-up pointless, an unconfirmed `topUp` that makes one
+    /// unsafe, and the pool to top up ([`RunFunding::pool_id`]).
     pub(crate) funding: &'a RunFunding,
 }
 
@@ -1043,12 +1037,16 @@ fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
 /// `additional`), since `topUp` pulls it via `transferFrom`, then send `topUp`
 /// and read its receipt within [`RECEIPT_TIMEOUT`].
 ///
-/// The proactive refill and the funding recovery step both escrow through
-/// here, each under its own lock: `open_lock` and the recovery step lock. A
-/// `topUp` whose receipt is not read ([`TopUpUnconfirmed`]) may still mine, so
-/// `funding` holds it before the caller's lock is released. Every later call
-/// in the run refuses with that error instead of escrowing a second deposit,
-/// and the acquire loop ends the command on it.
+/// The proactive refill, under `open_lock`, and the funding recovery step,
+/// under [`RecoveryGate`](crate::RecoveryGate)'s step lock, both escrow through
+/// here. Those two locks do not exclude each other, so the call holds the
+/// run's `topUp` lock in `funding` from its check to its outcome: a second
+/// caller waits for the first `topUp` to resolve. A `topUp` that may have been
+/// broadcast but is not known to have mined ([`TopUpUnconfirmed`]: a lapsed or
+/// failed receipt read, or a submit lost in transport) may still mine, so the
+/// lock keeps it. Every later call of the run refuses with that error instead
+/// of escrowing a second deposit, and the acquire loop classifies it as fatal
+/// to the command ([`crate::Fault::Fatal`]).
 ///
 /// # Errors
 ///
@@ -1065,7 +1063,8 @@ async fn escrow_top_up<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    if let Some(earlier) = funding.unconfirmed_top_up() {
+    let mut held = funding.top_up.lock().await;
+    if let Some(earlier) = *held {
         return Err(anyhow::Error::new(earlier)
             .context("refusing a second topUp while an earlier one is unconfirmed"));
     }
@@ -1081,7 +1080,7 @@ where
     if let Err(err) = &topped_up
         && let Some(unconfirmed) = err.downcast_ref::<TopUpUnconfirmed>()
     {
-        funding.hold_top_up(*unconfirmed);
+        *held = Some(*unconfirmed);
     }
     topped_up
 }
@@ -1101,7 +1100,9 @@ where
 /// receipt ([`TopUpUnconfirmed`]) may have escrowed, and once `topUp` returns a
 /// receipt the escrow has moved, so a failure to credit or re-read the local
 /// row ([`escrowed_but_untracked`]) is fatal: the acquire loop ends the
-/// command instead of retrying, because a retry escrows again.
+/// command instead of retrying, because a retry escrows again. A refill after
+/// an earlier `topUp` of the run went unconfirmed sends nothing and fails with
+/// that held [`TopUpUnconfirmed`] ([`escrow_top_up`]), fatal the same way.
 #[allow(clippy::too_many_arguments)]
 async fn refill_if_low<P>(
     store: &dyn BuyerPoolStore,

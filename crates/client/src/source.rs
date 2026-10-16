@@ -319,6 +319,8 @@ pub trait Funder: Send + Sync {
     /// [`crate::buyer_pool::OpenUnconfirmed`] for an `openPool`. If a mined
     /// transaction cannot be credited locally, the funds **are** escrowed and
     /// the error names the tx ([`crate::buyer_pool::escrowed_but_untracked`]).
+    /// A step refused because an earlier `topUp` of the run is unconfirmed
+    /// carries that [`crate::buyer_pool::TopUpUnconfirmed`] too.
     fn recover(&self, remaining: U256) -> SourceFuture<'_, Recovery>;
 
     /// The funder's own view of what the pool has spent across every lane,
