@@ -1520,6 +1520,7 @@ mod batch_store_admission {
 // handler over loopback (ADR 022 §STORE Flow Batched STORE).
 mod batch_store_client {
     use super::*;
+    use decdn_client::Connections;
     use decdn_node::dht::client;
 
     /// Spin up a staked-publisher DHT server whose accept loop serves an
@@ -1527,7 +1528,7 @@ mod batch_store_client {
     /// endpoint, its connect target, the publisher's key, the shared
     /// metrics handle, and the accept-loop join handle.
     #[allow(clippy::type_complexity)]
-    async fn spin_up_looping_staked_server(
+    pub(super) async fn spin_up_looping_staked_server(
         client_id: [u8; 32],
     ) -> anyhow::Result<(
         Endpoint,
@@ -1587,9 +1588,10 @@ mod batch_store_client {
         let (server_ep, target, _sid, _metrics, accept_task) =
             spin_up_looping_staked_server(holder).await?;
         let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
         let hashes: Vec<[u8; 32]> = (1u8..=4).map(|i| [i; 32]).collect();
         let ack = client::batch_store(
-            &client_ep,
+            &conns,
             target,
             hashes
                 .iter()
@@ -1601,6 +1603,147 @@ mod batch_store_client {
         .await?;
         assert_eq!(ack.results, vec![true; 4]);
         shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+}
+
+/// The outbound DHT primitives reuse one pooled connection per peer, redial
+/// once when a pooled connection turns out closed, and never retry a fresh
+/// dial that fails.
+mod pooled_client {
+    use super::*;
+    use decdn_client::Connections;
+    use decdn_node::dht::client;
+
+    /// Three `FindNode` calls to one peer through one map dial once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sequential_rpcs_to_one_peer_dial_once() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (server_ep, target, _sid, _metrics, accept_task) =
+            super::batch_store_client::spin_up_looping_staked_server(*client_id.as_bytes()).await?;
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+        for i in 1u8..=3 {
+            client::find_node(
+                &conns,
+                target.clone(),
+                NodeId::from_bytes([i; 32]),
+                client_id,
+            )
+            .await?;
+        }
+        assert_eq!(conns.dials(), 1, "three RPCs ride one connection");
+        drop(conns);
+        shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
+    /// A server that answers the first stream on each connection with an
+    /// empty `FindNodeResponse` and closes the connection when a second
+    /// stream arrives, the way a server closes at its per-connection budget.
+    async fn closing_server()
+    -> anyhow::Result<(Endpoint, EndpointAddr, tokio::task::JoinHandle<()>)> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let accept_ep = server_ep.clone();
+        let task = tokio::spawn(async move {
+            while let Some(incoming) = accept_ep.accept().await {
+                tokio::spawn(async move {
+                    let Ok(connecting) = incoming.accept() else {
+                        return;
+                    };
+                    let Ok(conn) = connecting.await else {
+                        return;
+                    };
+                    if let Ok((mut send, mut recv)) = conn.accept_bi().await
+                        && let Ok(frame) = read_frame(&mut recv).await
+                        && let Ok((wire::DhtMessage::FindNode(req), _)) =
+                            decode_message::<wire::DhtMessage>(&frame)
+                    {
+                        let resp = wire::DhtMessage::FindNodeResponse(wire::FindNodeResponse {
+                            target: req.target,
+                            closer_nodes: wire::CloserNodes::default(),
+                        });
+                        if let Ok(bytes) = encode_message(&resp) {
+                            let _ = write_frame(&mut send, &bytes).await;
+                            let _ = send.finish();
+                        }
+                    }
+                    if conn.accept_bi().await.is_ok() {
+                        conn.close(0u32.into(), b"budget-spent");
+                    }
+                    conn.closed().await;
+                });
+            }
+        });
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        Ok((server_ep, target, task))
+    }
+
+    /// A pooled connection the server closes under the next call is redialled
+    /// once, and the call succeeds on the fresh connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pooled_call_redials_after_server_closed_connection() -> anyhow::Result<()> {
+        let (server_ep, target, accept_task) = closing_server().await?;
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+
+        let first = client::find_node(
+            &conns,
+            target.clone(),
+            NodeId::from_bytes([1; 32]),
+            client_id,
+        )
+        .await?;
+        assert_eq!(first.target, NodeId::from_bytes([1; 32]));
+        assert_eq!(conns.dials(), 1);
+        let second = client::find_node(
+            &conns,
+            target.clone(),
+            NodeId::from_bytes([2; 32]),
+            client_id,
+        )
+        .await?;
+        assert_eq!(second.target, NodeId::from_bytes([2; 32]));
+        assert_eq!(
+            conns.dials(),
+            2,
+            "the closed pooled connection redials once"
+        );
+        drop(conns);
+        shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
+    /// A peer nobody runs fails within the client timeout, on one dial.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dead_peer_fails_within_client_timeout_without_retry() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+        // A bound-then-dropped socket: nothing answers on it.
+        let dead_addr = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
+        let target = EndpointAddr::new(fresh_key().public()).with_ip_addr(dead_addr);
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            client::DHT_CLIENT_TIMEOUT + std::time::Duration::from_secs(2),
+            client::find_node(&conns, target, NodeId::from_bytes([1; 32]), client_id),
+        )
+        .await
+        .expect("the call must end within the client timeout");
+        assert!(result.is_err(), "a dead peer must fail");
+        assert!(
+            started.elapsed() <= client::DHT_CLIENT_TIMEOUT + std::time::Duration::from_secs(1)
+        );
+        assert_eq!(conns.dials(), 1, "a fresh dial that fails is not retried");
+        drop(conns);
+        shutdown([], [&client_ep]).await?;
         Ok(())
     }
 }

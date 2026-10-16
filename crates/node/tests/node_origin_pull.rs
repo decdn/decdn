@@ -852,7 +852,7 @@ async fn build_origin_with_discovery(
     for (peer_id, peer_addr) in dht_peers {
         let peer = DhtNodeId::from_bytes(*peer_id.as_bytes());
         decdn_node::dht::client::find_node(
-            ep_b,
+            &support::dht_conns(ep_b),
             EndpointAddr::new(peer_id).with_ip_addr(peer_addr),
             peer,
             b_dht,
@@ -869,6 +869,11 @@ async fn build_origin_with_discovery(
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
         dial_runtime: tokio::runtime::Handle::current(),
+        dht_connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_DHT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         routing_table: Arc::new(Mutex::new(routing)),
         staker_set: Arc::new(ConfigStakerSet::new(stakers)) as Arc<dyn StakerSet>,
         origin_directory: Arc::new(StaticOriginDirectory::new(directory))
@@ -1023,6 +1028,11 @@ async fn build_origin_multi_hash(
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
         dial_runtime: tokio::runtime::Handle::current(),
+        dht_connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_DHT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
         // Providers are active stakers, matching production (a probe-cache HIT
         // re-checks `is_active`, so an empty set would make every cached provider
@@ -1628,6 +1638,11 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
         dial_runtime: tokio::runtime::Handle::current(),
+        dht_connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_DHT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(DhtNodeId::from_bytes(
             *b_id.as_bytes(),
         )))),
@@ -11234,6 +11249,11 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
         dial_runtime: tokio::runtime::Handle::current(),
+        dht_connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_DHT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(DhtNodeId::from_bytes(
             *b_id.as_bytes(),
         )))),
@@ -12931,6 +12951,11 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
         dial_runtime: tokio::runtime::Handle::current(),
+        dht_connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_DHT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
         staker_set: Arc::clone(&mutable_staker) as Arc<dyn StakerSet>,
         origin_directory: Arc::clone(&mutable_dir) as Arc<dyn OriginDirectory>,
@@ -14460,6 +14485,11 @@ async fn build_origin_economics(
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
         dial_runtime: tokio::runtime::Handle::current(),
+        dht_connections: decdn_client::Connections::with_options(
+            ep_b.clone(),
+            decdn_protocol::ALPN_DHT,
+            Some(tokio::runtime::Handle::current()),
+        ),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
         staker_set: Arc::new(stakers) as Arc<dyn StakerSet>,
         origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,

@@ -66,7 +66,7 @@ use decdn_bao_range::align_range;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
 use decdn_client::{
-    BudgetPacer, PeerSource, PrimedSource, RecoveryGate, Stepped, drive, first_leg,
+    BudgetPacer, Connections, PeerSource, PrimedSource, RecoveryGate, Stepped, drive, first_leg,
 };
 use decdn_common::redact::sanitize_err_chain;
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
@@ -544,6 +544,10 @@ pub struct NodeOriginDeps {
     /// [`PeerSource::with_dial_runtime`](decdn_client::source::PeerSource::with_dial_runtime)
     /// with this handle, so every driver lives here.
     pub dial_runtime: tokio::runtime::Handle,
+    /// The node's pooled `cdn/dht/v1` connections (one per peer, dialled on
+    /// the main runtime), shared with the DHT background tasks.
+    /// `find_providers` asks each peer on its warm connection.
+    pub dht_connections: Connections,
     /// DHT routing table handle for `find_providers`.
     pub routing_table: Arc<Mutex<RoutingTable>>,
     /// Active-staker set (lookup integrity filter).
@@ -1069,7 +1073,7 @@ async fn discover(
     // skip probing a candidate whose stale coverage already misses the whole
     // pull range; today every discovered candidate is still probed.
     let providers: Vec<DhtNodeId> = crate::dht::find_providers(
-        &deps.endpoint,
+        &deps.dht_connections,
         &deps.routing_table,
         &deps.staker_set,
         &deps.negative_cache,

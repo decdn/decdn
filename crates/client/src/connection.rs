@@ -130,14 +130,18 @@ impl WarmConnection {
         Ok(Self { conn })
     }
 
-    /// The live connection, for opening a per-hash bi-stream.
-    pub(crate) const fn connection(&self) -> &Connection {
+    /// The live connection, for opening a per-request bi-stream.
+    #[must_use]
+    #[doc(hidden)]
+    pub const fn connection(&self) -> &Connection {
         &self.conn
     }
 
     /// Whether the connection has closed: by either side, by an idle timeout,
     /// or by a transport fault. A closed connection opens no more streams.
-    pub(crate) fn is_closed(&self) -> bool {
+    #[must_use]
+    #[doc(hidden)]
+    pub fn is_closed(&self) -> bool {
         self.conn.close_reason().is_some()
     }
 }
@@ -228,9 +232,9 @@ impl Connections {
     }
 
     /// `target`'s live connection, dialled on the map's ALPN and dial
-    /// runtime when the node has none. A caller for a node another caller is dialling waits
-    /// for that dial and shares its connection. The dial has no deadline of
-    /// its own: the caller bounds it.
+    /// runtime when the node has none. A caller for a node another caller
+    /// is dialling waits for that dial and shares its connection. The dial
+    /// has no deadline of its own: the caller bounds it.
     ///
     /// # Errors
     ///
@@ -238,6 +242,22 @@ impl Connections {
     /// `connect failed: {err}` (a rate-limit shed keeps its typed sentinel).
     #[doc(hidden)]
     pub async fn get(&self, target: &EndpointAddr) -> anyhow::Result<Arc<WarmConnection>> {
+        self.get_or_dial(target).await.map(|(warm, _)| warm)
+    }
+
+    /// [`get`](Self::get), also saying whether this call dialled the
+    /// connection (`true`) or took one already pinned (`false`). A caller
+    /// that retries on a closed connection retries only a pinned one: a
+    /// connection it just dialled that fails is the peer's failure.
+    ///
+    /// # Errors
+    ///
+    /// The same faults as [`get`](Self::get).
+    #[doc(hidden)]
+    pub async fn get_or_dial(
+        &self,
+        target: &EndpointAddr,
+    ) -> anyhow::Result<(Arc<WarmConnection>, bool)> {
         let slot = Arc::clone(
             self.inner
                 .slots
@@ -248,7 +268,7 @@ impl Connections {
         );
         let mut held = slot.lock().await;
         if let Some(warm) = held.as_ref().filter(|warm| !warm.is_closed()) {
-            return Ok(Arc::clone(warm));
+            return Ok((Arc::clone(warm), false));
         }
         #[cfg(any(test, feature = "test-util"))]
         self.inner
@@ -264,7 +284,7 @@ impl Connections {
         .await?;
         let warm = Arc::new(WarmConnection { conn });
         *held = Some(Arc::clone(&warm));
-        Ok(warm)
+        Ok((warm, true))
     }
 
     /// Unpin `conn` from `node`'s slot, so the next [`get`](Self::get) dials

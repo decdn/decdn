@@ -33,6 +33,12 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
 
+/// A `cdn/dht/v1` connection map on `ep`, dialling on the caller's runtime.
+#[must_use]
+pub(crate) fn dht_conns(ep: &Endpoint) -> decdn_client::Connections {
+    decdn_client::Connections::with_options(ep.clone(), decdn_protocol::ALPN_DHT, None)
+}
+
 /// Fresh random iroh identity.
 pub(crate) fn fresh_key() -> SecretKey {
     SecretKey::generate()
