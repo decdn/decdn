@@ -966,19 +966,48 @@ async fn status_poisoned_record_store_mutex_returns_poisoned_error() {
 use alloy::primitives::{Address, B256};
 use decdn_incentive::MemoryPoolStateStore;
 
-/// Build a hydrated [`LaneState`] with the given identity + outstanding
-/// claim. `pool_byte` seeds the pool id, `signer_byte` the signer (which is
-/// also the reported counterparty in the shared-pool model); `last_amount`
-/// is the lane's cumulative claim. The provider is a fixed non-signer
-/// address so a signer/provider transposition would be caught.
-fn mk_lane(pool_byte: u8, signer_byte: u8, last_amount: u64) -> LaneState {
+use crate::admin::pool_owners::{PoolOwnerSource, PoolOwners};
+use crate::pool_view::PoolProjection;
+
+/// The pool id [`mk_lane`] derives from `pool_byte`.
+fn lane_pool_id(pool_byte: u8) -> B256 {
     let mut id = [0u8; 32];
     id[31] = pool_byte;
+    id.into()
+}
+
+/// The resolved owner map `build_lane_snapshots` reads, for each
+/// `(pool_byte, owner)` pair.
+fn pools_owned_by(owners: &[(u8, Address)]) -> HashMap<B256, Address> {
+    owners
+        .iter()
+        .map(|&(pool_byte, owner)| (lane_pool_id(pool_byte), owner))
+        .collect()
+}
+
+/// A [`PoolOwnerSource`] that names one fixed owner for every pool, standing
+/// in for the chain's `getPool`.
+struct OneOwner(Address);
+
+#[async_trait::async_trait]
+impl PoolOwnerSource for OneOwner {
+    async fn owner(&self, _pool_id: B256) -> anyhow::Result<Option<Address>> {
+        Ok(Some(self.0))
+    }
+}
+
+/// Build a hydrated [`LaneState`] with the given identity + outstanding
+/// claim. `pool_byte` seeds the pool id, `signer_byte` the voucher signer
+/// (never the reported counterparty: that is the pool owner);
+/// `last_amount` is the lane's cumulative claim. The provider is
+/// a fixed non-signer address so a signer/provider transposition would be
+/// caught.
+fn mk_lane(pool_byte: u8, signer_byte: u8, last_amount: u64) -> LaneState {
     let mut signer = [0u8; 20];
     signer[19] = signer_byte;
     let provider = Address::repeat_byte(0xEE);
     LaneState::hydrate(
-        id.into(),
+        lane_pool_id(pool_byte),
         Address::from(signer),
         provider,
         U256::from(1_000_000_000u64), // cap — irrelevant to the snapshot
@@ -994,12 +1023,17 @@ fn mk_lane(pool_byte: u8, signer_byte: u8, last_amount: u64) -> LaneState {
 /// hex ids, narrowed amounts, and threshold-based eligibility. A lane
 /// at/above the threshold is eligible; one below is not. In the shared-pool
 /// model the per-lane deposit and nonce are not tracked, so both report 0.
+/// The counterparty is the pool owner from the pool view, distinct from the
+/// lane signer; a pool the view has not seen reports `None`, never the signer.
 #[test]
 fn build_lane_snapshots_maps_fields_and_eligibility() {
+    let owner = Address::repeat_byte(0x0F);
     let states = vec![mk_lane(1, 0xAA, 2_500_000), mk_lane(2, 0xBB, 500_000)];
     let ages = HashMap::new();
     let threshold = U256::from(1_000_000u64);
-    let snaps = build_lane_snapshots(&states, threshold, &ages);
+    // Only pool 1's owner resolved; pool 2's read failed.
+    let owners = pools_owned_by(&[(1, owner)]);
+    let snaps = build_lane_snapshots(&states, threshold, &ages, &owners);
     assert_eq!(snaps.len(), 2);
     // No activity recorded → both have `None`; within the `None`
     // group ordering is by descending outstanding, so the
@@ -1013,10 +1047,16 @@ fn build_lane_snapshots_maps_fields_and_eligibility() {
         "pool_id must be 0x-hex: {}",
         first.pool_id
     );
-    assert!(
-        first.counterparty.starts_with("0x"),
-        "counterparty must be 0x-hex: {}",
-        first.counterparty
+    assert_eq!(
+        first.counterparty,
+        Some(owner.to_string()),
+        "counterparty must be the pool owner"
+    );
+    let first_signer = states.first().expect("first lane").signer;
+    assert_eq!(
+        first.voucher_signer,
+        first_signer.to_string(),
+        "voucher_signer must be the lane signer"
     );
     assert_eq!(first.seconds_since_last_voucher, None);
     assert!(
@@ -1025,6 +1065,7 @@ fn build_lane_snapshots_maps_fields_and_eligibility() {
     );
     let second = snaps.get(1).expect("second snapshot");
     assert_eq!(second.outstanding_micro_usdc, 500_000);
+    assert_eq!(second.counterparty, None, "an unresolved owner is unknown");
     assert!(
         !second.settlement_eligible,
         "0.5 USDC claim < 1 USDC threshold → not eligible"
@@ -1037,7 +1078,7 @@ fn build_lane_snapshots_maps_fields_and_eligibility() {
 fn build_lane_snapshots_threshold_is_inclusive() {
     let states = vec![mk_lane(1, 0xAA, 1_000_000)];
     let ages = HashMap::new();
-    let snaps = build_lane_snapshots(&states, U256::from(1_000_000u64), &ages);
+    let snaps = build_lane_snapshots(&states, U256::from(1_000_000u64), &ages, &HashMap::new());
     assert!(
         snaps.first().expect("snapshot").settlement_eligible,
         "outstanding == threshold must be eligible (>=)"
@@ -1054,7 +1095,12 @@ fn build_lane_snapshots_orders_active_lanes_first() {
     // `idle` has a much larger outstanding, but no activity — the active
     // lane must still sort first (recency beats size).
     let ages = HashMap::from([(active.key(), 3u64)]);
-    let snaps = build_lane_snapshots(&[idle, active], U256::from(1_000_000u64), &ages);
+    let snaps = build_lane_snapshots(
+        &[idle, active],
+        U256::from(1_000_000u64),
+        &ages,
+        &HashMap::new(),
+    );
     let first = snaps.first().expect("first snapshot");
     assert!(
         first.seconds_since_last_voucher.is_some(),
@@ -1077,18 +1123,25 @@ async fn lanes_without_handles_returns_empty() {
 
 /// End-to-end through the RPC method: a store seeded with two lanes
 /// surfaces both, with the configured threshold echoed and eligibility
-/// computed against it.
+/// computed against it. Pool 1's owner comes from the pool view; pool 2 is
+/// not in it, as a lane carried across a restart is not, so its owner comes
+/// from the chain read.
 #[tokio::test]
 async fn lanes_rpc_reports_seeded_store() -> anyhow::Result<()> {
     let store = Arc::new(MemoryPoolStateStore::new());
     store.record(&mk_lane(1, 0xAA, 2_000_000))?;
     store.record(&mk_lane(2, 0xBB, 100_000))?;
 
+    let owner = Address::repeat_byte(0x0F);
+    let chain_owner = Address::repeat_byte(0x0E);
+    let projection = PoolProjection::new();
+    projection.record_opened(lane_pool_id(1), owner, U256::from(10_000_000u64));
     let (state, _tmp) = state_with().await;
     let handles = LaneStatusHandles {
         pool_store: store as Arc<dyn PoolStateStore>,
         lane_activity: LaneActivityClock::empty(),
         redeem_threshold_micro_usdc: 1_000_000,
+        pool_owners: PoolOwners::new(projection, Some(Arc::new(OneOwner(chain_owner)))),
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let resp = rpc.lanes().await.expect("lanes ok");
@@ -1098,9 +1151,15 @@ async fn lanes_rpc_reports_seeded_store() -> anyhow::Result<()> {
     let first = resp.lanes.first().expect("first");
     assert_eq!(first.outstanding_micro_usdc, 2_000_000);
     assert!(first.settlement_eligible);
+    assert_eq!(first.counterparty, Some(owner.to_string()));
     let second = resp.lanes.get(1).expect("second");
     assert_eq!(second.outstanding_micro_usdc, 100_000);
     assert!(!second.settlement_eligible);
+    assert_eq!(
+        second.counterparty,
+        Some(chain_owner.to_string()),
+        "a pool the view lacks is named by the chain read"
+    );
     Ok(())
 }
 
@@ -1290,6 +1349,7 @@ async fn lanes_rpc_reflects_stamped_lane_through_activity_clock() -> anyhow::Res
         pool_store: store as Arc<dyn PoolStateStore>,
         lane_activity: LaneActivityClock::with_stamped_lanes(&[active_id]),
         redeem_threshold_micro_usdc: 1_000_000,
+        pool_owners: PoolOwners::new(PoolProjection::new(), None),
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let resp = rpc.lanes().await.expect("lanes ok");
@@ -1338,6 +1398,7 @@ async fn lanes_rpc_surfaces_store_load_failure() {
         pool_store: Arc::new(FailingStore) as Arc<dyn PoolStateStore>,
         lane_activity: LaneActivityClock::empty(),
         redeem_threshold_micro_usdc: 1_000_000,
+        pool_owners: PoolOwners::new(PoolProjection::new(), None),
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let err = rpc.lanes().await.expect_err("expected store-load error");

@@ -63,7 +63,7 @@ use std::time::Duration;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
-use decdn_common::admin::AdminRpcClient;
+use decdn_common::admin::{AdminRpcClient, LaneSnapshot};
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
@@ -151,19 +151,30 @@ async fn provider_lanes_from(
     let admin = provider.admin_client()?;
     let payer_hex = payer.to_string();
 
-    // (1) Ride out the fsync window: wait until at least one paid lane funded by
+    // A node buyer signs with its operator key, so its lanes are found by
+    // signer, and each must name the same key as its pool's owner.
+    let paid_by_payer = |s: &LaneSnapshot| {
+        s.voucher_signer.eq_ignore_ascii_case(&payer_hex) && s.outstanding_micro_usdc > 0
+    };
+
+    // (1) Ride out the fsync window: wait until at least one paid lane signed by
     // `payer` is visible before starting to count.
-    poll(Duration::from_secs(30), || async {
+    let first = poll(Duration::from_secs(30), || async {
         let resp = admin.lanes().await.context("admin lanes")?;
-        let any_paid = resp.lanes.iter().any(|s| {
-            s.counterparty.eq_ignore_ascii_case(&payer_hex) && s.outstanding_micro_usdc > 0
-        });
-        Ok(any_paid.then_some(()))
+        Ok(resp.lanes.into_iter().find(paid_by_payer))
     })
     .await?
     .with_context(|| {
-        format!("provider never reported a non-zero settled claim funded by {payer_hex}")
+        format!("provider never reported a non-zero settled claim signed by {payer_hex}")
     })?;
+    anyhow::ensure!(
+        first
+            .counterparty
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&payer_hex)),
+        "the lane signed by {payer_hex} must report it as the pool owner, got {:?}",
+        first.counterparty
+    );
 
     // (2) Observe a stability window and take the max count seen, so a second
     // paid lane that surfaces late is not missed.
@@ -175,9 +186,7 @@ async fn provider_lanes_from(
         let paid: Vec<u64> = resp
             .lanes
             .into_iter()
-            .filter(|s| {
-                s.counterparty.eq_ignore_ascii_case(&payer_hex) && s.outstanding_micro_usdc > 0
-            })
+            .filter(paid_by_payer)
             .map(|s| s.outstanding_micro_usdc)
             .collect();
         // `>=` so a growing cumulative claim on a stable count still refreshes the

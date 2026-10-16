@@ -631,7 +631,12 @@ fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result
 /// formatting stays in one place and the loop body reads as a single call.
 fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
     let lane = short_node_id(&c.pool_id);
-    let counterparty = short_node_id(&c.counterparty);
+    // The node names the pool owner only once its pool view has seen the pool;
+    // say so rather than leave the column blank.
+    let counterparty = c
+        .counterparty
+        .as_deref()
+        .map_or_else(|| "unknown".to_string(), short_node_id);
     let signer = short_node_id(&c.voucher_signer);
     let last_voucher = match c.seconds_since_last_voucher {
         // No voucher seen since this process started — distinct from

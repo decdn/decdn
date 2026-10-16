@@ -506,9 +506,9 @@ fn mk_lane(
 ) -> LaneSnapshot {
     LaneSnapshot {
         pool_id: pool_id.to_string(),
-        counterparty: counterparty.to_string(),
-        // Self-signing default; the delegated rendering gets its own
-        // dedicated test rather than an eighth parameter.
+        counterparty: Some(counterparty.to_string()),
+        // Self-signing default; the delegated and unknown-owner renderings
+        // get their own dedicated tests rather than an eighth parameter.
         voucher_signer: counterparty.to_string(),
         last_nonce,
         outstanding_micro_usdc: outstanding,
@@ -704,6 +704,89 @@ fn write_lanes_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A lane whose pool the node has not seen has no known owner: the
+/// COUNTERPARTY column says `unknown`, and the SIGNER column still names the
+/// signer. The signer never stands in for the owner.
+#[test]
+fn write_lanes_table_renders_an_unknown_counterparty() -> anyhow::Result<()> {
+    let signer = format!("0x{}", "2".repeat(40));
+    let mut lane = mk_lane(
+        &format!("0x{}", "a".repeat(64)),
+        &signer,
+        0,
+        1,
+        0,
+        None,
+        false,
+    );
+    lane.counterparty = None;
+
+    let mut buf = Vec::<u8>::new();
+    write_lanes_table(
+        &mut buf,
+        &LanesResponse {
+            redeem_threshold_micro_usdc: 1_000_000,
+            lanes: vec![lane],
+        },
+    )?;
+    let s = String::from_utf8(buf)?;
+    let row = s
+        .lines()
+        .find(|l| l.starts_with("0xaaaaaaaaaa"))
+        .unwrap_or_default();
+    assert!(
+        row.contains("unknown"),
+        "unknown-owner sentinel missing: {row}"
+    );
+    assert_eq!(
+        row.matches(&short_node_id(&signer)).count(),
+        1,
+        "the signer must appear once (SIGNER only), never as the owner: {row}"
+    );
+    Ok(())
+}
+
+/// `--json` renders an unknown owner as `null`, not an empty string or the
+/// signer, so a script can tell "not seen" from an address.
+#[test]
+fn lanes_json_renders_an_unknown_counterparty_as_null() -> anyhow::Result<()> {
+    let mut lane = mk_lane(
+        &format!("0x{}", "a".repeat(64)),
+        &format!("0x{}", "2".repeat(40)),
+        0,
+        1,
+        0,
+        None,
+        false,
+    );
+    lane.counterparty = None;
+    let pretty = serde_json::to_string_pretty(&LanesResponse {
+        redeem_threshold_micro_usdc: 1_000_000,
+        lanes: vec![lane],
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&pretty)?;
+    let c0 = value["lanes"]
+        .as_array()
+        .and_then(|lanes| lanes.first())
+        .ok_or_else(|| anyhow::anyhow!("one lane: {pretty}"))?;
+    // Present as `null`, not absent: `Value` indexing reads a missing key as
+    // `Null` too, so check the key itself.
+    assert!(
+        c0.as_object()
+            .is_some_and(|lane| lane.contains_key("counterparty")),
+        "counterparty key must be present: {pretty}"
+    );
+    assert!(
+        c0["counterparty"].is_null(),
+        "counterparty must be null: {pretty}"
+    );
+    assert!(
+        c0["voucher_signer"].is_string(),
+        "signer still reported: {pretty}"
+    );
+    Ok(())
+}
+
 #[test]
 fn format_usdc_renders_six_decimals() {
     assert_eq!(format_usdc(0), "0.000000");
@@ -755,7 +838,7 @@ fn lanes_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
     assert_eq!(back.redeem_threshold_micro_usdc, 1_000_000);
     assert_eq!(back.lanes.len(), 1);
     let bc = back.lanes.first().expect("one lane");
-    assert_eq!(bc.counterparty, counterparty);
+    assert_eq!(bc.counterparty.as_deref(), Some(counterparty.as_str()));
     assert_eq!(bc.last_nonce, 7);
     assert_eq!(bc.outstanding_micro_usdc, 2_500_000);
     assert_eq!(bc.deposit_micro_usdc, 10_000_000);
