@@ -101,8 +101,7 @@ impl WarmConnection {
     /// Bounded as a whole by `open`, the same dial budget
     /// [`crate::open_progressive_pull`] applies to its one-shot dial.
     /// `dial_runtime` is the runtime the dial and the connection's driver run on;
-    /// `None` runs them on the caller's (see
-    /// [`PeerSource::with_dial_runtime`](crate::source::PeerSource::with_dial_runtime)).
+    /// `None` runs them on the caller's (see [`dial`]).
     ///
     /// # Errors
     ///
