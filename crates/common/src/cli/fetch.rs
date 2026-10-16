@@ -195,13 +195,14 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "MICRO_USDC")]
     pub working_deposit_micro_usdc: Option<u64>,
 
-    /// Client-side size ceiling: refuse a delivery whose claimed total size
-    /// exceeds this many MiB before pulling any bytes. Defaults to 1 TiB
+    /// Client-side cap on the bytes of one blob this fetch holds, in MiB. A
+    /// range anywhere in a larger blob is fetched while the bytes held fit; a
+    /// fetch that would hold more ends with `BlobTooLarge`. Defaults to 1 TiB
     /// (1,048,576 MiB) — far above any real blob, so `decdn get` downloads
     /// normal content by its hash without tuning, yet low enough to bound what a
     /// provider's over-claimed `total_bytes` can cost locally. Lower it as a
-    /// tighter budget guard, or set `0` to disable the ceiling entirely. For a
-    /// bundle this is the per-entry ceiling.
+    /// tighter budget guard, or set `0` to disable the cap entirely. For a
+    /// bundle this is the per-entry cap.
     ///
     /// The cost it bounds is on disk, not memory: the streaming pull buffers only
     /// received bytes in RAM, so RAM stays bounded whatever the claim, and a
@@ -210,7 +211,8 @@ pub struct ClientFetchArgs {
     /// sparse bao outboard sidecar (~0.4% of `total_bytes`) via `set_len` at
     /// creation, so without a ceiling an absurd claim could surface a local disk
     /// or quota error before verification rejects it. This gate caps that pre-size
-    /// (1 TiB → ~4 GiB) by refusing the claim first.
+    /// (1 TiB → ~4 GiB) by clamping the claim to the furthest requested offset
+    /// plus this cap first.
     #[arg(long, value_name = "MB", default_value_t = 1_048_576)]
     pub max_blob_mb: u64,
 

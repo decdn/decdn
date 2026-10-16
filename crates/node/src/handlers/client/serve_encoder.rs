@@ -132,6 +132,32 @@ impl AwaitingDataReader {
             .map_err(io::Error::other)?;
         Ok(missing.is_empty())
     }
+
+    /// The error for a store read of `[offset, offset + len)` that failed with
+    /// `err`. When the store lacks a byte of the span, `unlanded` builds the
+    /// error from the span's description: a read of bytes no fill landed
+    /// ([`decdn_cache::is_unlanded`]). When the store holds the span, or cannot
+    /// say, the read itself failed: a store fault, never a refusal.
+    async fn read_failure(
+        &mut self,
+        offset: u64,
+        len: u64,
+        err: &decdn_bao_range::RangedStoreError,
+        unlanded: impl FnOnce(String) -> io::Error,
+    ) -> io::Error {
+        let context = format!(
+            "[{offset}, +{len}) (the store read failed: {})",
+            decdn_cache::ErrorChain::new(err)
+        );
+        match self.present_covers(offset, len).await {
+            Ok(false) => unlanded(context),
+            Ok(true) => io::Error::other(format!("the store holds content {context}")),
+            Err(probe) => io::Error::other(format!(
+                "content {context}; its presence probe failed: {}",
+                decdn_cache::ErrorChain::new(&probe)
+            )),
+        }
+    }
 }
 
 impl AsyncSliceReader for AwaitingDataReader {
@@ -201,16 +227,20 @@ impl AsyncSliceReader for AwaitingDataReader {
                                  landed: {msg}; the hash is refused"
                             )));
                         }
-                        // The fill's error rides in the source chain, so a fill that
-                        // ended at the cap on held bytes reaches the serve leg as
-                        // that refusal.
-                        return self.store.read(offset, need).await.map_err(|err| {
-                            msg.unlanded(format!(
-                                "upstream pull failed before content [{offset}, +{len}) \
-                                 landed (the store read failed: {})",
-                                decdn_cache::ErrorChain::new(&err)
-                            ))
-                        });
+                        // Bytes the store lacks carry the fill's error in their
+                        // source chain, so a fill that ended at the cap on held
+                        // bytes reaches the serve leg as that refusal. A store that
+                        // fails to read bytes it holds is a fault of its own.
+                        return match self.store.read(offset, need).await {
+                            Ok(bytes) => Ok(bytes),
+                            Err(err) => Err(self
+                                .read_failure(offset, need, &err, |context| {
+                                    msg.unlanded(format!(
+                                        "upstream pull failed before content {context}"
+                                    ))
+                                })
+                                .await),
+                        };
                     }
                     // No recorded outcome, yet nothing live covers the range:
                     // `range_still_live` and `outcome` are read separately, so a fill
@@ -220,7 +250,7 @@ impl AsyncSliceReader for AwaitingDataReader {
                         if self.present_covers(offset, need).await? {
                             break;
                         }
-                        return Err(io::Error::other(format!(
+                        return Err(decdn_cache::unlanded(format!(
                             "no live fill covers content [{offset}, +{len}); every covering pull ended"
                         )));
                     }
@@ -272,10 +302,17 @@ impl AsyncSliceReader for AwaitingDataReader {
             }
         }
 
-        self.store
-            .read(offset, need)
-            .await
-            .map_err(io::Error::other)
+        match self.store.read(offset, need).await {
+            Ok(bytes) => Ok(bytes),
+            // A covering fill ended cleanly, or the present snapshot showed the
+            // span, yet the read missed bytes: a sibling fill that covered them
+            // ended first, or the hash was taken down.
+            Err(err) => Err(self
+                .read_failure(offset, need, &err, |context| {
+                    decdn_cache::unlanded(format!("no fill landed content {context}"))
+                })
+                .await),
+        }
     }
 
     async fn size(&mut self) -> io::Result<u64> {

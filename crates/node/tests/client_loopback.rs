@@ -3635,6 +3635,20 @@ async fn lower_voucher_after_higher_sibling_is_already_satisfied() -> anyhow::Re
 /// with `RangeOutOfBounds`.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_delivers_empty_blob() -> anyhow::Result<()> {
+    empty_blob_delivery(0).await
+}
+
+/// A requester with a cap on bytes held receives the 0-byte blob as an
+/// uncapped one does: the per-stream bound sizes no range against a signed size
+/// of zero.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_delivers_empty_blob_under_a_held_cap() -> anyhow::Result<()> {
+    empty_blob_delivery(1024 * 1024).await
+}
+
+/// One 0-byte blob delivery to a requester whose cap on bytes held is
+/// `max_blob_size_bytes` (`0` is no cap).
+async fn empty_blob_delivery(max_blob_size_bytes: u64) -> anyhow::Result<()> {
     // Empty payload → `hash` is the empty root, computed via `bao_tree::blake3`, by construction.
     let payload: Vec<u8> = Vec::new();
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
@@ -3677,16 +3691,20 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
     let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
 
-    let got = stream_fetch(
+    let got = stream_fetch_tracked(
         &client_ep,
         target,
         &ctx,
         &slash_domain(),
         server_eth.address(),
         *hash.as_bytes(),
+        decdn_protocol::client::NO_NAMESPACE,
         0,
         0x00c0_ffee,
-        Duration::from_secs(20),
+        PullDeadlines::whole_transfer(Duration::from_secs(20)),
+        max_blob_size_bytes,
+        0,
+        &mut VoucherProgress::default(),
     )
     .await?;
 

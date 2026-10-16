@@ -150,8 +150,11 @@ pub struct CacheArgs {
     #[arg(long, value_name = "MB", env = "DECDN_CACHE_SIZE_MB")]
     pub cache_size_mb: Option<u64>,
 
-    /// Maximum single blob size in megabytes [default: 51200 (50 GB), capped to
-    /// `cache_size_mb`]. Must not exceed `cache_size_mb`; `0` = unlimited.
+    /// Cap on the bytes of one blob the node holds, in megabytes [default: 51200
+    /// (50 GB), capped to `cache_size_mb`]. A blob from the node's own origin
+    /// larger than it is refused; a pull-through serves a range at any offset of
+    /// a larger blob while the bytes held for it fit. Must not exceed
+    /// `cache_size_mb`; `0` = unlimited.
     #[arg(long, value_name = "MB", env = "DECDN_MAX_BLOB_SIZE_MB")]
     pub max_blob_size_mb: Option<u64>,
 

@@ -1,4 +1,6 @@
-use super::{FillError, FillSession, IROH_BLOCK_SIZE};
+use super::{
+    FillError, FillSession, IROH_BLOCK_SIZE, ended_at_held_bytes_cap, is_unlanded, unlanded,
+};
 use bao_tree::io::fsm::Outboard;
 use bao_tree::{BaoTree, blake3};
 
@@ -173,4 +175,38 @@ fn chunk_span_ignores_an_open_ended_tail() {
     use bao_tree::{ChunkNum, ChunkRanges};
     let open = &ChunkRanges::from(ChunkNum(0)..ChunkNum(2)) | &ChunkRanges::from(ChunkNum(4)..);
     assert_eq!(super::chunk_span(&open), 2);
+}
+
+/// A fill ended at the cap on bytes held is found through every layer a serve
+/// read wraps it in: bare, as the source of an unlanded read, inside the
+/// `io::Error` payload, and under `anyhow` context.
+#[test]
+fn a_held_cap_end_is_found_through_its_wrappers() {
+    let cap = FillError::held_bytes_cap("ended at the cap");
+    assert!(ended_at_held_bytes_cap(&cap));
+    let read = cap.unlanded("content [0, +1024)");
+    assert!(ended_at_held_bytes_cap(&read));
+    assert!(is_unlanded(&read));
+    let wrapped = anyhow::Error::new(read).context("serve read");
+    assert!(wrapped.chain().any(ended_at_held_bytes_cap));
+    assert!(wrapped.chain().any(is_unlanded));
+}
+
+/// A fault is no cap end, wrapped or not, and an unlanded read that names
+/// no fill of its own carries no cap end either: only the serve leg's check
+/// of the bytes held can make it one.
+#[test]
+fn a_fault_or_a_bare_unlanded_read_is_no_held_cap_end() {
+    let fault = FillError::new("upstream reset");
+    assert!(!ended_at_held_bytes_cap(&fault));
+    let read = fault.unlanded("content [0, +1024)");
+    assert!(!ended_at_held_bytes_cap(&read));
+    assert!(is_unlanded(&read));
+    let bare = unlanded("no live fill covers content [0, +1024)");
+    assert!(!ended_at_held_bytes_cap(&bare));
+    assert!(is_unlanded(&bare));
+    // A flattened message keeps neither mark.
+    let flat = std::io::Error::other(format!("{read}"));
+    assert!(!ended_at_held_bytes_cap(&flat));
+    assert!(!is_unlanded(&flat));
 }

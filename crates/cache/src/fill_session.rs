@@ -117,14 +117,26 @@ impl FillError {
 
     /// The I/O error a serve read raises for bytes this ended fill did not
     /// land, prefixed by `context`. The fill's error stays in the error's
-    /// source chain, so [`ended_at_held_bytes_cap`] finds it.
+    /// source chain, so [`ended_at_held_bytes_cap`] finds it, and
+    /// [`is_unlanded`] holds for it.
     #[must_use]
     pub fn unlanded(&self, context: impl Into<String>) -> io::Error {
         io::Error::other(Unlanded {
             context: context.into(),
-            cause: self.clone(),
+            cause: Some(self.clone()),
         })
     }
+}
+
+/// The I/O error a serve read raises for bytes no fill landed and the store
+/// does not hold, when no ended fill of its own names the cause: the covering
+/// fills were siblings. [`is_unlanded`] holds for it.
+#[must_use]
+pub fn unlanded(context: impl Into<String>) -> io::Error {
+    io::Error::other(Unlanded {
+        context: context.into(),
+        cause: None,
+    })
 }
 
 impl std::fmt::Display for FillError {
@@ -135,22 +147,29 @@ impl std::fmt::Display for FillError {
 
 impl std::error::Error for FillError {}
 
-/// A serve read of bytes an ended fill did not land ([`FillError::unlanded`]).
+/// A serve read of bytes that no fill landed and the store does not hold
+/// ([`FillError::unlanded`], [`unlanded`]), with the ended fill's error when
+/// this serve's own fill ended.
 #[derive(Debug)]
 struct Unlanded {
     context: String,
-    cause: FillError,
+    cause: Option<FillError>,
 }
 
 impl std::fmt::Display for Unlanded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.context, self.cause)
+        match &self.cause {
+            Some(cause) => write!(f, "{}: {cause}", self.context),
+            None => f.write_str(&self.context),
+        }
     }
 }
 
 impl std::error::Error for Unlanded {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.cause)
+        self.cause
+            .as_ref()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -159,15 +178,34 @@ impl std::error::Error for Unlanded {
 /// ([`FillError::held_bytes_cap`]).
 #[must_use]
 pub fn ended_at_held_bytes_cap(err: &(dyn std::error::Error + 'static)) -> bool {
+    chain_has(err, &|e| {
+        e.downcast_ref::<FillError>()
+            .is_some_and(FillError::is_held_bytes_cap)
+    })
+}
+
+/// Whether `err` or an error in its source chain, including the payload of an
+/// [`io::Error`], is a serve read of bytes that no fill landed and the store
+/// does not hold ([`FillError::unlanded`], [`unlanded`]). A store that failed
+/// to read bytes it holds raises no such error.
+#[must_use]
+pub fn is_unlanded(err: &(dyn std::error::Error + 'static)) -> bool {
+    chain_has(err, &|e| e.downcast_ref::<Unlanded>().is_some())
+}
+
+/// Whether `is` holds for `err` or for an error in its source chain,
+/// descending into the payload of each [`io::Error`].
+fn chain_has(
+    err: &(dyn std::error::Error + 'static),
+    is: &dyn Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
     let mut next = Some(err);
     while let Some(e) = next {
-        if e.downcast_ref::<FillError>()
-            .is_some_and(FillError::is_held_bytes_cap)
-        {
+        if is(e) {
             return true;
         }
         if let Some(payload) = e.downcast_ref::<io::Error>().and_then(io::Error::get_ref)
-            && ended_at_held_bytes_cap(payload)
+            && chain_has(payload, is)
         {
             return true;
         }
@@ -1057,18 +1095,19 @@ impl SessionOutboardReader {
         }
     }
 
-    /// The terminal error for a node no live fill will supply: a precise message
-    /// when this session's own pull ended (the standalone / single-fill case), a
-    /// generic one when the covering fills were siblings.
+    /// The terminal error for a node no live fill will supply and the store
+    /// does not hold: a precise message when this session's own pull ended (the
+    /// standalone / single-fill case), a generic one when the covering fills
+    /// were siblings. Each is [`is_unlanded`].
     fn dead_range_error(&self, node: TreeNode) -> io::Error {
         match self.session.outcome() {
             Some(Err(msg)) => msg.unlanded(format!(
                 "upstream pull failed before supplying outboard node {node:?}"
             )),
-            Some(Ok(())) => io::Error::other(format!(
+            Some(Ok(())) => unlanded(format!(
                 "upstream pull completed but outboard node {node:?} was never captured"
             )),
-            None => io::Error::other(format!(
+            None => unlanded(format!(
                 "no live fill covers outboard node {node:?}; every covering pull ended"
             )),
         }

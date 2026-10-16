@@ -3155,7 +3155,8 @@ fn classify_pull_failure(
         // OUR ceiling, not the provider's fault — it may legitimately serve larger blobs to
         // nodes configured with a higher `max_blob_size`. Metered, not scored (#1895). The
         // pull ends once no room is left under the cap on bytes held, so we paid the
-        // upstream for at most the cap's worth, never for the peer's claim.
+        // upstream for about the cap's worth (each leg widens to whole chunk groups and
+        // carries its proof), never for the peer's claim.
         PullVerdict::Oversize => {
             deps.metrics.node_pull_too_large();
             debug!(%provider_addr, error = %err, "node-origin: pull ended at our cap on bytes held for the blob");

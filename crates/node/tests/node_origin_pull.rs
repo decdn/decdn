@@ -10676,7 +10676,8 @@ async fn window_pull_through_oversized_upstream_stops_at_the_held_cap() -> Resul
     let leaf_pool_id = B256::repeat_byte(0x6F);
     // The retry pays on its own lane: the first leaf may have paid B for an
     // interval before the abort, and a fresh pull on that lane would re-sign
-    // from zero and be refused as a regression rather than reach the ceiling.
+    // from zero and be refused as a regression rather than meet the held-bytes
+    // gate.
     let retry_eth = Arc::new(PrivateKeySigner::random());
     let retry_pool_id = B256::repeat_byte(0x70);
     // A two-interval cap, far below the 4 MiB blob, so B's stored bytes reach it
@@ -10732,7 +10733,7 @@ async fn window_pull_through_oversized_upstream_stops_at_the_held_cap() -> Resul
     .is_err();
     anyhow::ensure!(
         refused,
-        "an upstream blob over the size ceiling must abort the fused serve mid-stream, not complete"
+        "an upstream blob over the held-bytes cap must stop the fused serve mid-stream, not complete"
     );
 
     // Wait for B's pull leg to SETTLE (it writes the upstream watermark this test
@@ -10760,7 +10761,8 @@ async fn window_pull_through_oversized_upstream_stops_at_the_held_cap() -> Resul
     let upstream_bytes: u64 = u64::try_from(settled).unwrap_or(u64::MAX);
     let bound_content = max_blob_size_bytes;
     // Each leg carries its own proof path from the root, so the window's several
-    // legs pay a few proof pairs more than one leg over the same content would.
+    // legs pay proof pairs more than one leg over the same content would: 64
+    // pairs of 64 bytes, under one chunk group, so a leg past the cap still fails.
     let proof_slack = 64 * 64;
     let bound_wire = support::bao_wire_len(total_bytes, 0, bound_content) + proof_slack;
     anyhow::ensure!(
@@ -10769,7 +10771,7 @@ async fn window_pull_through_oversized_upstream_stops_at_the_held_cap() -> Resul
     );
     anyhow::ensure!(
         upstream_bytes <= bound_wire,
-        "B's upstream spend ({upstream_bytes} wire) must stay bounded to ~one ceiling \
+        "B's upstream spend ({upstream_bytes} wire) must stay bounded to ~one cap \
          ({bound_content} content = {bound_wire} wire), not the whole blob"
     );
     assert_counter(&b_metrics, "node_pull_too_large_total", 1)?;
@@ -10779,10 +10781,20 @@ async fn window_pull_through_oversized_upstream_stops_at_the_held_cap() -> Resul
     assert_counter(&b_metrics, "serve_stream_midstream_blob_too_large_total", 1)?;
     assert_counter(&b_metrics, "serve_stream_node_fault_total", 0)?;
 
-    // The tee claim was released on the abort arm: an identical retry is not wedged on
-    // a stranded in-flight entry. B already holds the cap's worth of the blob, so it
-    // refuses the retry `Declined` before it commits, and opens no new upstream pull
-    // (a leaked tee would instead hang/coalesce).
+    // The tee claim was released on the abort arm: no live fill of the hash is left
+    // registered. The retry below meets the held-bytes gate before it claims a fill,
+    // so only this direct check sees a stranded claim.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while cache_b.in_flight_total(hash).is_some() {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the ended fill must release its tee claim"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // B already holds the cap's worth of the blob, so it refuses an identical retry
+    // `Declined` before it commits, and opens no new upstream pull.
     let retry_sk = fresh_key();
     let retry_node_id = B256::from(*retry_sk.public().as_bytes());
     let (retry_ep, _) = local_endpoint(retry_sk, vec![]).await?;
@@ -10813,7 +10825,7 @@ async fn window_pull_through_oversized_upstream_stops_at_the_held_cap() -> Resul
 
 /// What a leaf's bounded pull through B's fused window path left behind, for the
 /// held-bytes cap tests.
-struct CeilingRun {
+struct HeldCapRun {
     /// The leaf's decoded span, or the error it saw.
     leaf: Result<Vec<u8>>,
     /// B's metrics.
@@ -10823,13 +10835,13 @@ struct CeilingRun {
 }
 
 /// Run one leaf pull of `[byte_offset, +byte_len)` for `payload` through a B whose
-/// cap on the bytes it holds for one blob is `ceiling`, then shut every node down.
-async fn ranged_pull_under_ceiling(
+/// cap on the bytes it holds for one blob is `cap`, then shut every node down.
+async fn ranged_pull_under_cap(
     payload: &[u8],
-    ceiling: u64,
+    cap: u64,
     byte_offset: u64,
     byte_len: u64,
-) -> Result<CeilingRun> {
+) -> Result<HeldCapRun> {
     let hash = Hash::new(payload);
     let ab_pool_id = B256::repeat_byte(0xC7);
     let b_buyer = Arc::new(PrivateKeySigner::random());
@@ -10849,7 +10861,7 @@ async fn ranged_pull_under_ceiling(
             leaf_pool_id,
             leaf_eth.address(),
             U256::from(DEPOSIT_MICRO_USDC),
-            ceiling,
+            cap,
         )
         .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
@@ -10873,7 +10885,7 @@ async fn ranged_pull_under_ceiling(
 
     shutdown([task_a, task_b], [&leaf_ep, &ep_b, &ep_a]).await?;
     let upstream = progress_log(&recorded)?;
-    Ok(CeilingRun {
+    Ok(HeldCapRun {
         leaf,
         b_metrics,
         upstream,
@@ -10891,7 +10903,7 @@ async fn window_pull_through_past_the_cap_offset_is_served_while_held_bytes_fit(
         .collect();
     let cap = 64 * 1024;
     let (offset, len) = (128 * 1024u64, 32 * 1024u64);
-    let run = ranged_pull_under_ceiling(&payload, cap, offset, len).await?;
+    let run = ranged_pull_under_cap(&payload, cap, offset, len).await?;
     let got = run
         .leaf
         .map_err(|e| anyhow::anyhow!("a range within the held-bytes cap must be served: {e:#}"))?;
@@ -10920,7 +10932,7 @@ async fn window_pull_through_past_the_cap_offset_is_served_while_held_bytes_fit(
 async fn window_pull_through_over_the_held_cap_ends_declined_without_a_node_fault() -> Result<()> {
     let payload = vec![0xC2u8; 256 * 1024];
     let cap = 64 * 1024;
-    let run = ranged_pull_under_ceiling(&payload, cap, 32 * 1024, 128 * 1024).await?;
+    let run = ranged_pull_under_cap(&payload, cap, 32 * 1024, 128 * 1024).await?;
     let err = match &run.leaf {
         Ok(got) => anyhow::bail!(
             "a range over the held-bytes cap cannot complete, got {} bytes",
@@ -10961,6 +10973,7 @@ async fn window_pull_through_over_the_held_cap_ends_declined_without_a_node_faul
 /// byte it lacks `Declined` before it commits: its own store says the pull
 /// could not land, so it opens no upstream stream and pays nothing.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn window_pull_through_with_the_cap_already_held_is_refused_before_commit() -> Result<()> {
     let payload: Vec<u8> = (0..256 * 1024usize)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
@@ -11028,6 +11041,9 @@ async fn window_pull_through_with_the_cap_already_held_is_refused_before_commit(
     );
     let a_streams = counter_value(&a_metrics, "serve_cache_hit_total")?;
     let paid_before = progress_log(&recorded)?.len();
+    // Both baselines must have moved, or the equalities below hold vacuously.
+    anyhow::ensure!(a_streams > 0, "the first range must reach A");
+    anyhow::ensure!(paid_before > 0, "B must pay A for the first range");
 
     // The second asks for bytes past them: B's held bytes leave no room.
     let second_sk = fresh_key();
@@ -11069,21 +11085,20 @@ async fn window_pull_through_with_the_cap_already_held_is_refused_before_commit(
     Ok(())
 }
 
-/// B has no gate on a request's end, so a blob that fits B's ceiling is served
+/// B has no gate on a request's end, so a blob that fits B's cap is served
 /// even when the request's `byte_len` runs far past both. A blob of exactly the
-/// ceiling's size fits, so the boundary is served too (#2256).
+/// cap's size fits, so the boundary is served too (#2256).
 #[tokio::test(flavor = "multi_thread")]
-async fn window_pull_through_over_long_range_on_a_blob_within_the_ceiling_is_served() -> Result<()>
-{
+async fn window_pull_through_over_long_range_on_a_blob_within_the_cap_is_served() -> Result<()> {
     let payload: Vec<u8> = (0..128 * 1024usize)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect();
     let total = u64::try_from(payload.len())?;
     let offset = 16 * 1024u64;
-    let run = ranged_pull_under_ceiling(&payload, total, offset, total * 8).await?;
+    let run = ranged_pull_under_cap(&payload, total, offset, total * 8).await?;
     let got = run
         .leaf
-        .map_err(|e| anyhow::anyhow!("a blob within the ceiling must be served: {e:#}"))?;
+        .map_err(|e| anyhow::anyhow!("a blob within the cap must be served: {e:#}"))?;
     let want = payload
         .get(usize::try_from(offset)?..)
         .ok_or_else(|| anyhow::anyhow!("offset out of bounds"))?;

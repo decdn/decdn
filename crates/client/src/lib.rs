@@ -857,7 +857,8 @@ impl std::fmt::Display for BlobTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "reached {} bytes, past the {}-byte cap on bytes held for one blob (BlobTooLarge)",
+            "reached {} bytes, past the {}-byte cap on bytes held for one blob \
+             (max_blob_size: --max-blob-mb or cache.max_blob_size_mb) (BlobTooLarge)",
             self.reached, self.ceiling
         )
     }
@@ -3247,8 +3248,10 @@ async fn open_progressive_pull_impl(
         // stream never carries more content than the cap, wherever in the blob it
         // starts. Enforced on the bytes that ACTUALLY arrive, never on the peer's
         // unverified `total_bytes` claim. The caller's driver meters the bytes the
-        // store holds across streams (`driver::fill_gap`). `0` = unlimited.
-        let max_received_wire = if max_blob_size_bytes == 0 {
+        // store holds across streams (`driver::fill_gap`). `0` = unlimited. The
+        // empty blob carries no content, so a cap has nothing to bound and no
+        // range to size against a signed size of zero.
+        let max_received_wire = if max_blob_size_bytes == 0 || total_bytes == 0 {
             0
         } else {
             aligned_wire_len(byte_offset, max_blob_size_bytes, total_bytes)?

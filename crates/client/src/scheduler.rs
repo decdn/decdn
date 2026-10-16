@@ -379,7 +379,11 @@ pub struct AcquireEnv<'a, Pc, F> {
     /// anywhere in a larger blob is fetched while the bytes held fit. A size
     /// claim is clamped to the furthest range start plus the cap before any
     /// work is sized, and the bound never grows past that. Ranges that would
-    /// hold more than the cap end the acquire with [`crate::BlobTooLarge`].
+    /// hold more than the cap end the acquire with [`crate::BlobTooLarge`]:
+    /// at once when the store's proven size shows it, else once the bytes
+    /// held reach the cap. Work that could pass the cap runs on one stream
+    /// at a time, whatever [`Self::max_lanes`] allows, so no two legs in
+    /// flight each take the same room under it.
     pub max_blob_bytes: u64,
     /// What the caller's run still needs, or `None` when this acquire is
     /// the whole run. A delegated fetch prices the running-low signal on the
@@ -3386,12 +3390,29 @@ where
     // A resumed record's bound wins over the caller's hint.
     let first_bound = store.total_bytes();
     let mut want = Want::new(ranges, first_bound, c0);
+    let missing = missing_chunks(store, &want.ranges).await?;
     let mut pending = VecDeque::new();
-    for (start, len) in
-        contiguous_byte_ranges(&missing_chunks(store, &want.ranges).await?, first_bound)
-    {
+    for (start, len) in contiguous_byte_ranges(&missing, first_bound) {
         pending.push_back(align_range(start, len, first_bound)?);
     }
+    // Seeded with the bytes already present, so a resumed fetch's bar starts
+    // where the last run left off; each lane folds in its own leg deltas.
+    let base_present = ranges_content_len(&store.present_ranges().await?, first_bound);
+    let needs = base_present.saturating_add(ranges_content_len(&missing, first_bound));
+    // A proven size is verified, so ranges that need more than the cap under
+    // it can never complete: end before any leg opens.
+    if cap > 0 && store.proven().is_some() && needs > cap {
+        return Err(anyhow::Error::new(crate::BlobTooLarge {
+            reached: needs,
+            ceiling: cap,
+        }));
+    }
+    // Each leg's room is what the store's held bytes leave under the cap, and
+    // a leg in flight on another stream is not yet held. Work that could pass
+    // the cap therefore runs one stream at a time: one lane, no extra streams.
+    // The planned work rests on a claim that may be inflated, so it narrows
+    // the fetch and never refuses it.
+    let mut one_stream = cap > 0 && needs > cap;
     let work = AsyncMutex::new(Work::new(pending, env.pacing.is_some()));
     let progress_wake = Notify::new();
 
@@ -3482,9 +3503,6 @@ where
     let mut generation_seen = env.credentials.map_or(0, CredentialSlot::generation);
     let mut capability_refused = false;
 
-    // Seeded with the bytes already present, so a resumed fetch's bar starts
-    // where the last run left off; each lane folds in its own leg deltas.
-    let base_present = ranges_content_len(&store.present_ranges().await?, first_bound);
     let progress_agg = AtomicU64::new(base_present);
     // Surface the resume base on the bar before any lane opens a leg.
     if let Some(cb) = env.on_progress {
@@ -3630,6 +3648,9 @@ where
                 want.fit(grown);
                 bound_seen.store(grown, Ordering::Release);
                 let missing = missing_chunks(store, &want.ranges).await?;
+                if cap > 0 && held.saturating_add(ranges_content_len(&missing, grown)) > cap {
+                    one_stream = true;
+                }
                 work.lock().await.regrow(&missing, grown)?;
                 if let Some(cb) = env.on_progress {
                     cb(progress_agg.load(Ordering::Relaxed), grown);
@@ -3673,7 +3694,8 @@ where
                 .copied()
                 .chain(ready.iter().map(|(p, _)| *p))
                 .collect();
-            let room = max_lanes.saturating_sub(busy.len());
+            let lane_cap = if one_stream { 1 } else { max_lanes };
+            let room = lane_cap.saturating_sub(busy.len());
             let starts = {
                 let mut w = work.lock().await;
                 // A fault, a delivery, a discovery or the end of a bar's time
@@ -3795,7 +3817,7 @@ where
             // found no lane to ask while a running lane has a `LaneWiden`: a
             // worker that takes its next range wakes no pass, and an own
             // worker drains a whole queue without ending (#2252).
-            if growth.due(now) {
+            if !one_stream && growth.due(now) {
                 let mut w = work.lock().await;
                 let wanted = w.growth_wanted(total_bytes, |lane| {
                     growth.may_ask(lane, now)

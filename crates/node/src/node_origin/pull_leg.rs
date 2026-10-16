@@ -184,6 +184,9 @@ impl PrimeLeg {
     /// block, cut to the request; the leg is the run cut to the window and to
     /// the cap on held bytes `max_blob_size_bytes` (`0` = none), as
     /// [`decdn_client::first_leg`] cuts it for a store holding none of the blob.
+    /// A node that holds other parts of the blob has less room under the cap,
+    /// so its first leg can be shorter than this one; the drive then does not
+    /// adopt the primed pull and opens its own leg.
     fn predicted_leg(
         &self,
         total_bytes: u64,
@@ -219,7 +222,8 @@ impl PrimeLeg {
             .min(request_end);
         let mut draw = (span_end - start).min(self.window);
         if max_blob_size_bytes > 0 {
-            // The node holds none of the range, so the cap's whole worth is room.
+            // Predicted for a store holding none of the blob, so the cap's whole
+            // worth is room.
             draw = draw.min(max_blob_size_bytes);
         }
         align_range(start, draw, total_bytes).ok()

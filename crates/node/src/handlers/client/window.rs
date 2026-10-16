@@ -223,6 +223,13 @@ impl ClientHandler {
                 .cache
                 .present_ranges(hash)
                 .await
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        %hash,
+                        error = %decdn_cache::ErrorChain::new(e),
+                        "held-bytes gate: the store read failed; the gate stays open"
+                    );
+                })
                 .is_ok_and(|present| present.held_bytes() >= cap)
         {
             release_reservation_unspent(floor_reservation.as_ref());
@@ -774,8 +781,7 @@ impl ClientHandler {
         // for wire-parity with the peer path. Its local pull leg's admission enforces
         // the engine cap on the bytes it actually stores, so an over-ceiling origin
         // blob fails the fill there rather than being refused up front on the probe
-        // size. Keeping both legs' ceiling-on-received keeps `max_blob_size_mb` one
-        // consistent rule across the serve-miss tiers.
+        // size.
 
         // (4) Sign + send the response up front — it commits to `total_bytes`,
         // which the caller already read from the origin size probe, and to the

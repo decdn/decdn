@@ -53,7 +53,7 @@ const DEFAULT_CACHE_SIZE_MB: u64 = 102_400;
 /// an arbitrary machine leaves comfortable room for the OS, logs, and other
 /// services below the cache's reactive (soft-evict + GC-lagged) ceiling.
 pub const DEFAULT_DISK_HEADROOM_MB: u64 = 8192;
-/// Default largest single blob admitted (50 GB), when `max_blob_size_mb` is unset.
+/// Default cap on the bytes of one blob held (50 GB), when `max_blob_size_mb` is unset.
 /// Comfortably holds the largest model shard the chunked-manifest wedge delivers
 /// while capping the RAM the buffered miss tier spends on one pull. Clamped down to
 /// `cache_size_mb` at resolve time, so the `max_blob_size_mb <= cache_size_mb`

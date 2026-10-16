@@ -1411,18 +1411,28 @@ since project inception and will roll into the first tagged release.
   at once. When only uncovered work is left and every source is absent or
   barred again after its probe, the item ends as a unanimous `NotFound` does.
 
-- **A proxy over its size ceiling refuses before commit, and the client
-  drops it for that blob (#2256).** On a pull-through miss the node refuses a
-  request whose start reaches its `max_blob_size` with
-  `StreamError::BlobTooLarge` before it signs the stream. A request that
-  starts below the ceiling still binds on received bytes: the node does not
-  gate a request's end, because only the upstream's unverified size says
-  where the blob ends.
-  New counter: `decdn_serve_stream_rejected_blob_too_large_total`. The client
-  excludes a proxy or whole holder that refuses as too large for the rest of
-  the blob; a partial holder loses only pull-through. `decdn_client::BlobTooLarge`
-  renames its `received` field to `reached`, and its message names the byte
-  position it reached, not a received count.
+- **`max_blob_size` caps the bytes of one blob held, not the offsets served
+  (#2256, #2463).** A node serves a pull-through range at any offset of a
+  blob larger than its `max_blob_size` while the bytes it holds for that blob
+  fit; a read past 16 GiB of a 30 GB blob on a 16 GiB node is served, not
+  failed as a node fault. Each pull leg spans at most the room the bytes held
+  leave under the cap, and the pull ends before it opens a leg that could only
+  add bytes past it, so nothing past the cap is paid for. Before it commits, a
+  node refuses `Declined` only when it already holds the cap's worth of the
+  blob and lacks a byte of the range; it never reads the request's offset or
+  the upstream's unverified size. A fill that ends at the cap mid-stream sends
+  the bytes that landed, then a mid-stream `Declined`, and counts on the new
+  `decdn_serve_stream_midstream_blob_too_large_total`, never on
+  `decdn_serve_stream_node_fault_total`; the refusal before commit counts on
+  `decdn_serve_stream_rejected_blob_too_large_total`. The client excludes a
+  proxy or whole holder that refuses as too large for the rest of the blob; a
+  partial holder loses only pull-through. `decdn get --max-blob-mb` caps the
+  bytes the fetch holds the same way: `open_progressive_pull` refuses no
+  offset, and a fetch of ranges that could hold more than the cap runs one
+  stream at a time so concurrent legs cannot pass it. A resumed download whose
+  proven size needs more than the cap ends at once. `decdn_client::BlobTooLarge`
+  names its field `reached`: the bytes held, or the wire bytes one stream
+  received, past `ceiling`.
 
 - **An under-fold heal after a payer crash no longer loops, and a healed
   lane fault does not end the pull (#2257).** When a trailing-proof
