@@ -414,12 +414,14 @@ fn build_completed_updates_records_present_omits_failed() {
                 hash: "b3:bb".into(),
                 size: 4,
             }]),
+            landed_from: None,
         },
         ManifestEntry {
             path: "bad.txt".into(),
             hash: "b3:cc".into(),
             size: Some(9),
             chunks: None,
+            landed_from: None,
         },
     ];
     let outcomes = vec![
@@ -430,7 +432,7 @@ fn build_completed_updates_records_present_omits_failed() {
         },
     ];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
-    let upd = build_completed_updates(&refs, &outcomes, tmp.path());
+    let upd = build_completed_updates(&refs, &outcomes, TEST_BUNDLE, tmp.path());
     assert!(upd.contains_key("ok.txt"));
     let rec = upd.get("ok.txt").expect("rec");
     assert_eq!(rec.hash, "b3:aa");
@@ -451,17 +453,19 @@ fn build_completed_updates_records_linked_and_skipped() {
             hash: "b3:l".into(),
             size: Some(2),
             chunks: None,
+            landed_from: None,
         },
         ManifestEntry {
             path: "skipped.txt".into(),
             hash: "b3:s".into(),
             size: Some(4),
             chunks: None,
+            landed_from: None,
         },
     ];
     let outcomes = vec![EntryOutcome::Linked, EntryOutcome::Skipped];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
-    let upd = build_completed_updates(&refs, &outcomes, tmp.path());
+    let upd = build_completed_updates(&refs, &outcomes, TEST_BUNDLE, tmp.path());
     // Both are successes this run and present on disk → both recorded.
     assert_eq!(upd.get("linked.txt").expect("linked").hash, "b3:l");
     assert_eq!(upd.get("skipped.txt").expect("skipped").hash, "b3:s");
@@ -482,22 +486,35 @@ fn build_completed_updates_omits_entry_absent_from_outcomes() {
             hash: "b3:done".into(),
             size: Some(3),
             chunks: None,
+            landed_from: None,
         },
         ManifestEntry {
             path: "pending.txt".into(),
             hash: "b3:new".into(), // new hash, not yet fetched
             size: Some(3),
             chunks: None,
+            landed_from: None,
         },
     ];
     let outcomes = vec![EntryOutcome::Fetched(3)]; // only "done.txt" has completed
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
-    let upd = build_completed_updates(&refs, &outcomes, tmp.path());
+    let upd = build_completed_updates(&refs, &outcomes, TEST_BUNDLE, tmp.path());
     assert!(upd.contains_key("done.txt"));
     assert!(
         !upd.contains_key("pending.txt"),
         "an entry not yet in outcomes must never be recorded"
     );
+}
+
+/// The bundle key tests record their skip-cache files under.
+const TEST_BUNDLE: &str = "b3:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// A skip-cache source in [`TEST_BUNDLE`], for records whose source no check reads.
+fn test_source() -> skip_cache::SavedSource {
+    skip_cache::SavedSource {
+        bundle: TEST_BUNDLE.to_owned(),
+        path: "test".to_owned(),
+    }
 }
 
 fn saved_file(hash: &str, size: u64) -> skip_cache::SavedFile {
@@ -506,6 +523,7 @@ fn saved_file(hash: &str, size: u64) -> skip_cache::SavedFile {
         size,
         mtime: SavedMtime { secs: 1, nanos: 0 },
         chunks: None,
+        source: test_source(),
     }
 }
 
@@ -710,6 +728,7 @@ fn hints_of_accumulates_offsets_and_validates_the_size_sum() {
         hash: format!("b3:{}", blake3::Hash::from_bytes([0xff; 32]).to_hex()),
         size: Some(100),
         chunks: Some(vec![chunk(60, 0xaa), chunk(40, 0xbb)]),
+        landed_from: None,
     };
     let hints = hints_of(&e).expect("valid hints");
     assert_eq!(hints.len(), 2);
@@ -732,6 +751,7 @@ fn hints_of_rejects_a_size_sum_that_disagrees_with_the_whole_file() {
         hash: format!("b3:{}", blake3::Hash::from_bytes([0xff; 32]).to_hex()),
         size: Some(100),
         chunks: Some(vec![chunk(60, 0xaa), chunk(30, 0xbb)]),
+        landed_from: None,
     };
     assert!(hints_of(&e).is_none());
 }
@@ -745,6 +765,7 @@ fn hints_of_needs_a_size_and_valid_chunk_hashes() {
         hash: "b3:ff".into(),
         size: None,
         chunks: Some(vec![chunk(60, 0xaa)]),
+        landed_from: None,
     };
     assert!(hints_of(&no_size).is_none());
 
@@ -756,6 +777,7 @@ fn hints_of_needs_a_size_and_valid_chunk_hashes() {
             hash: "not-a-hash".into(),
             size: 4,
         }]),
+        landed_from: None,
     };
     assert!(hints_of(&bad_hash).is_none());
 }
@@ -1076,6 +1098,7 @@ fn mentry(whole: u8, size: u64, chunks: &[(u64, u8)]) -> ManifestEntry {
         hash: format!("b3:{}", blake3::Hash::from_bytes([whole; 32]).to_hex()),
         size: Some(size),
         chunks: Some(chunks.iter().map(|&(s, b)| chunk(s, b)).collect()),
+        landed_from: None,
     }
 }
 
@@ -1205,12 +1228,14 @@ fn groups_ordered_by_any_declared_size_not_just_the_first() {
         hash: whole.clone(),
         size: None,
         chunks: None,
+        landed_from: None,
     };
     let sized_dup = ManifestEntry {
         path: "b".into(),
         hash: whole,
         size: Some(10),
         chunks: None,
+        landed_from: None,
     };
     let big = mentry(0x01, 900, &[(900, 0x91)]);
     let refs = vec![&big, &unsized_first, &sized_dup];
@@ -2497,6 +2522,14 @@ fn parse_manifest_accepts_v1_with_optional_size() {
     assert_eq!(m.entries[1].size, None);
 }
 
+/// A parsed manifest's hash is its bytes' BLAKE3: the hash its URI names.
+#[test]
+fn parse_manifest_keeps_the_blob_hash() {
+    let json = br#"{"version":1,"entries":[]}"#;
+    let m = BundleManifest::parse(json).unwrap();
+    assert_eq!(m.hash(), *blake3::hash(json).as_bytes());
+}
+
 #[test]
 fn parse_manifest_accepts_chunked_entry_in_order() {
     let json = br#"{"version":1,"entries":[{"path":"m.bin","hash":"b3:whole","size":100,"chunks":[{"hash":"b3:c0","size":60},{"hash":"b3:c1","size":40}]}]}"#;
@@ -2607,6 +2640,7 @@ fn entry(path: &str, hash: &str) -> ManifestEntry {
         hash: hash.into(),
         size: None,
         chunks: None,
+        landed_from: None,
     }
 }
 
@@ -2730,33 +2764,85 @@ fn plan_slots_rejects_the_pull_state_paths() {
     assert!(matches!(slots[2], Slot::Write { .. }));
 }
 
-/// `unrecorded_paths` names each entry path that holds something no pull
-/// recorded, and passes an absent path and a recorded one.
+/// Record `entries` as landed under `out` from the bundle `bundle`, as a pull
+/// does once each one lands.
+fn record_landed(out: &std::path::Path, bundle: [u8; 32], entries: &[&ManifestEntry]) {
+    let outcomes = vec![EntryOutcome::Skipped; entries.len()];
+    let updates = build_completed_updates(entries, &outcomes, &skip_cache::bundle_key(bundle), out);
+    let mut saved = skip_cache::load(out);
+    skip_cache::merge(&mut saved, updates);
+    skip_cache::write_bytes(out, &skip_cache::serialize(&saved).unwrap()).unwrap();
+}
+
+/// `foreign_paths` names each entry path that holds something no pull
+/// recorded, or that a pull recorded from another bundle or manifest path. It
+/// passes an absent path and a file this bundle entry wrote.
 #[test]
-fn unrecorded_paths_names_only_present_unrecorded_paths() {
+fn foreign_paths_names_unrecorded_and_other_source_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path();
-    std::fs::write(out.join("mine.txt"), b"user").unwrap();
+    let (this, other) = ([1u8; 32], [2u8; 32]);
+    for name in ["mine.txt", "pulled.bin", "renamed.json", "shared.txt"] {
+        std::fs::write(out.join(name), b"abc").unwrap();
+    }
     std::fs::create_dir(out.join("sub")).unwrap();
-    std::fs::write(out.join("pulled.bin"), b"abc").unwrap();
-    let pulled = entry(
-        "pulled.bin",
-        &format!("b3:{}", blake3::hash(b"abc").to_hex()),
-    );
-    let rec = record_one(out, &pulled).expect("record");
-    let mut saved = SavedManifest::default();
-    skip_cache::merge(&mut saved, BTreeMap::from([("pulled.bin".to_owned(), rec)]));
-    skip_cache::write_bytes(out, &skip_cache::serialize(&saved).unwrap()).unwrap();
+    let pulled = entry("pulled.bin", "b3:h");
+    let landed = entry("a/config.json", "b3:h").land_at("renamed.json");
+    record_landed(out, this, &[&pulled, &landed]);
+    record_landed(out, other, &[&entry("shared.txt", "b3:h")]);
 
-    let entries = [
-        entry("mine.txt", "b3:h"),
-        entry("sub", "b3:h"),
-        pulled,
-        entry("absent.bin", "b3:h"),
-    ];
+    let manifest = BundleManifest::new(
+        this,
+        vec![
+            entry("mine.txt", "b3:h"),
+            entry("sub", "b3:h"),
+            pulled,
+            landed,
+            entry("b/config.json", "b3:h").land_at("renamed.json"),
+            entry("shared.txt", "b3:h"),
+            entry("absent.bin", "b3:h"),
+        ],
+    );
+    let found = crate::bundle::foreign_paths(&manifest, out);
+    let from = |hash, path: &str| {
+        Some(crate::uri::DecdnUri::new(
+            hash,
+            crate::uri::UriTarget::BundleEntry(path.to_owned()),
+            None,
+        ))
+    };
+    let got: Vec<_> = found
+        .iter()
+        .map(|f| (f.path.as_str(), f.written_from.clone()))
+        .collect();
     assert_eq!(
-        crate::bundle::unrecorded_paths(&entries, out),
-        ["mine.txt", "sub"]
+        got,
+        [
+            ("mine.txt", None),
+            ("sub", None),
+            ("renamed.json", from(this, "a/config.json")),
+            ("shared.txt", from(other, "shared.txt")),
+        ]
+    );
+}
+
+/// A record names the entry's manifest path, not the name `land_at` gave it,
+/// and the manifest's hash as its bundle.
+#[test]
+fn record_one_names_the_manifest_path_of_a_landed_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("config.json"), b"{}").unwrap();
+    let en = entry("text_encoder/config.json", "b3:h").land_at("config.json");
+    assert_eq!(en.path, "config.json");
+    assert_eq!(en.manifest_path(), "text_encoder/config.json");
+    let bundle = skip_cache::bundle_key([7u8; 32]);
+    let rec = record_one(tmp.path(), &bundle, &en).expect("record");
+    assert_eq!(
+        rec.source,
+        skip_cache::SavedSource {
+            bundle,
+            path: "text_encoder/config.json".to_owned(),
+        }
     );
 }
 
@@ -2773,6 +2859,7 @@ async fn resolve_disk_state_skips_matching_file_by_rehash() {
         hash: h,
         size: Some(u64::try_from(body.len()).expect("len")),
         chunks: None,
+        landed_from: None,
     }];
     // Empty saved manifest → falls to the re-hash gate, still skips (content matches).
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
@@ -2810,6 +2897,7 @@ async fn resolve_disk_state_fast_skips_on_matching_record_without_rehash() {
             size,
             mtime,
             chunks: None,
+            source: test_source(),
         },
     );
     skip_cache::merge_and_write(tmp.path(), SavedManifest::default(), updates)
@@ -2820,6 +2908,7 @@ async fn resolve_disk_state_fast_skips_on_matching_record_without_rehash() {
         hash: claimed, // equals the saved record's hash → fast-skip candidate
         size: Some(size),
         chunks: None,
+        landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
     // Skipped on the record alone; a re-hash of the (non-matching) bytes would fetch.
@@ -2847,6 +2936,7 @@ async fn a_mismatched_entry_is_not_refetched_on_rerun() {
             size,
             mtime: SavedMtime::of(&meta).expect("mtime"),
             chunks: None,
+            source: test_source(),
         },
     );
     skip_cache::merge_and_write(tmp.path(), SavedManifest::default(), updates)
@@ -2857,6 +2947,7 @@ async fn a_mismatched_entry_is_not_refetched_on_rerun() {
         hash,
         size: Some(size - 7),
         chunks: None,
+        landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
     assert!(st.skip.contains("a.bin"), "accepted by its hash");
@@ -2892,6 +2983,7 @@ async fn resolve_disk_state_rehash_confirms_touched_but_identical_file() {
             size,
             mtime: stale,
             chunks: None,
+            source: test_source(),
         },
     );
     skip_cache::merge_and_write(tmp.path(), SavedManifest::default(), updates)
@@ -2902,6 +2994,7 @@ async fn resolve_disk_state_rehash_confirms_touched_but_identical_file() {
         hash: real,
         size: Some(size),
         chunks: None,
+        landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
     // Re-hash confirmed the content is identical → skip, no re-fetch.
@@ -2920,6 +3013,7 @@ async fn resolve_disk_state_fetches_changed_file() {
         hash: new,
         size: Some(11),
         chunks: None,
+        landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
     assert!(!st.skip.contains("a.txt")); // hash mismatch → fetch
@@ -2934,6 +3028,7 @@ async fn resolve_disk_state_absent_file_fetches() {
         hash: "b3:00".into(),
         size: Some(1),
         chunks: None,
+        landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
     assert!(!st.skip.contains("missing.txt"));
@@ -2951,6 +3046,7 @@ async fn resolve_disk_state_overwrite_skips_nothing() {
         hash: h,
         size: Some(u64::try_from(body.len()).expect("len")),
         chunks: None,
+        landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), true).await;
     assert!(st.skip.is_empty());
@@ -2972,10 +3068,12 @@ async fn resolve_disk_state_indexes_whole_file_donor_from_other_path() {
         hash: h.clone(),
         size: Some(4096),
         chunks: None,
+        landed_from: None,
     }];
     let updates = build_completed_updates(
         &old_entries.iter().collect::<Vec<_>>(),
         &[EntryOutcome::Fetched(4096)],
+        TEST_BUNDLE,
         tmp.path(),
     );
     skip_cache::merge_and_write(tmp.path(), SavedManifest::default(), updates)
@@ -2987,6 +3085,7 @@ async fn resolve_disk_state_indexes_whole_file_donor_from_other_path() {
         hash: h.clone(),
         size: Some(4096),
         chunks: None,
+        landed_from: None,
     }];
     let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
     let want = parse_hash(&h).expect("hash");
@@ -3014,10 +3113,12 @@ async fn resolve_disk_state_excludes_will_write_path_from_whole_file_index() {
         hash: old_hash.clone(),
         size: Some(32),
         chunks: None,
+        landed_from: None,
     }];
     let updates = build_completed_updates(
         &old_entries.iter().collect::<Vec<_>>(),
         &[EntryOutcome::Fetched(32)],
+        TEST_BUNDLE,
         tmp.path(),
     );
     skip_cache::merge_and_write(tmp.path(), SavedManifest::default(), updates)
@@ -3033,6 +3134,7 @@ async fn resolve_disk_state_excludes_will_write_path_from_whole_file_index() {
         hash: new_hash,
         size: Some(32),
         chunks: None,
+        landed_from: None,
     }];
 
     let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
@@ -3060,10 +3162,12 @@ async fn resolve_disk_state_overwrite_builds_no_whole_file_index() {
         hash: h.clone(),
         size: Some(16),
         chunks: None,
+        landed_from: None,
     }];
     let updates = build_completed_updates(
         &old.iter().collect::<Vec<_>>(),
         &[EntryOutcome::Fetched(16)],
+        TEST_BUNDLE,
         tmp.path(),
     );
     skip_cache::merge_and_write(tmp.path(), SavedManifest::default(), updates).expect("w");
@@ -3093,6 +3197,7 @@ async fn resolve_disk_state_does_not_skip_a_symlink() {
         hash: h,
         size: Some(u64::try_from(body.len()).expect("len")),
         chunks: None,
+        landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
     assert!(!st.skip.contains("link.txt"));
@@ -3115,6 +3220,7 @@ async fn resolve_disk_state_seeds_unchanged_and_old_chunks() {
         hash: uh,
         size: Some(20),
         chunks: Some(vec![ManifestChunk { hash: ch, size: 20 }]),
+        landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
     assert!(st.skip.contains("u.bin"));
@@ -3147,10 +3253,11 @@ async fn resolve_disk_state_seeds_old_chunks_of_a_changed_file() {
             hash: old_chunk_hash.clone(),
             size: 20,
         }]),
+        landed_from: None,
     }];
     let old_outcomes = vec![EntryOutcome::Fetched(20)];
     let old_refs: Vec<&ManifestEntry> = old_entries.iter().collect();
-    let updates = build_completed_updates(&old_refs, &old_outcomes, tmp.path());
+    let updates = build_completed_updates(&old_refs, &old_outcomes, TEST_BUNDLE, tmp.path());
     skip_cache::merge_and_write(tmp.path(), SavedManifest::default(), updates)
         .expect("write saved manifest");
     let saved = skip_cache::load(tmp.path());
@@ -3164,6 +3271,7 @@ async fn resolve_disk_state_seeds_old_chunks_of_a_changed_file() {
         hash: new_hash,
         size: Some(20),
         chunks: None,
+        landed_from: None,
     }];
 
     let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
@@ -3498,6 +3606,7 @@ fn settle_group_run_records_outcomes_and_passes_a_stop_through() {
             size: 3,
             mtime: SavedMtime { secs: 1, nanos: 0 },
             chunks: None,
+            source: test_source(),
         },
     );
     let landed = GroupRun::landed(vec![EntryOutcome::Fetched(3)], EntryBytes::whole_blob(3, 1));
@@ -3651,7 +3760,7 @@ fn a_manifest_size_mismatch_warns() {
     ];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let outcomes = vec![EntryOutcome::Fetched(12), EntryOutcome::Fetched(4)];
-    let updates = build_completed_updates(&refs, &outcomes, tmp.path());
+    let updates = build_completed_updates(&refs, &outcomes, TEST_BUNDLE, tmp.path());
     assert_eq!(
         size_warnings(&refs, &updates),
         vec!["big.bin: manifest says 4 bytes, the blob is 12 bytes".to_string()]

@@ -394,7 +394,7 @@ fn entry_filter_reports_nothing_when_every_pattern_matches() {
 #[test]
 fn a_selection_adds_its_dropped_entries_to_the_excluded_count() {
     let kept = Kept {
-        manifest: BundleManifest::new(sample()),
+        manifest: BundleManifest::new([0; 32], sample()),
         excluded: 2,
     };
     let kept = apply_selection(kept, |entries| {
@@ -905,20 +905,69 @@ fn a_default_destination_refuses_an_unrecorded_file() {
     let out = tmp.path();
     std::fs::write(out.join("config.json"), b"mine").unwrap();
     let uri = format!("decdn:{}/x/config.json", "ab".repeat(32));
-    let entries = [sel_entry("config.json", 3)];
+    let manifest = |path| BundleManifest::new([0xab; 32], vec![sel_entry(path, 3)]);
 
     let (args, _) = get_args(&uri, &[]);
-    let err = super::refuse_unrecorded(&args, out, &entries).unwrap_err();
+    let err = super::refuse_foreign(&args, out, &manifest("config.json")).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("config.json"), "{msg}");
+    assert!(msg.contains("no earlier `decdn get` wrote it"), "{msg}");
     assert!(msg.contains("-o"), "{msg}");
 
     for extra in [&["-o", "."][..], &["--overwrite"]] {
         let (args, _) = get_args(&uri, extra);
-        super::refuse_unrecorded(&args, out, &entries).unwrap();
+        super::refuse_foreign(&args, out, &manifest("config.json")).unwrap();
     }
     let (args, _) = get_args(&uri, &[]);
-    super::refuse_unrecorded(&args, out, &[sel_entry("absent.json", 3)]).unwrap();
+    super::refuse_foreign(&args, out, &manifest("absent.json")).unwrap();
+}
+
+/// Without `-o`, an entry pull that lands at a name an earlier pull wrote
+/// from another entry of the bundle is refused, naming that entry's URI (#2472).
+/// The same entry passes, and so do `-o` and `--overwrite`.
+#[test]
+fn a_default_destination_refuses_a_file_another_entry_wrote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path();
+    let hex = "ab".repeat(32);
+    std::fs::write(out.join("config.json"), b"{}").unwrap();
+    // The record a pull of `decdn:<hex>/text_encoder/config.json` leaves.
+    let saved = serde_json::json!({"version": 2, "files": {"config.json": {
+        "hash": "b3:00", "size": 2, "mtime": {"secs": 1, "nanos": 0},
+        "source": {"bundle": format!("b3:{hex}"), "path": "text_encoder/config.json"},
+    }}});
+    std::fs::write(
+        out.join(".decdn-manifest.json"),
+        serde_json::to_vec(&saved).unwrap(),
+    )
+    .unwrap();
+    let landed = |path: &str| {
+        let filter = EntryFilter::compile(Some(path.to_owned()), &[], &[])
+            .unwrap()
+            .landing_as(Some("config.json".to_owned()));
+        let entries = vec![
+            sel_entry("text_encoder/config.json", 2),
+            sel_entry("tokenizer/config.json", 2),
+        ];
+        BundleManifest::new([0xab; 32], filter.apply_and_warn(entries).unwrap().0)
+    };
+
+    let uri = format!("decdn:{hex}/tokenizer/config.json");
+    let (args, _) = get_args(&uri, &[]);
+    let err = super::refuse_foreign(&args, out, &landed("tokenizer/config.json")).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&format!(
+            "an earlier `decdn get` wrote it from decdn:{hex}/text_encoder/config.json"
+        )),
+        "{msg}"
+    );
+    for extra in [&["-o", "."][..], &["--overwrite"]] {
+        let (args, _) = get_args(&uri, extra);
+        super::refuse_foreign(&args, out, &landed("tokenizer/config.json")).unwrap();
+    }
+    let (args, _) = get_args(&format!("decdn:{hex}/text_encoder/config.json"), &[]);
+    super::refuse_foreign(&args, out, &landed("text_encoder/config.json")).unwrap();
 }
 
 /// The dry run of a default entry pull plans the entry at its file name and

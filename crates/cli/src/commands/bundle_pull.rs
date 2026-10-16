@@ -229,30 +229,29 @@ impl EntryFilter {
                 "the bundle has no entry {entry:?}; a URI path names one manifest `path` exactly"
             );
         }
-        let mut kept = pass.kept;
-        if let Some(name) = &self.land_as {
-            for e in &mut kept {
-                e.path.clone_from(name);
-            }
-        }
+        let kept = match &self.land_as {
+            Some(name) => pass.kept.into_iter().map(|e| e.land_at(name)).collect(),
+            None => pass.kept,
+        };
         Ok((kept, pass.excluded))
     }
 }
 
 /// Refuse a pull into a default destination (no `-o`) that would replace a
-/// file no earlier pull wrote there: a pull fetches over a file whose bytes
-/// differ from its entry's, and the user did not choose this directory.
-/// `--overwrite` asks for the replacement, so it passes.
+/// file this pull did not write there: one no earlier pull wrote, or one an
+/// earlier pull wrote from another bundle or entry path. A pull fetches over a
+/// file whose bytes differ from its entry's, and the user did not choose this
+/// directory. `--overwrite` asks for the replacement, so it passes.
 ///
 /// # Errors
 ///
-/// When an entry path of `entries` under `out` holds a file, directory or link
-/// that the skip-cache in `out` has no record of.
-fn refuse_unrecorded(args: &GetArgs, out: &Path, entries: &[ManifestEntry]) -> anyhow::Result<()> {
+/// When an entry path of `manifest` under `out` holds a file, directory or
+/// link that [`decdn_client::bundle::foreign_paths`] names.
+fn refuse_foreign(args: &GetArgs, out: &Path, manifest: &BundleManifest) -> anyhow::Result<()> {
     if args.output.is_some() || args.overwrite {
         return Ok(());
     }
-    let found = decdn_client::bundle::unrecorded_paths(entries, out);
+    let found = decdn_client::bundle::foreign_paths(manifest, out);
     let Some(first) = found.first() else {
         return Ok(());
     };
@@ -260,11 +259,14 @@ fn refuse_unrecorded(args: &GetArgs, out: &Path, entries: &[ManifestEntry]) -> a
         1 => String::new(),
         n => format!(" (and {} more)", n.saturating_sub(1)),
     };
+    let writer = first.written_from.as_ref().map_or_else(
+        || "no earlier `decdn get` wrote it".to_owned(),
+        |uri| format!("an earlier `decdn get` wrote it from {uri}"),
+    );
     anyhow::bail!(
-        "refusing to replace {}{more}: no earlier `decdn get` wrote it; pass `-o <dir>` to \
-         pull into another directory, or `-o .` to pull here and replace each such file \
-         whose bytes differ",
-        out.join(first).display()
+        "refusing to replace {}{more}: {writer}; pass `-o <dir>` to pull into another \
+         directory, or `-o .` to pull here and replace each such file whose bytes differ",
+        out.join(&first.path).display()
     )
 }
 
@@ -817,7 +819,7 @@ async fn pull_manifest(
         };
         let kept = maybe_select(args, out, uri, kept)?;
         if let Some(Kept { manifest, .. }) = &kept {
-            refuse_unrecorded(args, out, &manifest.entries)?;
+            refuse_foreign(args, out, manifest)?;
         }
         anyhow::Ok(kept)
     }
@@ -1141,7 +1143,7 @@ fn dry_run(
     };
     let raw_empty = manifest.entries.is_empty();
     manifest.entries = filter.apply_and_warn(manifest.entries)?.0;
-    refuse_unrecorded(args, output, &manifest.entries)?;
+    refuse_foreign(args, output, &manifest)?;
     if args.json {
         // The `--json` plan stays machine-readable — an empty set is
         // `count: 0` with an empty `entries` array, no prose line. A bundle

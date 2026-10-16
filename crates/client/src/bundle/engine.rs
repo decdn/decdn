@@ -1578,7 +1578,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         }
     }
 
-    /// Pull every one of `entries` into `out_root`, and say how it ended.
+    /// Pull every entry of `manifest` into `out_root`, and say how it ended.
     ///
     /// A funding recovery step that replaced the pool ends the first pass. The
     /// remaining entries run once more against the new pool: lanes key on the
@@ -1587,11 +1587,14 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// second replacement ends the pull "funding needed".
     pub(super) async fn run(
         &mut self,
-        entries: &[ManifestEntry],
+        manifest: &super::BundleManifest,
         out_root: &Path,
         overwrite: bool,
         cancel: &CancellationToken,
     ) -> BundleOutcome {
+        let entries = manifest.entries.as_slice();
+        // Each skip-cache record names the bundle its file came from.
+        let bundle = skip_cache::bundle_key(manifest.hash());
         // The run's total meters its **download** — the bytes actually fetched
         // after shared-chunk dedup — beside the whole on-disk content size.
         let fetch_plan = build_fetch_plan(entries);
@@ -1612,7 +1615,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // lanes' paid bytes grew by while it ran.
         let paid_before = self.ledgers.paid_bytes();
         let mut run = self
-            .pull_all(entries, out_root, overwrite, saved, cancel)
+            .pull_all(entries, &bundle, out_root, overwrite, saved, cancel)
             .await;
         let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
         let replaced = replaced_pool(&run);
@@ -1627,7 +1630,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             self.recovery.start_next_pass();
             let saved = skip_cache::load(out_root);
             let second = self
-                .pull_all(entries, out_root, overwrite, saved, cancel)
+                .pull_all(entries, &bundle, out_root, overwrite, saved, cancel)
                 .await;
             run = merge_passes(run, second);
             paid = paid.saturating_add(self.ledgers.paid_bytes());
@@ -1713,6 +1716,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     async fn pull_all(
         &self,
         entries: &[ManifestEntry],
+        bundle: &str,
         out_root: &Path,
         overwrite: bool,
         saved: SavedManifest,
@@ -1754,6 +1758,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         let run = self
             .pull_plain(
                 &refs,
+                bundle,
                 out_root,
                 overwrite,
                 &index,
@@ -1790,6 +1795,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     async fn pull_plain<'e>(
         &self,
         entries: &[&'e ManifestEntry],
+        bundle: &str,
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
@@ -1843,7 +1849,8 @@ impl<P: Provider + Clone> PullCtx<P> {
                         run.outcomes.len(),
                         "fetch_group must return one outcome per entry"
                     );
-                    let updates = build_completed_updates(&group_entries, &run.outcomes, out_root);
+                    let updates =
+                        build_completed_updates(&group_entries, &run.outcomes, bundle, out_root);
                     let warnings = size_warnings(&group_entries, &updates);
                     (run, updates, warnings)
                 }
@@ -3865,14 +3872,15 @@ pub(super) fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
-/// The skip-cache record for one entry, built from its FINAL on-disk state, or
+/// The skip-cache record for one entry of the bundle `bundle`
+/// ([`skip_cache::bundle_key`]), built from its FINAL on-disk state, or
 /// `None` when this run has nothing safe to record for it. A record is produced
 /// only when a regular file is present at the entry's path with a usable mtime —
 /// the gates that keep a symlink, a non-regular file, a missing file, or an
 /// unreadable mtime out of the later fast-skip path. `materialize` renames new
 /// content into place only on success, so a present regular file at the path is
 /// this run's landed bytes; pairing the entry's hash with them is sound.
-fn record_one(out_root: &Path, en: &ManifestEntry) -> Option<skip_cache::SavedFile> {
+fn record_one(out_root: &Path, bundle: &str, en: &ManifestEntry) -> Option<skip_cache::SavedFile> {
     let dest = safe_join(out_root, &en.path).ok()?;
     // `symlink_metadata` does not follow links: only a regular file this run
     // landed is recorded, so a symlink or non-regular file at `dest` is never
@@ -3896,6 +3904,10 @@ fn record_one(out_root: &Path, en: &ManifestEntry) -> Option<skip_cache::SavedFi
         size: meta.len(),
         mtime,
         chunks,
+        source: skip_cache::SavedSource {
+            bundle: bundle.to_owned(),
+            path: en.manifest_path().to_owned(),
+        },
     })
 }
 
@@ -3936,10 +3948,12 @@ fn size_warnings(
 /// is what makes this safe to call MID-RUN: an entry whose group has not
 /// completed yet is simply absent from `outcomes`, so it is never recorded from
 /// bytes this run has not landed. A batch may be one completed group or the whole
-/// run's outcomes; the result is the same records either way.
+/// run's outcomes; the result is the same records either way. Each record names
+/// `bundle` ([`skip_cache::bundle_key`]) as its source.
 fn build_completed_updates(
     entries: &[&ManifestEntry],
     outcomes: &[EntryOutcome],
+    bundle: &str,
     out_root: &Path,
 ) -> BTreeMap<String, skip_cache::SavedFile> {
     let mut updates = BTreeMap::new();
@@ -3948,7 +3962,7 @@ fn build_completed_updates(
             outcome,
             EntryOutcome::Fetched(_) | EntryOutcome::Linked | EntryOutcome::Skipped
         );
-        if recordable && let Some(rec) = record_one(out_root, en) {
+        if recordable && let Some(rec) = record_one(out_root, bundle, en) {
             updates.insert(en.path.clone(), rec);
         }
     }

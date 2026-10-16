@@ -13,6 +13,10 @@ fn sample() -> SavedFile {
             hash: "b3:bb".into(),
             size: 10,
         }]),
+        source: SavedSource {
+            bundle: bundle_key([3u8; 32]),
+            path: "src/b.txt".into(),
+        },
     }
 }
 
@@ -27,6 +31,7 @@ fn write_then_load_round_trips() {
     let got = loaded.get("a/b.txt").expect("entry present");
     assert_eq!(got.hash, "b3:aa");
     assert_eq!(got.size, 10);
+    assert_eq!(got.source, sample().source);
     assert_eq!(
         got.mtime,
         SavedMtime {
@@ -47,6 +52,33 @@ fn corrupt_file_loads_empty_not_error() {
     let tmp = tempfile::tempdir().expect("tmp");
     std::fs::write(tmp.path().join(SAVED_MANIFEST_NAME), b"{not json").expect("write");
     assert!(load(tmp.path()).get("anything").is_none());
+}
+
+#[test]
+fn an_earlier_version_loads_empty() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    std::fs::write(
+        tmp.path().join(SAVED_MANIFEST_NAME),
+        br#"{"version":1,"files":{"a.txt":{"hash":"b3:aa","size":1,"mtime":{"secs":1,"nanos":0}}}}"#,
+    )
+    .expect("write");
+    assert!(load(tmp.path()).get("a.txt").is_none());
+}
+
+#[test]
+fn source_matches_only_its_bundle_and_path_and_prints_its_uri() {
+    let src = sample().source;
+    assert!(src.is(&bundle_key([3u8; 32]), "src/b.txt"));
+    assert!(!src.is(&bundle_key([4u8; 32]), "src/b.txt"));
+    assert!(!src.is(&bundle_key([3u8; 32]), "b.txt"));
+    let uri = src.uri().expect("a hash");
+    assert_eq!(uri.hash, [3u8; 32]);
+    assert_eq!(uri.target, UriTarget::BundleEntry("src/b.txt".into()));
+    let bad = SavedSource {
+        bundle: "not-a-hash".into(),
+        path: "x".into(),
+    };
+    assert!(bad.uri().is_none());
 }
 
 #[test]
@@ -85,6 +117,8 @@ fn saved_hints_places_offsets_and_validates_sum() {
                 size: 20,
             },
         ]),
+
+        source: sample().source,
     };
     let got = saved_hints(&rec).expect("hints");
     assert_eq!(got, vec![("b3:c0".into(), 0, 10), ("b3:c1".into(), 10, 20)]);
@@ -112,6 +146,8 @@ fn saved_hints_rejects_bad_sum_and_absent_chunks() {
             hash: "b3:c0".into(),
             size: 10,
         }]),
+
+        source: sample().source,
     };
     assert!(saved_hints(&rec).is_none()); // 10 != 99
     rec.chunks = None;

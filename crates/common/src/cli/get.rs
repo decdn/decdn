@@ -53,7 +53,8 @@ pub struct GetArgs {
     /// to stream that one entry to stdout. Without `-o`, a blob lands at
     /// `./<hash>`, a bundle in `.`, and an entry at `./<name>` (the last
     /// segment of its path); a bundle or entry pull then refuses a path that
-    /// holds a file no earlier pull wrote, unless `--overwrite`.
+    /// holds a file no earlier pull wrote, or that one wrote from another
+    /// bundle or entry path, unless `--overwrite`.
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 

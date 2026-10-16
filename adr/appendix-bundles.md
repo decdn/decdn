@@ -398,13 +398,17 @@ The rules below apply to every pull:
   files** by default (re-runs resume), and `--overwrite` forces a re-fetch.
   The skip check accepts a file by its hash. A saved record whose size and
   mtime match is a fast path. Without a match, the pull hashes the file
-  against the manifest.
+  against the manifest. Each saved record also names its source: the
+  manifest hash and the entry's manifest path.
 - **Output directory.** `-o <dir>` names the output directory. Without
   `-o`, the output directory is `.`. An entry URI without `-o` writes the
   entry to `./<name>`. `<name>` is the last segment of the entry's path.
   The pull does not make the entry's parent directories. A pull without `-o`
   refuses an entry path that holds a file with no skip-cache record, because
-  the user did not choose that directory. `--overwrite` disables this check.
+  the user did not choose that directory. It also refuses a path whose
+  record names another source: another manifest hash, or another manifest
+  path. The error names that source as a `decdn:` URI. `--overwrite`
+  disables this check.
   The manifest cache (`.decdn-bundles/`), the skip-cache
   (`.decdn-manifest.json`) and the staging directory (`.decdn-partial/`) go
   into the output directory. An entry at one of these paths fails. Without

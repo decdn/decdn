@@ -2,7 +2,9 @@
 //! writes into an output directory. It indexes every file the bundle(s) have
 //! placed there — keyed by bundle-relative POSIX path, merged across runs — so a
 //! later pull skips unchanged files without re-hashing and splices unchanged
-//! byte ranges from bytes already on disk.
+//! byte ranges from bytes already on disk. Each record names its source: the
+//! bundle and the manifest path the file came from, so a pull into a directory
+//! the user did not choose can tell its own files from another source's.
 //!
 //! The cache is advisory, not authoritative. A skip takes one of two paths: the
 //! re-hash path confirms the on-disk bytes against the new manifest hash before
@@ -21,11 +23,13 @@ use std::time::UNIX_EPOCH;
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
+use crate::uri::{DecdnUri, UriTarget};
+
 /// File name of the local skip-cache, written at the pull output root.
 pub(crate) const SAVED_MANIFEST_NAME: &str = ".decdn-manifest.json";
 
 /// Current on-disk schema version. A file with any other version loads empty.
-const SAVED_MANIFEST_VERSION: u32 = 1;
+const SAVED_MANIFEST_VERSION: u32 = 2;
 
 /// The local skip-cache: an index of the bundle files known to live under one
 /// output root, keyed by bundle-relative POSIX path. Ordered (`BTreeMap`) so the
@@ -52,8 +56,9 @@ impl SavedManifest {
 }
 
 /// One recorded file: the whole-file content address and size last materialized
-/// at this path, the mtime observed for it (the cheap change gate), and its
-/// range-dedup chunks when the source manifest carried them.
+/// at this path, the mtime observed for it (the cheap change gate), its
+/// range-dedup chunks when the source manifest carried them, and the bundle
+/// entry it came from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SavedFile {
     /// The whole-file BLAKE3 content address, `b3:<hex>`.
@@ -66,6 +71,43 @@ pub(crate) struct SavedFile {
     /// carried them; `None` for a plain (unhinted) entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) chunks: Option<Vec<SavedChunk>>,
+    /// The bundle entry the pull wrote this file from.
+    pub(crate) source: SavedSource,
+}
+
+/// The bundle entry a [`SavedFile`] came from: the manifest's hash and the
+/// entry's manifest path. An entry URI pull lands an entry under another name,
+/// so the record's key alone does not name its entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SavedSource {
+    /// The manifest blob's BLAKE3 hash, `b3:<hex>` ([`bundle_key`]).
+    pub(crate) bundle: String,
+    /// The entry's `path` in that manifest.
+    pub(crate) path: String,
+}
+
+impl SavedSource {
+    /// Whether this is the entry at manifest `path` of the bundle `bundle`
+    /// ([`bundle_key`]).
+    pub(crate) fn is(&self, bundle: &str, path: &str) -> bool {
+        self.bundle == bundle && self.path == path
+    }
+
+    /// The `decdn:<hash>/<path>` URI of this entry, or `None` when the
+    /// recorded bundle is not a hash.
+    pub(crate) fn uri(&self) -> Option<DecdnUri> {
+        let hash = super::parse_hash(&self.bundle).ok()?;
+        Some(DecdnUri::new(
+            hash,
+            UriTarget::BundleEntry(self.path.clone()),
+            None,
+        ))
+    }
+}
+
+/// The form a [`SavedSource`] records the manifest hash `hash` in: `b3:<hex>`.
+pub(crate) fn bundle_key(hash: [u8; 32]) -> String {
+    format!("b3:{}", blake3::Hash::from_bytes(hash).to_hex())
 }
 
 /// One range-dedup chunk of a [`SavedFile`]: a BLAKE3 over a byte range and its
