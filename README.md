@@ -26,6 +26,8 @@ economics from day one ([ADR 016](adr/016-contract-interactions.md)).
 
 **[Website](https://decdn.org)** · **[Documentation](https://docs.decdn.org)** · **[Network stats](https://stats.decdn.org)** · **[Discord](https://discord.gg/vVbNswKVGX)** · **[X](https://x.com/decdn_)**
 
+![decdn get pulling content from the deCDN testnet](https://github.com/user-attachments/assets/422fa510-2844-4f27-b3ff-649a36711792)
+
 ## Status
 
 Public testnet on Arbitrum Sepolia. Signed release archives, crates and container images
