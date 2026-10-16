@@ -653,3 +653,14 @@ fn max_manifest_mb_is_the_byte_cap_in_mib() {
         MAX_MANIFEST_MB
     );
 }
+
+#[test]
+fn a_manifest_fetch_caps_at_the_manifest_size() {
+    assert_eq!(
+        manifest_cap_mb(0),
+        MAX_MANIFEST_MB,
+        "no cap takes the manifest cap"
+    );
+    assert_eq!(manifest_cap_mb(10), 10, "a lower cap stays");
+    assert_eq!(manifest_cap_mb(1 << 20), MAX_MANIFEST_MB);
+}
