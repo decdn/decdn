@@ -904,6 +904,50 @@ async fn two_data_dirs_adopt_one_pool_on_disjoint_lanes() {
     }
 }
 
+/// #2468 review: data dir A opened the pool and tracks it, and another data
+/// dir on the wallet has since redeemed 9 of its 10 USDC on lanes A does not
+/// track. A's next run reads that spend from chain, so the pool reads 1 USDC
+/// remaining and the low-water refill fires. Read from A's row alone, the pool
+/// would read full: no refill, and a funding recovery that never tops up.
+#[tokio::test]
+async fn a_tracked_row_counts_what_another_data_dir_redeemed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let owner = signer.address();
+    let id = B256::repeat_byte(0xEE);
+    store
+        .record(&tracked_row(
+            id,
+            owner,
+            lane_of(&store, &signer),
+            WORKING,
+            &[],
+        ))
+        .unwrap();
+
+    let mut calls = vec![
+        Some(pool(owner, WORKING, 9_000_000).abi_encode().into()),
+        Some(lane(0, 0)),
+    ];
+    calls.extend(refill_fails_with_wallet(0));
+    let (result, drained) = run_in(
+        &store,
+        &signer,
+        ChainAdoption::Allowed,
+        calls,
+        &RunFunding::default(),
+    )
+    .await;
+    let (_, spend) = result.expect("1 USDC remains, so the lane builds");
+    assert_eq!(
+        spend.outside,
+        U256::from(9_000_000u64),
+        "the other data dir's redemptions count as spend"
+    );
+    assert!(drained, "the low pool fired the refill");
+}
+
 /// A ledger seeded at `amount`.
 fn ledger_at(amount: u64) -> Arc<PoolLedger> {
     Arc::new(PoolLedger::new(Cumulative {
@@ -1101,15 +1145,30 @@ async fn the_cli_funder_reads_the_run_funding() {
     );
 }
 
-/// Run a recovery step for a self-funded pool that already holds its working
-/// deposit, with the chain's `topUp` estimate answered by `estimate`. Also
-/// returns the opens the step left unconfirmed in the run's handle.
+/// The owner key of [`step_on_a_full_pool`]'s pool, so a test can script its
+/// `getPool` answer.
+fn full_pool_owner() -> Arc<PrivateKeySigner> {
+    Arc::new(PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42)).unwrap())
+}
+
+/// The `getPool` answer a recovery step reads first: [`full_pool_owner`]'s
+/// open pool at the working deposit, `redeemed` of it paid out.
+fn full_pool_on_chain(redeemed: u64) -> Bytes {
+    pool(full_pool_owner().address(), WORKING, redeemed)
+        .abi_encode()
+        .into()
+}
+
+/// Run a recovery step for a self-funded pool that, as far as the run knows,
+/// already holds its working deposit. The step reads the pool on chain first
+/// (`asserter`'s first answer, see [`full_pool_on_chain`]). Also returns the
+/// opens the step left unconfirmed in the run's handle.
 async fn step_on_a_full_pool(
     asserter: Asserter,
 ) -> (anyhow::Result<Recovery>, Vec<OpenUnconfirmed>) {
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
-    let signer = Arc::new(PrivateKeySigner::random());
+    let signer = full_pool_owner();
     let id = B256::repeat_byte(0xEE);
     store
         .record(&tracked_row(
@@ -1146,10 +1205,39 @@ async fn step_on_a_full_pool(
 #[tokio::test]
 async fn a_full_open_pool_settles_without_a_top_up() {
     let asserter = Asserter::new();
+    asserter.push_success(&full_pool_on_chain(0));
     asserter.push_success(&alloy::primitives::U64::from(50_000u64));
     let stepped = step_on_a_full_pool(asserter.clone()).await.0.unwrap();
     assert_matches!(stepped, Recovery::ToppedUp(d) if d == U256::from(WORKING));
-    assert!(asserter.read_q().is_empty(), "only the estimate ran");
+    assert!(
+        asserter.read_q().is_empty(),
+        "only the pool read and the estimate ran"
+    );
+}
+
+/// #2468 review: another data dir on the wallet redeemed 9 of the pool's 10
+/// USDC while this run went on. The run's own view reads the pool full, but
+/// the step reads the chain and tops up rather than only settling. Here the
+/// wallet holds no USDC, so the top-up ends in a shortfall.
+#[tokio::test]
+async fn a_pool_another_data_dir_drained_tops_up() {
+    let asserter = Asserter::new();
+    asserter.push_success(&full_pool_on_chain(9_000_000));
+    // The allowance read faults, and the wallet holds no USDC.
+    asserter.push_failure_msg("allowance read faulted");
+    asserter.push_success(&U256::ZERO.abi_encode());
+    let err = step_on_a_full_pool(asserter.clone())
+        .await
+        .0
+        .expect_err("a wallet with no USDC cannot top up");
+    assert!(
+        err.downcast_ref::<WalletShortfall>().is_some(),
+        "the step tried a top-up rather than settling: {err:#}"
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "the pool, allowance and wallet reads ran"
+    );
 }
 
 /// A full pool that is closing or closed still needs a replacement: its
@@ -1159,6 +1247,7 @@ async fn a_full_open_pool_settles_without_a_top_up() {
 async fn a_full_closing_pool_is_replaced() {
     let selector = alloy::primitives::keccak256("PoolNotOpen()");
     let asserter = Asserter::new();
+    asserter.push_success(&full_pool_on_chain(0));
     asserter.push_failure(
         serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
             "code": 3,

@@ -332,6 +332,7 @@ where
                 .funding
                 .pool_id()
                 .ok_or_else(|| anyhow::anyhow!("no payment lane is built, so no pool to top up"))?;
+            let remaining = self.chain_remaining(pool_id, remaining).await;
             let additional = self.working_deposit.saturating_sub(remaining);
             if additional.is_zero() {
                 return self.settle_or_replace(pool_id, remaining).await;
@@ -407,6 +408,39 @@ impl<P> PoolFunder<'_, P>
 where
     P: alloy::providers::Provider + Clone,
 {
+    /// The pool's remaining deposit for a recovery step: the run's `remaining`,
+    /// capped at what the chain shows.
+    ///
+    /// Other signers share the pool, such as another data dir on the wallet
+    /// ([`decdn_incentive::lane_signer`]). Their redemptions reach the run only
+    /// from chain, and can land while the run is going. So the step reads
+    /// `getPool` and counts at least `totalRedeemed` as spent
+    /// ([`BuyerPoolState::reconcile_with_chain`]). Without it, a pool drained
+    /// by another signer reads full here, the step only settles, and the run
+    /// ends "funding needed" with a funded wallet. A failed read keeps the
+    /// run's view.
+    async fn chain_remaining(&self, pool_id: PoolId, remaining: U256) -> U256 {
+        match self.contract.getPool(pool_id).call().await {
+            Ok(pool) if pool.owner == self.owner => {
+                let spent = self
+                    .funding
+                    .pool_spent()
+                    .unwrap_or(U256::ZERO)
+                    .max(U256::from(pool.totalRedeemed));
+                remaining.min(U256::from(pool.deposit).saturating_sub(spent))
+            }
+            Ok(_) => remaining,
+            Err(error) => {
+                tracing::debug!(
+                    %pool_id,
+                    %error,
+                    "could not read the buyer pool; the funding step uses the run's view"
+                );
+                remaining
+            }
+        }
+    }
+
     /// The recovery step for a pool that already holds its working deposit,
     /// so a top-up has nothing to add. A `topUp` gas estimate (no transaction)
     /// tells a closing or closed pool, which a new pool replaces. An open pool
@@ -875,6 +909,10 @@ where
 /// this owner's pool `Closing` or `Closed`. A failed read, or a pool the chain
 /// holds no record of yet, keeps `state`: a lagging RPC can miss a pool opened
 /// moments ago, and replacing it on that read would escrow a second deposit.
+/// An open pool's `state` takes in its on-chain deposit and redeemed spend
+/// ([`BuyerPoolState::reconcile_with_chain`]), so the run's funding counts what
+/// other signers on the pool spent. This is a run's first lane build, so the
+/// reconciled spend sets the run's baseline ([`RunFunding::join_lane`]).
 async fn still_open<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     self_address: Address,
@@ -893,6 +931,13 @@ where
                 "the tracked buyer pool no longer accepts work; a new pool replaces it"
             );
             None
+        }
+        // The pool is open: take in the top-ups and redemptions of the other
+        // signers that share it, which reach this row only from chain.
+        Ok(pool) if pool.owner == self_address => {
+            let mut state = state;
+            state.reconcile_with_chain(U256::from(pool.deposit), U256::from(pool.totalRedeemed));
+            Some(state)
         }
         Ok(_) => Some(state),
         Err(error) => {

@@ -174,7 +174,8 @@ pub struct BuyerPoolState {
     /// Redeemed spend no tracked lane accounts for: the pool's on-chain
     /// `totalRedeemed` when this row adopted the pool from chain, less the
     /// watermark of each lane seeded since ([`Self::seed_lane`]). Zero for a
-    /// pool this row opened.
+    /// pool this row opened. [`Self::reconcile_with_chain`] raises it to what
+    /// other signers sharing the pool have redeemed since.
     redeemed_elsewhere: U256,
 }
 
@@ -233,6 +234,29 @@ impl BuyerPoolState {
     pub fn pool_spend(&self) -> U256 {
         self.committed_amount()
             .saturating_add(self.redeemed_elsewhere)
+    }
+
+    /// Raise the row to the pool's on-chain `deposit` and `total_redeemed`, as
+    /// `getPool` reads them.
+    ///
+    /// Other signers share the pool: another data dir on the same wallet signs
+    /// on its own lanes ([`crate::lane_signer`]), and a delegate on its own
+    /// key. The row tracks none of their lanes, so their top-ups and
+    /// redemptions reach it only from chain.
+    ///
+    /// - The deposit only grows while a pool is open, so the row takes the
+    ///   larger of its own and the chain's.
+    /// - Of `total_redeemed`, this row's lanes redeemed at most their tracked
+    ///   amounts, so at least `total_redeemed` less those amounts was redeemed
+    ///   on other lanes. [`Self::redeemed_elsewhere`] takes the larger of its
+    ///   own and that bound. The tracked lanes are not counted twice, and
+    ///   [`Self::pool_spend`] never reads below `total_redeemed`.
+    ///
+    /// Neither value moves down, so a read from a lagging RPC changes nothing.
+    pub fn reconcile_with_chain(&mut self, deposit: U256, total_redeemed: U256) {
+        self.deposit = self.deposit.max(deposit);
+        let elsewhere = total_redeemed.saturating_sub(self.committed_amount());
+        self.redeemed_elsewhere = self.redeemed_elsewhere.max(elsewhere);
     }
 
     /// Record `lane`'s on-chain watermark `(bytes, amount)` as its progress.

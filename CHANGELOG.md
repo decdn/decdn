@@ -1047,7 +1047,11 @@ since project inception and will roll into the first tagged release.
   it. Data dirs keep sharing the pool, but each pays on its own lanes, so the
   `AlreadyOpen` advice to give each concurrent run its own `--data-dir` is
   safe on the wallet's own pool. Two data dirs on one `--capability` delegate
-  key still sign with that key and share its lanes. The daemon still signs its
+  key still sign with that key and share its lanes. A data dir tracks only its
+  own lanes, so its funding reads the pool's deposit and `totalRedeemed` from
+  chain at the run's first lane build and before each funding recovery step:
+  a pool another data dir drained gets a top-up instead of a settle wait that
+  ends the run "funding needed". The daemon still signs its
   own buyer lanes with the node key. An existing pool row keeps its
   wallet-signed lanes as spend; new vouchers sign on fresh lanes.
 - **CLI: `decdn gateway` pays for at most 64 MiB to read a bundle manifest

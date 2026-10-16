@@ -426,3 +426,58 @@ fn memory_store_delegate_lanes_match_the_table_rules() -> anyhow::Result<()> {
     anyhow::ensure!(store.is_empty(), "delegate lanes wrote a pool row");
     Ok(())
 }
+
+/// Another data dir on the wallet, or a delegate, redeems on lanes this row
+/// does not track. Their redemptions reach the row from chain: the pool spend
+/// reads at least `totalRedeemed`, and the row's own lane counts once (#2468).
+#[test]
+fn reconcile_with_chain_counts_other_signers_redemptions_once() {
+    let mut state = sample(1);
+    let own = state.committed_amount();
+    assert_eq!(own, U256::from(1_234u64));
+
+    state.reconcile_with_chain(state.deposit, U256::from(5_000u64));
+    assert_eq!(state.redeemed_elsewhere(), U256::from(5_000u64) - own);
+    assert_eq!(state.pool_spend(), U256::from(5_000u64));
+
+    // The chain redeemed less than the row's own lane: nothing else redeemed.
+    let mut lagging = sample(2);
+    lagging.reconcile_with_chain(lagging.deposit, U256::from(1_000u64));
+    assert_eq!(lagging.redeemed_elsewhere(), U256::ZERO);
+    assert_eq!(lagging.pool_spend(), own);
+}
+
+/// A top-up another data dir sent raises the row's deposit, and a later read
+/// from a lagging RPC lowers neither the deposit nor the spend.
+#[test]
+fn reconcile_with_chain_never_moves_down() {
+    let mut state = sample(1);
+    state.reconcile_with_chain(U256::from(20_000_000u64), U256::from(5_000u64));
+    assert_eq!(state.deposit, U256::from(20_000_000u64));
+    state.reconcile_with_chain(U256::from(10_000_000u64), U256::ZERO);
+    assert_eq!(state.deposit, U256::from(20_000_000u64));
+    assert_eq!(state.pool_spend(), U256::from(5_000u64));
+}
+
+/// A lane seeded from its chain watermark after a reconcile takes its share
+/// out of the redeemed spend, so the pool spend still counts it once.
+#[test]
+fn a_lane_seeded_after_a_reconcile_counts_once() -> Result<(), BuyerProgressError> {
+    let mut state = BuyerPoolState::new(
+        PoolId::repeat_byte(7),
+        DEPLOYMENT,
+        Address::repeat_byte(7),
+        Address::repeat_byte(8),
+        U256::from(10_000u64),
+    );
+    state.reconcile_with_chain(state.deposit, U256::from(3_000u64));
+    let lane = LaneKey {
+        pool_id: state.pool_id,
+        signer: Address::repeat_byte(9),
+        provider: Address::repeat_byte(0xb2),
+    };
+    state.seed_lane(lane, U256::from(1_000_000u64), U256::from(1_000u64))?;
+    assert_eq!(state.redeemed_elsewhere(), U256::from(2_000u64));
+    assert_eq!(state.pool_spend(), U256::from(3_000u64));
+    Ok(())
+}
