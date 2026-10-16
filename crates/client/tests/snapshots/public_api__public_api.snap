@@ -11,6 +11,11 @@ pub decdn_client::bundle::BundleEnd::FundingNeeded::error: anyhow::Error
 pub decdn_client::bundle::BundleEnd::FundingNeeded::needed: decdn_client::credential::FundingNeeded
 pub decdn_client::bundle::BundleEnd::Interrupted
 pub decdn_client::bundle::BundleEnd::Stopped(anyhow::Error)
+#[non_exhaustive] pub enum decdn_client::bundle::ForeignReason
+pub decdn_client::bundle::ForeignReason::Changed(core::option::Option<decdn_client::uri::DecdnUri>)
+pub decdn_client::bundle::ForeignReason::OtherSource(core::option::Option<decdn_client::uri::DecdnUri>)
+pub decdn_client::bundle::ForeignReason::UnreadableCache(alloc::string::String)
+pub decdn_client::bundle::ForeignReason::Unrecorded
 #[non_exhaustive] pub enum decdn_client::bundle::Funding
 pub decdn_client::bundle::Funding::Delegated
 pub decdn_client::bundle::Funding::Delegated::slot: decdn_client::credential::CredentialSlot
@@ -22,7 +27,8 @@ pub decdn_client::bundle::BundleManifest::entries: alloc::vec::Vec<decdn_client:
 impl decdn_client::bundle::BundleManifest
 pub fn decdn_client::bundle::BundleManifest::cache_path(&std::path::Path, [u8; 32]) -> std::path::PathBuf
 pub fn decdn_client::bundle::BundleManifest::cached(&std::path::Path, [u8; 32]) -> anyhow::Result<core::option::Option<Self>>
-pub const fn decdn_client::bundle::BundleManifest::new(alloc::vec::Vec<decdn_client::bundle::ManifestEntry>) -> Self
+pub const fn decdn_client::bundle::BundleManifest::hash(&self) -> [u8; 32]
+pub const fn decdn_client::bundle::BundleManifest::new([u8; 32], alloc::vec::Vec<decdn_client::bundle::ManifestEntry>) -> Self
 pub fn decdn_client::bundle::BundleManifest::parse(&[u8]) -> anyhow::Result<Self>
 #[non_exhaustive] pub struct decdn_client::bundle::BundleOutcome
 pub decdn_client::bundle::BundleOutcome::end: decdn_client::bundle::BundleEnd
@@ -76,6 +82,9 @@ pub decdn_client::bundle::EntryLanded::paid: u64
 pub decdn_client::bundle::EntryLanded::resumed: u64
 pub decdn_client::bundle::EntryLanded::size: u64
 pub decdn_client::bundle::EntryLanded::spliced: u64
+#[non_exhaustive] pub struct decdn_client::bundle::ForeignPath
+pub decdn_client::bundle::ForeignPath::path: alloc::string::String
+pub decdn_client::bundle::ForeignPath::reason: decdn_client::bundle::ForeignReason
 #[non_exhaustive] pub struct decdn_client::bundle::ManifestChunk
 pub decdn_client::bundle::ManifestChunk::hash: alloc::string::String
 pub decdn_client::bundle::ManifestChunk::size: u64
@@ -87,6 +96,8 @@ pub decdn_client::bundle::ManifestEntry::hash: alloc::string::String
 pub decdn_client::bundle::ManifestEntry::path: alloc::string::String
 pub decdn_client::bundle::ManifestEntry::size: core::option::Option<u64>
 impl decdn_client::bundle::ManifestEntry
+pub fn decdn_client::bundle::ManifestEntry::land_at(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn decdn_client::bundle::ManifestEntry::manifest_path(&self) -> &str
 pub fn decdn_client::bundle::ManifestEntry::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, core::option::Option<u64>) -> Self
 pub fn decdn_client::bundle::ManifestEntry::with_chunks(self, alloc::vec::Vec<decdn_client::bundle::ManifestChunk>) -> Self
 pub struct decdn_client::bundle::NodeSelection
@@ -108,9 +119,9 @@ pub fn decdn_client::bundle::FileObserver::finished(&self)
 pub fn decdn_client::bundle::FileObserver::hashed(&self, u64)
 pub fn decdn_client::bundle::FileObserver::pending(&self)
 pub fn decdn_client::bundle::FileObserver::reconstructing(&self)
+pub fn decdn_client::bundle::foreign_paths(&decdn_client::bundle::BundleManifest, &std::path::Path) -> alloc::vec::Vec<decdn_client::bundle::ForeignPath>
 pub fn decdn_client::bundle::parse_hash(&str) -> anyhow::Result<[u8; 32]>
 pub async fn decdn_client::bundle::select_nodes(&decdn_client::session::ChainConfig, &decdn_client::session::PullSite, &decdn_client::session::DiscoveryOptions) -> anyhow::Result<decdn_client::bundle::NodeSelection>
-pub fn decdn_client::bundle::unrecorded_paths(&[decdn_client::bundle::ManifestEntry], &std::path::Path) -> alloc::vec::Vec<alloc::string::String>
 pub mod decdn_client::buyer_pool
 #[non_exhaustive] pub enum decdn_client::buyer_pool::ProgressWrite
 pub decdn_client::buyer_pool::ProgressWrite::Advance

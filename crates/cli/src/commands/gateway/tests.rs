@@ -1,7 +1,7 @@
 use super::*;
 
 fn manifest() -> Arc<BundleManifest> {
-    Arc::new(BundleManifest::new(Vec::new()))
+    Arc::new(BundleManifest::new([0; 32], Vec::new()))
 }
 
 fn hash(n: u8) -> [u8; 32] {

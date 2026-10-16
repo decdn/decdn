@@ -1468,6 +1468,19 @@ async fn run_delta_update() -> anyhow::Result<()> {
             && saved_manifest["files"]["b.bin"].is_object(),
         "skip-cache must record both a.bin and b.bin: {saved_manifest}"
     );
+    // Each record names the bundle entry it came from: the manifest blob's
+    // hash and the entry's manifest path.
+    let bundle_v1 = format!(
+        "b3:{}",
+        Hash::new(std::fs::read(&manifest_v1_path).context("read v1 manifest")?).to_hex()
+    );
+    for path in ["a.bin", "b.bin"] {
+        anyhow::ensure!(
+            saved_manifest["files"][path]["source"]
+                == serde_json::json!({"bundle": bundle_v1, "path": path}),
+            "the {path} record must name its source {bundle_v1}: {saved_manifest}"
+        );
+    }
 
     // --- Mutate b.bin: new tail, same leading chunk -------------------------
     let tail_v2 = deterministic_bytes(TAIL_BYTES, 0x0DE7_00B2);

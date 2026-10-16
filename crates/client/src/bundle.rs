@@ -47,6 +47,7 @@ use crate::session::{
     ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, PullSite,
 };
 use crate::stream_cap::LaneStreamCap;
+use crate::uri::DecdnUri;
 use crate::{
     Connections, CredentialSlot, FundingNeeded, LaneLedgers, PeerHealth, PoolReplaced,
     ProgressClock, RecoveryGate, RunDemand, StopPolicy,
@@ -85,9 +86,11 @@ pub fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
 }
 
 /// A bundle manifest: the files a bundle publishes (`adr/appendix-bundles.md`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct BundleManifest {
+    /// The manifest blob's BLAKE3 hash: the hash a `decdn:<hash>/` URI names.
+    hash: [u8; 32],
     /// Its files, in manifest order.
     pub entries: Vec<ManifestEntry>,
 }
@@ -100,10 +103,20 @@ struct ManifestV1 {
 }
 
 impl BundleManifest {
-    /// A manifest of `entries`.
+    /// A manifest of `entries` whose blob has the BLAKE3 hash `hash`. A pull
+    /// records `hash` as the source of each file it writes, so a wrong one
+    /// makes a later pull of the same entry see its own files as foreign.
     #[must_use]
-    pub const fn new(entries: Vec<ManifestEntry>) -> Self {
-        Self { entries }
+    pub const fn new(hash: [u8; 32], entries: Vec<ManifestEntry>) -> Self {
+        Self { hash, entries }
+    }
+
+    /// The manifest blob's BLAKE3 hash. A pull records it as the source of
+    /// each file it writes. Filtering `entries` keeps it: it names the whole
+    /// manifest.
+    #[must_use]
+    pub const fn hash(&self) -> [u8; 32] {
+        self.hash
     }
 
     /// Parse manifest JSON and check its version.
@@ -123,6 +136,7 @@ impl BundleManifest {
             .into());
         }
         Ok(Self {
+            hash: *blake3::hash(bytes).as_bytes(),
             entries: manifest.entries,
         })
     }
@@ -155,23 +169,77 @@ impl BundleManifest {
     }
 }
 
-/// The paths of `entries` that hold something under `out_dir` that no pull
-/// recorded writing there: a file, directory or link at the entry's path, with
-/// no record in the skip-cache each pull keeps in `out_dir`. A pull replaces
-/// such a file when its bytes differ from the entry's, so a caller that did
-/// not choose `out_dir` can refuse the pull first.
+/// The entries of `manifest` whose path under `out_dir` holds something that
+/// a pull of the same entry may replace without the user's say: a file,
+/// directory or link that no record in the skip-cache in `out_dir` vouches
+/// for. A record vouches for a path when the file there still has the
+/// recorded size and mtime, and the record names this entry (this manifest
+/// hash and manifest path) or holds this entry's bytes. A caller that did not
+/// choose `out_dir` can refuse the pull first.
+///
+/// An entry whose path escapes `out_dir`, or that lands on the pull's own
+/// state, is not named: the pull fails that entry and writes nothing there.
 #[must_use]
-pub fn unrecorded_paths(entries: &[ManifestEntry], out_dir: &Path) -> Vec<String> {
-    let saved = skip_cache::load(out_dir);
-    entries
+pub fn foreign_paths(manifest: &BundleManifest, out_dir: &Path) -> Vec<ForeignPath> {
+    let saved = skip_cache::load_checked(out_dir);
+    manifest
+        .entries
         .iter()
-        .filter(|en| saved.get(&en.path).is_none())
-        .filter(|en| {
-            engine::safe_join(out_dir, &en.path)
-                .is_ok_and(|dest| std::fs::symlink_metadata(dest).is_ok())
+        .filter_map(|en| {
+            let dest = engine::writable_dest(out_dir, &en.path).ok()?;
+            let meta = std::fs::symlink_metadata(dest).ok()?;
+            let reason = match &saved {
+                Err(e) => ForeignReason::UnreadableCache(format!("{e:#}")),
+                Ok(saved) => match saved.get(&en.path) {
+                    None => ForeignReason::Unrecorded,
+                    Some(rec) if !rec.still_matches(&meta) => {
+                        ForeignReason::Changed(rec.source.uri())
+                    }
+                    Some(rec)
+                        if rec.source.is(manifest.hash, en.manifest_path())
+                            || rec.hash == en.hash =>
+                    {
+                        return None;
+                    }
+                    Some(rec) => ForeignReason::OtherSource(rec.source.uri()),
+                },
+            };
+            Some(ForeignPath {
+                path: en.path.clone(),
+                reason,
+            })
         })
-        .map(|en| en.path.clone())
         .collect()
+}
+
+/// A path a pull may replace that no record vouches for ([`foreign_paths`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ForeignPath {
+    /// The entry's path under the output directory.
+    pub path: String,
+    /// Why no record vouches for `path`.
+    pub reason: ForeignReason,
+}
+
+/// Why no skip-cache record vouches for a [`ForeignPath`].
+///
+/// A held [`DecdnUri`] is the bundle entry an earlier pull wrote the path
+/// from. It is `None` when the record names no readable manifest hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForeignReason {
+    /// No pull recorded writing the path.
+    Unrecorded,
+    /// The skip-cache file is there, but it cannot be used: it cannot be
+    /// read, it is not a skip-cache, or another build wrote it. Holds the
+    /// cause.
+    UnreadableCache(String),
+    /// A pull wrote the path, and it changed after: its size, its mtime, or
+    /// its kind differs from the record.
+    Changed(Option<DecdnUri>),
+    /// A pull wrote the path from another bundle entry, with other bytes.
+    OtherSource(Option<DecdnUri>),
 }
 
 /// Bytes that are not a v1 bundle manifest: [`BundleManifest::parse`]'s error,
@@ -204,6 +272,10 @@ pub struct ManifestEntry {
     /// twice. The whole file is still verified by `hash`.
     #[serde(default)]
     pub chunks: Option<Vec<ManifestChunk>>,
+    /// The manifest `path` of an entry that [`Self::land_at`] moved, or `None`
+    /// when `path` is still the manifest path.
+    #[serde(skip)]
+    landed_from: Option<String>,
 }
 
 impl ManifestEntry {
@@ -216,7 +288,27 @@ impl ManifestEntry {
             hash: hash.into(),
             size,
             chunks: None,
+            landed_from: None,
         }
+    }
+
+    /// This entry, landing at `path` under the output directory in place of
+    /// its manifest path. The pull records the manifest path as the source of
+    /// the file it writes. A second `land_at` keeps the first manifest path.
+    /// Setting the `path` field directly makes the pull record that path as
+    /// the manifest path.
+    #[must_use]
+    pub fn land_at(mut self, path: impl Into<String>) -> Self {
+        let manifest_path = std::mem::replace(&mut self.path, path.into());
+        self.landed_from.get_or_insert(manifest_path);
+        self
+    }
+
+    /// The entry's `path` in its manifest: where it lands, unless
+    /// [`Self::land_at`] moved it.
+    #[must_use]
+    pub fn manifest_path(&self) -> &str {
+        self.landed_from.as_deref().unwrap_or(&self.path)
     }
 
     /// This entry with the chunk decomposition `chunks`.
@@ -628,7 +720,7 @@ impl BundlePuller {
         overwrite: bool,
         cancel: &CancellationToken,
     ) -> BundleOutcome {
-        Box::pin(self.ctx.run(&manifest.entries, out_dir, overwrite, cancel)).await
+        Box::pin(self.ctx.run(manifest, out_dir, overwrite, cancel)).await
     }
 
     /// The warning for a wallet seen to hold too little USDC to top the pool

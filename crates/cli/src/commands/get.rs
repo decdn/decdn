@@ -18,7 +18,8 @@
 //! segment of the entry's path. The command then writes the absolute
 //! destination to stderr before the pull starts, except under `--json` or
 //! `--dry-run`. A bundle or entry pull into a default destination refuses a
-//! path that already holds a file no earlier pull wrote there.
+//! path that holds a file no earlier pull of the same entry left there
+//! unchanged, unless `--overwrite`.
 
 use std::path::{Path, PathBuf};
 

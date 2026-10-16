@@ -13,6 +13,7 @@ fn sample() -> SavedFile {
             hash: "b3:bb".into(),
             size: 10,
         }]),
+        source: SavedSource::new([3; 32], "src/b.txt"),
     }
 }
 
@@ -27,6 +28,7 @@ fn write_then_load_round_trips() {
     let got = loaded.get("a/b.txt").expect("entry present");
     assert_eq!(got.hash, "b3:aa");
     assert_eq!(got.size, 10);
+    assert_eq!(got.source, sample().source);
     assert_eq!(
         got.mtime,
         SavedMtime {
@@ -47,6 +49,56 @@ fn corrupt_file_loads_empty_not_error() {
     let tmp = tempfile::tempdir().expect("tmp");
     std::fs::write(tmp.path().join(SAVED_MANIFEST_NAME), b"{not json").expect("write");
     assert!(load(tmp.path()).get("anything").is_none());
+}
+
+#[test]
+fn an_earlier_version_loads_empty() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    std::fs::write(
+        tmp.path().join(SAVED_MANIFEST_NAME),
+        br#"{"version":1,"files":{"a.txt":{"hash":"b3:aa","size":1,"mtime":{"secs":1,"nanos":0}}}}"#,
+    )
+    .expect("write");
+    assert!(load(tmp.path()).get("a.txt").is_none());
+    let err = load_checked(tmp.path()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("has version 1; this build reads version 2"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn load_checked_passes_a_missing_file_and_names_a_corrupt_one() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    assert!(
+        load_checked(tmp.path())
+            .expect("missing is empty")
+            .get("a")
+            .is_none()
+    );
+    std::fs::write(tmp.path().join(SAVED_MANIFEST_NAME), b"{not json").expect("write");
+    let err = load_checked(tmp.path()).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("is not a skip-cache"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn source_matches_only_its_bundle_and_path_and_prints_its_uri() {
+    let src = sample().source;
+    assert!(src.is([3; 32], "src/b.txt"));
+    assert!(!src.is([4; 32], "src/b.txt"));
+    assert!(!src.is([3; 32], "b.txt"));
+    assert_eq!(src.bundle, bundle_key([3; 32]));
+    let uri = src.uri().expect("a hash");
+    assert_eq!(uri.hash, [3u8; 32]);
+    assert_eq!(uri.target, UriTarget::BundleEntry("src/b.txt".into()));
+    let bad = SavedSource {
+        bundle: "not-a-hash".into(),
+        path: "x".into(),
+    };
+    assert!(bad.uri().is_none());
 }
 
 #[test]
@@ -85,6 +137,7 @@ fn saved_hints_places_offsets_and_validates_sum() {
                 size: 20,
             },
         ]),
+        source: sample().source,
     };
     let got = saved_hints(&rec).expect("hints");
     assert_eq!(got, vec![("b3:c0".into(), 0, 10), ("b3:c1".into(), 10, 20)]);
@@ -112,6 +165,7 @@ fn saved_hints_rejects_bad_sum_and_absent_chunks() {
             hash: "b3:c0".into(),
             size: 10,
         }]),
+        source: sample().source,
     };
     assert!(saved_hints(&rec).is_none()); // 10 != 99
     rec.chunks = None;
