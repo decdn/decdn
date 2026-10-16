@@ -309,7 +309,17 @@ fetches every entry over the paid `cdn/client/v1` path, with the same
 kernel as the blob fetch of `decdn get decdn:<hash>`.
 `decdn get decdn:<hash>/<path>` keeps only the entry whose `path` is
 `<path>` (see [`decdn:` URIs](#decdn-uris)). A URI path that names no
-entry is an error. The rules below apply to every pull:
+entry is an error.
+
+`decdn get decdn:<hash>/<path> -o -` does not use the pull engine. It
+fetches the manifest blob into memory, with a limit of 64 MiB. The manifest
+fetch requests no bytes past that limit. The command then finds the entry
+whose `path` is `<path>` and streams the entry's blob to stdout as one blob
+fetch. The two fetches use one payer. The command takes no bundle flag, and
+it has no manifest cache and no skip cache. `-o -` on a whole bundle is an
+error.
+
+The rules below apply to every pull:
 
 - **Node selection is per distinct blob.** With an explicit `--node-id`
   every entry is pulled from that one node; otherwise each distinct blob

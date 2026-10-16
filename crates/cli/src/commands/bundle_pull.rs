@@ -621,6 +621,12 @@ pub(crate) async fn bundle_pull(
     uri: &DecdnUri,
     config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
+    // `-o -` is stdout, which a pull cannot write a tree to; the blob fetch
+    // takes every `-o -` run. Fail rather than create a directory named `-`.
+    anyhow::ensure!(
+        dest.path != Path::new("-"),
+        "`-o -` (stdout) does not take a bundle pull"
+    );
     // Validate the flag combination first — BEFORE the dry-run short-circuit — so a
     // bad combo (e.g. `--provider-address` without `--node-id`) or an unusable
     // timeout pair is rejected even for `--dry-run`. This rule does not run at

@@ -7,7 +7,9 @@
 //! - `decdn:<hash>` runs the blob fetch, `fetch::fetch`.
 //! - `decdn:<hash>/` runs the bundle pull, `bundle_pull::bundle_pull`, over
 //!   every entry.
-//! - `decdn:<hash>/<path>` runs the bundle pull for exactly that entry.
+//! - `decdn:<hash>/<path>` runs the bundle pull for exactly that entry. With
+//!   `-o -` it runs the blob fetch instead, which reads the manifest and
+//!   streams that entry's blob to stdout.
 //!
 //! The URI's `ns` is the namespace hint of either route.
 //!
@@ -38,9 +40,10 @@ pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<(
         let shown = std::path::absolute(&shown).unwrap_or(shown);
         eprintln!("Downloading to {}", shown.display());
     }
-    match uri.target {
-        UriTarget::Blob => super::fetch::fetch(args, &dest.path, &uri, config_path).await,
-        _ => super::bundle_pull::bundle_pull(args, &dest, &uri, config_path).await,
+    if streams_one_blob(args, &uri) {
+        super::fetch::fetch(args, &dest.path, &uri, config_path).await
+    } else {
+        super::bundle_pull::bundle_pull(args, &dest, &uri, config_path).await
     }
 }
 
@@ -99,9 +102,24 @@ impl Destination {
     }
 }
 
+/// Whether the run delivers one blob: a blob URI, or an entry URI to stdout.
+fn streams_one_blob(args: &GetArgs, uri: &DecdnUri) -> bool {
+    match uri.target {
+        UriTarget::Blob => true,
+        UriTarget::BundleEntry(_) => is_stdout(args),
+        _ => false,
+    }
+}
+
+/// Whether `-o` is `-` (stdout).
+fn is_stdout(args: &GetArgs) -> bool {
+    args.output.as_deref() == Some(Path::new("-"))
+}
+
 /// The URI `args` names, once its flags are checked against its target. Rejects
-/// a flag that does not apply: any bundle flag on a blob URI, an entry filter
-/// on an entry URI, and `-o -` on anything but a blob URI.
+/// a flag that does not apply: any bundle flag on a blob URI, or on an entry
+/// URI to stdout; an entry filter on an entry URI; and `-o -` on a whole
+/// bundle.
 fn parse_and_check(args: &GetArgs) -> anyhow::Result<DecdnUri> {
     let uri: DecdnUri = args
         .uri
@@ -124,12 +142,22 @@ fn parse_and_check(args: &GetArgs) -> anyhow::Result<DecdnUri> {
                 "{} do not apply to an entry URI: the URI already names one entry",
                 given.join(", ")
             );
+            if is_stdout(args) {
+                let given = bundle_flags_given(args);
+                anyhow::ensure!(
+                    given.is_empty(),
+                    "{} do not apply with `-o -`: an entry streams to stdout as one blob",
+                    given.join(", ")
+                );
+            }
+            return Ok(uri);
         }
         _ => {}
     }
     anyhow::ensure!(
-        args.output.as_deref() != Some(Path::new("-")),
-        "`-o -` (stdout) takes a blob URI (`decdn:<hash>`); a bundle needs an output directory"
+        !is_stdout(args),
+        "`-o -` (stdout) takes a blob or one bundle entry (`decdn:<hash>/<path>`); \
+         a whole bundle writes to a directory"
     );
     Ok(uri)
 }

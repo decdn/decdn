@@ -576,3 +576,80 @@ fn a_delegated_slot_rejects_a_key_the_capability_does_not_name() {
     assert!(msg.contains(&other.address().to_string()), "{msg}");
     assert!(msg.contains("load the delegate keystore"), "{msg}");
 }
+
+const ENTRY_A: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+const ENTRY_B: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+fn manifest_json(entries: &[(&str, &str)]) -> Vec<u8> {
+    let entries: Vec<String> = entries
+        .iter()
+        .map(|(path, hash)| format!(r#"{{"path":"{path}","hash":"{hash}"}}"#))
+        .collect();
+    format!(r#"{{"version":1,"entries":[{}]}}"#, entries.join(",")).into_bytes()
+}
+
+#[test]
+fn entry_hash_picks_the_named_entry() {
+    let bytes = manifest_json(&[
+        ("a/first.bin", &format!("b3:{ENTRY_A}")),
+        ("b/second.bin", ENTRY_B),
+    ]);
+    assert_eq!(
+        entry_hash(&bytes, "b/second.bin").unwrap(),
+        parse_hash(ENTRY_B).unwrap()
+    );
+    assert_eq!(
+        entry_hash(&bytes, "a/first.bin").unwrap(),
+        parse_hash(ENTRY_A).unwrap()
+    );
+}
+
+#[test]
+fn entry_hash_names_a_missing_entry() {
+    let bytes = manifest_json(&[("a/first.bin", ENTRY_A)]);
+    let err = format!("{:#}", entry_hash(&bytes, "first.bin").unwrap_err());
+    assert!(err.contains("no entry \"first.bin\""), "{err}");
+}
+
+#[test]
+fn entry_hash_rejects_a_blob_that_is_not_a_manifest() {
+    for bytes in [
+        &b"\x00\x01raw video bytes"[..],
+        br#"{"version":2,"entries":[]}"#,
+    ] {
+        let err = format!("{:#}", entry_hash(bytes, "a").unwrap_err());
+        assert!(err.contains("not a bundle manifest"), "{err}");
+    }
+}
+
+#[test]
+fn entry_hash_names_the_entry_of_a_malformed_hash() {
+    let bytes = manifest_json(&[("a.bin", "not-hex")]);
+    let err = format!("{:#}", entry_hash(&bytes, "a.bin").unwrap_err());
+    assert!(
+        err.contains("bundle entry \"a.bin\" has a malformed hash"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn manifest_buf_holds_the_cap_and_fails_past_it() {
+    use tokio::io::AsyncWriteExt as _;
+    let mut buf = ManifestBuf::default();
+    let chunk = vec![0u8; 1 << 20];
+    for _ in 0..(MAX_MANIFEST_BYTES / chunk.len()) {
+        buf.write_all(&chunk).await.unwrap();
+    }
+    assert_eq!(buf.0.lock().unwrap().len(), MAX_MANIFEST_BYTES);
+    let err = buf.write_all(&[0]).await.unwrap_err();
+    assert!(err.to_string().contains("larger than"), "{err}");
+    assert_eq!(buf.0.lock().unwrap().len(), MAX_MANIFEST_BYTES);
+}
+
+#[test]
+fn max_manifest_mb_is_the_byte_cap_in_mib() {
+    assert_eq!(
+        u64::try_from(MAX_MANIFEST_BYTES >> 20).unwrap(),
+        MAX_MANIFEST_MB
+    );
+}

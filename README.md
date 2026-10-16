@@ -173,7 +173,7 @@ A `decdn:` URI names a blob, a whole bundle, or one file of a bundle
 |-----|-------------|---------|--------------|
 | `decdn:<hash>` | the blob | a file, or `-` for stdout | `./<hash>` |
 | `decdn:<hash>/` | every file of the bundle whose manifest has this hash | a directory | `.` |
-| `decdn:<hash>/a/b.txt` | that one file of the bundle | a directory | `./b.txt` |
+| `decdn:<hash>/a/b.txt` | that one file of the bundle | a directory, or `-` for stdout | `./b.txt` |
 | any of these with `?ns=<id>` | the same, routed to a namespace's origins | the same | the same |
 
 Without `-o`, a bundle or entry pull refuses to replace a file that no earlier pull wrote.
