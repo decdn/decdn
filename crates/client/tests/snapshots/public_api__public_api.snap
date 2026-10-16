@@ -110,6 +110,7 @@ pub fn decdn_client::bundle::FileObserver::pending(&self)
 pub fn decdn_client::bundle::FileObserver::reconstructing(&self)
 pub fn decdn_client::bundle::parse_hash(&str) -> anyhow::Result<[u8; 32]>
 pub async fn decdn_client::bundle::select_nodes(&decdn_client::session::ChainConfig, &decdn_client::session::PullSite, &decdn_client::session::DiscoveryOptions) -> anyhow::Result<decdn_client::bundle::NodeSelection>
+pub fn decdn_client::bundle::unrecorded_paths(&[decdn_client::bundle::ManifestEntry], &std::path::Path) -> alloc::vec::Vec<alloc::string::String>
 pub mod decdn_client::buyer_pool
 #[non_exhaustive] pub enum decdn_client::buyer_pool::ProgressWrite
 pub decdn_client::buyer_pool::ProgressWrite::Advance

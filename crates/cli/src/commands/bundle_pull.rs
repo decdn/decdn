@@ -92,9 +92,9 @@ struct EntryFilter {
     exclude: globset::GlobSet,
     /// The `--exclude` patterns as given, indexed like `include_patterns`.
     exclude_patterns: Vec<String>,
-    /// Whether each kept entry lands at its file name, the last segment of its
-    /// `path`, directly in the output root.
-    flatten: bool,
+    /// The file name the entry an entry URI names lands at, directly in the
+    /// output root, in place of its manifest `path`. Set only with `entry`.
+    land_as: Option<String>,
 }
 
 /// A `--include` or `--exclude` pattern that matched no entry of the manifest.
@@ -152,8 +152,16 @@ impl EntryFilter {
             include_patterns: include.to_vec(),
             exclude: build_glob_set(exclude, "--exclude")?,
             exclude_patterns: exclude.to_vec(),
-            flatten: false,
+            land_as: None,
         })
+    }
+
+    /// This filter with the entry the URI names landing at `name`, directly in
+    /// the output root. A filter with no entry URI has no entry to rename, so
+    /// it drops `name`.
+    fn landing_as(mut self, name: Option<String>) -> Self {
+        self.land_as = name.filter(|_| self.entry.is_some());
+        self
     }
 
     /// Retain only the entries the filter keeps, preserving manifest order, and
@@ -221,31 +229,43 @@ impl EntryFilter {
                 "the bundle has no entry {entry:?}; a URI path names one manifest `path` exactly"
             );
         }
-        let kept = if self.flatten {
-            pass.kept
-                .into_iter()
-                .map(flatten_entry)
-                .collect::<anyhow::Result<_>>()?
-        } else {
-            pass.kept
-        };
+        let mut kept = pass.kept;
+        if let Some(name) = &self.land_as {
+            for e in &mut kept {
+                e.path.clone_from(name);
+            }
+        }
         Ok((kept, pass.excluded))
     }
 }
 
-/// `entry` with its `path` cut to its last segment, so it lands directly in the
-/// output root.
+/// Refuse a pull into a default destination (no `-o`) that would replace a
+/// file no earlier pull wrote there: a pull fetches over a file whose bytes
+/// differ from its entry's, and the user did not choose this directory.
+/// `--overwrite` asks for the replacement, so it passes.
 ///
 /// # Errors
 ///
-/// When the path has no last segment that names a file.
-fn flatten_entry(mut entry: ManifestEntry) -> anyhow::Result<ManifestEntry> {
-    let name = Path::new(&entry.path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow!("entry path {:?} names no file", entry.path))?;
-    entry.path = name.to_owned();
-    Ok(entry)
+/// When an entry path of `entries` under `out` holds a file, directory or link
+/// that the skip-cache in `out` has no record of.
+fn refuse_unrecorded(args: &GetArgs, out: &Path, entries: &[ManifestEntry]) -> anyhow::Result<()> {
+    if args.output.is_some() || args.overwrite {
+        return Ok(());
+    }
+    let found = decdn_client::bundle::unrecorded_paths(entries, out);
+    let Some(first) = found.first() else {
+        return Ok(());
+    };
+    let more = match found.len() {
+        1 => String::new(),
+        n => format!(" (and {} more)", n.saturating_sub(1)),
+    };
+    anyhow::bail!(
+        "refusing to replace {}{more}: no earlier `decdn get` wrote it; pass `-o <dir>` to \
+         pull into another directory, or `-o .` to pull here and replace each such file \
+         whose bytes differ",
+        out.join(first).display()
+    )
 }
 
 /// Mark in `hits` every pattern of `set` that matches `path`, and return
@@ -593,7 +613,8 @@ fn load_buyer_signer(chain: &fetch::ResolvedChain) -> anyhow::Result<Arc<Private
 }
 
 /// `decdn get decdn:<hash>/` and `decdn get decdn:<hash>/<path>`: pull the
-/// bundle `uri` names, or its one entry, into `--output`.
+/// bundle `uri` names, or its one entry, into `dest.path`. With
+/// `dest.entry_name`, the entry lands at that name directly in `dest.path`.
 pub(crate) async fn bundle_pull(
     args: &GetArgs,
     dest: &Destination,
@@ -615,9 +636,9 @@ pub(crate) async fn bundle_pull(
         UriTarget::BundleEntry(path) => Some(path.clone()),
         _ => None,
     };
-    let mut filter = EntryFilter::compile(entry, &args.include, &args.exclude)?;
-    filter.flatten = dest.flatten;
-    let out = dest.root.as_path();
+    let filter = EntryFilter::compile(entry, &args.include, &args.exclude)?
+        .landing_as(dest.entry_name.clone());
+    let out = dest.path.as_path();
     let filters_given = !args.include.is_empty() || !args.exclude.is_empty();
 
     // `--select` opens an editor: reject an incompatible combo or a non-terminal
@@ -788,7 +809,11 @@ async fn pull_manifest(
         let Some(kept) = obtained else {
             return Ok(None);
         };
-        maybe_select(args, out, uri, kept)
+        let kept = maybe_select(args, out, uri, kept)?;
+        if let Some(Kept { manifest, .. }) = &kept {
+            refuse_unrecorded(args, out, &manifest.entries)?;
+        }
+        anyhow::Ok(kept)
     }
     .await;
     // The manifest fetch is paid, so a run that ends here still owes the
@@ -1071,9 +1096,10 @@ fn not_a_manifest_hint(err: anyhow::Error) -> anyhow::Error {
 /// `filter` applies to those entries, so the plan is the entry set a real run
 /// starts from and the unmatched-pattern warnings are the ones it prints. A real
 /// run then skips files already present in the output root (unless
-/// `--overwrite`) and warns on leftover partials; the dry run does neither. A
-/// bundle with no cached manifest reports only the bundle and the output root,
-/// with `entries: null` under `--json`.
+/// `--overwrite`) and warns on leftover partials; the dry run does neither. It
+/// does refuse a default destination that holds a file no pull wrote, as a
+/// real run does. A bundle with no cached manifest reports only the bundle and
+/// the output root, with `entries: null` under `--json`.
 fn dry_run(
     args: &GetArgs,
     output: &Path,
@@ -1109,6 +1135,7 @@ fn dry_run(
     };
     let raw_empty = manifest.entries.is_empty();
     manifest.entries = filter.apply_and_warn(manifest.entries)?.0;
+    refuse_unrecorded(args, output, &manifest.entries)?;
     if args.json {
         // The `--json` plan stays machine-readable — an empty set is
         // `count: 0` with an empty `entries` array, no prose line. A bundle

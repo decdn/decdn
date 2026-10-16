@@ -2713,6 +2713,53 @@ fn plan_slots_rejects_the_reserved_staging_dir() {
     assert!(matches!(slots[0], Slot::Failed(_)));
 }
 
+/// A manifest path at the skip-cache file or inside the manifest cache must not
+/// be materialized: the run's own state writes would replace or collide with it.
+#[test]
+fn plan_slots_rejects_the_pull_state_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let entries = [
+        entry(skip_cache::SAVED_MANIFEST_NAME, "b3:h"),
+        entry(&format!("{}/x.json", manifest_cache::CACHE_DIR), "b3:h"),
+        entry("plain.bin", "b3:h"),
+    ];
+    let refs: Vec<&ManifestEntry> = entries.iter().collect();
+    let slots = plan_slots(&refs, dir.path(), false, &HashSet::new());
+    assert!(matches!(slots[0], Slot::Failed(_)));
+    assert!(matches!(slots[1], Slot::Failed(_)));
+    assert!(matches!(slots[2], Slot::Write { .. }));
+}
+
+/// `unrecorded_paths` names each entry path that holds something no pull
+/// recorded, and passes an absent path and a recorded one.
+#[test]
+fn unrecorded_paths_names_only_present_unrecorded_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path();
+    std::fs::write(out.join("mine.txt"), b"user").unwrap();
+    std::fs::create_dir(out.join("sub")).unwrap();
+    std::fs::write(out.join("pulled.bin"), b"abc").unwrap();
+    let pulled = entry(
+        "pulled.bin",
+        &format!("b3:{}", blake3::hash(b"abc").to_hex()),
+    );
+    let rec = record_one(out, &pulled).expect("record");
+    let mut saved = SavedManifest::default();
+    skip_cache::merge(&mut saved, BTreeMap::from([("pulled.bin".to_owned(), rec)]));
+    skip_cache::write_bytes(out, &skip_cache::serialize(&saved).unwrap()).unwrap();
+
+    let entries = [
+        entry("mine.txt", "b3:h"),
+        entry("sub", "b3:h"),
+        pulled,
+        entry("absent.bin", "b3:h"),
+    ];
+    assert_eq!(
+        crate::bundle::unrecorded_paths(&entries, out),
+        ["mine.txt", "sub"]
+    );
+}
+
 /// An unrecorded (empty saved manifest) file still skips via the re-hash gate
 /// when its on-disk bytes already match the new manifest hash.
 #[tokio::test]

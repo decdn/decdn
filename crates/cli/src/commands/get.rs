@@ -13,8 +13,10 @@
 //!
 //! Without `-o`, the destination follows the target: `./<hash>` for a blob,
 //! `.` for a bundle, and `./<name>` for an entry, where `<name>` is the last
-//! segment of the entry's path. The command then names the destination on
-//! stderr before the pull starts.
+//! segment of the entry's path. The command then writes the absolute
+//! destination to stderr before the pull starts, except under `--json` or
+//! `--dry-run`. A bundle or entry pull into a default destination refuses a
+//! path that already holds a file no earlier pull wrote there.
 
 use std::path::{Path, PathBuf};
 
@@ -32,10 +34,12 @@ pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<(
     let uri = parse_and_check(args)?;
     let dest = Destination::of(args, &uri);
     if args.output.is_none() && !args.json && !args.dry_run {
-        eprintln!("Downloading to {}", dest.shown(&uri).display());
+        let shown = dest.shown();
+        let shown = std::path::absolute(&shown).unwrap_or(shown);
+        eprintln!("Downloading to {}", shown.display());
     }
     match uri.target {
-        UriTarget::Blob => super::fetch::fetch(args, &dest.root, &uri, config_path).await,
+        UriTarget::Blob => super::fetch::fetch(args, &dest.path, &uri, config_path).await,
         _ => super::bundle_pull::bundle_pull(args, &dest, &uri, config_path).await,
     }
 }
@@ -43,49 +47,55 @@ pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<(
 /// Where a `decdn get` run writes: `-o`, or the default for the URI's target.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Destination {
-    /// The blob's destination file, or the bundle's output root.
-    pub(crate) root: PathBuf,
-    /// Whether the entry an entry URI names lands at its file name directly in
-    /// `root`, not at its full path under `root`. Set only without `-o`.
-    pub(crate) flatten: bool,
+    /// The blob's destination file, or the bundle's output directory.
+    pub(crate) path: PathBuf,
+    /// The file name the entry an entry URI names lands at, directly in
+    /// `path`, in place of its full manifest path under `path`. Set only for
+    /// an entry URI without `-o`.
+    pub(crate) entry_name: Option<String>,
 }
 
 impl Destination {
     /// The destination of `args` for `uri`: `-o` as given, or else
-    /// `./<hash>` for a blob, and `.` for a bundle or an entry, with the entry
-    /// flattened to its file name.
+    /// `./<hash>` for a blob, `.` for a bundle, and `.` for an entry with the
+    /// entry landing at the last segment of its path.
     pub(crate) fn of(args: &GetArgs, uri: &DecdnUri) -> Self {
         if let Some(output) = &args.output {
             return Self {
-                root: output.clone(),
-                flatten: false,
+                path: output.clone(),
+                entry_name: None,
             };
         }
         match &uri.target {
             UriTarget::Blob => Self {
-                root: Path::new(".").join(blake3::Hash::from_bytes(uri.hash).to_hex().as_str()),
-                flatten: false,
+                path: Path::new(".").join(blake3::Hash::from_bytes(uri.hash).to_hex().as_str()),
+                entry_name: None,
             },
-            UriTarget::BundleEntry(_) => Self {
-                root: PathBuf::from("."),
-                flatten: true,
+            // The URI parser holds every segment non-empty and free of `/`,
+            // so the last segment is a plain name. The pull still checks it
+            // against the path-safety rules, like any manifest path.
+            UriTarget::BundleEntry(entry) => Self {
+                path: PathBuf::from("."),
+                entry_name: Some(
+                    entry
+                        .rsplit_once('/')
+                        .map_or(entry.as_str(), |(_, name)| name)
+                        .to_owned(),
+                ),
             },
             _ => Self {
-                root: PathBuf::from("."),
-                flatten: false,
+                path: PathBuf::from("."),
+                entry_name: None,
             },
         }
     }
 
-    /// The path to name for the user: the entry's file for a flattened entry,
-    /// and `root` otherwise.
-    fn shown(&self, uri: &DecdnUri) -> PathBuf {
-        match &uri.target {
-            UriTarget::BundleEntry(path) if self.flatten => Path::new(path)
-                .file_name()
-                .map_or_else(|| self.root.clone(), |name| self.root.join(name)),
-            _ => self.root.clone(),
-        }
+    /// The path to name for the user: the entry's file when it lands at its
+    /// name, and `path` otherwise.
+    fn shown(&self) -> PathBuf {
+        self.entry_name
+            .as_ref()
+            .map_or_else(|| self.path.clone(), |name| self.path.join(name))
     }
 }
 

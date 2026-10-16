@@ -155,6 +155,25 @@ impl BundleManifest {
     }
 }
 
+/// The paths of `entries` that hold something under `out_dir` that no pull
+/// recorded writing there: a file, directory or link at the entry's path, with
+/// no record in the skip-cache each pull keeps in `out_dir`. A pull replaces
+/// such a file when its bytes differ from the entry's, so a caller that did
+/// not choose `out_dir` can refuse the pull first.
+#[must_use]
+pub fn unrecorded_paths(entries: &[ManifestEntry], out_dir: &Path) -> Vec<String> {
+    let saved = skip_cache::load(out_dir);
+    entries
+        .iter()
+        .filter(|en| saved.get(&en.path).is_none())
+        .filter(|en| {
+            engine::safe_join(out_dir, &en.path)
+                .is_ok_and(|dest| std::fs::symlink_metadata(dest).is_ok())
+        })
+        .map(|en| en.path.clone())
+        .collect()
+}
+
 /// Bytes that are not a v1 bundle manifest: [`BundleManifest::parse`]'s error,
 /// so a caller can tell a blob that is not a manifest from a failed fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]

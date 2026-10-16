@@ -49,7 +49,8 @@ pub struct GetArgs {
     /// absent); each entry's relative path resolves within it, and
     /// `..`/absolute/escaping paths are rejected. Without `-o`, a blob lands at
     /// `./<hash>`, a bundle in `.`, and an entry at `./<name>` (the last
-    /// segment of its path).
+    /// segment of its path); a bundle or entry pull then refuses a path that
+    /// holds a file no earlier pull wrote, unless `--overwrite`.
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 

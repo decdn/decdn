@@ -470,7 +470,7 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 
 /// `decdn get decdn:<hash>`: fetch the blob `uri` names over `cdn/client/v1`,
 /// auto-opening/reusing the caller's `PaymentPool` deposit, and write it
-/// atomically to `output` (or stream it to stdout for `-o -`). `config_path`
+/// atomically to `output` (or stream it to stdout when `output` is `-`). `config_path`
 /// (the global `--config`) supplies relays (#935), discovery (#936), and chain
 /// coordinates.
 ///
@@ -532,7 +532,7 @@ pub(crate) struct BlobFetch {
     pub(crate) hash: [u8; 32],
     /// The namespace routing hint (ADR 002).
     pub(crate) namespace: Option<u64>,
-    /// `-o`: the destination file, or `-` for stdout. Read only for
+    /// `-o`, or its `./<hash>` default: the destination file, or `-` for stdout. Read only for
     /// [`Sink::Output`].
     pub(crate) output: PathBuf,
     /// The retrieval flags.

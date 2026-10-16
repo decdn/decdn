@@ -116,29 +116,35 @@ fn output_defaults_follow_the_uri_target() {
         (
             format!("decdn:{HEX}"),
             format!("./{HEX}"),
-            false,
+            None,
             format!("./{HEX}"),
         ),
         (
             format!("decdn:{HEX}/"),
             ".".to_owned(),
-            false,
+            None,
             ".".to_owned(),
         ),
         (
             format!("decdn:{HEX}/models/a.bin"),
             ".".to_owned(),
-            true,
+            Some("a.bin"),
             "./a.bin".to_owned(),
         ),
+        (
+            format!("decdn:{HEX}/top.bin"),
+            ".".to_owned(),
+            Some("top.bin"),
+            "./top.bin".to_owned(),
+        ),
     ];
-    for (uri, root, flatten, shown) in cases {
+    for (uri, path, entry_name, shown) in cases {
         let args = get_args(&[&uri]);
         let parsed = parse_and_check(&args).unwrap();
         let dest = Destination::of(&args, &parsed);
-        assert_eq!(dest.root, PathBuf::from(&root), "{uri}");
-        assert_eq!(dest.flatten, flatten, "{uri}");
-        assert_eq!(dest.shown(&parsed), PathBuf::from(&shown), "{uri}");
+        assert_eq!(dest.path, PathBuf::from(&path), "{uri}");
+        assert_eq!(dest.entry_name.as_deref(), entry_name, "{uri}");
+        assert_eq!(dest.shown(), PathBuf::from(&shown), "{uri}");
     }
 }
 
@@ -151,8 +157,8 @@ fn an_explicit_output_is_kept_as_given() {
     assert_eq!(
         dest,
         Destination {
-            root: PathBuf::from("dir"),
-            flatten: false
+            path: PathBuf::from("dir"),
+            entry_name: None,
         }
     );
 }

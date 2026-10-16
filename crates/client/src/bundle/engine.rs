@@ -474,6 +474,23 @@ fn plan_slots<'a>(
                     ),
                 ))
             }
+            // Reserve the pull's own state: an entry at the skip-cache file
+            // would be overwritten by the run's skip-cache flush, and an entry
+            // inside the manifest cache would collide with a cached manifest.
+            Ok(dest)
+                if dest == out_root.join(skip_cache::SAVED_MANIFEST_NAME)
+                    || dest.starts_with(out_root.join(manifest_cache::CACHE_DIR)) =>
+            {
+                Slot::Failed(EntryOutcome::failed(
+                    &en.path,
+                    &anyhow::anyhow!(
+                        "manifest path {:?} is reserved for the pull's own state ({} or {}/)",
+                        en.path,
+                        skip_cache::SAVED_MANIFEST_NAME,
+                        manifest_cache::CACHE_DIR,
+                    ),
+                ))
+            }
             Ok(_) if !overwrite && skip.contains(en.path.as_str()) => Slot::Skip,
             Ok(dest) => Slot::Write {
                 label: en.path.as_str(),
@@ -3830,7 +3847,7 @@ impl EntryOutcome {
 /// components — absolute paths, `.`/`..`, drive prefixes, empty components
 /// (leading/trailing/double slash). With `..` rejected, the result cannot
 /// escape `root`. (`appendix-bundles.md` § Path-safety rules.)
-fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+pub(super) fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     if rel.is_empty() {
         bail!("empty entry path");
     }

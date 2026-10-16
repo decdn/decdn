@@ -163,12 +163,14 @@ decdn --config ~/.decdn/client.toml get decdn:<blake3-hash> -o ./blob.bin
 A `decdn:` URI names a blob, a whole bundle, or one file of a bundle
 ([appendix](adr/appendix-bundles.md#decdn-uris)):
 
-| URI | `get` pulls | `-o` is |
-|-----|-------------|---------|
-| `decdn:<hash>` | the blob | a file, or `-` for stdout |
-| `decdn:<hash>/` | every file of the bundle whose manifest has this hash | a directory |
-| `decdn:<hash>/a/b.txt` | that one file of the bundle | a directory |
-| any of these with `?ns=<id>` | the same, routed to a namespace's origins | the same |
+| URI | `get` pulls | `-o` is | Without `-o` |
+|-----|-------------|---------|--------------|
+| `decdn:<hash>` | the blob | a file, or `-` for stdout | `./<hash>` |
+| `decdn:<hash>/` | every file of the bundle whose manifest has this hash | a directory | `.` |
+| `decdn:<hash>/a/b.txt` | that one file of the bundle | a directory | `./b.txt` |
+| any of these with `?ns=<id>` | the same, routed to a namespace's origins | the same | the same |
+
+Without `-o`, a bundle or entry pull refuses to replace a file that no earlier pull wrote.
 
 `get` probes bonded nodes and picks one that holds the blob. When none does, it tries
 bonded non-holders nearest first. Each fills the miss from its own origin, or from a peer
