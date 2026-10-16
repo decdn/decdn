@@ -7,21 +7,62 @@
 //! is what causes duplicate spends. That is the one failure mode where the
 //! operator most needs the hash, so the error must name it.
 //!
+//! [`send`] and [`send_for_receipt`] bound their receipt wait by
+//! [`RECEIPT_TIMEOUT`] through [`await_receipt`]: a transaction dropped from the
+//! mempool never yields a receipt, and an unbounded wait would hang the command.
+//! A lapse ends in the same "receipt not read" outcome as a failed read, with
+//! the hash in the error.
+//!
 //! Lives in `decdn-incentive` rather than the CLI so every on-chain write in
 //! this crate shares one send/receipt path.
 //!
 //! `cli::commands::pool`'s `close_and_forget` / `reclaim_and_forget` hand-roll
 //! the pair so they can word a revert as a likely race: a concurrent close by
 //! the same owner, or a concurrent permissionless reclaim. Like this module,
-//! they read the tx hash before the receipt wait, so a receipt-read error names
-//! the transaction. In production code, a send/receipt pair that reads the hash
+//! they read the tx hash before the receipt wait and bound the wait with
+//! [`await_receipt`], so a receipt-read error or a lapse names the
+//! transaction. In production code, a send/receipt pair that reads the hash
 //! after the receipt wait is a bug. The `decdn-e2e` fixtures are exempt: a
 //! failed fixture tx fails the test, and no operator reconciles it.
 
 use alloy::contract::{CallBuilder, CallDecoder, Error as ContractError};
+use alloy::network::Ethereum;
 use alloy::primitives::B256;
-use alloy::providers::Provider;
+use alloy::providers::{PendingTransactionBuilder, Provider};
+use alloy::rpc::types::TransactionReceipt;
 use anyhow::Context;
+use std::time::Duration;
+
+/// The bound on a receipt wait: every CLI wait, and the node's `approve` and
+/// `openPool` waits. It is well above a normal inclusion window, so a lapse
+/// means the transaction is stuck or was dropped from the mempool. A lapse does
+/// not cancel the transaction: it may still mine, so every caller reports it as
+/// unconfirmed and names its hash.
+pub const RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// Wait for `pending`'s receipt, for at most `timeout` when it is `Some`.
+///
+/// `get_receipt` consumes `pending`, so a caller reads the tx hash before this
+/// call and names it in the error. `tokio::time::timeout` bounds the wait, not
+/// alloy's `with_timeout`: alloy checks its own deadline against the wall clock,
+/// which a paused test clock does not advance.
+///
+/// # Errors
+///
+/// Fails if the receipt cannot be read, or if no receipt arrives within
+/// `timeout`. Either way the transaction may still mine.
+pub async fn await_receipt(
+    pending: PendingTransactionBuilder<Ethereum>,
+    timeout: Option<Duration>,
+) -> anyhow::Result<TransactionReceipt> {
+    let Some(timeout) = timeout else {
+        return Ok(pending.get_receipt().await?);
+    };
+    match tokio::time::timeout(timeout, pending.get_receipt()).await {
+        Ok(receipt) => Ok(receipt?),
+        Err(_elapsed) => anyhow::bail!("no receipt within {timeout:?}"),
+    }
+}
 
 /// What a [`send_for_receipt`] call did on-chain, recorded through its out-param
 /// independently of the `Result` it returns.
@@ -42,7 +83,8 @@ use anyhow::Context;
 ///   transport-class error. The request may have reached the node and broadcast
 ///   the transaction, but no hash was captured. The outcome is UNKNOWN.
 /// - [`InFlight`](Self::InFlight) — broadcast, but the receipt could not be
-///   fetched. In flight, may still confirm. Carries the hash.
+///   read or did not arrive within [`RECEIPT_TIMEOUT`]. In flight, may still
+///   confirm. Carries the hash.
 /// - [`Reverted`](Self::Reverted) — broadcast and mined, but reverted: it burned
 ///   gas and had no effect. Carries the hash as a permanent on-chain handle.
 /// - [`Confirmed`](Self::Confirmed) — confirmed success. Carries the hash.
@@ -60,7 +102,8 @@ pub enum SendOutcome {
     /// no hash was captured, so the outcome is genuinely unknown and re-sending
     /// can double-submit.
     MaybeBroadcast,
-    /// Broadcast; the receipt could not be read. May still confirm.
+    /// Broadcast; the receipt could not be read or did not arrive within
+    /// [`RECEIPT_TIMEOUT`]. May still confirm.
     InFlight(B256),
     /// Broadcast and mined, but reverted. No effect; the hash is a handle for
     /// reconciling the gas spend.
@@ -177,7 +220,8 @@ pub fn is_nonce_collision(err: &ContractError) -> bool {
 ///   MAY have been broadcast — the outcome is unknown ([`SendOutcome`] carries
 ///   this as [`MaybeBroadcast`](SendOutcome::MaybeBroadcast) for callers that
 ///   render structured receipts)
-/// - broadcast, receipt unreadable → `Some(hash)` **and** `Err` — the outcome is
+/// - broadcast, receipt unread (a failed read, or none within
+///   [`RECEIPT_TIMEOUT`]) → `Some(hash)` **and** `Err` — the outcome is
 ///   UNKNOWN, and the caller must treat it as possibly-applied
 /// - confirmed revert → `None` and `Err` (definitively no effect)
 /// - confirmed success → `Some(hash)` and `Ok`
@@ -199,8 +243,8 @@ pub fn is_nonce_collision(err: &ContractError) -> bool {
 ///
 /// # Errors
 ///
-/// Fails if the call cannot be sent, if the receipt cannot be fetched, or if the
-/// transaction reverted.
+/// Fails if the call cannot be sent, if the receipt read fails or no receipt
+/// arrives within [`RECEIPT_TIMEOUT`], or if the transaction reverted.
 pub async fn send<C: CallDecoder, P: Provider>(
     call: CallBuilder<P, C>,
     label: &str,
@@ -227,8 +271,8 @@ pub async fn send<C: CallDecoder, P: Provider>(
 ///
 /// # Errors
 ///
-/// Fails if the call cannot be sent, if the receipt cannot be fetched, or if the
-/// transaction reverted.
+/// Fails if the call cannot be sent, if the receipt read fails or no receipt
+/// arrives within [`RECEIPT_TIMEOUT`], or if the transaction reverted.
 pub async fn send_for_receipt<C: CallDecoder, P: Provider>(
     call: CallBuilder<P, C>,
     label: &str,
@@ -267,12 +311,18 @@ pub async fn send_for_receipt<C: CallDecoder, P: Provider>(
     let hash = *pending.tx_hash();
     // Recorded BEFORE the receipt is awaited, which is the whole point of the
     // out-param. From here the transaction is broadcast and may take effect; if
-    // the receipt cannot be read `outcome` stays `InFlight`, so the caller can
-    // still see that a tx is outstanding.
+    // the receipt cannot be read or does not arrive within `RECEIPT_TIMEOUT`,
+    // `outcome` stays `InFlight`, so the caller can still see that a tx is
+    // outstanding.
     *outcome = SendOutcome::InFlight(hash);
-    let receipt = pending.get_receipt().await.with_context(|| {
-        format!("{label} sent (tx {hash:#x}) but the receipt could not be fetched")
-    })?;
+    let receipt = await_receipt(pending, Some(RECEIPT_TIMEOUT))
+        .await
+        .with_context(|| {
+            format!(
+                "{label} sent (tx {hash:#x}) but its receipt was not read; it may still mine — \
+                 check the tx before re-running"
+            )
+        })?;
     // `status()` coerces a pre-Byzantium `PostState` receipt to success. Not
     // reachable on the L2s this targets; noted so the check isn't read as
     // exhaustive over every receipt shape.

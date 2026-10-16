@@ -16,6 +16,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::payment_pool::{PaymentPool, newest_solvent_owned_pool};
+use decdn_incentive::tx::RECEIPT_TIMEOUT;
 use decdn_incentive::{CapabilityGrant, Deployment, LaneKey, PoolId, bind_node_id_domain};
 use iroh::Endpoint;
 
@@ -359,7 +360,14 @@ where
                     },
                 )
                 .await?;
-                top_up(self.contract, self.owner, pool_id, additional).await
+                top_up(
+                    self.contract,
+                    self.owner,
+                    pool_id,
+                    additional,
+                    Some(RECEIPT_TIMEOUT),
+                )
+                .await
             }
             .await;
             // A failure before any receipt names its cause once: a wallet
@@ -521,6 +529,7 @@ where
             self.owner,
             deposit,
             Some(self.funding.opens()),
+            Some(RECEIPT_TIMEOUT),
         )
         .await?;
         self.store
@@ -1092,7 +1101,14 @@ where
             if max_approve { None } else { Some(additional) },
         )
         .await?;
-        top_up(contract, self_address, state.pool_id, additional).await
+        top_up(
+            contract,
+            self_address,
+            state.pool_id,
+            additional,
+            Some(RECEIPT_TIMEOUT),
+        )
+        .await
     }
     .await;
     let err = match escrowed {
@@ -1269,6 +1285,7 @@ where
         self_address,
         deposit,
         Some(funding.opens()),
+        Some(RECEIPT_TIMEOUT),
     )
     .await?;
     // The deposit is escrowed on-chain; a failed local record leaves it

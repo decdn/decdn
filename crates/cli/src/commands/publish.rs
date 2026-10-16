@@ -550,7 +550,8 @@ pub(crate) enum SeatOutcome {
     /// The `addOrigin` transaction confirmed. The operator is authorized.
     Seated(B256),
     /// The transaction was broadcast but its outcome could not be read (the
-    /// receipt fetch failed). It may still confirm. `send_for_receipt` records
+    /// receipt fetch failed, or no receipt arrived within
+    /// `decdn_incentive::tx::RECEIPT_TIMEOUT`). It may still confirm. `send_for_receipt` records
     /// the hash before awaiting the receipt precisely so this case can carry it.
     InFlight(B256),
     /// Mined, but the transaction reverted: it burned gas and did not seat the

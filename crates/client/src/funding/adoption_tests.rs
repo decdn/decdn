@@ -1562,3 +1562,108 @@ async fn an_unreadable_delegate_record_fails_the_lane_build_fatally() -> anyhow:
     );
     Ok(())
 }
+
+/// Run [`open_or_reuse_pool`] on `rpc`, which never mines the transaction it
+/// is sent, for at most twice [`RECEIPT_TIMEOUT`].
+async fn run_until_lapse(
+    store: &RedbBuyerPoolStore,
+    signer: &Arc<PrivateKeySigner>,
+    rpc: &decdn_incentive::test_rpc::ScriptedRpc,
+    funding: &RunFunding,
+) -> anyhow::Error {
+    let provider = rpc.clone().provider();
+    let contract = PaymentPool::new(PP, provider.clone());
+    tokio::time::timeout(
+        RECEIPT_TIMEOUT * 2,
+        open_or_reuse_pool(
+            store,
+            &contract,
+            &provider,
+            funding,
+            &OwnedPayer::for_store(Arc::clone(signer), store).unwrap(),
+            PROVIDER,
+            DEPLOYMENT,
+            DepositPolicy {
+                working_deposit: U256::from(WORKING),
+                max_approve: false,
+                adoption: ChainAdoption::Refused,
+            },
+        ),
+    )
+    .await
+    .expect("the receipt wait must lapse within RECEIPT_TIMEOUT")
+    .expect_err("a transaction that never mines fails the lane build")
+}
+
+/// A lane build whose `openPool` never mines ends at [`RECEIPT_TIMEOUT`] with
+/// the open unconfirmed, in the error and in the run's handle, so `decdn get`
+/// names the tx instead of hanging (#2433).
+#[tokio::test(start_paused = true)]
+async fn a_lane_build_open_that_never_mines_lapses_unconfirmed() {
+    use decdn_incentive::test_rpc::{SCRIPTED_NONCE, SCRIPTED_TX, ScriptedRpc};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    // `usdc()`, then an allowance read that finds enough.
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([
+        Bytes::from(TOKEN.abi_encode()),
+        Bytes::from(U256::MAX.abi_encode()),
+    ]);
+    let opens = UnconfirmedOpens::default();
+    let funding = RunFunding::reporting_opens_to(opens.clone());
+    let err = run_until_lapse(&store, &signer, &rpc, &funding).await;
+    let unconfirmed = OpenUnconfirmed {
+        tx: Some(SCRIPTED_TX),
+        nonce: SCRIPTED_NONCE,
+    };
+    assert_eq!(
+        err.downcast_ref::<OpenUnconfirmed>(),
+        Some(&unconfirmed),
+        "{err:#}"
+    );
+    assert!(format!("{err:#}").contains("no receipt within"), "{err:#}");
+    assert_eq!(opens.pending(), vec![unconfirmed]);
+    assert!(rpc.calls_drained(), "the open read the token and allowance");
+}
+
+/// A reused pool's low-water refill whose `topUp` never mines ends at
+/// [`RECEIPT_TIMEOUT`] with [`TopUpUnconfirmed`] naming the tx (#2433).
+#[tokio::test(start_paused = true)]
+async fn a_refill_that_never_mines_lapses_unconfirmed() {
+    use crate::buyer_pool::TopUpUnconfirmed;
+    use decdn_incentive::test_rpc::{SCRIPTED_NONCE, SCRIPTED_TX, ScriptedRpc};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    // Five lanes of 2 USDC spend the whole deposit, so the build refills.
+    store
+        .record(&tracked_row(
+            B256::repeat_byte(0xEE),
+            signer.address(),
+            lane_of(&store, &signer),
+            WORKING,
+            &[2_000_000; 5],
+        ))
+        .unwrap();
+    // `getPool` shows the row's pool open, then the allowance read finds enough.
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([
+        still_open(signer.address()),
+        Bytes::from(U256::MAX.abi_encode()),
+    ]);
+    let err = run_until_lapse(&store, &signer, &rpc, &RunFunding::default()).await;
+    assert_eq!(
+        err.downcast_ref::<TopUpUnconfirmed>(),
+        Some(&TopUpUnconfirmed {
+            tx: Some(SCRIPTED_TX),
+            nonce: SCRIPTED_NONCE,
+        }),
+        "{err:#}"
+    );
+    assert!(format!("{err:#}").contains("no receipt within"), "{err:#}");
+    assert!(
+        rpc.calls_drained(),
+        "the refill read the pool and allowance"
+    );
+}

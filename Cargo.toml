@@ -289,7 +289,9 @@ proptest = "1"
 rexpect = "0.7"
 # `decdn-node` wraps its alloy RPC transport in a `tower::Layer`
 # (`rpc_metrics`) that counts every JSON-RPC request, and its chain-watcher
-# tests build a `tower::Service` transport whose RPCs never resolve. alloy
+# tests build a `tower::Service` transport whose RPCs never resolve.
+# `decdn-incentive`'s `test-util` feature builds one too (`test_rpc`), which
+# parks a receipt wait for the receipt-timeout tests. alloy
 # already depends on tower 0.5; this pins the same major so those `Service`
 # impls satisfy alloy's `Transport` blanket bound.
 tower = "0.5"

@@ -3757,3 +3757,64 @@ fn pin_ctx_signs_with_the_node_key() {
     let capability = ctx.capability.expect("a self capability");
     assert_eq!(capability.capability.signer, node.address());
 }
+
+/// A service whose `contract` sends every transaction as
+/// [`SCRIPTED_TX`](decdn_incentive::test_rpc::SCRIPTED_TX) and never mines
+/// it: a transaction dropped from the mempool.
+fn never_mining_service(owner: Address) -> BuyerPoolService<impl Provider + Clone + 'static> {
+    let contract = PaymentPool::new(
+        DEPLOYMENT.payment_pool,
+        decdn_incentive::test_rpc::ScriptedRpc::parked_receipt().provider(),
+    );
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    mocked_service_on(contract, store, signer(), owner)
+}
+
+/// An `openPool` that never mines lapses at [`RECEIPT_TIMEOUT`] into the
+/// settle loop, which holds the open slot, so a waiting miss fails fast as
+/// `OpenHeld` instead of waiting out its budget. Without the bound a dropped
+/// open would never reach the settle loop's re-send (#2433).
+#[tokio::test(start_paused = true)]
+async fn an_open_that_never_mines_lapses_into_the_held_slot() {
+    let svc = never_mining_service(Address::repeat_byte(1));
+    let budget = RECEIPT_TIMEOUT * 3;
+    let started = tokio::time::Instant::now();
+    let err = svc
+        .open_or_reuse_pool(Address::repeat_byte(3), budget)
+        .await
+        .expect_err("the open cannot resolve");
+    assert!(err.downcast_ref::<OpenHeld>().is_some(), "{err:#}");
+    let waited = started.elapsed();
+    assert!(
+        waited >= RECEIPT_TIMEOUT && waited < budget,
+        "the miss fails when the receipt wait lapses, after {waited:?}"
+    );
+    assert!(
+        svc.open_in_flight.lock().unwrap().is_some(),
+        "the settle loop still holds the slot"
+    );
+}
+
+/// A node `topUp` that never mines keeps its task, and so the top-up slot,
+/// for as long as it may still mine: a lapse would free the slot, and the next
+/// low-water refill would send a second `topUp` (#2433).
+#[tokio::test(start_paused = true)]
+async fn a_top_up_that_never_mines_keeps_the_top_up_slot() {
+    let svc = never_mining_service(Address::repeat_byte(1));
+    let (shared, claim) = svc.join_or_spawn_topup(
+        PoolId::from([0xAA; 32]),
+        U256::from(1_000u64),
+        TopUpFunder::Refill,
+    );
+    assert_eq!(claim, TopUpClaim::Spawned);
+    assert!(
+        tokio::time::timeout(RECEIPT_TIMEOUT * 10, shared)
+            .await
+            .is_err(),
+        "the topUp must still be waiting for its receipt"
+    );
+    assert!(
+        svc.topup_in_flight.lock().unwrap().is_some(),
+        "the topUp task still holds the slot"
+    );
+}

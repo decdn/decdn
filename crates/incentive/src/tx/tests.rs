@@ -117,3 +117,45 @@ fn a_transport_failure_leaves_the_broadcast_unknown() {
     assert!(send_broadcast_unknown(&http_error(502)));
     assert!(send_broadcast_unknown(&http_error(500)));
 }
+
+/// A broadcast transaction that never mines ends the wait at
+/// [`RECEIPT_TIMEOUT`]: the error names the hash, and the outcome
+/// stays `InFlight` because the transaction may still mine (#2433).
+#[tokio::test(start_paused = true)]
+async fn a_receipt_that_never_arrives_lapses_in_flight() {
+    use crate::test_rpc::{SCRIPTED_TX, ScriptedRpc};
+
+    let provider = ScriptedRpc::parked_receipt().provider();
+    let call = CallBuilder::new_raw(&provider, alloy::primitives::Bytes::new())
+        .to(alloy::primitives::Address::repeat_byte(0x01));
+    let mut outcome = SendOutcome::NotSent;
+    let sent = tokio::time::timeout(
+        RECEIPT_TIMEOUT * 2,
+        send_for_receipt(call, "closePool", None, &mut outcome),
+    )
+    .await
+    .expect("the receipt wait must lapse within RECEIPT_TIMEOUT");
+    let err = sent.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains(&format!("{SCRIPTED_TX:#x}")), "{msg}");
+    // A plain `send` caller prints this error as its whole message, so the
+    // warning against a re-run has to be in it.
+    assert!(msg.contains("it may still mine"), "{msg}");
+    assert!(msg.contains("no receipt within"), "{msg}");
+    assert_eq!(outcome, SendOutcome::InFlight(SCRIPTED_TX));
+}
+
+/// With no bound, [`await_receipt`] waits for as long as the receipt takes.
+#[tokio::test(start_paused = true)]
+async fn an_unbounded_receipt_wait_keeps_waiting() {
+    use crate::test_rpc::ScriptedRpc;
+
+    let provider = ScriptedRpc::parked_receipt().provider();
+    let pending = CallBuilder::new_raw(&provider, alloy::primitives::Bytes::new())
+        .to(alloy::primitives::Address::repeat_byte(0x01))
+        .send()
+        .await
+        .unwrap();
+    let waited = tokio::time::timeout(RECEIPT_TIMEOUT * 10, await_receipt(pending, None)).await;
+    assert!(waited.is_err(), "an unbounded wait must still be pending");
+}
