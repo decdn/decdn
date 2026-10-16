@@ -1667,3 +1667,89 @@ async fn a_refill_that_never_mines_lapses_unconfirmed() {
         "the refill read the pool and allowance"
     );
 }
+
+/// Once a run's `topUp` lapses unconfirmed, neither a sibling lane build's
+/// refill nor a recovery step sends another `topUp` while the first may still
+/// mine: each refuses at once with the held [`TopUpUnconfirmed`]. A bundle
+/// entry queued on `open_lock` or the recovery step lock reaches one of them
+/// before the first entry's fault ends the run.
+#[tokio::test(start_paused = true)]
+async fn a_top_up_after_an_unconfirmed_one_is_refused() {
+    use crate::buyer_pool::TopUpUnconfirmed;
+    use decdn_incentive::test_rpc::{SCRIPTED_NONCE, SCRIPTED_TX, ScriptedRpc};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let pool_id = B256::repeat_byte(0xEE);
+    // Five lanes of 2 USDC spend the whole deposit, so every build refills.
+    store
+        .record(&tracked_row(
+            pool_id,
+            signer.address(),
+            lane_of(&store, &signer),
+            WORKING,
+            &[2_000_000; 5],
+        ))
+        .unwrap();
+    let funding = RunFunding::default();
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([
+        still_open(signer.address()),
+        Bytes::from(U256::MAX.abi_encode()),
+    ]);
+    let held = TopUpUnconfirmed {
+        tx: Some(SCRIPTED_TX),
+        nonce: SCRIPTED_NONCE,
+    };
+    let first = run_until_lapse(&store, &signer, &rpc, &funding).await;
+    assert_eq!(first.downcast_ref::<TopUpUnconfirmed>(), Some(&held));
+
+    let refused = |err: &anyhow::Error| {
+        assert_eq!(
+            err.downcast_ref::<TopUpUnconfirmed>(),
+            Some(&held),
+            "{err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("refusing a second topUp"),
+            "{err:#}"
+        );
+    };
+
+    // A sibling lane build of the run reuses the noted pool without a read, so
+    // its first call would be the allowance read.
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([Bytes::from(U256::MAX.abi_encode())]);
+    let started = tokio::time::Instant::now();
+    refused(&run_until_lapse(&store, &signer, &rpc, &funding).await);
+    assert!(
+        started.elapsed() < RECEIPT_TIMEOUT,
+        "the refusal waits on no receipt"
+    );
+    assert!(!rpc.calls_drained(), "the refusal reads no allowance");
+
+    // A recovery step reads the pool, then would read the allowance.
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([
+        still_open(signer.address()),
+        Bytes::from(U256::MAX.abi_encode()),
+    ]);
+    let provider = rpc.clone().provider();
+    let contract = PaymentPool::new(PP, provider.clone());
+    let funder = PoolFunder {
+        contract: &contract,
+        rpc: &provider,
+        store: &store,
+        owner: signer.address(),
+        deployment: DEPLOYMENT,
+        token: TOKEN,
+        payment_pool_addr: PP,
+        working_deposit: U256::from(WORKING),
+        max_approve: false,
+        funding: &funding,
+    };
+    let err = tokio::time::timeout(RECEIPT_TIMEOUT * 2, funder.recover(U256::ZERO))
+        .await
+        .expect("a refused step returns at once")
+        .expect_err("a recovery step after an unconfirmed topUp fails");
+    refused(&err);
+    assert!(!rpc.calls_drained(), "the refusal reads no allowance");
+}

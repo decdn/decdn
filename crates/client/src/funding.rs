@@ -78,13 +78,15 @@ pub fn cached_pool_token(
 /// lane pays from, which a funding recovery step tops up: every entry of a
 /// bundle pull shares it, the entries that have built no lane yet included.
 /// Every `openPool` a lane build or a recovery step sends is held in its
-/// [`UnconfirmedOpens`] until its receipt is read.
+/// [`UnconfirmedOpens`] until its receipt is read. The first `topUp` whose
+/// receipt is not read is held too, and the run sends no further `topUp`.
 #[derive(Debug, Default)]
 pub struct RunFunding {
     spend: Mutex<RunSpend>,
     shortfall: Mutex<Option<String>>,
     pool_id: OnceLock<PoolId>,
     opens: UnconfirmedOpens,
+    top_up: Mutex<Option<TopUpUnconfirmed>>,
 }
 
 /// What a lane build learned about the pool's spend, for
@@ -189,6 +191,20 @@ impl RunFunding {
                 .unwrap_or(U256::ZERO);
             total.saturating_add(lane)
         }))
+    }
+
+    /// The run's `topUp` whose receipt was not read, if one was sent.
+    fn unconfirmed_top_up(&self) -> Option<TopUpUnconfirmed> {
+        *self.top_up.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Hold `top_up`, a `topUp` whose receipt was not read, unless the run
+    /// already holds one.
+    fn hold_top_up(&self, top_up: TopUpUnconfirmed) {
+        self.top_up
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(top_up);
     }
 
     /// The warning for a wallet seen to hold too little USDC for a top-up in
@@ -344,31 +360,15 @@ where
                         .context(WalletShortfall),
                 );
             }
-            // `topUp` pulls `additional` USDC via `transferFrom`, so the
-            // standing allowance must cover it first: unlimited under
-            // `--max-approve`, else exactly `additional`.
-            let escrowed = async {
-                ensure_allowance(
-                    self.rpc,
-                    self.token,
-                    self.owner,
-                    self.payment_pool_addr,
-                    if self.max_approve {
-                        None
-                    } else {
-                        Some(additional)
-                    },
-                )
-                .await?;
-                top_up(
-                    self.contract,
-                    self.owner,
-                    pool_id,
-                    additional,
-                    Some(RECEIPT_TIMEOUT),
-                )
-                .await
-            }
+            let escrowed = escrow_top_up(
+                self.funding,
+                self.contract,
+                self.token,
+                self.owner,
+                pool_id,
+                additional,
+                self.max_approve,
+            )
             .await;
             // A failure before any receipt names its cause once: a wallet
             // short of USDC is recorded for the run's closing warning.
@@ -1038,6 +1038,54 @@ fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
     ))
 }
 
+/// Top `pool_id` up by `additional` from `owner`: ensure the pool's standing
+/// USDC allowance covers it (unlimited under `max_approve`, else exactly
+/// `additional`), since `topUp` pulls it via `transferFrom`, then send `topUp`
+/// and read its receipt within [`RECEIPT_TIMEOUT`].
+///
+/// The proactive refill and the funding recovery step both escrow through
+/// here, each under its own lock: `open_lock` and the recovery step lock. A
+/// `topUp` whose receipt is not read ([`TopUpUnconfirmed`]) may still mine, so
+/// `funding` holds it before the caller's lock is released. Every later call
+/// in the run refuses with that error instead of escrowing a second deposit,
+/// and the acquire loop ends the command on it.
+///
+/// # Errors
+///
+/// The run holds an unconfirmed `topUp`, or the allowance or `topUp` leg fails.
+async fn escrow_top_up<P>(
+    funding: &RunFunding,
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    token: Address,
+    owner: Address,
+    pool_id: PoolId,
+    additional: U256,
+    max_approve: bool,
+) -> anyhow::Result<ToppedUpPool>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    if let Some(earlier) = funding.unconfirmed_top_up() {
+        return Err(anyhow::Error::new(earlier)
+            .context("refusing a second topUp while an earlier one is unconfirmed"));
+    }
+    ensure_allowance(
+        contract.provider(),
+        token,
+        owner,
+        *contract.address(),
+        if max_approve { None } else { Some(additional) },
+    )
+    .await?;
+    let topped_up = top_up(contract, owner, pool_id, additional, Some(RECEIPT_TIMEOUT)).await;
+    if let Err(err) = &topped_up
+        && let Some(unconfirmed) = err.downcast_ref::<TopUpUnconfirmed>()
+    {
+        funding.hold_top_up(*unconfirmed);
+    }
+    topped_up
+}
+
 /// Restore `state`'s remaining deposit (`deposit - spent`) to `working_deposit`
 /// once it falls below the low water — see [`refill_amount`] — and return the
 /// row to build the lane on.
@@ -1089,27 +1137,15 @@ where
         state.pool_id,
         state.deposit,
     );
-    // `topUp` pulls `additional` USDC via `transferFrom`, so the pool's
-    // standing allowance must cover it first. Ensure it in the caller's
-    // mode: unlimited under `--max-approve`, else exactly `additional`.
-    let escrowed = async {
-        ensure_allowance(
-            rpc,
-            state.token,
-            self_address,
-            *contract.address(),
-            if max_approve { None } else { Some(additional) },
-        )
-        .await?;
-        top_up(
-            contract,
-            self_address,
-            state.pool_id,
-            additional,
-            Some(RECEIPT_TIMEOUT),
-        )
-        .await
-    }
+    let escrowed = escrow_top_up(
+        funding,
+        contract,
+        state.token,
+        self_address,
+        state.pool_id,
+        additional,
+        max_approve,
+    )
     .await;
     let err = match escrowed {
         Ok(ToppedUpPool { credited, tx, .. }) => {
