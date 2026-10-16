@@ -3479,10 +3479,12 @@ since project inception and will roll into the first tagged release.
   no parent directories. A bundle or entry pull without `-o` refuses a path
   that holds a file no earlier pull left there unchanged, unless
   `--overwrite` (#2472). The earlier pull must be of the same entry (the
-  same manifest hash and manifest path), or have written the same bytes, so
-  a new version of a bundle replaces only the files it changes. The error
-  says why: no pull wrote the file, it changed after a pull wrote it, or a
-  pull wrote it from another entry, named as a `decdn:` URI. So `decdn get
+  same manifest hash and manifest path), or have written the same bytes. A
+  new version of a bundle that changes a file is refused, so `-o .` updates
+  a bundle in place: it replaces the files that changed and skips the rest.
+  `--overwrite` fetches every file again. The error says why: no pull wrote
+  the file, it changed after a pull wrote it, or a pull wrote it from
+  another entry, named as a `decdn:` URI. So `decdn get
   decdn:<h>/tokenizer/config.json` does not replace the `./config.json`
   that `decdn:<h>/text_encoder/config.json` wrote. Each
   `.decdn-manifest.json` record names its manifest hash and manifest path.
