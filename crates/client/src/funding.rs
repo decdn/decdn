@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore};
@@ -20,16 +20,14 @@ use decdn_incentive::{CapabilityGrant, Deployment, LaneKey, PoolId, bind_node_id
 use iroh::Endpoint;
 
 use crate::buyer_pool::{
-    LOW_WATER_DIVISOR, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, UnconfirmedOpens,
+    LOW_WATER_DIVISOR, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, UnconfirmedOpens,
     WalletShortfall, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool,
     pool_accepts_funds, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
 };
 use crate::lanes::LaneDeps;
 use crate::session::{ChainAdoption, ChainConfig, DepositPolicy};
 use crate::source::{Funder, SourceFuture};
-use crate::{
-    NoAffordableSource, PoolContext, PoolLedger, PoolReplaced, Recovery, sign_client_binding,
-};
+use crate::{NoAffordableSource, PoolContext, PoolLedger, PoolReplaced, Recovery};
 
 /// A pool status as the operator reads it.
 const fn status_label(status: PaymentPool::Status) -> &'static str {
@@ -292,8 +290,6 @@ pub struct PoolFunder<'a, P> {
     pub(crate) rpc: &'a P,
     pub(crate) store: &'a dyn BuyerPoolStore,
     pub(crate) owner: Address,
-    /// Signs a replacement pool's `openPool` and its self-issued capability.
-    pub(crate) signer: Arc<PrivateKeySigner>,
     /// The chain and `PaymentPool` a replacement pool opens on.
     pub(crate) deployment: Deployment,
     pub(crate) token: Address,
@@ -486,7 +482,6 @@ where
         .await?;
         let opened = open_pool(
             self.contract,
-            Arc::clone(&self.signer),
             self.deployment,
             self.token,
             self.owner,
@@ -502,22 +497,43 @@ where
     }
 }
 
+/// The keys one lane signs under, resolved when the lane is built.
+pub(crate) enum LaneKeys<'p> {
+    /// The buyer's own pool: the owner key owns it, the lane key signs.
+    Owned(&'p OwnedPayer),
+    /// A pool another owner funds: `signer` is the delegate `grant` authorizes.
+    Delegated {
+        /// The delegate key.
+        signer: Arc<PrivateKeySigner>,
+        /// The owner's capability for `signer`.
+        grant: CapabilityGrant,
+    },
+}
+
+impl LaneKeys<'_> {
+    /// The key the lane's vouchers sign under.
+    pub(crate) const fn lane_signer(&self) -> &Arc<PrivateKeySigner> {
+        match self {
+            Self::Owned(payer) => payer.lane(),
+            Self::Delegated { signer, .. } => signer,
+        }
+    }
+}
+
 /// Select the pool context for one lane of `deps`' run: the delegated
-/// adoption path when a [`CapabilityGrant`] is present (adopt the named pool,
-/// present the owner's capability, no open), else the self-owned
-/// open-or-reuse path.
+/// adoption path for [`LaneKeys::Delegated`] (adopt the named pool, present
+/// the owner's capability, no open), else the self-owned open-or-reuse path.
 pub(crate) async fn build_ctx_for_fetch<P>(
     deps: &LaneDeps<'_, P>,
-    grant: Option<&CapabilityGrant>,
-    signer: &Arc<PrivateKeySigner>,
+    keys: &LaneKeys<'_>,
     voucher_dom: &Eip712Domain,
     provider: Address,
 ) -> anyhow::Result<(PoolContext, Option<LaneSpend>)>
 where
     P: alloy::providers::Provider + Clone,
 {
-    if let Some(grant) = grant {
-        build_delegated_pool_ctx(
+    match keys {
+        LaneKeys::Delegated { signer, grant } => build_delegated_pool_ctx(
             deps.store.as_ref(),
             deps.contract,
             signer,
@@ -528,18 +544,17 @@ where
             grant,
         )
         .await
-        .map(|ctx| (ctx, None))
-    } else {
-        build_pool_ctx(deps, signer, provider)
+        .map(|ctx| (ctx, None)),
+        LaneKeys::Owned(payer) => build_pool_ctx(deps, payer, provider)
             .await
-            .map(|(ctx, spend)| (ctx, Some(spend)))
+            .map(|(ctx, spend)| (ctx, Some(spend))),
     }
 }
 
 /// [`open_or_reuse_pool`] plus the ADR 005 client identity binding (#1115):
-/// sign our OWN iroh `NodeId` with the buyer key so the serving node can prove
-/// we own the pool and reactively pull a cache-missed blob from its configured
-/// origin.
+/// sign our OWN iroh `NodeId` with the lane key, so the serving node can prove
+/// the request comes from the lane's signer and reactively pull a cache-missed
+/// blob for it.
 ///
 /// The bind domain's verifying contract is the `CapacityBond`; without one
 /// configured we can't sign, so the request goes out unbound and the node serves
@@ -549,7 +564,7 @@ where
 /// of failure.
 async fn build_pool_ctx<P>(
     deps: &LaneDeps<'_, P>,
-    signer: &Arc<PrivateKeySigner>,
+    payer: &OwnedPayer,
     provider: Address,
 ) -> anyhow::Result<(PoolContext, LaneSpend)>
 where
@@ -560,15 +575,14 @@ where
         deps.contract,
         deps.rpc,
         deps.funding,
-        signer,
+        payer,
         provider,
-        deps.self_address,
         deps.chain.deployment(),
         deps.deposit,
     )
     .await?;
     Ok((
-        attach_client_binding(ctx, deps.chain, deps.endpoint, signer)?,
+        attach_client_binding(ctx, deps.chain, deps.endpoint)?,
         spend,
     ))
 }
@@ -588,9 +602,8 @@ where
 /// `(pool, this signer, provider)` on this deployment
 /// ([`BuyerPoolStore::delegate_lanes`]); a delegate that has never streamed this
 /// lane starts at zero. The ADR 005 client binding is attached the same as the
-/// self-owned path — it only authorizes reactive origin pull-through when the
-/// binding owner also owns the pool, which a delegate does not, so a cache miss
-/// still refuses (already-cached content serves and is paid via the capability).
+/// self-owned path: the delegate signs it, so the serving node can tie the
+/// request to the delegate's lane.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_pool_ctx<P>(
     store: &dyn BuyerPoolStore,
@@ -658,13 +671,15 @@ where
     let ctx = PoolContext::for_pool(&state, Arc::clone(signer), voucher_dom.clone())
         .with_provider(provider, prior_bytes, prior_amount)
         .with_capability(signed_capability);
-    attach_client_binding(ctx, chain, endpoint, signer)
+    attach_client_binding(ctx, chain, endpoint)
 }
 
 /// Attach the ADR 005 client identity binding to an already-built
-/// [`PoolContext`] (#1115): sign our OWN iroh `NodeId` with the buyer key so
-/// the serving node can prove we own the pool and reactively pull a
-/// cache-missed blob from its configured origin. Separate from
+/// [`PoolContext`] (#1115): sign our OWN iroh `NodeId` with the context's
+/// `client_signer`, the key the lane's vouchers sign under
+/// ([`PoolContext::bind_endpoint`]). The serving node keys the lane on the
+/// binding's signer, so a binding signed by any other key names a lane the
+/// vouchers do not pay on, and the node refuses the request. Separate from
 /// [`build_pool_ctx`] so a bundle pull — which takes the `open_lock`
 /// itself around [`open_or_reuse_pool`] — can attach the same binding outside
 /// that critical section.
@@ -675,14 +690,14 @@ pub(crate) fn attach_client_binding(
     ctx: PoolContext,
     chain: &ChainConfig,
     endpoint: &Endpoint,
-    signer: &Arc<PrivateKeySigner>,
 ) -> anyhow::Result<PoolContext> {
     let Some(capacity_bond) = chain.capacity_bond else {
         return Ok(ctx);
     };
-    let bind_dom = bind_node_id_domain(chain.chain_id, capacity_bond);
-    let own_node_id = B256::from(*endpoint.id().as_bytes());
-    Ok(ctx.with_client_binding(sign_client_binding(signer, own_node_id, &bind_dom)?))
+    ctx.bind_endpoint(
+        endpoint,
+        &bind_node_id_domain(chain.chain_id, capacity_bond),
+    )
 }
 
 /// Adopt the live pool `owner` already holds on `deployment`, recording it in
@@ -1118,15 +1133,15 @@ pub(crate) async fn open_or_reuse_pool<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     rpc: &P,
     funding: &RunFunding,
-    signer: &Arc<PrivateKeySigner>,
+    payer: &OwnedPayer,
     provider: Address,
-    self_address: Address,
     deployment: Deployment,
     deposit: DepositPolicy,
 ) -> anyhow::Result<(PoolContext, LaneSpend)>
 where
     P: alloy::providers::Provider + Clone,
 {
+    let self_address = payer.owner().address();
     let DepositPolicy {
         working_deposit,
         max_approve,
@@ -1138,7 +1153,7 @@ where
     if let Some(state) = tracked {
         let lane = LaneKey {
             pool_id: state.pool_id,
-            signer: self_address,
+            signer: payer.lane().address(),
             provider,
         };
         let recorded = state.lane_progress(lane).is_some();
@@ -1178,7 +1193,7 @@ where
         };
         return self_owned_lane_ctx(
             &state,
-            signer,
+            payer,
             &deployment.voucher_domain(),
             provider,
             prior_bytes,
@@ -1204,7 +1219,6 @@ where
     ensure_allowance(rpc, token, self_address, payment_pool_addr, approve_amount).await?;
     let opened = open_pool(
         contract,
-        Arc::clone(signer),
         deployment,
         token,
         self_address,
@@ -1224,13 +1238,15 @@ where
         recorded: false,
         from_chain: false,
     };
-    Ok((
-        opened
-            .ctx
-            .with_provider(provider, U256::ZERO, U256::ZERO)
-            .with_capability(opened.capability),
-        spend,
-    ))
+    let ctx = self_owned_lane_ctx(
+        &opened.state,
+        payer,
+        &deployment.voucher_domain(),
+        provider,
+        U256::ZERO,
+        U256::ZERO,
+    )?;
+    Ok((ctx, spend))
 }
 
 #[cfg(test)]

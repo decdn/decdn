@@ -322,7 +322,10 @@ pub enum StoreError {
     /// open `Database`, so the second opener fails fast rather than letting two
     /// processes corrupt the shared voucher watermark (#942). Run one process
     /// per data dir, give each a distinct `--data-dir`, or let one process
-    /// multiplex internally.
+    /// multiplex internally. On the wallet's own pool, each data dir signs with
+    /// its own key ([`crate::lane_signer`]), so two data dirs on one wallet
+    /// share the pool but never a lane. Two data dirs on one `--capability`
+    /// delegate key sign with that key, and so share its lanes.
     #[error(
         "another decdn process is using the pool store at {path} — run one fetch/pull \
          at a time per --data-dir, or give each invocation a separate --data-dir"

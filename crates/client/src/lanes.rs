@@ -13,15 +13,14 @@ use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
-use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolStore};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{CapabilityGrant, LaneKey, PoolId};
 use iroh::{Endpoint, EndpointAddr, RelayUrl};
 
-use crate::buyer_pool::{ProgressWrite, WatermarkRow};
+use crate::buyer_pool::{OwnedPayer, ProgressWrite, WatermarkRow};
 use crate::discovery::{self, NodeCandidate};
-use crate::funding::{RunFunding, build_ctx_for_fetch};
+use crate::funding::{LaneKeys, RunFunding, build_ctx_for_fetch};
 use crate::ordered_writes::OrderedWrites;
 use crate::session::{ChainConfig, DepositPolicy, FetchMarks, PullSite};
 use crate::{
@@ -129,8 +128,9 @@ pub const STALL_WINDOW: Duration = Duration::from_secs(30);
 /// What a lane's vouchers sign under.
 #[derive(Debug, Clone, Copy)]
 pub enum LanePayer<'a> {
-    /// The buyer's own pool, signed by its owner key.
-    Owned(&'a Arc<PrivateKeySigner>),
+    /// The buyer's own pool: the payer's owner key owns it, and its lane key
+    /// signs.
+    Owned(&'a OwnedPayer),
     /// A pool another owner funds, signed under the slot's credential as it is
     /// when the lane is built.
     Delegated(&'a CredentialSlot),
@@ -156,7 +156,8 @@ pub struct LaneDeps<'a, P> {
     /// The `SlashJudge` domain every stream response verifies against.
     pub slash_dom: &'a Eip712Domain,
     /// The buyer's own address: the pool owner on the self-owned path, the
-    /// delegate signer on the delegated one.
+    /// delegate signer on the delegated one. On the self-owned path it need not
+    /// be the key the lanes sign under ([`OwnedPayer::lane`]).
     pub self_address: Address,
     /// The pool's settlement token (USDC), read once via `PaymentPool.usdc()`
     /// and threaded through rather than re-read per top-up.
@@ -316,12 +317,14 @@ where
 {
     // A delegated lane signs under the slot's credential as it is now: a lane
     // built after a swap signs under the new key and capability.
-    let (signer, grant) = match payer {
-        LanePayer::Owned(signer) => (Arc::clone(signer), None),
+    let keys = match payer {
+        LanePayer::Owned(payer) => LaneKeys::Owned(payer),
         LanePayer::Delegated(slot) => {
             let credential = slot.current();
-            let grant = CapabilityGrant::from_signed_capability(&credential.capability);
-            (credential.signer, Some(grant))
+            LaneKeys::Delegated {
+                grant: CapabilityGrant::from_signed_capability(&credential.capability),
+                signer: credential.signer,
+            }
         }
     };
     let (ctx, spend) = {
@@ -331,17 +334,17 @@ where
         // opens nothing on-chain (`build_delegated_pool_ctx` adopts the owner's
         // pool), so it skips the guard: holding the bundle-wide lock there
         // would serialize unrelated fetches for no mutual-exclusion win.
-        let _open_guard = match (open_lock, &grant) {
-            (Some(lock), None) => Some(lock.lock().await),
+        let _open_guard = match (open_lock, &keys) {
+            (Some(lock), LaneKeys::Owned(_)) => Some(lock.lock().await),
             _ => None,
         };
-        build_ctx_for_fetch(deps, grant.as_ref(), &signer, voucher_dom, provider).await?
+        build_ctx_for_fetch(deps, &keys, voucher_dom, provider).await?
     };
     let pool_id = ctx.pool_id;
     let prior_amount = ctx.prior_amount;
     let lane = LaneKey {
         pool_id,
-        signer: signer.address(),
+        signer: keys.lane_signer().address(),
         provider,
     };
     // The lane's ledger + context, seeded from its persisted `(signer,

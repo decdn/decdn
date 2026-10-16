@@ -81,6 +81,7 @@ pub mod content_blacklist;
 pub mod erc20;
 pub mod eth_identity;
 pub mod lane;
+pub mod lane_signer;
 pub mod node_register;
 pub mod origin_assignment;
 pub mod payment_pool;

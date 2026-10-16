@@ -239,7 +239,6 @@ async fn run() -> anyhow::Result<()> {
     let deposit = deposit_micro_usdc();
     let opened = open_pool(
         &contract,
-        Arc::clone(owner.signer()),
         deployment,
         chain.usdc(),
         owner.address(),

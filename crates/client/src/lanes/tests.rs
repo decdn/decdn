@@ -1,6 +1,7 @@
 use super::*;
 use crate::session::ChainAdoption;
 use alloy::primitives::B256;
+use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::buyer_pool::{BuyerLaneProgress, BuyerPoolState};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;

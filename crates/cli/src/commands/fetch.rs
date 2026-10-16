@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use alloy::primitives::U256;
 use anyhow::Context as _;
 use decdn_client::bundle::BundleManifest;
-use decdn_client::buyer_pool::UnconfirmedOpens;
+use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedOpens};
 use decdn_client::funding::{RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
@@ -831,16 +831,32 @@ enum PayerKey {
     /// resolution ends, and every later fetch under the payer reuses it.
     Keystore {
         grant: Option<CapabilityGrant>,
-        loaded: tokio::sync::OnceCell<(
-            Arc<alloy::signers::local::PrivateKeySigner>,
-            Option<CredentialSlot>,
-        )>,
+        loaded: tokio::sync::OnceCell<(Arc<alloy::signers::local::PrivateKeySigner>, PayerKeys)>,
     },
     /// A key in hand and the capability issued to it.
     Held {
         signer: Arc<alloy::signers::local::PrivateKeySigner>,
         slot: CredentialSlot,
     },
+}
+
+/// What a loaded payer's lanes sign under.
+#[derive(Clone)]
+enum PayerKeys {
+    /// The buyer's own pool: the keystore key owns it, and the lanes sign
+    /// under the key [`OwnedPayer::for_store`] derives for this data dir.
+    Owned(OwnedPayer),
+    /// A pool another owner funds, under the slot's credential.
+    Delegated(CredentialSlot),
+}
+
+impl PayerKeys {
+    const fn lane_payer(&self) -> LanePayer<'_> {
+        match self {
+            Self::Owned(payer) => LanePayer::Owned(payer),
+            Self::Delegated(slot) => LanePayer::Delegated(slot),
+        }
+    }
 }
 
 impl Payer {
@@ -944,15 +960,16 @@ pub(crate) async fn fetch_on(
     )?;
     timings.mark(Mark::Resolved);
 
-    // Buyer signer (vouchers + the openPool/topUp tx): the held one, else the
-    // keystore, loaded after holder resolution so a configuration fault never
+    // Buyer key: the held delegate key, else the keystore, loaded after holder
+    // resolution so a configuration fault never
     // prompts for a keystore password. Password from env, else
     // `--keystore-password-file`, else TTY.
     // A delegated payer signs under one credential slot across every fetch it
     // pays for, both passes of each fetch included: a held key brings its slot,
-    // and a keystore payer builds its slot at the first load.
-    let (signer, slot) = match &payer.key {
-        PayerKey::Held { signer, slot } => (Arc::clone(signer), Some(slot.clone())),
+    // and a keystore payer builds its slot at the first load. A keystore payer
+    // on its own pool derives this data dir's lane key at the first load.
+    let (signer, keys) = match &payer.key {
+        PayerKey::Held { signer, slot } => (Arc::clone(signer), PayerKeys::Delegated(slot.clone())),
         PayerKey::Keystore { grant, loaded } => loaded
             .get_or_try_init(|| async {
                 let password = super::chain_ctx::read_keystore_password(
@@ -964,11 +981,16 @@ pub(crate) async fn fetch_on(
                 )?
                 .into_secret();
                 let signer = Arc::new(load_signer(&chain.keystore, &password)?);
-                let slot = grant
-                    .as_ref()
-                    .map(|grant| delegated_slot(grant, Arc::clone(&signer)))
-                    .transpose()?;
-                anyhow::Ok((signer, slot))
+                let keys = match grant {
+                    Some(grant) => {
+                        PayerKeys::Delegated(delegated_slot(grant, Arc::clone(&signer))?)
+                    }
+                    None => PayerKeys::Owned(OwnedPayer::for_store(
+                        Arc::clone(&signer),
+                        store.as_ref(),
+                    )?),
+                };
+                anyhow::Ok((signer, keys))
             })
             .await?
             .clone(),
@@ -1063,10 +1085,7 @@ pub(crate) async fn fetch_on(
             &deps,
             &discovery,
             relays,
-            match &slot {
-                Some(slot) => LanePayer::Delegated(slot),
-                None => LanePayer::Owned(&signer),
-            },
+            keys.lane_payer(),
             &voucher_dom,
             Some(&payer.open_lock),
             payer.ledgers.as_ref(),

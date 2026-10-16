@@ -42,6 +42,7 @@ use alloy::primitives::{Address, U256};
 
 use crate::deployment::Deployment;
 use crate::lane::{LaneKey, PoolId};
+use crate::lane_signer::LaneSalt;
 use crate::store::StoreError;
 
 /// Buyer-tracked progress on one `(signer, provider)` lane inside a pool: the
@@ -686,6 +687,17 @@ pub trait BuyerPoolStore: Send + Sync {
         anchor: BuyerLaneProgress,
         totals: BuyerLaneProgress,
     ) -> Result<AdvanceOutcome, StoreError>;
+
+    /// The [`LaneSalt`] this store's client derives its lane signer from
+    /// ([`crate::lane_signer`]), created on first call and the same on every
+    /// call after. MUST commit the salt durably before returning it, because
+    /// a signer that changes leaves every recorded lane under a key that no
+    /// longer signs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the store cannot read or record the salt.
+    fn lane_salt(&self) -> Result<LaneSalt, StoreError>;
 }
 
 /// In-memory backing for [`MemoryBuyerPoolStore`]: the primary
@@ -697,6 +709,7 @@ struct MemoryInner {
     pools: HashMap<PoolId, BuyerPoolState>,
     owner_index: HashMap<Address, PoolId>,
     delegate_lanes: HashMap<(Deployment, LaneKey), BuyerLaneProgress>,
+    lane_salt: Option<LaneSalt>,
 }
 
 /// In-memory [`BuyerPoolStore`] for tests and the trait's reference
@@ -953,6 +966,14 @@ impl BuyerPoolStore for MemoryBuyerPoolStore {
             BuyerLaneProgress::rebased(anchor, totals),
         );
         Ok(AdvanceOutcome::Advanced)
+    }
+
+    fn lane_salt(&self) -> Result<LaneSalt, StoreError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        Ok(*guard.lane_salt.get_or_insert_with(LaneSalt::random))
     }
 }
 

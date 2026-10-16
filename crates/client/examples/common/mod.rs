@@ -11,10 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_client::buyer_pool::{
-    ProgressWrite, WatermarkRow, ensure_allowance, open_pool, self_owned_lane_ctx,
+    OwnedPayer, ProgressWrite, WatermarkRow, ensure_allowance, open_pool, self_owned_lane_ctx,
 };
 use decdn_client::discovery::{self, NodeCandidate};
 use decdn_client::{
@@ -82,7 +81,8 @@ impl Env {
 /// Everything a paid fetch borrows: the buyer, its pool, and the endpoint.
 pub(crate) struct Buyer {
     env: Env,
-    signer: Arc<PrivateKeySigner>,
+    /// The pool owner key, and the lane key this data dir signs vouchers with.
+    payer: OwnedPayer,
     store: RedbBuyerPoolStore,
     pool: BuyerPoolState,
     voucher_domain: Eip712Domain,
@@ -110,6 +110,10 @@ impl Buyer {
         // The store is the buyer's only record of its pool and of what each lane
         // has paid. Keep it for the life of the pool.
         let store = RedbBuyerPoolStore::open(&env.data_dir)?;
+        // The vouchers sign under a key derived from the owner key and this
+        // store's salt, so another data dir on the same wallet signs on its
+        // own lanes of the same pool.
+        let payer = OwnedPayer::for_store(Arc::clone(&signer), &store)?;
         // A row from another deployment names a pool this contract never saw.
         let reusable = store
             .get_by_owner(owner)?
@@ -119,16 +123,7 @@ impl Buyer {
         } else {
             let token = contract.usdc().call().await?;
             ensure_allowance(&rpc, token, owner, env.payment_pool, Some(env.deposit)).await?;
-            let opened = open_pool(
-                &contract,
-                Arc::clone(&signer),
-                deployment,
-                token,
-                owner,
-                env.deposit,
-                None,
-            )
-            .await?;
+            let opened = open_pool(&contract, deployment, token, owner, env.deposit, None).await?;
             // The deposit is escrowed once `open_pool` returns. A failed
             // record leaves it untracked, so name the transaction.
             store
@@ -143,7 +138,7 @@ impl Buyer {
 
         Ok(Self {
             env,
-            signer,
+            payer,
             store,
             pool,
             voucher_domain,
@@ -220,7 +215,7 @@ impl Buyer {
         let deadlines = PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30), 4096)?;
         let contract = PaymentPool::new(
             self.env.payment_pool,
-            provider::build_provider(&self.env.rpc_url, &self.signer)?,
+            provider::build_provider(&self.env.rpc_url, self.payer.owner())?,
         );
 
         let mut candidates = Vec::with_capacity(holders.len());
@@ -229,16 +224,16 @@ impl Buyer {
             let provider = holder.candidate.eth_address;
             let lane = LaneKey {
                 pool_id: self.pool.pool_id,
-                signer: self.signer.address(),
+                signer: self.payer.lane().address(),
                 provider,
             };
             let (prior_bytes, prior_amount) = prior_payment(&self.pool, &contract, lane).await?;
-            // The binding proves this endpoint pays from the buyer's pool, so a
-            // node that misses the blob in its cache may pull it from its
-            // origin for us. Without it, such a node refuses the open.
+            // The binding, signed by the lane key, ties this endpoint to the
+            // lane, so a node that misses the blob in its cache may pull it
+            // from its origin for us. Without it, such a node refuses the open.
             let ctx = self_owned_lane_ctx(
                 &self.pool,
-                &self.signer,
+                &self.payer,
                 &self.voucher_domain,
                 provider,
                 prior_bytes,
@@ -290,8 +285,7 @@ impl Buyer {
             let Some(write) = ProgressWrite::of(&progress) else {
                 continue;
             };
-            let owner = self.signer.address();
-            let row = WatermarkRow::Owned(owner);
+            let row = WatermarkRow::Owned(self.payer.owner().address());
             if let Err(err) = write.apply(&self.store, row, lane.key) {
                 tracing::warn!(provider = %lane.key.provider, error = %err, "lane not recorded");
             }

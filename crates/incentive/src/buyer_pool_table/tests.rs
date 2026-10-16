@@ -1276,3 +1276,35 @@ fn delegate_advance_accepts_equal_totals_and_refuses_a_lower_amount() -> anyhow:
     ));
     Ok(())
 }
+
+/// The lane-salt table's name and value width are frozen on-disk identifiers:
+/// a rename or a resize loses every data dir's salt, and with it the signer
+/// its recorded lanes name (#2468).
+#[test]
+fn lane_salt_table_is_frozen() {
+    use redb::TableHandle;
+    assert_eq!(LANE_SALT_TABLE.name(), "buyer_lane_salt_v1");
+    assert_eq!(LANE_SALT_KEY, "lane_salt");
+    assert_eq!(LANE_SALT_LEN, 32);
+}
+
+/// Two `lane_salt` calls on one file return the first salt written, and
+/// the salt survives the database closing and opening again.
+#[test]
+fn lane_salt_is_written_once() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("buyer.redb");
+    let salt = {
+        let db = Database::create(&path)?;
+        let table = BuyerPoolTable::new(&db);
+        let salt = table.lane_salt()?;
+        anyhow::ensure!(table.lane_salt()? == salt, "a second call changed the salt");
+        salt
+    };
+    let db = Database::create(&path)?;
+    anyhow::ensure!(
+        BuyerPoolTable::new(&db).lane_salt()? == salt,
+        "a reopen changed the salt"
+    );
+    Ok(())
+}

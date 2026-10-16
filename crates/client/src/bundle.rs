@@ -39,7 +39,7 @@ use iroh::{Endpoint, RelayUrl};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::buyer_pool::UnconfirmedOpens;
+use crate::buyer_pool::{OwnedPayer, UnconfirmedOpens};
 use crate::discovery::NodeCandidate;
 use crate::funding::RunFunding;
 use crate::ordered_writes::OrderedWrites;
@@ -348,9 +348,12 @@ pub enum Funding {
     /// The buyer's own pool: reused from the buyer store, adopted from chain,
     /// or opened at the working deposit, and topped up when it runs low.
     SelfOwned {
-        /// The pool owner's key: it signs the vouchers and every pool
-        /// transaction.
-        signer: Arc<PrivateKeySigner>,
+        /// The pool owner's key: it signs every pool transaction and the
+        /// capability for the lane key. The vouchers sign under a lane key
+        /// derived from it and the buyer store's salt
+        /// ([`crate::buyer_pool::OwnedPayer::for_store`]), so two stores on one
+        /// owner sign on disjoint lanes.
+        owner: Arc<PrivateKeySigner>,
         /// How the pool is funded.
         deposit: DepositPolicy,
     },
@@ -816,11 +819,15 @@ impl BundlePullerBuilder {
     ///
     /// # Errors
     ///
-    /// The RPC URL is malformed, the capability does not decode, or the
+    /// The RPC URL is malformed, the capability does not decode, the buyer
+    /// store cannot read or record its lane salt (a self-owned run), or the
     /// `PaymentPool` token read fails.
     pub async fn build(self) -> anyhow::Result<BundlePuller> {
-        let (signer, slot, deposit) = match self.funding {
-            Funding::SelfOwned { signer, deposit } => (signer, None, deposit),
+        let (signer, payer, deposit) = match self.funding {
+            Funding::SelfOwned { owner, deposit } => {
+                let payer = OwnedPayer::for_store(Arc::clone(&owner), self.store.as_ref())?;
+                (owner, engine::RunPayer::Owned(payer), deposit)
+            }
             Funding::Delegated { slot } => {
                 // A delegate owns no pool, so it funds and adopts none. Its
                 // lanes sign under the slot's credential as each is built; the
@@ -830,7 +837,11 @@ impl BundlePullerBuilder {
                     max_approve: false,
                     adoption: ChainAdoption::Refused,
                 };
-                (slot.current().signer, Some(slot), deposit)
+                (
+                    slot.current().signer,
+                    engine::RunPayer::Delegated(slot),
+                    deposit,
+                )
             }
         };
         let rpc = crate::provider::build_provider(&self.chain.rpc_url, &signer)?.erased();
@@ -849,7 +860,7 @@ impl BundlePullerBuilder {
             store: self.store,
             contract,
             rpc,
-            signer,
+            payer,
             token,
             chain: self.chain,
             site: self.site,
@@ -859,7 +870,6 @@ impl BundlePullerBuilder {
             max_rate_per_mb: self.max_rate_per_mb,
             max_blob_bytes: self.max_blob_bytes,
             deposit,
-            slot,
             namespace_id: namespace_id(self.namespace),
             ledgers: LaneLedgers::new(),
             funding: RunFunding::reporting_opens_to(self.opens),

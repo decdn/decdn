@@ -1779,6 +1779,10 @@ impl BuyerPoolStore for FailingStore {
             "rebase_delegate_progress faulted".into(),
         ))
     }
+
+    fn lane_salt(&self) -> std::result::Result<decdn_incentive::lane_signer::LaneSalt, StoreError> {
+        Err(StoreError::Backend("lane_salt faulted".into()))
+    }
 }
 
 /// A fully-redeemed pool is still `Open` on chain, and adopting it would
@@ -1969,6 +1973,10 @@ impl BuyerPoolStore for WriteOnlyFault {
         self.0
             .rebase_delegate_progress(deployment, lane, anchor, totals)
     }
+
+    fn lane_salt(&self) -> std::result::Result<decdn_incentive::lane_signer::LaneSalt, StoreError> {
+        self.0.lane_salt()
+    }
 }
 
 /// Faults only `forget_if_pool`, so a test can hold a foreign row that
@@ -2067,6 +2075,10 @@ impl BuyerPoolStore for ForgetFault {
     ) -> std::result::Result<decdn_incentive::AdvanceOutcome, StoreError> {
         self.0
             .rebase_delegate_progress(deployment, lane, anchor, totals)
+    }
+
+    fn lane_salt(&self) -> std::result::Result<decdn_incentive::lane_signer::LaneSalt, StoreError> {
+        self.0.lane_salt()
     }
 }
 
@@ -3125,7 +3137,6 @@ fn opened_receipt(
 /// The open a test's open task sends.
 fn open_request(owner: Address) -> OpenRequest {
     OpenRequest {
-        signer: signer(),
         deployment: DEPLOYMENT,
         token: Address::repeat_byte(2),
         owner,
@@ -3720,4 +3731,29 @@ async fn a_transport_failed_open_adopts_its_pool_once_the_nonce_is_spent() {
         Some(pool_id),
         "the adopted pool is tracked, so the next miss reuses it"
     );
+}
+
+/// The node's upstream buyer signs its lanes with the node key itself
+/// ([`OwnedPayer::sole`]), as the lane keys it records and redeems against
+/// name it. One daemon runs per node data dir, so it needs no derived lane key.
+#[test]
+fn pin_ctx_signs_with_the_node_key() {
+    let node = signer();
+    let state = BuyerPoolState::new(
+        alloy::primitives::B256::repeat_byte(0x11),
+        DEPLOYMENT,
+        node.address(),
+        Address::repeat_byte(2),
+        U256::from(1_000u64),
+    );
+    let ctx = pin_ctx(
+        &state,
+        &node,
+        &DEPLOYMENT.voucher_domain(),
+        Address::repeat_byte(0xaa),
+    )
+    .expect("pin a lane");
+    assert_eq!(ctx.client_signer.address(), node.address());
+    let capability = ctx.capability.expect("a self capability");
+    assert_eq!(capability.capability.signer, node.address());
 }

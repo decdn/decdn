@@ -86,8 +86,8 @@ pub struct LaneSources<'a, P> {
     deps: &'a LaneDeps<'a, P>,
     discovery: &'a DiscoveryOptions,
     relays: &'a [RelayUrl],
-    /// What every lane signs under: the owner key, or the delegated slot it
-    /// reads at each lane build.
+    /// What every lane signs under: the owned payer's lane key, or the
+    /// delegated slot it reads at each lane build.
     payer: LanePayer<'a>,
     voucher_dom: &'a Eip712Domain,
     /// The slot generation whose key's earlier spend was last recorded in the
@@ -205,10 +205,11 @@ where
             contract: self.deps.contract,
             rpc: self.deps.rpc,
             store: self.deps.store.as_ref(),
-            owner: self.deps.self_address,
-            signer: match self.payer {
-                LanePayer::Owned(signer) => Arc::clone(signer),
-                LanePayer::Delegated(slot) => slot.current().signer,
+            // The owner key of an owned run, read from the payer the lanes sign
+            // under. A delegated run has nothing to fund, and names its key.
+            owner: match self.payer {
+                LanePayer::Owned(payer) => payer.owner().address(),
+                LanePayer::Delegated(_) => self.deps.self_address,
             },
             deployment: self.deps.chain.deployment(),
             token: self.deps.token,
@@ -398,9 +399,9 @@ where
 
     /// The buyer-store record every lane's watermark goes to: the owner's
     /// pool row, or the delegate lanes on the fetch's deployment.
-    const fn watermark_row(&self) -> WatermarkRow {
+    fn watermark_row(&self) -> WatermarkRow {
         match self.payer {
-            LanePayer::Owned(_) => WatermarkRow::Owned(self.deps.self_address),
+            LanePayer::Owned(payer) => WatermarkRow::Owned(payer.owner().address()),
             LanePayer::Delegated(_) => WatermarkRow::Delegated(self.deps.chain.deployment()),
         }
     }

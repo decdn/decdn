@@ -1,5 +1,6 @@
 use super::super::{BundleManifest, ManifestChunk};
 use super::*;
+use alloy::signers::local::PrivateKeySigner;
 use iroh::PublicKey;
 use std::assert_matches;
 

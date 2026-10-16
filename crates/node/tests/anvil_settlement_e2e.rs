@@ -833,11 +833,11 @@ async fn run_e2e() -> anyhow::Result<()> {
     // delegates spend to its own key) plus the ADR 005 ownership binding. The
     // handler verifies the capability against the on-chain pool owner (`pool_view`)
     // and registers the `(pool_id, client, node)` lane so it accepts vouchers.
-    // Uncapped, matching production self-issue: the delegate IS the pool
-    // owner, so the pool deposit — not the capability cap — is the real
-    // spending bound.
+    // Uncapped, matching production self-issue. This test's one key owns the
+    // pool and signs its lanes (`OwnedPayer::sole`), so the pool deposit — not
+    // the capability cap — is the real spending bound.
     let capability = issue_self_capability(
-        client_signer.as_ref(),
+        &decdn_client::buyer_pool::OwnedPayer::sole(Arc::clone(&client_signer)),
         pool_id,
         SELF_CAPABILITY_CAP,
         unix_now() + 1_000_000,
