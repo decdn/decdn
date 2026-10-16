@@ -464,7 +464,7 @@ impl<'a> PeerSource<'a> {
     /// endpoint's active set, and `Endpoint::close` waits for it forever.
     /// The dial and the connection's driver move to `runtime`; the pull still
     /// opens and polls its streams from the caller's runtime. A source with a
-    /// [`Connections`] map dials through the map instead, on the caller's
+    /// [`Connections`] map dials through the map instead, on the map's dial
     /// runtime.
     #[must_use]
     #[doc(hidden)]

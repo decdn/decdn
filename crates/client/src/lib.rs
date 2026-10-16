@@ -1984,7 +1984,16 @@ async fn open_stream(
                 endpoint,
                 target,
                 runtime,
-            } => connection::dial(endpoint, target, runtime, "connect failed").await?,
+            } => {
+                connection::dial(
+                    endpoint,
+                    target,
+                    decdn_protocol::ALPN_CLIENT,
+                    runtime,
+                    "connect failed",
+                )
+                .await?
+            }
             // Already dialled and warm — reuse the handle. A fresh `open_bi` below
             // gives this hash its own stream.
             ConnSource::Reuse(conn) => conn.clone(),
