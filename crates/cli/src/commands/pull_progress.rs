@@ -212,7 +212,10 @@ impl PullProgress {
         let mp = crate::logging::progress_container();
         // Header: what the run downloads vs what lands on disk after dedup. Printed
         // once above the live bars; only when a download size is known and dedup
-        // actually saves bytes is the "on disk" figure worth showing.
+        // actually saves bytes is the "on disk" figure worth showing. It goes out
+        // through `suspend` with its own newline: the container redraws in place
+        // (`logging::new_container`), and an in-place redraw returns to the start
+        // of a `println` line that has no bar under it yet and overwrites it.
         if let Some(dl) = download_total.filter(|n| *n > 0) {
             let header = match content_total.filter(|c| *c > dl) {
                 Some(content) => format!(
@@ -222,7 +225,7 @@ impl PullProgress {
                 ),
                 None => format!("{label} · {} to download", indicatif::HumanBytes(dl)),
             };
-            let _ = mp.println(header);
+            mp.suspend(|| eprintln!("{header}"));
         }
         let download_total = download_total.filter(|n| *n > 0);
         let tab = TabProgress::detect(download_total.is_some());
