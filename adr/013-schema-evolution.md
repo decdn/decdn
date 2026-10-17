@@ -49,7 +49,7 @@ The node bounds the number of connections with `security.max_concurrent_handlers
 - 200 MiB of `cdn/client/v1` reader buffers (256 × 100 streams × 8 KiB). Each stream holds a request of at most one ceiling, or a partial proof frame of at most one ceiling plus one 4 KiB read.
 - 16 MiB of `cdn/dht/v1` reader buffers (256 × 64 KiB).
 
-A peer must send these bytes to pin them, so the cost grows with its bandwidth. An operator with less memory lowers `security.max_concurrent_handlers`. The value `0` removes the connection cap and with it this bound. The ceilings are not operator settings: a receiver that refuses a legitimate frame breaks the protocol for its peers.
+A peer must send these bytes to pin them, so the cost grows with its bandwidth. An operator with less memory lowers `security.max_concurrent_handlers`. The value `0` removes the connection cap and with it this bound. The node keeps no count of connections per source. A relay-routed connection carries no source address, so a per-source count does not bind an attacker, and it refuses honest clients that share one address behind NAT. A requester that gets `RATE_LIMITED` moves to another source. The ceilings are not operator settings: a receiver that refuses a legitimate frame breaks the protocol for its peers.
 
 The receiver reads the varint length, checks it against the ceiling, allocates and reads exactly that many bytes, then deserializes with `postcard::take_from_bytes` on the bounded slice. `take_from_bytes` succeeds even if the sender's struct has more fields than the receiver's definition — unconsumed trailing bytes are returned as a remainder. This is the key mechanism for forward-compatible minor evolution.
 
