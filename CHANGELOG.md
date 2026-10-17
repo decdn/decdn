@@ -1062,6 +1062,16 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node: a top-up for one pool no longer joins a `topUp` for another
+  (#2496).** The top-up slot did not record which pool its `topUp` funds. When
+  the store replaced the pool while a `topUp` for the old one waited for its
+  receipt, a recovery top-up for the new pool joined it. It counted the old
+  pool's escrow as its own headroom, and then failed as escrowed and
+  untracked. A fill could also wait on a sibling's recovery top-up for the old
+  pool and take that pool's deposit as its own. The slot now records its
+  pool. A recovery step for another pool fails at once as a local fault, and
+  counts on `decdn_node_pull_recovery_step_refused_total`. A low-water refill
+  for another pool does nothing.
 - **Node: a funding recovery step fails at once while a `topUp` settles
   (#2494).** A recovery top-up that found the top-up slot held for an
   unconfirmed `topUp` joined it and waited for the whole settle, which lasts

@@ -2564,7 +2564,7 @@ async fn top_up_at_least_held_call_after_a_landed_join_returns_what_landed() {
 fn in_flight(amount: u64, funder: TopUpFunder) -> InFlightTopUp {
     let fut: BoxFuture<'static, TopUpOutcome> =
         Box::pin(futures_util::future::ready(Ok(landed(0, amount))));
-    InFlightTopUp::new(fut.shared(), u(amount), funder)
+    InFlightTopUp::new(fut.shared(), PoolId::from([0x5A; 32]), u(amount), funder)
 }
 
 /// A refill's amount is claimable once: reactive joiners split it, and a claim
@@ -2849,6 +2849,7 @@ async fn concurrent_steps_share_one_recovery_top_up() {
     });
     *svc.topup_in_flight.lock().unwrap() = Some(InFlightTopUp::new(
         landed.shared(),
+        PoolId::from([0x5A; 32]),
         U256::from(6_000_000u64),
         TopUpFunder::Recovery,
     ));
@@ -2880,6 +2881,7 @@ async fn fills_waiting_on_a_top_up_into_a_closing_pool_join_its_replacement() {
     });
     *svc.topup_in_flight.lock().unwrap() = Some(InFlightTopUp::new(
         reverted.shared(),
+        PoolId::from([0x5A; 32]),
         U256::from(6_000_000u64),
         TopUpFunder::Recovery,
     ));
@@ -2907,6 +2909,73 @@ async fn fills_waiting_on_a_top_up_into_a_closing_pool_join_its_replacement() {
             Recovery::Replaced(PoolReplaced { closed, opened })
         );
     }
+}
+
+/// A pool the store replaced while its `topUp` was in flight: the row tracks
+/// the new pool, and the slot holds a `topUp` for the old one.
+const REPLACED: PoolId = PoolId::repeat_byte(0x4A);
+
+/// A `topUp` that never resolves, so a caller that joins or waits on it hangs.
+fn never_landing() -> SharedTopUp {
+    let fut: BoxFuture<'static, TopUpOutcome> = Box::pin(std::future::pending());
+    fut.shared()
+}
+
+/// A recovery top-up for the tracked pool does not join a refill `topUp` for
+/// the pool the store replaced: that `topUp` escrows into the old pool. The
+/// call fails at once as a local fault and claims none of the refill (#2496).
+#[tokio::test]
+async fn a_recovery_does_not_join_a_top_up_for_another_pool() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    let svc = recovery_service(&asserter, 4_000_000);
+    *svc.topup_in_flight.lock().unwrap() = Some(InFlightTopUp::new(
+        never_landing(),
+        REPLACED,
+        U256::from(6_000_000u64),
+        TopUpFunder::Refill,
+    ));
+
+    // `now_or_never`: the call fails on its first poll, with no time passing.
+    let err = svc
+        .top_up_pool_by(U256::from(6_000_000u64))
+        .now_or_never()
+        .expect("the call fails at once")
+        .expect_err("the slot holds a topUp for another pool");
+    assert!(err.downcast_ref::<TopUpForOtherPool>().is_some(), "{err:#}");
+    assert!(err.downcast_ref::<LocalPullFault>().is_some(), "{err:#}");
+
+    let slot = svc.topup_in_flight.lock().unwrap();
+    let in_flight = slot.as_ref().expect("the old pool's topUp holds the slot");
+    assert_eq!(in_flight.pool_id, REPLACED, "no topUp was spawned");
+    assert_eq!(
+        in_flight.unclaimed,
+        U256::from(6_000_000u64),
+        "the recovery claimed nothing"
+    );
+}
+
+/// A fill on the tracked pool does not wait on a sibling's recovery top-up for
+/// the pool the store replaced, so it never takes that pool's deposit as its
+/// own. It sizes its own top-up, which fails at once (#2496).
+#[tokio::test]
+async fn a_fill_does_not_wait_on_a_siblings_recovery_for_another_pool() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    let svc = recovery_service(&asserter, 4_000_000);
+    *svc.topup_in_flight.lock().unwrap() = Some(InFlightTopUp::new(
+        never_landing(),
+        REPLACED,
+        U256::from(6_000_000u64),
+        TopUpFunder::Recovery,
+    ));
+
+    let err = svc
+        .recover_pool(U256::from(4_000_000u64))
+        .now_or_never()
+        .expect("the step does not wait on the old pool's topUp")
+        .expect_err("the slot holds a topUp for another pool");
+    assert!(err.downcast_ref::<TopUpForOtherPool>().is_some(), "{err:#}");
+    assert!(err.downcast_ref::<LocalPullFault>().is_some(), "{err:#}");
+    assert!(asserter.read_q().is_empty(), "no chain read was made");
 }
 
 /// The reclaim sweep drops the row of a pool another caller already
@@ -3905,11 +3974,13 @@ async fn an_open_that_never_mines_lapses_into_the_held_slot() {
 #[tokio::test(start_paused = true)]
 async fn a_top_up_that_never_mines_keeps_the_top_up_slot() {
     let svc = never_mining_service(Address::repeat_byte(1));
-    let (shared, claim) = svc.join_or_spawn_topup(
-        PoolId::from([0xAA; 32]),
-        U256::from(1_000u64),
-        TopUpFunder::Refill,
-    );
+    let (shared, claim) = svc
+        .join_or_spawn_topup(
+            PoolId::from([0xAA; 32]),
+            U256::from(1_000u64),
+            TopUpFunder::Refill,
+        )
+        .unwrap();
     assert_eq!(claim, TopUpClaim::Spawned);
     assert!(
         tokio::time::timeout(RECEIPT_TIMEOUT * 10, shared)
@@ -3921,11 +3992,13 @@ async fn a_top_up_that_never_mines_keeps_the_top_up_slot() {
         svc.topup_in_flight.lock().unwrap().is_some(),
         "the topUp task still holds the slot"
     );
-    let (_, again) = svc.join_or_spawn_topup(
-        PoolId::from([0xAA; 32]),
-        U256::from(1_000u64),
-        TopUpFunder::Refill,
-    );
+    let (_, again) = svc
+        .join_or_spawn_topup(
+            PoolId::from([0xAA; 32]),
+            U256::from(1_000u64),
+            TopUpFunder::Refill,
+        )
+        .unwrap();
     assert!(
         matches!(again, TopUpClaim::Joined { .. }),
         "a refill meanwhile joins the held topUp instead of sending a second one"
@@ -4322,7 +4395,9 @@ async fn a_dropped_top_up_is_re_sent_at_its_nonce_and_credited_once() {
         signer(),
         owner,
     );
-    let (shared, claim) = svc.join_or_spawn_topup(TOPPED, U256::from(TOP_UP), TopUpFunder::Refill);
+    let (shared, claim) = svc
+        .join_or_spawn_topup(TOPPED, U256::from(TOP_UP), TopUpFunder::Refill)
+        .unwrap();
     assert_eq!(claim, TopUpClaim::Spawned);
 
     tokio::time::sleep(RECEIPT_TIMEOUT + TOPUP_RESOLVE_INTERVAL * 3).await;
@@ -4432,12 +4507,16 @@ async fn spawn_hashless_top_up(
         signer(),
         owner,
     );
-    let (shared, claim) = svc.join_or_spawn_topup(TOPPED, U256::from(TOP_UP), funder);
+    let (shared, claim) = svc
+        .join_or_spawn_topup(TOPPED, U256::from(TOP_UP), funder)
+        .unwrap();
     assert_eq!(claim, TopUpClaim::Spawned);
     tokio::time::sleep(Duration::from_millis(1)).await;
     assert!(svc.topup_hold.is_held(), "the settle holds the slot");
     assert_eq!(topup_unresolved(&svc.metrics), 1);
-    let (_, again) = svc.join_or_spawn_topup(TOPPED, U256::from(TOP_UP), TopUpFunder::Refill);
+    let (_, again) = svc
+        .join_or_spawn_topup(TOPPED, U256::from(TOP_UP), TopUpFunder::Refill)
+        .unwrap();
     assert!(
         matches!(again, TopUpClaim::Joined { .. }),
         "the settling topUp holds the slot"
@@ -4631,7 +4710,9 @@ async fn a_recovery_joined_before_the_settle_gets_its_outcome() {
         signer(),
         owner,
     );
-    let (_refill, claim) = svc.join_or_spawn_topup(TOPPED, U256::from(TOP_UP), TopUpFunder::Refill);
+    let (_refill, claim) = svc
+        .join_or_spawn_topup(TOPPED, U256::from(TOP_UP), TopUpFunder::Refill)
+        .unwrap();
     assert_eq!(claim, TopUpClaim::Spawned);
 
     // The first poll joins the refill; its task has not run yet.
