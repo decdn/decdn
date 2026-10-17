@@ -26,7 +26,7 @@ use decdn_node::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer}
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, DISCOVERY_BLOCK_BYTES, MAX_MESSAGE_SIZE,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, DISCOVERY_BLOCK_BYTES, MAX_PROBE_FRAME,
     ProbeMessage, ProbeResponseExt, SLASH_SIG_LEN, decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse, ProbeResponseBody},
     num_blocks, parse_probe_response_ext, read_frame, write_frame,
@@ -524,7 +524,7 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
-    let frame = read_frame(&mut recv)
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_PROBE_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read: {e}"))?;
     let (msg, tail) = decode_message::<ProbeMessage>(&frame)?;
@@ -644,6 +644,40 @@ async fn tear_down(h: Harness) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A probe response announced past [`MAX_PROBE_FRAME`] fails the requester's
+/// probe on its length prefix alone (ADR 013 § Wire Framing). The daemon probes
+/// upstream candidates it cannot trust, so it must not buffer toward the
+/// announced length or wait out its probe timeout for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_refuses_an_oversized_probe_response_on_its_prefix() -> anyhow::Result<()> {
+    let server_sk = SecretKey::generate();
+    let server_id = server_sk.public();
+    let (server_ep, server_addr) =
+        support::local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
+    let responder = support::spawn_oversized_responder(server_ep.clone(), MAX_PROBE_FRAME);
+    let (client_ep, _) = support::local_endpoint(SecretKey::generate(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let timeout = Duration::from_secs(10);
+    let started = std::time::Instant::now();
+    let result =
+        decdn_client::probe::probe_once(&client_ep, target, [0x22; 32], 0x00c0_ffee, timeout).await;
+    let Err(err) = result else {
+        anyhow::bail!("an oversized probe response must fail the probe");
+    };
+    anyhow::ensure!(
+        started.elapsed() < timeout / 2,
+        "the probe waited {:?} on an oversized response",
+        started.elapsed()
+    );
+    anyhow::ensure!(
+        format!("{err:#}").contains("exceeds the frame ceiling"),
+        "an oversized probe response must fail on the frame ceiling, got: {err:#}"
+    );
+    shutdown([responder], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_oversized_frame_returns_too_large_code() -> anyhow::Result<()> {
     let h = spin_up_probe_harness().await?;
@@ -653,18 +687,8 @@ async fn probe_oversized_frame_returns_too_large_code() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
 
-    // Write a varint length-prefix that exceeds MAX_MESSAGE_SIZE with no payload.
-    let mut bogus = Vec::new();
-    let mut v = MAX_MESSAGE_SIZE + 1;
-    loop {
-        let byte = (v & 0x7F) as u8;
-        v >>= 7;
-        if v == 0 {
-            bogus.push(byte);
-            break;
-        }
-        bogus.push(byte | 0x80);
-    }
+    // Write a varint length-prefix that exceeds MAX_PROBE_FRAME with no payload.
+    let bogus = support::frame_len_prefix(MAX_PROBE_FRAME + 1);
     send.write_all(&bogus)
         .await
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
@@ -1337,7 +1361,7 @@ async fn run_one_probe_as(
         .await
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
-    let frame = read_frame(&mut recv)
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_PROBE_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read: {e}"))?;
     let (msg, tail) = decode_message::<ProbeMessage>(&frame)?;

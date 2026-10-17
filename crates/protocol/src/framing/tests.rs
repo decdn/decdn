@@ -12,28 +12,39 @@ async fn parse_frame_incomplete_header_and_body_return_none() -> Result<(), Fram
     framed.extend_from_slice(&payload);
 
     // Empty buffer: no varint yet.
-    assert_eq!(parse_frame(&[])?, None);
+    assert_eq!(parse_frame(&[], 64)?, None);
     // Header present but body short by one byte: incomplete.
     let short = framed.get(..framed.len() - 1).unwrap_or_default();
-    assert_eq!(parse_frame(short)?, None);
+    assert_eq!(parse_frame(short, 64)?, None);
     // Complete frame: exact split point (header_len, payload_len).
-    let got = parse_frame(&framed)?.ok_or(FrameError::Varint)?;
+    let got = parse_frame(&framed, 64)?.ok_or(FrameError::Varint)?;
     assert_eq!(got, (hdr.len(), payload.len()));
     // Extra trailing bytes (a second frame's start) do not confuse the split.
     let mut with_tail = framed.clone();
     with_tail.extend_from_slice(b"\x03ab");
-    assert_eq!(parse_frame(&with_tail)?, Some((hdr.len(), payload.len())));
+    assert_eq!(
+        parse_frame(&with_tail, 64)?,
+        Some((hdr.len(), payload.len()))
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn parse_frame_rejects_oversized_length() -> Result<(), FrameError> {
+async fn parse_frame_rejects_a_length_past_its_ceiling() -> Result<(), FrameError> {
+    const MAX: u32 = 1024;
     let mut hdr = Vec::new();
-    write_varint_u32(&mut hdr, MAX_MESSAGE_SIZE + 1).await?;
+    write_varint_u32(&mut hdr, MAX + 1).await?;
+    // Refused on the header alone: the payload never has to arrive.
     assert_matches!(
-        parse_frame(&hdr),
-        Err(FrameError::TooLarge(n)) if n == MAX_MESSAGE_SIZE + 1
+        parse_frame(&hdr, MAX),
+        Err(FrameError::TooLarge { len, max }) if len == u64::from(MAX + 1) && max == MAX
     );
+    // A frame of exactly the ceiling is accepted.
+    let mut at_max = Vec::new();
+    write_varint_u32(&mut at_max, MAX).await?;
+    let header_len = at_max.len();
+    at_max.resize(header_len + MAX as usize, 0);
+    assert_eq!(parse_frame(&at_max, MAX)?, Some((header_len, MAX as usize)));
     Ok(())
 }
 
@@ -88,7 +99,7 @@ async fn frame_roundtrip() -> Result<(), FrameError> {
     let mut buf = Vec::new();
     write_frame(&mut buf, &payload).await?;
     let mut cursor = std::io::Cursor::new(buf);
-    let got = read_frame(&mut cursor).await?;
+    let got = read_frame(&mut cursor, crate::MAX_PROBE_FRAME).await?;
     assert_eq!(got, payload);
     Ok(())
 }
@@ -96,12 +107,13 @@ async fn frame_roundtrip() -> Result<(), FrameError> {
 #[tokio::test]
 async fn frame_rejects_too_large_without_reading_payload() -> Result<(), FrameError> {
     // Encode a varint for MAX+1 and follow with NO payload bytes.
+    const MAX: u32 = 1024;
     let mut header = Vec::new();
-    write_varint_u32(&mut header, MAX_MESSAGE_SIZE + 1).await?;
+    write_varint_u32(&mut header, MAX + 1).await?;
     let header_len = header.len();
     let mut cursor = std::io::Cursor::new(header);
-    let r = read_frame(&mut cursor).await;
-    assert_matches!(r, Err(FrameError::TooLarge(n)) if n == MAX_MESSAGE_SIZE + 1);
+    let r = read_frame(&mut cursor, MAX).await;
+    assert_matches!(r, Err(FrameError::TooLarge { len, max }) if len == u64::from(MAX + 1) && max == MAX);
     // No payload bytes were read.
     assert_eq!(usize::try_from(cursor.position()).ok(), Some(header_len));
     Ok(())
@@ -114,7 +126,7 @@ async fn frame_short_read_errors() -> Result<(), FrameError> {
     write_varint_u32(&mut buf, 10).await?;
     buf.extend_from_slice(b"abc");
     let mut cursor = std::io::Cursor::new(buf);
-    let r = read_frame(&mut cursor).await;
+    let r = read_frame(&mut cursor, crate::MAX_PROBE_FRAME).await;
     assert_matches!(r, Err(FrameError::Io(_)));
     Ok(())
 }
@@ -259,7 +271,7 @@ async fn probe_message_full_stack_roundtrip() -> Result<(), FrameError> {
         let mut buf = Vec::new();
         write_frame(&mut buf, &payload).await?;
         let mut cursor = std::io::Cursor::new(buf);
-        let frame = read_frame(&mut cursor).await?;
+        let frame = read_frame(&mut cursor, crate::MAX_PROBE_FRAME).await?;
         let (decoded, tail) = decode_message::<ProbeMessage>(&frame)?;
         assert_eq!(decoded, msg);
         assert!(tail.is_empty(), "no extension bytes expected");
@@ -279,7 +291,7 @@ async fn probe_message_full_stack_roundtrip() -> Result<(), FrameError> {
     let mut buf = Vec::new();
     write_frame(&mut buf, &payload).await?;
     let mut cursor = std::io::Cursor::new(buf);
-    let frame = read_frame(&mut cursor).await?;
+    let frame = read_frame(&mut cursor, crate::MAX_PROBE_FRAME).await?;
     let (decoded, tail) = decode_message::<ProbeMessage>(&frame)?;
     assert_eq!(decoded, resp);
     assert!(!tail.is_empty(), "extension bytes expected");

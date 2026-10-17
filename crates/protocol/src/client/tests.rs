@@ -1,5 +1,5 @@
 use super::*;
-use crate::framing::{decode_message, encode_message, read_frame, write_frame};
+use crate::framing::{FrameError, decode_message, encode_message, read_frame, write_frame};
 use std::assert_matches;
 
 fn sample_body() -> StreamResponseBody {
@@ -703,7 +703,7 @@ fn an_empty_chunk_cannot_be_decoded_at_all() -> Result<(), Box<dyn std::error::E
 fn chunk_data_new_is_the_only_way_in_and_it_enforces_the_floor() {
     // The floor is what makes every frame a unit of progress (#1088). There is no
     // ceiling: frame size is the sender's choice, bounded above by the framing
-    // layer's MAX_MESSAGE_SIZE, which runs before the receiver allocates.
+    // layer's MAX_CHUNK_FRAME, which runs before the receiver allocates.
     assert_eq!(
         ChunkData::new(Vec::new()),
         Err(MessageValidationError::EmptyChunk)
@@ -778,14 +778,17 @@ fn encode_chunk_frame_rejects_an_empty_payload() {
 /// Without this the ceiling is only pinned on the two hot-path encoders, and this
 /// is the one an out-of-tree caller reaches. It is also the boundary where the
 /// equivalence with `encode_message` stops holding: the generic path builds an
-/// oversized frame happily and only `write_frame` refuses it.
+/// oversized frame happily, and only the payer's read refuses it against
+/// `MAX_CHUNK_FRAME`.
 #[test]
-fn encode_chunk_frame_rejects_a_frame_past_max_message_size() {
-    let max = crate::framing::MAX_MESSAGE_SIZE as usize;
-    // A 2^24 cap gives a 4-byte payload varint, so the header is 5 and the largest
-    // frame that fits carries 5 fewer payload bytes.
-    let largest = max - 5;
+fn encode_chunk_frame_rejects_a_frame_past_max_chunk_frame() {
+    let max = MAX_CHUNK_FRAME as usize;
+    // The largest frame that fits carries exactly one CHUNK_BYTES payload: its
+    // 3-byte payload varint and the discriminant make the 4-byte header.
+    let largest = max - 4;
+    assert_eq!(u64::try_from(largest).ok(), Some(CHUNK_BYTES));
     assert_eq!(chunk_frame_postcard_len(largest), max);
+    assert!(crate::client::encode_chunk_frame(&vec![0u8; largest]).is_ok());
 
     let over = vec![0u8; largest + 1];
     assert_matches!(
@@ -800,10 +803,11 @@ async fn encode_chunk_frame_headers_matches_framed_encode_chunk_frame()
     // Hot-path headers must be wire-identical to the generic
     // `encode_chunk_frame` + `write_frame` pair. This pins both
     // `encode_chunk_data_header` and `encode_chunk_frame_headers` across every
-    // varint width boundary of BOTH varints the pair emits: the payload varint
-    // (127/128, 16_383/16_384, 2_097_151/2_097_152) and the framing varint over
-    // `postcard_len`, which widens at a different payload length because the
-    // header sits in front of it (125/126, 16_381/16_382, 2_097_149/2_097_150).
+    // varint width boundary of BOTH varints the pair emits below the
+    // `MAX_CHUNK_FRAME` ceiling: the payload varint (127/128, 16_383/16_384) and
+    // the framing varint over `postcard_len`, which widens at a different payload
+    // length because the header sits in front of it (125/126, 16_381/16_382). The
+    // next widths (2 MiB) lie past the ceiling, so the encoders refuse them.
     for len in [
         1usize,
         2,
@@ -821,10 +825,6 @@ async fn encode_chunk_frame_headers_matches_framed_encode_chunk_frame()
         16_385,
         64 * 1024,
         1024 * 1024,
-        2_097_149,
-        2_097_150,
-        2_097_151,
-        2_097_152,
     ] {
         let payload = vec![0xABu8; len];
         let mut frame_hdr = [0u8; crate::client::CHUNK_FRAME_HEADERS_MAX];
@@ -861,7 +861,7 @@ async fn encode_chunk_frame_headers_matches_framed_encode_chunk_frame()
 ///
 /// The ceiling is a *frame* length, not a payload length — `ChunkTooLarge`
 /// reports `postcard_len` (header + payload), so the largest accepted payload is
-/// `MAX_MESSAGE_SIZE` minus its own header.
+/// `MAX_CHUNK_FRAME` minus its own header, which is exactly `CHUNK_BYTES`.
 #[test]
 fn the_hot_path_encoders_reject_empty_and_oversized_frames() {
     let mut data_hdr = [0u8; CHUNK_DATA_HEADER_MAX];
@@ -876,10 +876,10 @@ fn the_hot_path_encoders_reject_empty_and_oversized_frames() {
         Err(MessageValidationError::EmptyChunk)
     );
 
-    // `MAX_MESSAGE_SIZE` is 2^24, whose payload varint is 4 bytes, so the header
-    // is 5 and the largest frame that fits carries 5 fewer payload bytes.
-    let max = crate::framing::MAX_MESSAGE_SIZE as usize;
-    let largest = max - 5;
+    // A CHUNK_BYTES payload has a 3-byte varint, so the header is 4 and the
+    // largest frame that fits carries 4 fewer payload bytes than the ceiling.
+    let max = MAX_CHUNK_FRAME as usize;
+    let largest = max - 4;
     assert_eq!(chunk_frame_postcard_len(largest), max);
     assert!(encode_chunk_data_header(largest, &mut data_hdr).is_ok());
     assert!(encode_chunk_frame_headers(largest, &mut frame_hdr).is_ok());
@@ -902,16 +902,7 @@ fn the_hot_path_encoders_reject_empty_and_oversized_frames() {
 /// or rejects at the wrong boundary.
 #[test]
 fn chunk_frame_postcard_len_matches_the_encoded_header() -> Result<(), MessageValidationError> {
-    for len in [
-        1usize,
-        127,
-        128,
-        16_383,
-        16_384,
-        2_097_151,
-        2_097_152,
-        1024 * 1024,
-    ] {
+    for len in [1usize, 127, 128, 16_383, 16_384, 1024 * 1024] {
         let mut hdr = [0u8; CHUNK_DATA_HEADER_MAX];
         let hdr_len = encode_chunk_data_header(len, &mut hdr)?;
         assert_eq!(
@@ -920,6 +911,11 @@ fn chunk_frame_postcard_len_matches_the_encoded_header() -> Result<(), MessageVa
             "postcard length disagrees with the encoded header at len {len}"
         );
     }
+    // Past the ceiling the encoders refuse, but the sizing function still counts
+    // the 4-byte payload varint that 2 MiB widens to: it is what `MAX_CHUNK_FRAME`
+    // is computed from, so it must stay right at every width.
+    assert_eq!(chunk_frame_postcard_len(2_097_151), 1 + 3 + 2_097_151);
+    assert_eq!(chunk_frame_postcard_len(2_097_152), 1 + 4 + 2_097_152);
     // Every caller rejects 0 first, but the sizing answer for it is still the
     // true encoded length of an empty `ChunkData` body: discriminant + `0x00`.
     assert_eq!(chunk_frame_postcard_len(0), 2);
@@ -1185,10 +1181,122 @@ async fn client_message_full_stack_roundtrip() -> Result<(), Box<dyn std::error:
         let mut buf = Vec::new();
         write_frame(&mut buf, &payload).await?;
         let mut cursor = std::io::Cursor::new(buf);
-        let frame = read_frame(&mut cursor).await?;
+        let frame = read_frame(&mut cursor, MAX_CHUNK_FRAME).await?;
         let (decoded, tail) = decode_message::<ClientMessage>(&frame)?;
         assert_eq!(decoded, msg);
         assert!(tail.is_empty(), "no extension bytes expected");
     }
+    Ok(())
+}
+
+/// The largest `WatermarkBundle` a node can attach: every `u64` at full varint
+/// width and an EOA signature.
+fn widest_bundle() -> WatermarkBundle {
+    WatermarkBundle {
+        amount: u64::MAX,
+        bytes_delivered: u64::MAX,
+        chain_root: [0xAB; 32],
+        verified_index: u8::MAX,
+        tip: [0xCD; 32],
+        chunk_price: u64::MAX,
+        last_signature: vec![0x11; VOUCHER_SIG_LEN],
+    }
+}
+
+/// Every `cdn/client/v1` control message at its widest legitimate encoding fits
+/// [`MAX_CLIENT_CONTROL_FRAME`] (ADR 013 § Wire Framing). The node reads the
+/// request and every payment proof against that ceiling, and the payer reads the
+/// response against it, so a message that outgrew it would be refused on the
+/// wire. The `StreamRequest` size is pinned exactly so the ceiling's headroom
+/// stays visible.
+#[test]
+fn client_control_frame_ceiling_holds_the_largest_message() -> Result<(), FrameError> {
+    let ceiling = MAX_CLIENT_CONTROL_FRAME as usize;
+    let request = StreamRequest {
+        hash: [0x01; 32],
+        namespace_id: [0x02; 32],
+        pool_id: [0x03; 32],
+        byte_offset: u64::MAX,
+        byte_len: u64::MAX,
+        timestamp_us: u64::MAX,
+    };
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: [0x04; 20],
+            binding_signature: vec![0x05; BINDING_SIG_LEN],
+        }),
+        capability: Some(WireCapability {
+            spending_cap: u64::MAX,
+            expiry: u64::MAX,
+            owner_signature: vec![0x06; VOUCHER_SIG_LEN],
+        }),
+    };
+    let request_len = encode_stream_request(&request, Some(&ext))?.len();
+    assert_eq!(request_len, 301, "StreamRequest + ext at full width");
+
+    let response = StreamResponse {
+        body: StreamResponseBody {
+            hash: [0x07; 32],
+            ok: false,
+            rate_per_mb: MAX_RATE_PER_MB,
+            total_bytes: u64::MAX,
+            pool_id: [0x08; 32],
+            timestamp_us: u64::MAX,
+        },
+        slash_sig: vec![0x09; SLASH_SIG_LEN],
+    };
+    let rejected = StreamError::VoucherRejected {
+        reason: VoucherRejectReason::BytesRegression,
+        bundle: Some(widest_bundle()),
+    };
+    let response_len = encode_stream_response(
+        &response,
+        Some(&StreamResponseExt {
+            error: Some(rejected.clone()),
+        }),
+    )?
+    .len();
+    let voucher_len = encode_message(&ClientMessage::Voucher(Voucher {
+        signature: vec![0x0A; VOUCHER_SIG_LEN],
+        amount: u64::MAX,
+        bytes_delivered: u64::MAX,
+        chain_root: [0x0B; 32],
+        chunk_price: u64::MAX,
+    }))?
+    .len();
+    let preimage_len = encode_message(&ClientMessage::ChunkPreimage(ChunkPreimage {
+        preimage: [0x0C; 32],
+        index: u8::MAX,
+    }))?
+    .len();
+    let error_len = encode_message(&ClientMessage::StreamError(rejected))?.len();
+
+    for (what, len) in [
+        ("StreamRequest", request_len),
+        ("StreamResponse", response_len),
+        ("Voucher", voucher_len),
+        ("ChunkPreimage", preimage_len),
+        ("StreamError", error_len),
+    ] {
+        assert!(
+            len <= ceiling,
+            "{what} = {len} B exceeds MAX_CLIENT_CONTROL_FRAME"
+        );
+    }
+    Ok(())
+}
+
+/// A frame carrying exactly one full payment interval is the largest legitimate
+/// `ChunkData`, and [`MAX_CHUNK_FRAME`] is exactly its length — the generic
+/// encoder and the single-buffer door agree on it.
+#[test]
+fn max_chunk_frame_is_one_full_interval() -> Result<(), Box<dyn std::error::Error>> {
+    let payload = vec![0u8; usize::try_from(CHUNK_BYTES)?];
+    let generic = encode_message(&ClientMessage::ChunkData(ChunkData::new(payload.clone())?))?;
+    assert_eq!(generic.len(), MAX_CHUNK_FRAME as usize);
+    assert_eq!(
+        encode_chunk_frame(&payload)?.len(),
+        MAX_CHUNK_FRAME as usize
+    );
     Ok(())
 }

@@ -304,8 +304,8 @@ impl ClientHandler {
 ///
 /// # Errors
 ///
-/// A `total` past [`decdn_protocol::framing::MAX_MESSAGE_SIZE`] is refused one door
-/// further down, by `encode_chunk_frame_headers`' own ADR 013 ceiling; the ADR 005
+/// A frame past [`decdn_protocol::MAX_CHUNK_FRAME`] is refused one door further
+/// down, by `encode_chunk_frame_headers`' own ADR 013 ceiling; the ADR 005
 /// empty-frame floor lives there too. Neither is reachable while
 /// `payment.frame_target_bytes` is capped at one payment chunk.
 pub(super) fn chunk_frame_bufs(frame: &FrameChunks) -> anyhow::Result<Vec<Bytes>> {
@@ -409,7 +409,9 @@ fn tolerate_departed_peer(result: anyhow::Result<()>, what: &str) -> anyhow::Res
 /// went away.
 fn write_frame_error(e: FrameError) -> anyhow::Error {
     match e {
-        FrameError::TooLarge(len) => anyhow::anyhow!("refusing to write a {len}-byte frame"),
+        FrameError::TooLarge { len, .. } => {
+            anyhow::anyhow!("refusing to write a {len}-byte frame")
+        }
         FrameError::Io(io)
             if matches!(
                 io.get_ref()

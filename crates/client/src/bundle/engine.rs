@@ -55,7 +55,7 @@
 //! paying for it again.
 //!
 //! **Whole-root content reuse.** A run also reuses a byte-identical file
-//! already anywhere in the output root, not only at its own manifest path. It
+//! already anywhere in the output root, not only at its own entry path. It
 //! consults a whole-root content index built from `.decdn-manifest.json`'s
 //! saved records: target blob hash → an on-disk regular file the manifest
 //! records with that hash. When a blob's hash hits that index, the candidate
@@ -73,7 +73,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
 use alloy::providers::Provider;
-use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context as _, anyhow, bail};
 use decdn_bao_range::CHUNK_GROUP_BYTES;
 use decdn_common::redact::sanitize_err_chain;
@@ -88,6 +87,7 @@ use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
     FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, manifest_cache, parse_hash,
 };
+use crate::buyer_pool::OwnedPayer;
 use crate::discovery::{self, NodeCandidate};
 use crate::funding::RunFunding;
 use crate::lane_sources::LaneSources;
@@ -332,11 +332,9 @@ async fn resolve_disk_state(
         // mtime. The file is accepted by its hash: the manifest's `size` is only
         // a first claim, and a blob whose true size differs from it is still
         // the entry's blob, so it is not fetched again on every run.
-        let fast = saved.get(&en.path).is_some_and(|rec| {
-            rec.hash == en.hash
-                && rec.size == meta.len()
-                && SavedMtime::of(&meta).as_ref() == Some(&rec.mtime)
-        });
+        let fast = saved
+            .get(&en.path)
+            .is_some_and(|rec| rec.hash == en.hash && rec.still_matches(&meta));
         if fast {
             state.skip.insert(en.path.clone());
             seed_new_chunks(&mut state, en, &dest);
@@ -444,6 +442,35 @@ fn seed_new_chunks(state: &mut DiskState, en: &ManifestEntry, dest: &Path) {
     }
 }
 
+/// Where an entry at `path` lands under `out_root`: the § Path-safety join,
+/// outside the paths the pull keeps its own state in.
+///
+/// # Errors
+///
+/// `path` escapes `out_root`, or lands in the staging directory, on the
+/// skip-cache file, or in the manifest cache.
+pub(super) fn writable_dest(out_root: &Path, path: &str) -> anyhow::Result<PathBuf> {
+    let dest = safe_join(out_root, path)?;
+    // Reserve the staging dir: an entry resolving inside
+    // `<out_root>/.decdn-partial/` would collide with a per-hash staging
+    // file, and `remove_staging` could then delete a materialized output.
+    anyhow::ensure!(
+        !dest.starts_with(out_root.join(STAGING_DIR)),
+        "manifest path {path:?} is inside the reserved staging directory {STAGING_DIR}/"
+    );
+    // Reserve the pull's own state: an entry at the skip-cache file would be
+    // overwritten by the run's skip-cache flush, and an entry inside the
+    // manifest cache would collide with a cached manifest.
+    anyhow::ensure!(
+        dest != out_root.join(skip_cache::SAVED_MANIFEST_NAME)
+            && !dest.starts_with(out_root.join(manifest_cache::CACHE_DIR)),
+        "manifest path {path:?} is reserved for the pull's own state ({} or {}/)",
+        skip_cache::SAVED_MANIFEST_NAME,
+        manifest_cache::CACHE_DIR,
+    );
+    Ok(dest)
+}
+
 /// Resolve each entry's on-disk destination and classify it — a resolve failure,
 /// a path to skip, or a path to write — before any fetch. `skip` is the
 /// [`resolve_disk_state`] pre-pass result: a path lands in it on a matching
@@ -460,37 +487,8 @@ fn plan_slots<'a>(
 ) -> Vec<Slot<'a>> {
     entries
         .iter()
-        .map(|en| match safe_join(out_root, &en.path) {
+        .map(|en| match writable_dest(out_root, &en.path) {
             Err(e) => Slot::Failed(EntryOutcome::failed(&en.path, &e)),
-            // Reserve the staging dir: an entry resolving inside
-            // `<out_root>/.decdn-partial/` would collide with a per-hash staging
-            // file, and `remove_staging` could then delete a materialized output.
-            Ok(dest) if dest.starts_with(out_root.join(STAGING_DIR)) => {
-                Slot::Failed(EntryOutcome::failed(
-                    &en.path,
-                    &anyhow::anyhow!(
-                        "manifest path {:?} is inside the reserved staging directory {STAGING_DIR}/",
-                        en.path
-                    ),
-                ))
-            }
-            // Reserve the pull's own state: an entry at the skip-cache file
-            // would be overwritten by the run's skip-cache flush, and an entry
-            // inside the manifest cache would collide with a cached manifest.
-            Ok(dest)
-                if dest == out_root.join(skip_cache::SAVED_MANIFEST_NAME)
-                    || dest.starts_with(out_root.join(manifest_cache::CACHE_DIR)) =>
-            {
-                Slot::Failed(EntryOutcome::failed(
-                    &en.path,
-                    &anyhow::anyhow!(
-                        "manifest path {:?} is reserved for the pull's own state ({} or {}/)",
-                        en.path,
-                        skip_cache::SAVED_MANIFEST_NAME,
-                        manifest_cache::CACHE_DIR,
-                    ),
-                ))
-            }
             Ok(_) if !overwrite && skip.contains(en.path.as_str()) => Slot::Skip,
             Ok(dest) => Slot::Write {
                 label: en.path.as_str(),
@@ -1236,6 +1234,16 @@ impl<'g> FetchSlot<'g> {
     }
 }
 
+/// What a bundle run's lanes sign under.
+pub(super) enum RunPayer {
+    /// The buyer's own pool: the owner key owns it, the lane key signs.
+    Owned(OwnedPayer),
+    /// The delegated credential slot, read at each lane build so a swapped-in
+    /// credential takes over at the next voucher boundary. A funding recovery
+    /// step has no funding path: the delegate owns no pool to fund.
+    Delegated(CredentialSlot),
+}
+
 /// The run's state, shared by the entry fetch loop. Borrowed by every
 /// in-flight entry future, and every entry must be polled on one task, as
 /// `buffer_unordered` does: each entry reads its lanes' ledgers and queues
@@ -1246,7 +1254,8 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     pub(super) store: Arc<dyn BuyerPoolStore>,
     pub(super) contract: PaymentPool::PaymentPoolInstance<P>,
     pub(super) rpc: P,
-    pub(super) signer: Arc<PrivateKeySigner>,
+    /// The keys every entry's lanes sign under.
+    pub(super) payer: RunPayer,
     pub(super) self_address: Address,
     /// The pool's settlement token (USDC), read once via `PaymentPool.usdc()`.
     pub(super) token: Address,
@@ -1266,12 +1275,6 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     pub(super) max_blob_bytes: u64,
     /// How the run funds its pool.
     pub(super) deposit: DepositPolicy,
-    /// The delegated credential slot every entry's lanes sign under, read
-    /// at each lane build so a swapped-in credential takes over at the next
-    /// voucher boundary; `None` for the self-owned pool path. With a slot, a
-    /// funding recovery step has no funding path (the delegate owns no pool
-    /// to fund).
-    pub(super) slot: Option<CredentialSlot>,
     /// Bundle-level namespace id (ADR 002) applied to every paid pull in the run —
     /// the namespace as a big-endian `uint256`; `NO_NAMESPACE` when the
     /// caller names none.
@@ -1472,9 +1475,9 @@ impl<P: Provider + Clone> PullCtx<P> {
             &deps,
             &self.discovery,
             &self.relays,
-            match &self.slot {
-                Some(slot) => LanePayer::Delegated(slot),
-                None => LanePayer::Owned(&self.signer),
+            match &self.payer {
+                RunPayer::Delegated(slot) => LanePayer::Delegated(slot),
+                RunPayer::Owned(payer) => LanePayer::Owned(payer),
             },
             &self.voucher_dom,
             Some(&self.open_lock),
@@ -1578,7 +1581,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         }
     }
 
-    /// Pull every one of `entries` into `out_root`, and say how it ended.
+    /// Pull every entry of `manifest` into `out_root`, and say how it ended.
     ///
     /// A funding recovery step that replaced the pool ends the first pass. The
     /// remaining entries run once more against the new pool: lanes key on the
@@ -1587,11 +1590,14 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// second replacement ends the pull "funding needed".
     pub(super) async fn run(
         &mut self,
-        entries: &[ManifestEntry],
+        manifest: &super::BundleManifest,
         out_root: &Path,
         overwrite: bool,
         cancel: &CancellationToken,
     ) -> BundleOutcome {
+        let entries = manifest.entries.as_slice();
+        // Each skip-cache record names the bundle its file came from.
+        let bundle = manifest.hash();
         // The run's total meters its **download** — the bytes actually fetched
         // after shared-chunk dedup — beside the whole on-disk content size.
         let fetch_plan = build_fetch_plan(entries);
@@ -1612,7 +1618,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // lanes' paid bytes grew by while it ran.
         let paid_before = self.ledgers.paid_bytes();
         let mut run = self
-            .pull_all(entries, out_root, overwrite, saved, cancel)
+            .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
             .await;
         let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
         let replaced = replaced_pool(&run);
@@ -1623,11 +1629,11 @@ impl<P: Provider + Clone> PullCtx<P> {
             // Every lane in the fresh registry counts from its own seed, so
             // the second pass's payment is the new registry's whole total.
             self.ledgers = LaneLedgers::new();
-            self.funding = RunFunding::reporting_opens_to(self.funding.opens().clone());
+            self.funding = RunFunding::reporting_escrows_to(self.funding.escrows().clone());
             self.recovery.start_next_pass();
             let saved = skip_cache::load(out_root);
             let second = self
-                .pull_all(entries, out_root, overwrite, saved, cancel)
+                .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
                 .await;
             run = merge_passes(run, second);
             paid = paid.saturating_add(self.ledgers.paid_bytes());
@@ -1713,6 +1719,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     async fn pull_all(
         &self,
         entries: &[ManifestEntry],
+        bundle: [u8; 32],
         out_root: &Path,
         overwrite: bool,
         saved: SavedManifest,
@@ -1754,6 +1761,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         let run = self
             .pull_plain(
                 &refs,
+                bundle,
                 out_root,
                 overwrite,
                 &index,
@@ -1790,6 +1798,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     async fn pull_plain<'e>(
         &self,
         entries: &[&'e ManifestEntry],
+        bundle: [u8; 32],
         out_root: &Path,
         overwrite: bool,
         index: &ChunkIndex,
@@ -1843,7 +1852,8 @@ impl<P: Provider + Clone> PullCtx<P> {
                         run.outcomes.len(),
                         "fetch_group must return one outcome per entry"
                     );
-                    let updates = build_completed_updates(&group_entries, &run.outcomes, out_root);
+                    let updates =
+                        build_completed_updates(&group_entries, &run.outcomes, bundle, out_root);
                     let warnings = size_warnings(&group_entries, &updates);
                     (run, updates, warnings)
                 }
@@ -3865,14 +3875,19 @@ pub(super) fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
-/// The skip-cache record for one entry, built from its FINAL on-disk state, or
-/// `None` when this run has nothing safe to record for it. A record is produced
-/// only when a regular file is present at the entry's path with a usable mtime —
-/// the gates that keep a symlink, a non-regular file, a missing file, or an
-/// unreadable mtime out of the later fast-skip path. `materialize` renames new
-/// content into place only on success, so a present regular file at the path is
-/// this run's landed bytes; pairing the entry's hash with them is sound.
-fn record_one(out_root: &Path, en: &ManifestEntry) -> Option<skip_cache::SavedFile> {
+/// The skip-cache record for one entry of the bundle whose manifest hash is
+/// `bundle`, built from its FINAL on-disk state, or `None` when this run has
+/// nothing safe to record for it. A record is produced only when a regular file
+/// is present at the entry's path with a usable mtime — the gates that keep a
+/// symlink, a non-regular file, a missing file, or an unreadable mtime out of
+/// the later fast-skip path. `materialize` renames new content into place only
+/// on success, so a present regular file at the path is this run's landed
+/// bytes; pairing the entry's hash with them is sound.
+fn record_one(
+    out_root: &Path,
+    bundle: [u8; 32],
+    en: &ManifestEntry,
+) -> Option<skip_cache::SavedFile> {
     let dest = safe_join(out_root, &en.path).ok()?;
     // `symlink_metadata` does not follow links: only a regular file this run
     // landed is recorded, so a symlink or non-regular file at `dest` is never
@@ -3896,6 +3911,7 @@ fn record_one(out_root: &Path, en: &ManifestEntry) -> Option<skip_cache::SavedFi
         size: meta.len(),
         mtime,
         chunks,
+        source: skip_cache::SavedSource::new(bundle, en.manifest_path()),
     })
 }
 
@@ -3936,10 +3952,13 @@ fn size_warnings(
 /// is what makes this safe to call MID-RUN: an entry whose group has not
 /// completed yet is simply absent from `outcomes`, so it is never recorded from
 /// bytes this run has not landed. A batch may be one completed group or the whole
-/// run's outcomes; the result is the same records either way.
+/// run's outcomes; the result is the same records either way. Each record names
+/// its entry's manifest path in the bundle whose manifest hash is `bundle` as
+/// its source.
 fn build_completed_updates(
     entries: &[&ManifestEntry],
     outcomes: &[EntryOutcome],
+    bundle: [u8; 32],
     out_root: &Path,
 ) -> BTreeMap<String, skip_cache::SavedFile> {
     let mut updates = BTreeMap::new();
@@ -3948,7 +3967,7 @@ fn build_completed_updates(
             outcome,
             EntryOutcome::Fetched(_) | EntryOutcome::Linked | EntryOutcome::Skipped
         );
-        if recordable && let Some(rec) = record_one(out_root, en) {
+        if recordable && let Some(rec) = record_one(out_root, bundle, en) {
             updates.insert(en.path.clone(), rec);
         }
     }

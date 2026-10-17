@@ -37,6 +37,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools_at};
+use decdn_incentive::tx::RECEIPT_TIMEOUT;
 use decdn_incentive::{
     AdvanceOutcome, BuyerPoolState, BuyerPoolStore, Deployment, LaneKey, PoolId,
     PoolOpenFailureReason,
@@ -47,10 +48,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use decdn_client::buyer_pool::{
-    LOW_WATER_DIVISOR, OpenUnconfirmed, OpenedPool, PoolNotOpen, ProgressWrite, ToppedUpPool,
-    WatermarkRow, ensure_allowance, grade_deposit_credit, open_pool, opened_from_receipt,
-    pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool, top_up as pool_top_up,
-    topped_up_effect,
+    LOW_WATER_DIVISOR, OpenUnconfirmed, OpenedPool, OwnedPayer, PoolNotOpen, ProgressWrite,
+    TopUpUnconfirmed, WatermarkRow, ensure_allowance, grade_deposit_credit, open_pool,
+    opened_from_receipt, pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool,
+    send_top_up_at, top_up as pool_top_up, topped_up_effect, topped_up_from_receipt,
 };
 use decdn_client::{LocalPullFault, PoolContext, PoolReplaced, Recovery};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
@@ -89,6 +90,21 @@ const OPEN_UNRESOLVED_WARN_INTERVAL: Duration = Duration::from_mins(1);
 /// reads. A re-send past it forgets the oldest; a forgotten one that mines
 /// still resolves through its spent nonce and `getPools`.
 const MAX_OPEN_TXS: usize = 4;
+
+/// How often the funding task re-reads the chain for a `topUp` whose outcome
+/// it did not see ([`settle_unconfirmed_top_up`]). A tick reads each known
+/// transaction's receipt, the block number, and one or two nonces. Once the
+/// nonce is spent, a tick reads the receipts again and `getPool` once.
+const TOPUP_RESOLVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the funding task repeats its warning while it holds the top-up
+/// slot for an unconfirmed `topUp`.
+const TOPUP_UNRESOLVED_WARN_INTERVAL: Duration = Duration::from_mins(1);
+
+/// The most `topUp` transactions at one nonce whose receipts the funding task
+/// reads. A re-send past it forgets the oldest; a forgotten one that mines
+/// still resolves through its spent nonce and the pool's deposit.
+const MAX_TOPUP_TXS: usize = 4;
 
 /// A lane's seed queue: the lock the streams seeding one lane take in turn, and
 /// the watermark read the first of them made, for the lane it read. The rest
@@ -178,15 +194,18 @@ pub struct TopUpLanded {
     pub added: U256,
 }
 
-/// Typed marker: a `topUp` mined but its deposit could not be credited to the local
-/// pool row. The deposit is escrowed and untracked, so no caller funds again on top
-/// of it — a second `topUp` would strand a second deposit the same way.
+/// Typed marker: a `topUp` mined, or may have mined, and its deposit is not credited
+/// to the local pool row. The deposit is escrowed and untracked, so no caller funds
+/// again on top of it — a second `topUp` would strand a second deposit the same way.
 #[derive(Debug)]
 struct EscrowedUntracked;
 
 impl std::fmt::Display for EscrowedUntracked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "topUp escrowed but not credited to the local pool row")
+        write!(
+            f,
+            "topUp escrowed, or may have escrowed, but not credited to the local pool row"
+        )
     }
 }
 
@@ -196,7 +215,9 @@ impl std::error::Error for EscrowedUntracked {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TopUpFunder {
     /// The proactive low-water refill. No pull waits on its amount, so a recovery
-    /// top-up that joins it can claim that amount as its own.
+    /// top-up that joins it can claim that amount as its own. While the refill
+    /// settles an unconfirmed `topUp`, a recovery top-up fails instead of
+    /// joining it ([`BuyerPoolService::held_topup_error`]).
     Refill,
     /// A funding recovery step's top-up. Its spawner relies on the whole amount,
     /// so no joiner can claim any of it.
@@ -223,6 +244,9 @@ enum TopUpClaim {
 /// claimed yet.
 struct InFlightTopUp {
     fut: SharedTopUp,
+    /// The pool this `topUp` escrows into. Only a caller for the same pool
+    /// joins it or waits on it: its headroom cannot fund any other pool.
+    pool_id: PoolId,
     /// The amount this `topUp` asks the chain for.
     requested: U256,
     /// Headroom this `topUp` adds that no pull relies on yet. A refill starts with
@@ -233,13 +257,14 @@ struct InFlightTopUp {
 }
 
 impl InFlightTopUp {
-    fn new(fut: SharedTopUp, requested: U256, funder: TopUpFunder) -> Self {
+    fn new(fut: SharedTopUp, pool_id: PoolId, requested: U256, funder: TopUpFunder) -> Self {
         let unclaimed = match funder {
             TopUpFunder::Refill => requested,
             TopUpFunder::Recovery => U256::ZERO,
         };
         Self {
             fut,
+            pool_id,
             requested,
             unclaimed,
             funder,
@@ -284,7 +309,8 @@ const MAX_TOPUP_CALLS: u32 = 3;
 
 /// Fund at least `additional` of new headroom for one recovery top-up on `pool_id`.
 ///
-/// `join_or_spawn(amount)` joins the in-flight `topUp` or spawns one for `amount`.
+/// `join_or_spawn(amount)` joins the in-flight `topUp` or spawns one for `amount`,
+/// or fails without either.
 ///
 /// - A spawned `topUp` escrows this caller's own amount, so its result is final.
 ///   A spawned `topUp` that credits less than requested is not retried: the
@@ -294,27 +320,37 @@ const MAX_TOPUP_CALLS: u32 = 3;
 ///   than the remainder, or when the joined `topUp` fails, this warns and asks
 ///   again for the rest.
 ///
-/// When [`MAX_TOPUP_CALLS`] calls end short, this returns what landed and warns.
-/// The caller compares [`TopUpLanded::added`] with its request.
+/// When [`MAX_TOPUP_CALLS`] calls end short, or a later `join_or_spawn` call
+/// fails after a join landed, this returns what landed and warns. The caller
+/// compares [`TopUpLanded::added`] with its request.
 ///
 /// # Errors
 ///
-/// Propagates the error of a spawned `topUp`, and of any `topUp` whose deposit is
-/// escrowed but untracked. Errors when every call joins a `topUp` that fails.
+/// Propagates the error of a spawned `topUp`, of any `topUp` whose deposit is
+/// escrowed but untracked, and of a `join_or_spawn` call made before any join
+/// landed. Errors when every call joins a `topUp` that fails.
 async fn top_up_at_least<F, Fut>(
     pool_id: PoolId,
     additional: U256,
     mut join_or_spawn: F,
 ) -> Result<TopUpLanded>
 where
-    F: FnMut(U256) -> (Fut, TopUpClaim),
+    F: FnMut(U256) -> Result<(Fut, TopUpClaim)>,
     Fut: std::future::Future<Output = TopUpOutcome>,
 {
     let mut added = U256::ZERO;
     let mut new_deposit = None;
     let mut last_err = None;
     for _ in 0..MAX_TOPUP_CALLS {
-        let (fut, claim) = join_or_spawn(additional.saturating_sub(added));
+        let (fut, claim) = match (join_or_spawn(additional.saturating_sub(added)), new_deposit) {
+            (Ok(call), _) => call,
+            (Err(err), Some(new_deposit)) => {
+                let out = TopUpLanded { new_deposit, added };
+                warn_short_top_up(pool_id, additional, out, &format!("{err:#}"));
+                return Ok(out);
+            }
+            (Err(err), None) => return Err(err),
+        };
         let landed = match (fut.await, claim) {
             (Ok(landed), TopUpClaim::Spawned) => {
                 added = added.saturating_add(landed.added);
@@ -389,14 +425,20 @@ fn warn_short_top_up(pool_id: PoolId, requested: U256, landed: TopUpLanded, why:
 /// A spawned `topUp` failure is this caller's own and is final. So is an
 /// escrowed-but-untracked failure: a second `topUp` against a row that cannot be
 /// credited strands a second deposit. `fund_pool` has already graded that case
-/// into the error, tx and all, so there is nothing to re-diagnose.
+/// into the error, tx and all, so there is nothing to re-diagnose. So is a
+/// [`TopUpUnconfirmed`] failure: that `topUp` may still mine, and a second one
+/// beside it escrows twice. `fund_pool` settles every `TopUpUnconfirmed` before
+/// it returns, so this check guards any path that lets one escape.
 fn retryable_join_error(
     pool_id: PoolId,
     requested: U256,
     err: Arc<anyhow::Error>,
     claim: TopUpClaim,
 ) -> Result<Arc<anyhow::Error>> {
-    if claim == TopUpClaim::Spawned || err.downcast_ref::<EscrowedUntracked>().is_some() {
+    if claim == TopUpClaim::Spawned
+        || err.downcast_ref::<EscrowedUntracked>().is_some()
+        || err.downcast_ref::<TopUpUnconfirmed>().is_some()
+    {
         let failed = anyhow::anyhow!("recovery top-up failed: {err:#}");
         // A pool that accepts no more funds is what the recovery step answers
         // with a new pool, so the marker rides out of the shared future.
@@ -461,6 +503,9 @@ struct FundingHandles<P: Provider + Clone + 'static> {
     owner: Address,
     payment_pool_addr: Address,
     metrics: Arc<Metrics>,
+    /// The top-up slot's hold, which [`settle_unconfirmed_top_up`] sets for as
+    /// long as it runs.
+    hold: SlotHold,
 }
 
 /// Run `attempt` (a `topUp`), and only if it fails with an
@@ -509,11 +554,19 @@ where
 /// and the funding recovery top-up (#1146/#1530), so the allowance posture, the
 /// deposit-credit grading, and the metering cannot drift apart.
 ///
+/// A `topUp` whose outcome this task did not see ([`TopUpUnconfirmed`]) keeps
+/// the task, and so the top-up slot, until the chain resolves it
+/// ([`settle_unconfirmed_top_up`]). Releasing the slot earlier lets the next
+/// refill send a second `topUp` beside one that may still mine (#2489).
+///
 /// # Errors
 ///
-/// Errors if the allowance or `topUp` fails — the funds did not move — and if a
-/// mined `topUp` cannot be credited locally, in which case the deposit is
-/// escrowed and the error names the tx.
+/// - The allowance or `topUp` failed, or the settle found that the `topUp`
+///   escrowed nothing: the funds did not move.
+/// - The settle found the pool no longer accepts funds, marked [`PoolNotOpen`].
+/// - The `topUp` escrowed, or may have escrowed, and the local row is not
+///   credited: marked [`EscrowedUntracked`]. The error names the tx, or the
+///   nonce and block the escrow was read at when no receipt was read.
 async fn fund_pool<P: Provider + Clone + 'static>(
     handles: &FundingHandles<P>,
     pool_id: PoolId,
@@ -524,8 +577,23 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     // an allowance shortfall (the approval was revoked or never granted) do a
     // just-in-time `approve` and retry once — so the happy path issues zero
     // allowance reads per top-up.
-    let ToppedUpPool { credited, tx, .. } = match top_up_recovering_allowance(
-        || pool_top_up(&handles.contract, handles.owner, pool_id, additional),
+    let topped_up = top_up_recovering_allowance(
+        // Bounded: a lapse is a `TopUpUnconfirmed` like a failed read, so
+        // `settle_unconfirmed_top_up` takes over and keeps the top-up slot
+        // until the chain resolves the `topUp`. That is also how a `topUp`
+        // dropped from the mempool reaches the settle loop's re-send.
+        || {
+            pool_top_up(
+                &handles.contract,
+                handles.owner,
+                pool_id,
+                additional,
+                // The top-up slot, not a handle, holds an unconfirmed `topUp`
+                // until `settle_unconfirmed_top_up` resolves it.
+                None,
+                Some(RECEIPT_TIMEOUT),
+            )
+        },
         || {
             ensure_allowance(
                 &handles.rpc,
@@ -537,20 +605,67 @@ async fn fund_pool<P: Provider + Clone + 'static>(
         },
     )
     .await
-    {
-        Ok(topped_up) => topped_up,
-        Err(err) => {
-            warn!(
-                %pool_id,
-                %additional,
-                error = %sanitize_err_chain(&err),
-                "buyer top-up: topUp failed; pool not topped up"
-            );
-            handles.metrics.buyer_topup_failure();
-            return Err(err);
-        }
+    .map(|topped_up| SettledTopUp {
+        credited: topped_up.credited,
+        proof: TopUpProof::Receipt(topped_up.tx),
+    });
+    let settled = match topped_up {
+        Err(err) => match err.downcast_ref::<TopUpUnconfirmed>().copied() {
+            Some(unconfirmed) => {
+                settle_unconfirmed_top_up(handles, pool_id, additional, unconfirmed, &err).await
+            }
+            None => Err(err),
+        },
+        settled => settled,
     };
+    match settled {
+        Ok(settled) => credit_settled_top_up(handles, pool_id, settled),
+        Err(err) => Err(report_top_up_failure(handles, pool_id, additional, err)),
+    }
+}
 
+/// Log and meter a funding `topUp` that did not credit the row, and return its
+/// error. One that escrowed, or may have escrowed ([`EscrowedUntracked`]), logs
+/// the "ESCROWED AND UNTRACKED" `error!` an operator reconciles from.
+fn report_top_up_failure<P: Provider + Clone + 'static>(
+    handles: &FundingHandles<P>,
+    pool_id: PoolId,
+    additional: U256,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    if err.downcast_ref::<EscrowedUntracked>().is_some() {
+        error!(
+            %pool_id,
+            %additional,
+            error = %sanitize_err_chain(&err),
+            "buyer top-up: the topUp may have escrowed, and the local pool row is not \
+             credited; the deposit is ESCROWED AND UNTRACKED — reconcile against the chain"
+        );
+    } else {
+        warn!(
+            %pool_id,
+            %additional,
+            error = %sanitize_err_chain(&err),
+            "buyer top-up: topUp failed; pool not topped up"
+        );
+    }
+    handles.metrics.buyer_topup_failure();
+    err
+}
+
+/// Credit what a funding `topUp` escrowed into the local pool row, and meter
+/// the outcome.
+///
+/// # Errors
+///
+/// The row could not be credited: the deposit is escrowed and untracked,
+/// marked [`EscrowedUntracked`], and the error names the tx, or the nonce and
+/// block the escrow was read at.
+fn credit_settled_top_up<P: Provider + Clone + 'static>(
+    handles: &FundingHandles<P>,
+    pool_id: PoolId,
+    SettledTopUp { credited, proof }: SettledTopUp,
+) -> Result<TopUpLanded> {
     // Credit the CHAIN-measured delta into the committed row inside one write txn,
     // so a concurrent settle cannot clobber the deposit or lose the top-up.
     // `add_deposit` splits its failures across two channels — a backend fault is
@@ -561,11 +676,12 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     // stranded deposits (#1146 review). Grading both here is also what puts the
     // tx in the propagated error: `DepositOutcome` has nowhere to carry it.
     let effect = topped_up_effect(pool_id, credited);
-    match grade_deposit_credit(
-        handles.store.add_deposit(handles.owner, pool_id, credited),
-        &effect,
-        tx,
-    ) {
+    let outcome = handles.store.add_deposit(handles.owner, pool_id, credited);
+    let graded = match &proof {
+        TopUpProof::Receipt(tx) => grade_deposit_credit(outcome, &effect, *tx),
+        TopUpProof::DepositGrowth { .. } => grade_grown_deposit_credit(outcome, &effect, &proof),
+    };
+    match graded {
         Ok(new_deposit) => {
             handles.metrics.buyer_topup_ok();
             Ok(TopUpLanded {
@@ -577,7 +693,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
             error!(
                 %pool_id,
                 %credited,
-                %tx,
+                %proof,
                 error = %format_args!("{err:#}"),
                 "buyer top-up: topUp landed on-chain but the local pool row could not be \
                  credited; the deposit is ESCROWED AND UNTRACKED — reconcile against the chain"
@@ -585,6 +701,514 @@ async fn fund_pool<P: Provider + Clone + 'static>(
             handles.metrics.buyer_topup_failure();
             Err(err.context(EscrowedUntracked))
         }
+    }
+}
+
+/// Grade the local credit of a `topUp` whose escrow was read from the pool's
+/// deposit, not from a receipt. The counterpart of [`grade_deposit_credit`],
+/// which needs a tx hash this credit does not have.
+///
+/// # Errors
+///
+/// Errors on any outcome other than [`decdn_incentive::DepositOutcome::Added`].
+fn grade_grown_deposit_credit(
+    outcome: std::result::Result<
+        decdn_incentive::DepositOutcome,
+        decdn_incentive::store::StoreError,
+    >,
+    effect: &str,
+    proof: &TopUpProof,
+) -> Result<U256> {
+    let cause = match outcome {
+        Ok(decdn_incentive::DepositOutcome::Added(new_deposit)) => return Ok(new_deposit),
+        Ok(other) => format!("the local record was not updated: {other:?}"),
+        Err(err) => err.to_string(),
+    };
+    Err(anyhow::anyhow!(
+        "{effect} on-chain ({proof}) but the local record did not survive; the deposit is \
+         escrowed but untracked — reconcile against the pool's deposit before retrying, because \
+         a retry escrows again: {cause}"
+    ))
+}
+
+/// What a funding `topUp` escrowed into its pool.
+struct SettledTopUp {
+    /// The amount the pool's deposit grew by.
+    credited: U256,
+    /// How `credited` was established.
+    proof: TopUpProof,
+}
+
+/// How a funding `topUp`'s escrow was established: what an operator reconciles
+/// against if the local credit fails.
+#[derive(Debug)]
+enum TopUpProof {
+    /// A `topUp` receipt was read, and its `PoolToppedUp` event names the amount.
+    Receipt(TxHash),
+    /// The `topUp`'s nonce was spent with no receipt in hand, and the pool's
+    /// deposit at `block` stood above the row's. This happens when the
+    /// `topUp`'s hash was never returned (a submit that failed in transport),
+    /// was forgotten past [`MAX_TOPUP_TXS`], or its receipt was not yet
+    /// readable on the RPC backend that answered.
+    DepositGrowth {
+        /// The nonce the `topUp` was sent at.
+        nonce: u64,
+        /// The block the nonce and the pool's deposit were read at.
+        block: u64,
+        /// The `topUp` transactions known at `nonce`, oldest first.
+        known: Vec<TxHash>,
+    },
+}
+
+impl std::fmt::Display for TopUpProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Receipt(tx) => write!(f, "tx {tx}"),
+            Self::DepositGrowth {
+                nonce,
+                block,
+                known,
+            } => write!(
+                f,
+                "topUp nonce {nonce} spent at block {block} with no receipt read; known txs \
+                 {known:?}"
+            ),
+        }
+    }
+}
+
+/// Hold the top-up slot until the chain resolves `unconfirmed`, then report
+/// what the `topUp` escrowed. The funding task runs this, so its
+/// [`SlotGuard`] keeps the slot for as long as this waits, and no `topUp` at
+/// another nonce is sent meanwhile. `handles.hold` marks the slot held and
+/// publishes it on `decdn_buyer_topup_unresolved`. A refill for the same pool
+/// joins this `topUp` and claims nothing, and a refill for another pool does
+/// nothing. A funding recovery
+/// step that finds the hold set fails at once
+/// ([`BuyerPoolService::held_topup_error`]). A recovery step that joined before
+/// this began waits for its outcome.
+///
+/// The slot is released only once a receipt is in hand, the nonce is spent, or
+/// a re-send shows the pool accepts no more funds. A timer never decides:
+///
+/// - A receipt for any known `topUp` sent at the nonce is its own record
+///   ([`topped_up_from_receipt`]).
+/// - A nonce the chain shows spent at block `B`, with no receipt in hand, means
+///   the `topUp` has mined or never will. The pool's `deposit` at `B` then
+///   answers. On-chain `deposit` only grows, and the row's deposit, read once
+///   before the first tick, mirrors it, so what the chain holds above that is
+///   what escrowed. This assumes nothing else escrowed into the pool since the
+///   row last matched the chain: an earlier deposit that was not credited, or a
+///   `topUp` sent with the node key from outside the node, is credited with it.
+///   A load-balanced RPC backend that has not reached `B` fails the read, and
+///   the next tick asks again.
+/// - A pending transaction at the nonce may still mine, so the task waits. An
+///   earlier nonce that is not confirmed makes it wait the same way: nothing at
+///   the nonce can mine before it.
+/// - A nonce that the account has reached and no transaction holds gets a
+///   fresh `topUp` at that same nonce ([`send_top_up_at`]). Two transactions at
+///   one nonce cannot both mine. A re-send that reverts [`PoolNotOpen`] ends
+///   the settle once one block shows the nonce unspent and the pool not open:
+///   no `topUp` can escrow into a pool that is not open, and a pool never
+///   reopens. A re-send that reverts on the allowance sends an `approve` at
+///   the nonce instead, which restores the allowance and fills the nonce.
+///
+/// A failed read and any other failed re-send wait for the next tick. A
+/// warning repeats every [`TOPUP_UNRESOLVED_WARN_INTERVAL`] with the elapsed
+/// time and the last thing the chain said.
+///
+/// # Errors
+///
+/// - A mined `topUp` reverted, or the nonce is spent and the pool's deposit
+///   shows nothing escrowed. Neither carries the [`TopUpUnconfirmed`] marker,
+///   because the outcome is known.
+/// - A re-send reverted `PoolNotOpen`, and one block shows the nonce unspent
+///   and the pool not open: nothing escrowed, marked [`PoolNotOpen`] so the
+///   recovery step opens a new pool.
+/// - The nonce is spent, and the row did not track `pool_id` when the settle
+///   began, so the deposit cannot be compared; marked [`EscrowedUntracked`],
+///   so no caller funds again on top of it.
+async fn settle_unconfirmed_top_up<P: Provider + Clone + 'static>(
+    handles: &FundingHandles<P>,
+    pool_id: PoolId,
+    additional: U256,
+    unconfirmed: TopUpUnconfirmed,
+    err: &anyhow::Error,
+) -> Result<SettledTopUp> {
+    let _held = handles.hold.hold(&handles.metrics);
+    let started = tokio::time::Instant::now();
+    let mut settling = TopUpSettling {
+        pool_id,
+        additional,
+        baseline: settle_baseline(handles, pool_id),
+        nonce: unconfirmed.nonce,
+        txs: unconfirmed.tx.into_iter().collect(),
+        original: sanitize_err_chain(err),
+    };
+    warn!(
+        %pool_id,
+        nonce = settling.nonce,
+        txs = ?settling.txs,
+        error = %settling.original,
+        "topUp outcome unknown; holding the top-up slot until the chain resolves it, so no \
+         second topUp escrows beside it"
+    );
+    let mut ticker = tokio::time::interval(TOPUP_RESOLVE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_warned = started;
+    let mut last_seen = String::from("no chain read has answered yet");
+    loop {
+        ticker.tick().await;
+        if last_warned.elapsed() >= TOPUP_UNRESOLVED_WARN_INTERVAL {
+            last_warned = tokio::time::Instant::now();
+            warn!(
+                %pool_id,
+                nonce = settling.nonce,
+                txs = ?settling.txs,
+                elapsed = ?started.elapsed(),
+                last = %last_seen,
+                "still holding the top-up slot for an unconfirmed topUp; this node funds no \
+                 buyer pool until the chain resolves it"
+            );
+        }
+        match settling.tick(handles).await {
+            Tick::Wait(seen) => last_seen = seen,
+            Tick::Done(settled) => {
+                let outcome = settle_outcome(&settled);
+                info!(
+                    %pool_id,
+                    nonce = settling.nonce,
+                    elapsed = ?started.elapsed(),
+                    %outcome,
+                    "unconfirmed topUp resolved"
+                );
+                return settled;
+            }
+        }
+    }
+}
+
+/// The deposit of the row that tracks `pool_id`, read as a settle begins, or
+/// `None` when no row tracks it. The slot is held, so nothing credits the row
+/// while the settle waits; reading it first keeps a replacement open or the
+/// reclaim sweep from moving the baseline the escrow is measured against.
+fn settle_baseline<P: Provider + Clone + 'static>(
+    handles: &FundingHandles<P>,
+    pool_id: PoolId,
+) -> Option<U256> {
+    match handles.store.get_by_owner(handles.owner) {
+        Ok(row) => row
+            .filter(|row| row.pool_id == pool_id)
+            .map(|row| row.deposit),
+        Err(err) => {
+            warn!(%pool_id, error = %err, "could not read the pool row an unconfirmed topUp settles against");
+            None
+        }
+    }
+}
+
+/// What a settle's result says escrowed, for its log line.
+fn settle_outcome(settled: &Result<SettledTopUp>) -> String {
+    match settled {
+        Ok(settled) => format!("escrowed {} ({})", settled.credited, settled.proof),
+        Err(err) if err.downcast_ref::<EscrowedUntracked>().is_some() => {
+            "unknown; the row cannot be compared".to_owned()
+        }
+        Err(err) => format!("escrowed nothing: {}", sanitize_err_chain(err)),
+    }
+}
+
+/// The funding task's state while it settles an unconfirmed `topUp`.
+struct TopUpSettling {
+    pool_id: PoolId,
+    /// The amount every `topUp` of this settle requests.
+    additional: U256,
+    /// The row's deposit when the settle began, or `None` when the row did not
+    /// track `pool_id` then.
+    baseline: Option<U256>,
+    /// The nonce every `topUp` of this settle is sent at.
+    nonce: u64,
+    /// The `topUp` transactions known at `nonce`, oldest first, at most
+    /// [`MAX_TOPUP_TXS`].
+    txs: Vec<TxHash>,
+    /// The error that left the `topUp` unconfirmed, sanitized for logs and for
+    /// the settle's own errors.
+    original: String,
+}
+
+impl TopUpSettling {
+    /// Read the chain once and act on what it says.
+    async fn tick<P: Provider + Clone + 'static>(
+        &mut self,
+        handles: &FundingHandles<P>,
+    ) -> Tick<SettledTopUp> {
+        let resolution = match resolve_unconfirmed_tx(
+            &handles.contract,
+            handles.owner,
+            self.nonce,
+            &self.txs,
+        )
+        .await
+        {
+            Ok(resolution) => resolution,
+            Err(err) => {
+                let seen = format!("a chain read failed: {}", sanitize_err_chain(&err));
+                debug!(nonce = self.nonce, last = %seen, "could not read the unconfirmed topUp's state");
+                return Tick::Wait(seen);
+            }
+        };
+        match resolution {
+            NonceResolution::Pending => Tick::Wait("a pending transaction holds the nonce".into()),
+            NonceResolution::Queued => {
+                Tick::Wait("an earlier nonce of this account is not confirmed".into())
+            }
+            NonceResolution::Vacant => self.resend(handles).await,
+            NonceResolution::Mined(receipt) => {
+                let tx = receipt.transaction_hash;
+                info!(nonce = self.nonce, %tx, "a topUp at the unconfirmed nonce mined");
+                Tick::Done(
+                    topped_up_from_receipt(
+                        &receipt,
+                        *handles.contract.address(),
+                        self.pool_id,
+                        self.additional,
+                    )
+                    .map(|topped_up| SettledTopUp {
+                        credited: topped_up.credited,
+                        proof: TopUpProof::Receipt(tx),
+                    }),
+                )
+            }
+            NonceResolution::NonceSpent { block } => self.spent(handles, block).await,
+        }
+    }
+
+    /// Send a fresh `topUp` at the nonce no transaction holds.
+    ///
+    /// A re-send that reverts at gas estimation says the `topUp` cannot escrow
+    /// now, but the original may still mine. Two reverts are acted on:
+    ///
+    /// - [`PoolNotOpen`]: the pool is confirmed closed at one block
+    ///   ([`Self::confirm_closed`]) before the settle ends.
+    /// - [`AllowanceShortfall`](decdn_client::buyer_pool::AllowanceShortfall):
+    ///   an `approve` at the nonce restores the allowance
+    ///   ([`Self::approve_at_nonce`]). A `topUp` at the nonce would revert on
+    ///   the allowance anyway, so the `approve` ends the wait for the nonce
+    ///   without letting a second `topUp` escrow.
+    async fn resend<P: Provider + Clone + 'static>(
+        &mut self,
+        handles: &FundingHandles<P>,
+    ) -> Tick<SettledTopUp> {
+        match send_top_up_at(
+            &handles.contract,
+            handles.owner,
+            self.pool_id,
+            self.additional,
+            self.nonce,
+        )
+        .await
+        {
+            Ok(tx) => {
+                info!(
+                    nonce = self.nonce,
+                    %tx,
+                    "no transaction holds the unconfirmed topUp's nonce; re-sent topUp at that \
+                     nonce"
+                );
+                if self.txs.len() >= MAX_TOPUP_TXS {
+                    self.txs.remove(0);
+                }
+                self.txs.push(tx);
+                Tick::Wait(format!("re-sent topUp at the nonce as {tx}"))
+            }
+            Err(err) if err.downcast_ref::<PoolNotOpen>().is_some() => {
+                self.confirm_closed(handles).await
+            }
+            Err(err)
+                if err
+                    .downcast_ref::<decdn_client::buyer_pool::AllowanceShortfall>()
+                    .is_some() =>
+            {
+                self.approve_at_nonce(handles).await
+            }
+            Err(err) => {
+                let seen = format!(
+                    "no transaction holds the nonce, and the re-send failed: {}",
+                    sanitize_err_chain(&err)
+                );
+                debug!(nonce = self.nonce, last = %seen, "could not re-send the topUp");
+                Tick::Wait(seen)
+            }
+        }
+    }
+
+    /// End the settle once one block shows the nonce unspent and the pool not
+    /// open, after a re-send reverted `PoolNotOpen`.
+    ///
+    /// The revert reads the head, and the nonce was read at an earlier block,
+    /// so the original `topUp` may have mined between the two while the pool
+    /// was still open. Reading both at one block `B` closes that gap: an
+    /// unspent nonce at `B` means nothing at it mined by `B`, and anything
+    /// that mines after `B` reverts, because a pool never reopens. A nonce
+    /// spent at `B` waits for the next tick to resolve it, and a pool still
+    /// open at `B` (a lagging RPC backend) waits too.
+    async fn confirm_closed<P: Provider + Clone + 'static>(
+        &self,
+        handles: &FundingHandles<P>,
+    ) -> Tick<SettledTopUp> {
+        let nonce = self.nonce;
+        let provider = handles.contract.provider();
+        let read = async {
+            let block = provider
+                .get_block_number()
+                .await
+                .context("read the block number")?;
+            let confirmed = provider
+                .get_transaction_count(handles.owner)
+                .number(block)
+                .await
+                .context("read the confirmed nonce")?;
+            let pool = handles
+                .contract
+                .getPool(self.pool_id)
+                .call()
+                .block(BlockId::Number(block.into()))
+                .await
+                .context("read the pool's status")?;
+            anyhow::Ok((block, confirmed, pool.status))
+        };
+        match read.await {
+            Err(err) => {
+                let seen = format!(
+                    "a re-send reverts PoolNotOpen, and confirming it failed: {}",
+                    sanitize_err_chain(&err)
+                );
+                debug!(nonce, last = %seen, "could not confirm the pool is closed");
+                Tick::Wait(seen)
+            }
+            Ok((block, confirmed, _)) if confirmed > nonce => Tick::Wait(format!(
+                "a re-send reverts PoolNotOpen, and the nonce is spent at block {block}"
+            )),
+            Ok((block, _, PaymentPool::Status::Closing | PaymentPool::Status::Closed)) => {
+                Tick::Done(Err(anyhow::anyhow!(
+                    "the topUp nonce {nonce} is unspent at block {block}, where the pool is no \
+                     longer open, so the topUp escrowed nothing: {}",
+                    self.original
+                )
+                .context(PoolNotOpen)))
+            }
+            Ok((block, ..)) => Tick::Wait(format!(
+                "a re-send reverts PoolNotOpen, but the pool reads open at block {block}"
+            )),
+        }
+    }
+
+    /// Send an unlimited USDC `approve` at the nonce, after a re-send reverted
+    /// on the allowance. It restores the daemon's standing allowance, and it
+    /// fills the nonce, so the chain then resolves it and the deposit shows
+    /// whether the original `topUp` escrowed.
+    async fn approve_at_nonce<P: Provider + Clone + 'static>(
+        &self,
+        handles: &FundingHandles<P>,
+    ) -> Tick<SettledTopUp> {
+        let nonce = self.nonce;
+        match Erc20::new(handles.token, handles.contract.provider().clone())
+            .approve(handles.payment_pool_addr, U256::MAX)
+            .from(handles.owner)
+            .nonce(nonce)
+            .send()
+            .await
+        {
+            Ok(pending) => {
+                let tx = *pending.tx_hash();
+                info!(
+                    nonce,
+                    %tx,
+                    "a topUp re-send reverts on the allowance; sent approve at the unconfirmed \
+                     topUp's nonce"
+                );
+                Tick::Wait(format!(
+                    "a re-send reverts on the allowance; sent approve {tx} at the nonce"
+                ))
+            }
+            Err(err) => {
+                let seen = format!(
+                    "a re-send reverts on the allowance, and the approve at the nonce failed: {}",
+                    sanitize_error_sources(&err)
+                );
+                debug!(nonce, last = %seen, "could not send the approve");
+                Tick::Wait(seen)
+            }
+        }
+    }
+
+    /// Compare the pool's deposit at `block`, where the nonce is spent, with
+    /// the row's deposit when the settle began: what the chain holds above it
+    /// is what escrowed.
+    async fn spent<P: Provider + Clone + 'static>(
+        &self,
+        handles: &FundingHandles<P>,
+        block: u64,
+    ) -> Tick<SettledTopUp> {
+        let nonce = self.nonce;
+        let Some(baseline) = self.baseline else {
+            return Tick::Done(Err(anyhow::anyhow!(
+                "the topUp nonce {nonce} is spent at block {block}, but the row did not track \
+                 pool {} when the settle began, so whether it escrowed cannot be told; reconcile \
+                 against the pool's deposit: {}",
+                self.pool_id,
+                self.original
+            )
+            .context(EscrowedUntracked)));
+        };
+        let pool = match handles
+            .contract
+            .getPool(self.pool_id)
+            .call()
+            .block(BlockId::Number(block.into()))
+            .await
+        {
+            Ok(pool) => pool,
+            Err(err) => {
+                let seen = format!(
+                    "the nonce is spent at block {block}, but getPool there failed: {}",
+                    sanitize_error_sources(&err)
+                );
+                debug!(nonce, last = %seen, "could not read the pool's deposit");
+                return Tick::Wait(seen);
+            }
+        };
+        let on_chain = U256::from(pool.deposit);
+        let escrowed = on_chain.saturating_sub(baseline);
+        if escrowed.is_zero() {
+            return Tick::Done(Err(anyhow::anyhow!(
+                "the topUp nonce {nonce} is spent at block {block} and the pool's deposit there \
+                 ({on_chain}) is not above the row's ({baseline}), so the topUp escrowed \
+                 nothing: {}",
+                self.original
+            )));
+        }
+        if escrowed == self.additional {
+            info!(
+                pool_id = %self.pool_id, nonce, block, %on_chain, row = %baseline, %escrowed,
+                "an unconfirmed topUp escrowed, read from the pool's deposit growth"
+            );
+        } else {
+            warn!(
+                pool_id = %self.pool_id, nonce, block, %on_chain, row = %baseline, %escrowed,
+                requested = %self.additional,
+                "the pool's deposit grew by other than the topUp's request; crediting the \
+                 growth, which brings the row level with the chain"
+            );
+        }
+        Tick::Done(Ok(SettledTopUp {
+            credited: escrowed,
+            proof: TopUpProof::DepositGrowth {
+                nonce,
+                block,
+                known: self.txs.clone(),
+            },
+        }))
     }
 }
 
@@ -603,6 +1227,8 @@ fn refill_decision(deposit: U256, spent: U256, working_deposit: U256) -> U256 {
 
 /// Build the [`PoolContext`] paying `provider_addr` from this pool's state,
 /// resuming the lane at its recorded cumulative totals ([`self_owned_lane_ctx`]).
+/// The node key both owns the pool and signs its lanes ([`OwnedPayer::sole`]):
+/// one daemon runs per node data dir, so its lanes have one signer.
 ///
 /// # Errors
 ///
@@ -623,7 +1249,7 @@ fn pin_ctx(
         .map_or((U256::ZERO, U256::ZERO), |p| (p.last_bytes, p.last_amount));
     self_owned_lane_ctx(
         state,
-        signer,
+        &OwnedPayer::sole(Arc::clone(signer)),
         voucher_domain,
         provider_addr,
         prior_bytes,
@@ -658,13 +1284,18 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     open_in_flight: Arc<Mutex<Option<SharedOpen>>>,
     /// Whether the running open waits on an unconfirmed `openPool`, so callers
     /// fail fast instead of joining it.
-    open_hold: OpenHold,
+    open_hold: SlotHold,
     /// The single in-flight funding `topUp`, if one is running (#1146/#1530). Both
     /// the proactive low-water refill and the funding recovery top-up dedup here,
     /// so the two legs racing on the one pool cannot double-escrow one shortfall. The
     /// slot also tracks how much of the running `topUp` no pull has claimed, so two
-    /// recovery top-ups cannot both count one escrow as their own.
+    /// recovery top-ups cannot both count one escrow as their own. The slot
+    /// records its pool, so a caller for another pool neither joins nor spawns.
     topup_in_flight: Arc<Mutex<Option<InFlightTopUp>>>,
+    /// Whether the funding task settles its unconfirmed `topUp`
+    /// ([`settle_unconfirmed_top_up`]), so a funding recovery step fails fast
+    /// instead of joining it or waiting for it.
+    topup_hold: SlotHold,
     /// One [`SeedSlot`] per lane that a stream is seeding from chain
     /// ([`Self::reseed_lane_from_chain`]), so the streams that find one lane
     /// missing at the same time read its watermark once. A lane's slot never
@@ -763,8 +1394,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             owner,
             working_deposit,
             open_in_flight: Arc::new(Mutex::new(None)),
-            open_hold: OpenHold::new(),
+            open_hold: SlotHold::open(),
             topup_in_flight: Arc::new(Mutex::new(None)),
+            topup_hold: SlotHold::top_up(),
             seed_slots: Mutex::new(HashMap::new()),
             metrics,
             _reclaimer: AbortOnDropHandle::new(reclaimer),
@@ -1206,26 +1838,35 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// NEVER blocks the pull. Deduped via [`Self::topup_in_flight`], so many
     /// concurrent reuse pulls fire at most one `topUp`. An in-flight refill, an
     /// allowance failure, or a reverted `topUp` all just skip it (logged /
-    /// metered), leaving the pool un-topped-up — strictly no worse. The one leg
-    /// that IS worse is a `topUp` that mines and cannot be credited locally: the
-    /// deposit is then escrowed and untracked, and because this handle is
-    /// dropped, `fund_pool`'s `error!` and `buyer_topup_failure()` are all the
-    /// operator gets.
+    /// metered), and so does a `topUp` in flight for another pool (logged at
+    /// `debug`), leaving the pool un-topped-up — strictly no worse. The one leg
+    /// that IS worse is a `topUp` that escrows, or may have escrowed, and cannot
+    /// be credited locally: the deposit is then escrowed and untracked, and
+    /// because this handle is dropped, `fund_pool`'s "ESCROWED AND UNTRACKED"
+    /// `error!` and `buyer_topup_failure()` are all the operator gets.
     fn spawn_refill_if_low(&self, state: &BuyerPoolState) {
         let additional = refill_decision(state.deposit, state.pool_spend(), self.working_deposit);
         if additional.is_zero() {
             return; // still above the low-water mark
         }
-        info!(
-            pool_id = %state.pool_id,
-            %additional,
-            "buyer refill: reused pool below its low-water mark; funding toward the working \
-             deposit (#1146)"
-        );
         // Detached: the handle is DROPPED, not awaited — the task self-reports, and
-        // a recovery top-up arriving while it runs JOINS the same future and can
-        // claim its amount.
-        drop(self.join_or_spawn_topup(state.pool_id, additional, TopUpFunder::Refill));
+        // a recovery top-up for the same pool arriving while it runs JOINS the
+        // same future and can claim its amount, unless the task settles an
+        // unconfirmed `topUp`. A `topUp` in flight for another pool skips this
+        // refill; `join_or_spawn_topup` logs it.
+        let Ok((_, claim)) =
+            self.join_or_spawn_topup(state.pool_id, additional, TopUpFunder::Refill)
+        else {
+            return;
+        };
+        if claim == TopUpClaim::Spawned {
+            info!(
+                pool_id = %state.pool_id,
+                %additional,
+                "buyer refill: reused pool below its low-water mark; funding toward the \
+                 working deposit (#1146)"
+            );
+        }
     }
 
     /// Everything the detached funding task needs, lifted off `&self` so the task
@@ -1239,21 +1880,32 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             owner: self.owner,
             payment_pool_addr: *self.contract.address(),
             metrics: Arc::clone(&self.metrics),
+            hold: self.topup_hold.clone(),
         }
     }
 
-    /// Join the in-flight funding `topUp`, or spawn one escrowing `additional`.
+    /// Join the in-flight funding `topUp` for `pool_id`, or spawn one escrowing
+    /// `additional`.
     /// Reservation and spawn are one indivisible step under the slot lock, so two
     /// callers cannot both decide to spawn; the task holds a [`SlotGuard`] that
     /// frees the slot when it ends (any path). The returned [`TopUpClaim`] says
     /// which, and how much of a joined `topUp` this caller claimed (see
     /// [`InFlightTopUp::join`]).
+    ///
+    /// # Errors
+    ///
+    /// The slot holds a `topUp` for a pool other than `pool_id`: a
+    /// [`TopUpForOtherPool`] error marked [`LocalPullFault`]. That `topUp`
+    /// escrows into the other pool, so none of it funds `pool_id`. The two
+    /// differ when the store replaced one of them while the `topUp` was in
+    /// flight. One wallet sends every `topUp`, so a second one could not mine
+    /// before the first one's nonce is spent.
     fn join_or_spawn_topup(
         &self,
         pool_id: PoolId,
         additional: U256,
         funder: TopUpFunder,
-    ) -> (SharedTopUp, TopUpClaim) {
+    ) -> Result<(SharedTopUp, TopUpClaim)> {
         // Recover the slot on poison rather than treat a prior holder's panic as
         // node-fatal (as [`SlotGuard`]'s own Drop does): the guarded value is a
         // single `Option<Shared…>` move that cannot tear, so the worst a panic
@@ -1265,8 +1917,20 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(existing) = slot.as_mut() {
+            if existing.pool_id != pool_id {
+                debug!(
+                    %pool_id,
+                    in_flight = %existing.pool_id,
+                    "the top-up slot holds a topUp for another pool; refusing at once"
+                );
+                return Err(anyhow::Error::new(TopUpForOtherPool {
+                    pool_id,
+                    in_flight: existing.pool_id,
+                })
+                .context(LocalPullFault));
+            }
             debug!(%pool_id, "joining a pool topUp already in flight");
-            return existing.join(additional, funder);
+            return Ok(existing.join(additional, funder));
         }
 
         let handles = self.funding_handles();
@@ -1281,16 +1945,37 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
                 .await
                 .map_err(Arc::new)
         });
+        let join_metrics = Arc::clone(&self.metrics);
         let fut: BoxFuture<'static, TopUpOutcome> = Box::pin(async move {
             task.await.unwrap_or_else(|join_err| {
-                Err(Arc::new(anyhow::anyhow!(
-                    "buyer pool topUp task failed: {join_err}"
-                )))
+                // The task may have died mid-settle, with a `topUp` that may
+                // still mine, so no joiner may fund again on top of it.
+                join_metrics.buyer_topup_failure();
+                error!(%join_err, "buyer pool topUp task did not run to completion");
+                Err(Arc::new(
+                    anyhow::anyhow!("buyer pool topUp task failed: {join_err}")
+                        .context(EscrowedUntracked),
+                ))
             })
         });
         let shared = fut.shared();
-        *slot = Some(InFlightTopUp::new(shared.clone(), additional, funder));
-        (shared, TopUpClaim::Spawned)
+        *slot = Some(InFlightTopUp::new(
+            shared.clone(),
+            pool_id,
+            additional,
+            funder,
+        ));
+        Ok((shared, TopUpClaim::Spawned))
+    }
+
+    /// The error a funding recovery step gets while the funding task settles
+    /// its unconfirmed `topUp`: no other `topUp` is sent until the chain
+    /// resolves it, so it is node-wide ([`LocalPullFault`]). The funding task's
+    /// own warning says what it waits on, and `decdn_buyer_topup_unresolved`
+    /// reads 1, so this logs at `debug`.
+    fn held_topup_error() -> anyhow::Error {
+        debug!("the top-up slot is held for an unconfirmed topUp; refusing at once");
+        anyhow::Error::new(TopUpHeld).context(LocalPullFault)
     }
 
     /// The error a caller gets while the open slot is held for an unconfirmed
@@ -1307,7 +1992,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     }
 
     /// `open`'s outcome, or `None` once the open slot is held for an
-    /// unconfirmed `openPool` ([`OpenHold`]); the caller then fails with
+    /// unconfirmed `openPool` ([`SlotHold`]); the caller then fails with
     /// [`Self::held_open_error`].
     async fn unless_held(&self, open: SharedOpen) -> Option<OpenOutcome> {
         tokio::select! {
@@ -1337,7 +2022,6 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         let contract = self.contract.clone();
         let store = Arc::clone(&self.store);
         let open = OpenRequest {
-            signer: Arc::clone(&self.signer),
             deployment: self.deployment,
             token: self.token,
             owner: self.owner,
@@ -1469,9 +2153,12 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// Concurrent fills share one pool, so one step funds them all.
     /// `seen_deposit` is the deposit the calling fill saw. A row that already
     /// holds more is a sibling's step that landed: the call returns the row's
-    /// deposit and escrows nothing. A recovery top-up still in flight is a
-    /// sibling's step too: the call waits for it and returns its deposit. When
+    /// deposit and escrows nothing. A recovery top-up still in flight for the
+    /// same pool is a sibling's step too: the call waits for it and returns its
+    /// deposit. When
     /// that top-up reverts `PoolNotOpen`, the call joins the replacement open.
+    /// When the funding task settles an unconfirmed `topUp`, the call fails at
+    /// once instead of waiting (see Errors).
     ///
     /// The step sizes itself from the pool row: the deposit less the spend its
     /// lanes recorded. A fill runs the step only once its own pulls ended, and
@@ -1485,9 +2172,11 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// # Errors
     ///
     /// No pool is tracked, the `topUp` or replacement `openPool` fails, a
-    /// joined top-up fails for any reason but `PoolNotOpen`, or a mined
-    /// transaction cannot be recorded
-    /// (escrowed and untracked).
+    /// joined top-up fails for any reason but `PoolNotOpen`, a mined
+    /// transaction cannot be recorded (escrowed and untracked), the top-up
+    /// slot is held for an unconfirmed `topUp` (a `TopUpHeld` error marked
+    /// [`LocalPullFault`]), or the slot holds a `topUp` for another pool (a
+    /// `TopUpForOtherPool` error marked [`LocalPullFault`]).
     pub async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
         let state = self
             .reuse_or_report()?
@@ -1495,7 +2184,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         if state.deposit > seen_deposit {
             return Ok(Recovery::ToppedUp(state.deposit));
         }
-        if let Some(in_flight) = self.recovery_in_flight() {
+        if let Some(in_flight) = self.recovery_in_flight(state.pool_id)? {
             return match in_flight.await {
                 Ok(landed) => Ok(Recovery::ToppedUp(landed.new_deposit)),
                 // The sibling's step replaces the pool; this fill joins that
@@ -1572,15 +2261,28 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         }))
     }
 
-    /// The recovery top-up in flight, if one is: a sibling fill's step, which
-    /// this fill waits for instead of funding its own.
-    fn recovery_in_flight(&self) -> Option<SharedTopUp> {
-        self.topup_in_flight
+    /// The recovery top-up in flight for `pool_id`, if one is: a sibling fill's
+    /// step, which this fill waits for instead of funding its own. A recovery
+    /// top-up for another pool is not this fill's to wait for.
+    ///
+    /// # Errors
+    ///
+    /// The funding task settles the sibling's unconfirmed `topUp`
+    /// ([`Self::held_topup_error`]).
+    fn recovery_in_flight(&self, pool_id: PoolId) -> Result<Option<SharedTopUp>> {
+        let slot = self
+            .topup_in_flight
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .filter(|in_flight| in_flight.funder == TopUpFunder::Recovery)
-            .map(|in_flight| in_flight.fut.clone())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(in_flight) = slot.as_ref().filter(|in_flight| {
+            in_flight.funder == TopUpFunder::Recovery && in_flight.pool_id == pool_id
+        }) else {
+            return Ok(None);
+        };
+        if self.topup_hold.is_held() {
+            return Err(Self::held_topup_error());
+        }
+        Ok(Some(in_flight.fut.clone()))
     }
 
     /// The deposit the store's pool row records, or `None` with no pool
@@ -1621,7 +2323,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// total deposit with the amount this call added (#1530): the top-up behind
     /// [`Self::recover_pool`].
     ///
-    /// A `topUp` already in flight is JOINED, not duplicated. This call counts only
+    /// A `topUp` already in flight is JOINED, not duplicated, unless the funding
+    /// task settles it as unconfirmed or it funds another pool (see Errors).
+    /// This call counts only
     /// the part of it that no other pull relies on: all of a refill's amount, none of
     /// another recovery top-up's. When that part is less than `additional`, this
     /// method funds the remainder with a further `topUp` (see `top_up_at_least`).
@@ -1629,17 +2333,29 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// chain credits less than a `topUp` asked for. The caller compares the two.
     ///
     /// Routes through the detached, join-or-spawn funding task (never an inline
-    /// `.await`): `topUp` waits on an unbounded `get_receipt`, and this runs inside
-    /// the miss-pull future the foreground serve path DROPS on its deadline — an
+    /// `.await`): the task holds the top-up slot until the chain resolves its
+    /// `topUp` (`settle_unconfirmed_top_up`), and this runs inside the
+    /// miss-pull future the foreground serve path DROPS on its deadline — an
     /// inline await cancelled mid-receipt would leave the deposit escrowed and
     /// untracked. On the spawned task, a dropped caller loses only the answer.
     ///
     /// # Errors
     ///
-    /// Errors if no pool is tracked, if our own allowance/`topUp` fails, if a
-    /// `topUp` mined but the local row could not be credited (terminal — the
-    /// deposit is escrowed-and-untracked; a retry would escrow again), or if every
-    /// funding call joined a `topUp` that failed.
+    /// Errors if no pool is tracked, if our own allowance/`topUp` fails or
+    /// settles as having escrowed nothing, if a `topUp` escrowed or may have
+    /// escrowed but the local row is not credited (terminal — the deposit is
+    /// escrowed-and-untracked; a retry would escrow again), or if every funding
+    /// call joined a `topUp` that failed. Fails at once, sending no `topUp`,
+    /// while the funding task settles its unconfirmed `topUp` (a `TopUpHeld`
+    /// error marked [`LocalPullFault`]): that settle can last as long as the
+    /// chain takes. A call that joined before the settle began waits for its
+    /// outcome, or until the caller drops it. Also fails at once, sending no
+    /// `topUp`, while the slot holds a `topUp` for another pool (a
+    /// `TopUpForOtherPool` error marked [`LocalPullFault`]): its headroom
+    /// cannot fund this pool. Either refusal after a joined `topUp` landed
+    /// returns what landed instead (see `top_up_at_least`). This method meters
+    /// nothing itself; the funding recovery step that calls it meters the
+    /// refusal.
     pub async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
         let state = self
             .reuse_or_report()?
@@ -1651,6 +2367,11 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             });
         }
         let landed = top_up_at_least(state.pool_id, additional, |amount| {
+            // The hold is set only while the funding task runs, so a set hold
+            // means the slot holds that task: refuse rather than join it.
+            if self.topup_hold.is_held() {
+                return Err(Self::held_topup_error());
+            }
             self.join_or_spawn_topup(state.pool_id, amount, TopUpFunder::Recovery)
         })
         .await?;
@@ -1722,8 +2443,9 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// Implementations error when no pool is tracked, when the allowance,
-    /// `topUp` or replacement `openPool` fails, or when a transaction lands but
-    /// the local row can no longer record it.
+    /// `topUp` or replacement `openPool` fails, when a transaction lands but
+    /// the local row can no longer record it, or when the top-up or open slot
+    /// is held for an unconfirmed transaction (marked [`LocalPullFault`]).
     async fn recover_pool(&self, _seen_deposit: U256) -> Result<Recovery> {
         Ok(Recovery::Unavailable)
     }
@@ -2386,7 +3108,7 @@ async fn run_open<P: Provider + Clone>(
     store: &Arc<dyn BuyerPoolStore>,
     open: OpenRequest,
     replacing: Option<PoolId>,
-    hold: &OpenHold,
+    hold: &SlotHold,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     // Re-check under the slot: a previous open for this owner may have persisted
@@ -2432,7 +3154,6 @@ async fn run_open<P: Provider + Clone>(
     // this node is unable to pay — another candidate may still deliver.
     let landed = match open_pool(
         contract,
-        Arc::clone(&open.signer),
         open.deployment,
         open.token,
         open.owner,
@@ -2441,6 +3162,11 @@ async fn run_open<P: Provider + Clone>(
         // this wait, and an error names its tx. Only shutdown drops it, and
         // the `info` broadcast line names the tx then (#2415).
         None,
+        // Bounded: a lapse is an `OpenUnconfirmed` like a failed read, so
+        // `settle_unconfirmed_open` takes over and keeps the open slot until the
+        // chain resolves the open. That is also how an `openPool` dropped from
+        // the mempool reaches the settle loop's re-send.
+        Some(RECEIPT_TIMEOUT),
     )
     .await
     {
@@ -2500,7 +3226,6 @@ async fn run_open<P: Provider + Clone>(
 /// The `openPool` an open task sends: what [`open_pool`] sends, and what
 /// [`opened_from_receipt`] needs to rebuild its result from a receipt read later.
 struct OpenRequest {
-    signer: Arc<PrivateKeySigner>,
     deployment: Deployment,
     token: Address,
     owner: Address,
@@ -2518,35 +3243,65 @@ enum Landed {
     Adopted,
 }
 
-/// Whether the open task holds the open slot for an `openPool` whose outcome
-/// it has not seen ([`settle_unconfirmed_open`]).
+/// Whether a task holds its slot (the open slot or the top-up slot) for a
+/// transaction whose outcome it has not seen ([`settle_unconfirmed_open`],
+/// [`settle_unconfirmed_top_up`]).
 ///
-/// That wait can last as long as the chain takes to resolve the open, and no
-/// pool opens meanwhile, so a caller that finds the slot held fails at once as
-/// this node's own fault ([`BuyerPoolService::held_open_error`]) instead of
-/// waiting out its budget on every candidate.
+/// That wait can last as long as the chain takes to resolve the transaction,
+/// so a caller that needs the outcome fails at once as this node's own fault
+/// instead of waiting out its budget: a miss that needs a pool
+/// ([`BuyerPoolService::held_open_error`]), or a funding recovery step
+/// ([`BuyerPoolService::held_topup_error`]). A refill for the same pool that
+/// finds the top-up slot held joins it and claims nothing; a refill for
+/// another pool does nothing. [`Self::wait_held`] serves the open
+/// slot only: an open joiner abandons its wait once the hold begins, but a
+/// recovery step that joined a `topUp` before its settle began waits for the
+/// outcome. `publish` exports the state on the slot's gauge.
+///
+/// A hold has one holder at a time: the slot's single task.
 #[derive(Clone)]
-struct OpenHold {
+struct SlotHold {
     held: Arc<tokio::sync::watch::Sender<bool>>,
+    publish: fn(&Metrics, bool),
 }
 
-impl OpenHold {
-    /// A hold that is not held.
-    fn new() -> Self {
+impl SlotHold {
+    /// The open slot's hold, published on `decdn_buyer_pool_open_unresolved`.
+    fn open() -> Self {
+        Self::new(Metrics::set_buyer_pool_open_unresolved)
+    }
+
+    /// The top-up slot's hold, published on `decdn_buyer_topup_unresolved`.
+    fn top_up() -> Self {
+        Self::new(Metrics::set_buyer_topup_unresolved)
+    }
+
+    /// A hold that is not held, and publishes on `publish`.
+    fn new(publish: fn(&Metrics, bool)) -> Self {
         Self {
             held: Arc::new(tokio::sync::watch::channel(false).0),
+            publish,
         }
     }
 
-    /// Mark the slot held until the returned guard drops, and publish it on
-    /// `decdn_buyer_pool_open_unresolved`.
+    /// Mark the slot held until the returned guard drops, and publish it.
     fn hold(&self, metrics: &Arc<Metrics>) -> HeldGuard {
-        self.held.send_replace(true);
-        metrics.set_buyer_pool_open_unresolved(true);
+        let was_held = self.held.send_replace(true);
+        debug_assert!(
+            !was_held,
+            "a slot hold has one holder: the slot's single task"
+        );
+        (self.publish)(metrics, true);
         HeldGuard {
             held: Arc::clone(&self.held),
+            publish: self.publish,
             metrics: Arc::clone(metrics),
         }
+    }
+
+    /// Whether the slot is held now.
+    fn is_held(&self) -> bool {
+        *self.held.borrow()
     }
 
     /// Resolve once the slot is held, at once if it is held now.
@@ -2560,17 +3315,18 @@ impl OpenHold {
     }
 }
 
-/// Clears an [`OpenHold`] when the settle loop ends on any path, including an
-/// abort of the open task.
+/// Clears a [`SlotHold`] when the settle loop ends on any path, including an
+/// abort of the task that runs it.
 struct HeldGuard {
     held: Arc<tokio::sync::watch::Sender<bool>>,
+    publish: fn(&Metrics, bool),
     metrics: Arc<Metrics>,
 }
 
 impl Drop for HeldGuard {
     fn drop(&mut self) {
         self.held.send_replace(false);
-        self.metrics.set_buyer_pool_open_unresolved(false);
+        (self.publish)(&self.metrics, false);
     }
 }
 
@@ -2590,29 +3346,69 @@ impl std::fmt::Display for OpenHeld {
 
 impl std::error::Error for OpenHeld {}
 
-/// What one chain read says about an `openPool` whose outcome the open task
-/// did not see.
+/// Typed marker: the top-up slot is held for a `topUp` whose outcome the chain
+/// has not resolved, so this node sends no other `topUp` until it does.
 #[derive(Debug)]
-enum OpenResolution {
-    /// A transaction sent at the open's nonce mined; this is its receipt, which
+struct TopUpHeld;
+
+impl std::fmt::Display for TopUpHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the top-up slot is held for an unconfirmed topUp; this node sends no other topUp \
+             until the chain resolves it",
+        )
+    }
+}
+
+impl std::error::Error for TopUpHeld {}
+
+/// Typed marker: the top-up slot holds a `topUp` for a pool other than the one
+/// the caller funds. That `topUp` escrows into the other pool, so the caller
+/// neither joins it nor sends a second `topUp` beside it.
+#[derive(Debug)]
+struct TopUpForOtherPool {
+    /// The pool the caller funds.
+    pool_id: PoolId,
+    /// The pool the slot's `topUp` escrows into.
+    in_flight: PoolId,
+}
+
+impl std::fmt::Display for TopUpForOtherPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the top-up slot holds a topUp for pool {}, not {}; this node sends no topUp for \
+             {} until that topUp's task ends",
+            self.in_flight, self.pool_id, self.pool_id
+        )
+    }
+}
+
+impl std::error::Error for TopUpForOtherPool {}
+
+/// What one chain read says about a transaction (an `openPool` or a `topUp`)
+/// whose outcome the task that sent it did not see.
+#[derive(Debug)]
+enum NonceResolution {
+    /// A known transaction sent at the nonce mined; this is its receipt, which
     /// may record a revert.
     Mined(Box<alloy::rpc::types::TransactionReceipt>),
-    /// The account's nonce at `block` has passed the open's, and no receipt is
-    /// in hand. The open has mined or never will, so `getPools` at `block`
-    /// answers whether it escrowed.
+    /// The account's nonce at `block` has passed the transaction's, and no
+    /// receipt is in hand. The transaction has mined or never will, so pool
+    /// state read at `block` answers whether it escrowed.
     NonceSpent {
         /// The block the nonce was read at.
         block: u64,
     },
-    /// A pending transaction holds the open's nonce, so the open may still mine.
+    /// A pending transaction holds the nonce, so the transaction may still mine.
     Pending,
     /// An earlier nonce of this account is not confirmed, so nothing at the
-    /// open's nonce can mine yet. The pending count stops at the first gap, so
-    /// it cannot say whether a transaction waits at the open's nonce behind it.
+    /// transaction's nonce can mine yet. The pending count stops at the first
+    /// gap, so it cannot say whether a transaction waits at the nonce behind it.
     Queued,
-    /// The account's confirmed nonce is the open's, and this RPC sees no
-    /// transaction at it. The open task re-sends at that nonce, so the re-send
-    /// and the open cannot both mine.
+    /// The account's confirmed nonce is the transaction's, and this RPC sees no
+    /// transaction at it. The task re-sends at that nonce, so the re-send and
+    /// the first transaction cannot both mine.
     Vacant,
 }
 
@@ -2629,9 +3425,8 @@ enum OpenResolution {
 ///   same chain state as the nonce. A load-balanced RPC backend that has not
 ///   reached `B` fails the read, and the next tick asks again.
 /// - A pending transaction at the nonce may still mine, so the task waits,
-///   however long that takes, as the receipt wait in [`open_pool`] does. An
-///   earlier nonce that is not confirmed makes it wait the same way: nothing
-///   at the open's nonce can mine before it.
+///   however long that takes. An earlier nonce that is not confirmed makes it
+///   wait the same way: nothing at the open's nonce can mine before it.
 /// - A nonce that the account has reached and no transaction holds gets a
 ///   fresh `openPool` at that same nonce ([`send_open_pool`]). Two transactions at one nonce cannot both
 ///   mine, so the re-send and a first open that resurfaces escrow at most one
@@ -2660,7 +3455,7 @@ async fn settle_unconfirmed_open<P: Provider + Clone>(
     open: &OpenRequest,
     unconfirmed: OpenUnconfirmed,
     err: anyhow::Error,
-    hold: &OpenHold,
+    hold: &SlotHold,
     metrics: &Arc<Metrics>,
 ) -> Result<Landed> {
     let _held = hold.hold(metrics);
@@ -2722,12 +3517,13 @@ struct Settling {
     reconcile_backoff: Duration,
 }
 
-/// What one settle tick decided.
-enum Tick {
-    /// Keep waiting; this is what the chain said.
+/// What one settle tick decided, for an open (`T` = [`Landed`]) or a top-up
+/// (`T` = [`SettledTopUp`]).
+enum Tick<T> {
+    /// Keep waiting; this is what the chain, the store or a re-send said.
     Wait(String),
-    /// The open is resolved.
-    Done(Result<Landed>),
+    /// The transaction is resolved.
+    Done(Result<T>),
 }
 
 impl Settling {
@@ -2738,8 +3534,8 @@ impl Settling {
         store: &Arc<dyn BuyerPoolStore>,
         open: &OpenRequest,
         metrics: &Arc<Metrics>,
-    ) -> Tick {
-        let resolution = match resolve_unconfirmed_open(contract, open.owner, self.nonce, &self.txs)
+    ) -> Tick<Landed> {
+        let resolution = match resolve_unconfirmed_tx(contract, open.owner, self.nonce, &self.txs)
             .await
         {
             Ok(resolution) => resolution,
@@ -2750,12 +3546,12 @@ impl Settling {
             }
         };
         match resolution {
-            OpenResolution::Pending => Tick::Wait("a pending transaction holds the nonce".into()),
-            OpenResolution::Queued => {
+            NonceResolution::Pending => Tick::Wait("a pending transaction holds the nonce".into()),
+            NonceResolution::Queued => {
                 Tick::Wait("an earlier nonce of this account is not confirmed".into())
             }
-            OpenResolution::Vacant => Tick::Wait(self.resend(contract, open).await),
-            OpenResolution::Mined(receipt) => {
+            NonceResolution::Vacant => Tick::Wait(self.resend(contract, open).await),
+            NonceResolution::Mined(receipt) => {
                 let tx = receipt.transaction_hash;
                 info!(
                     nonce = self.nonce,
@@ -2767,7 +3563,6 @@ impl Settling {
                     opened_from_receipt(
                         &receipt,
                         tx,
-                        Arc::clone(&open.signer),
                         open.deployment,
                         open.token,
                         open.owner,
@@ -2776,7 +3571,7 @@ impl Settling {
                     .map(|opened| Landed::Opened(Box::new(opened))),
                 )
             }
-            OpenResolution::NonceSpent { block } => {
+            NonceResolution::NonceSpent { block } => {
                 let now = tokio::time::Instant::now();
                 if now < self.next_reconcile {
                     return Tick::Wait(format!(
@@ -2834,7 +3629,7 @@ impl Settling {
     }
 
     /// Act on what reconciliation found once the nonce is spent at `block`.
-    fn spent(&mut self, block: u64, reconciled: Reconciled) -> Tick {
+    fn spent(&mut self, block: u64, reconciled: Reconciled) -> Tick<Landed> {
         let nonce = self.nonce;
         match reconciled {
             Reconciled::Adopted(pool_id) => {
@@ -2890,21 +3685,21 @@ impl Settling {
     }
 }
 
-/// One read of the chain for an unconfirmed `openPool` at `nonce`, whose known
-/// transactions are `txs`.
+/// One read of the chain for an unconfirmed transaction of `owner` at `nonce`,
+/// whose known hashes are `txs`.
 ///
 /// # Errors
 ///
 /// An RPC read failed.
-async fn resolve_unconfirmed_open<P: Provider + Clone>(
+async fn resolve_unconfirmed_tx<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
     nonce: u64,
     txs: &[TxHash],
-) -> Result<OpenResolution> {
+) -> Result<NonceResolution> {
     let provider = contract.provider();
     if let Some(receipt) = first_receipt(provider, txs).await? {
-        return Ok(OpenResolution::Mined(receipt));
+        return Ok(NonceResolution::Mined(receipt));
     }
     let block = provider
         .get_block_number()
@@ -2917,14 +3712,14 @@ async fn resolve_unconfirmed_open<P: Provider + Clone>(
         .context("read the confirmed nonce")?;
     if confirmed > nonce {
         // A transaction may have mined between the first receipt read and the
-        // nonce read, so read the receipts again before asking `getPools`.
+        // nonce read, so read the receipts again before reading pool state.
         if let Some(receipt) = first_receipt(provider, txs).await? {
-            return Ok(OpenResolution::Mined(receipt));
+            return Ok(NonceResolution::Mined(receipt));
         }
-        return Ok(OpenResolution::NonceSpent { block });
+        return Ok(NonceResolution::NonceSpent { block });
     }
     if confirmed < nonce {
-        return Ok(OpenResolution::Queued);
+        return Ok(NonceResolution::Queued);
     }
     let pending = provider
         .get_transaction_count(owner)
@@ -2932,9 +3727,9 @@ async fn resolve_unconfirmed_open<P: Provider + Clone>(
         .await
         .context("read the pending nonce")?;
     Ok(if pending > nonce {
-        OpenResolution::Pending
+        NonceResolution::Pending
     } else {
-        OpenResolution::Vacant
+        NonceResolution::Vacant
     })
 }
 
@@ -2952,7 +3747,7 @@ async fn first_receipt<P: Provider>(
         if let Some(receipt) = provider
             .get_transaction_receipt(tx)
             .await
-            .context("read an openPool receipt")?
+            .context("read a receipt")?
         {
             return Ok(Some(Box::new(receipt)));
         }
@@ -3089,7 +3884,10 @@ async fn reclaim_once<P: Provider + Clone>(
     match contract.reclaim(state.pool_id).send().await {
         Ok(pending) => {
             let tx = *pending.tx_hash();
-            match pending.get_receipt().await {
+            // Bounded: a lapse only defers the reclaim. If it mined, the next
+            // sweep finds the pool `Closed` and drops the row; if not, the
+            // next sweep sends it again.
+            match decdn_incentive::tx::await_receipt(pending, Some(RECEIPT_TIMEOUT)).await {
                 Ok(receipt) if receipt.status() => {
                     // Only the `Err` leaves the row's fate unknown — `Ok(false)`
                     // means the compare-and-delete found no row for this pool, so
@@ -3109,7 +3907,7 @@ async fn reclaim_once<P: Provider + Clone>(
                     metrics.buyer_reclaim_failure();
                 }
                 Err(err) => {
-                    warn!(pool_id = %state.pool_id, %tx, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim receipt failed");
+                    warn!(pool_id = %state.pool_id, %tx, error = %sanitize_err_chain(&err), "reclaim sweep: reclaim receipt not read; the next sweep retries");
                     metrics.buyer_reclaim_failure();
                 }
             }

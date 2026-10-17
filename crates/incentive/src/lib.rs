@@ -81,6 +81,7 @@ pub mod content_blacklist;
 pub mod erc20;
 pub mod eth_identity;
 pub mod lane;
+pub mod lane_signer;
 pub mod node_register;
 pub mod origin_assignment;
 pub mod payment_pool;
@@ -93,6 +94,8 @@ pub mod slash_appeal;
 pub mod slash_judge;
 pub mod store;
 pub mod stream_sig;
+#[cfg(feature = "test-util")]
+pub mod test_rpc;
 pub mod tx;
 pub mod voucher;
 

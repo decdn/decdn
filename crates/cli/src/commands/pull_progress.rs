@@ -5,7 +5,10 @@
 //! for a sibling's donor chunks — above one bottom **total** bar, all sharing
 //! an [`indicatif::MultiProgress`], under a one-line
 //! header naming the run and its download vs on-disk sizes. A finished file's bar
-//! clears, so only active pulls stay on screen.
+//! clears, so only active pulls stay on screen. A blank **pad** bar under the
+//! total gains a row for each cleared file bar and gives one back for each new
+//! one, so the stack never shrinks: the container redraws in place, and an
+//! in-place redraw never erases the rows a shrunk stack leaves below it.
 //!
 //! The **total** bar meters the run's **download** — the bytes actually fetched
 //! after shared-chunk dedup (`download_bytes`), fixed up front as its denominator so
@@ -43,7 +46,7 @@
 //! piped and scripted output carries no progress-bar bytes.
 
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,8 +99,79 @@ struct Inner {
     /// the run's rate/ETA; per-file bars insert before it. `None` when the manifest
     /// declares no sizes, in which case only per-file bars render.
     total: Option<TotalBar>,
+    /// The blank bar under every other bar that holds the stack's height.
+    pad: Arc<PadBar>,
     /// The terminal's tab-bar indicator; `None` when the terminal lacks OSC 9;4.
     tab: Option<Arc<TabProgress>>,
+}
+
+/// The blank bottom bar that keeps the stack from shrinking. It renders one
+/// blank line plus one per row a cleared file bar freed, and a new file bar
+/// takes a freed row back. Its blank lines are written full width, so they
+/// overwrite whatever a taller stack left in those rows.
+struct PadBar {
+    /// The bar, styled to render only its `{msg}` of newlines.
+    bar: indicatif::ProgressBar,
+    /// The rows freed and not yet taken back. The lock also orders the
+    /// re-renders, so the last render shows the last count.
+    rows: Mutex<usize>,
+}
+
+impl PadBar {
+    /// Add the pad at the bottom of `mp` (see [`TICK`] for why the add comes
+    /// first).
+    fn add(mp: &indicatif::MultiProgress) -> Arc<Self> {
+        let bar = mp.add(new_bar(1));
+        bar.set_style(
+            indicatif::ProgressStyle::with_template("{msg}")
+                .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar()),
+        );
+        Arc::new(Self {
+            bar,
+            rows: Mutex::new(0),
+        })
+    }
+
+    /// Hold the row of a file bar about to clear. Called before the clear, so
+    /// no frame draws the shorter stack.
+    fn free_row(&self) {
+        self.set_rows(|rows| rows + 1);
+    }
+
+    /// Give a freed row to a file bar just inserted. Called after the insert,
+    /// so no frame draws the shorter stack.
+    fn take_row(&self) {
+        self.set_rows(|rows| rows.saturating_sub(1));
+    }
+
+    fn set_rows(&self, f: impl FnOnce(usize) -> usize) {
+        if let Ok(mut rows) = self.rows.lock() {
+            *rows = f(*rows);
+            self.bar.set_message("\n".repeat(*rows));
+        }
+    }
+}
+
+/// A file bar's claim on one row of the stack. Releasing it, explicitly when
+/// the file finishes or on drop when the pull stops early, hands the row to
+/// the pad before the file bar clears.
+struct PadRow {
+    pad: Arc<PadBar>,
+    held: AtomicBool,
+}
+
+impl PadRow {
+    fn release(&self) {
+        if self.held.swap(false, Ordering::Relaxed) {
+            self.pad.free_row();
+        }
+    }
+}
+
+impl Drop for PadRow {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl Drop for Inner {
@@ -212,7 +286,10 @@ impl PullProgress {
         let mp = crate::logging::progress_container();
         // Header: what the run downloads vs what lands on disk after dedup. Printed
         // once above the live bars; only when a download size is known and dedup
-        // actually saves bytes is the "on disk" figure worth showing.
+        // actually saves bytes is the "on disk" figure worth showing. It goes out
+        // through `suspend` with its own newline: the container redraws in place
+        // (`logging::new_container`), and an in-place redraw returns to the start
+        // of a `println` line that has no bar under it yet and overwrites it.
         if let Some(dl) = download_total.filter(|n| *n > 0) {
             let header = match content_total.filter(|c| *c > dl) {
                 Some(content) => format!(
@@ -222,13 +299,19 @@ impl PullProgress {
                 ),
                 None => format!("{label} · {} to download", indicatif::HumanBytes(dl)),
             };
-            let _ = mp.println(header);
+            mp.suspend(|| eprintln!("{header}"));
         }
         let download_total = download_total.filter(|n| *n > 0);
         let tab = TabProgress::detect(download_total.is_some());
         let total = download_total.map(|len| Self::add_total_bar(&mp, len, tab.clone()));
+        let pad = PadBar::add(&mp);
         Self {
-            inner: Some(Inner { mp, total, tab }),
+            inner: Some(Inner {
+                mp,
+                total,
+                pad,
+                tab,
+            }),
         }
     }
 
@@ -264,20 +347,27 @@ impl PullProgress {
             .progress_chars("=>-")
     }
 
-    /// Insert a new per-file bar above the total bar (or at the bottom when there is
-    /// no total bar), style and label it, set its length to the file's download size
-    /// (the download-phase denominator), and start its steady tick — all after the
-    /// insert (see [`TICK`] for why nothing touches the bar before the container
-    /// owns it).
-    fn insert_file_bar(i: &Inner, label: &str, download_total: u64) -> indicatif::ProgressBar {
-        let bar = match &i.total {
-            Some(total) => i.mp.insert_before(&total.bar, new_bar(download_total)),
-            None => i.mp.add(new_bar(download_total)),
-        };
+    /// Insert a new per-file bar above the total bar (or above the pad when there
+    /// is no total bar), style and label it, set its length to the file's download
+    /// size (the download-phase denominator), and start its steady tick — all
+    /// after the insert (see [`TICK`] for why nothing touches the bar before the
+    /// container owns it). The bar then takes a freed row back from the pad.
+    fn insert_file_bar(
+        i: &Inner,
+        label: &str,
+        download_total: u64,
+    ) -> (indicatif::ProgressBar, PadRow) {
+        let above = i.total.as_ref().map_or(&i.pad.bar, |total| &total.bar);
+        let bar = i.mp.insert_before(above, new_bar(download_total));
         bar.set_style(Self::file_style());
         bar.set_prefix(label.to_string());
         bar.enable_steady_tick(TICK);
-        bar
+        i.pad.take_row();
+        let row = PadRow {
+            pad: Arc::clone(&i.pad),
+            held: AtomicBool::new(true),
+        };
+        (bar, row)
     }
 
     /// A per-file bar for a whole-blob pull, labeled `label` and inserted above the
@@ -298,7 +388,7 @@ impl PullProgress {
         let Some(i) = &self.inner else {
             return FileBar::disabled();
         };
-        let bar = Self::insert_file_bar(i, label, download_total);
+        let (bar, row) = Self::insert_file_bar(i, label, download_total);
         let phase = FilePhase {
             bar,
             download_total,
@@ -326,6 +416,7 @@ impl PullProgress {
             }
         };
         FileBar {
+            row: Some(row),
             phase: Some(phase),
             cb: Some(Box::new(cb)),
         }
@@ -340,6 +431,7 @@ impl PullProgress {
         if let Some(total) = &i.total {
             total.finish_and_clear();
         }
+        i.pad.bar.finish_and_clear();
         if let Some(tab) = &i.tab {
             tab.clear();
         }
@@ -439,6 +531,9 @@ impl FilePhase {
 /// the delivery callback that drives the download. Silent when the renderer is
 /// disabled.
 pub(crate) struct FileBar {
+    /// The bar's row in the stack; `None` when disabled. Declared first so a
+    /// drop hands the row to the pad before the bar's own drop clears it.
+    row: Option<PadRow>,
     /// The live bar state; `None` when disabled.
     phase: Option<FilePhase>,
     /// The delivery callback handed to the fetch path; `None` when disabled.
@@ -449,6 +544,7 @@ impl FileBar {
     /// A silent bar: no rendering, no callback.
     fn disabled() -> Self {
         Self {
+            row: None,
             phase: None,
             cb: None,
         }
@@ -500,6 +596,9 @@ impl decdn_client::bundle::FileObserver for FileBar {
     }
 
     fn finished(&self) {
+        if let Some(row) = &self.row {
+            row.release();
+        }
         if let Some(p) = &self.phase {
             p.bar.finish_and_clear();
         }

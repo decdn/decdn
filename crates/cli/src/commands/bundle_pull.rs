@@ -20,10 +20,10 @@ use anyhow::{Context as _, anyhow, bail};
 use decdn_client::PoolReplaced;
 use decdn_client::bundle::{
     BundleEnd, BundleManifest, BundleObserver, BundlePuller, BundleReport, EntryLanded,
-    FaultContext, FaultHints, FileObserver, Funding, ManifestEntry, NotAManifest, STAGING_DIR,
-    select_nodes,
+    FaultContext, FaultHints, FileObserver, ForeignReason, Funding, ManifestEntry, NotAManifest,
+    STAGING_DIR, select_nodes,
 };
-use decdn_client::buyer_pool::UnconfirmedOpens;
+use decdn_client::buyer_pool::UnconfirmedEscrows;
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::GetArgs;
@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use super::buyer_store::open_client_store_for_buy;
 use super::fetch;
 use super::get::Destination;
-use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
+use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_escrows};
 use super::manifest::build_glob_set;
 use super::pull_progress::{self, PullProgress};
 
@@ -209,8 +209,9 @@ impl EntryFilter {
     }
 
     /// [`Self::apply_reporting`], with one `warning:` line on stderr for each
-    /// pattern that matched no entry. Returns the kept entries and how many the
-    /// filter dropped.
+    /// pattern that matched no entry. Returns the kept entries, each moved to
+    /// `land_as` with [`ManifestEntry::land_at`] when it is set, and how many
+    /// the filter dropped.
     ///
     /// # Errors
     ///
@@ -229,30 +230,30 @@ impl EntryFilter {
                 "the bundle has no entry {entry:?}; a URI path names one manifest `path` exactly"
             );
         }
-        let mut kept = pass.kept;
-        if let Some(name) = &self.land_as {
-            for e in &mut kept {
-                e.path.clone_from(name);
-            }
-        }
+        let kept = match &self.land_as {
+            Some(name) => pass.kept.into_iter().map(|e| e.land_at(name)).collect(),
+            None => pass.kept,
+        };
         Ok((kept, pass.excluded))
     }
 }
 
-/// Refuse a pull into a default destination (no `-o`) that would replace a
-/// file no earlier pull wrote there: a pull fetches over a file whose bytes
-/// differ from its entry's, and the user did not choose this directory.
-/// `--overwrite` asks for the replacement, so it passes.
+/// Refuse a pull into a default destination (no `-o`) that may replace a file
+/// no earlier pull of the same entry left there unchanged: one no pull wrote,
+/// one that changed after a pull wrote it, or one a pull wrote from another
+/// bundle entry. A pull fetches over a file whose bytes differ from its
+/// entry's, and the user did not choose this directory. `--overwrite` asks for
+/// the replacement, so it passes.
 ///
 /// # Errors
 ///
-/// When an entry path of `entries` under `out` holds a file, directory or link
-/// that the skip-cache in `out` has no record of.
-fn refuse_unrecorded(args: &GetArgs, out: &Path, entries: &[ManifestEntry]) -> anyhow::Result<()> {
+/// When an entry path of `manifest` under `out` holds a file, directory or
+/// link that [`decdn_client::bundle::foreign_paths`] names.
+fn refuse_foreign(args: &GetArgs, out: &Path, manifest: &BundleManifest) -> anyhow::Result<()> {
     if args.output.is_some() || args.overwrite {
         return Ok(());
     }
-    let found = decdn_client::bundle::unrecorded_paths(entries, out);
+    let found = decdn_client::bundle::foreign_paths(manifest, out);
     let Some(first) = found.first() else {
         return Ok(());
     };
@@ -260,11 +261,30 @@ fn refuse_unrecorded(args: &GetArgs, out: &Path, entries: &[ManifestEntry]) -> a
         1 => String::new(),
         n => format!(" (and {} more)", n.saturating_sub(1)),
     };
+    let from = |uri: &Option<DecdnUri>| {
+        uri.as_ref().map_or_else(
+            || "a source this build cannot read".to_owned(),
+            ToString::to_string,
+        )
+    };
+    let why = match &first.reason {
+        ForeignReason::Unrecorded => "no earlier `decdn get` wrote it".to_owned(),
+        ForeignReason::UnreadableCache(cause) => {
+            format!("the skip-cache cannot say which `decdn get` wrote it ({cause})")
+        }
+        ForeignReason::Changed(uri) => format!(
+            "it changed after an earlier `decdn get` wrote it from {}",
+            from(uri)
+        ),
+        ForeignReason::OtherSource(uri) => {
+            format!("an earlier `decdn get` wrote it from {}", from(uri))
+        }
+        _ => "no earlier `decdn get` of this entry wrote it".to_owned(),
+    };
     anyhow::bail!(
-        "refusing to replace {}{more}: no earlier `decdn get` wrote it; pass `-o <dir>` to \
-         pull into another directory, or `-o .` to pull here and replace each such file \
-         whose bytes differ",
-        out.join(first).display()
+        "refusing to replace {}{more}: {why}; pass `-o <dir>` to pull into another \
+         directory, or `-o .` to pull here and replace each such file whose bytes differ",
+        out.join(&first.path).display()
     )
 }
 
@@ -621,6 +641,12 @@ pub(crate) async fn bundle_pull(
     uri: &DecdnUri,
     config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
+    // `-o -` is stdout, which a pull cannot write a tree to; the blob fetch
+    // takes every `-o -` run. Fail rather than create a directory named `-`.
+    anyhow::ensure!(
+        dest.path != Path::new("-"),
+        "`-o -` (stdout) does not take a bundle pull"
+    );
     // Validate the flag combination first — BEFORE the dry-run short-circuit — so a
     // bad combo (e.g. `--provider-address` without `--node-id`) or an unusable
     // timeout pair is rejected even for `--dry-run`. This rule does not run at
@@ -719,7 +745,7 @@ async fn pull_over(
     let signer = load_buyer_signer(chain)?;
     let funding = match &grant {
         None => Funding::SelfOwned {
-            signer,
+            owner: signer,
             deposit: chain.deposit_policy(false)?,
         },
         Some(grant) => Funding::Delegated {
@@ -728,9 +754,9 @@ async fn pull_over(
     };
 
     let observer = Arc::new(PullObserver::new(args.json, run_label(out)));
-    // Outlives the puller's passes, so an `openPool` that a Ctrl-C or a fault
-    // dropped before its receipt was read is still named.
-    let opens = UnconfirmedOpens::default();
+    // Outlives the puller's passes, so an `openPool` or `topUp` that a Ctrl-C
+    // or a fault dropped before its receipt was read is still named.
+    let escrows = UnconfirmedEscrows::default();
     let mut puller = BundlePuller::builder(
         chain.config.clone(),
         chain.site.clone(),
@@ -751,14 +777,14 @@ async fn pull_over(
     .stop(std::io::stderr().is_terminal(), common.give_up_after())
     .observer(Arc::clone(&observer) as Arc<dyn BundleObserver>)
     .fault_hints(Arc::new(CliFaultHints))
-    .unconfirmed_opens(opens.clone())
+    .unconfirmed_escrows(escrows.clone())
     .build()
     .await?;
 
     // Watched from before the manifest: the manifest fetch is paid, so it can
     // open the run's pool. The first Ctrl-C stops the run where it is; a
     // second one exits at once.
-    let mut interrupt = Interrupt::watch(opens.clone());
+    let mut interrupt = Interrupt::watch(escrows.clone());
     let result = pull_manifest(
         &mut puller,
         &mut interrupt,
@@ -768,9 +794,9 @@ async fn pull_over(
         (filter, filters_given),
     )
     .await;
-    // Every exit of the manifest or the pull can drop an `openPool` before
-    // its receipt is read, and the transaction may still escrow its deposit.
-    let result = name_unconfirmed_open(result, &opens.pending());
+    // Every exit of the manifest or the pull can drop an `openPool` or a
+    // `topUp` before its receipt is read, and the transaction may still escrow.
+    let result = name_unconfirmed_escrows(result, &escrows.pending());
     // On every exit, a Ctrl-C's included: what the entries queued is durable
     // before the command returns.
     puller.finish().await;
@@ -811,7 +837,7 @@ async fn pull_manifest(
         };
         let kept = maybe_select(args, out, uri, kept)?;
         if let Some(Kept { manifest, .. }) = &kept {
-            refuse_unrecorded(args, out, &manifest.entries)?;
+            refuse_foreign(args, out, manifest)?;
         }
         anyhow::Ok(kept)
     }
@@ -845,8 +871,8 @@ async fn pull_manifest(
     warn_leftover_partials(out, &manifest.entries, uri.hash);
     let reported = report(&outcome.report, excluded, out, args.json);
     // A fault that ended the whole pull is its result, so `main` maps it to
-    // its exit code (75 for a give-up with no `openPool` in flight, 1
-    // otherwise).
+    // its exit code (75 for a give-up with no `openPool` or `topUp` in
+    // flight, 1 otherwise).
     match outcome.end {
         BundleEnd::Interrupted => Err(Interrupted.into()),
         BundleEnd::FundingNeeded { error, .. } | BundleEnd::Stopped(error) => Err(error),
@@ -1097,9 +1123,10 @@ fn not_a_manifest_hint(err: anyhow::Error) -> anyhow::Error {
 /// starts from and the unmatched-pattern warnings are the ones it prints. A real
 /// run then skips files already present in the output root (unless
 /// `--overwrite`) and warns on leftover partials; the dry run does neither. It
-/// does refuse a default destination that holds a file no pull wrote, as a
-/// real run does. A bundle with no cached manifest reports only the bundle and
-/// the output root, with `entries: null` under `--json`.
+/// does refuse a default destination that holds a file the pull may replace
+/// ([`refuse_foreign`]), as a real run does. A bundle with no cached manifest
+/// reports only the bundle and the output root, with `entries: null` under
+/// `--json`.
 fn dry_run(
     args: &GetArgs,
     output: &Path,
@@ -1135,7 +1162,7 @@ fn dry_run(
     };
     let raw_empty = manifest.entries.is_empty();
     manifest.entries = filter.apply_and_warn(manifest.entries)?.0;
-    refuse_unrecorded(args, output, &manifest.entries)?;
+    refuse_foreign(args, output, &manifest)?;
     if args.json {
         // The `--json` plan stays machine-readable — an empty set is
         // `count: 0` with an empty `entries` array, no prose line. A bundle

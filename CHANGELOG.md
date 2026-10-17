@@ -28,6 +28,42 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` take a
+  `receipt_timeout: Option<Duration>` (#2433).** `Some` bounds the receipt
+  wait. A lapse returns `OpenUnconfirmed` / `TopUpUnconfirmed` with the tx
+  hash, because the transaction may still mine. `None` waits until the receipt
+  arrives or its read fails. The CLI passes
+  `decdn_incentive::tx::RECEIPT_TIMEOUT` (3 min) to both. The node passes it
+  to both as well, and settles an unconfirmed open or top-up against the chain.
+  `open_pool` also refuses to send while the `UnconfirmedEscrows` it is given
+  already holds an open, and fails with that `OpenUnconfirmed`.
+- **Admin/CLI: a lane's `counterparty` is its pool owner, not its voucher
+  signer (#2484).** `admin_v1_lanes` filled `LaneSnapshot.counterparty` with
+  the lane signer, so every `decdn get` lane (signed by a key derived for its
+  data dir) and every `--capability` lane showed that key instead of the
+  wallet that funds the pool. The node now names the owner (`getPool.owner`)
+  from its event-fed pool view, then from an owner cache, then with one bounded
+  `getPool` read per pool in neither, at most eight at once. A pool's owner
+  never changes, so the cache keeps every owner it reads. The first
+  `decdn node lanes` after a restart reads the owner of each carried-over pool.
+  The read is separate from the serve path's pool resolver, so a failed read
+  never makes the node refuse serves on that pool. **Wire-breaking:**
+  `counterparty` is `Option<String>`, `null` when the read fails or finds no
+  such pool. The node logs one warning per call that has failed reads, and
+  reads those pools again on the next call. It never falls back to the signer.
+  `decdn node lanes` prints `unknown` in that case, and `--json` prints
+  `null`. `voucher_signer` is unchanged. To find a client by its funding
+  wallet, match on `counterparty`; to find a lane by its signing key, match
+  on `voucher_signer`.
+- **SDK: an owned pool pays through `decdn_client::buyer_pool::OwnedPayer`
+  (#2468).** `OwnedPayer::for_store(owner, store)` pairs the owner key with
+  the lane key the store's salt derives; `OwnedPayer::sole(owner)` signs with
+  the owner key alone. `self_owned_lane_ctx` and `issue_self_capability` take
+  an `&OwnedPayer`, and `lanes::LanePayer::Owned` holds one.
+  `buyer_pool::open_pool` and `opened_from_receipt` no longer take a signer,
+  and `OpenedPool` drops its `ctx` and `capability`: build a lane on the new
+  pool with `self_owned_lane_ctx`. `bundle::Funding::SelfOwned` names its key
+  `owner`. `BuyerPoolStore` gains the required `lane_salt` method.
 - **CLI: `decdn get <decdn: URI>` replaces `decdn fetch` and `decdn bundle
   pull` (#2449).** One `decdn:` URI names what to pull
   (`adr/appendix-bundles.md` § `decdn:` URIs), and `get` routes it:
@@ -41,15 +77,19 @@ since project inception and will roll into the first tagged release.
     (`origin import` writes it) and pull it by hash.
   - The bundle flags (`--include`, `--exclude`, `--select`, `--jobs`,
     `--max-lane-streams`, `--overwrite`, `--dry-run`, `--json`) are an error
-    on a blob URI, and the entry filters are an error on an entry URI.
+    on a blob URI and on an entry URI with `-o -`, and the entry filters are
+    an error on an entry URI.
   - `decdn:H/` on a blob that is not a manifest fails with a hint to drop the
     trailing `/`. `decdn_client::bundle::BundleManifest::parse` returns a
     typed `NotAManifest` for that case.
-- **`decdn_client::buyer_pool::open_pool` takes an `opens` handle (#2418).**
-  The new last argument, `Option<&UnconfirmedOpens>`, holds the `openPool`
-  from before its submit until its receipt is read. Pass `None` when nothing
-  can drop the future or its error. `BundlePullerBuilder::unconfirmed_opens`
-  hands a bundle pull the same handle. The fix is under Fixed.
+- **`decdn_client::buyer_pool::open_pool` and `top_up` take an `escrows`
+  handle (#2418, #2491).** The argument before `receipt_timeout`,
+  `Option<&UnconfirmedEscrows>`, holds the `openPool` or `topUp` from before
+  its submit until its receipt is read. Pass `None` when nothing can drop the
+  future or its error. `UnconfirmedEscrows::pending` returns
+  `EscrowUnconfirmed` entries (`Open` or `TopUp`).
+  `BundlePullerBuilder::unconfirmed_escrows` hands a bundle pull the same
+  handle. The fix is under Fixed.
 - **Buyer-store API: delegate lanes (#2435).** `BuyerPoolStore` gains three
   required methods, `delegate_lanes`, `advance_delegate_progress` and
   `rebase_delegate_progress`, so an implementor outside the workspace must add
@@ -493,7 +533,8 @@ since project inception and will roll into the first tagged release.
 
 - **`cdn/client/v1`: `ChunkData` frame size is now the sender's choice.** The
   protocol bounded a payload at 1,024 bytes; it now bounds it only as non-empty,
-  with the framing layer's 16 MiB `MAX_MESSAGE_SIZE` as the effective ceiling.
+  with the framing layer's `MAX_CHUNK_FRAME` (one `CHUNK_BYTES` payload) as the
+  effective ceiling.
   `decdn_protocol::CHUNK_SIZE` and `MessageValidationError::ChunkTooLarge` are
   removed. A serving node coalesces to `payment.frame_target_bytes` (new, default
   1 MiB) instead of chopping at 1 KiB, so a served MiB costs about one frame
@@ -1025,6 +1066,121 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: a `decdn get` that ends before a `topUp` confirms names the tx
+  (#2491).** A refill or a funding recovery step can still wait on its `topUp`
+  receipt when the command ends: on a give-up after the no-progress limit, a
+  Ctrl-C, a fault in a sibling bundle entry, or the 30 s drain of late lane
+  builds after a fetch that succeeded. The command dropped the wait and named
+  no tx. A give-up exited 75 ("rerun to resume"), a drain exited 0, and a
+  re-run before the `topUp` confirmed escrowed a second top-up. Now a
+  `topUp` is named on every such end, as an `openPool` is: a give-up with one
+  pending exits 1, not 75, a command that otherwise succeeded exits nonzero,
+  and a second Ctrl-C prints it. A `topUp` left unconfirmed also refuses every
+  later `topUp` in the same command, across passes and fetches.
+  `decdn pool top-up` now handles Ctrl-C as `decdn pool open` does: it names
+  the `topUp` instead of dying with no output. A `topUp` whose submit
+  returned no hash reads "returned no tx hash", not "failed in transport",
+  since a submit dropped in flight holds no hash either.
+- **Node: a top-up for one pool no longer joins a `topUp` for another
+  (#2496).** The top-up slot did not record which pool its `topUp` funds. When
+  the store replaced the pool while a `topUp` for the old one waited for its
+  receipt, a recovery top-up for the new pool joined it. It claimed the old
+  pool's refill as its own headroom, and when that `topUp` escrowed, the
+  recovery failed as escrowed and untracked. A fill could also wait on a
+  sibling's recovery top-up for the old pool. It then failed, or, when that
+  `topUp` reverted `PoolNotOpen`, replaced the new pool, which was still open.
+  The slot now records its pool. A recovery step that finds the slot funding
+  another pool fails at once as a local fault, names both pools, and counts on
+  `decdn_node_pull_recovery_step_refused_total`. A low-water refill does
+  nothing meanwhile.
+- **Node: a funding recovery step fails at once while a `topUp` settles
+  (#2494).** A recovery top-up that found the top-up slot held for an
+  unconfirmed `topUp` joined it and waited for the whole settle, which lasts
+  as long as the chain takes. Each such cache miss waited until its deadline
+  dropped it. The recovery step now fails at once as a local fault, like a
+  miss that finds the open slot held, and counts on
+  `decdn_node_pull_recovery_step_refused_total`. A recovery step that joined
+  before the settle began still waits for its outcome, and a low-water refill
+  still does nothing and no longer logs that it funds. A recovery top-up whose
+  earlier join already landed returns that headroom when a later funding call
+  finds the slot held.
+- **CLI: a transaction dropped from the mempool no longer hangs the command
+  (#2433).** alloy's receipt wait has no bound, so a broadcast transaction
+  that never mined left these commands waiting forever: `decdn pool {open,
+  top-up, close, reclaim}`, `decdn get`'s pool open and top-up,
+  `decdn node {bond, unbond, register, deregister, update-region,
+  update-multiaddrs, rotate-key}`, `decdn publish`, `decdn appeal slash` and
+  `decdn setup`. Under `pool close --all` and `reclaim --all`, a pool whose
+  transaction was dropped also blocked every pool after it. Each wait now ends
+  after 3 minutes (`decdn_incentive::tx::RECEIPT_TIMEOUT`, the bound the USDC
+  `approve` already used). A lapse is reported like a receipt that could not
+  be read: the error names the tx hash and says it may still mine, and a
+  `--all` sweep counts the pool as unconfirmed and moves on. A transaction
+  that is stuck rather than dropped holds its nonce, so each later pool's
+  transaction queues behind it and lapses in turn. A `decdn get` whose
+  `openPool` or `topUp` lapsed never sends a second one in the same run, so
+  no other lane, bundle entry or funding recovery step escrows a second
+  deposit beside it. The run sends one `topUp` at a time.
+- **Node: an `openPool` dropped from the mempool is re-sent (#2433).** The
+  node waited for the receipt of its own `openPool` with no bound, so a
+  dropped open held the open slot forever, and every miss that joined it
+  waited out its budget. The wait now ends after `decdn_incentive::tx::RECEIPT_TIMEOUT`, and the open
+  goes to the settle loop, which re-sends it at the same nonce when the chain
+  holds no transaction there.
+- **Node: an unconfirmed `topUp` is settled against the chain, not
+  forgotten (#2489).** A `topUp` whose receipt read failed, or whose submit
+  failed in transport, freed the node's top-up slot. The next low-water
+  refill then sent a second `topUp` beside one that could still mine. A
+  recovery top-up that joined the failed one also sent its own. A dropped
+  `topUp` held the slot forever instead, so the node funded no pool again
+  until a restart. The receipt wait now ends after
+  `decdn_incentive::tx::RECEIPT_TIMEOUT`. An unconfirmed `topUp` keeps the
+  slot until the chain resolves it: its receipt credits the row, a nonce that
+  no transaction holds gets a re-send at that nonce, and a spent nonce with no
+  receipt credits what the pool's on-chain deposit holds above the row as it
+  stood when the settle began. A re-send that reverts `PoolNotOpen` ends the
+  settle once one block shows the nonce unspent and the pool closed, so the
+  recovery step opens a new pool. A re-send that reverts on the allowance
+  sends an `approve` at the nonce, which restores the allowance and fills the
+  nonce. A settle that may have
+  escrowed but cannot credit the row logs the "ESCROWED AND UNTRACKED" error,
+  and so does a funding task that dies mid-settle, which no joiner then funds
+  over. The
+  hourly reclaim sweep's `reclaim` receipt wait is bounded the same way, so
+  one dropped `reclaim` no longer stalls the sweep. `decdn-client` adds
+  `buyer_pool::send_top_up_at` and `buyer_pool::topped_up_from_receipt` for
+  the settle step.
+- **CLI: two `decdn get` runs with separate `--data-dir`s on one wallet no
+  longer pay on the same lanes (#2468).** A fresh data dir adopts the
+  wallet's live pool, and both runs signed vouchers with the wallet key, so
+  they shared each `(pool, signer, provider)` lane from separate watermarks.
+  Providers rejected the run that fell behind as `UnderFold`, and the runs
+  spent their resume budget re-fetching bytes elsewhere. Each client data dir
+  now signs with a key derived from the wallet key and a random salt that its
+  `buyer-pools.redb` keeps in the new `buyer_lane_salt_v1` table. The derived
+  key is never stored, and the wallet key signs the capability that authorizes
+  it. Data dirs keep sharing the pool, but each pays on its own lanes, so the
+  `AlreadyOpen` advice to give each concurrent run its own `--data-dir` is
+  safe on the wallet's own pool. Two data dirs on one `--capability` delegate
+  key still sign with that key and share its lanes. A data dir tracks only its
+  own lanes, so its funding reads the pool's deposit and `totalRedeemed` from
+  chain at the run's first lane build and before each funding recovery step:
+  a pool another data dir drained gets a top-up instead of a settle wait that
+  ends the run "funding needed". The daemon still signs its
+  own buyer lanes with the node key. An existing pool row keeps its
+  wallet-signed lanes as spend; new vouchers sign on fresh lanes.
+- **CLI: `decdn gateway` pays for at most 64 MiB to read a bundle manifest
+  (#2474).** A `/<hash>/` or `/<hash>/<path>` request reads the manifest
+  `<hash>` into memory. That pull ran under the gateway's `--max-blob-mb`
+  (1 TiB by default), so for a large blob that is not a manifest, the
+  gateway paid for 64 MiB plus the lanes' read-ahead before it failed. Anyone
+  who could reach the gateway could spend the operator's funds this way. The
+  manifest pull now runs under the manifest cap (64 MiB, or a lower nonzero
+  `--max-blob-mb`), as `decdn get decdn:<hash>/<path> -o -` does, and its
+  lanes request no byte past it. A blob over that cap, or one that does not
+  parse as a manifest, answers 404 instead of 502, because nothing upstream
+  failed. The 404 names the raw blob's gateway path when the gateway serves
+  that blob.
 - **CLI: a command that ends before an `openPool` confirms names the tx
   (#2418).** A Ctrl-C during the `openPool` submit or receipt wait in `decdn
   fetch` or `decdn bundle pull` printed only "run the same command again", and
@@ -3419,12 +3575,13 @@ since project inception and will roll into the first tagged release.
     and on mismatch discards the partial and fails rather than writing a wrong
     output file. A fetch that started at byte 0 skips this — every byte was
     verified on the wire as it landed.
-- **`decdn node channels` gained a `SIGNER` column.** It reports the channel's
-  pinned `voucherSigner` — the key whose signature is required on every voucher —
-  next to `COUNTERPARTY` (the funder, and the address the ADR 011 compliance
-  gates check). For every channel opened today the two are equal, because a zero
-  `voucherSigner` argument to `openChannel` resolves on-chain to `msg.sender`;
-  they diverge only when a funder pins a delegate. **Output-breaking for scripts:**
+- **`decdn node lanes` has a `SIGNER` column.** It reports the lane's voucher
+  signer — the key whose signature is required on every voucher — next to
+  `COUNTERPARTY` (the pool owner, and the address the ADR 011 compliance gates
+  check). The two are equal only when the owner signs its own vouchers, as a
+  node buyer does. A `decdn get` on its own wallet's pool signs with a key
+  derived for its data dir, and a `decdn get --capability` signs with the
+  delegate key the capability names. **Output-breaking for scripts:**
   the table is ~15 characters wider and column positions after `COUNTERPARTY`
   have shifted, so positional parsers (`awk '{print $N}'`, fixed-offset `cut`)
   need updating.
@@ -3466,12 +3623,37 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Node: `decdn_buyer_topup_unresolved` gauge (#2493).** It reads 1 while
+  the node holds its top-up slot for a `topUp` whose outcome the chain has not
+  resolved, and 0 again once the settle ends, including when its task is
+  aborted. `adr/appendix-observability.md` and `docs/runbook.md` describe what
+  keeps it at 1 and what the operator does.
+- **CLI: `decdn get decdn:<hash>/<path> -o -` streams one bundle entry to
+  stdout (#2467).** The command reads the bundle manifest into memory (at
+  most 64 MiB, and the manifest fetch requests and pays for no more), then
+  streams the entry's verified blob to stdout. Both fetches share one payer,
+  so the keystore password is read once. The bundle flags are an error with
+  `-o -`, and `-o -` on a whole bundle (`decdn:<hash>/`) stays an error.
 - **CLI: `-o` is optional on `decdn get` (#2466).** Without `-o`, a blob
   lands at `./<hash>`, a bundle in `.`, and an entry URI
   (`decdn:<hash>/<path>`) at `./<name>`, the last segment of its path, with
   no parent directories. A bundle or entry pull without `-o` refuses a path
-  that holds a file no earlier pull wrote, unless `--overwrite`, and leaves
-  its `.decdn-bundles/`, `.decdn-manifest.json` and `.decdn-partial/` in `.`.
+  that holds a file no earlier pull left there unchanged, unless
+  `--overwrite` (#2472). The earlier pull must be of the same entry (the
+  same manifest hash and manifest path), or have written the same bytes. A
+  new version of a bundle that changes a file is refused, so `-o .` updates
+  a bundle in place: it replaces the files that changed and skips the rest.
+  `--overwrite` fetches every file again. The error says why: no pull wrote
+  the file, it changed after a pull wrote it, or a pull wrote it from
+  another entry, named as a `decdn:` URI. So `decdn get
+  decdn:<h>/tokenizer/config.json` does not replace the `./config.json`
+  that `decdn:<h>/text_encoder/config.json` wrote. Each
+  `.decdn-manifest.json` record names its manifest hash and manifest path.
+  A `.decdn-manifest.json` an older build wrote vouches for no file, so the
+  first pull without `-o` into such a directory refuses its files, and the
+  error names the version mismatch; pass `-o .` once to pull there. The
+  pull leaves its `.decdn-bundles/`, `.decdn-manifest.json` and
+  `.decdn-partial/` in `.`.
   Without `-o`, the command prints `Downloading to <absolute path>` on stderr
   before the pull starts (not under `--json` or `--dry-run`). With `-o`, each
   target lands where `-o` names. A bundle entry at `.decdn-manifest.json` or
@@ -4111,6 +4293,31 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: a peer could pin up to 16 MiB per stream with an oversized frame
+  (#2501).** Every frame read accepted a length prefix up to a global 16 MiB
+  `MAX_MESSAGE_SIZE` and allocated the buffer before the payload arrived, though
+  no request is larger than a few hundred bytes. A peer with no stake or funds
+  could announce a near-16 MiB request, send most of it, and stall, holding the
+  buffer for the 5 s read timeout. On `cdn/client/v1` the node read the request
+  before it checked the per-connection stream cap, so one connection could hold
+  100 such buffers (about 1.6 GiB); the only bound was the attacker's upload
+  bandwidth. Every read now names a ceiling sized to its ALPN's largest
+  legitimate message (ADR 013 § Wire Framing): `MAX_PROBE_FRAME` (1 KiB),
+  `MAX_CLIENT_CONTROL_FRAME` (4 KiB) for requests, payment proofs and
+  `StreamResponse`, `MAX_CHUNK_FRAME` (one `CHUNK_BYTES` `ChunkData`) for the
+  delivery stream, and `MAX_DHT_FRAME` (64 KiB) for DHT requests and responses.
+  The node resets an over-cap client stream with `RATE_LIMITED` before it reads
+  the request. The node's QUIC transport also had no connection-level receive
+  window, so a peer could park about 1.25 MB of out-of-order data per stream
+  below the reader; a new 8 MiB connection window (`QUIC_CONNECTION_RECEIVE_WINDOW`)
+  bounds it, which also caps one connection's in-flight download at about
+  80 MB/s at a 100 ms round trip. At the default 256 handlers the memory stalled
+  peers can hold is now bounded at about 2.2 GiB (ADR 013 § Wire Framing);
+  operators with less memory lower `security.max_concurrent_handlers`.
+  Legitimate traffic is unchanged, so this is not wire-breaking.
+  **API break (`decdn-protocol`):** `read_frame` and `framing::parse_frame` take
+  a required `max`, `MAX_MESSAGE_SIZE` is removed, and `FrameError::TooLarge` is
+  now `{ len: u64, max: u32 }`. Reported by Radeonares32.
 - `aws-smithy-json` → 0.62.7 (CVE-2026-18140: uncontrolled recursion on deeply
   nested JSON, a denial of service). It reaches the node through the S3
   origin's AWS SDK: `aws-sdk-s3` and the `aws-config` credential chain (SSO,

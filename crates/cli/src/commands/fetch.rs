@@ -31,12 +31,16 @@
 //! and config into their inputs, and renders what the fetch did.
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
-use decdn_client::buyer_pool::UnconfirmedOpens;
+use anyhow::Context as _;
+use decdn_client::bundle::BundleManifest;
+use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
@@ -68,14 +72,14 @@ use decdn_client::provider;
 
 use super::buyer_store::{DataDirSource, chain_adoption_for_buy, open_client_store_for_buy};
 use super::fetch_timings::{FetchTimings, Mark};
-use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
+use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_escrows};
 use super::tab_progress::TabProgress;
 use decdn_client::ordered_writes::OrderedWrites;
 
 /// Parse a manifest entry's BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
 pub(crate) use decdn_client::bundle::parse_hash;
-use decdn_client::uri::DecdnUri;
+use decdn_client::uri::{DecdnUri, UriTarget};
 
 /// Build the blob `decdn get` delivery progress bar (#1118). Drawn to stderr and
 /// TTY-aware — `indicatif` hides it automatically when stderr is not a terminal,
@@ -468,11 +472,33 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
     }
 }
 
+/// The largest bundle manifest that the gateway and
+/// `decdn get decdn:<hash>/<path> -o -` read into memory.
+pub(crate) const MAX_MANIFEST_BYTES: usize = 64 << 20;
+
+/// [`MAX_MANIFEST_BYTES`] in MiB, the unit of `--max-blob-mb`.
+pub(crate) const MAX_MANIFEST_MB: u64 = 64;
+
+/// The `--max-blob-mb` a manifest fetch runs with, given the caller's. The cap
+/// bounds what the lanes request, and so pay for, to the largest manifest.
+/// `0` is no cap, so it takes the manifest cap too.
+pub(crate) fn manifest_cap_mb(max_blob_mb: u64) -> u64 {
+    match max_blob_mb {
+        0 => MAX_MANIFEST_MB,
+        mb => mb.min(MAX_MANIFEST_MB),
+    }
+}
+
 /// `decdn get decdn:<hash>`: fetch the blob `uri` names over `cdn/client/v1`,
 /// auto-opening/reusing the caller's `PaymentPool` deposit, and write it
 /// atomically to `output` (or stream it to stdout when `output` is `-`). `config_path`
 /// (the global `--config`) supplies relays (#935), discovery (#936), and chain
 /// coordinates.
+///
+/// `decdn get decdn:<hash>/<path> -o -` runs here too. It fetches the bundle
+/// manifest into memory, then streams the blob of the entry `<path>` names to
+/// stdout. Both fetches share one host and one payer, so the keystore unlocks
+/// once.
 ///
 /// With `--node-id` the node is dialed explicitly. Without it, `fetch`
 /// auto-discovers (#936): read the active set from `CapacityBond`, probe a
@@ -483,37 +509,31 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 ///
 /// [`Interrupted`] on Ctrl-C, [`decdn_client::GaveUp`] once the stop policy's
 /// no-progress limit passes, or the fault that ended the fetch. A fetch that
-/// ends with an `openPool` whose receipt it did not read carries
-/// [`super::interrupt::PendingOpens`], as context on any of those or as the
-/// error of a fetch that otherwise succeeded.
+/// ends with an `openPool` or `topUp` whose receipt it did not read carries
+/// [`super::interrupt::PendingEscrows`], as context on any of those or as the
+/// error of a fetch that otherwise succeeded. A transaction the error already
+/// carries itself is not repeated there.
 pub(crate) async fn fetch(
     args: &cli::GetArgs,
     output: &Path,
     uri: &DecdnUri,
     config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let blob = BlobFetch {
-        hash: uri.hash,
-        namespace: uri.namespace,
-        output: output.to_path_buf(),
-        common: args.common.clone(),
-    };
     let timings = FetchTimings::start();
-    let (host, grant) = FetchHost::open(&blob.common, config_path, false).await?;
+    let (host, grant) = FetchHost::open(&args.common, config_path, false).await?;
     timings.mark(Mark::Endpoint);
     let payer = Payer::keystore(grant);
     // A Ctrl-C drops the fetch mid-transfer: each drive's drop guard queues
     // what it paid for recording, and the `.partial` is the next run's resume
-    // prefix. The handle outlives the fetch, so an `openPool` that a Ctrl-C or a
-    // fault dropped before its receipt was read is still named.
-    let mut interrupt = Interrupt::watch(host.opens.clone());
-    let mut sink = Sink::Output;
+    // prefix. The handle outlives the fetch, so an `openPool` or `topUp` that a
+    // Ctrl-C or a fault dropped before its receipt was read is still named.
+    let mut interrupt = Interrupt::watch(host.escrows.clone());
     let result = tokio::select! {
-        result = fetch_on(&host, &payer, &blob, &mut sink, &timings) => result,
+        result = fetch_target(&host, &payer, args, output, uri, &timings) => result,
         () = interrupt.wait() => Err(Interrupted.into()),
     };
-    let result = name_unconfirmed_open(result, &host.opens.pending());
-    let output = if wants_stdout(&blob.output) {
+    let result = name_unconfirmed_escrows(result, &host.escrows.pending());
+    let output = if wants_stdout(output) {
         "stdout"
     } else {
         "file"
@@ -523,6 +543,131 @@ pub(crate) async fn fetch(
     // before the command returns.
     host.close().await;
     result
+}
+
+/// Fetch what `uri` names on `host` to `output`: the blob itself, or for an
+/// entry URI the blob of that bundle entry.
+async fn fetch_target(
+    host: &FetchHost,
+    payer: &Payer,
+    args: &cli::GetArgs,
+    output: &Path,
+    uri: &DecdnUri,
+    timings: &FetchTimings,
+) -> anyhow::Result<()> {
+    let blob = |hash| BlobFetch {
+        hash,
+        namespace: uri.namespace,
+        output: output.to_path_buf(),
+        common: args.common.clone(),
+    };
+    match &uri.target {
+        UriTarget::Blob => fetch_on(host, payer, &blob(uri.hash), &mut Sink::Output, timings).await,
+        UriTarget::BundleEntry(path) => {
+            let hash = fetch_entry_hash(host, payer, args, uri, path).await?;
+            fetch_on(host, payer, &blob(hash), &mut Sink::Output, timings)
+                .await
+                .with_context(|| {
+                    format!(
+                        "fetch bundle entry {path:?} (blob {})",
+                        blake3::Hash::from_bytes(hash).to_hex()
+                    )
+                })
+        }
+        _ => anyhow::bail!("only a blob or one bundle entry streams as one blob"),
+    }
+}
+
+/// Fetch the bundle manifest `uri` names into memory, at most
+/// [`MAX_MANIFEST_BYTES`], and return the blob hash of its entry `path`. The
+/// manifest fetch logs its own `fetch timings` event, with
+/// `output = "manifest"`.
+async fn fetch_entry_hash(
+    host: &FetchHost,
+    payer: &Payer,
+    args: &cli::GetArgs,
+    uri: &DecdnUri,
+    path: &str,
+) -> anyhow::Result<[u8; 32]> {
+    let mut common = args.common.clone();
+    common.max_blob_mb = manifest_cap_mb(common.max_blob_mb);
+    let manifest = BlobFetch {
+        hash: uri.hash,
+        namespace: uri.namespace,
+        output: PathBuf::from("-"),
+        common,
+    };
+    let buf = ManifestBuf::default();
+    let mut sink = Sink::Writer(Box::new(buf.clone()));
+    let timings = FetchTimings::start();
+    let fetched = fetch_on(host, payer, &manifest, &mut sink, &timings).await;
+    timings.log("manifest", fetched.is_ok());
+    fetched.map_err(|err| {
+        if err.downcast_ref::<decdn_client::BlobTooLarge>().is_some() {
+            err.context(format!(
+                "the blob is larger than a bundle manifest can be ({MAX_MANIFEST_MB} MiB); \
+                 drop the path to fetch the raw blob"
+            ))
+        } else {
+            err.context("fetch the bundle manifest")
+        }
+    })?;
+    let bytes = std::mem::take(&mut *buf.0.lock().unwrap_or_else(PoisonError::into_inner));
+    entry_hash(&bytes, path)
+}
+
+/// The blob hash of the entry `path` in the bundle manifest `bytes`.
+fn entry_hash(bytes: &[u8], path: &str) -> anyhow::Result<[u8; 32]> {
+    let manifest = BundleManifest::parse(bytes).context(
+        "the URI's `/<path>` names a bundle entry, but this blob is not a bundle manifest; \
+         drop the path to fetch the raw blob",
+    )?;
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|e| e.path == path)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the bundle has no entry {path:?}; a URI path names one manifest `path` exactly"
+            )
+        })?;
+    parse_hash(&entry.hash).with_context(|| format!("bundle entry {path:?} has a malformed hash"))
+}
+
+/// An in-memory [`Sink::Writer`] for a bundle manifest. It holds at most
+/// [`MAX_MANIFEST_BYTES`] and fails a write past that.
+#[derive(Clone, Default)]
+struct ManifestBuf(Arc<Mutex<Vec<u8>>>);
+
+impl tokio::io::AsyncWrite for ManifestBuf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if bytes.len().saturating_add(buf.len()) > MAX_MANIFEST_BYTES {
+            return Poll::Ready(Err(std::io::Error::other(format!(
+                "the manifest is larger than {MAX_MANIFEST_BYTES} bytes"
+            ))));
+        }
+        bytes.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// One blob fetch: what `decdn get decdn:<hash>` and the gateway each hand
@@ -554,7 +699,8 @@ pub(crate) enum Sink {
     /// `--output`: a file, or stdout for `-`.
     Output,
     /// A caller's byte stream, filled in order as `-o -` fills stdout. The
-    /// gateway hands one per HTTP response.
+    /// gateway hands one per HTTP response, and `decdn get` hands one to read
+    /// an entry URI's manifest.
     Writer(Box<dyn tokio::io::AsyncWrite + Send + Unpin>),
 }
 
@@ -572,8 +718,9 @@ impl Sink {
 /// What every blob fetch on it shares, built once: the chain, the relays, the
 /// buyer-pool store, one discovery-enabled endpoint with one connection per
 /// node, the holder health table, and the queue of peer-record and watermark
-/// writes. `decdn get` builds one for its one fetch; the gateway builds one
-/// for its whole run and fetches on it concurrently from one thread.
+/// writes. `decdn get` builds one for its fetch, or for the manifest fetch
+/// and the entry fetch of an entry URI to stdout; the gateway builds one for
+/// its whole run and fetches on it concurrently from one thread.
 pub(crate) struct FetchHost {
     relays: Vec<RelayUrl>,
     chain: ResolvedChain,
@@ -582,8 +729,8 @@ pub(crate) struct FetchHost {
     connections: Connections,
     health: Arc<PeerHealth>,
     writes: OrderedWrites,
-    /// Each `openPool` whose receipt is unread, across every fetch.
-    pub(crate) opens: UnconfirmedOpens,
+    /// Each `openPool` and `topUp` whose receipt is unread, across every fetch.
+    pub(crate) escrows: UnconfirmedEscrows,
     /// The pool's settlement token, `PaymentPool.usdc()`, read once.
     token: tokio::sync::OnceCell<alloy::primitives::Address>,
 }
@@ -650,7 +797,7 @@ impl FetchHost {
             endpoint,
             health: Arc::new(PeerHealth::default()),
             writes: OrderedWrites::default(),
-            opens: UnconfirmedOpens::default(),
+            escrows: UnconfirmedEscrows::default(),
             token: tokio::sync::OnceCell::new(),
         };
         Ok((host, grant))
@@ -671,17 +818,22 @@ impl FetchHost {
 /// advance each lane's cumulative voucher through one issuer.
 pub(crate) struct Payer {
     key: PayerKey,
-    /// The lane ledgers concurrent fetches share; `None` for a solo fetch,
-    /// whose lanes each start from their persisted watermark.
+    /// The lane ledgers concurrent fetches share; `None` for a keystore payer,
+    /// whose fetches run one at a time, each lane starting from its persisted
+    /// watermark.
     ledgers: Option<LaneLedgers>,
     recovery: Arc<RecoveryGate>,
     open_lock: tokio::sync::Mutex<()>,
 }
 
 enum PayerKey {
-    /// The keystore the flags name, loaded once holders are found, with the
-    /// `--capability` delegation when there is one.
-    Keystore(Option<CapabilityGrant>),
+    /// The keystore the flags name, with the `--capability` delegation when
+    /// there is one. The first fetch under the payer loads it once its holder
+    /// resolution ends, and every later fetch under the payer reuses it.
+    Keystore {
+        grant: Option<CapabilityGrant>,
+        loaded: tokio::sync::OnceCell<(Arc<alloy::signers::local::PrivateKeySigner>, PayerKeys)>,
+    },
     /// A key in hand and the capability issued to it.
     Held {
         signer: Arc<alloy::signers::local::PrivateKeySigner>,
@@ -689,12 +841,34 @@ enum PayerKey {
     },
 }
 
+/// What a loaded payer's lanes sign under.
+#[derive(Clone)]
+enum PayerKeys {
+    /// The buyer's own pool: the keystore key owns it, and the lanes sign
+    /// under the key [`OwnedPayer::for_store`] derives for this data dir.
+    Owned(OwnedPayer),
+    /// A pool another owner funds, under the slot's credential.
+    Delegated(CredentialSlot),
+}
+
+impl PayerKeys {
+    const fn lane_payer(&self) -> LanePayer<'_> {
+        match self {
+            Self::Owned(payer) => LanePayer::Owned(payer),
+            Self::Delegated(slot) => LanePayer::Delegated(slot),
+        }
+    }
+}
+
 impl Payer {
-    /// A solo fetch paying from the keystore the flags name, under `grant`
-    /// when it is delegated.
+    /// The fetches of one `decdn get` run, paying from the keystore the flags
+    /// name, under `grant` when it is delegated.
     pub(crate) fn keystore(grant: Option<CapabilityGrant>) -> Self {
         Self {
-            key: PayerKey::Keystore(grant),
+            key: PayerKey::Keystore {
+                grant,
+                loaded: tokio::sync::OnceCell::new(),
+            },
             ledgers: None,
             recovery: Arc::new(RecoveryGate::new()),
             open_lock: tokio::sync::Mutex::new(()),
@@ -723,7 +897,7 @@ impl Payer {
     /// Whether the fetch pays from a pool another owner funds.
     const fn delegated(&self) -> bool {
         match &self.key {
-            PayerKey::Keystore(grant) => grant.is_some(),
+            PayerKey::Keystore { grant, .. } => grant.is_some(),
             PayerKey::Held { .. } => true,
         }
     }
@@ -759,7 +933,7 @@ pub(crate) async fn fetch_on(
         connections,
         health,
         writes,
-        opens,
+        escrows,
         token,
     } = host;
     let hash = args.hash;
@@ -787,30 +961,40 @@ pub(crate) async fn fetch_on(
     )?;
     timings.mark(Mark::Resolved);
 
-    // Buyer signer (vouchers + the openPool/topUp tx): the held one, else the
-    // keystore, loaded after selection so a failed discovery never prompts for a
-    // keystore password. Password from env, else `--keystore-password-file`,
-    // else TTY.
-    // A delegated fetch signs under one credential slot for the whole fetch,
-    // both passes included; a held key's slot spans every fetch it pays for.
-    let (signer, slot) = match &payer.key {
-        PayerKey::Held { signer, slot } => (Arc::clone(signer), Some(slot.clone())),
-        PayerKey::Keystore(grant) => {
-            let password = super::chain_ctx::read_keystore_password(
-                &super::chain_ctx::password_sources(
-                    chain.keystore_password_file.as_deref(),
-                    PasswordUse::Unlock,
-                ),
-                "eth keystore password",
-            )?
-            .into_secret();
-            let signer = Arc::new(load_signer(&chain.keystore, &password)?);
-            let slot = grant
-                .as_ref()
-                .map(|grant| delegated_slot(grant, Arc::clone(&signer)))
-                .transpose()?;
-            (signer, slot)
-        }
+    // Buyer key: the held delegate key, else the keystore, loaded after holder
+    // resolution so a configuration fault never
+    // prompts for a keystore password. Password from env, else
+    // `--keystore-password-file`, else TTY.
+    // A delegated payer signs under one credential slot across every fetch it
+    // pays for, both passes of each fetch included: a held key brings its slot,
+    // and a keystore payer builds its slot at the first load. A keystore payer
+    // on its own pool derives this data dir's lane key at the first load.
+    let (signer, keys) = match &payer.key {
+        PayerKey::Held { signer, slot } => (Arc::clone(signer), PayerKeys::Delegated(slot.clone())),
+        PayerKey::Keystore { grant, loaded } => loaded
+            .get_or_try_init(|| async {
+                let password = super::chain_ctx::read_keystore_password(
+                    &super::chain_ctx::password_sources(
+                        chain.keystore_password_file.as_deref(),
+                        PasswordUse::Unlock,
+                    ),
+                    "eth keystore password",
+                )?
+                .into_secret();
+                let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+                let keys = match grant {
+                    Some(grant) => {
+                        PayerKeys::Delegated(delegated_slot(grant, Arc::clone(&signer))?)
+                    }
+                    None => PayerKeys::Owned(OwnedPayer::for_store(
+                        Arc::clone(&signer),
+                        store.as_ref(),
+                    )?),
+                };
+                anyhow::Ok((signer, keys))
+            })
+            .await?
+            .clone(),
     };
     timings.mark(Mark::Unlocked);
     let self_address = signer.address();
@@ -872,7 +1056,7 @@ pub(crate) async fn fetch_on(
     loop {
         // Per pass: the funding facts, the lanes and their handles all name the
         // pool the pass pays from.
-        let funding = RunFunding::reporting_opens_to(opens.clone());
+        let funding = RunFunding::reporting_escrows_to(escrows.clone());
         // The shared pull/funding deps every lane borrows for the whole pass.
         let deps = LaneDeps {
             endpoint,
@@ -902,10 +1086,7 @@ pub(crate) async fn fetch_on(
             &deps,
             &discovery,
             relays,
-            match &slot {
-                Some(slot) => LanePayer::Delegated(slot),
-                None => LanePayer::Owned(&signer),
-            },
+            keys.lane_payer(),
             &voucher_dom,
             Some(&payer.open_lock),
             payer.ledgers.as_ref(),

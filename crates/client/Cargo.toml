@@ -75,12 +75,11 @@ tracing = { workspace = true }
 alloy-json-rpc = { workspace = true }
 decdn-bao-range = { workspace = true, features = ["test-util"] }
 # The examples keep the buyer's pool and lane records in the same redb store
-# `decdn get` uses, and print their warnings through a subscriber.
-decdn-incentive = { workspace = true, features = ["redb"] }
+# `decdn get` uses, and print their warnings through a subscriber. `test-util`
+# brings `test_rpc::ScriptedRpc`, which the `buyer_pool` and funding tests use
+# to park a receipt wait.
+decdn-incentive = { workspace = true, features = ["redb", "test-util"] }
 tracing-subscriber = { workspace = true }
-# A scripted RPC transport that answers some methods and hangs on the rest, so a
-# test can drop `open_pool` inside its receipt wait.
-tower = { workspace = true }
 # Public-API stability snapshot (#1150). Only exercised by the `public_api` test
 # target below, which is gated behind `public-api-test`.
 public-api = { workspace = true }

@@ -293,3 +293,52 @@ fn store_delegates_every_op() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A data dir derives its lane signer from this salt on every run, so the
+/// salt is written once and read back unchanged, also after the store closes
+/// and opens again (#2468).
+#[test]
+fn lane_salt_is_stable_across_calls_and_reopen() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let first = store(&dir)?;
+    let salt = first.lane_salt()?;
+    anyhow::ensure!(first.lane_salt()? == salt, "a second call changed the salt");
+    drop(first);
+    let reopened = store(&dir)?;
+    anyhow::ensure!(reopened.lane_salt()? == salt, "a reopen changed the salt");
+    Ok(())
+}
+
+/// Two data dirs on one wallet must sign on different lanes, so each draws
+/// its own salt.
+#[test]
+fn two_data_dirs_get_different_lane_salts() -> anyhow::Result<()> {
+    let (a, b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    anyhow::ensure!(
+        store(&a)?.lane_salt()? != store(&b)?.lane_salt()?,
+        "two data dirs drew the same salt"
+    );
+    Ok(())
+}
+
+/// The salt lives in its own table: creating it adds no pool row, and it
+/// leaves the pool rows as they are.
+#[test]
+fn lane_salt_is_not_a_pool_row() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = store(&dir)?;
+    s.lane_salt()?;
+    anyhow::ensure!(
+        s.load_all()?.pools.is_empty(),
+        "the salt read back as a pool row"
+    );
+    let (state, _) = state(0x01, 10, 20)?;
+    s.record(&state)?;
+    s.lane_salt()?;
+    let pools = s.load_all()?.pools;
+    anyhow::ensure!(
+        pools.len() == 1 && pools.first().map(|p| p.pool_id) == Some(state.pool_id),
+        "the salt changed the pool rows: {pools:?}"
+    );
+    Ok(())
+}

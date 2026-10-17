@@ -63,6 +63,7 @@ use decdn_e2e::poll;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity;
+use decdn_incentive::lane_signer::derive_lane_signer;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const KEYSTORE_PASSWORD: &str = "multi-source-e2e-password";
@@ -177,10 +178,16 @@ async fn run() -> anyhow::Result<()> {
         blob.len()
     );
 
-    // (2) BOTH nodes' admin lanes report a non-zero settled claim funded by the
-    // client, proving neither lane was a dead fallback.
-    let paid_a = settled_outstanding(&holder_a, buyer_addr).await?;
-    let paid_b = settled_outstanding(&holder_b, buyer_addr).await?;
+    // (2) BOTH nodes' admin lanes report a non-zero settled claim on the
+    // client's lane, proving neither lane was a dead fallback. The lanes are
+    // signed by the key this data dir derives from the wallet
+    // and its store's salt, not by the wallet key itself (#2468).
+    let lane_signer = {
+        let store = RedbBuyerPoolStore::open(client_dir.path()).context("open buyer store")?;
+        derive_lane_signer(&buyer, &store.lane_salt()?)?.address()
+    };
+    let paid_a = settled_outstanding(&holder_a, lane_signer, buyer_addr).await?;
+    let paid_b = settled_outstanding(&holder_b, lane_signer, buyer_addr).await?;
     anyhow::ensure!(
         paid_a > 0 && paid_b > 0,
         "both holders must report a non-zero settled claim from the client — the transfer was \
@@ -213,29 +220,40 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Poll a node's admin `lanes()` for the lane funded by `payer` (the client's
-/// address) until it reports a non-zero settled claim, or the budget expires.
+/// Poll a node's admin `lanes()` for the lane `signer` signs vouchers on (the
+/// client data dir's lane key) until it reports a non-zero settled claim, or
+/// the budget expires.
 /// Mirrors `node_to_node_coalesce`'s `settled_outstanding`: the admin surface
 /// reads the persisted lane store, so a short poll rides out the fsync gap
 /// between `fetch` returning and the node durably recording the voucher.
+///
+/// The lane signer is a derived key, not the wallet, so the node must still
+/// name the wallet that owns the pool as the lane's counterparty (#2484).
 async fn settled_outstanding(
     node: &NodeFixture,
-    payer: alloy::primitives::Address,
+    signer: alloy::primitives::Address,
+    owner: alloy::primitives::Address,
 ) -> anyhow::Result<u64> {
     let admin = node.admin_client()?;
-    let payer_hex = payer.to_string();
+    let signer_hex = signer.to_string();
     let snapshot = poll(Duration::from_secs(30), || async {
         let resp = admin.lanes().await.context("admin lanes")?;
         Ok(resp
             .lanes
             .into_iter()
-            .find(|s| s.counterparty.eq_ignore_ascii_case(&payer_hex))
+            .find(|s| s.voucher_signer.eq_ignore_ascii_case(&signer_hex))
             .filter(|s| s.outstanding_micro_usdc > 0))
     })
     .await?
     .with_context(|| {
-        format!("node never reported a non-zero settled claim funded by {payer_hex}")
+        format!("node never reported a non-zero settled claim signed by {signer_hex}")
     })?;
+    anyhow::ensure!(
+        snapshot.counterparty == Some(owner.to_string()),
+        "the lane signed by {signer_hex} must report its pool owner {owner} as the \
+         counterparty, got {:?}",
+        snapshot.counterparty
+    );
     Ok(snapshot.outstanding_micro_usdc)
 }
 

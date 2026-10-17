@@ -35,6 +35,7 @@ use decdn_common::cli::{
 };
 use decdn_incentive::buyer_pool::{BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::{LaneState, MemoryBuyerPoolStore, MemoryPoolStateStore, PoolStateStore};
+use decdn_node::admin::pool_owners::PoolOwners;
 use decdn_node::admin::{
     self, AdminState, DhtStatusHandles, DrainTrigger, LaneActivityClock, LaneStatusHandles,
 };
@@ -43,6 +44,7 @@ use decdn_node::dht::{
     ConfigStakerSet, RecordStore, RecordStoreConfig, RepublishScheduler, StakerSet,
 };
 use decdn_node::metrics::Metrics;
+use decdn_node::pool_view::PoolProjection;
 use decdn_protocol::{ContentHash, Coverage};
 use jsonrpsee::RpcModule;
 use jsonrpsee::core::ClientError;
@@ -193,20 +195,25 @@ async fn unknown_method_returns_method_not_found() -> anyhow::Result<()> {
 /// computed against it.
 #[tokio::test]
 async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
-    use alloy::primitives::{Address, U256};
+    use alloy::primitives::{Address, B256, U256};
 
     // A lane is keyed by `(pool_id, signer, provider)`; the admin surface
-    // reports the pool id as the lane id and the signer as both
-    // counterparty and voucher signer (the shared-pool model has no separate
-    // delegate at the lane level — see `decdn_node::admin::build_lane_snapshots`).
-    let mk = |pool_byte: u8, signer_byte: u8, last_amount: u64| -> LaneState {
+    // reports the pool id as the lane id, the lane signer as the voucher
+    // signer, and the pool owner (read from the node's pool view) as the
+    // counterparty. A `decdn get` lane signs with a derived key, so the owner
+    // here is distinct from either signer.
+    let pool_id = |pool_byte: u8| -> B256 {
         let mut id = [0u8; 32];
         id[31] = pool_byte;
+        id.into()
+    };
+    let mk = |pool_byte: u8, signer_byte: u8, last_amount: u64| -> LaneState {
+        let id = pool_id(pool_byte);
         let mut signer = [0u8; 20];
         signer[19] = signer_byte;
         let provider = Address::repeat_byte(0xEE);
         LaneState::hydrate(
-            id.into(),
+            id,
             Address::from(signer),
             provider,
             U256::from(1_000_000_000u64), // cap — irrelevant to the snapshot
@@ -222,6 +229,12 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
     store.record(&mk(1, 0xAA, 2_000_000))?;
     store.record(&mk(2, 0xBB, 100_000))?;
 
+    // The node has seen pool 1 open. Pool 2 is not in its pool view, and this
+    // state wires no chain source to read it from, so its owner is unknown.
+    let owner = Address::repeat_byte(0x0F);
+    let pool_view = PoolProjection::new();
+    pool_view.record_opened(pool_id(1), owner, U256::from(10_000_000u64));
+
     let (cache, _tmp) = test_cache().await?;
     let state = AdminState::new(
         [0u8; 32],
@@ -235,6 +248,7 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
         pool_store: store as Arc<dyn PoolStateStore>,
         lane_activity: LaneActivityClock::empty(),
         redeem_threshold_micro_usdc: 1_000_000,
+        pool_owners: PoolOwners::new(pool_view, None),
     });
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -253,10 +267,14 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
     assert_eq!(first.last_nonce, 0);
     assert!(first.settlement_eligible, "2 USDC >= 1 USDC threshold");
     assert!(first.pool_id.starts_with("0x"));
-    assert!(first.counterparty.starts_with("0x"));
     assert_eq!(
-        first.voucher_signer, first.counterparty,
-        "the shared-pool model reports the lane signer as both fields"
+        first.counterparty,
+        Some(owner.to_string()),
+        "the counterparty is the pool owner, not the signer"
+    );
+    assert_eq!(
+        first.voucher_signer,
+        Address::with_last_byte(0xAA).to_string()
     );
     assert_eq!(first.seconds_since_last_voucher, None);
     let second = resp
@@ -265,6 +283,10 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("missing second lane"))?;
     assert_eq!(second.outstanding_micro_usdc, 100_000);
     assert!(!second.settlement_eligible, "0.1 USDC < 1 USDC threshold");
+    assert_eq!(
+        second.counterparty, None,
+        "an unseen pool's owner is unknown, never the signer"
+    );
 
     let _ = stop_tx.send(());
     join.await?;

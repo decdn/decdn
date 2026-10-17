@@ -56,6 +56,17 @@ use serde::{Deserialize, Serialize};
 /// substitute for safe math.
 pub const MAX_RATE_PER_MB: u64 = 1000;
 
+/// Frame ceiling for `cdn/probe/v1`, in payload bytes (ADR 013 § Wire Framing).
+///
+/// Every probe read passes this to [`crate::read_frame`]. The largest legitimate
+/// message is a [`ProbeResponse`] with its [`ProbeResponseExt`] at full width:
+/// 325 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap and
+/// its 2-byte length). A [`ProbeRequest`] is
+/// at most 43 bytes. The ceiling leaves headroom for Tier-1 extension fields
+/// and refuses a larger frame before the reader buffers it. The
+/// `probe_frame_ceiling_holds_the_largest_message` test pins the margin.
+pub const MAX_PROBE_FRAME: u32 = 1024;
+
 /// Length in bytes of an EOA secp256k1 EIP-712 signature (`r‖s‖v`, 32+32+1).
 ///
 /// ADR 014 §1 mandates `slash_sig` is **non-empty** and that requesters MUST
@@ -163,13 +174,13 @@ pub enum MessageValidationError {
     EmptyChunk,
     /// The postcard message body of a [`crate::client::ChunkData`] frame —
     /// discriminant + length prefix + payload, which is the length the framing prefix
-    /// announces — exceeds [`crate::framing::MAX_MESSAGE_SIZE`] (ADR 013 §Wire
+    /// announces — exceeds [`crate::client::MAX_CHUNK_FRAME`] (ADR 013 §Wire
     /// Framing).
     ///
     /// The field is named for what it holds: this is always larger than the
     /// `payload_len` the caller passed in, so comparing it against that is a category
     /// error.
-    #[error("ChunkData frame length {frame_len} exceeds MAX_MESSAGE_SIZE ({max})", max = crate::framing::MAX_MESSAGE_SIZE)]
+    #[error("ChunkData frame length {frame_len} exceeds MAX_CHUNK_FRAME ({max})", max = crate::client::MAX_CHUNK_FRAME)]
     ChunkTooLarge {
         /// The refused frame-body length, in bytes.
         frame_len: usize,

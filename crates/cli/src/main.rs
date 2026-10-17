@@ -41,7 +41,8 @@ async fn main() -> std::process::ExitCode {
             }
             if let Some(line) = decdn_cli::commands::interrupt::stop_message(&e) {
                 // Not an error to fix: an interrupt or a give-up, with any
-                // `openPool` still in flight in place of the rerun advice.
+                // `openPool` or `topUp` still in flight in place of the rerun
+                // advice.
                 eprintln!("{line}");
             } else {
                 eprintln!("Error: {}", decdn_common::redact::sanitize_err_chain(&e));
@@ -53,7 +54,7 @@ async fn main() -> std::process::ExitCode {
 
 /// The process exit code for a command's error: 130 for an interrupt, 75
 /// (`EX_TEMPFAIL`) for a fetch that gave up for lack of progress with no
-/// `openPool` in flight, 1 otherwise.
+/// `openPool` or `topUp` in flight, 1 otherwise.
 fn exit_code_for(err: &anyhow::Error) -> std::process::ExitCode {
     decdn_cli::commands::interrupt::stop_exit(err).map_or(
         std::process::ExitCode::FAILURE,

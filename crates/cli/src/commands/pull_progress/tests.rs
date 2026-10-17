@@ -49,14 +49,47 @@ fn disabled_file_bar_has_no_callback() {
 fn hidden_pp(download_total: u64) -> (PullProgress, TotalBar) {
     let mp = indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
     let total = TotalBar::wrap(mp.add(indicatif::ProgressBar::new(download_total)), None);
+    let pad = PadBar::add(&mp);
     let pp = PullProgress {
         inner: Some(Inner {
             mp,
             total: Some(total.clone()),
+            pad,
             tab: None,
         }),
     };
     (pp, total)
+}
+
+/// The rows the pad of `pp` holds.
+fn pad_rows(pp: &PullProgress) -> usize {
+    *pp.inner.as_ref().unwrap().pad.rows.lock().unwrap()
+}
+
+#[test]
+fn pad_holds_the_rows_cleared_file_bars_free_until_new_bars_take_them() {
+    use decdn_client::bundle::FileObserver as _;
+
+    let (pp, _total) = hidden_pp(100);
+    let a = pp.file_bar("a", 10, 0);
+    let b = pp.file_bar("b", 10, 0);
+    assert_eq!(pad_rows(&pp), 0);
+
+    a.finished();
+    assert_eq!(pad_rows(&pp), 1);
+    // A second report, and the drop after it, free nothing more.
+    a.finished();
+    drop(a);
+    assert_eq!(pad_rows(&pp), 1);
+
+    let c = pp.file_bar("c", 10, 0);
+    assert_eq!(pad_rows(&pp), 0);
+
+    // A bar dropped unfinished (a pull stopped early) frees its row too.
+    drop(b);
+    assert_eq!(pad_rows(&pp), 1);
+    drop(c);
+    assert_eq!(pad_rows(&pp), 2);
 }
 
 #[test]

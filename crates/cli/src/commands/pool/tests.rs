@@ -886,6 +886,70 @@ async fn an_unreadable_reclaim_receipt_names_the_tx() {
     );
 }
 
+/// A `PaymentPool` whose send is broadcast as
+/// [`SCRIPTED_TX`](decdn_incentive::test_rpc::SCRIPTED_TX) and whose receipt
+/// never arrives: a tx dropped from the mempool.
+fn pool_whose_tx_never_mines()
+-> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone> {
+    PaymentPool::new(
+        Address::repeat_byte(0x01),
+        decdn_incentive::test_rpc::ScriptedRpc::parked_receipt().provider(),
+    )
+}
+
+/// A `closePool` whose receipt never arrives ends at [`RECEIPT_TIMEOUT`] as
+/// unconfirmed, naming its tx, so a `--all` sweep moves on to the next pool
+/// (#2433).
+#[tokio::test(start_paused = true)]
+async fn a_close_that_never_mines_lapses_unconfirmed() {
+    let err = tokio::time::timeout(
+        RECEIPT_TIMEOUT * 2,
+        close_and_forget(
+            &pool_whose_tx_never_mines(),
+            LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+            Address::repeat_byte(0x22),
+            B256::repeat_byte(0x33),
+        ),
+    )
+    .await
+    .expect("the receipt wait must lapse within RECEIPT_TIMEOUT")
+    .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TxUnconfirmed>(),
+        Some(&TxUnconfirmed {
+            label: "closePool",
+            tx: Some(decdn_incentive::test_rpc::SCRIPTED_TX)
+        })
+    );
+    assert!(format!("{err:#}").contains("no receipt within"), "{err:#}");
+}
+
+/// A `reclaim` whose receipt never arrives ends at [`RECEIPT_TIMEOUT`] as
+/// unconfirmed, naming its tx (#2433).
+#[tokio::test(start_paused = true)]
+async fn a_reclaim_that_never_mines_lapses_unconfirmed() {
+    let err = tokio::time::timeout(
+        RECEIPT_TIMEOUT * 2,
+        reclaim_and_forget(
+            &pool_whose_tx_never_mines(),
+            LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+            Address::repeat_byte(0x22),
+            B256::repeat_byte(0x33),
+        ),
+    )
+    .await
+    .expect("the receipt wait must lapse within RECEIPT_TIMEOUT")
+    .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TxUnconfirmed>(),
+        Some(&TxUnconfirmed {
+            label: "reclaim",
+            tx: Some(decdn_incentive::test_rpc::SCRIPTED_TX)
+        })
+    );
+    assert!(format!("{err:#}").contains("no receipt within"), "{err:#}");
+}
+
 /// The `send_failed` note that a transport failure may have broadcast the tx.
 const MAYBE_BROADCAST: &str = "may have reached the node and broadcast the transaction";
 
@@ -1589,6 +1653,12 @@ impl BuyerPoolStore for ForgetFaults {
     ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
         self.0
             .rebase_delegate_progress(deployment, lane, anchor, totals)
+    }
+
+    fn lane_salt(
+        &self,
+    ) -> Result<decdn_incentive::lane_signer::LaneSalt, decdn_incentive::StoreError> {
+        self.0.lane_salt()
     }
 }
 

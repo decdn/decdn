@@ -77,7 +77,7 @@ use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
 
-use super::fetch::{BlobFetch, Credential, resolve_chain};
+use super::fetch::{BlobFetch, Credential, MAX_MANIFEST_BYTES, manifest_cap_mb, resolve_chain};
 use crate::known_chains;
 
 mod worker;
@@ -113,9 +113,6 @@ const GIVE_UP_AFTER_SECS: u64 = 120;
 /// pull stripes across up to `--max-sources` holders, so this also bounds the
 /// streams the gateway opens on one node's connection.
 const MAX_PULLS: usize = 16;
-
-/// The largest bundle manifest the gateway reads into memory.
-const MAX_MANIFEST_BYTES: usize = 64 << 20;
 
 /// The most parsed manifests the gateway keeps.
 const MAX_CACHED_MANIFESTS: usize = 16;
@@ -638,6 +635,9 @@ impl ManifestCache {
 enum PullError {
     /// The capability cannot pay for the rest.
     Funding(anyhow::Error),
+    /// The blob cannot be read as a bundle manifest: it is over the manifest
+    /// cap, or its bytes do not parse as one. Nothing upstream failed.
+    NotManifest(anyhow::Error),
     Other(anyhow::Error),
 }
 
@@ -953,6 +953,9 @@ impl Gateway {
                     tracing::info!(error = %e, host = %page_host, "a capability ran out");
                     self.mark_spent(paying.signer.address()).await;
                 }
+                Err(PullError::NotManifest(e)) => {
+                    return text(StatusCode::NOT_FOUND, &format!("{e:#}\n"));
+                }
                 Err(PullError::Other(e)) => {
                     return text(StatusCode::BAD_GATEWAY, &format!("{e:#}\n"));
                 }
@@ -975,7 +978,9 @@ impl Gateway {
                 &format!("the bundle has no entry {path:?}\n"),
             ));
         };
-        let hash = parse_hash(&entry.hash).map_err(PullError::Other)?;
+        let hash = parse_hash(&entry.hash)
+            .with_context(|| format!("bundle entry {path:?} has a malformed hash"))
+            .map_err(PullError::Other)?;
         self.stream(hash, namespace, paying, Some(path), entry.size)
             .await
     }
@@ -1020,7 +1025,8 @@ impl Gateway {
             .get(hash)
     }
 
-    /// The bundle manifest `hash`, from the cache or pulled once.
+    /// The bundle manifest `hash`, from the cache or pulled once. The pull
+    /// requests, and so pays for, at most the manifest cap.
     async fn manifest(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -1036,7 +1042,16 @@ impl Gateway {
         if let Some(manifest) = self.cached_manifest(&hash) {
             return Ok(manifest);
         }
-        let (first, mut reader, done) = self.start_pull(hash, namespace, paying).await?;
+        let cap_mb = manifest_cap_mb(self.common.max_blob_mb);
+        let raw = raw_blob_hint(hash, namespace);
+        // The raw blob pulls under the gateway's own cap, so it is a way past
+        // the manifest cap only when that cap is higher.
+        let raw_past_cap = (self.common.max_blob_mb == 0 || cap_mb < self.common.max_blob_mb)
+            .then_some(raw.as_str());
+        let (first, mut reader, done) = self
+            .start_pull(hash, namespace, paying, cap_mb)
+            .await
+            .map_err(|e| over_manifest_cap(e, cap_mb, raw_past_cap))?;
         let mut bytes = first.to_vec();
         let mut buf = vec![0u8; CHUNK_BYTES];
         loop {
@@ -1048,17 +1063,22 @@ impl Gateway {
                 break;
             }
             bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
+            // A backstop: the manifest cap ends the pull before this.
             if bytes.len() > MAX_MANIFEST_BYTES {
-                return Err(PullError::Other(anyhow::anyhow!(
-                    "the manifest is larger than {MAX_MANIFEST_BYTES} bytes"
+                return Err(PullError::NotManifest(anyhow::anyhow!(
+                    "the blob is larger than {MAX_MANIFEST_BYTES} bytes, the most this \
+                     gateway reads as a bundle manifest"
                 )));
             }
         }
-        finished(done).await?;
+        finished(done)
+            .await
+            .map_err(|e| over_manifest_cap(e, cap_mb, raw_past_cap))?;
+        // The blob fits under the manifest cap, so it fits under the gateway's.
         let manifest = Arc::new(
             BundleManifest::parse(&bytes)
-                .context("not a bundle manifest; drop the trailing `/` to fetch the raw blob")
-                .map_err(PullError::Other)?,
+                .with_context(|| format!("not a bundle manifest; {raw}"))
+                .map_err(PullError::NotManifest)?,
         );
         self.manifests
             .lock()
@@ -1077,7 +1097,9 @@ impl Gateway {
         path: Option<&str>,
         size: Option<u64>,
     ) -> Result<Response<Body>, PullError> {
-        let (first, reader, done) = self.start_pull(hash, namespace, paying).await?;
+        let (first, reader, done) = self
+            .start_pull(hash, namespace, paying, self.common.max_blob_mb)
+            .await?;
         let state = (Some(first), reader, Some(done));
         let gateway = Arc::clone(self);
         let signer = paying.signer.address();
@@ -1130,23 +1152,27 @@ impl Gateway {
             .map_err(|e| PullError::Other(e.into()))
     }
 
-    /// Hand the pull of `hash` to the worker, and wait for its first verified
-    /// bytes. The pull writes into a pipe the response reads from.
+    /// Hand the pull of `hash` to the worker, capped at `max_blob_mb`, and wait
+    /// for its first verified bytes. The pull writes into a pipe the response
+    /// reads from.
     async fn start_pull(
         self: &Arc<Self>,
         hash: [u8; 32],
         namespace: Option<u64>,
         paying: &Paying,
+        max_blob_mb: u64,
     ) -> Result<(Bytes, DuplexStream, oneshot::Receiver<anyhow::Result<()>>), PullError> {
         let (writer, mut reader) = tokio::io::duplex(PIPE_BYTES);
         let (done_tx, done_rx) = oneshot::channel();
+        let mut common = self.common.clone();
+        common.max_blob_mb = max_blob_mb;
         self.pulls
             .pull(Job {
                 blob: BlobFetch {
                     hash,
                     output: PathBuf::from("-"),
                     namespace,
-                    common: self.common.clone(),
+                    common,
                 },
                 paying: Credential {
                     signer: Arc::clone(&paying.signer),
@@ -1209,9 +1235,34 @@ fn classify(e: anyhow::Error) -> PullError {
     }
 }
 
+/// Mark a manifest pull that the cap of `cap_mb` ended as
+/// [`PullError::NotManifest`]: the gateway reads no larger blob as a manifest.
+/// `raw` is the hint to fetch the raw blob, when the gateway serves it.
+fn over_manifest_cap(e: PullError, cap_mb: u64, raw: Option<&str>) -> PullError {
+    match e {
+        PullError::Other(e) if e.downcast_ref::<decdn_client::BlobTooLarge>().is_some() => {
+            let hint = raw.map_or_else(String::new, |raw| format!("; {raw}"));
+            PullError::NotManifest(e.context(format!(
+                "the blob is larger than {cap_mb} MiB, the most this gateway reads as a \
+                 bundle manifest{hint}"
+            )))
+        }
+        e => e,
+    }
+}
+
+/// The hint to fetch blob `hash` raw, at its gateway path.
+fn raw_blob_hint(hash: [u8; 32], namespace: Option<u64>) -> String {
+    let uri = DecdnUri::new(hash, UriTarget::Blob, namespace).to_string();
+    let path = uri.strip_prefix(decdn_client::uri::SCHEME).unwrap_or(&uri);
+    format!("fetch `/{path}` for the raw blob")
+}
+
 fn pull_error_text(e: &PullError) -> String {
     match e {
-        PullError::Funding(e) | PullError::Other(e) => format!("{e:#}"),
+        PullError::Funding(e) | PullError::NotManifest(e) | PullError::Other(e) => {
+            format!("{e:#}")
+        }
     }
 }
 

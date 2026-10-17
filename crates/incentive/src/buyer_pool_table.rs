@@ -24,6 +24,10 @@
 //! the voucher watermarks of a key that signs on a pool another owner funds.
 //! Only a delegated client writes it.
 //!
+//! It can also hold the lane-salt table (`LANE_SALT_TABLE`): the one
+//! [`LaneSalt`] a client data dir derives its lane signer from
+//! ([`crate::lane_signer`]). Only a client reads or writes it.
+//!
 //! The operations here never assume they own the file or that the buyer
 //! table is the only table in it — that is what makes the node's
 //! multi-table layout safe to serve from the same code.
@@ -38,6 +42,7 @@ use crate::buyer_pool::{
 };
 use crate::deployment::Deployment;
 use crate::lane::{LaneKey, PoolId};
+use crate::lane_signer::{LANE_SALT_LEN, LaneSalt};
 use crate::store::StoreError;
 
 /// The buyer table: name, key type, and value type.
@@ -125,6 +130,21 @@ const DELEGATE_LANE_TABLE: TableDefinition<
     &'static [u8; DELEGATE_LANE_KEY_LEN],
     &'static [u8],
 > = TableDefinition::new("buyer_delegate_lanes_v1");
+
+/// The lane-salt table: [`LANE_SALT_KEY`] → the [`LaneSalt`] this file's
+/// client derives its lane signer from ([`crate::lane_signer`]).
+///
+/// The salt sits in the same file as the lanes it keys, so a data dir's lane
+/// records and the signer they name are created, copied and lost together.
+/// The table holds one row, written once and never changed: a new salt derives
+/// a new signer, which leaves every recorded lane under a key that no longer
+/// signs. The same frozen-identifier rule as [`BUYER_POOL_TABLE`] applies to
+/// the name.
+const LANE_SALT_TABLE: TableDefinition<'static, &'static str, &'static [u8; LANE_SALT_LEN]> =
+    TableDefinition::new("buyer_lane_salt_v1");
+
+/// The one key of [`LANE_SALT_TABLE`].
+const LANE_SALT_KEY: &str = "lane_salt";
 
 /// The delegate-lane record `schema_version` this binary reads and writes.
 /// Matched exactly, as [`BUYER_SUPPORTED_SCHEMA_VERSION`] is.
@@ -977,6 +997,68 @@ impl<'a> BuyerPoolTable<'a> {
             ));
         }
         Ok(out)
+    }
+
+    /// The [`LaneSalt`] this file's client derives its lane signer from,
+    /// created on first call ([`crate::lane_signer`]).
+    ///
+    /// A read finds the salt on every call after the first. When it is absent,
+    /// one durable write transaction reads again and inserts a fresh salt only
+    /// if the row is still absent, so two callers that race on a new file both
+    /// get the salt the first commit wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if the table is unreadable or the write cannot
+    /// commit.
+    pub fn lane_salt(&self) -> Result<LaneSalt, StoreError> {
+        if let Some(salt) = self.read_lane_salt()? {
+            return Ok(salt);
+        }
+        let write_txn = self.begin_durable_write()?;
+        let salt = {
+            let mut table = write_txn
+                .open_table(LANE_SALT_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table (lane salt): {err}")))?;
+            let recorded = table
+                .get(LANE_SALT_KEY)
+                .map_err(|err| StoreError::Backend(format!("get (lane salt): {err}")))?
+                .map(|guard| LaneSalt::from_bytes(*guard.value()));
+            if let Some(salt) = recorded {
+                return Ok(salt);
+            }
+            let salt = LaneSalt::random();
+            table
+                .insert(LANE_SALT_KEY, salt.as_bytes())
+                .map_err(|err| StoreError::Backend(format!("insert (lane salt): {err}")))?;
+            salt
+        };
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (lane salt): {err}")))?;
+        Ok(salt)
+    }
+
+    /// The recorded lane salt, or `None` when the table or its row is absent.
+    fn read_lane_salt(&self) -> Result<Option<LaneSalt>, StoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let table = match read_txn.open_table(LANE_SALT_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => {
+                return Err(StoreError::Backend(format!(
+                    "open_table (lane salt): {err}"
+                )));
+            }
+        };
+        let salt = table
+            .get(LANE_SALT_KEY)
+            .map_err(|err| StoreError::Backend(format!("get (lane salt): {err}")))?
+            .map(|guard| LaneSalt::from_bytes(*guard.value()));
+        Ok(salt)
     }
 
     /// Atomically advance the delegate lane `lane` on `deployment` to `totals`

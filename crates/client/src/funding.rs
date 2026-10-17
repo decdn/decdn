@@ -3,33 +3,34 @@
 //! that runs low; and the funding recovery step the acquire loop asks for at
 //! an exhausted candidate set ([`PoolFunder`]).
 //!
-//! The run's funding facts ([`RunFunding`]) are shared by every lane build:
-//! the pool's spend outside the run's lanes, the pool the run pays from, and a
-//! wallet too short of USDC to top it up.
+//! The run's funding facts ([`RunFunding`]) are shared by every lane build and
+//! funding recovery step: the pool's spend outside the run's lanes, the pool
+//! the run pays from, a wallet too short of USDC to top it up, and the handle
+//! that holds the run's unconfirmed `openPool`s and `topUp`s
+//! ([`UnconfirmedEscrows`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::payment_pool::{PaymentPool, newest_solvent_owned_pool};
+use decdn_incentive::tx::RECEIPT_TIMEOUT;
 use decdn_incentive::{CapabilityGrant, Deployment, LaneKey, PoolId, bind_node_id_domain};
 use iroh::Endpoint;
 
 use crate::buyer_pool::{
-    LOW_WATER_DIVISOR, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, UnconfirmedOpens,
+    LOW_WATER_DIVISOR, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, UnconfirmedEscrows,
     WalletShortfall, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool,
     pool_accepts_funds, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
 };
 use crate::lanes::LaneDeps;
 use crate::session::{ChainAdoption, ChainConfig, DepositPolicy};
 use crate::source::{Funder, SourceFuture};
-use crate::{
-    NoAffordableSource, PoolContext, PoolLedger, PoolReplaced, Recovery, sign_client_binding,
-};
+use crate::{NoAffordableSource, PoolContext, PoolLedger, PoolReplaced, Recovery};
 
 /// A pool status as the operator reads it.
 const fn status_label(status: PaymentPool::Status) -> &'static str {
@@ -67,7 +68,8 @@ pub fn cached_pool_token(
 /// What the lane builds of one run learn about funding its pool, shared by
 /// every fetch of the run: one blob fetch, or every entry of a bundle pull.
 ///
-/// It holds two facts. The first is the pool's spend across every lane: a
+/// It holds what the run's lane builds and recovery steps share. The first is
+/// the pool's spend across every lane: a
 /// baseline for the lanes the run does not drive, plus what each lane the run
 /// built has committed since. The deposit gate reads it
 /// ([`Funder::pool_spent`]), so a pool shared across many providers gates on its
@@ -78,14 +80,23 @@ pub fn cached_pool_token(
 /// `warning:` line naming it. It also names the pool the run's first built
 /// lane pays from, which a funding recovery step tops up: every entry of a
 /// bundle pull shares it, the entries that have built no lane yet included.
-/// Every `openPool` a lane build or a recovery step sends is held in its
-/// [`UnconfirmedOpens`] until its receipt is read.
+/// Every `openPool` and `topUp` a lane build or a recovery step sends is held
+/// in its [`UnconfirmedEscrows`] until its receipt is read. The run sends one
+/// `topUp` at a time, and while the handle holds one that may have been
+/// broadcast but is not known to have mined ([`TopUpUnconfirmed`]), every later
+/// `topUp` sent through the same handle is refused with it: in this run, or in
+/// a later pass or fetch that shares the handle.
 #[derive(Debug, Default)]
 pub struct RunFunding {
     spend: Mutex<RunSpend>,
     shortfall: Mutex<Option<String>>,
     pool_id: OnceLock<PoolId>,
-    opens: UnconfirmedOpens,
+    escrows: UnconfirmedEscrows,
+    /// Held across each `topUp` of the run, from the refusal check on
+    /// `escrows` to the `topUp`'s outcome, so the check and the send it allows
+    /// are one step within this run. A handle shared with another live
+    /// `RunFunding` is not serialized by it.
+    top_up_serial: tokio::sync::Mutex<()>,
 }
 
 /// What a lane build learned about the pool's spend, for
@@ -121,21 +132,22 @@ struct RunSpend {
 }
 
 impl RunFunding {
-    /// A run whose `openPool` transactions are held in `opens`, a handle the
-    /// caller keeps after the run's state is dropped. A caller that builds a
-    /// `RunFunding` per pass passes the same handle to each.
+    /// A run whose `openPool` and `topUp` transactions are held in `escrows`,
+    /// a handle the caller keeps after the run's state is dropped. A caller
+    /// that builds a `RunFunding` per pass passes the same handle to each, so
+    /// a `topUp` one pass left unconfirmed refuses the next pass's.
     #[must_use]
-    pub fn reporting_opens_to(opens: UnconfirmedOpens) -> Self {
+    pub fn reporting_escrows_to(escrows: UnconfirmedEscrows) -> Self {
         Self {
-            opens,
+            escrows,
             ..Self::default()
         }
     }
 
-    /// The handle that holds the run's `openPool` transactions whose receipt
-    /// was not read ([`UnconfirmedOpens::pending`]).
-    pub const fn opens(&self) -> &UnconfirmedOpens {
-        &self.opens
+    /// The handle that holds the run's `openPool` and `topUp` transactions
+    /// whose receipt was not read ([`UnconfirmedEscrows::pending`]).
+    pub const fn escrows(&self) -> &UnconfirmedEscrows {
+        &self.escrows
     }
 
     /// Name `pool_id` as the pool the run's lanes pay from. The first lane
@@ -272,8 +284,10 @@ impl RunFunding {
 
 /// A self-owned pool's [`Funder`]: the funding recovery step (ADR 003 § Funding
 /// recovery). A self-funded owner tops its current pool up toward the working
-/// deposit through the same `ensure_allowance -> top_up -> add_deposit` path
-/// as the proactive low-water refill (`refill_if_low`). A pool that is
+/// deposit through the same allowance → `topUp` → `add_deposit` path as the
+/// proactive low-water refill (`escrow_top_up`, then `add_deposit`). Once a
+/// `topUp` of the run is unconfirmed, the step sends none and fails with it.
+/// A pool that is
 /// `Closing` or `Closed` reverts that `topUp` with `PoolNotOpen`; the owner
 /// then opens a new pool at the working deposit and records it as the current
 /// pool in the buyer store, and the step reports [`Recovery::Replaced`]. The
@@ -292,8 +306,6 @@ pub struct PoolFunder<'a, P> {
     pub(crate) rpc: &'a P,
     pub(crate) store: &'a dyn BuyerPoolStore,
     pub(crate) owner: Address,
-    /// Signs a replacement pool's `openPool` and its self-issued capability.
-    pub(crate) signer: Arc<PrivateKeySigner>,
     /// The chain and `PaymentPool` a replacement pool opens on.
     pub(crate) deployment: Deployment,
     pub(crate) token: Address,
@@ -303,8 +315,8 @@ pub struct PoolFunder<'a, P> {
     pub(crate) working_deposit: U256,
     pub(crate) max_approve: bool,
     /// The run's funding facts: its outside spend, a wallet shortfall that
-    /// makes a further top-up pointless, and the pool to top up
-    /// ([`RunFunding::pool_id`]).
+    /// makes a further top-up pointless, an unconfirmed `topUp` that makes one
+    /// unsafe, and the pool to top up ([`RunFunding::pool_id`]).
     pub(crate) funding: &'a RunFunding,
 }
 
@@ -336,6 +348,7 @@ where
                 .funding
                 .pool_id()
                 .ok_or_else(|| anyhow::anyhow!("no payment lane is built, so no pool to top up"))?;
+            let remaining = self.chain_remaining(pool_id, remaining).await;
             let additional = self.working_deposit.saturating_sub(remaining);
             if additional.is_zero() {
                 return self.settle_or_replace(pool_id, remaining).await;
@@ -346,24 +359,15 @@ where
                         .context(WalletShortfall),
                 );
             }
-            // `topUp` pulls `additional` USDC via `transferFrom`, so the
-            // standing allowance must cover it first: unlimited under
-            // `--max-approve`, else exactly `additional`.
-            let escrowed = async {
-                ensure_allowance(
-                    self.rpc,
-                    self.token,
-                    self.owner,
-                    self.payment_pool_addr,
-                    if self.max_approve {
-                        None
-                    } else {
-                        Some(additional)
-                    },
-                )
-                .await?;
-                top_up(self.contract, self.owner, pool_id, additional).await
-            }
+            let escrowed = escrow_top_up(
+                self.funding,
+                self.contract,
+                self.token,
+                self.owner,
+                pool_id,
+                additional,
+                self.max_approve,
+            )
             .await;
             // A failure before any receipt names its cause once: a wallet
             // short of USDC is recorded for the run's closing warning.
@@ -411,6 +415,39 @@ impl<P> PoolFunder<'_, P>
 where
     P: alloy::providers::Provider + Clone,
 {
+    /// The pool's remaining deposit for a recovery step: the run's `remaining`,
+    /// capped at what the chain shows.
+    ///
+    /// Other signers share the pool, such as another data dir on the wallet
+    /// ([`decdn_incentive::lane_signer`]). Their redemptions reach the run only
+    /// from chain, and can land while the run is going. So the step reads
+    /// `getPool` and counts at least `totalRedeemed` as spent
+    /// ([`BuyerPoolState::reconcile_with_chain`]). Without it, a pool drained
+    /// by another signer reads full here, the step only settles, and the run
+    /// ends "funding needed" with a funded wallet. A failed read keeps the
+    /// run's view.
+    async fn chain_remaining(&self, pool_id: PoolId, remaining: U256) -> U256 {
+        match self.contract.getPool(pool_id).call().await {
+            Ok(pool) if pool.owner == self.owner => {
+                let spent = self
+                    .funding
+                    .pool_spent()
+                    .unwrap_or(U256::ZERO)
+                    .max(U256::from(pool.totalRedeemed));
+                remaining.min(U256::from(pool.deposit).saturating_sub(spent))
+            }
+            Ok(_) => remaining,
+            Err(error) => {
+                tracing::debug!(
+                    %pool_id,
+                    %error,
+                    "could not read the buyer pool; the funding step uses the run's view"
+                );
+                remaining
+            }
+        }
+    }
+
     /// The recovery step for a pool that already holds its working deposit,
     /// so a top-up has nothing to add. A `topUp` gas estimate (no transaction)
     /// tells a closing or closed pool, which a new pool replaces. An open pool
@@ -486,12 +523,12 @@ where
         .await?;
         let opened = open_pool(
             self.contract,
-            Arc::clone(&self.signer),
             self.deployment,
             self.token,
             self.owner,
             deposit,
-            Some(self.funding.opens()),
+            Some(self.funding.escrows()),
+            Some(RECEIPT_TIMEOUT),
         )
         .await?;
         self.store
@@ -502,22 +539,43 @@ where
     }
 }
 
+/// The keys one lane signs under, resolved when the lane is built.
+pub(crate) enum LaneKeys<'p> {
+    /// The buyer's own pool: the owner key owns it, the lane key signs.
+    Owned(&'p OwnedPayer),
+    /// A pool another owner funds: `signer` is the delegate `grant` authorizes.
+    Delegated {
+        /// The delegate key.
+        signer: Arc<PrivateKeySigner>,
+        /// The owner's capability for `signer`.
+        grant: CapabilityGrant,
+    },
+}
+
+impl LaneKeys<'_> {
+    /// The key the lane's vouchers sign under.
+    pub(crate) const fn lane_signer(&self) -> &Arc<PrivateKeySigner> {
+        match self {
+            Self::Owned(payer) => payer.lane(),
+            Self::Delegated { signer, .. } => signer,
+        }
+    }
+}
+
 /// Select the pool context for one lane of `deps`' run: the delegated
-/// adoption path when a [`CapabilityGrant`] is present (adopt the named pool,
-/// present the owner's capability, no open), else the self-owned
-/// open-or-reuse path.
+/// adoption path for [`LaneKeys::Delegated`] (adopt the named pool, present
+/// the owner's capability, no open), else the self-owned open-or-reuse path.
 pub(crate) async fn build_ctx_for_fetch<P>(
     deps: &LaneDeps<'_, P>,
-    grant: Option<&CapabilityGrant>,
-    signer: &Arc<PrivateKeySigner>,
+    keys: &LaneKeys<'_>,
     voucher_dom: &Eip712Domain,
     provider: Address,
 ) -> anyhow::Result<(PoolContext, Option<LaneSpend>)>
 where
     P: alloy::providers::Provider + Clone,
 {
-    if let Some(grant) = grant {
-        build_delegated_pool_ctx(
+    match keys {
+        LaneKeys::Delegated { signer, grant } => build_delegated_pool_ctx(
             deps.store.as_ref(),
             deps.contract,
             signer,
@@ -528,18 +586,17 @@ where
             grant,
         )
         .await
-        .map(|ctx| (ctx, None))
-    } else {
-        build_pool_ctx(deps, signer, provider)
+        .map(|ctx| (ctx, None)),
+        LaneKeys::Owned(payer) => build_pool_ctx(deps, payer, provider)
             .await
-            .map(|(ctx, spend)| (ctx, Some(spend)))
+            .map(|(ctx, spend)| (ctx, Some(spend))),
     }
 }
 
 /// [`open_or_reuse_pool`] plus the ADR 005 client identity binding (#1115):
-/// sign our OWN iroh `NodeId` with the buyer key so the serving node can prove
-/// we own the pool and reactively pull a cache-missed blob from its configured
-/// origin.
+/// sign our OWN iroh `NodeId` with the lane key, so the serving node can prove
+/// the request comes from the lane's signer and reactively pull a cache-missed
+/// blob for it.
 ///
 /// The bind domain's verifying contract is the `CapacityBond`; without one
 /// configured we can't sign, so the request goes out unbound and the node serves
@@ -549,7 +606,7 @@ where
 /// of failure.
 async fn build_pool_ctx<P>(
     deps: &LaneDeps<'_, P>,
-    signer: &Arc<PrivateKeySigner>,
+    payer: &OwnedPayer,
     provider: Address,
 ) -> anyhow::Result<(PoolContext, LaneSpend)>
 where
@@ -560,15 +617,14 @@ where
         deps.contract,
         deps.rpc,
         deps.funding,
-        signer,
+        payer,
         provider,
-        deps.self_address,
         deps.chain.deployment(),
         deps.deposit,
     )
     .await?;
     Ok((
-        attach_client_binding(ctx, deps.chain, deps.endpoint, signer)?,
+        attach_client_binding(ctx, deps.chain, deps.endpoint)?,
         spend,
     ))
 }
@@ -588,9 +644,8 @@ where
 /// `(pool, this signer, provider)` on this deployment
 /// ([`BuyerPoolStore::delegate_lanes`]); a delegate that has never streamed this
 /// lane starts at zero. The ADR 005 client binding is attached the same as the
-/// self-owned path — it only authorizes reactive origin pull-through when the
-/// binding owner also owns the pool, which a delegate does not, so a cache miss
-/// still refuses (already-cached content serves and is paid via the capability).
+/// self-owned path: the delegate signs it, so the serving node can tie the
+/// request to the delegate's lane.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_delegated_pool_ctx<P>(
     store: &dyn BuyerPoolStore,
@@ -658,13 +713,15 @@ where
     let ctx = PoolContext::for_pool(&state, Arc::clone(signer), voucher_dom.clone())
         .with_provider(provider, prior_bytes, prior_amount)
         .with_capability(signed_capability);
-    attach_client_binding(ctx, chain, endpoint, signer)
+    attach_client_binding(ctx, chain, endpoint)
 }
 
 /// Attach the ADR 005 client identity binding to an already-built
-/// [`PoolContext`] (#1115): sign our OWN iroh `NodeId` with the buyer key so
-/// the serving node can prove we own the pool and reactively pull a
-/// cache-missed blob from its configured origin. Separate from
+/// [`PoolContext`] (#1115): sign our OWN iroh `NodeId` with the context's
+/// `client_signer`, the key the lane's vouchers sign under
+/// ([`PoolContext::bind_endpoint`]). The serving node keys the lane on the
+/// binding's signer, so a binding signed by any other key names a lane the
+/// vouchers do not pay on, and the node refuses the request. Separate from
 /// [`build_pool_ctx`] so a bundle pull — which takes the `open_lock`
 /// itself around [`open_or_reuse_pool`] — can attach the same binding outside
 /// that critical section.
@@ -675,14 +732,14 @@ pub(crate) fn attach_client_binding(
     ctx: PoolContext,
     chain: &ChainConfig,
     endpoint: &Endpoint,
-    signer: &Arc<PrivateKeySigner>,
 ) -> anyhow::Result<PoolContext> {
     let Some(capacity_bond) = chain.capacity_bond else {
         return Ok(ctx);
     };
-    let bind_dom = bind_node_id_domain(chain.chain_id, capacity_bond);
-    let own_node_id = B256::from(*endpoint.id().as_bytes());
-    Ok(ctx.with_client_binding(sign_client_binding(signer, own_node_id, &bind_dom)?))
+    ctx.bind_endpoint(
+        endpoint,
+        &bind_node_id_domain(chain.chain_id, capacity_bond),
+    )
 }
 
 /// Adopt the live pool `owner` already holds on `deployment`, recording it in
@@ -860,6 +917,10 @@ where
 /// this owner's pool `Closing` or `Closed`. A failed read, or a pool the chain
 /// holds no record of yet, keeps `state`: a lagging RPC can miss a pool opened
 /// moments ago, and replacing it on that read would escrow a second deposit.
+/// An open pool's `state` takes in its on-chain deposit and redeemed spend
+/// ([`BuyerPoolState::reconcile_with_chain`]), so the run's funding counts what
+/// other signers on the pool spent. This is a run's first lane build, so the
+/// reconciled spend sets the run's baseline ([`RunFunding::join_lane`]).
 async fn still_open<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     self_address: Address,
@@ -878,6 +939,13 @@ where
                 "the tracked buyer pool no longer accepts work; a new pool replaces it"
             );
             None
+        }
+        // The pool is open: take in the top-ups and redemptions of the other
+        // signers that share it, which reach this row only from chain.
+        Ok(pool) if pool.owner == self_address => {
+            let mut state = state;
+            state.reconcile_with_chain(U256::from(pool.deposit), U256::from(pool.totalRedeemed));
+            Some(state)
         }
         Ok(_) => Some(state),
         Err(error) => {
@@ -969,6 +1037,62 @@ fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
     ))
 }
 
+/// Top `pool_id` up by `additional` from `owner`: ensure the pool's standing
+/// USDC allowance covers it (unlimited under `max_approve`, else exactly
+/// `additional`), since `topUp` pulls it via `transferFrom`, then send `topUp`
+/// and read its receipt within [`RECEIPT_TIMEOUT`].
+///
+/// The proactive refill, under `open_lock`, and the funding recovery step,
+/// under [`RecoveryGate`](crate::RecoveryGate)'s step lock, both escrow through
+/// here. Those two locks do not exclude each other, so the call holds the
+/// run's `topUp` lock in `funding` from its check to its outcome: a second
+/// caller waits for the first `topUp` to resolve. A `topUp` that may have been
+/// broadcast but is not known to have mined ([`TopUpUnconfirmed`]: a lapsed or
+/// failed receipt read, a submit lost in transport, or a future dropped before
+/// either) may still mine, so the run's [`UnconfirmedEscrows`] keeps it. Every
+/// later call through the same handle refuses with it instead of escrowing a
+/// second deposit, and the acquire loop classifies that as fatal to the
+/// command ([`crate::Fault::Fatal`]).
+///
+/// # Errors
+///
+/// The run holds an unconfirmed `topUp`, or the allowance or `topUp` leg fails.
+async fn escrow_top_up<P>(
+    funding: &RunFunding,
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    token: Address,
+    owner: Address,
+    pool_id: PoolId,
+    additional: U256,
+    max_approve: bool,
+) -> anyhow::Result<ToppedUpPool>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let _serial = funding.top_up_serial.lock().await;
+    if let Some(earlier) = funding.escrows.top_ups().first().copied() {
+        return Err(anyhow::Error::new(earlier)
+            .context("refusing a second topUp while an earlier one is unconfirmed"));
+    }
+    ensure_allowance(
+        contract.provider(),
+        token,
+        owner,
+        *contract.address(),
+        if max_approve { None } else { Some(additional) },
+    )
+    .await?;
+    top_up(
+        contract,
+        owner,
+        pool_id,
+        additional,
+        Some(&funding.escrows),
+        Some(RECEIPT_TIMEOUT),
+    )
+    .await
+}
+
 /// Restore `state`'s remaining deposit (`deposit - spent`) to `working_deposit`
 /// once it falls below the low water — see [`refill_amount`] — and return the
 /// row to build the lane on.
@@ -984,7 +1108,9 @@ fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
 /// receipt ([`TopUpUnconfirmed`]) may have escrowed, and once `topUp` returns a
 /// receipt the escrow has moved, so a failure to credit or re-read the local
 /// row ([`escrowed_but_untracked`]) is fatal: the acquire loop ends the
-/// command instead of retrying, because a retry escrows again.
+/// command instead of retrying, because a retry escrows again. A refill after
+/// an earlier `topUp` of the run went unconfirmed sends nothing and fails with
+/// that held [`TopUpUnconfirmed`] ([`escrow_top_up`]), fatal the same way.
 #[allow(clippy::too_many_arguments)]
 async fn refill_if_low<P>(
     store: &dyn BuyerPoolStore,
@@ -1020,20 +1146,15 @@ where
         state.pool_id,
         state.deposit,
     );
-    // `topUp` pulls `additional` USDC via `transferFrom`, so the pool's
-    // standing allowance must cover it first. Ensure it in the caller's
-    // mode: unlimited under `--max-approve`, else exactly `additional`.
-    let escrowed = async {
-        ensure_allowance(
-            rpc,
-            state.token,
-            self_address,
-            *contract.address(),
-            if max_approve { None } else { Some(additional) },
-        )
-        .await?;
-        top_up(contract, self_address, state.pool_id, additional).await
-    }
+    let escrowed = escrow_top_up(
+        funding,
+        contract,
+        state.token,
+        self_address,
+        state.pool_id,
+        additional,
+        max_approve,
+    )
     .await;
     let err = match escrowed {
         Ok(ToppedUpPool { credited, tx, .. }) => {
@@ -1118,15 +1239,15 @@ pub(crate) async fn open_or_reuse_pool<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     rpc: &P,
     funding: &RunFunding,
-    signer: &Arc<PrivateKeySigner>,
+    payer: &OwnedPayer,
     provider: Address,
-    self_address: Address,
     deployment: Deployment,
     deposit: DepositPolicy,
 ) -> anyhow::Result<(PoolContext, LaneSpend)>
 where
     P: alloy::providers::Provider + Clone,
 {
+    let self_address = payer.owner().address();
     let DepositPolicy {
         working_deposit,
         max_approve,
@@ -1138,7 +1259,7 @@ where
     if let Some(state) = tracked {
         let lane = LaneKey {
             pool_id: state.pool_id,
-            signer: self_address,
+            signer: payer.lane().address(),
             provider,
         };
         let recorded = state.lane_progress(lane).is_some();
@@ -1178,7 +1299,7 @@ where
         };
         return self_owned_lane_ctx(
             &state,
-            signer,
+            payer,
             &deployment.voucher_domain(),
             provider,
             prior_bytes,
@@ -1204,12 +1325,12 @@ where
     ensure_allowance(rpc, token, self_address, payment_pool_addr, approve_amount).await?;
     let opened = open_pool(
         contract,
-        Arc::clone(signer),
         deployment,
         token,
         self_address,
         deposit,
-        Some(funding.opens()),
+        Some(funding.escrows()),
+        Some(RECEIPT_TIMEOUT),
     )
     .await?;
     // The deposit is escrowed on-chain; a failed local record leaves it
@@ -1224,13 +1345,15 @@ where
         recorded: false,
         from_chain: false,
     };
-    Ok((
-        opened
-            .ctx
-            .with_provider(provider, U256::ZERO, U256::ZERO)
-            .with_capability(opened.capability),
-        spend,
-    ))
+    let ctx = self_owned_lane_ctx(
+        &opened.state,
+        payer,
+        &deployment.voucher_domain(),
+        provider,
+        U256::ZERO,
+        U256::ZERO,
+    )?;
+    Ok((ctx, spend))
 }
 
 #[cfg(test)]

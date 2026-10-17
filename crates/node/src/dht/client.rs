@@ -248,7 +248,9 @@ async fn exchange_on(conn: &Connection, payload: &[u8]) -> anyhow::Result<wire::
         .map_err(|e| anyhow::anyhow!("dht client: write request: {e}"))?;
     send.finish()
         .map_err(|e| anyhow::anyhow!("dht client: finish send: {e}"))?;
-    let frame = read_frame(&mut recv)
+    // Capped at the DHT frame ceiling: a peer's response cannot make this node
+    // buffer more than the largest legitimate DHT message.
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_DHT_FRAME)
         .await
         .map_err(|e| anyhow::Error::new(e).context("dht client: read response"))?;
     let (msg, _tail) = decode_message::<wire::DhtMessage>(&frame)

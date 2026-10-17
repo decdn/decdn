@@ -116,6 +116,8 @@ pub const decdn_protocol::client::BINDING_SIG_LEN: usize
 pub const decdn_protocol::client::CHUNK_BYTES: u64
 pub const decdn_protocol::client::CHUNK_FRAME_HEADERS_MAX: usize
 pub const decdn_protocol::client::MAX_CHAIN_LENGTH: u8
+pub const decdn_protocol::client::MAX_CHUNK_FRAME: u32
+pub const decdn_protocol::client::MAX_CLIENT_CONTROL_FRAME: u32
 pub const decdn_protocol::client::MB_BYTES: u64
 pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize
@@ -203,6 +205,7 @@ pub decdn_protocol::dht::StoreRequest::holder: decdn_protocol::identity::NodeId
 pub struct decdn_protocol::dht::StoreRequestExt
 pub const decdn_protocol::dht::MAX_BATCH_STORE_HASHES: usize
 pub const decdn_protocol::dht::MAX_CLOSER_NODES: usize
+pub const decdn_protocol::dht::MAX_DHT_FRAME: u32
 pub const decdn_protocol::dht::MAX_PROVIDERS_PER_HASH: usize
 pub fn decdn_protocol::dht::encode_find_value_response(&decdn_protocol::dht::FindValueResponse, core::option::Option<&decdn_protocol::dht::FindValueResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::dht::encode_store_request(&decdn_protocol::dht::StoreRequest, core::option::Option<&decdn_protocol::dht::StoreRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
@@ -212,9 +215,10 @@ pub mod decdn_protocol::framing
 pub enum decdn_protocol::framing::FrameError
 pub decdn_protocol::framing::FrameError::Decode(postcard::error::Error)
 pub decdn_protocol::framing::FrameError::Io(core::io::error::Error)
-pub decdn_protocol::framing::FrameError::TooLarge(u32)
+pub decdn_protocol::framing::FrameError::TooLarge
+pub decdn_protocol::framing::FrameError::TooLarge::len: u64
+pub decdn_protocol::framing::FrameError::TooLarge::max: u32
 pub decdn_protocol::framing::FrameError::Varint
-pub const decdn_protocol::framing::MAX_MESSAGE_SIZE: u32
 pub trait decdn_protocol::framing::TopLevelEnum
 pub const decdn_protocol::framing::TopLevelEnum::VARIANT_COUNT: u32
 impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::client::ClientMessage
@@ -226,8 +230,8 @@ pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub fn decdn_protocol::framing::decode_message<M: serde_core::de::DeserializeOwned>(&[u8]) -> core::result::Result<(M, &[u8]), decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::framing::encode_message<M: serde_core::ser::Serialize>(&M) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::framing::is_unknown_variant<M: decdn_protocol::framing::TopLevelEnum>(&[u8]) -> bool
-pub fn decdn_protocol::framing::parse_frame(&[u8]) -> core::result::Result<core::option::Option<(usize, usize)>, decdn_protocol::framing::FrameError>
-pub async fn decdn_protocol::framing::read_frame<R: tokio::io::async_read::AsyncRead + core::marker::Unpin>(&mut R) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
+pub fn decdn_protocol::framing::parse_frame(&[u8], u32) -> core::result::Result<core::option::Option<(usize, usize)>, decdn_protocol::framing::FrameError>
+pub async fn decdn_protocol::framing::read_frame<R: tokio::io::async_read::AsyncRead + core::marker::Unpin>(&mut R, u32) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub async fn decdn_protocol::framing::write_frame<W: tokio::io::async_write::AsyncWrite + core::marker::Unpin>(&mut W, &[u8]) -> core::result::Result<(), decdn_protocol::framing::FrameError>
 pub mod decdn_protocol::identity
 #[repr(transparent)] pub struct decdn_protocol::identity::ContentHash(_)
@@ -294,6 +298,7 @@ pub decdn_protocol::message::ProbeResponseExt::coverage: decdn_protocol::coverag
 pub decdn_protocol::message::ProbeResponseExt::total_bytes: core::option::Option<u64>
 impl decdn_protocol::message::ProbeResponseExt
 pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, bool) -> bool
+pub const decdn_protocol::message::MAX_PROBE_FRAME: u32
 pub const decdn_protocol::message::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::message::SLASH_SIG_LEN: usize
 pub fn decdn_protocol::message::encode_probe_response(&decdn_protocol::message::ProbeResponse, core::option::Option<&decdn_protocol::message::ProbeResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
@@ -347,7 +352,9 @@ pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
 pub enum decdn_protocol::FrameError
 pub decdn_protocol::FrameError::Decode(postcard::error::Error)
 pub decdn_protocol::FrameError::Io(core::io::error::Error)
-pub decdn_protocol::FrameError::TooLarge(u32)
+pub decdn_protocol::FrameError::TooLarge
+pub decdn_protocol::FrameError::TooLarge::len: u64
+pub decdn_protocol::FrameError::TooLarge::max: u32
 pub decdn_protocol::FrameError::Varint
 pub enum decdn_protocol::MessageValidationError
 pub decdn_protocol::MessageValidationError::ChunkTooLarge
@@ -576,8 +583,11 @@ pub const decdn_protocol::DISCOVERY_BLOCK_BYTES: u64
 pub const decdn_protocol::ID_LEN: usize
 pub const decdn_protocol::MAX_BATCH_STORE_HASHES: usize
 pub const decdn_protocol::MAX_CHAIN_LENGTH: u8
+pub const decdn_protocol::MAX_CHUNK_FRAME: u32
+pub const decdn_protocol::MAX_CLIENT_CONTROL_FRAME: u32
 pub const decdn_protocol::MAX_CLOSER_NODES: usize
-pub const decdn_protocol::MAX_MESSAGE_SIZE: u32
+pub const decdn_protocol::MAX_DHT_FRAME: u32
+pub const decdn_protocol::MAX_PROBE_FRAME: u32
 pub const decdn_protocol::MAX_PROVIDERS_PER_HASH: usize
 pub const decdn_protocol::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::MB_BYTES: u64
@@ -609,5 +619,5 @@ pub fn decdn_protocol::parse_probe_response_ext(&[u8]) -> core::result::Result<d
 pub fn decdn_protocol::parse_store_request_ext(&[u8]) -> core::result::Result<decdn_protocol::dht::StoreRequestExt, postcard::error::Error>
 pub fn decdn_protocol::parse_stream_request_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamRequestExt, postcard::error::Error>
 pub fn decdn_protocol::parse_stream_response_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamResponseExt, postcard::error::Error>
-pub async fn decdn_protocol::read_frame<R: tokio::io::async_read::AsyncRead + core::marker::Unpin>(&mut R) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
+pub async fn decdn_protocol::read_frame<R: tokio::io::async_read::AsyncRead + core::marker::Unpin>(&mut R, u32) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub async fn decdn_protocol::write_frame<W: tokio::io::async_write::AsyncWrite + core::marker::Unpin>(&mut W, &[u8]) -> core::result::Result<(), decdn_protocol::framing::FrameError>

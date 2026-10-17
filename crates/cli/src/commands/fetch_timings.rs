@@ -5,7 +5,9 @@
 //! event named `fetch timings`. `RUST_LOG=info` or `-v` shows it. Each mark is
 //! cumulative, so a mark the fetch never reached shows as absent and the marks
 //! before it still read correctly. The event also counts the holders the fetch
-//! started with and the holders that joined it while it ran.
+//! started with and the holders that joined it while it ran. An entry URI to
+//! stdout reads its bundle manifest first, and that fetch logs its own event,
+//! with `output = "manifest"`.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};

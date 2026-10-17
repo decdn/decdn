@@ -998,6 +998,109 @@ fn free_dual_stack_port() -> u16 {
     panic!("no port free on both address families");
 }
 
+/// [`loopback_endpoint`] built with `transport`, the way the node builds its own.
+async fn loopback_endpoint_with_transport(
+    alpns: Vec<Vec<u8>>,
+    transport: QuicTransportConfig,
+) -> (Endpoint, EndpointAddr) {
+    let ep = Endpoint::builder(presets::Minimal)
+        .alpns(alpns)
+        .relay_mode(RelayMode::Disabled)
+        .transport_config(transport)
+        .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .expect("loopback bind address")
+        .bind()
+        .await
+        .expect("bind loopback endpoint");
+    let socket = *ep
+        .bound_sockets()
+        .iter()
+        .find(|a| a.is_ipv4())
+        .expect("an IPv4 bound socket");
+    let addr = EndpointAddr::new(ep.id()).with_ip_addr(socket);
+    (ep, addr)
+}
+
+/// The connection receive window bounds the stream data one peer can park in
+/// this node's transport buffers (ADR 013 § Wire Framing). The node's handler
+/// here accepts every stream and reads nothing, which is what a stalled request
+/// read looks like below `read_frame`. The peer writes into many streams at
+/// once; QUIC flow control must block it once the connection holds
+/// [`QUIC_CONNECTION_RECEIVE_WINDOW`] unread bytes, however many streams it
+/// spreads them over. Without the window the bound is one 1.25 MB stream window
+/// per stream, so these 16 streams would park about 20 MB.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_cannot_park_more_than_the_connection_receive_window() {
+    const ALPN: &[u8] = b"decdn/test/receive-window";
+    const STREAMS: usize = 16;
+    const PER_STREAM: usize = 2 * 1024 * 1024;
+    let (server, target) =
+        loopback_endpoint_with_transport(vec![ALPN.to_vec()], quic_transport_config().unwrap())
+            .await;
+    let server_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let conn = server
+                .accept()
+                .await
+                .unwrap()
+                .accept()
+                .unwrap()
+                .await
+                .unwrap();
+            // Hold every stream open and unread until the peer goes away.
+            let mut held = Vec::new();
+            while let Ok(stream) = conn.accept_bi().await {
+                held.push(stream);
+            }
+        })
+    };
+
+    let (client, _) = loopback_endpoint(vec![]).await;
+    let conn = client.connect(target, ALPN).await.unwrap();
+    let mut writers = JoinSet::new();
+    for _ in 0..STREAMS {
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        writers.spawn(async move {
+            let chunk = vec![0x5Au8; 16 * 1024];
+            let mut written = 0usize;
+            while written < PER_STREAM {
+                match tokio::time::timeout(Duration::from_millis(500), send.write_all(&chunk)).await
+                {
+                    Ok(Ok(())) => written += chunk.len(),
+                    // Blocked on flow control, or the stream closed: stop counting.
+                    _ => break,
+                }
+            }
+            (written, send, recv)
+        });
+    }
+    let mut parked = 0usize;
+    let mut streams = Vec::new();
+    while let Some(joined) = writers.join_next().await {
+        let (written, send, recv) = joined.unwrap();
+        parked += written;
+        streams.push((send, recv));
+    }
+
+    let window = QUIC_CONNECTION_RECEIVE_WINDOW as usize;
+    assert!(
+        parked <= window,
+        "the peer parked {parked} bytes, past the {window}-byte connection window"
+    );
+    // Non-vacuous: the writes did run into the window, not stop short of it.
+    assert!(
+        parked > window / 2,
+        "only {parked} bytes flowed; the test did not reach the window"
+    );
+
+    conn.close(0u32.into(), b"done");
+    drop(streams);
+    server_task.abort();
+    client.close().await;
+    server.close().await;
+}
+
 #[tokio::test]
 async fn build_endpoint_binds_ipv6_on_bind_port() {
     let port = free_dual_stack_port();

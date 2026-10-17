@@ -1439,6 +1439,10 @@ impl BuyerPoolStore for BuyerPoolStoreHandle {
         self.table()
             .rebase_delegate_progress(deployment, lane, anchor, totals)
     }
+
+    fn lane_salt(&self) -> Result<decdn_incentive::lane_signer::LaneSalt, StoreError> {
+        self.table().lane_salt()
+    }
 }
 
 impl PersistentPoolStateStore {

@@ -4,7 +4,7 @@ use decdn_common::cli::{Cli, Command, GetArgs};
 
 use std::path::PathBuf;
 
-use super::{Destination, parse_and_check};
+use super::{Destination, parse_and_check, streams_one_blob};
 
 const HEX: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
 
@@ -87,10 +87,41 @@ fn entry_filters_rejected_on_entry_uri() {
 
 #[test]
 fn stdout_rejected_on_bundle_uri() {
-    for uri in [format!("decdn:{HEX}/"), format!("decdn:{HEX}/a.txt")] {
-        let err = err_of(&[&uri, "-o", "-"]);
-        assert!(err.contains("stdout"), "{err}");
-    }
+    let err = err_of(&[&format!("decdn:{HEX}/"), "-o", "-"]);
+    assert!(
+        err.contains("a whole bundle writes to a directory"),
+        "{err}"
+    );
+}
+
+/// Whether `flags` run the blob fetch.
+fn routes_to_blob_fetch(flags: &[&str]) -> bool {
+    let args = get_args(flags);
+    streams_one_blob(&args, &parse_and_check(&args).unwrap())
+}
+
+#[test]
+fn entry_uri_streams_to_stdout_as_one_blob() {
+    let entry = format!("decdn:{HEX}/sintel/Sintel.mkv?ns=1");
+    assert!(routes_to_blob_fetch(&[&entry, "-o", "-"]));
+    assert!(!routes_to_blob_fetch(&[&entry, "-o", "dir"]));
+    assert!(!routes_to_blob_fetch(&[&entry]));
+    let blob = format!("decdn:{HEX}");
+    assert!(routes_to_blob_fetch(&[&blob, "-o", "-"]));
+    assert!(routes_to_blob_fetch(&[&blob]));
+    assert!(!routes_to_blob_fetch(&[
+        &format!("decdn:{HEX}/"),
+        "-o",
+        "dir"
+    ]));
+}
+
+#[test]
+fn bundle_flags_rejected_on_entry_uri_to_stdout() {
+    let uri = format!("decdn:{HEX}/a.txt");
+    let err = err_of(&[&uri, "-o", "-", "--jobs", "2", "--overwrite"]);
+    assert!(err.contains("--jobs, --overwrite"), "{err}");
+    assert!(err.contains("-o -"), "{err}");
 }
 
 #[test]

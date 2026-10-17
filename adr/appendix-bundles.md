@@ -309,7 +309,17 @@ fetches every entry over the paid `cdn/client/v1` path, with the same
 kernel as the blob fetch of `decdn get decdn:<hash>`.
 `decdn get decdn:<hash>/<path>` keeps only the entry whose `path` is
 `<path>` (see [`decdn:` URIs](#decdn-uris)). A URI path that names no
-entry is an error. The rules below apply to every pull:
+entry is an error.
+
+`decdn get decdn:<hash>/<path> -o -` does not use the pull engine. It
+fetches the manifest blob into memory, with a limit of 64 MiB. The manifest
+fetch requests no bytes past that limit. The command then finds the entry
+whose `path` is `<path>` and streams the entry's blob to stdout as one blob
+fetch. The two fetches use one payer. The command takes no bundle flag, and
+it has no manifest cache and no skip cache. `-o -` on a whole bundle is an
+error.
+
+The rules below apply to every pull:
 
 - **Node selection is per distinct blob.** With an explicit `--node-id`
   every entry is pulled from that one node; otherwise each distinct blob
@@ -388,13 +398,20 @@ entry is an error. The rules below apply to every pull:
   files** by default (re-runs resume), and `--overwrite` forces a re-fetch.
   The skip check accepts a file by its hash. A saved record whose size and
   mtime match is a fast path. Without a match, the pull hashes the file
-  against the manifest.
+  against the manifest. Each saved record also names its source: the
+  manifest hash and the entry's manifest path.
 - **Output directory.** `-o <dir>` names the output directory. Without
   `-o`, the output directory is `.`. An entry URI without `-o` writes the
   entry to `./<name>`. `<name>` is the last segment of the entry's path.
   The pull does not make the entry's parent directories. A pull without `-o`
-  refuses an entry path that holds a file with no skip-cache record, because
-  the user did not choose that directory. `--overwrite` disables this check.
+  refuses an entry path that holds a file, directory or link with no
+  skip-cache record, because the user did not choose that directory. It
+  also refuses a path whose record does not vouch for it. A record vouches
+  for a path when the file has the recorded size and mtime, and the record
+  names the same manifest hash and manifest path or the same file hash. The
+  error names the cause. When the record names an earlier source, the error
+  names it as a `decdn:` URI. A skip-cache that the pull cannot read vouches
+  for no path. `--overwrite` disables this check.
   The manifest cache (`.decdn-bundles/`), the skip-cache
   (`.decdn-manifest.json`) and the staging directory (`.decdn-partial/`) go
   into the output directory. An entry at one of these paths fails. Without

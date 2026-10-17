@@ -140,6 +140,19 @@ const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// connection and then closing.
 const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 
+/// Connection-level QUIC receive window: the most stream data one peer may have
+/// in flight to this node, across every stream of one connection, before QUIC
+/// flow control blocks it (ADR 013 § Wire Framing).
+///
+/// The frame ceilings bound what a handler buffers, but the transport buffers
+/// below them: a peer can send a stream's later bytes and hold back its first,
+/// and the transport keeps the out-of-order data until the read times out.
+/// Without this window the only limit is one stream window (1.25 MB) per stream,
+/// so one connection could park about 125 MB. Eight `CHUNK_BYTES` intervals keep
+/// a node-to-node pull at about 80 MB/s per connection at a 100 ms round trip.
+/// The per-stream window stays at the transport default.
+const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+
 /// The `FeeRouter` contract's own `OPERATOR_BPS_FLOOR` (`contracts/src/FeeRouter.sol`):
 /// the minimum operator share governance can configure. Used as the startup
 /// fallback for the live operator fee-share seed (ADR 041) — a conservative
@@ -275,6 +288,7 @@ fn quic_transport_config() -> anyhow::Result<QuicTransportConfig> {
         .max_idle_timeout(Some(idle_timeout))
         .keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL)
         .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS))
+        .receive_window(VarInt::from_u32(QUIC_CONNECTION_RECEIVE_WINDOW))
         // BBR3 over the default Cubic. Congestion control lives at the sender, so
         // this governs the bytes the node serves to a downstream client or node.
         // BBR paces to the path's measured bandwidth and round trip instead of
@@ -844,6 +858,10 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     /// the same live policy.
     shed_controller: Arc<crate::load_shed::LoadShedController>,
     payment_service: PoolSettlementService<P>,
+    /// Names each lane's pool owner for `admin_v1_lanes`: the event-fed pool
+    /// view the settlement watcher writes, then an owner cache, then its own
+    /// `getPool` reads (never the serve path's negative-caching resolver).
+    pool_owners: admin::pool_owners::PoolOwners,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     /// Bring-up node-id binding self-check (#1034), carried through to
     /// `AdminState` so `admin_v1_health` can report it. A plain value, not a
@@ -1363,6 +1381,17 @@ async fn build_chain_and_handlers(
         pool_view.clone(),
         Arc::clone(&infra.node_metrics),
     );
+    // Lane owner lookup for `admin_v1_lanes`. Its own binding and reads, so an
+    // operator's `node lanes` never negative-caches a pool the serve path reads.
+    let pool_owners = admin::pool_owners::PoolOwners::new(
+        pool_view.clone(),
+        Some(Arc::new(admin::pool_owners::ChainPoolOwners::new(
+            decdn_incentive::payment_pool::PaymentPool::new(
+                payment_pool_addr,
+                wallet_provider.clone(),
+            ),
+        ))),
+    );
     // ADR 041 serve-credit inputs: a non-blocking sink in front of the SAME warming
     // allowance the buy loop debits and the eviction path forgets, plus the live
     // operator fee-share cell. The background aggregator behind the sink is what
@@ -1584,6 +1613,7 @@ async fn build_chain_and_handlers(
         client_handler,
         shed_controller,
         payment_service,
+        pool_owners,
         blacklist_ready_rx,
         binding_report,
         serve_economics,
@@ -1676,8 +1706,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // daemon's lifetime, which is why no CLI can read it from disk (#2078).
     let buyer_pool_store_for_admin = Arc::clone(&buyer_pool_store);
     // The buyer-side PaymentPool bootstrap (whose on-chain round-trips —
-    // notably the one-time USDC `approve` receipt — can block for many
-    // minutes on a stuck tx, bounded by `APPROVE_RECEIPT_TIMEOUT`) and
+    // notably the one-time USDC `approve` receipt — can block for up to
+    // `decdn_incentive::tx::RECEIPT_TIMEOUT` (3 min) on a stuck tx) and
     // the node-origin pull-through provisioning it feeds are BOTH deferred to a
     // background task spawned below (#1109), so the metrics/admin listeners and
     // the "node runtime ready" banner come up independent of any chain RPC. The
@@ -2076,8 +2106,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
 
     // Buyer-side PaymentPool bootstrap + node-to-node pull-through
     // provisioning (#831), fully backgrounded off the startup critical path
-    // (#1109). The USDC `approve` receipt that `bootstrap` awaits could hang for
-    // many minutes on a stuck tx (capped by `APPROVE_RECEIPT_TIMEOUT`);
+    // (#1109). The USDC `approve` receipt that `bootstrap` awaits can block for
+    // up to `decdn_incentive::tx::RECEIPT_TIMEOUT` (3 min) on a stuck tx;
     // running it inline would gate the metrics/admin binds and the
     // "node runtime ready" banner below. The origin shares its `OnceLock` with
     // the clone already in the cache's origin chain, so a later `provision` from
@@ -2293,11 +2323,13 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // Lane introspection for `admin_v1_lanes` (issue #749). Shares the
         // same persistent lane-state store the client handler and settlement
         // service use, plus a read handle over the handler's live lane
-        // registry for the last-voucher clock (issue #1733) — read-only here.
+        // registry for the last-voucher clock (issue #1733) and the resolver
+        // that names each lane's pool owner — read-only here.
         .with_lanes(admin::LaneStatusHandles {
             pool_store: Arc::clone(&infra.pool_state_store),
             lane_activity: ch.client_handler.lane_activity_clock(),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
+            pool_owners: ch.pool_owners.clone(),
         })
         // Buyer-pool introspection for `admin_v1_pools` (#2078). The SAME store
         // handle `BuyerPoolService` records into, so the admin surface reports

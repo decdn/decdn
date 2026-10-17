@@ -31,7 +31,7 @@ proptest! {
             let mut buf = Vec::new();
             write_frame(&mut buf, &payload).await.unwrap();
             let mut cursor = std::io::Cursor::new(buf);
-            let decoded = read_frame(&mut cursor).await.unwrap();
+            let decoded = read_frame(&mut cursor, 4096).await.unwrap();
             prop_assert_eq!(decoded, payload);
             Ok(())
         })?;
@@ -41,7 +41,7 @@ proptest! {
     fn garbage_bytes_never_panic(data in proptest::collection::vec(any::<u8>(), 0..256)) {
         block_on(async {
             let mut cursor = std::io::Cursor::new(&data);
-            let _ = read_frame(&mut cursor).await;
+            let _ = read_frame(&mut cursor, 4096).await;
             Ok(()) as Result<(), TestCaseError>
         })?;
     }

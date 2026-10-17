@@ -706,7 +706,7 @@ const fn frame_err_code(e: &FrameError) -> u32 {
     // new variant fails the build instead of being silently collapsed
     // into `APP_ERR_MALFORMED_MESSAGE`.
     match e {
-        FrameError::TooLarge(_) => APP_ERR_MESSAGE_TOO_LARGE,
+        FrameError::TooLarge { .. } => APP_ERR_MESSAGE_TOO_LARGE,
         // #577 M1: transport-level fault (short read, peer reset,
         // mid-frame EOF) is NOT a protocol fault. Mirrors the
         // timeout-path convention in `read_probe_request` — peers must
@@ -782,7 +782,14 @@ async fn read_probe_request(
         let _ = recv.stop(v);
     };
 
-    let frame = match tokio::time::timeout(PROBE_READ_TIMEOUT, read_frame(recv)).await {
+    // A probe request is at most 43 bytes; the ceiling refuses a larger frame before it
+    // is buffered (ADR 013 § Wire Framing).
+    let frame = match tokio::time::timeout(
+        PROBE_READ_TIMEOUT,
+        read_frame(recv, decdn_protocol::MAX_PROBE_FRAME),
+    )
+    .await
+    {
         Err(_) => {
             // ADR 013 defines no timeout-specific code; use the named
             // `APP_ERR_NO_ERROR` constant (same convention now applied

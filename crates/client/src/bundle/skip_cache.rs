@@ -1,8 +1,11 @@
 //! The local, advisory `.decdn-manifest.json` skip-cache a bundle `decdn get`
 //! writes into an output directory. It indexes every file the bundle(s) have
-//! placed there — keyed by bundle-relative POSIX path, merged across runs — so a
-//! later pull skips unchanged files without re-hashing and splices unchanged
-//! byte ranges from bytes already on disk.
+//! placed there — keyed by the POSIX path the file landed at under the output
+//! root, merged across runs — so a later pull skips unchanged files without
+//! re-hashing and splices unchanged byte ranges from bytes already on disk.
+//! Each record names its source: the bundle and the manifest path the file
+//! came from, so a pull into a directory the user did not choose can tell its
+//! own files from another source's.
 //!
 //! The cache is advisory, not authoritative. A skip takes one of two paths: the
 //! re-hash path confirms the on-disk bytes against the new manifest hash before
@@ -21,20 +24,23 @@ use std::time::UNIX_EPOCH;
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
+use crate::uri::{DecdnUri, UriTarget};
+
 /// File name of the local skip-cache, written at the pull output root.
 pub(crate) const SAVED_MANIFEST_NAME: &str = ".decdn-manifest.json";
 
 /// Current on-disk schema version. A file with any other version loads empty.
-const SAVED_MANIFEST_VERSION: u32 = 1;
+const SAVED_MANIFEST_VERSION: u32 = 2;
 
 /// The local skip-cache: an index of the bundle files known to live under one
-/// output root, keyed by bundle-relative POSIX path. Ordered (`BTreeMap`) so the
+/// output root, keyed by the POSIX path each landed at under that root
+/// ([`SavedSource::path`] holds its manifest path). Ordered (`BTreeMap`) so the
 /// serialized form is deterministic across runs.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct SavedManifest {
     /// On-disk schema version; see [`SAVED_MANIFEST_VERSION`].
     version: u32,
-    /// Recorded files, keyed by bundle-relative POSIX path.
+    /// Recorded files, keyed by the POSIX path each landed at under the root.
     files: BTreeMap<String, SavedFile>,
 }
 
@@ -52,8 +58,9 @@ impl SavedManifest {
 }
 
 /// One recorded file: the whole-file content address and size last materialized
-/// at this path, the mtime observed for it (the cheap change gate), and its
-/// range-dedup chunks when the source manifest carried them.
+/// at this path, the mtime observed for it (the cheap change gate), its
+/// range-dedup chunks when the source manifest carried them, and the bundle
+/// entry it came from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SavedFile {
     /// The whole-file BLAKE3 content address, `b3:<hex>`.
@@ -66,6 +73,61 @@ pub(crate) struct SavedFile {
     /// carried them; `None` for a plain (unhinted) entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) chunks: Option<Vec<SavedChunk>>,
+    /// The bundle entry the pull wrote this file from.
+    pub(crate) source: SavedSource,
+}
+
+impl SavedFile {
+    /// Whether the file `meta` describes is still the one this record saw land:
+    /// a regular file of the recorded size and mtime. The cheap gate that
+    /// stands in for a re-hash.
+    pub(crate) fn still_matches(&self, meta: &std::fs::Metadata) -> bool {
+        meta.is_file() && meta.len() == self.size && SavedMtime::of(meta) == Some(self.mtime)
+    }
+}
+
+/// The bundle entry a [`SavedFile`] came from: the manifest's hash and the
+/// entry's manifest path. An entry URI pull lands an entry under another name,
+/// so the record's key alone does not name its entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SavedSource {
+    /// The manifest blob's BLAKE3 hash, `b3:<hex>` ([`bundle_key`]).
+    pub(crate) bundle: String,
+    /// The entry's `path` in that manifest.
+    pub(crate) path: String,
+}
+
+impl SavedSource {
+    /// The entry at manifest `path` of the bundle whose manifest hash is
+    /// `bundle`.
+    pub(crate) fn new(bundle: [u8; 32], path: &str) -> Self {
+        Self {
+            bundle: bundle_key(bundle),
+            path: path.to_owned(),
+        }
+    }
+
+    /// Whether this is the entry at manifest `path` of the bundle whose
+    /// manifest hash is `bundle`.
+    pub(crate) fn is(&self, bundle: [u8; 32], path: &str) -> bool {
+        self.path == path && super::parse_hash(&self.bundle).is_ok_and(|h| h == bundle)
+    }
+
+    /// The `decdn:<hash>/<path>` URI of this entry, or `None` when the
+    /// recorded bundle is not a hash.
+    pub(crate) fn uri(&self) -> Option<DecdnUri> {
+        let hash = super::parse_hash(&self.bundle).ok()?;
+        Some(DecdnUri::new(
+            hash,
+            UriTarget::BundleEntry(self.path.clone()),
+            None,
+        ))
+    }
+}
+
+/// The form a [`SavedSource`] records the manifest hash `hash` in: `b3:<hex>`.
+fn bundle_key(hash: [u8; 32]) -> String {
+    format!("b3:{}", blake3::Hash::from_bytes(hash).to_hex())
 }
 
 /// One range-dedup chunk of a [`SavedFile`]: a BLAKE3 over a byte range and its
@@ -118,14 +180,40 @@ pub(crate) fn saved_hints(rec: &SavedFile) -> Option<Vec<(String, u64, u64)>> {
 /// wrong-version file yields an empty manifest — the cache is advisory, so its
 /// absence only means every path falls to the re-hash gate.
 pub(crate) fn load(out_root: &Path) -> SavedManifest {
-    let path = out_root.join(SAVED_MANIFEST_NAME);
-    let Ok(bytes) = std::fs::read(&path) else {
-        return SavedManifest::default();
-    };
-    match serde_json::from_slice::<SavedManifest>(&bytes) {
-        Ok(m) if m.version == SAVED_MANIFEST_VERSION => m,
-        _ => SavedManifest::default(),
+    load_checked(out_root).unwrap_or_default()
+}
+
+/// Load the skip-cache at `out_root`, saying why a file that is there cannot
+/// be used. A missing file is an empty manifest, not an error.
+///
+/// # Errors
+///
+/// The file cannot be read, is not a skip-cache, or has another schema
+/// version. The error names the file and the cause.
+pub(crate) fn load_checked(out_root: &Path) -> anyhow::Result<SavedManifest> {
+    /// The version gate, read before the records so a file of another
+    /// version reports its version rather than a field it lacks.
+    #[derive(Deserialize)]
+    struct Versioned {
+        version: u32,
     }
+    let path = out_root.join(SAVED_MANIFEST_NAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SavedManifest::default());
+        }
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let Versioned { version } = serde_json::from_slice(&bytes)
+        .with_context(|| format!("{} is not a skip-cache", path.display()))?;
+    anyhow::ensure!(
+        version == SAVED_MANIFEST_VERSION,
+        "{} has version {version}; this build reads version {SAVED_MANIFEST_VERSION}",
+        path.display()
+    );
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("{} is not a skip-cache", path.display()))
 }
 
 /// Overlay `updates` onto `manifest` in place: insert-or-replace per path, keep
