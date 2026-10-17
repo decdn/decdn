@@ -10,6 +10,7 @@ use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
 use crate::buyer_pool::{EscrowUntracked, OpenUnconfirmed, TopUpUnconfirmed, WalletShortfall};
 use crate::driver::PoolExhausted;
+use crate::funding::UntrackedEscrowHeld;
 use crate::source::PoolReplaced;
 use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
 
@@ -173,6 +174,7 @@ pub fn classify(err: &anyhow::Error) -> Fault {
         || err
             .downcast_ref::<crate::credential::FundingNeeded>()
             .is_some()
+        || err.downcast_ref::<UntrackedEscrowHeld>().is_some()
     {
         return Fault::Fatal(FatalScope::Command);
     }

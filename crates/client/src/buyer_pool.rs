@@ -556,8 +556,9 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// deterministic revert (with ABI revert data, decoded against the
 /// insufficient-deposit error selectors) is split from a transport/RPC fault (no
 /// revert data) and a mined on-chain revert. The missing-`PoolOpened` leg carries
-/// no reason — the deposit is escrowed but untracked, so it surfaces as an
-/// unclassified error for manual reconciliation.
+/// no reason: the deposit is escrowed but untracked, so it surfaces as
+/// [`EscrowUntracked`] for manual reconciliation, which the acquire loop
+/// classifies as fatal to the command.
 ///
 /// # The caller picks the receipt bound
 ///
@@ -699,8 +700,8 @@ pub async fn open_pool<P: Provider + Clone>(
 /// # Errors
 ///
 /// The tx reverted ([`PoolOpenFailureReason::ContractRevert`]), or the receipt
-/// holds no `PoolOpened` event for `owner` (the deposit is escrowed but
-/// untracked; logged here).
+/// holds no `PoolOpened` event for `owner`: the deposit is escrowed but
+/// untracked ([`EscrowUntracked`], logged here), so a retry escrows again.
 pub fn opened_from_receipt(
     receipt: &alloy::rpc::types::TransactionReceipt,
     tx: TxHash,
@@ -737,10 +738,11 @@ pub fn opened_from_receipt(
             "openPool mined but its PoolOpened event is missing from the receipt logs; \
              the deposit is escrowed on-chain but UNTRACKED — reconcile manually against the tx"
         );
-        anyhow::bail!(
-            "PoolOpened event for owner {owner} not found in openPool receipt logs (tx {tx}); \
-             the deposit is escrowed on-chain but untracked — reconcile manually"
-        );
+        return Err(escrowed_but_untracked(
+            "buyer pool opened",
+            tx,
+            format!("its receipt holds no PoolOpened event for owner {owner}"),
+        ));
     };
     let pool_id = opened.poolId;
     // Record what the contract CREDITED, not what we asked it to transfer.

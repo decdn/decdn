@@ -214,6 +214,47 @@ fn a_possibly_escrowed_deposit_ends_the_command() {
     }
 }
 
+/// A run that holds an untracked escrow refuses every later `openPool` and
+/// `topUp`. The refusal ends the command, from a lane build too, and names the
+/// held escrow's tx. Yet it escrowed nothing: the build error the acquire's
+/// drain reads is not an escrow it reports.
+#[test]
+fn a_refusal_after_an_untracked_escrow_ends_the_command() -> anyhow::Result<()> {
+    let tx = alloy::primitives::TxHash::repeat_byte(0xab);
+    let funding = crate::funding::RunFunding::default();
+    let _ = funding.note_untracked(crate::buyer_pool::escrowed_but_untracked(
+        "pool 0x01 topped up by 5 µUSDC",
+        tx,
+        "disk",
+    ));
+    let refused = || {
+        funding
+            .refuse_after_untracked()
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("the run holds an untracked escrow"))
+    };
+    for (name, err) in [
+        ("refusal", refused()?),
+        (
+            "refused lane build",
+            anyhow::Error::new(LaneBuildFault(refused()?)),
+        ),
+    ] {
+        assert_eq!(
+            classify(&err),
+            Fault::Fatal(FatalScope::Command),
+            "{name}: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains(&tx.to_string()),
+            "{name}: {err:#}"
+        );
+    }
+    let bare = refused()?;
+    assert!(!super::escrow_untracked(&bare), "{bare:#}");
+    Ok(())
+}
+
 #[test]
 fn delivery_faults_are_the_sources() {
     for error in [StreamError::NotFound, StreamError::Declined] {

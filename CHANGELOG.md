@@ -1098,6 +1098,22 @@ since project inception and will roll into the first tagged release.
   which runs a stream's drive to its end and returns the error the fetch
   ended with. A consumer that reads a stream to its end calls it before it
   reports success.
+- **Client: no second escrow after an untracked one (#2506).** When a run's
+  `topUp` mined and its local credit failed, the build failed as escrowed and
+  untracked, but a sibling lane build of the same run could still escrow
+  again. Builds of one fetch wait behind each other on the pool lock. The
+  next one in line ran before the acquire loop saw the first one's error, or
+  in the drain after it. That build read the uncredited row, saw the pool low,
+  and sent a second `topUp`: the receipt read had already cleared the first
+  one, so nothing refused it. A failed record after a mined `openPool` could
+  let the next build open a second pool the same way. Now a run that holds an
+  untracked `topUp` or `openPool` refuses every later `topUp` and `openPool`
+  of that run before its allowance read or send, from a lane build or a
+  funding recovery step. The refusal names the held escrow and ends the
+  command. It is not reported as a second escrow. An `openPool` that mined
+  with no `PoolOpened` event for the owner also fails as escrowed and
+  untracked (`EscrowUntracked`), not as a plain error: the acquire loop
+  retried that lane build, and the retry opened a second pool.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its
