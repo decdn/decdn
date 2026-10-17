@@ -60,7 +60,8 @@ pub const MAX_RATE_PER_MB: u64 = 1000;
 ///
 /// Every probe read passes this to [`crate::read_frame`]. The largest legitimate
 /// message is a [`ProbeResponse`] with its [`ProbeResponseExt`] at full width:
-/// 325 bytes, of which the coverage bitmap is up to 202. A [`ProbeRequest`] is
+/// 325 bytes, of which the encoded coverage is up to 202 (a 200-byte bitmap and
+/// its 2-byte length). A [`ProbeRequest`] is
 /// at most 43 bytes. The ceiling leaves headroom for Tier-1 extension fields
 /// and refuses a larger frame before the reader buffers it. The
 /// `probe_frame_ceiling_holds_the_largest_message` test pins the margin.

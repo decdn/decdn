@@ -45,8 +45,9 @@ use crate::coverage::Coverage;
 use crate::identity::{ContentHash, NodeId};
 
 /// Wire-level maximum number of providers a [`FindValueResponse`] may carry
-/// (ADR 022 §Content Records and TTL). Bounds the response size at the
-/// `~2.3 KB` ceiling documented in ADR 022 §DHT Bandwidth Analysis.
+/// (ADR 022 §Content Records and TTL). With 200-byte coverage bitmaps it bounds
+/// a full response to the 12,375 bytes in ADR 022 §DHT Bandwidth Analysis,
+/// inside [`MAX_DHT_FRAME`].
 ///
 /// Enforced at the wire boundary by `deserialize_providers`; oversize values
 /// fail decode rather than being silently truncated.
@@ -246,8 +247,9 @@ pub struct Provider {
 /// in XOR keyspace, used by the requester to continue iterative lookup.
 ///
 /// Responders MUST NOT emit more than [`MAX_PROVIDERS_PER_HASH`] providers or
-/// more than [`MAX_CLOSER_NODES`] closer nodes — the wire-cost ceiling
-/// (~2.3 KB) in ADR 022 §DHT Bandwidth Analysis depends on these bounds.
+/// more than [`MAX_CLOSER_NODES`] closer nodes — the 12,375-byte worst case in
+/// ADR 022 §DHT Bandwidth Analysis, and so [`MAX_DHT_FRAME`], depend on these
+/// bounds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindValueResponse {
     /// Echoes the requested hash.

@@ -216,7 +216,7 @@ pub enum decdn_protocol::framing::FrameError
 pub decdn_protocol::framing::FrameError::Decode(postcard::error::Error)
 pub decdn_protocol::framing::FrameError::Io(core::io::error::Error)
 pub decdn_protocol::framing::FrameError::TooLarge
-pub decdn_protocol::framing::FrameError::TooLarge::len: u32
+pub decdn_protocol::framing::FrameError::TooLarge::len: u64
 pub decdn_protocol::framing::FrameError::TooLarge::max: u32
 pub decdn_protocol::framing::FrameError::Varint
 pub trait decdn_protocol::framing::TopLevelEnum
@@ -353,7 +353,7 @@ pub enum decdn_protocol::FrameError
 pub decdn_protocol::FrameError::Decode(postcard::error::Error)
 pub decdn_protocol::FrameError::Io(core::io::error::Error)
 pub decdn_protocol::FrameError::TooLarge
-pub decdn_protocol::FrameError::TooLarge::len: u32
+pub decdn_protocol::FrameError::TooLarge::len: u64
 pub decdn_protocol::FrameError::TooLarge::max: u32
 pub decdn_protocol::FrameError::Varint
 pub enum decdn_protocol::MessageValidationError

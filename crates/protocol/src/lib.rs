@@ -24,7 +24,7 @@
 //! # Frames and extensions
 //!
 //! Every message is a postcard encoding behind a varint length prefix. Each read
-//! caps the prefix at its ALPN's frame ceiling — [`MAX_PROBE_FRAME`],
+//! caps the prefix at its frame ceiling — [`MAX_PROBE_FRAME`],
 //! [`MAX_CLIENT_CONTROL_FRAME`], [`MAX_CHUNK_FRAME`] or [`MAX_DHT_FRAME`]
 //! ([ADR 013 § Wire Framing]). A signed message has a frozen
 //! base: the fields its signature covers. Unsigned fields travel as trailing

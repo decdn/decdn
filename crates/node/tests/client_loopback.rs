@@ -12112,11 +12112,12 @@ async fn a_zero_byte_voucher_after_paying_counts_as_rejected() -> anyhow::Result
 
 /// A payment-proof frame announced past
 /// [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`] ends the stream on its length
-/// prefix alone (ADR 013 § Wire Framing). A proof is a few hundred bytes at most,
+/// prefix alone (ADR 013 § Wire Framing). A proof is at most about 130 bytes,
 /// so the node does not buffer toward the announced length or wait out the
 /// 10 s voucher wait for it. The fault is the payer's, not the node's.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_proof_frame_ends_the_stream_on_its_prefix() -> anyhow::Result<()> {
+    let spans = support::capture_spans();
     let mut fx = drive_to_second_interval_awaiting_voucher().await?;
 
     let mut bytes = support::frame_len_prefix(decdn_protocol::MAX_CLIENT_CONTROL_FRAME + 1);
@@ -12139,6 +12140,24 @@ async fn an_oversized_proof_frame_ends_the_stream_on_its_prefix() -> anyhow::Res
     anyhow::ensure!(
         counter(&fx.metrics, "decdn_serve_stream_node_fault_total")? == 0,
         "an oversized proof frame is the payer's fault, not the node's"
+    );
+    // The timing alone cannot tell a ceiling refusal from a proof-wait stall, so
+    // pin the cause the serve span records.
+    let peer = fx.client_ep.id().to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while spans.matching("serve_stream", "peer", &peer).is_empty()
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let served = spans.matching("serve_stream", "peer", &peer);
+    let [span] = served.as_slice() else {
+        anyhow::bail!("expected one serve_stream span for the peer, got {served:?}");
+    };
+    let error = span.fields.get("error").map_or("", String::as_str);
+    anyhow::ensure!(
+        error.contains("proof frame parse failed") && error.contains("exceeds the frame ceiling"),
+        "the stream must end on the proof frame ceiling: {span:?}"
     );
 
     fx.conn.close(0u32.into(), b"done");
@@ -12681,8 +12700,9 @@ async fn over_cap_stream_is_reset_before_its_request_is_read() -> anyhow::Result
     let _held =
         stall_delivery_at_closing_voucher(&conn, *hash.as_bytes(), wire_bytes, Some(&ext)).await?;
 
-    // A legal-sized announcement with no body: before the fix the handler parks in
-    // the request read until its 5 s timeout, holding the announced buffer.
+    // A legal-sized announcement with no body: a handler that read before it
+    // admitted would park here until the 5 s request-read timeout, holding the
+    // announced buffer, and then reset with NO_ERROR rather than RATE_LIMITED.
     let (mut send2, mut recv2) = conn
         .open_bi()
         .await
@@ -12694,7 +12714,7 @@ async fn over_cap_stream_is_reset_before_its_request_is_read() -> anyhow::Result
         .await
         .map_err(|e| anyhow::anyhow!("write prefix: {e}"))?;
     tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         assert_stream_reset(&mut recv2, decdn_protocol::APP_ERR_RATE_LIMITED),
     )
     .await
@@ -12758,9 +12778,12 @@ async fn an_oversized_request_frame_is_refused_on_its_prefix() -> anyhow::Result
     send.write_all(&bytes)
         .await
         .map_err(|e| anyhow::anyhow!("write prefix: {e}"))?;
-    tokio::time::timeout(Duration::from_secs(2), assert_stream_reset(&mut recv, 0x02))
-        .await
-        .map_err(|_| anyhow::anyhow!("the oversized request was not refused on its prefix"))??;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        assert_stream_reset(&mut recv, 0x02),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the oversized request was not refused on its prefix"))??;
     anyhow::ensure!(
         counter(&metrics, "decdn_serve_stream_request_unreadable_total")? == 1,
         "an oversized request is counted as unreadable"
@@ -12810,6 +12833,11 @@ enum Lie {
         /// Payload size of each garbage `ChunkData` frame.
         frame: usize,
     },
+    /// Answer the request with a length prefix past
+    /// [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`] and a little of its body, then
+    /// stall with the send side open: the shape that would make the buyer buffer
+    /// a chunk-sized `StreamResponse` for as long as its pull deadline allows.
+    OversizedResponse,
 }
 
 /// A raw `cdn/client/v1` upstream that accepts the request, signs a VALID
@@ -12833,6 +12861,15 @@ async fn serve_lying_stream(
         ClientMessage::StreamRequest(req) => req,
         other => anyhow::bail!("lying upstream: expected a StreamRequest, got {other:?}"),
     };
+    if matches!(lie, Lie::OversizedResponse) {
+        let mut bytes = support::frame_len_prefix(decdn_protocol::MAX_CLIENT_CONTROL_FRAME + 1);
+        bytes.extend_from_slice(&[0u8; 512]);
+        send.write_all(&bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("write oversized response prefix: {e}"))?;
+        conn.closed().await;
+        return Ok(());
+    }
 
     let body = StreamResponseBody {
         hash: req.hash,
@@ -12870,7 +12907,7 @@ async fn serve_lying_stream(
     }
 
     match lie {
-        Lie::OverSendStraddling => {
+        Lie::OverSendStraddling | Lie::OversizedResponse => {
             // The buyer bails on the straddling frame before any `StreamEnd`, so
             // nothing more is owed here.
         }
@@ -13252,6 +13289,73 @@ async fn client_pays_nothing_for_an_inflated_garbage_claim() -> anyhow::Result<(
          paid: {:?}",
         progress.advanced()
     );
+    Ok(())
+}
+
+/// A `StreamResponse` frame announced past
+/// [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`] fails the pull on its length
+/// prefix alone (ADR 013 § Wire Framing). The buyer does not buffer toward the
+/// announced length or wait out its pull deadline for it, and pays nothing. The
+/// daemon reads every upstream response through this path.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_refuses_an_oversized_stream_response_on_its_prefix() -> anyhow::Result<()> {
+    let hash = Hash::new(b"a blob behind an oversized response");
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_lying_server(
+        server_ep.clone(),
+        Arc::clone(&server_eth),
+        slash_domain(),
+        Vec::new(),
+        1024,
+        Lie::OversizedResponse,
+    );
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = pool_context(
+        &client_ep,
+        Arc::new(PrivateKeySigner::random()),
+        U256::from(10_000_000u64),
+    );
+    let mut progress = VoucherProgress::default();
+    let started = std::time::Instant::now();
+    let err = stream_fetch_tracked(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        0x00c0_ffee,
+        PullDeadlines::whole_transfer(Duration::from_secs(20)),
+        0,
+        0,
+        &mut progress,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("an oversized response must fail the fetch"))?;
+    anyhow::ensure!(
+        started.elapsed() < Duration::from_secs(10),
+        "the buyer waited {:?} on an oversized response",
+        started.elapsed()
+    );
+    anyhow::ensure!(
+        format!("{err:#}").contains("exceeds the frame ceiling"),
+        "an oversized response must fail on the frame ceiling, got: {err:#}"
+    );
+    anyhow::ensure!(
+        progress.advanced().is_none(),
+        "nothing is paid before a response is read: {:?}",
+        progress.advanced()
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 

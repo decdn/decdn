@@ -28,13 +28,15 @@ pub enum FrameError {
     /// The underlying stream failed while reading or writing the frame.
     #[error("frame I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// The length prefix names more bytes than the reader's ceiling allows.
-    /// Rejected before anything is buffered.
+    /// The frame is longer than the ceiling allows. A reader returns this for
+    /// a length prefix above its ceiling, before it buffers anything.
+    /// [`write_frame`] returns it for a payload too long for the `u32` length
+    /// prefix, with `max` set to `u32::MAX`.
     #[error("frame length {len} exceeds the frame ceiling ({max})")]
     TooLarge {
-        /// The announced payload length, in bytes.
-        len: u32,
-        /// The ceiling the reader applied, in bytes.
+        /// The announced (reader) or attempted (writer) payload length, in bytes.
+        len: u64,
+        /// The ceiling that applied, in bytes.
         max: u32,
     },
     /// The length prefix is not a well-formed varint — a non-terminating
@@ -129,7 +131,7 @@ fn leading_varint_u32(frame: &[u8]) -> Option<u32> {
 /// decodes it with [`decode_message`], then drains `header_len + payload_len`
 /// bytes.
 ///
-/// The announced length is validated against `max` — the ALPN's frame ceiling —
+/// The announced length is validated against `max` — the read's frame ceiling —
 /// as soon as the varint is complete, before the caller waits for (or buffers)
 /// the payload. This mirrors [`read_frame`]'s pre-allocation denial-of-service
 /// bound.
@@ -144,7 +146,10 @@ pub fn parse_frame(buf: &[u8], max: u32) -> Result<Option<(usize, usize)>, Frame
         return Ok(None);
     };
     if len > max {
-        return Err(FrameError::TooLarge { len, max });
+        return Err(FrameError::TooLarge {
+            len: u64::from(len),
+            max,
+        });
     }
     let payload_len = len as usize;
     if buf.len().saturating_sub(header_len) < payload_len {
@@ -187,7 +192,7 @@ fn decode_varint_prefix(buf: &[u8]) -> Result<Option<(u32, usize)>, FrameError> 
 ///
 /// The length prefix is validated against `max` *before* any payload
 /// allocation, so a peer cannot make the reader buffer more than `max` bytes.
-/// Pass the ALPN's frame ceiling for the messages that can arrive at this read
+/// Pass the frame ceiling for the messages that can arrive at this read
 /// (ADR 013 § Wire Framing): a ceiling sized to the largest legitimate message
 /// keeps a stalled oversized frame from pinning memory.
 ///
@@ -199,7 +204,10 @@ fn decode_varint_prefix(buf: &[u8]) -> Result<Option<(u32, usize)>, FrameError> 
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max: u32) -> Result<Vec<u8>, FrameError> {
     let len = read_varint_u32(r).await?;
     if len > max {
-        return Err(FrameError::TooLarge { len, max });
+        return Err(FrameError::TooLarge {
+            len: u64::from(len),
+            max,
+        });
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf).await?;
@@ -208,9 +216,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max: u32) -> Result<Vec
 
 /// Write one length-prefixed frame to an async writer.
 ///
-/// The writer checks only that the length fits the `u32` prefix. Each message's
-/// encoder keeps it under its ALPN's frame ceiling; the worst-case encode tests
-/// beside each ceiling pin that.
+/// The writer checks only that the length fits the `u32` prefix. The chunk
+/// encoders refuse a frame above [`crate::client::MAX_CHUNK_FRAME`]. Every other
+/// message is small by shape, and the worst-case encode tests beside each
+/// ceiling pin that it fits the read that receives it.
 ///
 /// # Errors
 ///
@@ -221,7 +230,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     payload: &[u8],
 ) -> Result<(), FrameError> {
     let len = u32::try_from(payload.len()).map_err(|_| FrameError::TooLarge {
-        len: u32::MAX,
+        len: u64::try_from(payload.len()).unwrap_or(u64::MAX),
         max: u32::MAX,
     })?;
     write_varint_u32(w, len).await?;

@@ -1925,13 +1925,15 @@ pub struct DecdnMetrics {
     pub serve_stream_proof_budget_exhausted: Counter,
     /// `decdn_serve_stream_rejected_stream_cap_full_total`: `cdn/client/v1`
     /// streams reset with `RATE_LIMITED` because the connection already had
-    /// `max_concurrent_streams` streams in flight. No signed response is sent.
-    /// A client that opens more concurrent streams than the cap drives it.
+    /// `max_concurrent_streams` streams in flight. The node reads no request and
+    /// sends no signed response. A client that opens more concurrent streams
+    /// than the cap drives it.
     pub serve_stream_rejected_stream_cap_full: Counter,
     /// `decdn_serve_stream_request_unreadable_total`: `cdn/client/v1` streams
     /// reset because the node could not read the first request: the read timed
-    /// out, the peer reset the stream or dropped the connection, or the frame or
-    /// its extensions failed to decode. Peer-side, logged at `debug!`.
+    /// out, the peer reset the stream or dropped the connection, the length
+    /// prefix was above `MAX_CLIENT_CONTROL_FRAME`, or the frame or its
+    /// extensions failed to decode. Peer-side, logged at `debug!`.
     pub serve_stream_request_unreadable: Counter,
     /// `decdn_serve_stream_voucher_rejected_total`: paying `cdn/client/v1`
     /// streams the node stopped because it rejected a voucher or a chunk

@@ -37,7 +37,7 @@ async fn parse_frame_rejects_a_length_past_its_ceiling() -> Result<(), FrameErro
     // Refused on the header alone: the payload never has to arrive.
     assert_matches!(
         parse_frame(&hdr, MAX),
-        Err(FrameError::TooLarge { len, max }) if len == MAX + 1 && max == MAX
+        Err(FrameError::TooLarge { len, max }) if len == u64::from(MAX + 1) && max == MAX
     );
     // A frame of exactly the ceiling is accepted.
     let mut at_max = Vec::new();
@@ -113,7 +113,7 @@ async fn frame_rejects_too_large_without_reading_payload() -> Result<(), FrameEr
     let header_len = header.len();
     let mut cursor = std::io::Cursor::new(header);
     let r = read_frame(&mut cursor, MAX).await;
-    assert_matches!(r, Err(FrameError::TooLarge { len, max }) if len == MAX + 1 && max == MAX);
+    assert_matches!(r, Err(FrameError::TooLarge { len, max }) if len == u64::from(MAX + 1) && max == MAX);
     // No payload bytes were read.
     assert_eq!(usize::try_from(cursor.position()).ok(), Some(header_len));
     Ok(())

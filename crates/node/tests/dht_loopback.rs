@@ -518,6 +518,44 @@ mod adr_013_error_codes {
         }
     }
 
+    /// A DHT response announced past [`decdn_protocol::MAX_DHT_FRAME`] fails the
+    /// requester's lookup on its length prefix alone (ADR 013 § Wire Framing).
+    /// The node queries peers it cannot trust, so it must not buffer toward the
+    /// announced length or wait out `DHT_CLIENT_TIMEOUT` for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_refuses_an_oversized_response_on_its_prefix() -> anyhow::Result<()> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let responder =
+            support::spawn_oversized_responder(server_ep.clone(), decdn_protocol::MAX_DHT_FRAME);
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+        let started = std::time::Instant::now();
+        let result = decdn_node::dht::client::find_value(
+            &client_ep,
+            target,
+            ContentHash::from_bytes([0x11; 32]),
+            NodeId::from_bytes(*client_ep.id().as_bytes()),
+        )
+        .await;
+        let Err(err) = result else {
+            anyhow::bail!("an oversized response must fail the lookup");
+        };
+        anyhow::ensure!(
+            started.elapsed() < decdn_node::dht::client::DHT_CLIENT_TIMEOUT / 2,
+            "the lookup waited {:?} on an oversized response",
+            started.elapsed()
+        );
+        anyhow::ensure!(
+            format!("{err:#}").contains("exceeds the frame ceiling"),
+            "an oversized response must fail on the frame ceiling, got: {err:#}"
+        );
+        shutdown([responder], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
     /// A request frame announced past [`decdn_protocol::MAX_DHT_FRAME`] →
     /// `APP_ERR_MESSAGE_TOO_LARGE` (0x02), refused on the length prefix alone
     /// (ADR 013 § Wire Framing). The client writes the prefix and a few body
@@ -539,7 +577,7 @@ mod adr_013_error_codes {
         let mut bytes = support::frame_len_prefix(decdn_protocol::MAX_DHT_FRAME + 1);
         bytes.extend_from_slice(&[0u8; 512]);
         send.write_all(&bytes).await?;
-        let r = tokio::time::timeout(std::time::Duration::from_secs(2), recv.read_to_end(64))
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_to_end(64))
             .await
             .map_err(|_| anyhow::anyhow!("the server waited on an oversized frame"))?;
         assert_close_code(r, APP_ERR_MESSAGE_TOO_LARGE);

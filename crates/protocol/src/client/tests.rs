@@ -778,7 +778,8 @@ fn encode_chunk_frame_rejects_an_empty_payload() {
 /// Without this the ceiling is only pinned on the two hot-path encoders, and this
 /// is the one an out-of-tree caller reaches. It is also the boundary where the
 /// equivalence with `encode_message` stops holding: the generic path builds an
-/// oversized frame happily and only `write_frame` refuses it.
+/// oversized frame happily, and only the payer's read refuses it against
+/// `MAX_CHUNK_FRAME`.
 #[test]
 fn encode_chunk_frame_rejects_a_frame_past_max_chunk_frame() {
     let max = MAX_CHUNK_FRAME as usize;

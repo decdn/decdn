@@ -782,7 +782,7 @@ async fn read_probe_request(
         let _ = recv.stop(v);
     };
 
-    // A probe request is 43 bytes; the ceiling refuses a larger frame before it
+    // A probe request is at most 43 bytes; the ceiling refuses a larger frame before it
     // is buffered (ADR 013 § Wire Framing).
     let frame = match tokio::time::timeout(
         PROBE_READ_TIMEOUT,

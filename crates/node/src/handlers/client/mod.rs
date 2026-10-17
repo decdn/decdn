@@ -131,6 +131,7 @@ const APP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 // finishes the stream so the reason survives.
 const APP_ERR_NO_ERROR: u32 = 0x00;
 const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
+const APP_ERR_MESSAGE_TOO_LARGE: u32 = 0x02;
 const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 
 /// Per-lane delivery state: the validated voucher watermark plus the lane-wide
@@ -2563,7 +2564,7 @@ struct StreamReadError {
 
 const fn frame_err_code(e: &FrameError) -> u32 {
     match e {
-        FrameError::TooLarge { .. } => 0x02,
+        FrameError::TooLarge { .. } => APP_ERR_MESSAGE_TOO_LARGE,
         FrameError::Io(_) => APP_ERR_NO_ERROR,
         FrameError::Varint | FrameError::Decode(_) => APP_ERR_MALFORMED_MESSAGE,
     }

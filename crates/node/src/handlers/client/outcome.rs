@@ -49,7 +49,8 @@ pub(super) enum ResetCause {
     /// The client binding failed to verify (`MALFORMED_MESSAGE`).
     BadBinding,
     /// The first request could not be read: a timeout, a peer reset or lost
-    /// connection, or a frame that failed to decode.
+    /// connection, a length prefix above `MAX_CLIENT_CONTROL_FRAME`, or a frame
+    /// that failed to decode.
     RequestUnreadable,
 }
 

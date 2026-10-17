@@ -886,6 +886,28 @@ pub(crate) fn frame_len_prefix(len: u32) -> Vec<u8> {
     }
 }
 
+/// A one-connection responder that answers the first request with a frame
+/// announced at `ceiling + 1` bytes and a little of its body, then stalls with
+/// its send side open until the peer goes away. Drives a requester-side read to
+/// prove it refuses on the length prefix rather than buffering toward it.
+pub(crate) fn spawn_oversized_responder(ep: Endpoint, ceiling: u32) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Ok(conn) = accept_one(&ep).await else {
+            return;
+        };
+        let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+            return;
+        };
+        // The request itself is irrelevant; read it so the reply follows it.
+        let _ = read_frame(&mut recv, ceiling).await;
+        let mut bytes = frame_len_prefix(ceiling.saturating_add(1));
+        bytes.extend_from_slice(&[0u8; 512]);
+        if send.write_all(&bytes).await.is_ok() {
+            conn.closed().await;
+        }
+    })
+}
+
 /// Accept exactly one inbound connection on `ep` — the [`spawn_server`] accept
 /// plumbing (`incoming.accept()` then `connecting.await`) factored out for the
 /// one-shot raw servers that don't run a full accept loop.

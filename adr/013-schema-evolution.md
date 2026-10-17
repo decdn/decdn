@@ -28,7 +28,7 @@ Every message on every QUIC stream (all ALPNs) is length-prefixed:
 
 The varint uses postcard's native varint encoding (continuation-bit scheme similar to LEB128).
 
-Each read has a frame ceiling. The ceiling is the largest legitimate message that can arrive at that read, with headroom. The receiver refuses a length prefix above the ceiling before it allocates, and it does not wait for the payload. A sender MUST NOT send a frame above the ceiling of the read that receives it. The ceilings are protocol constants in `decdn-protocol`:
+Each read has a frame ceiling. The ceiling is at least the largest legitimate message that can arrive at that read. The probe, client control and DHT ceilings add headroom. `MAX_CHUNK_FRAME` is exactly one full `ChunkData` frame. The receiver refuses a length prefix above the ceiling before it allocates, and it does not wait for the payload. A sender MUST NOT send a frame above the ceiling of the read that receives it. The ceilings are protocol constants in `decdn-protocol`:
 
 | Ceiling | Value | Reads | Largest legitimate message |
 | --- | --- | --- | --- |
@@ -37,9 +37,19 @@ Each read has a frame ceiling. The ceiling is the largest legitimate message tha
 | `MAX_CHUNK_FRAME` | 1,048,580 B | Every node → payer frame after `StreamResponse` | `ChunkData` with one `CHUNK_BYTES` payload |
 | `MAX_DHT_FRAME` | 64 KiB | Every `cdn/dht/v1` read, request and response | `BatchStoreRequest` with 256 entries: 59,939 B |
 
-The sizes use 65-byte EOA signatures, full-width varints and 200-byte coverage bitmaps. A test beside each ceiling encodes the largest message and fails if the message outgrows the ceiling. The client ceiling leaves room for a longer contract-wallet `owner_signature`. A message that needs more than its ceiling is a wire change: the same change updates the constant and this table.
+The sizes use 65-byte EOA signatures, full-width varints and 200-byte coverage bitmaps. Every signature on the wire is a 65-byte EOA signature. A test beside each ceiling encodes the largest message and fails if the message outgrows the ceiling. The headroom is for Tier-1 extension fields. A message that needs more than its ceiling is a wire change: the same change updates the constant and this table.
 
-**DoS note:** `read_frame` allocates `len` bytes. A peer can send a length prefix, send most of the payload, and then stall. The receiver holds the buffer until the read timeout. The ceiling bounds this buffer for each stream. The node also bounds the number of streams. The dispatch semaphore caps the connections. Each `cdn/client/v1` connection admits at most `max_concurrent_streams` streams ([ADR 005 § Concurrent stream limits](005-protocol.md#concurrent-stream-limits)). The node refuses an over-cap stream before it reads the request. Thus each admitted stream holds at most one ceiling of request bytes. At the defaults (256 connections × 100 streams × 4 KiB) this is 100 MiB. The ceilings are not operator settings: a receiver that refuses a legitimate frame breaks the protocol for its peers.
+**DoS note:** `read_frame` allocates `len` bytes. A peer can send a length prefix, send most of the payload, and then stall. The receiver holds the buffer until the read timeout. The ceiling bounds this buffer for each stream.
+
+The transport also buffers stream data below the reader. A peer can send the later bytes of a stream and hold back its first bytes. The transport keeps the out-of-order bytes until the stream ends. QUIC flow control bounds these bytes. The node sets a connection receive window of 8 MiB (`QUIC_CONNECTION_RECEIVE_WINDOW`). This window bounds the unread stream data of one connection, across all of its streams and on every ALPN. The window for each stream stays at the transport default of 1.25 MB.
+
+The node bounds the number of connections with `security.max_concurrent_handlers` (default 256). Each `cdn/client/v1` connection admits at most 100 streams (`MAX_CLIENT_STREAMS`, [ADR 005 § Concurrent stream limits](005-protocol.md#concurrent-stream-limits)). The node refuses an over-cap stream before it reads the request. `cdn/probe/v1` and `cdn/dht/v1` serve one stream at a time on each connection. At the default handler cap, stalled peers can hold at most:
+
+- 2 GiB of unread transport data (256 connections × 8 MiB).
+- 200 MiB of `cdn/client/v1` reader buffers (256 × 100 streams × 8 KiB). Each stream holds a request of at most one ceiling, or a partial proof frame of at most one ceiling plus one 4 KiB read.
+- 16 MiB of `cdn/dht/v1` reader buffers (256 × 64 KiB).
+
+A peer must send these bytes to pin them, so the cost grows with its bandwidth. An operator with less memory lowers `security.max_concurrent_handlers`. The value `0` removes the connection cap and with it this bound. The ceilings are not operator settings: a receiver that refuses a legitimate frame breaks the protocol for its peers.
 
 The receiver reads the varint length, checks it against the ceiling, allocates and reads exactly that many bytes, then deserializes with `postcard::take_from_bytes` on the bounded slice. `take_from_bytes` succeeds even if the sender's struct has more fields than the receiver's definition — unconsumed trailing bytes are returned as a remainder. This is the key mechanism for forward-compatible minor evolution.
 
@@ -325,7 +335,7 @@ QUIC application error codes used by this ADR:
 | --- | --- | --- |
 | `0x00` | `NO_ERROR` | Normal stream/connection close. Also used for transport-level conditions that aren't application-protocol faults — read timeout, short read, peer reset, mid-frame EOF. A peer observing `0x00` after a partial exchange MUST NOT apply the protocol-fault backoff/penalty associated with `0x03`. (Enforcement of the MUST NOT lives on the receiving peer's reputation/backoff layer — yet to be built; see [ADR 008 §Local Score Calculation](008-reputation.md#local-score-calculation). Without that layer the clause is purely normative.) |
 | `0x01` | `UNSUPPORTED_MESSAGE` | Received an unknown protocol enum variant |
-| `0x02` | `MESSAGE_TOO_LARGE` | Received a length prefix above the frame ceiling of the read ([Wire Framing](#wire-framing)) |
+| `0x02` | `MESSAGE_TOO_LARGE` | Received a length prefix above the frame ceiling of the read ([Wire Framing](#wire-framing)). The node sends it when it refuses a request read. A reader that refuses a later frame on an open stream ends the stream without this code. |
 | `0x03` | `MALFORMED_MESSAGE` | Frame failed application-layer decoding: postcard deserialization failure or varint parse error. Transport-level read failures (truncation, peer reset) are reported as `0x00` instead — the framing layer surfaces them as a distinct error variant (`FrameError::Io` vs `FrameError::Varint`/`Decode`), so a receiver does not have to collapse the two. |
 | `0x10` | `RATE_LIMITED` | Connection rejected by the per-source or global rate limiter. Delivered via `CONNECTION_CLOSE` (not `RESET_STREAM`) because rejection happens before any application stream exists; the close-frame reason bytes carry a short layer label (e.g. `global-full`, `per-source`) so peers can pick an appropriate backoff. Peers that receive this code SHOULD back off before reconnecting; they MUST NOT treat it as a protocol error. The requester reads this code: `decdn-client` types a `0x10` close or stream reset as `UpstreamRateLimited`, and the node-to-node pull path suppresses the `(peer, hash)` pair for a short window and records no reputation outcome (the same treatment as a handler-level `NotFound` refusal). |
 
