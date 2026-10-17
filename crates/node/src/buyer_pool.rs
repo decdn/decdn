@@ -244,6 +244,9 @@ enum TopUpClaim {
 /// claimed yet.
 struct InFlightTopUp {
     fut: SharedTopUp,
+    /// The pool this `topUp` escrows into. Only a caller for the same pool
+    /// joins it or waits on it: its headroom cannot fund any other pool.
+    pool_id: PoolId,
     /// The amount this `topUp` asks the chain for.
     requested: U256,
     /// Headroom this `topUp` adds that no pull relies on yet. A refill starts with
@@ -254,13 +257,14 @@ struct InFlightTopUp {
 }
 
 impl InFlightTopUp {
-    fn new(fut: SharedTopUp, requested: U256, funder: TopUpFunder) -> Self {
+    fn new(fut: SharedTopUp, pool_id: PoolId, requested: U256, funder: TopUpFunder) -> Self {
         let unclaimed = match funder {
             TopUpFunder::Refill => requested,
             TopUpFunder::Recovery => U256::ZERO,
         };
         Self {
             fut,
+            pool_id,
             requested,
             unclaimed,
             funder,
@@ -774,8 +778,9 @@ impl std::fmt::Display for TopUpProof {
 /// what the `topUp` escrowed. The funding task runs this, so its
 /// [`SlotGuard`] keeps the slot for as long as this waits, and no `topUp` at
 /// another nonce is sent meanwhile. `handles.hold` marks the slot held and
-/// publishes it on `decdn_buyer_topup_unresolved`. A refill joins this `topUp`,
-/// as it joins any in-flight `topUp`, and claims nothing. A funding recovery
+/// publishes it on `decdn_buyer_topup_unresolved`. A refill for the same pool
+/// joins this `topUp` and claims nothing, and a refill for another pool does
+/// nothing. A funding recovery
 /// step that finds the hold set fails at once
 /// ([`BuyerPoolService::held_topup_error`]). A recovery step that joined before
 /// this began waits for its outcome.
@@ -1281,7 +1286,8 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     /// the proactive low-water refill and the funding recovery top-up dedup here,
     /// so the two legs racing on the one pool cannot double-escrow one shortfall. The
     /// slot also tracks how much of the running `topUp` no pull has claimed, so two
-    /// recovery top-ups cannot both count one escrow as their own.
+    /// recovery top-ups cannot both count one escrow as their own. The slot
+    /// records its pool, so a caller for another pool neither joins nor spawns.
     topup_in_flight: Arc<Mutex<Option<InFlightTopUp>>>,
     /// Whether the funding task settles its unconfirmed `topUp`
     /// ([`settle_unconfirmed_top_up`]), so a funding recovery step fails fast
@@ -1829,7 +1835,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// NEVER blocks the pull. Deduped via [`Self::topup_in_flight`], so many
     /// concurrent reuse pulls fire at most one `topUp`. An in-flight refill, an
     /// allowance failure, or a reverted `topUp` all just skip it (logged /
-    /// metered), leaving the pool un-topped-up — strictly no worse. The one leg
+    /// metered), and so does a `topUp` in flight for another pool (logged at
+    /// `debug`), leaving the pool un-topped-up — strictly no worse. The one leg
     /// that IS worse is a `topUp` that escrows, or may have escrowed, and cannot
     /// be credited locally: the deposit is then escrowed and untracked, and
     /// because this handle is dropped, `fund_pool`'s "ESCROWED AND UNTRACKED"
@@ -1840,9 +1847,15 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             return; // still above the low-water mark
         }
         // Detached: the handle is DROPPED, not awaited — the task self-reports, and
-        // a recovery top-up arriving while it runs JOINS the same future and can
-        // claim its amount, unless the task settles an unconfirmed `topUp`.
-        let (_, claim) = self.join_or_spawn_topup(state.pool_id, additional, TopUpFunder::Refill);
+        // a recovery top-up for the same pool arriving while it runs JOINS the
+        // same future and can claim its amount, unless the task settles an
+        // unconfirmed `topUp`. A `topUp` in flight for another pool skips this
+        // refill; `join_or_spawn_topup` logs it.
+        let Ok((_, claim)) =
+            self.join_or_spawn_topup(state.pool_id, additional, TopUpFunder::Refill)
+        else {
+            return;
+        };
         if claim == TopUpClaim::Spawned {
             info!(
                 pool_id = %state.pool_id,
@@ -1868,18 +1881,28 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         }
     }
 
-    /// Join the in-flight funding `topUp`, or spawn one escrowing `additional`.
+    /// Join the in-flight funding `topUp` for `pool_id`, or spawn one escrowing
+    /// `additional`.
     /// Reservation and spawn are one indivisible step under the slot lock, so two
     /// callers cannot both decide to spawn; the task holds a [`SlotGuard`] that
     /// frees the slot when it ends (any path). The returned [`TopUpClaim`] says
     /// which, and how much of a joined `topUp` this caller claimed (see
     /// [`InFlightTopUp::join`]).
+    ///
+    /// # Errors
+    ///
+    /// The slot holds a `topUp` for a pool other than `pool_id`: a
+    /// [`TopUpForOtherPool`] error marked [`LocalPullFault`]. That `topUp`
+    /// escrows into the other pool, so none of it funds `pool_id`. The two
+    /// differ when the store replaced one of them while the `topUp` was in
+    /// flight. One wallet sends every `topUp`, so a second one could not mine
+    /// before the first one's nonce is spent.
     fn join_or_spawn_topup(
         &self,
         pool_id: PoolId,
         additional: U256,
         funder: TopUpFunder,
-    ) -> (SharedTopUp, TopUpClaim) {
+    ) -> Result<(SharedTopUp, TopUpClaim)> {
         // Recover the slot on poison rather than treat a prior holder's panic as
         // node-fatal (as [`SlotGuard`]'s own Drop does): the guarded value is a
         // single `Option<Shared…>` move that cannot tear, so the worst a panic
@@ -1891,8 +1914,20 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if let Some(existing) = slot.as_mut() {
+            if existing.pool_id != pool_id {
+                debug!(
+                    %pool_id,
+                    in_flight = %existing.pool_id,
+                    "the top-up slot holds a topUp for another pool; refusing at once"
+                );
+                return Err(anyhow::Error::new(TopUpForOtherPool {
+                    pool_id,
+                    in_flight: existing.pool_id,
+                })
+                .context(LocalPullFault));
+            }
             debug!(%pool_id, "joining a pool topUp already in flight");
-            return existing.join(additional, funder);
+            return Ok(existing.join(additional, funder));
         }
 
         let handles = self.funding_handles();
@@ -1921,8 +1956,13 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             })
         });
         let shared = fut.shared();
-        *slot = Some(InFlightTopUp::new(shared.clone(), additional, funder));
-        (shared, TopUpClaim::Spawned)
+        *slot = Some(InFlightTopUp::new(
+            shared.clone(),
+            pool_id,
+            additional,
+            funder,
+        ));
+        Ok((shared, TopUpClaim::Spawned))
     }
 
     /// The error a funding recovery step gets while the funding task settles
@@ -2110,8 +2150,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// Concurrent fills share one pool, so one step funds them all.
     /// `seen_deposit` is the deposit the calling fill saw. A row that already
     /// holds more is a sibling's step that landed: the call returns the row's
-    /// deposit and escrows nothing. A recovery top-up still in flight is a
-    /// sibling's step too: the call waits for it and returns its deposit. When
+    /// deposit and escrows nothing. A recovery top-up still in flight for the
+    /// same pool is a sibling's step too: the call waits for it and returns its
+    /// deposit. When
     /// that top-up reverts `PoolNotOpen`, the call joins the replacement open.
     /// When the funding task settles an unconfirmed `topUp`, the call fails at
     /// once instead of waiting (see Errors).
@@ -2129,9 +2170,10 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     ///
     /// No pool is tracked, the `topUp` or replacement `openPool` fails, a
     /// joined top-up fails for any reason but `PoolNotOpen`, a mined
-    /// transaction cannot be recorded (escrowed and untracked), or the top-up
+    /// transaction cannot be recorded (escrowed and untracked), the top-up
     /// slot is held for an unconfirmed `topUp` (a `TopUpHeld` error marked
-    /// [`LocalPullFault`]).
+    /// [`LocalPullFault`]), or the slot holds a `topUp` for another pool (a
+    /// `TopUpForOtherPool` error marked [`LocalPullFault`]).
     pub async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
         let state = self
             .reuse_or_report()?
@@ -2139,7 +2181,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         if state.deposit > seen_deposit {
             return Ok(Recovery::ToppedUp(state.deposit));
         }
-        if let Some(in_flight) = self.recovery_in_flight()? {
+        if let Some(in_flight) = self.recovery_in_flight(state.pool_id)? {
             return match in_flight.await {
                 Ok(landed) => Ok(Recovery::ToppedUp(landed.new_deposit)),
                 // The sibling's step replaces the pool; this fill joins that
@@ -2216,22 +2258,22 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         }))
     }
 
-    /// The recovery top-up in flight, if one is: a sibling fill's step, which
-    /// this fill waits for instead of funding its own.
+    /// The recovery top-up in flight for `pool_id`, if one is: a sibling fill's
+    /// step, which this fill waits for instead of funding its own. A recovery
+    /// top-up for another pool is not this fill's to wait for.
     ///
     /// # Errors
     ///
     /// The funding task settles the sibling's unconfirmed `topUp`
     /// ([`Self::held_topup_error`]).
-    fn recovery_in_flight(&self) -> Result<Option<SharedTopUp>> {
+    fn recovery_in_flight(&self, pool_id: PoolId) -> Result<Option<SharedTopUp>> {
         let slot = self
             .topup_in_flight
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(in_flight) = slot
-            .as_ref()
-            .filter(|in_flight| in_flight.funder == TopUpFunder::Recovery)
-        else {
+        let Some(in_flight) = slot.as_ref().filter(|in_flight| {
+            in_flight.funder == TopUpFunder::Recovery && in_flight.pool_id == pool_id
+        }) else {
             return Ok(None);
         };
         if self.topup_hold.is_held() {
@@ -2279,7 +2321,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// [`Self::recover_pool`].
     ///
     /// A `topUp` already in flight is JOINED, not duplicated, unless the funding
-    /// task settles it as unconfirmed (see Errors). This call counts only
+    /// task settles it as unconfirmed or it funds another pool (see Errors).
+    /// This call counts only
     /// the part of it that no other pull relies on: all of a refill's amount, none of
     /// another recovery top-up's. When that part is less than `additional`, this
     /// method funds the remainder with a further `topUp` (see `top_up_at_least`).
@@ -2303,8 +2346,13 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// while the funding task settles its unconfirmed `topUp` (a `TopUpHeld`
     /// error marked [`LocalPullFault`]): that settle can last as long as the
     /// chain takes. A call that joined before the settle began waits for its
-    /// outcome, or until the caller drops it. This method meters nothing
-    /// itself; the funding recovery step that calls it meters the refusal.
+    /// outcome, or until the caller drops it. Also fails at once, sending no
+    /// `topUp`, while the slot holds a `topUp` for another pool (a
+    /// `TopUpForOtherPool` error marked [`LocalPullFault`]): its headroom
+    /// cannot fund this pool. Either refusal after a joined `topUp` landed
+    /// returns what landed instead (see `top_up_at_least`). This method meters
+    /// nothing itself; the funding recovery step that calls it meters the
+    /// refusal.
     pub async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
         let state = self
             .reuse_or_report()?
@@ -2321,7 +2369,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             if self.topup_hold.is_held() {
                 return Err(Self::held_topup_error());
             }
-            Ok(self.join_or_spawn_topup(state.pool_id, amount, TopUpFunder::Recovery))
+            self.join_or_spawn_topup(state.pool_id, amount, TopUpFunder::Recovery)
         })
         .await?;
         info!(
@@ -3200,8 +3248,9 @@ enum Landed {
 /// so a caller that needs the outcome fails at once as this node's own fault
 /// instead of waiting out its budget: a miss that needs a pool
 /// ([`BuyerPoolService::held_open_error`]), or a funding recovery step
-/// ([`BuyerPoolService::held_topup_error`]). A refill that finds the top-up
-/// slot held joins it and claims nothing. [`Self::wait_held`] serves the open
+/// ([`BuyerPoolService::held_topup_error`]). A refill for the same pool that
+/// finds the top-up slot held joins it and claims nothing; a refill for
+/// another pool does nothing. [`Self::wait_held`] serves the open
 /// slot only: an open joiner abandons its wait once the hold begins, but a
 /// recovery step that joined a `topUp` before its settle began waits for the
 /// outcome. `publish` exports the state on the slot's gauge.
@@ -3309,6 +3358,30 @@ impl std::fmt::Display for TopUpHeld {
 }
 
 impl std::error::Error for TopUpHeld {}
+
+/// Typed marker: the top-up slot holds a `topUp` for a pool other than the one
+/// the caller funds. That `topUp` escrows into the other pool, so the caller
+/// neither joins it nor sends a second `topUp` beside it.
+#[derive(Debug)]
+struct TopUpForOtherPool {
+    /// The pool the caller funds.
+    pool_id: PoolId,
+    /// The pool the slot's `topUp` escrows into.
+    in_flight: PoolId,
+}
+
+impl std::fmt::Display for TopUpForOtherPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the top-up slot holds a topUp for pool {}, not {}; this node sends no topUp for \
+             {} until that topUp's task ends",
+            self.in_flight, self.pool_id, self.pool_id
+        )
+    }
+}
+
+impl std::error::Error for TopUpForOtherPool {}
 
 /// What one chain read says about a transaction (an `openPool` or a `topUp`)
 /// whose outcome the task that sent it did not see.
