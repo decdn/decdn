@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use alloy::primitives::U256;
 use anyhow::Context as _;
 use decdn_client::bundle::BundleManifest;
-use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedOpens};
+use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
@@ -72,7 +72,7 @@ use decdn_client::provider;
 
 use super::buyer_store::{DataDirSource, chain_adoption_for_buy, open_client_store_for_buy};
 use super::fetch_timings::{FetchTimings, Mark};
-use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
+use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_escrows};
 use super::tab_progress::TabProgress;
 use decdn_client::ordered_writes::OrderedWrites;
 
@@ -510,7 +510,7 @@ pub(crate) fn manifest_cap_mb(max_blob_mb: u64) -> u64 {
 /// [`Interrupted`] on Ctrl-C, [`decdn_client::GaveUp`] once the stop policy's
 /// no-progress limit passes, or the fault that ended the fetch. A fetch that
 /// ends with an `openPool` whose receipt it did not read carries
-/// [`super::interrupt::PendingOpens`], as context on any of those or as the
+/// [`super::interrupt::PendingEscrows`], as context on any of those or as the
 /// error of a fetch that otherwise succeeded.
 pub(crate) async fn fetch(
     args: &cli::GetArgs,
@@ -524,14 +524,14 @@ pub(crate) async fn fetch(
     let payer = Payer::keystore(grant);
     // A Ctrl-C drops the fetch mid-transfer: each drive's drop guard queues
     // what it paid for recording, and the `.partial` is the next run's resume
-    // prefix. The handle outlives the fetch, so an `openPool` that a Ctrl-C or a
-    // fault dropped before its receipt was read is still named.
-    let mut interrupt = Interrupt::watch(host.opens.clone());
+    // prefix. The handle outlives the fetch, so an `openPool` or `topUp` that a
+    // Ctrl-C or a fault dropped before its receipt was read is still named.
+    let mut interrupt = Interrupt::watch(host.escrows.clone());
     let result = tokio::select! {
         result = fetch_target(&host, &payer, args, output, uri, &timings) => result,
         () = interrupt.wait() => Err(Interrupted.into()),
     };
-    let result = name_unconfirmed_open(result, &host.opens.pending());
+    let result = name_unconfirmed_escrows(result, &host.escrows.pending());
     let output = if wants_stdout(output) {
         "stdout"
     } else {
@@ -728,8 +728,8 @@ pub(crate) struct FetchHost {
     connections: Connections,
     health: Arc<PeerHealth>,
     writes: OrderedWrites,
-    /// Each `openPool` whose receipt is unread, across every fetch.
-    pub(crate) opens: UnconfirmedOpens,
+    /// Each `openPool` and `topUp` whose receipt is unread, across every fetch.
+    pub(crate) escrows: UnconfirmedEscrows,
     /// The pool's settlement token, `PaymentPool.usdc()`, read once.
     token: tokio::sync::OnceCell<alloy::primitives::Address>,
 }
@@ -796,7 +796,7 @@ impl FetchHost {
             endpoint,
             health: Arc::new(PeerHealth::default()),
             writes: OrderedWrites::default(),
-            opens: UnconfirmedOpens::default(),
+            escrows: UnconfirmedEscrows::default(),
             token: tokio::sync::OnceCell::new(),
         };
         Ok((host, grant))
@@ -932,7 +932,7 @@ pub(crate) async fn fetch_on(
         connections,
         health,
         writes,
-        opens,
+        escrows,
         token,
     } = host;
     let hash = args.hash;
@@ -1055,7 +1055,7 @@ pub(crate) async fn fetch_on(
     loop {
         // Per pass: the funding facts, the lanes and their handles all name the
         // pool the pass pays from.
-        let funding = RunFunding::reporting_opens_to(opens.clone());
+        let funding = RunFunding::reporting_escrows_to(escrows.clone());
         // The shared pull/funding deps every lane borrows for the whole pass.
         let deps = LaneDeps {
             endpoint,

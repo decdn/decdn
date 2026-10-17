@@ -22,7 +22,7 @@ use decdn_incentive::{CapabilityGrant, Deployment, LaneKey, PoolId, bind_node_id
 use iroh::Endpoint;
 
 use crate::buyer_pool::{
-    LOW_WATER_DIVISOR, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, UnconfirmedOpens,
+    LOW_WATER_DIVISOR, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, UnconfirmedEscrows,
     WalletShortfall, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool,
     pool_accepts_funds, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
 };
@@ -79,20 +79,19 @@ pub fn cached_pool_token(
 /// `warning:` line naming it. It also names the pool the run's first built
 /// lane pays from, which a funding recovery step tops up: every entry of a
 /// bundle pull shares it, the entries that have built no lane yet included.
-/// Every `openPool` a lane build or a recovery step sends is held in its
-/// [`UnconfirmedOpens`] until its receipt is read. The run sends one `topUp` at
-/// a time, and the first that may have been broadcast but is not known to have
-/// mined ([`TopUpUnconfirmed`]) stays in the run's state, not in that handle:
-/// every later `topUp` of the run is refused with it.
+/// Every `openPool` and `topUp` a lane build or a recovery step sends is held
+/// in its [`UnconfirmedEscrows`] until its receipt is read. The run sends one
+/// `topUp` at a time, and while the handle holds one that may have been
+/// broadcast but is not known to have mined ([`TopUpUnconfirmed`]), every later
+/// `topUp` of the run is refused with it.
 #[derive(Debug, Default)]
 pub struct RunFunding {
     spend: Mutex<RunSpend>,
     shortfall: Mutex<Option<String>>,
     pool_id: OnceLock<PoolId>,
-    opens: UnconfirmedOpens,
-    /// Held across each `topUp` of the run, so one runs at a time; it holds
-    /// the first [`TopUpUnconfirmed`].
-    top_up: tokio::sync::Mutex<Option<TopUpUnconfirmed>>,
+    escrows: UnconfirmedEscrows,
+    /// Held across each `topUp` of the run, so one runs at a time.
+    top_up: tokio::sync::Mutex<()>,
 }
 
 /// What a lane build learned about the pool's spend, for
@@ -128,21 +127,22 @@ struct RunSpend {
 }
 
 impl RunFunding {
-    /// A run whose `openPool` transactions are held in `opens`, a handle the
-    /// caller keeps after the run's state is dropped. A caller that builds a
-    /// `RunFunding` per pass passes the same handle to each.
+    /// A run whose `openPool` and `topUp` transactions are held in `escrows`,
+    /// a handle the caller keeps after the run's state is dropped. A caller
+    /// that builds a `RunFunding` per pass passes the same handle to each, so
+    /// a `topUp` one pass left unconfirmed refuses the next pass's.
     #[must_use]
-    pub fn reporting_opens_to(opens: UnconfirmedOpens) -> Self {
+    pub fn reporting_escrows_to(escrows: UnconfirmedEscrows) -> Self {
         Self {
-            opens,
+            escrows,
             ..Self::default()
         }
     }
 
-    /// The handle that holds the run's `openPool` transactions whose receipt
-    /// was not read ([`UnconfirmedOpens::pending`]).
-    pub const fn opens(&self) -> &UnconfirmedOpens {
-        &self.opens
+    /// The handle that holds the run's `openPool` and `topUp` transactions
+    /// whose receipt was not read ([`UnconfirmedEscrows::pending`]).
+    pub const fn escrows(&self) -> &UnconfirmedEscrows {
+        &self.escrows
     }
 
     /// Name `pool_id` as the pool the run's lanes pay from. The first lane
@@ -522,7 +522,7 @@ where
             self.token,
             self.owner,
             deposit,
-            Some(self.funding.opens()),
+            Some(self.funding.escrows()),
             Some(RECEIPT_TIMEOUT),
         )
         .await?;
@@ -1043,10 +1043,11 @@ fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
 /// run's `topUp` lock in `funding` from its check to its outcome: a second
 /// caller waits for the first `topUp` to resolve. A `topUp` that may have been
 /// broadcast but is not known to have mined ([`TopUpUnconfirmed`]: a lapsed or
-/// failed receipt read, or a submit lost in transport) may still mine, so the
-/// lock keeps it. Every later call of the run refuses with that error instead
-/// of escrowing a second deposit, and the acquire loop classifies it as fatal
-/// to the command ([`crate::Fault::Fatal`]).
+/// failed receipt read, a submit lost in transport, or a future dropped before
+/// either) may still mine, so the run's [`UnconfirmedEscrows`] keeps it. Every
+/// later call of the run refuses with it instead of escrowing a second
+/// deposit, and the acquire loop classifies that as fatal to the command
+/// ([`crate::Fault::Fatal`]).
 ///
 /// # Errors
 ///
@@ -1063,8 +1064,8 @@ async fn escrow_top_up<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let mut held = funding.top_up.lock().await;
-    if let Some(earlier) = *held {
+    let _serial = funding.top_up.lock().await;
+    if let Some(earlier) = funding.escrows.top_ups().first().copied() {
         return Err(anyhow::Error::new(earlier)
             .context("refusing a second topUp while an earlier one is unconfirmed"));
     }
@@ -1076,13 +1077,15 @@ where
         if max_approve { None } else { Some(additional) },
     )
     .await?;
-    let topped_up = top_up(contract, owner, pool_id, additional, Some(RECEIPT_TIMEOUT)).await;
-    if let Err(err) = &topped_up
-        && let Some(unconfirmed) = err.downcast_ref::<TopUpUnconfirmed>()
-    {
-        *held = Some(*unconfirmed);
-    }
-    topped_up
+    top_up(
+        contract,
+        owner,
+        pool_id,
+        additional,
+        Some(&funding.escrows),
+        Some(RECEIPT_TIMEOUT),
+    )
+    .await
 }
 
 /// Restore `state`'s remaining deposit (`deposit - spent`) to `working_deposit`
@@ -1321,7 +1324,7 @@ where
         token,
         self_address,
         deposit,
-        Some(funding.opens()),
+        Some(funding.escrows()),
         Some(RECEIPT_TIMEOUT),
     )
     .await?;

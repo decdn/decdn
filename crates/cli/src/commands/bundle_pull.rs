@@ -23,7 +23,7 @@ use decdn_client::bundle::{
     FaultContext, FaultHints, FileObserver, ForeignReason, Funding, ManifestEntry, NotAManifest,
     STAGING_DIR, select_nodes,
 };
-use decdn_client::buyer_pool::UnconfirmedOpens;
+use decdn_client::buyer_pool::UnconfirmedEscrows;
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::GetArgs;
@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use super::buyer_store::open_client_store_for_buy;
 use super::fetch;
 use super::get::Destination;
-use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
+use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_escrows};
 use super::manifest::build_glob_set;
 use super::pull_progress::{self, PullProgress};
 
@@ -754,9 +754,9 @@ async fn pull_over(
     };
 
     let observer = Arc::new(PullObserver::new(args.json, run_label(out)));
-    // Outlives the puller's passes, so an `openPool` that a Ctrl-C or a fault
-    // dropped before its receipt was read is still named.
-    let opens = UnconfirmedOpens::default();
+    // Outlives the puller's passes, so an `openPool` or `topUp` that a Ctrl-C
+    // or a fault dropped before its receipt was read is still named.
+    let escrows = UnconfirmedEscrows::default();
     let mut puller = BundlePuller::builder(
         chain.config.clone(),
         chain.site.clone(),
@@ -777,14 +777,14 @@ async fn pull_over(
     .stop(std::io::stderr().is_terminal(), common.give_up_after())
     .observer(Arc::clone(&observer) as Arc<dyn BundleObserver>)
     .fault_hints(Arc::new(CliFaultHints))
-    .unconfirmed_opens(opens.clone())
+    .unconfirmed_escrows(escrows.clone())
     .build()
     .await?;
 
     // Watched from before the manifest: the manifest fetch is paid, so it can
     // open the run's pool. The first Ctrl-C stops the run where it is; a
     // second one exits at once.
-    let mut interrupt = Interrupt::watch(opens.clone());
+    let mut interrupt = Interrupt::watch(escrows.clone());
     let result = pull_manifest(
         &mut puller,
         &mut interrupt,
@@ -794,9 +794,9 @@ async fn pull_over(
         (filter, filters_given),
     )
     .await;
-    // Every exit of the manifest or the pull can drop an `openPool` before
-    // its receipt is read, and the transaction may still escrow its deposit.
-    let result = name_unconfirmed_open(result, &opens.pending());
+    // Every exit of the manifest or the pull can drop an `openPool` or a
+    // `topUp` before its receipt is read, and the transaction may still escrow.
+    let result = name_unconfirmed_escrows(result, &escrows.pending());
     // On every exit, a Ctrl-C's included: what the entries queued is durable
     // before the command returns.
     puller.finish().await;

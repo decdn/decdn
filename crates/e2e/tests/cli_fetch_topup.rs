@@ -190,7 +190,7 @@ async fn run() -> anyhow::Result<()> {
     // measured on-chain amount into the local record via `add_deposit`.
     let remaining = deposit - prior_amount; // == 1
     let additional = deposit - remaining; // restore to a full `deposit`
-    let topped_up = top_up(&pool, buyer_addr, pool_id, additional, None)
+    let topped_up = top_up(&pool, buyer_addr, pool_id, additional, None, None)
         .await
         .context("top_up")?;
     // The tx is the only handle an operator has to reconcile an escrow whose

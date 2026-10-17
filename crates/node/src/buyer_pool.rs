@@ -588,6 +588,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
                 handles.owner,
                 pool_id,
                 additional,
+                None,
                 Some(RECEIPT_TIMEOUT),
             )
         },
