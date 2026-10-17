@@ -1062,6 +1062,14 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node: a funding recovery step fails at once while a `topUp` settles
+  (#2494).** A recovery top-up that found the top-up slot held for an
+  unconfirmed `topUp` joined it and waited for the whole settle, which lasts
+  as long as the chain takes. Each such cache miss spent its budget on every
+  candidate and then dropped. The recovery step now fails at once as a local
+  fault, like a miss that finds the open slot held. A recovery step that
+  joined before the settle began still waits for its outcome, and a low-water
+  refill still does nothing.
 - **CLI: a transaction dropped from the mempool no longer hangs the command
   (#2433).** alloy's receipt wait has no bound, so a broadcast transaction
   that never mined left these commands waiting forever: `decdn pool {open,
@@ -3581,6 +3589,11 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Node: `decdn_buyer_topup_unresolved` gauge (#2493).** It reads 1 while
+  the node holds its top-up slot for a `topUp` whose outcome the chain has not
+  resolved, and 0 again once the settle ends, including when its task is
+  aborted. `adr/appendix-observability.md` and `docs/runbook.md` describe what
+  keeps it at 1 and what the operator does.
 - **CLI: `decdn get decdn:<hash>/<path> -o -` streams one bundle entry to
   stdout (#2467).** The command reads the bundle manifest into memory (at
   most 64 MiB, and the manifest fetch requests and pays for no more), then

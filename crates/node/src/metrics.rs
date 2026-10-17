@@ -470,6 +470,16 @@ pub struct DecdnMetrics {
     /// re-send at that nonce fails: the wallet cannot fund the deposit or the
     /// gas, or the contract refuses the open.
     pub buyer_pool_open_unresolved: Gauge,
+    /// `decdn_buyer_topup_unresolved`: 1 while this node holds its top-up slot
+    /// for a `topUp` whose outcome the chain has not resolved.
+    ///
+    /// The submit or the receipt read of that `topUp` failed, and the
+    /// transaction may still mine, so the node sends no other `topUp` until the
+    /// chain shows the outcome. A low-water refill meanwhile does nothing, and a
+    /// funding recovery step fails at once as a local fault. A value that stays
+    /// at 1 means the chain lane cannot answer, a pending transaction holds the
+    /// `topUp`'s nonce or an earlier one, or every re-send at that nonce fails.
+    pub buyer_topup_unresolved: Gauge,
     /// Total raw USDC this node holds in accepted vouchers that it has not yet
     /// redeemed on-chain — the sum of `owed − paid` across every inbound lane
     /// the redeemer plans to collect. Refreshed once per redeemer self-tick
@@ -2556,6 +2566,11 @@ impl Metrics {
     /// `openPool`.
     pub(crate) fn set_buyer_pool_open_unresolved(&self, held: bool) {
         self.decdn.buyer_pool_open_unresolved.set(i64::from(held));
+    }
+
+    /// Publish whether the top-up slot is held for an unconfirmed `topUp`.
+    pub(crate) fn set_buyer_topup_unresolved(&self, held: bool) {
+        self.decdn.buyer_topup_unresolved.set(i64::from(held));
     }
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so

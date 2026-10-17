@@ -613,6 +613,24 @@ RPC, let that transaction mine, or fund the wallet. Do not restart to clear it:
 a restart forgets the wait, and a transaction that mines after the restart is a
 deposit the node does not track until the next restart adopts or reports it.
 
+**`decdn_buyer_topup_unresolved` at 1 means the node holds its top-up slot for a
+`topUp` it could not confirm.** The submit failed in transport, or the receipt
+read failed, so the transaction may still mine. The node sends no other `topUp`
+until the chain resolves it: a low-water refill does nothing, and a funding
+recovery step fails at once as a local fault, so a cache miss whose upstream
+refuses this node's funding fails fast. The node re-reads the chain every 5 s: a
+receipt, or the account's nonce passing the `topUp`'s, ends the wait and credits
+what escrowed. A nonce that no transaction holds gets a fresh `topUp` at that
+same nonce, so at most one of them escrows. `still holding the top-up slot for an
+unconfirmed topUp` repeats every minute with the elapsed time and the last thing
+the chain said. A gauge that stays at 1 means the RPC cannot answer, a pending
+transaction from this key holds the `topUp`'s nonce or an earlier one, or every
+re-send at that nonce fails. Read `last` in the repeating warning, then fix the
+RPC, let that transaction mine, or fund the wallet's gas. Do not restart to clear
+it: a restart forgets the settle, and a `topUp` that mines after it escrows into
+the pool without the local row being credited. Compare `decdn node pools` with
+`decdn pool list --all` to find that deposit.
+
 1. Run `decdn node pools`, and `decdn pool list --all` beside it. The first
    reports every pool the daemon tracks, its deposit, and the per-lane amounts
    already signed away; the second reports every pool the wallet owns on chain.
