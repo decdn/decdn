@@ -101,7 +101,7 @@ impl std::error::Error for HealExhausted {}
 /// Whether `err` reports a `topUp` or `openPool` that may have escrowed USDC
 /// no local record credits ([`EscrowUntracked`], [`TopUpUnconfirmed`],
 /// [`OpenUnconfirmed`]). A retry escrows again, so it is fatal to the command.
-fn escrow_untracked(err: &anyhow::Error) -> bool {
+pub(crate) fn escrow_untracked(err: &anyhow::Error) -> bool {
     err.downcast_ref::<EscrowUntracked>().is_some()
         || err.downcast_ref::<TopUpUnconfirmed>().is_some()
         || err.downcast_ref::<OpenUnconfirmed>().is_some()

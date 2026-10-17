@@ -691,3 +691,102 @@ impl BlobSource for TamperTailSource {
         Box::pin(async { Ok(VoucherProgress::default()) })
     }
 }
+
+/// Static lanes, one of whose builds ends after a delay with an error that
+/// says its top-up mined but its local record was not written: a lane build
+/// still in flight as the stream's last byte lands.
+struct LateEscrowBuild {
+    lanes: StaticSources<ScriptedSource>,
+    late: Address,
+}
+
+impl crate::SourceProvider for LateEscrowBuild {
+    type Source = ScriptedSource;
+
+    fn discover(&self, hash: [u8; 32]) -> SourceFuture<'_, Vec<crate::Holder>> {
+        self.lanes.discover(hash)
+    }
+
+    fn connect<'a>(
+        &'a self,
+        holder: &'a crate::Holder,
+    ) -> SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+        let late = holder.provider == self.late;
+        Box::pin(async move {
+            if !late {
+                return self.lanes.connect(holder).await;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Err(crate::buyer_pool::escrowed_but_untracked(
+                "pool 0x01 topped up by 5 µUSDC",
+                alloy::primitives::TxHash::repeat_byte(0xab),
+                "disk full",
+            ))
+        })
+    }
+}
+
+/// A stream read to its end still reports what the fetch ends with after its
+/// last byte: a late lane build that may have escrowed USDC no record
+/// credits. The reader's end of stream does not carry it; `finish` does.
+#[tokio::test(start_paused = true)]
+async fn finish_reports_a_late_lane_build_escrow_after_the_last_byte() -> anyhow::Result<()> {
+    let blob = payload(1_500_000);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let (root, total) = (source.root(), source.total_bytes());
+    let (late_source, late_ledger) = paying_source(blob.clone())?;
+    let lanes = StaticSources::new(vec![
+        candidate(source, ledger, 0xA1),
+        candidate(late_source, late_ledger, 0xB2),
+    ])?;
+    let holders = lanes.holders();
+    let provider = LateEscrowBuild {
+        lanes,
+        late: Address::repeat_byte(0xB2),
+    };
+    let scratch = tempfile::tempdir()?;
+    let streamer = Streamer::new(provider, funder(), scratch.path()).holders(holders);
+    let (mut reader, mut drive) = streamer
+        .open(
+            root,
+            total,
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    drive.alongside(reader.read_to_end(&mut out)).await?;
+    anyhow::ensure!(out == blob, "every verified byte reaches the reader");
+    let err = drive
+        .finish()
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("finish must report the late escrow"))?;
+    let tx = alloy::primitives::TxHash::repeat_byte(0xab).to_string();
+    anyhow::ensure!(format!("{err:#}").contains(&tx), "the tx is named: {err:#}");
+    Ok(())
+}
+
+/// A stream whose fetch ends cleanly finishes cleanly.
+#[tokio::test]
+async fn finish_after_a_clean_stream_is_ok() -> anyhow::Result<()> {
+    let blob = payload(1_500_000);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let (root, total) = (source.root(), source.total_bytes());
+    let scratch = tempfile::tempdir()?;
+    let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
+    let (mut reader, mut drive) = streamer
+        .open(
+            root,
+            total,
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    drive.alongside(reader.read_to_end(&mut out)).await?;
+    anyhow::ensure!(out == blob, "every verified byte reaches the reader");
+    drive.finish().await
+}

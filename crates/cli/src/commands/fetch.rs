@@ -1419,6 +1419,10 @@ where
         bar.finish_and_clear();
     }
     let copied = copy_result.map_err(|read_err| stream_error(read_err, drive.take_error()))?;
+    // Every verified byte is out, but the fetch can still be awaiting a lane
+    // build: one that may have escrowed USDC no record credits fails the stream,
+    // as it fails a fetch to a file.
+    drive.finish().await?;
     tracing::info!("streamed {copied} verified bytes");
     Ok(())
 }
