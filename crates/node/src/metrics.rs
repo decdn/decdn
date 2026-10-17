@@ -1468,7 +1468,8 @@ pub struct DecdnMetrics {
     /// transaction failed (allowance, revert, RPC, or a mined `topUp` the local
     /// pool row could not credit), or the top-up slot is held for an
     /// unconfirmed `topUp` (`decdn_buyer_topup_unresolved` reads 1, and no
-    /// transaction is sent).
+    /// transaction is sent), or the top-up slot holds a `topUp` for another
+    /// pool (no transaction is sent).
     ///
     /// A failed funding transaction also ticks `decdn_buyer_topup_failure_total`.
     pub node_pull_recovery_step_refused: Counter,

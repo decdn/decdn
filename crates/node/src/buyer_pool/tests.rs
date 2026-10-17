@@ -2941,7 +2941,11 @@ async fn a_recovery_does_not_join_a_top_up_for_another_pool() {
         .now_or_never()
         .expect("the call fails at once")
         .expect_err("the slot holds a topUp for another pool");
-    assert!(err.downcast_ref::<TopUpForOtherPool>().is_some(), "{err:#}");
+    let other = err
+        .downcast_ref::<TopUpForOtherPool>()
+        .expect("the refusal names both pools");
+    assert_eq!(other.in_flight, REPLACED);
+    assert_eq!(other.pool_id, PoolId::from([0x5A; 32]));
     assert!(err.downcast_ref::<LocalPullFault>().is_some(), "{err:#}");
 
     let slot = svc.topup_in_flight.lock().unwrap();
@@ -2975,7 +2979,10 @@ async fn a_fill_does_not_wait_on_a_siblings_recovery_for_another_pool() {
         .expect_err("the slot holds a topUp for another pool");
     assert!(err.downcast_ref::<TopUpForOtherPool>().is_some(), "{err:#}");
     assert!(err.downcast_ref::<LocalPullFault>().is_some(), "{err:#}");
-    assert!(asserter.read_q().is_empty(), "no chain read was made");
+    assert!(
+        svc.open_in_flight.lock().unwrap().is_none(),
+        "no replacement open"
+    );
 }
 
 /// The reclaim sweep drops the row of a pool another caller already
