@@ -17,13 +17,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
+use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256, TxHash, U256};
-use alloy::providers::Provider;
+use alloy::providers::{PendingTransactionBuilder, Provider};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::lane_signer::derive_lane_signer;
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
+use decdn_incentive::tx::{RECEIPT_TIMEOUT, await_receipt};
 use decdn_incentive::{
     AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, Capability, Deployment,
     DepositOutcome, LaneKey, PoolOpenFailureReason, SignedCapability, StoreError,
@@ -65,13 +67,6 @@ fn approve_decision(current: U256, amount: Option<U256>) -> Option<U256> {
         Some(approve_value)
     }
 }
-
-/// Bound the wait for the one-time USDC `approve` receipt so a stuck or
-/// underpriced tx can't wedge the buyer path (#1109). Sized well above a normal
-/// inclusion window but short enough that the worst case is a few minutes. On
-/// timeout the broadcast tx may still mine later; the allowance read at the top
-/// of the next run makes the re-approve idempotent, so no funds are stranded.
-const APPROVE_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// A freshly opened buyer pool: the persistable [`BuyerPoolState`] and the open
 /// transaction hash. A lane on it signs under [`self_owned_lane_ctx`]. The
@@ -465,8 +460,10 @@ pub enum WatermarkRow {
 ///
 /// # Errors
 ///
-/// Fails on the allowance read, the `approve` submission, or a reverted approve.
-/// A submission that fails in transport
+/// Fails on the allowance read, the `approve` submission, a receipt that is not
+/// read (a failed read, or none within [`RECEIPT_TIMEOUT`]; the error names the
+/// tx, which may still mine), or a reverted approve. A submission that fails in
+/// transport
 /// ([`decdn_incentive::tx::send_broadcast_unknown`]) says the `approve` may have
 /// been broadcast.
 pub async fn ensure_allowance<P: Provider + Clone>(
@@ -500,19 +497,18 @@ pub async fn ensure_allowance<P: Provider + Clone>(
             return Err(anyhow::Error::new(err).context(format!("submit USDC approve{note}")));
         }
     };
-    // Capture the hash before `get_receipt` consumes `pending`, so a timeout
-    // error names the broadcast tx an operator needs to look up (it stays in the
-    // mempool and may still mine after we give up).
+    // Capture the hash before the wait consumes `pending`, so a timeout error
+    // names the broadcast tx an operator needs to look up: it stays in the
+    // mempool and may still mine after the wait ends. The wait is bounded, so a
+    // stuck or underpriced tx cannot wedge the buyer path, in the CLI or the
+    // node (#1109). Ending the wait is safe: the allowance read at the top of
+    // the next run makes the re-approve idempotent, so no funds are stranded.
     let approve_tx = *pending.tx_hash();
-    let receipt = tokio::time::timeout(APPROVE_RECEIPT_TIMEOUT, pending.get_receipt())
+    let receipt = await_receipt(pending, Some(RECEIPT_TIMEOUT))
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "USDC approve receipt timed out after {APPROVE_RECEIPT_TIMEOUT:?} \
-                 (tx {approve_tx}; may still mine later)"
-            )
-        })?
-        .with_context(|| format!("await USDC approve receipt (tx {approve_tx:#x})"))?;
+        .with_context(|| {
+            format!("await USDC approve receipt (tx {approve_tx:#x}; it may still mine later)")
+        })?;
     if !receipt.status() {
         anyhow::bail!("USDC approve transaction reverted (tx {approve_tx:#x})");
     }
@@ -563,20 +559,22 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// no reason — the deposit is escrowed but untracked, so it surfaces as an
 /// unclassified error for manual reconciliation.
 ///
-/// # The receipt wait is deliberately UNBOUNDED
+/// # The caller picks the receipt bound
 ///
-/// `ensure_allowance`'s `approve` bounds its receipt wait (idempotent — giving up
-/// costs nothing). `openPool` and `top_up` **escrow funds**: giving up on the
-/// receipt does not cancel the tx, so a caller that then believes no open is in
-/// flight would escrow a second deposit against a pool the first tx is still
-/// going to mine. So while an `openPool` is outstanding, the only safe thing is
-/// to keep waiting; the node calls this inside a detached task that holds the
-/// owner's open slot while this future runs, and after it while the open is
-/// unconfirmed (#1143, #2415).
+/// `receipt_timeout` bounds the receipt wait when it is `Some`. `openPool`
+/// **escrows funds**, and giving up on the receipt does not cancel the tx. A
+/// caller that then believes no open is in flight would escrow a second deposit
+/// against a pool the first tx is still going to mine. So a caller that bounds
+/// the wait must resolve the unconfirmed open before it sends another one.
+/// Both binaries pass [`RECEIPT_TIMEOUT`]. In the CLI a lapse ends the command
+/// and names the tx (#2433). The node calls this inside a detached task that
+/// holds the owner's open slot while this future runs, and after it while the
+/// open is unconfirmed (#1143, #2415). That task settles an unconfirmed open
+/// against the chain and re-sends one dropped from the mempool.
 ///
-/// The wait ends early only when the receipt read itself fails. That error
-/// names the broadcast tx, which may still mine and escrow the deposit. The
-/// error is classified [`PoolOpenFailureReason::RpcError`] and carries an
+/// The wait ends without a receipt when the receipt read fails or the bound
+/// lapses. That error names the broadcast tx, which may still mine and escrow the deposit.
+/// The error is classified [`PoolOpenFailureReason::RpcError`] and carries an
 /// [`OpenUnconfirmed`] with the hash and nonce. A submit that fails in
 /// transport ([`decdn_incentive::tx::send_broadcast_unknown`]) carries one too,
 /// with the nonce and no hash. The caller must resolve that transaction before
@@ -590,6 +588,12 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// flight or failed in transport, with the hash after. A caller that may drop
 /// the future or its error passes `Some` and reads
 /// [`UnconfirmedOpens::pending`] when it ends, so it can still name the tx.
+///
+/// An `opens` that already holds an unconfirmed open refuses a new one: the
+/// call fails with that [`OpenUnconfirmed`] before any chain read, because the
+/// earlier tx may still mine and a second open would escrow a second deposit.
+/// A caller that serializes its opens sees this only after an earlier open
+/// ended without a receipt.
 ///
 /// # The nonce is explicit
 ///
@@ -605,6 +609,7 @@ pub async fn open_pool<P: Provider + Clone>(
     owner: Address,
     deposit: U256,
     opens: Option<&UnconfirmedOpens>,
+    receipt_timeout: Option<Duration>,
 ) -> Result<OpenedPool> {
     anyhow::ensure!(
         *contract.address() == deployment.payment_pool,
@@ -613,6 +618,10 @@ pub async fn open_pool<P: Provider + Clone>(
         deployment.payment_pool
     );
     let amount = to_pool_u64(deposit, "deposit")?;
+    if let Some(earlier) = opens.and_then(|opens| opens.pending().first().copied()) {
+        return Err(anyhow::Error::new(earlier)
+            .context("refusing a second openPool while an earlier one is unconfirmed"));
+    }
     let nonce = contract
         .provider()
         .get_transaction_count(owner)
@@ -662,17 +671,18 @@ pub async fn open_pool<P: Provider + Clone>(
     };
     opens.insert(unconfirmed);
 
-    // Unbounded by design — see the `# The receipt wait is deliberately UNBOUNDED`
-    // section above. Only a receipt releases the entry: a drop here or a failed
-    // read leaves it, which is the point.
-    let receipt = pending.get_receipt().await.map_err(|err| {
-        anyhow::Error::new(err)
-            .context(format!(
+    // Bounded only when the caller asks — see `# The caller picks the receipt
+    // bound` above. Only a receipt releases the entry: a drop here, a failed
+    // read or a lapse leaves it, which is the point.
+    let receipt = await_receipt(pending, receipt_timeout)
+        .await
+        .map_err(|err| {
+            err.context(format!(
                 "await openPool receipt (tx {tx:#x}; it may still mine and escrow the deposit)"
             ))
             .context(unconfirmed)
             .context(PoolOpenFailureReason::RpcError)
-    })?;
+        })?;
     opens.remove(unconfirmed);
     opened_from_receipt(&receipt, tx, deployment, token, owner, deposit)
 }
@@ -766,10 +776,10 @@ pub const SELF_CAPABILITY_CAP: u64 = u64::MAX;
 
 /// Typed marker on an [`open_pool`] error raised when the `openPool` may have
 /// been broadcast but is not known to have mined: its submit failed in
-/// transport, or it was broadcast and its receipt could not be read. An
-/// [`UnconfirmedOpens`] entry has the same meaning. The
-/// transaction may still mine and escrow the deposit, so a caller must resolve
-/// it before it sends another `openPool`. Recover it with
+/// transport, or it was broadcast and its receipt was not read (a failed read,
+/// or none within the caller's bound). An [`UnconfirmedOpens`] entry has the
+/// same meaning. The transaction may still mine and escrow the deposit, so a
+/// caller must resolve it before it sends another `openPool`. Recover it with
 /// `err.downcast_ref::<OpenUnconfirmed>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenUnconfirmed {
@@ -907,11 +917,11 @@ impl std::error::Error for AllowanceShortfall {}
 
 /// Typed marker on a [`top_up`] error raised when the `topUp` may have been
 /// broadcast but is not known to have mined: its submit failed in transport
-/// (a timeout, a reset, an HTTP 5xx), or it was broadcast and its receipt
-/// could not be read. The transaction may still mine, so the escrow may have
-/// moved while no local record credits it. A caller must not treat it as
-/// "nothing escrowed"; the acquire loop classifies it as fatal to the command
-/// ([`crate::Fault::Fatal`]).
+/// (a timeout, a reset, an HTTP 5xx), or it was broadcast and its receipt was
+/// not read (a failed read, or none within the caller's bound). The
+/// transaction may still mine, so the escrow may have moved while no local
+/// record credits it. A caller must not treat it as "nothing escrowed"; the
+/// acquire loop classifies it as fatal to the command ([`crate::Fault::Fatal`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopUpUnconfirmed {
     /// The broadcast `topUp` transaction, which an operator reconciles
@@ -1023,49 +1033,18 @@ const TOPUP_NONCE_RETRIES: u32 = 3;
 /// pending-nonce read skips past it.
 const TOPUP_NONCE_BACKOFF: Duration = Duration::from_millis(250);
 
-/// Add `additional` USDC to the buyer pool `pool_id` on-chain and return the
-/// credited amount and the mining transaction as a [`ToppedUpPool`] — the shared
-/// mechanism behind the node's cache-miss buyer (#744) and the CLI fetch buyer's
-/// auto-refill (#1103). `topUp` does not extend any lifecycle deadline; the caller
-/// credits `credited` into its local [`BuyerPoolState`] via `add_deposit`, and
-/// names `tx` if that credit fails — see [`escrowed_but_untracked`].
-///
-/// The amount credited is read back from `PoolToppedUp.additionalDeposit`, not
-/// assumed to equal `additional`: the contract credits a measured balance delta,
-/// so the two differ under a fee-on-transfer token and the local row must not
-/// over-state the on-chain deposit. If the event is absent (an ABI skew), the
-/// requested `additional` is returned as the best available estimate and the
-/// fallback is logged — an over-stated local row is the mirror of the hazard
-/// [`escrowed_but_untracked`] guards, so it must not be reached silently.
-///
-/// `owner` is the pool owner, which signs the `topUp` (`topUp` is owner-only
-/// on-chain). `top_up` reads `owner`'s pending nonce and sends the `topUp` with
-/// it, so an unconfirmed `topUp` names the nonce it holds. The provider's own
-/// nonce manager does not see that nonce, so `contract`'s provider must read
-/// the pending nonce on every send (alloy's `with_simple_nonce_management`).
-///
-/// A submit rejected as a same-account nonce collision
-/// ([`decdn_incentive::tx::is_nonce_collision`]) broadcast nothing, so it is
-/// re-sent up to three more times, a quarter second apart, each time on a fresh
-/// pending nonce.
-/// A node signs its sellers' redemptions and its buyer top-ups with one key, so a
-/// top-up can lose its nonce to a redemption sent at the same moment.
-///
-/// # Errors
-///
-/// Errors if the nonce read or the `topUp` transaction fails (submit, revert, or
-/// receipt). A submit that fails in transport
-/// ([`decdn_incentive::tx::send_broadcast_unknown`]) and a receipt that cannot be
-/// read both carry [`TopUpUnconfirmed`], because the `topUp` may still mine.
-pub async fn top_up<P: Provider + Clone>(
+/// Send `topUp(pool_id, amount)` from `owner` at its pending nonce, re-sent on
+/// a fresh nonce after a same-account nonce collision, and return the pending
+/// transaction with the nonce it holds. The errors are [`top_up`]'s submit
+/// errors.
+async fn send_top_up<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
     pool_id: B256,
-    additional: U256,
-) -> Result<ToppedUpPool> {
-    let amount = to_pool_u64(additional, "top-up")?;
+    amount: u64,
+) -> Result<(PendingTransactionBuilder<Ethereum>, u64)> {
     let mut nonce_retries = 0u32;
-    let (pending, nonce) = loop {
+    loop {
         let nonce = contract
             .provider()
             .get_transaction_count(owner)
@@ -1074,7 +1053,7 @@ pub async fn top_up<P: Provider + Clone>(
             .context("read the pending nonce for topUp")?;
         let call = contract.topUp(pool_id, amount).from(owner).nonce(nonce);
         let err = match call.send().await {
-            Ok(pending) => break (pending, nonce),
+            Ok(pending) => return Ok((pending, nonce)),
             Err(err) => err,
         };
         if nonce_retries < TOPUP_NONCE_RETRIES && decdn_incentive::tx::is_nonce_collision(&err) {
@@ -1110,22 +1089,75 @@ pub async fn top_up<P: Provider + Clone>(
         } else {
             submit_err
         });
-    };
-    // Capture the hash before `get_receipt` consumes `pending`: past this point
-    // the transaction is broadcast and may mine, so every receipt failure names
-    // it (see [`TopUpUnconfirmed`]).
-    // The wait is unbounded, like `open_pool`'s: giving up does not cancel the
-    // transaction, and the node holds its top-up slot for exactly as long as
-    // this future runs.
+    }
+}
+
+/// Add `additional` USDC to the buyer pool `pool_id` on-chain and return the
+/// credited amount and the mining transaction as a [`ToppedUpPool`] — the shared
+/// mechanism behind the node's cache-miss buyer (#744) and the CLI fetch buyer's
+/// auto-refill (#1103). `topUp` does not extend any lifecycle deadline; the caller
+/// credits `credited` into its local [`BuyerPoolState`] via `add_deposit`, and
+/// names `tx` if that credit fails — see [`escrowed_but_untracked`].
+///
+/// The amount credited is read back from `PoolToppedUp.additionalDeposit`, not
+/// assumed to equal `additional`: the contract credits a measured balance delta,
+/// so the two differ under a fee-on-transfer token and the local row must not
+/// over-state the on-chain deposit. If the event is absent (an ABI skew), the
+/// requested `additional` is returned as the best available estimate and the
+/// fallback is logged — an over-stated local row is the mirror of the hazard
+/// [`escrowed_but_untracked`] guards, so it must not be reached silently.
+///
+/// `owner` is the pool owner, which signs the `topUp` (`topUp` is owner-only
+/// on-chain). `top_up` reads `owner`'s pending nonce and sends the `topUp` with
+/// it, so an unconfirmed `topUp` names the nonce it holds. The provider's own
+/// nonce manager does not see that nonce, so `contract`'s provider must read
+/// the pending nonce on every send (alloy's `with_simple_nonce_management`).
+///
+/// A submit rejected as a same-account nonce collision
+/// ([`decdn_incentive::tx::is_nonce_collision`]) broadcast nothing, so it is
+/// re-sent up to three more times, a quarter second apart, each time on a fresh
+/// pending nonce.
+/// A node signs its sellers' redemptions and its buyer top-ups with one key, so a
+/// top-up can lose its nonce to a redemption sent at the same moment.
+///
+/// `receipt_timeout` bounds the receipt wait when it is `Some`, as for
+/// [`open_pool`]. The CLI passes [`RECEIPT_TIMEOUT`]. A caller that bounds the
+/// wait must not send another `topUp` on the pool while this one is
+/// unconfirmed: `decdn get` holds the first for the run and refuses the rest.
+/// The node passes `None`:
+/// the task that runs this holds the node's top-up slot until it returns, so a
+/// lapse would free the slot while the `topUp` may still mine.
+///
+/// # Errors
+///
+/// Errors if the nonce read or the `topUp` transaction fails (submit, revert, or
+/// receipt). A submit that fails in transport
+/// ([`decdn_incentive::tx::send_broadcast_unknown`]) and a receipt that is not
+/// read (a failed read, or none within `receipt_timeout`) both carry
+/// [`TopUpUnconfirmed`], because the `topUp` may still mine.
+pub async fn top_up<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
+    pool_id: B256,
+    additional: U256,
+    receipt_timeout: Option<Duration>,
+) -> Result<ToppedUpPool> {
+    let amount = to_pool_u64(additional, "top-up")?;
+    let (pending, nonce) = send_top_up(contract, owner, pool_id, amount).await?;
+    // Capture the hash before the wait consumes `pending`: past this point the
+    // transaction is broadcast and may mine, so every receipt failure names it
+    // (see [`TopUpUnconfirmed`]). A lapse does not cancel the transaction.
     let tx = *pending.tx_hash();
-    let receipt = pending.get_receipt().await.map_err(|err| {
-        anyhow::Error::new(err)
-            .context("await topUp receipt")
-            .context(TopUpUnconfirmed {
-                tx: Some(tx),
-                nonce,
-            })
-    })?;
+    info!(%tx, %owner, %pool_id, %additional, nonce, "topUp broadcast; awaiting its receipt");
+    let receipt = await_receipt(pending, receipt_timeout)
+        .await
+        .map_err(|err| {
+            err.context("await topUp receipt")
+                .context(TopUpUnconfirmed {
+                    tx: Some(tx),
+                    nonce,
+                })
+        })?;
     if !receipt.status() {
         anyhow::bail!("topUp reverted for pool {pool_id} (tx {tx:#x})");
     }

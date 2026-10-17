@@ -28,6 +28,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` take a
+  `receipt_timeout: Option<Duration>` (#2433).** `Some` bounds the receipt
+  wait. A lapse returns `OpenUnconfirmed` / `TopUpUnconfirmed` with the tx
+  hash, because the transaction may still mine. `None` waits until the receipt
+  arrives or its read fails. The CLI passes
+  `decdn_incentive::tx::RECEIPT_TIMEOUT` (3 min) to both. The node passes it to
+  `open_pool`, whose unconfirmed opens it settles against the chain, and
+  `None` to `top_up`, because its top-up slot frees when the wait ends.
+  `open_pool` also refuses to send while the `UnconfirmedOpens` it is given
+  already holds an open, and fails with that `OpenUnconfirmed`.
 - **Admin/CLI: a lane's `counterparty` is its pool owner, not its voucher
   signer (#2484).** `admin_v1_lanes` filled `LaneSnapshot.counterparty` with
   the lane signer, so every `decdn get` lane (signed by a key derived for its
@@ -1053,6 +1063,29 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: a transaction dropped from the mempool no longer hangs the command
+  (#2433).** alloy's receipt wait has no bound, so a broadcast transaction
+  that never mined left these commands waiting forever: `decdn pool {open,
+  top-up, close, reclaim}`, `decdn get`'s pool open and top-up,
+  `decdn node {bond, unbond, register, deregister, update-region,
+  update-multiaddrs, rotate-key}`, `decdn publish`, `decdn appeal slash` and
+  `decdn setup`. Under `pool close --all` and `reclaim --all`, a pool whose
+  transaction was dropped also blocked every pool after it. Each wait now ends
+  after 3 minutes (`decdn_incentive::tx::RECEIPT_TIMEOUT`, the bound the USDC
+  `approve` already used). A lapse is reported like a receipt that could not
+  be read: the error names the tx hash and says it may still mine, and a
+  `--all` sweep counts the pool as unconfirmed and moves on. A transaction
+  that is stuck rather than dropped holds its nonce, so each later pool's
+  transaction queues behind it and lapses in turn. A `decdn get` whose
+  `openPool` or `topUp` lapsed never sends a second one in the same run, so
+  no other lane, bundle entry or funding recovery step escrows a second
+  deposit beside it. The run sends one `topUp` at a time.
+- **Node: an `openPool` dropped from the mempool is re-sent (#2433).** The
+  node waited for the receipt of its own `openPool` with no bound, so a
+  dropped open held the open slot forever, and every miss that joined it
+  waited out its budget. The wait now ends after `decdn_incentive::tx::RECEIPT_TIMEOUT`, and the open
+  goes to the settle loop, which re-sends it at the same nonce when the chain
+  holds no transaction there.
 - **CLI: two `decdn get` runs with separate `--data-dir`s on one wallet no
   longer pay on the same lanes (#2468).** A fresh data dir adopts the
   wallet's live pool, and both runs signed vouchers with the wallet key, so

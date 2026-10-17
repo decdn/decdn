@@ -134,9 +134,17 @@ async fn run() -> anyhow::Result<()> {
         payment_pool: chain.addrs().payment_pool,
     };
 
-    let opened = open_pool(&pool, deployment, chain.usdc(), buyer_addr, deposit, None)
-        .await
-        .context("open buyer pool")?;
+    let opened = open_pool(
+        &pool,
+        deployment,
+        chain.usdc(),
+        buyer_addr,
+        deposit,
+        None,
+        None,
+    )
+    .await
+    .context("open buyer pool")?;
     let pool_id = opened.state.pool_id;
     // A synthetic lane signed by the wallet key: this scenario drives the top-up
     // kernel only, and any recorded lane counts as pool spend. The provider is
@@ -182,7 +190,7 @@ async fn run() -> anyhow::Result<()> {
     // measured on-chain amount into the local record via `add_deposit`.
     let remaining = deposit - prior_amount; // == 1
     let additional = deposit - remaining; // restore to a full `deposit`
-    let topped_up = top_up(&pool, buyer_addr, pool_id, additional)
+    let topped_up = top_up(&pool, buyer_addr, pool_id, additional, None)
         .await
         .context("top_up")?;
     // The tx is the only handle an operator has to reconcile an escrow whose
@@ -502,6 +510,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
         buyer_addr,
         working_deposit,
         None,
+        None,
     )
     .await
     .context("open buyer pool")?;
@@ -801,6 +810,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         chain.usdc(),
         buyer_addr,
         U256::from(DEPOSIT_SHORT_WORKING_MICRO_USDC),
+        None,
         None,
     )
     .await

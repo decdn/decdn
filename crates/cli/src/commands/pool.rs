@@ -31,6 +31,7 @@ use decdn_incentive::buyer_pool::{BuyerLoad, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::buyer_pool_redb::{ReadOnlyBuyerPoolStore, RedbBuyerPoolStore};
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools};
+use decdn_incentive::tx::{RECEIPT_TIMEOUT, await_receipt};
 use decdn_incentive::{
     Capability, CapabilityGrant, Deployment, PoolId, PoolLifecycleRevert, voucher_domain,
 };
@@ -202,7 +203,16 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
     let opens = UnconfirmedOpens::default();
     let mut interrupt = Interrupt::watch(opens.clone());
     let opened = async {
-        let opened = open_pool(&contract, deployment, token, owner, deposit, Some(&opens)).await?;
+        let opened = open_pool(
+            &contract,
+            deployment,
+            token,
+            owner,
+            deposit,
+            Some(&opens),
+            Some(RECEIPT_TIMEOUT),
+        )
+        .await?;
         // The deposit is escrowed on-chain; a failed local record leaves it
         // untracked (reconcile against the tx).
         store
@@ -260,7 +270,8 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
     ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(additional)).await?;
 
-    let ToppedUpPool { credited, tx, .. } = top_up(&contract, owner, pool_id, additional).await?;
+    let ToppedUpPool { credited, tx, .. } =
+        top_up(&contract, owner, pool_id, additional, Some(RECEIPT_TIMEOUT)).await?;
 
     // `add_deposit` reports a backend fault as `Err` and a committed-row
     // mismatch as a non-`Added` `Ok` (the row vanished or now tracks a
@@ -412,7 +423,7 @@ impl LocalBookkeeping<'_> {
     ///
     /// A row like this survives when the run that closed or reclaimed the pool
     /// could not clear it: the row-clear faulted, or the tx's outcome was
-    /// unknown (an unreadable receipt, or a send whose broadcast is unknown)
+    /// unknown (an unread receipt, or a send whose broadcast is unknown)
     /// but it mined. It also survives a close or reclaim run from another
     /// machine or data dir. A later fetch then reuses a pool that is winding
     /// down or done. Seeing the status on-chain is enough to drop the row, so a
@@ -687,8 +698,9 @@ impl BatchTally {
 
 /// The context on a `closePool` / `reclaim` error whose transaction may have
 /// broadcast and may still mine: its send failed in transport, or it was
-/// broadcast and its receipt could not be read. A re-run may double-submit,
-/// so a `--all` sweep counts it apart from a definite failure. Recover it with
+/// broadcast and its receipt was not read (a failed read, or none within
+/// [`RECEIPT_TIMEOUT`]). A re-run may double-submit, so a `--all` sweep counts
+/// it apart from a definite failure. Recover it with
 /// `err.downcast_ref::<TxUnconfirmed>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TxUnconfirmed {
@@ -706,8 +718,8 @@ impl std::fmt::Display for TxUnconfirmed {
         match self.tx {
             Some(tx) => write!(
                 f,
-                "{label} sent (tx {tx:#x}) but the receipt could not be fetched; it may still \
-                 mine — check the tx before re-running"
+                "{label} sent (tx {tx:#x}) but its receipt was not read; it may still mine — \
+                 check the tx before re-running"
             ),
             None => write!(
                 f,
@@ -835,9 +847,9 @@ fn batch_result(tally: &BatchTally, verb: &str) -> anyhow::Result<()> {
 ///
 /// Errors when gas estimation rejects the call (see `send_reverted`), the send
 /// fails (an error that leaves the broadcast unknown says so; see
-/// `send_failed`), the receipt cannot be read, the tx reverted, or the local
-/// row-clear faulted after a landed close (the error carries
-/// [`CloseUnrecorded`]).
+/// `send_failed`), the receipt is not read within [`RECEIPT_TIMEOUT`], the tx
+/// reverted, or the local row-clear faulted after a landed close (the error
+/// carries [`CloseUnrecorded`]).
 async fn close_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -854,15 +866,18 @@ where
         }
         Err(e) => return Err(send_failed(e, "closePool")),
     };
-    // Read before `get_receipt` consumes `pending`: an unreadable receipt leaves
-    // the tx's fate unknown, and the hash is the operator's only handle on it.
+    // Read before the wait consumes `pending`: an unread receipt leaves the
+    // tx's fate unknown, and the hash is the operator's only handle on it. The
+    // wait is bounded, so a dropped tx cannot stall a `--all` sweep (#2433).
     let tx = *pending.tx_hash();
-    let receipt = pending.get_receipt().await.map_err(|e| {
-        anyhow::Error::new(e).context(TxUnconfirmed {
-            label: "closePool",
-            tx: Some(tx),
-        })
-    })?;
+    let receipt = await_receipt(pending, Some(RECEIPT_TIMEOUT))
+        .await
+        .map_err(|e| {
+            e.context(TxUnconfirmed {
+                label: "closePool",
+                tx: Some(tx),
+            })
+        })?;
 
     match receipt_outcome(receipt.status()) {
         TxOutcome::Landed => {
@@ -902,9 +917,9 @@ where
 ///
 /// Errors when gas estimation rejects the call (see `send_reverted`), the send
 /// fails (an error that leaves the broadcast unknown says so; see
-/// `send_failed`), the receipt cannot be read, or the tx reverted after the
-/// pre-check passed (see `reclaim_reverted`). A failed local row-clear only
-/// warns — the refund itself landed.
+/// `send_failed`), the receipt is not read within [`RECEIPT_TIMEOUT`], or the
+/// tx reverted after the pre-check passed (see `reclaim_reverted`). A failed
+/// local row-clear only warns — the refund itself landed.
 async fn reclaim_and_forget<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: LocalBookkeeping<'_>,
@@ -926,15 +941,18 @@ where
         }
         Err(e) => return Err(send_failed(e, "reclaim")),
     };
-    // Read before `get_receipt` consumes `pending`: an unreadable receipt leaves
-    // the tx's fate unknown, and the hash is the operator's only handle on it.
+    // Read before the wait consumes `pending`: an unread receipt leaves the
+    // tx's fate unknown, and the hash is the operator's only handle on it. The
+    // wait is bounded, so a dropped tx cannot stall a `--all` sweep (#2433).
     let tx = *pending.tx_hash();
-    let receipt = pending.get_receipt().await.map_err(|e| {
-        anyhow::Error::new(e).context(TxUnconfirmed {
-            label: "reclaim",
-            tx: Some(tx),
-        })
-    })?;
+    let receipt = await_receipt(pending, Some(RECEIPT_TIMEOUT))
+        .await
+        .map_err(|e| {
+            e.context(TxUnconfirmed {
+                label: "reclaim",
+                tx: Some(tx),
+            })
+        })?;
 
     match receipt_outcome(receipt.status()) {
         TxOutcome::Landed => {

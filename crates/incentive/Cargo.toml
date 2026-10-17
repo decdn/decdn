@@ -45,7 +45,10 @@ redb = ["buyer-store-core"]
 # not propagate, and `decdn-node`'s `insert_raw_buyer_record` seam (its #763
 # reconciliation e2e) has to reach it. Enabled from downstream
 # `[dev-dependencies]` — same pattern as `decdn-client`'s `test-util`.
-test-util = []
+# Also exposes `test_rpc::ScriptedRpc`, a scripted RPC transport that parks a
+# receipt wait, shared by the receipt-timeout tests here, in `decdn-client` and
+# in `decdn-cli`.
+test-util = ["dep:tower", "dep:alloy-json-rpc", "dep:serde_json"]
 
 [dependencies]
 decdn-common = { workspace = true }
@@ -68,15 +71,21 @@ redb = { workspace = true, optional = true }
 postcard = { workspace = true }
 # `dcap1:` delegation-token base64url alphabet (`capability_grant`).
 base64 = { workspace = true }
+# `test-util` only: the `tower::Service` RPC transport in `test_rpc` and the
+# packet types it is generic over (see the workspace manifest's note on both).
+tower = { workspace = true, optional = true }
+alloy-json-rpc = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Self dev-dependency that turns on the buyer-store modules for this crate's own
-# test build, so `cargo nextest run -p decdn-incentive` runs the
-# `buyer_pool_table` on-disk-format guards and the `buyer_pool_redb` suite.
+# Self dev-dependency that turns on the buyer-store modules and `test-util` for
+# this crate's own test build, so `cargo nextest run -p decdn-incentive` runs the
+# `buyer_pool_table` on-disk-format guards, the `buyer_pool_redb` suite and the
+# `tx` receipt-timeout tests on `test_rpc`.
 # Without it a solo run compiles neither module and skips their tests without a
 # word. Dev-only: a normal build of this crate or any downstream still links
 # `redb` only when it asks for a feature.
-decdn-incentive = { path = ".", features = ["redb"] }
+decdn-incentive = { path = ".", features = ["redb", "test-util"] }
 anyhow = { workspace = true }
 tempfile = { workspace = true }
 # Deserializing an `alloy` JSON-RPC `ErrorPayload` in `tx.rs`'s send-error

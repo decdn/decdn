@@ -396,9 +396,10 @@ impl StagedNodeKey {
     /// The third outcome, between [`Self::commit`] and the `Drop` that discards
     /// an abandoned stage. It exists for one situation, reached three ways: a
     /// key-rotation transaction may have taken effect, but the caller cannot
-    /// confirm the binding moved — the receipt could not be read at all, or it
-    /// mined carrying no matching `NodeIdBound`, or it mined and the install of
-    /// the confirmed key then failed. Whether the chain now names this key is
+    /// confirm the binding moved — the receipt was not read at all (a failed
+    /// read, or none within the send's bound), or it mined carrying no matching
+    /// `NodeIdBound`, or it mined and the install of the confirmed key then
+    /// failed. Whether the chain now names this key is
     /// **unknown** in the first two, and *known* in the third — where the key is
     /// even more valuable. Discarding the secret there is unrecoverable — if the
     /// transaction did land, the operator is bound to an identity whose private

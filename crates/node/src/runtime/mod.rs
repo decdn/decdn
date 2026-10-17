@@ -1681,8 +1681,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // daemon's lifetime, which is why no CLI can read it from disk (#2078).
     let buyer_pool_store_for_admin = Arc::clone(&buyer_pool_store);
     // The buyer-side PaymentPool bootstrap (whose on-chain round-trips —
-    // notably the one-time USDC `approve` receipt — can block for many
-    // minutes on a stuck tx, bounded by `APPROVE_RECEIPT_TIMEOUT`) and
+    // notably the one-time USDC `approve` receipt — can block for up to
+    // `decdn_incentive::tx::RECEIPT_TIMEOUT` (3 min) on a stuck tx) and
     // the node-origin pull-through provisioning it feeds are BOTH deferred to a
     // background task spawned below (#1109), so the metrics/admin listeners and
     // the "node runtime ready" banner come up independent of any chain RPC. The
@@ -2081,8 +2081,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
 
     // Buyer-side PaymentPool bootstrap + node-to-node pull-through
     // provisioning (#831), fully backgrounded off the startup critical path
-    // (#1109). The USDC `approve` receipt that `bootstrap` awaits could hang for
-    // many minutes on a stuck tx (capped by `APPROVE_RECEIPT_TIMEOUT`);
+    // (#1109). The USDC `approve` receipt that `bootstrap` awaits can block for
+    // up to `decdn_incentive::tx::RECEIPT_TIMEOUT` (3 min) on a stuck tx;
     // running it inline would gate the metrics/admin binds and the
     // "node runtime ready" banner below. The origin shares its `OnceLock` with
     // the clone already in the cache's origin chain, so a later `provision` from

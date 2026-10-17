@@ -123,7 +123,16 @@ impl Buyer {
         } else {
             let token = contract.usdc().call().await?;
             ensure_allowance(&rpc, token, owner, env.payment_pool, Some(env.deposit)).await?;
-            let opened = open_pool(&contract, deployment, token, owner, env.deposit, None).await?;
+            let opened = open_pool(
+                &contract,
+                deployment,
+                token,
+                owner,
+                env.deposit,
+                None,
+                Some(decdn_incentive::tx::RECEIPT_TIMEOUT),
+            )
+            .await?;
             // The deposit is escrowed once `open_pool` returns. A failed
             // record leaves it untracked, so name the transaction.
             store

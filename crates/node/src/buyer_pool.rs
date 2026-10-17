@@ -37,6 +37,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_pool::{PaymentPool, enumerate_owned_pools_at};
+use decdn_incentive::tx::RECEIPT_TIMEOUT;
 use decdn_incentive::{
     AdvanceOutcome, BuyerPoolState, BuyerPoolStore, Deployment, LaneKey, PoolId,
     PoolOpenFailureReason,
@@ -525,7 +526,10 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     // just-in-time `approve` and retry once — so the happy path issues zero
     // allowance reads per top-up.
     let ToppedUpPool { credited, tx, .. } = match top_up_recovering_allowance(
-        || pool_top_up(&handles.contract, handles.owner, pool_id, additional),
+        // Unbounded: the task that runs `fund_pool` holds the node's top-up
+        // slot until it returns, so a lapse would free the slot while the
+        // `topUp` may still mine.
+        || pool_top_up(&handles.contract, handles.owner, pool_id, additional, None),
         || {
             ensure_allowance(
                 &handles.rpc,
@@ -2441,6 +2445,11 @@ async fn run_open<P: Provider + Clone>(
         // this wait, and an error names its tx. Only shutdown drops it, and
         // the `info` broadcast line names the tx then (#2415).
         None,
+        // Bounded: a lapse is an `OpenUnconfirmed` like a failed read, so
+        // `settle_unconfirmed_open` takes over and keeps the open slot until the
+        // chain resolves the open. That is also how an `openPool` dropped from
+        // the mempool reaches the settle loop's re-send.
+        Some(RECEIPT_TIMEOUT),
     )
     .await
     {
@@ -2628,9 +2637,8 @@ enum OpenResolution {
 ///   same chain state as the nonce. A load-balanced RPC backend that has not
 ///   reached `B` fails the read, and the next tick asks again.
 /// - A pending transaction at the nonce may still mine, so the task waits,
-///   however long that takes, as the receipt wait in [`open_pool`] does. An
-///   earlier nonce that is not confirmed makes it wait the same way: nothing
-///   at the open's nonce can mine before it.
+///   however long that takes. An earlier nonce that is not confirmed makes it
+///   wait the same way: nothing at the open's nonce can mine before it.
 /// - A nonce that the account has reached and no transaction holds gets a
 ///   fresh `openPool` at that same nonce ([`send_open_pool`]). Two transactions at one nonce cannot both
 ///   mine, so the re-send and a first open that resurfaces escrow at most one

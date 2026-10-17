@@ -5,9 +5,11 @@ use super::{
     pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool, top_up,
 };
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, B256, TxHash, U256};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
+use decdn_incentive::test_rpc::{SCRIPTED_NONCE, SCRIPTED_TX, ScriptedRpc};
+use decdn_incentive::tx::RECEIPT_TIMEOUT;
 use decdn_incentive::{BuyerPoolState, DepositOutcome, MemoryBuyerPoolStore, StoreError};
 use decdn_incentive::{SignedCapability, voucher_domain};
 use std::sync::Arc;
@@ -60,6 +62,7 @@ async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
         Address::repeat_byte(0x22),
         B256::repeat_byte(0x33),
         U256::from(1_000u64),
+        None,
     )
     .await
     .unwrap_err();
@@ -71,15 +74,17 @@ async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
 
 /// Run [`open_pool`] against a mocked pool whose RPC calls `asserter` answers.
 async fn open_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error {
-    open_tracked(mocked_pool(asserter), &UnconfirmedOpens::default())
+    open_tracked(mocked_pool(asserter), &UnconfirmedOpens::default(), None)
         .await
         .unwrap_err()
 }
 
-/// Run [`open_pool`] on `contract`, holding its broadcast in `opens`.
+/// Run [`open_pool`] on `contract`, holding its broadcast in `opens`, with
+/// its receipt wait bounded by `receipt_timeout`.
 async fn open_tracked(
     contract: PaymentPool::PaymentPoolInstance<impl Provider + Clone>,
     opens: &UnconfirmedOpens,
+    receipt_timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<super::OpenedPool> {
     let deployment = decdn_incentive::Deployment {
         chain_id: CHAIN_ID,
@@ -92,78 +97,22 @@ async fn open_tracked(
         Address::repeat_byte(0x22),
         U256::from(1_000u64),
         Some(opens),
+        receipt_timeout,
     )
     .await
 }
 
-/// Answers `eth_getTransactionCount` with nonce 5. `eth_sendTransaction` gets
-/// [`SCRIPTED_TX`] when `send` is set, and `eth_getTransactionReceipt` gets
-/// `receipt` when one is set. Every other call never completes, so an
-/// `open_pool` on it parks in its submit or its receipt wait.
-#[derive(Clone, Debug)]
-struct Scripted {
-    send: bool,
-    receipt: Option<alloy::rpc::types::TransactionReceipt>,
-}
-
-/// The hash [`Scripted`] returns for the `openPool` send.
-const SCRIPTED_TX: B256 = B256::repeat_byte(0xef);
-
-impl tower::Service<alloy_json_rpc::RequestPacket> for Scripted {
-    type Response = alloy_json_rpc::ResponsePacket;
-    type Error = alloy::transports::TransportError;
-    type Future = alloy::transports::TransportFut<'static>;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: alloy_json_rpc::RequestPacket) -> Self::Future {
-        let alloy_json_rpc::RequestPacket::Single(req) = req else {
-            return Box::pin(std::future::pending());
-        };
-        let result = match (req.method(), &self.receipt) {
-            ("eth_getTransactionCount", _) => serde_json::value::to_raw_value(&U256::from(5u64)),
-            ("eth_sendTransaction", _) if self.send => {
-                serde_json::value::to_raw_value(&SCRIPTED_TX)
-            }
-            ("eth_getTransactionReceipt", Some(receipt)) => {
-                serde_json::value::to_raw_value(receipt)
-            }
-            _ => return Box::pin(std::future::pending()),
-        };
-        let id = req.id().clone();
-        Box::pin(async move {
-            Ok(alloy_json_rpc::ResponsePacket::Single(
-                alloy_json_rpc::Response {
-                    id,
-                    payload: alloy_json_rpc::ResponsePayload::Success(
-                        result.map_err(alloy::transports::TransportErrorKind::custom)?,
-                    ),
-                },
-            ))
-        })
-    }
-}
-
-/// A `PaymentPool` whose RPC calls [`Scripted`] answers.
-fn scripted_pool(script: Scripted) -> PaymentPool::PaymentPoolInstance<impl Provider + Clone> {
-    PaymentPool::new(
-        Address::repeat_byte(0x01),
-        alloy::providers::ProviderBuilder::default()
-            .connect_client(alloy::rpc::client::RpcClient::new(script, false)),
-    )
+/// A `PaymentPool` whose RPC calls [`ScriptedRpc`] answers.
+fn scripted_pool(script: ScriptedRpc) -> PaymentPool::PaymentPoolInstance<impl Provider + Clone> {
+    PaymentPool::new(Address::repeat_byte(0x01), script.provider())
 }
 
 /// Run [`open_tracked`] on `script` until it parks, then drop it.
-async fn drop_parked_open(script: Scripted) -> UnconfirmedOpens {
+async fn drop_parked_open(script: ScriptedRpc) -> UnconfirmedOpens {
     let opens = UnconfirmedOpens::default();
     let waited = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        open_tracked(scripted_pool(script), &opens),
+        open_tracked(scripted_pool(script), &opens, None),
     )
     .await;
     assert!(waited.is_err(), "the open must still be pending");
@@ -174,11 +123,7 @@ async fn drop_parked_open(script: Scripted) -> UnconfirmedOpens {
 /// broadcast stays in `opens`: the caller can still name the tx (#2418).
 #[tokio::test(start_paused = true)]
 async fn an_open_dropped_in_its_receipt_wait_stays_unconfirmed() {
-    let opens = drop_parked_open(Scripted {
-        send: true,
-        receipt: None,
-    })
-    .await;
+    let opens = drop_parked_open(ScriptedRpc::parked_receipt()).await;
     assert_eq!(
         opens.pending(),
         vec![OpenUnconfirmed {
@@ -192,14 +137,122 @@ async fn an_open_dropped_in_its_receipt_wait_stays_unconfirmed() {
 /// broadcast with no hash returned, so `opens` holds its nonce.
 #[tokio::test(start_paused = true)]
 async fn an_open_dropped_in_its_submit_stays_unconfirmed_by_nonce() {
-    let opens = drop_parked_open(Scripted {
-        send: false,
-        receipt: None,
-    })
-    .await;
+    let opens = drop_parked_open(ScriptedRpc::parked_send()).await;
     assert_eq!(
         opens.pending(),
         vec![OpenUnconfirmed { tx: None, nonce: 5 }]
+    );
+}
+
+/// The cause [`decdn_incentive::tx::await_receipt`] gives when no receipt
+/// arrives within its bound.
+const LAPSE: &str = "no receipt within";
+
+/// An `open_pool` whose `opens` already holds an unconfirmed open refuses to
+/// send another, before any chain read: the earlier tx may still mine, and a
+/// second open would escrow a second deposit.
+#[tokio::test]
+async fn a_second_open_is_refused_while_one_is_unconfirmed() {
+    let earlier = OpenUnconfirmed {
+        tx: Some(SCRIPTED_TX),
+        nonce: SCRIPTED_NONCE,
+    };
+    let opens = UnconfirmedOpens::default();
+    opens.insert(earlier);
+    // An empty queue: any chain read would fail in transport.
+    let err = open_tracked(
+        mocked_pool(alloy::providers::mock::Asserter::new()),
+        &opens,
+        Some(RECEIPT_TIMEOUT),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<OpenUnconfirmed>(),
+        Some(&earlier),
+        "{err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("refusing a second openPool"),
+        "{err:#}"
+    );
+    assert_eq!(opens.pending(), vec![earlier]);
+}
+
+/// A bounded `open_pool` whose broadcast never mines returns at the bound.
+/// The open stays unconfirmed in the error and in `opens`, because the tx may
+/// still mine and escrow the deposit (#2433).
+#[tokio::test(start_paused = true)]
+async fn a_bounded_open_receipt_wait_lapses_unconfirmed() {
+    let opens = UnconfirmedOpens::default();
+    let err = tokio::time::timeout(
+        RECEIPT_TIMEOUT * 2,
+        open_tracked(
+            scripted_pool(ScriptedRpc::parked_receipt()),
+            &opens,
+            Some(RECEIPT_TIMEOUT),
+        ),
+    )
+    .await
+    .expect("the receipt wait must lapse within RECEIPT_TIMEOUT")
+    .unwrap_err();
+    let unconfirmed = OpenUnconfirmed {
+        tx: Some(SCRIPTED_TX),
+        nonce: SCRIPTED_NONCE,
+    };
+    assert_eq!(err.downcast_ref::<OpenUnconfirmed>(), Some(&unconfirmed));
+    assert_eq!(
+        err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
+        Some(&decdn_incentive::PoolOpenFailureReason::RpcError),
+        "{err:#}"
+    );
+    assert!(format!("{err:#}").contains(LAPSE), "{err:#}");
+    assert_eq!(opens.pending(), vec![unconfirmed]);
+}
+
+/// Run [`top_up`] on a pool whose broadcast never mines, bounded by
+/// `receipt_timeout`, for at most twice [`RECEIPT_TIMEOUT`].
+async fn top_up_parked(
+    receipt_timeout: Option<std::time::Duration>,
+) -> Result<anyhow::Result<super::ToppedUpPool>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(
+        RECEIPT_TIMEOUT * 2,
+        top_up(
+            &scripted_pool(ScriptedRpc::parked_receipt()),
+            Address::repeat_byte(0x22),
+            B256::repeat_byte(0x33),
+            U256::from(1_000u64),
+            receipt_timeout,
+        ),
+    )
+    .await
+}
+
+/// A bounded `top_up` whose broadcast never mines returns at the bound with
+/// [`TopUpUnconfirmed`] naming the tx and its nonce (#2433).
+#[tokio::test(start_paused = true)]
+async fn a_bounded_top_up_receipt_wait_lapses_unconfirmed() {
+    let err = top_up_parked(Some(RECEIPT_TIMEOUT))
+        .await
+        .expect("the receipt wait must lapse within RECEIPT_TIMEOUT")
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<TopUpUnconfirmed>(),
+        Some(&TopUpUnconfirmed {
+            tx: Some(SCRIPTED_TX),
+            nonce: SCRIPTED_NONCE,
+        })
+    );
+    assert!(format!("{err:#}").contains(LAPSE), "{err:#}");
+}
+
+/// An unbounded `top_up` keeps waiting: the node relies on it to hold its
+/// top-up slot while the `topUp` may still mine.
+#[tokio::test(start_paused = true)]
+async fn an_unbounded_top_up_receipt_wait_keeps_waiting() {
+    assert!(
+        top_up_parked(None).await.is_err(),
+        "the top-up must still be pending"
     );
 }
 
@@ -231,13 +284,7 @@ async fn a_read_receipt_leaves_no_unconfirmed_open() {
     let opens = UnconfirmedOpens::default();
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        open_tracked(
-            scripted_pool(Scripted {
-                send: true,
-                receipt: Some(receipt),
-            }),
-            &opens,
-        ),
+        open_tracked(scripted_pool(ScriptedRpc::mined(receipt)), &opens, None),
     )
     .await
     .expect("the receipt is answered")
@@ -259,7 +306,7 @@ async fn an_unreadable_receipt_keeps_the_open_unconfirmed() {
     asserter.push_success(&U256::from(5u64));
     asserter.push_success(&hash);
     let opens = UnconfirmedOpens::default();
-    let err = open_tracked(mocked_pool(asserter), &opens)
+    let err = open_tracked(mocked_pool(asserter), &opens, None)
         .await
         .unwrap_err();
     let unconfirmed = OpenUnconfirmed {
@@ -277,7 +324,7 @@ async fn a_transport_failed_submit_stays_unconfirmed_by_nonce() {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&U256::from(5u64));
     let opens = UnconfirmedOpens::default();
-    let err = open_tracked(mocked_pool(asserter), &opens)
+    let err = open_tracked(mocked_pool(asserter), &opens, None)
         .await
         .unwrap_err();
     let unconfirmed = OpenUnconfirmed { tx: None, nonce: 5 };
@@ -365,7 +412,7 @@ async fn a_rejected_open_pool_submit_is_not_unconfirmed() {
     asserter.push_success(&U256::from(5u64));
     asserter.push_failure_msg("insufficient funds for gas");
     let opens = UnconfirmedOpens::default();
-    let err = open_tracked(mocked_pool(asserter), &opens)
+    let err = open_tracked(mocked_pool(asserter), &opens, None)
         .await
         .unwrap_err();
     assert!(err.downcast_ref::<OpenUnconfirmed>().is_none(), "{err:#}");
@@ -384,6 +431,7 @@ async fn a_rejected_top_up_submit_is_not_unconfirmed() {
         Address::repeat_byte(0x22),
         B256::repeat_byte(0x33),
         U256::from(1_000u64),
+        None,
     )
     .await
     .unwrap_err();
@@ -520,6 +568,32 @@ async fn a_transport_failed_approve_submit_warns_it_may_have_broadcast() {
     assert!(msg.contains("submit USDC approve"), "{msg}");
     assert!(msg.contains(APPROVE_MAYBE_BROADCAST), "{msg}");
     assert!(msg.contains("eth_sendTransaction"), "{msg}");
+}
+
+/// An `approve` whose receipt never arrives ends at [`RECEIPT_TIMEOUT`], naming
+/// its tx, so a stuck approve cannot wedge the node's bootstrap or a CLI run
+/// (#1109, #2433).
+#[tokio::test(start_paused = true)]
+async fn an_approve_that_never_mines_lapses_naming_the_tx() {
+    // An ABI-encoded zero allowance, so `approve` is sent.
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([Bytes::from(B256::ZERO.to_vec())]);
+    let err = tokio::time::timeout(
+        RECEIPT_TIMEOUT * 2,
+        ensure_allowance(
+            &rpc.provider(),
+            Address::repeat_byte(0x44),
+            Address::repeat_byte(0x22),
+            Address::repeat_byte(0x01),
+            None,
+        ),
+    )
+    .await
+    .expect("the receipt wait must lapse within RECEIPT_TIMEOUT")
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains(&format!("{SCRIPTED_TX:#x}")), "{msg}");
+    assert!(msg.contains("may still mine later"), "{msg}");
+    assert!(msg.contains(LAPSE), "{msg}");
 }
 
 /// An `approve` submit the RPC node rejects broadcast nothing, so it carries no
