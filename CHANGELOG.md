@@ -1081,6 +1081,23 @@ since project inception and will roll into the first tagged release.
   the `topUp` instead of dying with no output. A `topUp` whose submit
   returned no hash reads "returned no tx hash", not "failed in transport",
   since a submit dropped in flight holds no hash either.
+- **Client: a late lane build that may have escrowed with no record fails the
+  fetch (#2500).** During the 30 s drain of late lane builds, a build could
+  send a `topUp` or `openPool` that mined, or may have mined, with no local
+  record to credit it. The drain logged that error at debug only. A completed
+  `decdn get` exited 0, a give-up exited 75, and nothing named a tx the
+  receipt read had already cleared from the pending-escrow handle. Now such a
+  build fails `acquire` with a `LaneBuildFault` that names the tx when the
+  submit returned one, whatever the fetch's own outcome was. A fetch that
+  completed fails. A fetch that failed keeps its error only as text, so its
+  give-up cannot exit 75 and a `PoolReplaced` cannot start a second pass,
+  either of which would invite a rerun that escrows again. Any other late
+  build failure leaves the result unchanged. `decdn get -o -` and the manifest
+  fetch of an entry URI also dropped the drain once the reader hit the end of
+  the stream. They now wait for it through the new `StreamDrive::finish`,
+  which runs a stream's drive to its end and returns the error the fetch
+  ended with. A consumer that reads a stream to its end calls it before it
+  reports success.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

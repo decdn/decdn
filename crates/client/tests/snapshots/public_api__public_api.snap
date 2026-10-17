@@ -491,6 +491,7 @@ pub fn decdn_client::streamer::StreamCandidate<S>::fmt(&self, &mut core::fmt::Fo
 pub struct decdn_client::streamer::StreamDrive<'a>
 impl decdn_client::streamer::StreamDrive<'_>
 pub async fn decdn_client::streamer::StreamDrive<'_>::alongside<T>(&mut self, impl core::future::future::Future<Output = T>) -> T
+pub async fn decdn_client::streamer::StreamDrive<'_>::finish(&mut self) -> anyhow::Result<()>
 pub const fn decdn_client::streamer::StreamDrive<'_>::take_error(&mut self) -> core::option::Option<anyhow::Error>
 impl core::fmt::Debug for decdn_client::streamer::StreamDrive<'_>
 pub fn decdn_client::streamer::StreamDrive<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -791,6 +792,7 @@ pub fn decdn_client::streamer::StreamCandidate<S>::fmt(&self, &mut core::fmt::Fo
 pub struct decdn_client::StreamDrive<'a>
 impl decdn_client::streamer::StreamDrive<'_>
 pub async fn decdn_client::streamer::StreamDrive<'_>::alongside<T>(&mut self, impl core::future::future::Future<Output = T>) -> T
+pub async fn decdn_client::streamer::StreamDrive<'_>::finish(&mut self) -> anyhow::Result<()>
 pub const fn decdn_client::streamer::StreamDrive<'_>::take_error(&mut self) -> core::option::Option<anyhow::Error>
 impl core::fmt::Debug for decdn_client::streamer::StreamDrive<'_>
 pub fn decdn_client::streamer::StreamDrive<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

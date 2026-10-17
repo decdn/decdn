@@ -139,7 +139,7 @@ use crate::driver::{
     DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool, UnitProgress, WaitReason,
     contiguous_byte_ranges, fill_gap, ranges_content_len,
 };
-use crate::fault::Fault;
+use crate::fault::{Fault, LaneBuildFault, escrow_untracked};
 use crate::health::PeerHealth;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::DownstreamFrontier;
@@ -3318,13 +3318,19 @@ where
 /// Every started lane's lease is released at the latest when it returns or
 /// is dropped. Before it returns, it stops every lane and awaits each lane
 /// build still in flight, for at most 30 s: a build can be in the middle of an
-/// on-chain top-up. A lane built there never starts.
+/// on-chain top-up. A lane built there never starts, and a build that ends
+/// there with a `topUp` or `openPool` that may have escrowed USDC no record
+/// credits fails the acquire. A caller that drops the acquire skips this
+/// drain, and a build there drops mid top-up.
 ///
 /// # Errors
 ///
 /// - a fatal fault ([`crate::Fault::Fatal`]) a lane ended with, verbatim;
 /// - a fatal lane build, wrapped in [`crate::LaneBuildFault`]: one that may
-///   have escrowed USDC no record credits, which a retry would escrow again;
+///   have escrowed USDC no record credits, which a retry would escrow again.
+///   A build that ends so in the drain before the acquire returns overrides
+///   every other outcome: it fails a completed fetch, and any error listed
+///   here survives on it only as text;
 /// - [`crate::GaveUp`] once the stop policy's limit passes without a verified
 ///   byte;
 /// - [`crate::NoAffordableSource`] or [`crate::NoSourceHasBlob`] on a
@@ -4179,8 +4185,8 @@ where
         Err(err) => Err(flushed(store, err).await),
         ok => ok,
     };
-    drain_builds(&mut connecting).await;
-    result
+    let late = drain_builds(&mut connecting).await;
+    fold_late_escrow(result, late)
 }
 
 /// How long [`acquire`] waits, as it returns, for lane builds still in flight.
@@ -4190,19 +4196,39 @@ const BUILD_DRAIN: Duration = Duration::from_secs(30);
 /// A build can be in the middle of an on-chain top-up; dropping it there
 /// would escrow funds its caller never records. A lane that builds here never
 /// starts and drops at once.
-async fn drain_builds<S>(connecting: &mut FuturesUnordered<Connecting<'_, S>>) {
+///
+/// Returns one error for the builds that ended with a `topUp` or `openPool`
+/// that may have escrowed USDC no record credits
+/// ([`escrow_untracked`]): the first, wrapped in
+/// [`LaneBuildFault`], with each later one added to it as text context, so
+/// every such build is reported. `None` when no build ended so. Any other
+/// build error is logged at `debug`: the fetch no longer needs the lane.
+async fn drain_builds<S>(
+    connecting: &mut FuturesUnordered<Connecting<'_, S>>,
+) -> Option<anyhow::Error> {
     if connecting.is_empty() {
-        return;
+        return None;
     }
+    let mut late: Option<anyhow::Error> = None;
     let drained = tokio::time::timeout(BUILD_DRAIN, async {
         while let Some((provider, built)) = connecting.next().await {
-            if let Err(err) = built {
+            let Err(err) = built else { continue };
+            if !escrow_untracked(&err) {
                 tracing::debug!(
                     %provider,
                     error = %decdn_common::redact::sanitize_err_chain(&err),
-                    "a lane build that ended after the fetch failed"
+                    "a lane build failed after the fetch ended"
                 );
+                continue;
             }
+            late = Some(match late.take() {
+                None => anyhow::Error::new(LaneBuildFault(err)),
+                Some(first) => first.context(format!(
+                    "another lane build may also have escrowed USDC no record credits after \
+                     the fetch ended: {}",
+                    decdn_common::redact::sanitize_err_chain(&err)
+                )),
+            });
         }
     })
     .await;
@@ -4211,6 +4237,24 @@ async fn drain_builds<S>(connecting: &mut FuturesUnordered<Connecting<'_, S>>) {
             builds = connecting.len(),
             "lane builds still running {BUILD_DRAIN:?} after the fetch ended are dropped"
         );
+    }
+    late
+}
+
+/// Fold a late lane build's untracked escrow ([`drain_builds`]) into the
+/// fetch's `result`. The escrow wins over any outcome: a fetch that completed
+/// fails, and a failed fetch's error survives only as text, so a retryable
+/// [`crate::GaveUp`] or a [`crate::PoolReplaced`] cannot send the caller into a
+/// retry that escrows again.
+fn fold_late_escrow(result: anyhow::Result<()>, late: Option<anyhow::Error>) -> anyhow::Result<()> {
+    match (result, late) {
+        (result, None) => result,
+        (Ok(()), Some(late)) => Err(late),
+        (Err(err), Some(late)) => Err(late.context(format!(
+            "the fetch failed ({}), and a lane build that ended after it may have escrowed \
+             USDC no record credits",
+            decdn_common::redact::sanitize_err_chain(&err)
+        ))),
     }
 }
 

@@ -61,7 +61,12 @@ async fn main() -> Result<()> {
         .alongside(tokio::io::copy(&mut reader, &mut stdout))
         .await;
 
+    // The reader's end of stream does not carry an error the fetch ends with
+    // after its last byte, such as a late lane build's untracked escrow.
+    let finished = match copied {
+        Ok(_) => drive.finish().await,
+        Err(err) => Err(err.into()),
+    };
     buyer.record_payments(&lanes);
-    copied?;
-    Ok(())
+    finished
 }

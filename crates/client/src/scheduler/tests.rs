@@ -3405,13 +3405,7 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
             &'a self,
             _holder: &'a crate::Holder,
         ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
-            Box::pin(async {
-                Err(crate::buyer_pool::escrowed_but_untracked(
-                    "pool 0x01 topped up by 5 µUSDC",
-                    alloy::primitives::TxHash::repeat_byte(0xab),
-                    "disk full",
-                ))
-            })
+            Box::pin(async { Err(late_escrow(0xab)) })
         }
     }
 
@@ -4281,6 +4275,283 @@ async fn a_lane_build_in_flight_is_awaited_before_acquire_returns() -> anyhow::R
     assert!(
         provider.built.load(std::sync::atomic::Ordering::SeqCst),
         "the slow build ran to its end before acquire returned"
+    );
+    Ok(())
+}
+
+/// One lane build that ends late: the build for `byte`'s provider ends with
+/// `fail` after `delay`, and sets `ended` as it does.
+struct LateBuild {
+    byte: u8,
+    delay: Duration,
+    fail: fn() -> anyhow::Error,
+    ended: std::sync::atomic::AtomicBool,
+}
+
+/// A build for the lane of `byte`'s provider that ends with `fail` after
+/// `delay`.
+fn late_build(byte: u8, delay: Duration, fail: fn() -> anyhow::Error) -> LateBuild {
+    LateBuild {
+        byte,
+        delay,
+        fail,
+        ended: std::sync::atomic::AtomicBool::new(false),
+    }
+}
+
+/// Static lanes, the `late` ones of which build late and fail: lane builds
+/// still in flight as the fetch ends.
+struct LateBuilds {
+    lanes: StaticSources<ScriptedSource>,
+    late: Vec<LateBuild>,
+}
+
+impl crate::SourceProvider for LateBuilds {
+    type Source = ScriptedSource;
+
+    fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+        self.lanes.discover(hash)
+    }
+
+    fn connect<'a>(
+        &'a self,
+        holder: &'a crate::Holder,
+    ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+        let late = self
+            .late
+            .iter()
+            .find(|late| Address::repeat_byte(late.byte) == holder.provider);
+        Box::pin(async move {
+            let Some(late) = late else {
+                return self.lanes.connect(holder).await;
+            };
+            tokio::time::sleep(late.delay).await;
+            late.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err((late.fail)())
+        })
+    }
+}
+
+/// The error a late lane build reports when its top-up mined but its local
+/// record was not written: tx `0x<tx>…`.
+fn late_escrow(tx: u8) -> anyhow::Error {
+    crate::buyer_pool::escrowed_but_untracked(
+        "pool 0x01 topped up by 5 µUSDC",
+        alloy::primitives::TxHash::repeat_byte(tx),
+        "disk full",
+    )
+}
+
+/// The tx hash [`late_escrow`]`(tx)` names, as its error text spells it.
+fn late_escrow_tx(tx: u8) -> String {
+    alloy::primitives::TxHash::repeat_byte(tx).to_string()
+}
+
+/// Acquire `a`'s blob, which pays `la`, beside a lane for each of `late`
+/// whose build ends late. The stop policy gives up after `give_up_after`.
+/// Returns the acquire's result and, for each late build, whether it ended
+/// before the acquire returned.
+async fn acquire_with_late_builds(
+    a: ScriptedSource,
+    la: Arc<PoolLedger>,
+    late: Vec<LateBuild>,
+    give_up_after: Duration,
+) -> anyhow::Result<(anyhow::Result<()>, Vec<bool>)> {
+    let (root, total) = (a.root(), a.total_bytes());
+    let mut lanes = vec![candidate(a, la, 0xA1, None)];
+    for build in &late {
+        let source = ScriptedSource::new(blob(1024 * 1024))?;
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        lanes.push(candidate(source, ledger, build.byte, None));
+    }
+    let max_lanes = lanes.len();
+    let (store, _dir) = fresh_store(root, total);
+    let provider = LateBuilds {
+        lanes: StaticSources::new(lanes)?,
+        late,
+    };
+    let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
+    let stop = StopPolicy::new(false, Some(give_up_after), Arc::default());
+    let gate = recovery_gate();
+    let result = acquire(
+        AcquireTarget {
+            store: &store,
+            hash: root,
+            total_bytes: total,
+            ranges: &[(0, total)],
+        },
+        &mut set,
+        &AcquireEnv {
+            pacer: &BudgetPacer::new(),
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
+            max_lanes,
+            stop: &stop,
+            on_progress: None,
+            ledgers: None,
+            pacing: None,
+            max_blob_bytes: 0,
+            run: None,
+        },
+    )
+    .await;
+    let ended = provider
+        .late
+        .iter()
+        .map(|build| build.ended.load(std::sync::atomic::Ordering::SeqCst))
+        .collect();
+    Ok((result, ended))
+}
+
+/// A healthy 1 MiB lane A that delivers the whole blob at once.
+fn delivering_lane() -> anyhow::Result<(ScriptedSource, Arc<PoolLedger>)> {
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    let a = ScriptedSource::new(blob(1024 * 1024))?.paying(Arc::clone(&la));
+    Ok((a, la))
+}
+
+/// A lane build that may have escrowed USDC no record credits after the
+/// fetch completed fails the acquire: the funds moved and nothing else names
+/// the tx, so a success would hide them.
+#[tokio::test(start_paused = true)]
+async fn a_late_lane_build_that_escrowed_fails_a_completed_acquire() -> anyhow::Result<()> {
+    let (a, la) = delivering_lane()?;
+    let late = vec![late_build(0xB2, Duration::from_secs(5), || {
+        late_escrow(0xab)
+    })];
+    let (result, ended) = acquire_with_late_builds(a, la, late, Duration::from_hours(1)).await?;
+    assert_eq!(ended, [true], "the late build ended in the drain");
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("the late escrow must fail the acquire"))?;
+    assert_eq!(classify(&err), Fault::Fatal(FatalScope::Command), "{err:#}");
+    assert!(
+        err.downcast_ref::<crate::fault::LaneBuildFault>().is_some(),
+        "{err:#}"
+    );
+    let tx = late_escrow_tx(0xab);
+    assert!(format!("{err:#}").contains(&tx), "the tx is named: {err:#}");
+    Ok(())
+}
+
+/// A lane build that fails after the fetch completed for any reason but a
+/// possible untracked escrow leaves the acquire's success standing, even when
+/// the failure is fatal on its own: the fetch no longer needs the lane.
+#[tokio::test(start_paused = true)]
+async fn a_late_lane_build_that_fails_otherwise_leaves_the_acquire_ok() -> anyhow::Result<()> {
+    let fatal = || {
+        anyhow::Error::new(crate::BlobTooLarge {
+            reached: 2,
+            ceiling: 1,
+        })
+    };
+    assert!(
+        matches!(
+            classify(&anyhow::Error::new(crate::fault::LaneBuildFault(fatal()))),
+            Fault::Fatal(_)
+        ),
+        "the second case is a fatal lane build"
+    );
+    let fails: [fn() -> anyhow::Error; 2] = [|| anyhow::anyhow!("rpc timed out"), fatal];
+    for fail in fails {
+        let (a, la) = delivering_lane()?;
+        let late = vec![late_build(0xB2, Duration::from_secs(5), fail)];
+        let (result, ended) =
+            acquire_with_late_builds(a, la, late, Duration::from_hours(1)).await?;
+        assert_eq!(ended, [true], "the late build ended in the drain");
+        result?;
+    }
+    Ok(())
+}
+
+/// A late lane build's possible untracked escrow wins over a fetch that gave
+/// up: a [`GaveUp`] the caller could still downcast tells it a re-run is
+/// safe, and that re-run escrows again. The give-up survives as text.
+#[tokio::test(start_paused = true)]
+async fn a_late_lane_build_that_escrowed_wins_over_a_give_up() -> anyhow::Result<()> {
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    let a = ScriptedSource::new(blob(1024 * 1024))?
+        .with_fault_after(0, || anyhow::anyhow!("scripted immediate fault"))
+        .paying(Arc::clone(&la));
+    // The build outlives the 1 min give-up and ends well inside the drain.
+    let late = vec![late_build(0xB2, Duration::from_secs(75), || {
+        late_escrow(0xab)
+    })];
+    let (result, ended) = acquire_with_late_builds(a, la, late, Duration::from_mins(1)).await?;
+    assert_eq!(ended, [true], "the late build ended in the drain");
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a fetch with no verified byte must stop"))?;
+    assert_eq!(classify(&err), Fault::Fatal(FatalScope::Command), "{err:#}");
+    assert!(
+        err.downcast_ref::<crate::fault::LaneBuildFault>().is_some(),
+        "{err:#}"
+    );
+    assert!(err.downcast_ref::<GaveUp>().is_none(), "{err:#}");
+    let text = format!("{err:#}");
+    let tx = late_escrow_tx(0xab);
+    assert!(text.contains(&tx), "the tx is named: {text}");
+    let gave_up = GaveUp {
+        idle: Duration::from_mins(1),
+    };
+    assert!(
+        text.contains(&gave_up.to_string()),
+        "the give-up is named: {text}"
+    );
+    Ok(())
+}
+
+/// Every late lane build that may have escrowed USDC no record credits is
+/// named, not only the first.
+#[tokio::test(start_paused = true)]
+async fn every_late_lane_build_that_escrowed_is_named() -> anyhow::Result<()> {
+    let (a, la) = delivering_lane()?;
+    let late = vec![
+        late_build(0xB2, Duration::from_secs(5), || late_escrow(0xab)),
+        late_build(0xC3, Duration::from_secs(10), || late_escrow(0xcd)),
+    ];
+    let (result, ended) = acquire_with_late_builds(a, la, late, Duration::from_hours(1)).await?;
+    assert_eq!(ended, [true, true], "both late builds ended in the drain");
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("the late escrows must fail the acquire"))?;
+    assert_eq!(classify(&err), Fault::Fatal(FatalScope::Command), "{err:#}");
+    let text = format!("{err:#}");
+    for tx in [0xab, 0xcd] {
+        let tx = late_escrow_tx(tx);
+        assert!(text.contains(&tx), "{tx} is named: {text}");
+    }
+    Ok(())
+}
+
+/// A late build's possible untracked escrow survives the drain's 30 s bound
+/// when another build outlives it: that one drops, and the first is still
+/// named.
+#[tokio::test(start_paused = true)]
+async fn a_late_escrow_survives_a_sibling_build_past_the_drain_bound() -> anyhow::Result<()> {
+    let (a, la) = delivering_lane()?;
+    let late = vec![
+        late_build(0xB2, Duration::from_secs(5), || late_escrow(0xab)),
+        late_build(0xC3, Duration::from_secs(120), || late_escrow(0xcd)),
+    ];
+    let (result, ended) = acquire_with_late_builds(a, la, late, Duration::from_hours(1)).await?;
+    assert_eq!(
+        ended,
+        [true, false],
+        "the second build dropped at the bound"
+    );
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("the late escrow must fail the acquire"))?;
+    assert_eq!(classify(&err), Fault::Fatal(FatalScope::Command), "{err:#}");
+    let text = format!("{err:#}");
+    let first = late_escrow_tx(0xab);
+    let dropped = late_escrow_tx(0xcd);
+    assert!(text.contains(&first), "the first escrow is named: {text}");
+    assert!(
+        !text.contains(&dropped),
+        "a dropped build reports nothing: {text}"
     );
     Ok(())
 }
