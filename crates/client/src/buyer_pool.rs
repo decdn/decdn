@@ -1112,7 +1112,9 @@ fn top_up_submit_error(err: alloy::contract::Error, context: impl Into<String>) 
 ///
 /// The amount overflows `uint64`, or the send fails. A revert carries the
 /// markers [`top_up`]'s submit errors carry ([`AllowanceShortfall`],
-/// [`PoolNotOpen`]).
+/// [`PoolNotOpen`]). A transport failure is not marked [`TopUpUnconfirmed`]:
+/// the caller already holds the nonce, and reads it again to learn the
+/// outcome.
 pub async fn send_top_up_at<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
@@ -1201,7 +1203,7 @@ pub async fn top_up<P: Provider + Clone>(
                     nonce,
                 })
         })?;
-    topped_up_from_receipt(&receipt, tx, *contract.address(), pool_id, additional)
+    topped_up_from_receipt(&receipt, *contract.address(), pool_id, additional)
 }
 
 /// Build the [`ToppedUpPool`] a `topUp` tx bought, from its mined `receipt`.
@@ -1217,11 +1219,11 @@ pub async fn top_up<P: Provider + Clone>(
 /// The tx reverted: nothing was escrowed.
 pub fn topped_up_from_receipt(
     receipt: &alloy::rpc::types::TransactionReceipt,
-    tx: TxHash,
     payment_pool: Address,
     pool_id: B256,
     additional: U256,
 ) -> Result<ToppedUpPool> {
+    let tx = receipt.transaction_hash;
     if !receipt.status() {
         anyhow::bail!("topUp reverted for pool {pool_id} (tx {tx:#x})");
     }

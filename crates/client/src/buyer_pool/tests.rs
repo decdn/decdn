@@ -490,13 +490,7 @@ fn topped_up_from_receipt_reads_the_pools_own_event() {
     let pool_id = B256::repeat_byte(0xaa);
     let requested = U256::from(1_000u64);
     let credit = |logs, status| {
-        topped_up_from_receipt(
-            &top_up_receipt(logs, status),
-            SCRIPTED_TX,
-            pool,
-            pool_id,
-            requested,
-        )
+        topped_up_from_receipt(&top_up_receipt(logs, status), pool, pool_id, requested)
     };
 
     let forged = topped_up_log(Address::repeat_byte(0x99), pool_id, 5_000);

@@ -34,7 +34,7 @@ since project inception and will roll into the first tagged release.
   hash, because the transaction may still mine. `None` waits until the receipt
   arrives or its read fails. The CLI passes
   `decdn_incentive::tx::RECEIPT_TIMEOUT` (3 min) to both. The node passes it
-  to both too, and settles an unconfirmed open or top-up against the chain.
+  to both as well, and settles an unconfirmed open or top-up against the chain.
   `open_pool` also refuses to send while the `UnconfirmedOpens` it is given
   already holds an open, and fails with that `OpenUnconfirmed`.
 - **Admin/CLI: a lane's `counterparty` is its pool owner, not its voucher
@@ -1095,7 +1095,12 @@ since project inception and will roll into the first tagged release.
   `decdn_incentive::tx::RECEIPT_TIMEOUT`. An unconfirmed `topUp` keeps the
   slot until the chain resolves it: its receipt credits the row, a nonce that
   no transaction holds gets a re-send at that nonce, and a spent nonce with no
-  receipt credits what the pool's on-chain deposit holds above the row. The
+  receipt credits what the pool's on-chain deposit holds above the row as it
+  stood when the settle began. A re-send that reverts `PoolNotOpen` ends the
+  settle, so the recovery step opens a new pool. A settle that may have
+  escrowed but cannot credit the row logs the "ESCROWED AND UNTRACKED" error,
+  and so does a funding task that dies mid-settle, which no joiner then funds
+  over. The
   hourly reclaim sweep's `reclaim` receipt wait is bounded the same way, so
   one dropped `reclaim` no longer stalls the sweep. `decdn-client` adds
   `buyer_pool::send_top_up_at` and `buyer_pool::topped_up_from_receipt` for

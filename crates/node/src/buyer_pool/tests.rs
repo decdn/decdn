@@ -3053,6 +3053,8 @@ enum Reply {
     Call(alloy::primitives::Bytes),
     /// The call faults, as a transient RPC error does.
     Fault,
+    /// The call reverts `PoolNotOpen` at gas estimation.
+    RevertsPoolNotOpen,
 }
 
 /// Push `replies` onto `asserter`, in order.
@@ -3067,6 +3069,17 @@ fn push(asserter: &alloy::providers::mock::Asserter, replies: Vec<Reply>) {
             Reply::Sent(tx) => asserter.push_success(&tx),
             Reply::Call(bytes) => asserter.push_success(&bytes),
             Reply::Fault => asserter.push_failure_msg("transient rpc fault"),
+            Reply::RevertsPoolNotOpen => {
+                let selector = alloy::primitives::keccak256("PoolNotOpen()");
+                asserter.push_failure(
+                    serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
+                        "code": 3,
+                        "message": "execution reverted",
+                        "data": format!("0x{}", alloy::primitives::hex::encode(&selector[..4])),
+                    }))
+                    .unwrap(),
+                );
+            }
         }
     }
 }
@@ -3938,7 +3951,7 @@ async fn settle_top_up(
     let err = anyhow::anyhow!("await topUp receipt").context(unconfirmed);
     let settled = tokio::time::timeout(
         SETTLE_TEST_BOUND,
-        settle_unconfirmed_top_up(&handles, TOPPED, U256::from(TOP_UP), unconfirmed, err),
+        settle_unconfirmed_top_up(&handles, TOPPED, U256::from(TOP_UP), unconfirmed, &err),
     )
     .await
     .expect("the topUp settles within the scripted replies");
@@ -3976,7 +3989,7 @@ async fn an_unconfirmed_top_up_waits_out_its_pending_tx_and_credits_its_receipt(
     .await
     .unwrap();
     assert_eq!(settled.credited, U256::from(900u64));
-    assert_eq!(settled.tx, Some(open_tx()));
+    assert!(matches!(settled.proof, TopUpProof::Receipt(tx) if tx == open_tx()));
 }
 
 /// A nonce that no transaction holds gets a fresh `topUp` at that nonce, and
@@ -4003,7 +4016,7 @@ async fn a_vacant_top_up_nonce_is_re_sent_at_that_nonce() {
     .await
     .unwrap();
     assert_eq!(settled.credited, U256::from(TOP_UP));
-    assert_eq!(settled.tx, Some(resent_tx()));
+    assert!(matches!(settled.proof, TopUpProof::Receipt(tx) if tx == resent_tx()));
 }
 
 /// A submit that failed in transport has no hash to poll. Once its nonce is
@@ -4024,7 +4037,13 @@ async fn a_spent_nonce_credits_what_the_pool_holds_above_the_row() {
     .await
     .unwrap();
     assert_eq!(settled.credited, U256::from(TOP_UP));
-    assert_eq!(settled.tx, None, "no known hash mined");
+    assert!(
+        matches!(
+            settled.proof,
+            TopUpProof::DepositGrowth { nonce: 5, block: 100, ref known } if known.is_empty()
+        ),
+        "no known hash mined"
+    );
 }
 
 /// A spent nonce with no receipt and a pool deposit equal to the row's means
@@ -4088,4 +4107,225 @@ async fn a_reverted_unconfirmed_top_up_escrowed_nothing() {
     .err()
     .expect("a revert");
     assert!(format!("{err:#}").contains("reverted"), "{err:#}");
+}
+
+/// A re-send that reverts `PoolNotOpen` at a vacant nonce ends the settle: no
+/// `topUp` can escrow into a pool that is not open, and the marker sends the
+/// recovery step to a new pool instead of holding the top-up slot.
+#[tokio::test(start_paused = true)]
+async fn a_re_send_into_a_closed_pool_ends_the_settle() {
+    let owner = Address::repeat_byte(1);
+    let err = settle_top_up(
+        vec![
+            Reply::NoReceipt,
+            Reply::Block(100),
+            Reply::Nonce(5),
+            Reply::Nonce(5),
+            Reply::RevertsPoolNotOpen,
+        ],
+        unread_top_up(),
+        store_tracking(owner, TOPPED),
+        owner,
+    )
+    .await
+    .err()
+    .expect("the pool accepts no funds");
+    assert!(err.downcast_ref::<PoolNotOpen>().is_some(), "{err:#}");
+    assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
+}
+
+/// A transient fault on a receipt read, a re-send or a `getPool` waits for the
+/// next tick: ending the settle on one would free the slot while the `topUp`
+/// may still mine.
+#[tokio::test(start_paused = true)]
+async fn transient_settle_faults_wait_for_the_next_tick() {
+    let owner = Address::repeat_byte(1);
+    let settled = settle_top_up(
+        vec![
+            // The receipt read faults.
+            Reply::Fault,
+            // Vacant, and the re-send faults.
+            Reply::NoReceipt,
+            Reply::Block(100),
+            Reply::Nonce(5),
+            Reply::Nonce(5),
+            Reply::Fault,
+            // The nonce is spent, and `getPool` at that block faults.
+            Reply::NoReceipt,
+            Reply::Block(101),
+            Reply::Nonce(6),
+            Reply::NoReceipt,
+            Reply::Fault,
+            // The next tick reads the deposit growth.
+            Reply::NoReceipt,
+            Reply::Block(102),
+            Reply::Nonce(6),
+            Reply::NoReceipt,
+            deposit_reply(owner, ROW_DEPOSIT + TOP_UP),
+        ],
+        unread_top_up(),
+        store_tracking(owner, TOPPED),
+        owner,
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.credited, U256::from(TOP_UP));
+    assert!(matches!(
+        settled.proof,
+        TopUpProof::DepositGrowth { block: 102, .. }
+    ));
+}
+
+/// The value of the counter `name` in `metrics`.
+fn counter(metrics: &Arc<Metrics>, name: &str) -> u64 {
+    let text = metrics.encode().expect("encode metrics");
+    text.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse::<u64>().ok())
+        .expect("the counter is exported")
+}
+
+/// Spawn a refill whose `topUp` submit fails in transport, so it settles with
+/// no hash to poll, and run it to its first settle tick. The scripted queue is
+/// empty after the submit, so that tick fails its block read and waits.
+async fn spawn_hashless_top_up(
+    store: &Arc<dyn BuyerPoolStore>,
+    owner: Address,
+) -> (
+    BuyerPoolService<impl Provider + Clone + 'static>,
+    alloy::providers::mock::Asserter,
+    SharedTopUp,
+) {
+    let asserter = script(vec![Reply::Nonce(5)]);
+    let svc = mocked_service_on(
+        bare_pool_contract(asserter.clone()),
+        Arc::clone(store),
+        signer(),
+        owner,
+    );
+    let (shared, claim) = svc.join_or_spawn_topup(TOPPED, U256::from(TOP_UP), TopUpFunder::Refill);
+    assert_eq!(claim, TopUpClaim::Spawned);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let (_, again) = svc.join_or_spawn_topup(TOPPED, U256::from(TOP_UP), TopUpFunder::Refill);
+    assert!(
+        matches!(again, TopUpClaim::Joined { .. }),
+        "the settling topUp holds the slot"
+    );
+    (svc, asserter, shared)
+}
+
+/// A `topUp` whose submit failed in transport settles through `fund_pool`:
+/// once its nonce is spent, the pool's deposit growth credits the row exactly
+/// once, meters one success, and releases the slot (#2489).
+#[tokio::test(start_paused = true)]
+async fn a_settled_top_up_credits_the_row_once() {
+    let owner = Address::repeat_byte(1);
+    let store = store_tracking(owner, TOPPED);
+    let (svc, asserter, shared) = spawn_hashless_top_up(&store, owner).await;
+
+    push(
+        &asserter,
+        vec![
+            Reply::Block(100),
+            Reply::Nonce(6),
+            deposit_reply(owner, ROW_DEPOSIT + TOP_UP),
+        ],
+    );
+    let landed = tokio::time::timeout(SETTLE_TEST_BOUND, shared)
+        .await
+        .expect("the topUp settles")
+        .unwrap();
+
+    assert_eq!(
+        landed,
+        TopUpLanded {
+            new_deposit: U256::from(ROW_DEPOSIT + TOP_UP),
+            added: U256::from(TOP_UP),
+        }
+    );
+    assert!(asserter.read_q().is_empty(), "every scripted read was made");
+    assert_eq!(
+        store.get_by_owner(owner).unwrap().map(|row| row.deposit),
+        Some(U256::from(ROW_DEPOSIT + TOP_UP)),
+        "the row is credited once"
+    );
+    assert_eq!(counter(&svc.metrics, "decdn_buyer_topup_ok_total"), 1);
+    assert_eq!(counter(&svc.metrics, "decdn_buyer_topup_failure_total"), 0);
+    assert!(
+        svc.topup_in_flight.lock().unwrap().is_none(),
+        "the funding task released the slot"
+    );
+}
+
+/// A settle that finds nothing escrowed fails the `topUp` with a known
+/// outcome: one failure metered, the row unchanged, and the slot free for the
+/// next refill.
+#[tokio::test(start_paused = true)]
+async fn a_settled_top_up_that_escrowed_nothing_frees_the_slot() {
+    let owner = Address::repeat_byte(1);
+    let store = store_tracking(owner, TOPPED);
+    let (svc, asserter, shared) = spawn_hashless_top_up(&store, owner).await;
+
+    push(
+        &asserter,
+        vec![
+            Reply::Block(100),
+            Reply::Nonce(6),
+            deposit_reply(owner, ROW_DEPOSIT),
+        ],
+    );
+    let err = tokio::time::timeout(SETTLE_TEST_BOUND, shared)
+        .await
+        .expect("the topUp settles")
+        .unwrap_err();
+
+    assert!(format!("{err:#}").contains("escrowed nothing"), "{err:#}");
+    assert!(err.downcast_ref::<EscrowedUntracked>().is_none(), "{err:#}");
+    assert_eq!(
+        store.get_by_owner(owner).unwrap().map(|row| row.deposit),
+        Some(U256::from(ROW_DEPOSIT))
+    );
+    assert_eq!(counter(&svc.metrics, "decdn_buyer_topup_ok_total"), 0);
+    assert_eq!(counter(&svc.metrics, "decdn_buyer_topup_failure_total"), 1);
+    assert!(svc.topup_in_flight.lock().unwrap().is_none());
+}
+
+/// A row replaced while the `topUp` settles does not hide the escrow: the
+/// deposit growth is read against the row as it stood when the settle began,
+/// and the credit that then fails is escrowed-and-untracked, naming the nonce
+/// and block it was read at.
+#[tokio::test(start_paused = true)]
+async fn a_row_replaced_mid_settle_leaves_the_escrow_untracked() {
+    let owner = Address::repeat_byte(1);
+    let store = store_tracking(owner, TOPPED);
+    let (svc, asserter, shared) = spawn_hashless_top_up(&store, owner).await;
+
+    store
+        .record(&BuyerPoolState::new(
+            PoolId::repeat_byte(0xBB),
+            DEPLOYMENT,
+            owner,
+            Address::repeat_byte(2),
+            U256::from(ROW_DEPOSIT),
+        ))
+        .unwrap();
+    push(
+        &asserter,
+        vec![
+            Reply::Block(100),
+            Reply::Nonce(6),
+            deposit_reply(owner, ROW_DEPOSIT + TOP_UP),
+        ],
+    );
+    let err = tokio::time::timeout(SETTLE_TEST_BOUND, shared)
+        .await
+        .expect("the topUp settles")
+        .unwrap_err();
+
+    assert!(err.downcast_ref::<EscrowedUntracked>().is_some(), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("nonce 5 spent at block 100"),
+        "{err:#}"
+    );
+    assert_eq!(counter(&svc.metrics, "decdn_buyer_topup_ok_total"), 0);
+    assert_eq!(counter(&svc.metrics, "decdn_buyer_topup_failure_total"), 1);
 }
