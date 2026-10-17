@@ -583,15 +583,16 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 ///
 /// A caller can also drop this future: a Ctrl-C, or a fault that ends the
 /// command. No error is returned then, and a caller can also drop an error a
-/// sibling task returned. So `opens` holds the `openPool` from before its
+/// sibling task returned. So `escrows` holds the `openPool` from before its
 /// submit until its receipt is read: with no hash while the submit is in
 /// flight or failed in transport, with the hash after. A caller that may drop
 /// the future or its error passes `Some` and reads
-/// [`UnconfirmedOpens::pending`] when it ends, so it can still name the tx.
+/// [`UnconfirmedEscrows::pending`] when it ends, so it can still name the tx.
 ///
-/// An `opens` that already holds an unconfirmed open refuses a new one: the
+/// An `escrows` that already holds an unconfirmed open refuses a new one: the
 /// call fails with that [`OpenUnconfirmed`] before any chain read, because the
 /// earlier tx may still mine and a second open would escrow a second deposit.
+/// A held `topUp` does not refuse an open.
 /// A caller that serializes its opens sees this only after an earlier open
 /// ended without a receipt.
 ///
@@ -608,7 +609,7 @@ pub async fn open_pool<P: Provider + Clone>(
     token: Address,
     owner: Address,
     deposit: U256,
-    opens: Option<&UnconfirmedOpens>,
+    escrows: Option<&UnconfirmedEscrows>,
     receipt_timeout: Option<Duration>,
 ) -> Result<OpenedPool> {
     anyhow::ensure!(
@@ -618,7 +619,7 @@ pub async fn open_pool<P: Provider + Clone>(
         deployment.payment_pool
     );
     let amount = to_pool_u64(deposit, "deposit")?;
-    if let Some(earlier) = opens.and_then(|opens| opens.pending().first().copied()) {
+    if let Some(earlier) = escrows.and_then(|escrows| escrows.opens().first().copied()) {
         return Err(anyhow::Error::new(earlier)
             .context("refusing a second openPool while an earlier one is unconfirmed"));
     }
@@ -630,18 +631,17 @@ pub async fn open_pool<P: Provider + Clone>(
         .context("read the pending nonce for openPool")
         .context(PoolOpenFailureReason::RpcError)?;
     // A caller with no handle holds the entries in one nobody reads.
-    let opens = opens.cloned().unwrap_or_default();
+    let escrows = escrows.cloned().unwrap_or_default();
     let submitted = OpenUnconfirmed { tx: None, nonce };
     // Held across the submit: a drop while it is in flight leaves an
     // `openPool` the RPC node may have broadcast with no hash returned.
-    opens.insert(submitted);
+    escrows.insert(submitted);
     let sent = contract
         .openPool(amount)
         .from(owner)
         .nonce(nonce)
         .send()
         .await;
-    opens.remove(submitted);
     let pending = match sent {
         Ok(pending) => pending,
         Err(err) => {
@@ -655,8 +655,9 @@ pub async fn open_pool<P: Provider + Clone>(
             let broadcast_unknown = decdn_incentive::tx::send_broadcast_unknown(&err);
             let mut err = anyhow::Error::new(err).context("submit openPool");
             if broadcast_unknown {
-                opens.insert(submitted);
                 err = err.context(submitted);
+            } else {
+                escrows.remove(submitted);
             }
             return Err(err.context(reason));
         }
@@ -669,7 +670,7 @@ pub async fn open_pool<P: Provider + Clone>(
         tx: Some(tx),
         nonce,
     };
-    opens.insert(unconfirmed);
+    escrows.replace(submitted, unconfirmed);
 
     // Bounded only when the caller asks — see `# The caller picks the receipt
     // bound` above. Only a receipt releases the entry: a drop here, a failed
@@ -683,7 +684,7 @@ pub async fn open_pool<P: Provider + Clone>(
             .context(unconfirmed)
             .context(PoolOpenFailureReason::RpcError)
         })?;
-    opens.remove(unconfirmed);
+    escrows.remove(unconfirmed);
     opened_from_receipt(&receipt, tx, deployment, token, owner, deposit)
 }
 
@@ -777,7 +778,7 @@ pub const SELF_CAPABILITY_CAP: u64 = u64::MAX;
 /// Typed marker on an [`open_pool`] error raised when the `openPool` may have
 /// been broadcast but is not known to have mined: its submit failed in
 /// transport, or it was broadcast and its receipt was not read (a failed read,
-/// or none within the caller's bound). An [`UnconfirmedOpens`] entry has the
+/// or none within the caller's bound). An [`UnconfirmedEscrows`] entry has the
 /// same meaning. The transaction may still mine and escrow the deposit, so a
 /// caller must resolve it before it sends another `openPool`. Recover it with
 /// `err.downcast_ref::<OpenUnconfirmed>()`.
@@ -817,45 +818,119 @@ impl std::fmt::Display for OpenUnconfirmed {
 
 impl std::error::Error for OpenUnconfirmed {}
 
-/// The `openPool` transactions a command submitted whose receipt it has not
-/// read.
+/// An `openPool` or `topUp` a command submitted whose receipt it has not read:
+/// one entry of [`UnconfirmedEscrows`]. Either may still mine and escrow USDC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscrowUnconfirmed {
+    /// An `openPool`, which may escrow a new pool's deposit.
+    Open(OpenUnconfirmed),
+    /// A `topUp`, which may add to a pool's deposit.
+    TopUp(TopUpUnconfirmed),
+}
+
+impl From<OpenUnconfirmed> for EscrowUnconfirmed {
+    fn from(open: OpenUnconfirmed) -> Self {
+        Self::Open(open)
+    }
+}
+
+impl From<TopUpUnconfirmed> for EscrowUnconfirmed {
+    fn from(top_up: TopUpUnconfirmed) -> Self {
+        Self::TopUp(top_up)
+    }
+}
+
+impl std::fmt::Display for EscrowUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(open) => open.fmt(f),
+            Self::TopUp(top_up) => top_up.fmt(f),
+        }
+    }
+}
+
+/// The `openPool` and `topUp` transactions a command submitted whose receipt
+/// it has not read.
 ///
-/// [`open_pool`] adds an entry before its submit and removes it once it reads
-/// the receipt, or once a submit is rejected without a broadcast. A future
-/// dropped mid-submit or mid-wait, or a receipt read that fails, leaves its
-/// entry. A command that ends while an entry remains names it, because the
-/// deposit may escrow after the command exits and a re-run before it confirms
-/// escrows a second deposit.
+/// [`open_pool`] and [`top_up`] add an entry before their submit and remove it
+/// once they read the receipt, or once a submit is rejected without a
+/// broadcast. A future dropped mid-submit or mid-wait, or a receipt read that
+/// fails, leaves its entry. A command that ends while an entry remains names
+/// it, because the transaction may escrow after the command exits and a
+/// re-run before it confirms escrows again.
 ///
 /// A clone shares the same list, so one handle can outlive the per-pass state
-/// that the opens run under.
+/// that the transactions run under.
 #[derive(Debug, Default, Clone)]
-pub struct UnconfirmedOpens(Arc<Mutex<Vec<OpenUnconfirmed>>>);
+pub struct UnconfirmedEscrows(Arc<Mutex<Vec<EscrowUnconfirmed>>>);
 
-impl UnconfirmedOpens {
-    /// The opens whose receipt was not read, oldest first.
+impl UnconfirmedEscrows {
+    /// The transactions whose receipt was not read, oldest first.
     #[must_use]
-    pub fn pending(&self) -> Vec<OpenUnconfirmed> {
+    pub fn pending(&self) -> Vec<EscrowUnconfirmed> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
-    /// Hold `open` from its submit.
-    fn insert(&self, open: OpenUnconfirmed) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(open);
+    /// The `openPool` transactions whose receipt was not read, oldest first.
+    #[must_use]
+    pub(crate) fn opens(&self) -> Vec<OpenUnconfirmed> {
+        self.pending()
+            .into_iter()
+            .filter_map(|held| match held {
+                EscrowUnconfirmed::Open(open) => Some(open),
+                EscrowUnconfirmed::TopUp(_) => None,
+            })
+            .collect()
     }
 
-    /// Release `open` once its receipt is read, or its submit was rejected.
-    fn remove(&self, open: OpenUnconfirmed) {
+    /// The `topUp` transactions whose receipt was not read, oldest first.
+    #[must_use]
+    pub(crate) fn top_ups(&self) -> Vec<TopUpUnconfirmed> {
+        self.pending()
+            .into_iter()
+            .filter_map(|held| match held {
+                EscrowUnconfirmed::TopUp(top_up) => Some(top_up),
+                EscrowUnconfirmed::Open(_) => None,
+            })
+            .collect()
+    }
+
+    /// Hold `escrow` from its submit.
+    fn insert(&self, escrow: impl Into<EscrowUnconfirmed>) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|held| *held != open);
+            .push(escrow.into());
+    }
+
+    /// Release `escrow` once its receipt is read, or its submit was rejected.
+    /// Releases one entry: two calls that hold equal entries each release
+    /// their own.
+    fn remove(&self, escrow: impl Into<EscrowUnconfirmed>) {
+        let escrow = escrow.into();
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = held.iter().position(|entry| *entry == escrow) {
+            held.remove(at);
+        }
+    }
+
+    /// Swap `submitted` for `broadcast` under one lock, once the submit
+    /// returns a hash, so a reader never sees the transaction held as
+    /// neither.
+    fn replace(
+        &self,
+        submitted: impl Into<EscrowUnconfirmed>,
+        broadcast: impl Into<EscrowUnconfirmed>,
+    ) {
+        let (submitted, broadcast) = (submitted.into(), broadcast.into());
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match held.iter_mut().find(|entry| **entry == submitted) {
+            Some(entry) => *entry = broadcast,
+            None => held.push(broadcast),
+        }
     }
 }
 
@@ -918,15 +993,18 @@ impl std::error::Error for AllowanceShortfall {}
 /// Typed marker on a [`top_up`] error raised when the `topUp` may have been
 /// broadcast but is not known to have mined: its submit failed in transport
 /// (a timeout, a reset, an HTTP 5xx), or it was broadcast and its receipt was
-/// not read (a failed read, or none within the caller's bound). The
-/// transaction may still mine, so the escrow may have moved while no local
-/// record credits it. A caller must not treat it as "nothing escrowed"; the
-/// acquire loop classifies it as fatal to the command ([`crate::Fault::Fatal`]).
+/// not read (a failed read, or none within the caller's bound). An
+/// [`UnconfirmedEscrows`] entry has the same meaning, and also holds a `topUp`
+/// whose future was dropped before either. The transaction may still mine, so
+/// the escrow may have moved while no local record credits it. A caller must
+/// not treat it as "nothing escrowed"; the acquire loop classifies it as fatal
+/// to the command ([`crate::Fault::Fatal`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TopUpUnconfirmed {
     /// The broadcast `topUp` transaction, which an operator reconciles
-    /// against. `None` when the submit failed in transport: the RPC node may
-    /// have broadcast the transaction without returning its hash.
+    /// against. `None` when the submit returned no hash (it failed in
+    /// transport, or was dropped in flight): the RPC node may have broadcast
+    /// the transaction without returning its hash.
     pub tx: Option<TxHash>,
     /// The nonce the `topUp` was sent with. Once the account's confirmed nonce
     /// passes it, the `topUp` has either mined or can never mine.
@@ -945,7 +1023,7 @@ impl std::fmt::Display for TopUpUnconfirmed {
             ),
             None => write!(
                 f,
-                "topUp submit (nonce {}) failed in transport, so the RPC node may have \
+                "topUp submit (nonce {}) returned no tx hash, so the RPC node may have \
                  broadcast it and it may mine; reconcile against the account's nonce before \
                  retrying, because a retry escrows again",
                 self.nonce
@@ -1037,11 +1115,17 @@ const TOPUP_NONCE_BACKOFF: Duration = Duration::from_millis(250);
 /// a fresh nonce after a same-account nonce collision, and return the pending
 /// transaction with the nonce it holds. The errors are [`top_up`]'s submit
 /// errors.
+///
+/// `escrows` holds each submit while it is in flight, and keeps one that
+/// failed in transport: either may have been broadcast with no hash returned.
+/// A submit that returns a hash stays held for [`top_up`] to swap for the
+/// broadcast `topUp`; a rejected one is released.
 async fn send_top_up<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
     pool_id: B256,
     amount: u64,
+    escrows: &UnconfirmedEscrows,
 ) -> Result<(PendingTransactionBuilder<Ethereum>, u64)> {
     let mut nonce_retries = 0u32;
     loop {
@@ -1052,12 +1136,17 @@ async fn send_top_up<P: Provider + Clone>(
             .await
             .context("read the pending nonce for topUp")?;
         let call = contract.topUp(pool_id, amount).from(owner).nonce(nonce);
+        let submitted = TopUpUnconfirmed { tx: None, nonce };
+        // Held across the submit: a drop while it is in flight leaves a
+        // `topUp` the RPC node may have broadcast with no hash returned.
+        escrows.insert(submitted);
         let err = match call.send().await {
             Ok(pending) => return Ok((pending, nonce)),
             Err(err) => err,
         };
         if nonce_retries < TOPUP_NONCE_RETRIES && decdn_incentive::tx::is_nonce_collision(&err) {
             nonce_retries = nonce_retries.saturating_add(1);
+            escrows.remove(submitted);
             debug!(
                 %pool_id, nonce_retries,
                 "topUp lost its nonce to a concurrent transaction; re-sending"
@@ -1070,8 +1159,9 @@ async fn send_top_up<P: Provider + Clone>(
         if decdn_incentive::tx::send_broadcast_unknown(&err) {
             return Err(anyhow::Error::new(err)
                 .context("submit topUp")
-                .context(TopUpUnconfirmed { tx: None, nonce }));
+                .context(submitted));
         }
+        escrows.remove(submitted);
         return Err(top_up_submit_error(err, "submit topUp"));
     }
 }
@@ -1168,10 +1258,18 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 ///
 /// `receipt_timeout` bounds the receipt wait when it is `Some`, as for
 /// [`open_pool`]. A caller that bounds the wait must not send another `topUp`
-/// on the pool while this one is unconfirmed. `decdn get` holds the first for
-/// the run and refuses the rest. The node keeps its top-up slot and settles the
-/// unconfirmed `topUp` against the chain ([`send_top_up_at`],
+/// on the pool while this one is unconfirmed. The run funding of `decdn get`
+/// refuses the rest while its `escrows` holds one
+/// ([`crate::funding::RunFunding`]). The node keeps its top-up slot and settles
+/// the unconfirmed `topUp` against the chain ([`send_top_up_at`],
 /// [`topped_up_from_receipt`]).
+///
+/// `escrows` holds the `topUp` from before its submit until its receipt is
+/// read, as [`open_pool`] holds an `openPool`: with no hash while the submit
+/// is in flight or failed in transport, with the hash after. A drop, a failed
+/// read or a lapse leaves the entry, so a caller that may drop the future or
+/// its error passes `Some` and reads [`UnconfirmedEscrows::pending`] when it
+/// ends. `top_up` itself refuses nothing on what `escrows` holds.
 ///
 /// # Errors
 ///
@@ -1185,24 +1283,29 @@ pub async fn top_up<P: Provider + Clone>(
     owner: Address,
     pool_id: B256,
     additional: U256,
+    escrows: Option<&UnconfirmedEscrows>,
     receipt_timeout: Option<Duration>,
 ) -> Result<ToppedUpPool> {
     let amount = to_pool_u64(additional, "top-up")?;
-    let (pending, nonce) = send_top_up(contract, owner, pool_id, amount).await?;
+    // A caller with no handle holds the entries in one nobody reads.
+    let escrows = escrows.cloned().unwrap_or_default();
+    let (pending, nonce) = send_top_up(contract, owner, pool_id, amount, &escrows).await?;
     // Capture the hash before the wait consumes `pending`: past this point the
     // transaction is broadcast and may mine, so every receipt failure names it
     // (see [`TopUpUnconfirmed`]). A lapse does not cancel the transaction.
     let tx = *pending.tx_hash();
     info!(%tx, %owner, %pool_id, %additional, nonce, "topUp broadcast; awaiting its receipt");
+    let unconfirmed = TopUpUnconfirmed {
+        tx: Some(tx),
+        nonce,
+    };
+    escrows.replace(TopUpUnconfirmed { tx: None, nonce }, unconfirmed);
+    // Only a receipt releases the entry: a drop here, a failed read or a
+    // lapse leaves it.
     let receipt = await_receipt(pending, receipt_timeout)
         .await
-        .map_err(|err| {
-            err.context("await topUp receipt")
-                .context(TopUpUnconfirmed {
-                    tx: Some(tx),
-                    nonce,
-                })
-        })?;
+        .map_err(|err| err.context("await topUp receipt").context(unconfirmed))?;
+    escrows.remove(unconfirmed);
     topped_up_from_receipt(&receipt, *contract.address(), pool_id, additional)
 }
 

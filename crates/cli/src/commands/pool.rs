@@ -17,8 +17,8 @@ use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use decdn_client::buyer_pool::{
-    ToppedUpPool, UnconfirmedOpens, ensure_allowance, escrowed_but_untracked, grade_deposit_credit,
-    open_pool, top_up, topped_up_effect,
+    ToppedUpPool, UnconfirmedEscrows, ensure_allowance, escrowed_but_untracked,
+    grade_deposit_credit, open_pool, top_up, topped_up_effect,
 };
 use decdn_common::admin::{AdminRpcClient as _, BuyerPoolsResponse};
 use decdn_common::cli::{self, common::expand_tilde};
@@ -44,7 +44,7 @@ use super::buyer_store::{
     open_client_store_for_escrow,
 };
 use super::chain_ctx;
-use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_open};
+use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_escrows};
 
 /// Dispatch `decdn pool <subcommand>`.
 pub async fn pool_dispatch(args: &cli::PoolArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
@@ -200,8 +200,8 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
 
     // Watched from the open on: a Ctrl-C does not cancel a broadcast
     // `openPool`, so the command names it rather than dying with no hash.
-    let opens = UnconfirmedOpens::default();
-    let mut interrupt = Interrupt::watch(opens.clone());
+    let escrows = UnconfirmedEscrows::default();
+    let mut interrupt = Interrupt::watch(escrows.clone());
     let opened = async {
         let opened = open_pool(
             &contract,
@@ -209,7 +209,7 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
             token,
             owner,
             deposit,
-            Some(&opens),
+            Some(&escrows),
             Some(RECEIPT_TIMEOUT),
         )
         .await?;
@@ -224,7 +224,7 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
         result = opened => result,
         () = interrupt.wait() => Err(Interrupted.into()),
     };
-    let pool_id = name_unconfirmed_open(result, &opens.pending())?;
+    let pool_id = name_unconfirmed_escrows(result, &escrows.pending())?;
 
     let out = PoolOpenJson {
         pool_id: format!("{pool_id:#x}"),
@@ -270,18 +270,37 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
     ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(additional)).await?;
 
-    let ToppedUpPool { credited, tx, .. } =
-        top_up(&contract, owner, pool_id, additional, Some(RECEIPT_TIMEOUT)).await?;
-
-    // `add_deposit` reports a backend fault as `Err` and a committed-row
-    // mismatch as a non-`Added` `Ok` (the row vanished or now tracks a
-    // different pool). Both mean the same thing here: the USDC is escrowed and
-    // the local deposit is short by `credited`. Exiting 0 on either would let a
-    // wrapper record the pool as funded — after which the low-water check
-    // re-fires on every later fetch, and re-running this command escrows again.
-    let effect = topped_up_effect(pool_id, credited);
-    let new_deposit =
-        grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx)?;
+    // Watched from the `topUp` on: a Ctrl-C does not cancel a broadcast
+    // `topUp`, so the command names it rather than dying with no hash.
+    let escrows = UnconfirmedEscrows::default();
+    let mut interrupt = Interrupt::watch(escrows.clone());
+    let topped_up = async {
+        let ToppedUpPool { credited, tx, .. } = top_up(
+            &contract,
+            owner,
+            pool_id,
+            additional,
+            Some(&escrows),
+            Some(RECEIPT_TIMEOUT),
+        )
+        .await?;
+        // `add_deposit` reports a backend fault as `Err` and a committed-row
+        // mismatch as a non-`Added` `Ok` (the row vanished or now tracks a
+        // different pool). Both mean the same thing here: the USDC is escrowed
+        // and the local deposit is short by `credited`. Exiting 0 on either
+        // would let a wrapper record the pool as funded — after which the
+        // low-water check re-fires on every later fetch, and re-running this
+        // command escrows again.
+        let effect = topped_up_effect(pool_id, credited);
+        let new_deposit =
+            grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx)?;
+        anyhow::Ok((credited, new_deposit))
+    };
+    let result = tokio::select! {
+        result = topped_up => result,
+        () = interrupt.wait() => Err(Interrupted.into()),
+    };
+    let (credited, new_deposit) = name_unconfirmed_escrows(result, &escrows.pending())?;
     println!("topped up pool {pool_id} by {credited} µUSDC; deposit now {new_deposit} µUSDC");
     Ok(())
 }

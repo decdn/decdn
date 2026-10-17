@@ -1629,7 +1629,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             // Every lane in the fresh registry counts from its own seed, so
             // the second pass's payment is the new registry's whole total.
             self.ledgers = LaneLedgers::new();
-            self.funding = RunFunding::reporting_opens_to(self.funding.opens().clone());
+            self.funding = RunFunding::reporting_escrows_to(self.funding.escrows().clone());
             self.recovery.start_next_pass();
             let saved = skip_cache::load(out_root);
             let second = self

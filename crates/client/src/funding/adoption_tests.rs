@@ -1181,8 +1181,8 @@ async fn step_on_a_full_pool(
         .unwrap();
     let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
     let contract = PaymentPool::new(PP, rpc.clone());
-    let opens = UnconfirmedOpens::default();
-    let funding = RunFunding::reporting_opens_to(opens.clone());
+    let opens = UnconfirmedEscrows::default();
+    let funding = RunFunding::reporting_escrows_to(opens.clone());
     funding.note_pool(id);
     let funder = PoolFunder {
         contract: &contract,
@@ -1196,7 +1196,7 @@ async fn step_on_a_full_pool(
         max_approve: false,
         funding: &funding,
     };
-    (funder.recover(U256::from(WORKING)).await, opens.pending())
+    (funder.recover(U256::from(WORKING)).await, opens.opens())
 }
 
 /// A full pool that still accepts funds settles: the step escrows nothing and
@@ -1278,7 +1278,7 @@ async fn a_full_closing_pool_is_replaced() {
 /// A lane build that opens the run's pool holds the `openPool` in the run's
 /// handle, so a command that drops the build can still name it (#2418).
 #[tokio::test]
-async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_opens() {
+async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_escrows() {
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
     let signer = Arc::new(PrivateKeySigner::random());
@@ -1290,8 +1290,8 @@ async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_opens() {
     asserter.push_success(&U256::from(3u64));
     let rpc = ProviderBuilder::new().connect_mocked_client(asserter.clone());
     let contract = PaymentPool::new(PP, rpc.clone());
-    let opens = UnconfirmedOpens::default();
-    let funding = RunFunding::reporting_opens_to(opens.clone());
+    let opens = UnconfirmedEscrows::default();
+    let funding = RunFunding::reporting_escrows_to(opens.clone());
     let err = open_or_reuse_pool(
         &store,
         &contract,
@@ -1309,10 +1309,7 @@ async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_opens() {
     .await
     .expect_err("the open's submit fails in transport");
     assert!(format!("{err:#}").contains("submit openPool"), "{err:#}");
-    assert_eq!(
-        opens.pending(),
-        vec![OpenUnconfirmed { tx: None, nonce: 3 }]
-    );
+    assert_eq!(opens.opens(), vec![OpenUnconfirmed { tx: None, nonce: 3 }]);
 }
 
 /// A delegated lane resumes from the delegate lanes the store holds for its
@@ -1611,8 +1608,8 @@ async fn a_lane_build_open_that_never_mines_lapses_unconfirmed() {
         Bytes::from(TOKEN.abi_encode()),
         Bytes::from(U256::MAX.abi_encode()),
     ]);
-    let opens = UnconfirmedOpens::default();
-    let funding = RunFunding::reporting_opens_to(opens.clone());
+    let opens = UnconfirmedEscrows::default();
+    let funding = RunFunding::reporting_escrows_to(opens.clone());
     let err = run_until_lapse(&store, &signer, &rpc, &funding).await;
     let unconfirmed = OpenUnconfirmed {
         tx: Some(SCRIPTED_TX),
@@ -1624,7 +1621,7 @@ async fn a_lane_build_open_that_never_mines_lapses_unconfirmed() {
         "{err:#}"
     );
     assert!(format!("{err:#}").contains("no receipt within"), "{err:#}");
-    assert_eq!(opens.pending(), vec![unconfirmed]);
+    assert_eq!(opens.opens(), vec![unconfirmed]);
     assert!(rpc.calls_drained(), "the open read the token and allowance");
 }
 
@@ -1769,7 +1766,7 @@ async fn a_top_up_after_an_unconfirmed_refill_is_refused() {
         Bytes::from(U256::MAX.abi_encode()),
     ]);
     lapsed(&run_until_lapse(&store, &signer, &rpc, &funding).await);
-    assert_eq!(*funding.top_up.lock().await, Some(HELD));
+    assert_eq!(funding.escrows().top_ups(), vec![HELD]);
 
     // A sibling lane build of the run reuses the noted pool without a read, so
     // any call it makes would take the allowance answer.
@@ -1821,7 +1818,7 @@ async fn a_refill_after_an_unconfirmed_recovery_step_is_refused() {
         rpc.calls_drained(),
         "the step read the pool and the allowance"
     );
-    assert_eq!(*funding.top_up.lock().await, Some(HELD));
+    assert_eq!(funding.escrows().top_ups(), vec![HELD]);
 
     // The pool is noted, so the lane build makes no read before the refill.
     let rpc = ScriptedRpc::parked_receipt().answering_calls([Bytes::from(U256::MAX.abi_encode())]);
@@ -1865,4 +1862,82 @@ async fn a_concurrent_refill_and_recovery_step_send_one_top_up() {
         !(refill_rpc.calls_drained() && step_rpc.calls_drained()),
         "only one of the two read the allowance and sent"
     );
+}
+
+/// A recovery step dropped while its `topUp` waits for a receipt (a give-up,
+/// a Ctrl-C, or a sibling fault ends the command) returns no error, yet the
+/// run's handle still names the tx, and a later `topUp` of the run refuses
+/// with it (#2491).
+#[tokio::test(start_paused = true)]
+async fn a_recovery_top_up_dropped_mid_wait_is_held_in_the_runs_escrows() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let pool_id = a_spent_pool(&store, &signer);
+    let escrows = UnconfirmedEscrows::default();
+    let funding = RunFunding::reporting_escrows_to(escrows.clone());
+    funding.note_pool(pool_id);
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([
+        still_open(signer.address()),
+        Bytes::from(U256::MAX.abi_encode()),
+    ]);
+    let provider = rpc.clone().provider();
+    let contract = PaymentPool::new(PP, provider.clone());
+    let funder = PoolFunder {
+        contract: &contract,
+        rpc: &provider,
+        store: &store,
+        owner: signer.address(),
+        deployment: DEPLOYMENT,
+        token: TOKEN,
+        payment_pool_addr: PP,
+        working_deposit: U256::from(WORKING),
+        max_approve: false,
+        funding: &funding,
+    };
+    let waited = tokio::time::timeout(RECEIPT_TIMEOUT / 2, funder.recover(U256::ZERO)).await;
+    assert!(waited.is_err(), "the step must still wait on its receipt");
+    assert!(
+        rpc.calls_drained(),
+        "the step read the pool and the allowance"
+    );
+    assert_eq!(escrows.top_ups(), vec![HELD]);
+
+    // The pool is noted, so the lane build makes no read before the refill.
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([Bytes::from(U256::MAX.abi_encode())]);
+    refused(&run_until_lapse(&store, &signer, &rpc, &funding).await);
+}
+
+/// A `topUp` one `RunFunding` left unconfirmed refuses the `topUp` of a later
+/// `RunFunding` built on the same handle: a fetch's next pass, a bundle's
+/// replacement pass, or another fetch of the command.
+#[tokio::test(start_paused = true)]
+async fn a_top_up_left_unconfirmed_by_one_pass_refuses_the_next() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store, &signer);
+    let escrows = UnconfirmedEscrows::default();
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([
+        still_open(signer.address()),
+        Bytes::from(U256::MAX.abi_encode()),
+    ]);
+    let first = RunFunding::reporting_escrows_to(escrows.clone());
+    lapsed(&run_until_lapse(&store, &signer, &rpc, &first).await);
+    drop(first);
+
+    // The next pass reads the pool afresh; any further call would take the
+    // allowance answer.
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([
+        still_open(signer.address()),
+        Bytes::from(U256::MAX.abi_encode()),
+    ]);
+    let next = RunFunding::reporting_escrows_to(escrows.clone());
+    refused(&run_until_lapse(&store, &signer, &rpc, &next).await);
+    assert!(!rpc.calls_drained(), "the refusal sends no allowance read");
+    assert_eq!(escrows.top_ups(), vec![HELD]);
 }

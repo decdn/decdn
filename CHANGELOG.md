@@ -35,7 +35,7 @@ since project inception and will roll into the first tagged release.
   arrives or its read fails. The CLI passes
   `decdn_incentive::tx::RECEIPT_TIMEOUT` (3 min) to both. The node passes it
   to both as well, and settles an unconfirmed open or top-up against the chain.
-  `open_pool` also refuses to send while the `UnconfirmedOpens` it is given
+  `open_pool` also refuses to send while the `UnconfirmedEscrows` it is given
   already holds an open, and fails with that `OpenUnconfirmed`.
 - **Admin/CLI: a lane's `counterparty` is its pool owner, not its voucher
   signer (#2484).** `admin_v1_lanes` filled `LaneSnapshot.counterparty` with
@@ -82,11 +82,14 @@ since project inception and will roll into the first tagged release.
   - `decdn:H/` on a blob that is not a manifest fails with a hint to drop the
     trailing `/`. `decdn_client::bundle::BundleManifest::parse` returns a
     typed `NotAManifest` for that case.
-- **`decdn_client::buyer_pool::open_pool` takes an `opens` handle (#2418).**
-  The new last argument, `Option<&UnconfirmedOpens>`, holds the `openPool`
-  from before its submit until its receipt is read. Pass `None` when nothing
-  can drop the future or its error. `BundlePullerBuilder::unconfirmed_opens`
-  hands a bundle pull the same handle. The fix is under Fixed.
+- **`decdn_client::buyer_pool::open_pool` and `top_up` take an `escrows`
+  handle (#2418, #2491).** The argument before `receipt_timeout`,
+  `Option<&UnconfirmedEscrows>`, holds the `openPool` or `topUp` from before
+  its submit until its receipt is read. Pass `None` when nothing can drop the
+  future or its error. `UnconfirmedEscrows::pending` returns
+  `EscrowUnconfirmed` entries (`Open` or `TopUp`).
+  `BundlePullerBuilder::unconfirmed_escrows` hands a bundle pull the same
+  handle. The fix is under Fixed.
 - **Buyer-store API: delegate lanes (#2435).** `BuyerPoolStore` gains three
   required methods, `delegate_lanes`, `advance_delegate_progress` and
   `rebase_delegate_progress`, so an implementor outside the workspace must add
@@ -1062,6 +1065,21 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: a `decdn get` that ends before a `topUp` confirms names the tx
+  (#2491).** A refill or a funding recovery step can still wait on its `topUp`
+  receipt when the command ends: on a give-up after the no-progress limit, a
+  Ctrl-C, a fault in a sibling bundle entry, or the 30 s drain of late lane
+  builds after a fetch that succeeded. The command dropped the wait and named
+  no tx. A give-up exited 75 ("rerun to resume"), a drain exited 0, and a
+  re-run before the `topUp` confirmed escrowed a second top-up. Now a
+  `topUp` is named on every such end, as an `openPool` is: a give-up with one
+  pending exits 1, not 75, a command that otherwise succeeded exits nonzero,
+  and a second Ctrl-C prints it. A `topUp` left unconfirmed also refuses every
+  later `topUp` in the same command, across passes and fetches.
+  `decdn pool top-up` now handles Ctrl-C as `decdn pool open` does: it names
+  the `topUp` instead of dying with no output. A `topUp` whose submit
+  returned no hash reads "returned no tx hash", not "failed in transport",
+  since a submit dropped in flight holds no hash either.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

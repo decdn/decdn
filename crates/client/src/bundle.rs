@@ -39,7 +39,7 @@ use iroh::{Endpoint, RelayUrl};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::buyer_pool::{OwnedPayer, UnconfirmedOpens};
+use crate::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use crate::discovery::NodeCandidate;
 use crate::funding::RunFunding;
 use crate::ordered_writes::OrderedWrites;
@@ -644,7 +644,7 @@ pub struct BundlePullerBuilder {
     give_up_after: Option<Duration>,
     observer: Option<Arc<dyn BundleObserver>>,
     hints: Option<Arc<dyn FaultHints>>,
-    opens: UnconfirmedOpens,
+    escrows: UnconfirmedEscrows,
 }
 
 impl std::fmt::Debug for BundlePullerBuilder {
@@ -688,7 +688,7 @@ impl BundlePuller {
             give_up_after: None,
             observer: None,
             hints: None,
-            opens: UnconfirmedOpens::default(),
+            escrows: UnconfirmedEscrows::default(),
         }
     }
 
@@ -797,13 +797,14 @@ impl BundlePullerBuilder {
         self
     }
 
-    /// Where the pull holds each `openPool` whose receipt it has not read,
-    /// across every pass. A cancel or a fault that ends the pull can drop a
-    /// receipt wait, and the transaction may still escrow its deposit, so the
+    /// Where the pull holds each `openPool` and `topUp` whose receipt it has
+    /// not read, across every pass. A cancel or a fault that ends the pull can
+    /// drop a receipt wait, and the transaction may still escrow, so the
     /// caller keeps a clone and names what is left when the pull ends. A
-    /// private handle by default.
-    pub fn unconfirmed_opens(mut self, opens: UnconfirmedOpens) -> Self {
-        self.opens = opens;
+    /// `topUp` the handle holds also refuses every later `topUp` of the pull,
+    /// across passes. A private handle by default.
+    pub fn unconfirmed_escrows(mut self, escrows: UnconfirmedEscrows) -> Self {
+        self.escrows = escrows;
         self
     }
 
@@ -872,7 +873,7 @@ impl BundlePullerBuilder {
             deposit,
             namespace_id: namespace_id(self.namespace),
             ledgers: LaneLedgers::new(),
-            funding: RunFunding::reporting_opens_to(self.opens),
+            funding: RunFunding::reporting_escrows_to(self.escrows),
             recovery: Arc::new(RecoveryGate::new()),
             dedup_stats: engine::DedupStats::default(),
             open_lock: tokio::sync::Mutex::new(()),
