@@ -5,8 +5,9 @@
 //!
 //! The run's funding facts ([`RunFunding`]) are shared by every lane build and
 //! funding recovery step: the pool's spend outside the run's lanes, the pool
-//! the run pays from, a wallet too short of USDC to top it up, and the run's
-//! unconfirmed `openPool`s and `topUp`.
+//! the run pays from, a wallet too short of USDC to top it up, and the handle
+//! that holds the run's unconfirmed `openPool`s and `topUp`s
+//! ([`UnconfirmedEscrows`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -83,15 +84,19 @@ pub fn cached_pool_token(
 /// in its [`UnconfirmedEscrows`] until its receipt is read. The run sends one
 /// `topUp` at a time, and while the handle holds one that may have been
 /// broadcast but is not known to have mined ([`TopUpUnconfirmed`]), every later
-/// `topUp` of the run is refused with it.
+/// `topUp` sent through the same handle is refused with it: in this run, or in
+/// a later pass or fetch that shares the handle.
 #[derive(Debug, Default)]
 pub struct RunFunding {
     spend: Mutex<RunSpend>,
     shortfall: Mutex<Option<String>>,
     pool_id: OnceLock<PoolId>,
     escrows: UnconfirmedEscrows,
-    /// Held across each `topUp` of the run, so one runs at a time.
-    top_up: tokio::sync::Mutex<()>,
+    /// Held across each `topUp` of the run, from the refusal check on
+    /// `escrows` to the `topUp`'s outcome, so the check and the send it allows
+    /// are one step within this run. A handle shared with another live
+    /// `RunFunding` is not serialized by it.
+    top_up_serial: tokio::sync::Mutex<()>,
 }
 
 /// What a lane build learned about the pool's spend, for
@@ -1045,9 +1050,9 @@ fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
 /// broadcast but is not known to have mined ([`TopUpUnconfirmed`]: a lapsed or
 /// failed receipt read, a submit lost in transport, or a future dropped before
 /// either) may still mine, so the run's [`UnconfirmedEscrows`] keeps it. Every
-/// later call of the run refuses with it instead of escrowing a second
-/// deposit, and the acquire loop classifies that as fatal to the command
-/// ([`crate::Fault::Fatal`]).
+/// later call through the same handle refuses with it instead of escrowing a
+/// second deposit, and the acquire loop classifies that as fatal to the
+/// command ([`crate::Fault::Fatal`]).
 ///
 /// # Errors
 ///
@@ -1064,7 +1069,7 @@ async fn escrow_top_up<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let _serial = funding.top_up.lock().await;
+    let _serial = funding.top_up_serial.lock().await;
     if let Some(earlier) = funding.escrows.top_ups().first().copied() {
         return Err(anyhow::Error::new(earlier)
             .context("refusing a second topUp while an earlier one is unconfirmed"));

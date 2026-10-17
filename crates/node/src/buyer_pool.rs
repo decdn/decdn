@@ -588,6 +588,8 @@ async fn fund_pool<P: Provider + Clone + 'static>(
                 handles.owner,
                 pool_id,
                 additional,
+                // The top-up slot, not a handle, holds an unconfirmed `topUp`
+                // until `settle_unconfirmed_top_up` resolves it.
                 None,
                 Some(RECEIPT_TIMEOUT),
             )

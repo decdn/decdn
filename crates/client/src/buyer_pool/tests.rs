@@ -53,25 +53,102 @@ fn mocked_pool(
 }
 
 /// A `topUp` submit that fails in transport may have been broadcast, so it
-/// carries [`TopUpUnconfirmed`] with no hash and the nonce it was sent with.
+/// carries [`TopUpUnconfirmed`] with no hash and the nonce it was sent with,
+/// and `escrows` keeps the same entry: a caller that drops the error can still
+/// name it.
 #[tokio::test]
 async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&U256::from(5u64));
+    let escrows = UnconfirmedEscrows::default();
     let err = top_up(
         &mocked_pool(asserter),
         Address::repeat_byte(0x22),
         B256::repeat_byte(0x33),
         U256::from(1_000u64),
-        None,
+        Some(&escrows),
         None,
     )
     .await
     .unwrap_err();
-    let marker = err.downcast_ref::<TopUpUnconfirmed>().unwrap();
-    assert_eq!(marker.tx, None);
-    assert_eq!(marker.nonce, 5);
+    let unconfirmed = TopUpUnconfirmed { tx: None, nonce: 5 };
+    assert_eq!(err.downcast_ref::<TopUpUnconfirmed>(), Some(&unconfirmed));
     assert!(format!("{err:#}").contains("nonce 5"), "{err:#}");
+    assert_eq!(escrows.top_ups(), vec![unconfirmed]);
+}
+
+/// Run [`top_up`] against a mocked pool whose RPC calls `asserter` answers,
+/// holding it in `escrows`, with a paused clock past the nonce backoff.
+async fn top_up_mocked(
+    asserter: alloy::providers::mock::Asserter,
+    escrows: &UnconfirmedEscrows,
+) -> anyhow::Result<super::ToppedUpPool> {
+    top_up(
+        &mocked_pool(asserter),
+        Address::repeat_byte(0x22),
+        B256::repeat_byte(0x33),
+        U256::from(1_000u64),
+        Some(escrows),
+        None,
+    )
+    .await
+}
+
+/// A submit rejected as a nonce collision broadcast nothing, so its entry is
+/// released before the re-send: after one collision at nonce 5 and a
+/// broadcast at nonce 6 whose receipt read fails, only nonce 6 is held.
+#[tokio::test(start_paused = true)]
+async fn a_nonce_collision_releases_its_entry_before_the_re_send() {
+    let hash = B256::repeat_byte(0xab);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    asserter.push_failure_msg("nonce too low");
+    asserter.push_success(&U256::from(6u64));
+    asserter.push_success(&hash);
+    let escrows = UnconfirmedEscrows::default();
+    let err = top_up_mocked(asserter.clone(), &escrows).await.unwrap_err();
+    let unconfirmed = TopUpUnconfirmed {
+        tx: Some(hash),
+        nonce: 6,
+    };
+    assert_eq!(err.downcast_ref::<TopUpUnconfirmed>(), Some(&unconfirmed));
+    assert_eq!(
+        escrows.pending(),
+        vec![EscrowUnconfirmed::TopUp(unconfirmed)]
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "every scripted answer was read"
+    );
+}
+
+/// A `topUp` whose every send collides runs out of re-sends: nothing was
+/// broadcast, so the error carries no [`TopUpUnconfirmed`] and `escrows`
+/// keeps no entry.
+#[tokio::test(start_paused = true)]
+async fn a_top_up_out_of_nonce_retries_holds_nothing() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    for nonce in 5u64..9 {
+        asserter.push_success(&U256::from(nonce));
+        asserter.push_failure_msg("nonce too low");
+    }
+    let escrows = UnconfirmedEscrows::default();
+    let err = top_up_mocked(asserter.clone(), &escrows).await.unwrap_err();
+    assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
+    assert_eq!(escrows.pending(), vec![]);
+    assert!(asserter.read_q().is_empty(), "four sends were tried");
+}
+
+/// Two calls that hold equal entries each release their own: releasing one
+/// leaves the other held.
+#[test]
+fn removing_an_entry_releases_one_of_two_equal_ones() {
+    let submitted = TopUpUnconfirmed { tx: None, nonce: 5 };
+    let escrows = UnconfirmedEscrows::default();
+    escrows.insert(submitted);
+    escrows.insert(submitted);
+    escrows.remove(submitted);
+    assert_eq!(escrows.top_ups(), vec![submitted]);
 }
 
 /// Run [`open_pool`] against a mocked pool whose RPC calls `asserter` answers.

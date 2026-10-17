@@ -871,8 +871,8 @@ async fn pull_manifest(
     warn_leftover_partials(out, &manifest.entries, uri.hash);
     let reported = report(&outcome.report, excluded, out, args.json);
     // A fault that ended the whole pull is its result, so `main` maps it to
-    // its exit code (75 for a give-up with no `openPool` in flight, 1
-    // otherwise).
+    // its exit code (75 for a give-up with no `openPool` or `topUp` in
+    // flight, 1 otherwise).
     match outcome.end {
         BundleEnd::Interrupted => Err(Interrupted.into()),
         BundleEnd::FundingNeeded { error, .. } | BundleEnd::Stopped(error) => Err(error),

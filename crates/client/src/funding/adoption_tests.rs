@@ -1909,3 +1909,35 @@ async fn a_recovery_top_up_dropped_mid_wait_is_held_in_the_runs_escrows() {
     let rpc = ScriptedRpc::parked_receipt().answering_calls([Bytes::from(U256::MAX.abi_encode())]);
     refused(&run_until_lapse(&store, &signer, &rpc, &funding).await);
 }
+
+/// A `topUp` one `RunFunding` left unconfirmed refuses the `topUp` of a later
+/// `RunFunding` built on the same handle: a fetch's next pass, a bundle's
+/// replacement pass, or another fetch of the command.
+#[tokio::test(start_paused = true)]
+async fn a_top_up_left_unconfirmed_by_one_pass_refuses_the_next() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store, &signer);
+    let escrows = UnconfirmedEscrows::default();
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([
+        still_open(signer.address()),
+        Bytes::from(U256::MAX.abi_encode()),
+    ]);
+    let first = RunFunding::reporting_escrows_to(escrows.clone());
+    lapsed(&run_until_lapse(&store, &signer, &rpc, &first).await);
+    drop(first);
+
+    // The next pass reads the pool afresh; any further call would take the
+    // allowance answer.
+    let rpc = ScriptedRpc::parked_receipt().answering_calls([
+        still_open(signer.address()),
+        Bytes::from(U256::MAX.abi_encode()),
+    ]);
+    let next = RunFunding::reporting_escrows_to(escrows.clone());
+    refused(&run_until_lapse(&store, &signer, &rpc, &next).await);
+    assert!(!rpc.calls_drained(), "the refusal sends no allowance read");
+    assert_eq!(escrows.top_ups(), vec![HELD]);
+}

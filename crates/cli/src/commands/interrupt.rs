@@ -1,4 +1,4 @@
-//! Graceful Ctrl-C for `decdn get` and `decdn pool open`.
+//! Graceful Ctrl-C for `decdn get`, `decdn pool open` and `decdn pool top-up`.
 //!
 //! The first Ctrl-C resolves `Interrupt::wait`: the command stops its
 //! transfers, writes what it must keep (the bundle skip-cache, the progress
@@ -82,7 +82,8 @@ pub(crate) fn name_unconfirmed_escrows<T>(
 }
 
 /// The unconfirmed `openPool` or `topUp` that `err` itself carries, from a
-/// receipt read that failed or lapsed, or a refusal that names an earlier one.
+/// submit lost in transport, a receipt read that failed or lapsed, or a
+/// refusal that names an earlier one.
 fn carried(err: &anyhow::Error) -> Option<EscrowUnconfirmed> {
     err.downcast_ref::<OpenUnconfirmed>()
         .copied()

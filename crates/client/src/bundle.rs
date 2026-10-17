@@ -801,7 +801,8 @@ impl BundlePullerBuilder {
     /// not read, across every pass. A cancel or a fault that ends the pull can
     /// drop a receipt wait, and the transaction may still escrow, so the
     /// caller keeps a clone and names what is left when the pull ends. A
-    /// private handle by default.
+    /// `topUp` the handle holds also refuses every later `topUp` of the pull,
+    /// across passes. A private handle by default.
     pub fn unconfirmed_escrows(mut self, escrows: UnconfirmedEscrows) -> Self {
         self.escrows = escrows;
         self

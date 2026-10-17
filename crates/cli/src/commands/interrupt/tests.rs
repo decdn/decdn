@@ -200,3 +200,18 @@ fn a_top_up_the_error_carries_is_not_named_twice() {
     let message = stop_message(&carried).unwrap();
     assert!(message.contains("topUp tx 0xcdcd"), "{message}");
 }
+
+/// A `topUp` dropped while its submit was in flight holds no hash. Its line
+/// names the nonce and claims no transport failure, because nothing failed.
+#[test]
+fn a_top_up_dropped_mid_submit_names_its_nonce() {
+    let submitted = TopUpUnconfirmed { tx: None, nonce: 7 };
+    let err =
+        name_unconfirmed_escrows::<()>(Err(Interrupted.into()), &[submitted.into()]).unwrap_err();
+    let message = stop_message(&err).unwrap();
+    assert!(
+        message.starts_with("interrupted: topUp submit (nonce 7) returned no tx hash"),
+        "{message}"
+    );
+    assert!(!message.contains("transport"), "{message}");
+}

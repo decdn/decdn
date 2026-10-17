@@ -130,7 +130,6 @@ impl core::convert::From<decdn_client::buyer_pool::OpenUnconfirmed> for decdn_cl
 pub fn decdn_client::buyer_pool::EscrowUnconfirmed::from(decdn_client::buyer_pool::OpenUnconfirmed) -> Self
 impl core::convert::From<decdn_client::buyer_pool::TopUpUnconfirmed> for decdn_client::buyer_pool::EscrowUnconfirmed
 pub fn decdn_client::buyer_pool::EscrowUnconfirmed::from(decdn_client::buyer_pool::TopUpUnconfirmed) -> Self
-impl core::error::Error for decdn_client::buyer_pool::EscrowUnconfirmed
 impl core::fmt::Display for decdn_client::buyer_pool::EscrowUnconfirmed
 pub fn decdn_client::buyer_pool::EscrowUnconfirmed::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub enum decdn_client::buyer_pool::ProgressWrite
@@ -190,9 +189,7 @@ pub decdn_client::buyer_pool::ToppedUpPool::credited: alloy_primitives::aliases:
 pub decdn_client::buyer_pool::ToppedUpPool::tx: alloy_primitives::aliases::TxHash
 pub struct decdn_client::buyer_pool::UnconfirmedEscrows(_)
 impl decdn_client::buyer_pool::UnconfirmedEscrows
-pub fn decdn_client::buyer_pool::UnconfirmedEscrows::opens(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::OpenUnconfirmed>
 pub fn decdn_client::buyer_pool::UnconfirmedEscrows::pending(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::EscrowUnconfirmed>
-pub fn decdn_client::buyer_pool::UnconfirmedEscrows::top_ups(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::TopUpUnconfirmed>
 pub struct decdn_client::buyer_pool::WalletShortfall
 impl core::error::Error for decdn_client::buyer_pool::WalletShortfall
 impl core::fmt::Display for decdn_client::buyer_pool::WalletShortfall

@@ -87,9 +87,9 @@ since project inception and will roll into the first tagged release.
   `Option<&UnconfirmedEscrows>`, holds the `openPool` or `topUp` from before
   its submit until its receipt is read. Pass `None` when nothing can drop the
   future or its error. `UnconfirmedEscrows::pending` returns
-  `EscrowUnconfirmed` entries (`Open` or `TopUp`); `opens` and `top_ups`
-  return each kind alone. `BundlePullerBuilder::unconfirmed_escrows` hands a
-  bundle pull the same handle. The fix is under Fixed.
+  `EscrowUnconfirmed` entries (`Open` or `TopUp`).
+  `BundlePullerBuilder::unconfirmed_escrows` hands a bundle pull the same
+  handle. The fix is under Fixed.
 - **Buyer-store API: delegate lanes (#2435).** `BuyerPoolStore` gains three
   required methods, `delegate_lanes`, `advance_delegate_progress` and
   `rebase_delegate_progress`, so an implementor outside the workspace must add
@@ -1076,6 +1076,10 @@ since project inception and will roll into the first tagged release.
   pending exits 1, not 75, a command that otherwise succeeded exits nonzero,
   and a second Ctrl-C prints it. A `topUp` left unconfirmed also refuses every
   later `topUp` in the same command, across passes and fetches.
+  `decdn pool top-up` now handles Ctrl-C as `decdn pool open` does: it names
+  the `topUp` instead of dying with no output. A `topUp` whose submit
+  returned no hash reads "returned no tx hash", not "failed in transport",
+  since a submit dropped in flight holds no hash either.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its
