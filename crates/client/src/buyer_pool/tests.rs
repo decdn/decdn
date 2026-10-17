@@ -2,7 +2,8 @@ use super::{
     AllowanceShortfall, LOW_WATER_DIVISOR, OpenUnconfirmed, OwnedPayer, PaymentPool,
     TopUpUnconfirmed, UnconfirmedOpens, approval_floor, approve_decision, ensure_allowance,
     escrowed_but_untracked, grade_deposit_credit, issue_self_capability, open_pool,
-    pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool, top_up,
+    pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool, send_top_up_at, top_up,
+    topped_up_from_receipt,
 };
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
@@ -402,6 +403,107 @@ async fn send_open_pool_returns_the_hash_without_a_receipt_wait() {
         asserter.read_q().is_empty(),
         "one send each, no receipt read"
     );
+}
+
+/// A re-sent `topUp` returns its hash without waiting for a receipt, and a
+/// rejected one carries no [`TopUpUnconfirmed`]: the caller already holds the
+/// nonce it re-sent at.
+#[tokio::test]
+async fn send_top_up_at_returns_the_hash_without_a_receipt_wait() {
+    let hash = B256::repeat_byte(0xcd);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&hash);
+    asserter.push_failure_msg("nonce too low");
+    let contract = mocked_pool(asserter.clone());
+    let owner = Address::repeat_byte(0x22);
+    let pool_id = B256::repeat_byte(0xaa);
+    let amount = U256::from(1_000u64);
+    assert_eq!(
+        send_top_up_at(&contract, owner, pool_id, amount, 5)
+            .await
+            .unwrap(),
+        hash
+    );
+    let err = send_top_up_at(&contract, owner, pool_id, amount, 5)
+        .await
+        .unwrap_err();
+    assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
+    assert!(format!("{err:#}").contains("nonce 5"), "{err:#}");
+    assert!(
+        asserter.read_q().is_empty(),
+        "one send each, no receipt read"
+    );
+}
+
+/// A mined `topUp` receipt with `logs`, emitted as given, and `status`.
+fn top_up_receipt(
+    logs: Vec<alloy::rpc::types::Log>,
+    status: bool,
+) -> alloy::rpc::types::TransactionReceipt {
+    alloy::rpc::types::TransactionReceipt {
+        inner: alloy::consensus::ReceiptEnvelope::Eip1559(alloy::consensus::ReceiptWithBloom {
+            receipt: alloy::consensus::Receipt {
+                status: alloy::consensus::Eip658Value::Eip658(status),
+                cumulative_gas_used: 0,
+                logs,
+            },
+            logs_bloom: alloy::primitives::Bloom::ZERO,
+        }),
+        transaction_hash: SCRIPTED_TX,
+        transaction_index: Some(0),
+        block_hash: Some(B256::repeat_byte(0x01)),
+        block_number: Some(1),
+        gas_used: 0,
+        effective_gas_price: 0,
+        blob_gas_used: None,
+        blob_gas_price: None,
+        from: Address::repeat_byte(0x22),
+        to: Some(Address::repeat_byte(0x01)),
+        contract_address: None,
+    }
+}
+
+/// A `PoolToppedUp` log for `pool_id` crediting `credited`, emitted by `address`.
+fn topped_up_log(address: Address, pool_id: B256, credited: u64) -> alloy::rpc::types::Log {
+    use alloy::sol_types::SolEvent;
+
+    alloy::rpc::types::Log {
+        inner: alloy::primitives::Log {
+            address,
+            data: PaymentPool::PoolToppedUp {
+                poolId: pool_id,
+                additionalDeposit: U256::from(credited),
+                newDeposit: U256::from(credited),
+            }
+            .encode_log_data(),
+        },
+        ..Default::default()
+    }
+}
+
+/// A `topUp` receipt credits the amount the pool's own `PoolToppedUp` names,
+/// ignores a `PoolToppedUp` some other contract emitted, falls back to the
+/// requested amount without one, and fails on a revert.
+#[test]
+fn topped_up_from_receipt_reads_the_pools_own_event() {
+    let pool = Address::repeat_byte(0x01);
+    let pool_id = B256::repeat_byte(0xaa);
+    let requested = U256::from(1_000u64);
+    let credit = |logs, status| {
+        topped_up_from_receipt(&top_up_receipt(logs, status), pool, pool_id, requested)
+    };
+
+    let forged = topped_up_log(Address::repeat_byte(0x99), pool_id, 5_000);
+    let own = topped_up_log(pool, pool_id, 900);
+    let landed = credit(vec![forged.clone(), own], true).unwrap();
+    assert_eq!(landed.credited, U256::from(900u64));
+    assert_eq!(landed.tx, SCRIPTED_TX);
+
+    let fallback = credit(vec![forged], true).unwrap();
+    assert_eq!(fallback.credited, requested, "no event of the pool's own");
+
+    let err = credit(Vec::new(), false).unwrap_err();
+    assert!(format!("{err:#}").contains("reverted"), "{err:#}");
 }
 
 /// An `openPool` submit the RPC node rejects broadcast nothing, so it carries

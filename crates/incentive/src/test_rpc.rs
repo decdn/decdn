@@ -25,15 +25,25 @@ pub const SCRIPTED_NONCE: u64 = 5;
 
 /// Answers `eth_getTransactionCount` with [`SCRIPTED_NONCE`], and each
 /// `eth_call` with the next answer in its queue. `eth_sendTransaction` gets
-/// [`SCRIPTED_TX`] unless the send parks, and `eth_getTransactionReceipt` gets
-/// the scripted receipt when there is one. Every other call, and an `eth_call`
-/// past the end of the queue, never completes, so a send on it parks in its
-/// submit or its receipt wait.
+/// [`SCRIPTED_TX`] unless the send parks, and records the nonce it was sent
+/// at. `eth_getTransactionReceipt` gets the scripted receipt when there is
+/// one. Every other call, and an `eth_call` past the end of the queue, never
+/// completes, so a send on it parks in its submit or its receipt wait. A
+/// [`ScriptedRpc::dropped`] transport also answers the block number, and a
+/// receipt read before [`ScriptedRpc::mine`] with "not mined".
+///
+/// A clone shares the receipt, the `eth_call` queue and the recorded nonces.
 #[derive(Clone, Debug)]
 pub struct ScriptedRpc {
     send: bool,
-    receipt: Option<TransactionReceipt>,
+    receipt: Arc<Mutex<Option<TransactionReceipt>>>,
+    /// Answer a receipt read with "not mined" while no receipt is scripted,
+    /// instead of never completing.
+    unmined_answers: bool,
+    /// The block number `eth_blockNumber` answers, if it is answered.
+    block: Option<u64>,
     calls: Arc<Mutex<VecDeque<Bytes>>>,
+    sent_nonces: Arc<Mutex<Vec<u64>>>,
 }
 
 impl ScriptedRpc {
@@ -43,9 +53,43 @@ impl ScriptedRpc {
     pub fn parked_receipt() -> Self {
         Self {
             send: true,
-            receipt: None,
+            receipt: Arc::default(),
+            unmined_answers: false,
+            block: None,
             calls: Arc::default(),
+            sent_nonces: Arc::default(),
         }
+    }
+
+    /// A transport whose sends are dropped from the mempool until
+    /// [`Self::mine`]: a send returns [`SCRIPTED_TX`], a receipt read answers
+    /// "not mined", the block number is `block`, and both the confirmed and the
+    /// pending nonce are [`SCRIPTED_NONCE`], so no transaction holds it. A
+    /// receipt wait still parks, because the block watcher alloy runs under it
+    /// never gets an answer.
+    #[must_use]
+    pub fn dropped(block: u64) -> Self {
+        Self {
+            unmined_answers: true,
+            block: Some(block),
+            ..Self::parked_receipt()
+        }
+    }
+
+    /// Answer every receipt read from now on with `receipt`: a transaction
+    /// that mined late.
+    pub fn mine(&self, receipt: TransactionReceipt) {
+        *self.receipt.lock().unwrap_or_else(PoisonError::into_inner) = Some(receipt);
+    }
+
+    /// The nonce of each `eth_sendTransaction` this transport answered, in
+    /// order. A send that names no nonce is not recorded.
+    #[must_use]
+    pub fn sent_nonces(&self) -> Vec<u64> {
+        self.sent_nonces
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// A transport whose send never completes: a submit still in flight.
@@ -62,7 +106,7 @@ impl ScriptedRpc {
     #[must_use]
     pub fn mined(receipt: TransactionReceipt) -> Self {
         Self {
-            receipt: Some(receipt),
+            receipt: Arc::new(Mutex::new(Some(receipt))),
             ..Self::parked_receipt()
         }
     }
@@ -91,6 +135,22 @@ impl ScriptedRpc {
         ProviderBuilder::default().connect_client(RpcClient::new(self, false))
     }
 
+    /// Record the nonce the `eth_sendTransaction` request `params` names.
+    fn record_nonce(&self, params: Option<&serde_json::value::RawValue>) {
+        let nonce = params
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.get()).ok())
+            .and_then(|value| {
+                let hex = value.get(0)?.get("nonce")?.as_str()?.to_owned();
+                u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok()
+            });
+        if let Some(nonce) = nonce {
+            self.sent_nonces
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(nonce);
+        }
+    }
+
     /// The next scripted `eth_call` answer, if any is left.
     fn next_call(&self) -> Option<Bytes> {
         self.calls
@@ -116,19 +176,31 @@ impl tower::Service<RequestPacket> for ScriptedRpc {
         let RequestPacket::Single(req) = req else {
             return Box::pin(std::future::pending());
         };
-        let result = match (req.method(), &self.receipt) {
-            ("eth_getTransactionCount", _) => {
+        let receipt = self
+            .receipt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let result = match (req.method(), receipt, self.block) {
+            ("eth_getTransactionCount", ..) => {
                 serde_json::value::to_raw_value(&U256::from(SCRIPTED_NONCE))
             }
-            ("eth_call", _) => match self.next_call() {
+            ("eth_call", ..) => match self.next_call() {
                 Some(answer) => serde_json::value::to_raw_value(&answer),
                 None => return Box::pin(std::future::pending()),
             },
-            ("eth_sendTransaction", _) if self.send => {
+            ("eth_sendTransaction", ..) if self.send => {
+                self.record_nonce(req.params());
                 serde_json::value::to_raw_value(&SCRIPTED_TX)
             }
-            ("eth_getTransactionReceipt", Some(receipt)) => {
-                serde_json::value::to_raw_value(receipt)
+            ("eth_getTransactionReceipt", Some(receipt), _) => {
+                serde_json::value::to_raw_value(&receipt)
+            }
+            ("eth_getTransactionReceipt", None, _) if self.unmined_answers => {
+                serde_json::value::to_raw_value(&serde_json::Value::Null)
+            }
+            ("eth_blockNumber", _, Some(block)) => {
+                serde_json::value::to_raw_value(&U256::from(block))
             }
             _ => return Box::pin(std::future::pending()),
         };
