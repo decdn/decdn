@@ -215,7 +215,9 @@ impl std::error::Error for EscrowedUntracked {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TopUpFunder {
     /// The proactive low-water refill. No pull waits on its amount, so a recovery
-    /// top-up that joins it can claim that amount as its own.
+    /// top-up that joins it can claim that amount as its own. While the refill
+    /// settles an unconfirmed `topUp`, a recovery top-up fails instead of
+    /// joining it ([`BuyerPoolService::held_topup_error`]).
     Refill,
     /// A funding recovery step's top-up. Its spawner relies on the whole amount,
     /// so no joiner can claim any of it.
@@ -303,7 +305,8 @@ const MAX_TOPUP_CALLS: u32 = 3;
 
 /// Fund at least `additional` of new headroom for one recovery top-up on `pool_id`.
 ///
-/// `join_or_spawn(amount)` joins the in-flight `topUp` or spawns one for `amount`.
+/// `join_or_spawn(amount)` joins the in-flight `topUp` or spawns one for `amount`,
+/// or fails without either.
 ///
 /// - A spawned `topUp` escrows this caller's own amount, so its result is final.
 ///   A spawned `topUp` that credits less than requested is not retried: the
@@ -313,27 +316,37 @@ const MAX_TOPUP_CALLS: u32 = 3;
 ///   than the remainder, or when the joined `topUp` fails, this warns and asks
 ///   again for the rest.
 ///
-/// When [`MAX_TOPUP_CALLS`] calls end short, this returns what landed and warns.
-/// The caller compares [`TopUpLanded::added`] with its request.
+/// When [`MAX_TOPUP_CALLS`] calls end short, or a later `join_or_spawn` call
+/// fails after a join landed, this returns what landed and warns. The caller
+/// compares [`TopUpLanded::added`] with its request.
 ///
 /// # Errors
 ///
-/// Propagates the error of a spawned `topUp`, and of any `topUp` whose deposit is
-/// escrowed but untracked. Errors when every call joins a `topUp` that fails.
+/// Propagates the error of a spawned `topUp`, of any `topUp` whose deposit is
+/// escrowed but untracked, and of a `join_or_spawn` call made before any join
+/// landed. Errors when every call joins a `topUp` that fails.
 async fn top_up_at_least<F, Fut>(
     pool_id: PoolId,
     additional: U256,
     mut join_or_spawn: F,
 ) -> Result<TopUpLanded>
 where
-    F: FnMut(U256) -> (Fut, TopUpClaim),
+    F: FnMut(U256) -> Result<(Fut, TopUpClaim)>,
     Fut: std::future::Future<Output = TopUpOutcome>,
 {
     let mut added = U256::ZERO;
     let mut new_deposit = None;
     let mut last_err = None;
     for _ in 0..MAX_TOPUP_CALLS {
-        let (fut, claim) = join_or_spawn(additional.saturating_sub(added));
+        let (fut, claim) = match (join_or_spawn(additional.saturating_sub(added)), new_deposit) {
+            (Ok(call), _) => call,
+            (Err(err), Some(new_deposit)) => {
+                let out = TopUpLanded { new_deposit, added };
+                warn_short_top_up(pool_id, additional, out, &format!("{err:#}"));
+                return Ok(out);
+            }
+            (Err(err), None) => return Err(err),
+        };
         let landed = match (fut.await, claim) {
             (Ok(landed), TopUpClaim::Spawned) => {
                 added = added.saturating_add(landed.added);
@@ -486,6 +499,9 @@ struct FundingHandles<P: Provider + Clone + 'static> {
     owner: Address,
     payment_pool_addr: Address,
     metrics: Arc<Metrics>,
+    /// The top-up slot's hold, which [`settle_unconfirmed_top_up`] sets for as
+    /// long as it runs.
+    hold: SlotHold,
 }
 
 /// Run `attempt` (a `topUp`), and only if it fails with an
@@ -756,8 +772,13 @@ impl std::fmt::Display for TopUpProof {
 
 /// Hold the top-up slot until the chain resolves `unconfirmed`, then report
 /// what the `topUp` escrowed. The funding task runs this, so its
-/// [`SlotGuard`] keeps the slot for as long as this waits, and every refill or
-/// recovery top-up meanwhile joins it instead of sending a second `topUp`.
+/// [`SlotGuard`] keeps the slot for as long as this waits, and no `topUp` at
+/// another nonce is sent meanwhile. `handles.hold` marks the slot held and
+/// publishes it on `decdn_buyer_topup_unresolved`. A refill joins this `topUp`,
+/// as it joins any in-flight `topUp`, and claims nothing. A funding recovery
+/// step that finds the hold set fails at once
+/// ([`BuyerPoolService::held_topup_error`]). A recovery step that joined before
+/// this began waits for its outcome.
 ///
 /// The slot is released only once a receipt is in hand, the nonce is spent, or
 /// a re-send shows the pool accepts no more funds. A timer never decides:
@@ -806,6 +827,7 @@ async fn settle_unconfirmed_top_up<P: Provider + Clone + 'static>(
     unconfirmed: TopUpUnconfirmed,
     err: &anyhow::Error,
 ) -> Result<SettledTopUp> {
+    let _held = handles.hold.hold(&handles.metrics);
     let started = tokio::time::Instant::now();
     let mut settling = TopUpSettling {
         pool_id,
@@ -1254,13 +1276,17 @@ pub struct BuyerPoolService<P: Provider + Clone + 'static> {
     open_in_flight: Arc<Mutex<Option<SharedOpen>>>,
     /// Whether the running open waits on an unconfirmed `openPool`, so callers
     /// fail fast instead of joining it.
-    open_hold: OpenHold,
+    open_hold: SlotHold,
     /// The single in-flight funding `topUp`, if one is running (#1146/#1530). Both
     /// the proactive low-water refill and the funding recovery top-up dedup here,
     /// so the two legs racing on the one pool cannot double-escrow one shortfall. The
     /// slot also tracks how much of the running `topUp` no pull has claimed, so two
     /// recovery top-ups cannot both count one escrow as their own.
     topup_in_flight: Arc<Mutex<Option<InFlightTopUp>>>,
+    /// Whether the funding task settles its unconfirmed `topUp`
+    /// ([`settle_unconfirmed_top_up`]), so a funding recovery step fails fast
+    /// instead of joining it or waiting for it.
+    topup_hold: SlotHold,
     /// One [`SeedSlot`] per lane that a stream is seeding from chain
     /// ([`Self::reseed_lane_from_chain`]), so the streams that find one lane
     /// missing at the same time read its watermark once. A lane's slot never
@@ -1359,8 +1385,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             owner,
             working_deposit,
             open_in_flight: Arc::new(Mutex::new(None)),
-            open_hold: OpenHold::new(),
+            open_hold: SlotHold::open(),
             topup_in_flight: Arc::new(Mutex::new(None)),
+            topup_hold: SlotHold::top_up(),
             seed_slots: Mutex::new(HashMap::new()),
             metrics,
             _reclaimer: AbortOnDropHandle::new(reclaimer),
@@ -1812,16 +1839,18 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         if additional.is_zero() {
             return; // still above the low-water mark
         }
-        info!(
-            pool_id = %state.pool_id,
-            %additional,
-            "buyer refill: reused pool below its low-water mark; funding toward the working \
-             deposit (#1146)"
-        );
         // Detached: the handle is DROPPED, not awaited — the task self-reports, and
         // a recovery top-up arriving while it runs JOINS the same future and can
-        // claim its amount.
-        drop(self.join_or_spawn_topup(state.pool_id, additional, TopUpFunder::Refill));
+        // claim its amount, unless the task settles an unconfirmed `topUp`.
+        let (_, claim) = self.join_or_spawn_topup(state.pool_id, additional, TopUpFunder::Refill);
+        if claim == TopUpClaim::Spawned {
+            info!(
+                pool_id = %state.pool_id,
+                %additional,
+                "buyer refill: reused pool below its low-water mark; funding toward the \
+                 working deposit (#1146)"
+            );
+        }
     }
 
     /// Everything the detached funding task needs, lifted off `&self` so the task
@@ -1835,6 +1864,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             owner: self.owner,
             payment_pool_addr: *self.contract.address(),
             metrics: Arc::clone(&self.metrics),
+            hold: self.topup_hold.clone(),
         }
     }
 
@@ -1895,6 +1925,16 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         (shared, TopUpClaim::Spawned)
     }
 
+    /// The error a funding recovery step gets while the funding task settles
+    /// its unconfirmed `topUp`: no other `topUp` is sent until the chain
+    /// resolves it, so it is node-wide ([`LocalPullFault`]). The funding task's
+    /// own warning says what it waits on, and `decdn_buyer_topup_unresolved`
+    /// reads 1, so this logs at `debug`.
+    fn held_topup_error() -> anyhow::Error {
+        debug!("the top-up slot is held for an unconfirmed topUp; refusing at once");
+        anyhow::Error::new(TopUpHeld).context(LocalPullFault)
+    }
+
     /// The error a caller gets while the open slot is held for an unconfirmed
     /// `openPool`: no provider can be paid from a new pool until the chain
     /// resolves it, so it is node-wide ([`LocalPullFault`]). Metered and marked
@@ -1909,7 +1949,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     }
 
     /// `open`'s outcome, or `None` once the open slot is held for an
-    /// unconfirmed `openPool` ([`OpenHold`]); the caller then fails with
+    /// unconfirmed `openPool` ([`SlotHold`]); the caller then fails with
     /// [`Self::held_open_error`].
     async fn unless_held(&self, open: SharedOpen) -> Option<OpenOutcome> {
         tokio::select! {
@@ -2073,6 +2113,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// deposit and escrows nothing. A recovery top-up still in flight is a
     /// sibling's step too: the call waits for it and returns its deposit. When
     /// that top-up reverts `PoolNotOpen`, the call joins the replacement open.
+    /// When the funding task settles an unconfirmed `topUp`, the call fails at
+    /// once instead of waiting (see Errors).
     ///
     /// The step sizes itself from the pool row: the deposit less the spend its
     /// lanes recorded. A fill runs the step only once its own pulls ended, and
@@ -2086,9 +2128,10 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// # Errors
     ///
     /// No pool is tracked, the `topUp` or replacement `openPool` fails, a
-    /// joined top-up fails for any reason but `PoolNotOpen`, or a mined
-    /// transaction cannot be recorded
-    /// (escrowed and untracked).
+    /// joined top-up fails for any reason but `PoolNotOpen`, a mined
+    /// transaction cannot be recorded (escrowed and untracked), or the top-up
+    /// slot is held for an unconfirmed `topUp` (a `TopUpHeld` error marked
+    /// [`LocalPullFault`]).
     pub async fn recover_pool(&self, seen_deposit: U256) -> Result<Recovery> {
         let state = self
             .reuse_or_report()?
@@ -2096,7 +2139,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         if state.deposit > seen_deposit {
             return Ok(Recovery::ToppedUp(state.deposit));
         }
-        if let Some(in_flight) = self.recovery_in_flight() {
+        if let Some(in_flight) = self.recovery_in_flight()? {
             return match in_flight.await {
                 Ok(landed) => Ok(Recovery::ToppedUp(landed.new_deposit)),
                 // The sibling's step replaces the pool; this fill joins that
@@ -2175,13 +2218,26 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
 
     /// The recovery top-up in flight, if one is: a sibling fill's step, which
     /// this fill waits for instead of funding its own.
-    fn recovery_in_flight(&self) -> Option<SharedTopUp> {
-        self.topup_in_flight
+    ///
+    /// # Errors
+    ///
+    /// The funding task settles the sibling's unconfirmed `topUp`
+    /// ([`Self::held_topup_error`]).
+    fn recovery_in_flight(&self) -> Result<Option<SharedTopUp>> {
+        let slot = self
+            .topup_in_flight
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(in_flight) = slot
             .as_ref()
             .filter(|in_flight| in_flight.funder == TopUpFunder::Recovery)
-            .map(|in_flight| in_flight.fut.clone())
+        else {
+            return Ok(None);
+        };
+        if self.topup_hold.is_held() {
+            return Err(Self::held_topup_error());
+        }
+        Ok(Some(in_flight.fut.clone()))
     }
 
     /// The deposit the store's pool row records, or `None` with no pool
@@ -2222,7 +2278,8 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// total deposit with the amount this call added (#1530): the top-up behind
     /// [`Self::recover_pool`].
     ///
-    /// A `topUp` already in flight is JOINED, not duplicated. This call counts only
+    /// A `topUp` already in flight is JOINED, not duplicated, unless the funding
+    /// task settles it as unconfirmed (see Errors). This call counts only
     /// the part of it that no other pull relies on: all of a refill's amount, none of
     /// another recovery top-up's. When that part is less than `additional`, this
     /// method funds the remainder with a further `topUp` (see `top_up_at_least`).
@@ -2242,9 +2299,12 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
     /// settles as having escrowed nothing, if a `topUp` escrowed or may have
     /// escrowed but the local row is not credited (terminal — the deposit is
     /// escrowed-and-untracked; a retry would escrow again), or if every funding
-    /// call joined a `topUp` that failed. A `topUp` whose outcome is unknown
-    /// keeps this waiting until the chain resolves it, or until the caller
-    /// drops it.
+    /// call joined a `topUp` that failed. Fails at once, sending no `topUp`,
+    /// while the funding task settles its unconfirmed `topUp` (a `TopUpHeld`
+    /// error marked [`LocalPullFault`]): that settle can last as long as the
+    /// chain takes. A call that joined before the settle began waits for its
+    /// outcome, or until the caller drops it. This method meters nothing
+    /// itself; the funding recovery step that calls it meters the refusal.
     pub async fn top_up_pool_by(&self, additional: U256) -> Result<TopUpLanded> {
         let state = self
             .reuse_or_report()?
@@ -2256,7 +2316,12 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             });
         }
         let landed = top_up_at_least(state.pool_id, additional, |amount| {
-            self.join_or_spawn_topup(state.pool_id, amount, TopUpFunder::Recovery)
+            // The hold is set only while the funding task runs, so a set hold
+            // means the slot holds that task: refuse rather than join it.
+            if self.topup_hold.is_held() {
+                return Err(Self::held_topup_error());
+            }
+            Ok(self.join_or_spawn_topup(state.pool_id, amount, TopUpFunder::Recovery))
         })
         .await?;
         info!(
@@ -2327,8 +2392,9 @@ pub trait PoolOpener: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// Implementations error when no pool is tracked, when the allowance,
-    /// `topUp` or replacement `openPool` fails, or when a transaction lands but
-    /// the local row can no longer record it.
+    /// `topUp` or replacement `openPool` fails, when a transaction lands but
+    /// the local row can no longer record it, or when the top-up or open slot
+    /// is held for an unconfirmed transaction (marked [`LocalPullFault`]).
     async fn recover_pool(&self, _seen_deposit: U256) -> Result<Recovery> {
         Ok(Recovery::Unavailable)
     }
@@ -2991,7 +3057,7 @@ async fn run_open<P: Provider + Clone>(
     store: &Arc<dyn BuyerPoolStore>,
     open: OpenRequest,
     replacing: Option<PoolId>,
-    hold: &OpenHold,
+    hold: &SlotHold,
     metrics: &Arc<Metrics>,
 ) -> Result<()> {
     // Re-check under the slot: a previous open for this owner may have persisted
@@ -3126,35 +3192,64 @@ enum Landed {
     Adopted,
 }
 
-/// Whether the open task holds the open slot for an `openPool` whose outcome
-/// it has not seen ([`settle_unconfirmed_open`]).
+/// Whether a task holds its slot (the open slot or the top-up slot) for a
+/// transaction whose outcome it has not seen ([`settle_unconfirmed_open`],
+/// [`settle_unconfirmed_top_up`]).
 ///
-/// That wait can last as long as the chain takes to resolve the open, and no
-/// pool opens meanwhile, so a caller that finds the slot held fails at once as
-/// this node's own fault ([`BuyerPoolService::held_open_error`]) instead of
-/// waiting out its budget on every candidate.
+/// That wait can last as long as the chain takes to resolve the transaction,
+/// so a caller that needs the outcome fails at once as this node's own fault
+/// instead of waiting out its budget: a miss that needs a pool
+/// ([`BuyerPoolService::held_open_error`]), or a funding recovery step
+/// ([`BuyerPoolService::held_topup_error`]). A refill that finds the top-up
+/// slot held joins it and claims nothing. [`Self::wait_held`] serves the open
+/// slot only: an open joiner abandons its wait once the hold begins, but a
+/// recovery step that joined a `topUp` before its settle began waits for the
+/// outcome. `publish` exports the state on the slot's gauge.
+///
+/// A hold has one holder at a time: the slot's single task.
 #[derive(Clone)]
-struct OpenHold {
+struct SlotHold {
     held: Arc<tokio::sync::watch::Sender<bool>>,
+    publish: fn(&Metrics, bool),
 }
 
-impl OpenHold {
-    /// A hold that is not held.
-    fn new() -> Self {
+impl SlotHold {
+    /// The open slot's hold, published on `decdn_buyer_pool_open_unresolved`.
+    fn open() -> Self {
+        Self::new(Metrics::set_buyer_pool_open_unresolved)
+    }
+
+    /// The top-up slot's hold, published on `decdn_buyer_topup_unresolved`.
+    fn top_up() -> Self {
+        Self::new(Metrics::set_buyer_topup_unresolved)
+    }
+
+    /// A hold that is not held, and publishes on `publish`.
+    fn new(publish: fn(&Metrics, bool)) -> Self {
         Self {
             held: Arc::new(tokio::sync::watch::channel(false).0),
+            publish,
         }
     }
 
-    /// Mark the slot held until the returned guard drops, and publish it on
-    /// `decdn_buyer_pool_open_unresolved`.
+    /// Mark the slot held until the returned guard drops, and publish it.
     fn hold(&self, metrics: &Arc<Metrics>) -> HeldGuard {
-        self.held.send_replace(true);
-        metrics.set_buyer_pool_open_unresolved(true);
+        let was_held = self.held.send_replace(true);
+        debug_assert!(
+            !was_held,
+            "a slot hold has one holder: the slot's single task"
+        );
+        (self.publish)(metrics, true);
         HeldGuard {
             held: Arc::clone(&self.held),
+            publish: self.publish,
             metrics: Arc::clone(metrics),
         }
+    }
+
+    /// Whether the slot is held now.
+    fn is_held(&self) -> bool {
+        *self.held.borrow()
     }
 
     /// Resolve once the slot is held, at once if it is held now.
@@ -3168,17 +3263,18 @@ impl OpenHold {
     }
 }
 
-/// Clears an [`OpenHold`] when the settle loop ends on any path, including an
-/// abort of the open task.
+/// Clears a [`SlotHold`] when the settle loop ends on any path, including an
+/// abort of the task that runs it.
 struct HeldGuard {
     held: Arc<tokio::sync::watch::Sender<bool>>,
+    publish: fn(&Metrics, bool),
     metrics: Arc<Metrics>,
 }
 
 impl Drop for HeldGuard {
     fn drop(&mut self) {
         self.held.send_replace(false);
-        self.metrics.set_buyer_pool_open_unresolved(false);
+        (self.publish)(&self.metrics, false);
     }
 }
 
@@ -3197,6 +3293,22 @@ impl std::fmt::Display for OpenHeld {
 }
 
 impl std::error::Error for OpenHeld {}
+
+/// Typed marker: the top-up slot is held for a `topUp` whose outcome the chain
+/// has not resolved, so this node sends no other `topUp` until it does.
+#[derive(Debug)]
+struct TopUpHeld;
+
+impl std::fmt::Display for TopUpHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the top-up slot is held for an unconfirmed topUp; this node sends no other topUp \
+             until the chain resolves it",
+        )
+    }
+}
+
+impl std::error::Error for TopUpHeld {}
 
 /// What one chain read says about a transaction (an `openPool` or a `topUp`)
 /// whose outcome the task that sent it did not see.
@@ -3267,7 +3379,7 @@ async fn settle_unconfirmed_open<P: Provider + Clone>(
     open: &OpenRequest,
     unconfirmed: OpenUnconfirmed,
     err: anyhow::Error,
-    hold: &OpenHold,
+    hold: &SlotHold,
     metrics: &Arc<Metrics>,
 ) -> Result<Landed> {
     let _held = hold.hold(metrics);
