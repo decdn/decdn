@@ -3053,8 +3053,9 @@ enum Reply {
     Call(alloy::primitives::Bytes),
     /// The call faults, as a transient RPC error does.
     Fault,
-    /// The call reverts `PoolNotOpen` at gas estimation.
-    RevertsPoolNotOpen,
+    /// The call reverts at gas estimation with this custom error, named by its
+    /// signature.
+    Reverts(&'static str),
 }
 
 /// Push `replies` onto `asserter`, in order.
@@ -3069,8 +3070,8 @@ fn push(asserter: &alloy::providers::mock::Asserter, replies: Vec<Reply>) {
             Reply::Sent(tx) => asserter.push_success(&tx),
             Reply::Call(bytes) => asserter.push_success(&bytes),
             Reply::Fault => asserter.push_failure_msg("transient rpc fault"),
-            Reply::RevertsPoolNotOpen => {
-                let selector = alloy::primitives::keccak256("PoolNotOpen()");
+            Reply::Reverts(signature) => {
+                let selector = alloy::primitives::keccak256(signature);
                 asserter.push_failure(
                     serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
                         "code": 3,
@@ -3132,21 +3133,22 @@ fn opened_receipt(
         owner,
         deposit: U256::from(deposit),
     };
-    mined_receipt(tx, owner, event.encode_log_data(), status)
+    mined_receipt(tx, owner, Address::ZERO, event.encode_log_data(), status)
 }
 
-/// A mined receipt for `tx` from `owner` whose one log, emitted by the
-/// [`bare_pool_contract`], is `data`, with the given execution `status`. A
-/// reverted receipt holds no logs.
+/// A mined receipt for `tx` from `owner` whose one log, emitted by `emitter`,
+/// is `data`, with the given execution `status`. A reverted receipt holds no
+/// logs.
 fn mined_receipt(
     tx: TxHash,
     owner: Address,
+    emitter: Address,
     data: alloy::primitives::LogData,
     status: bool,
 ) -> Box<alloy::rpc::types::TransactionReceipt> {
     let log = alloy::rpc::types::Log {
         inner: alloy::primitives::Log {
-            address: Address::ZERO,
+            address: emitter,
             data,
         },
         block_hash: None,
@@ -3900,9 +3902,20 @@ fn store_tracking(owner: Address, pool_id: PoolId) -> Arc<dyn BuyerPoolStore> {
     store
 }
 
-/// A mined `topUp` receipt for `tx` whose `PoolToppedUp` log credits
-/// `credited` to [`TOPPED`].
+/// A mined `topUp` receipt for `tx` whose `PoolToppedUp` log, emitted by the
+/// [`bare_pool_contract`], credits `credited` to [`TOPPED`].
 fn topped_up_receipt(
+    tx: TxHash,
+    owner: Address,
+    credited: u64,
+    status: bool,
+) -> Box<alloy::rpc::types::TransactionReceipt> {
+    topped_up_receipt_from(Address::ZERO, tx, owner, credited, status)
+}
+
+/// [`topped_up_receipt`] with its log emitted by `emitter`.
+fn topped_up_receipt_from(
+    emitter: Address,
     tx: TxHash,
     owner: Address,
     credited: u64,
@@ -3915,7 +3928,7 @@ fn topped_up_receipt(
         additionalDeposit: U256::from(credited),
         newDeposit: U256::from(ROW_DEPOSIT + credited),
     };
-    mined_receipt(tx, owner, event.encode_log_data(), status)
+    mined_receipt(tx, owner, emitter, event.encode_log_data(), status)
 }
 
 /// A `getPool` answer: `owner`'s open pool holding `deposit`.
@@ -4109,20 +4122,47 @@ async fn a_reverted_unconfirmed_top_up_escrowed_nothing() {
     assert!(format!("{err:#}").contains("reverted"), "{err:#}");
 }
 
-/// A re-send that reverts `PoolNotOpen` at a vacant nonce ends the settle: no
-/// `topUp` can escrow into a pool that is not open, and the marker sends the
-/// recovery step to a new pool instead of holding the top-up slot.
+/// The custom error a `topUp` into a closing or closed pool reverts with.
+const POOL_NOT_OPEN: &str = "PoolNotOpen()";
+
+/// The custom error a `topUp` beyond the USDC allowance reverts with.
+const ALLOWANCE_SHORT: &str = "ERC20InsufficientAllowance(address,uint256,uint256)";
+
+/// The replies of one settle tick that finds the nonce vacant and whose
+/// re-send reverts with `revert`, read at `block`.
+fn vacant_re_send_reverts(block: u64, revert: &'static str) -> Vec<Reply> {
+    vec![
+        Reply::NoReceipt,
+        Reply::Block(block),
+        Reply::Nonce(5),
+        Reply::Nonce(5),
+        Reply::Reverts(revert),
+    ]
+}
+
+/// A re-send that reverts `PoolNotOpen` ends the settle once one block shows
+/// the nonce unspent and the pool not open: no `topUp` can escrow into a pool
+/// that is not open, and the marker sends the recovery step to a new pool
+/// instead of holding the top-up slot. A pool that still reads open at that
+/// block, as a lagging RPC backend can answer, waits for the next tick.
 #[tokio::test(start_paused = true)]
 async fn a_re_send_into_a_closed_pool_ends_the_settle() {
     let owner = Address::repeat_byte(1);
+    let mut replies = vacant_re_send_reverts(100, POOL_NOT_OPEN);
+    // The confirming read lags: the pool still reads open.
+    replies.extend([
+        Reply::Block(100),
+        Reply::Nonce(5),
+        pool_reply(owner, PaymentPool::Status::Open),
+    ]);
+    replies.extend(vacant_re_send_reverts(101, POOL_NOT_OPEN));
+    replies.extend([
+        Reply::Block(101),
+        Reply::Nonce(5),
+        pool_reply(owner, PaymentPool::Status::Closing),
+    ]);
     let err = settle_top_up(
-        vec![
-            Reply::NoReceipt,
-            Reply::Block(100),
-            Reply::Nonce(5),
-            Reply::Nonce(5),
-            Reply::RevertsPoolNotOpen,
-        ],
+        replies,
         unread_top_up(),
         store_tracking(owner, TOPPED),
         owner,
@@ -4132,6 +4172,117 @@ async fn a_re_send_into_a_closed_pool_ends_the_settle() {
     .expect("the pool accepts no funds");
     assert!(err.downcast_ref::<PoolNotOpen>().is_some(), "{err:#}");
     assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
+}
+
+/// The original `topUp` can mine while the pool is still open, after the tick
+/// read its nonce vacant and before the re-send's estimate saw the pool
+/// closed. The confirming read then finds the nonce spent, so the settle does
+/// not end as "escrowed nothing": the next tick credits the escrow.
+#[tokio::test(start_paused = true)]
+async fn a_closed_pool_whose_nonce_is_spent_still_credits_the_escrow() {
+    let owner = Address::repeat_byte(1);
+    let mut replies = vacant_re_send_reverts(100, POOL_NOT_OPEN);
+    replies.extend([
+        Reply::Block(101),
+        Reply::Nonce(6),
+        pool_reply(owner, PaymentPool::Status::Closing),
+        // The next tick: the nonce is spent, with no receipt in hand.
+        Reply::NoReceipt,
+        Reply::Block(102),
+        Reply::Nonce(6),
+        Reply::NoReceipt,
+        deposit_reply(owner, ROW_DEPOSIT + TOP_UP),
+    ]);
+    let settled = settle_top_up(
+        replies,
+        unread_top_up(),
+        store_tracking(owner, TOPPED),
+        owner,
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.credited, U256::from(TOP_UP));
+}
+
+/// A re-send that reverts on the allowance sends an `approve` at the nonce. It
+/// fills the nonce, so the next tick finds it spent, and the unchanged deposit
+/// shows the `topUp` escrowed nothing.
+#[tokio::test(start_paused = true)]
+async fn a_re_send_short_of_allowance_approves_at_the_nonce() {
+    let owner = Address::repeat_byte(1);
+    let mut replies = vacant_re_send_reverts(100, ALLOWANCE_SHORT);
+    replies.extend([
+        Reply::Sent(resent_tx()),
+        // The next tick: the approve spent the nonce.
+        Reply::NoReceipt,
+        Reply::Block(101),
+        Reply::Nonce(6),
+        Reply::NoReceipt,
+        deposit_reply(owner, ROW_DEPOSIT),
+    ]);
+    let err = settle_top_up(
+        replies,
+        unread_top_up(),
+        store_tracking(owner, TOPPED),
+        owner,
+    )
+    .await
+    .err()
+    .expect("the topUp escrowed nothing");
+    assert!(format!("{err:#}").contains("escrowed nothing"), "{err:#}");
+}
+
+/// A `topUp` dropped from the mempool lapses at [`RECEIPT_TIMEOUT`] into the
+/// settle loop, which re-sends it at the same nonce while it holds the top-up
+/// slot. A receipt that arrives later credits the row once and frees the slot.
+/// With no bound on the receipt wait, the task would never re-send.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_top_up_is_re_sent_at_its_nonce_and_credited_once() {
+    use decdn_incentive::test_rpc::{SCRIPTED_NONCE, SCRIPTED_TX, ScriptedRpc};
+
+    let owner = Address::repeat_byte(1);
+    let store = store_tracking(owner, TOPPED);
+    let rpc = ScriptedRpc::dropped(100);
+    let svc = mocked_service_on(
+        PaymentPool::new(DEPLOYMENT.payment_pool, rpc.clone().provider()),
+        Arc::clone(&store),
+        signer(),
+        owner,
+    );
+    let (shared, claim) = svc.join_or_spawn_topup(TOPPED, U256::from(TOP_UP), TopUpFunder::Refill);
+    assert_eq!(claim, TopUpClaim::Spawned);
+
+    tokio::time::sleep(RECEIPT_TIMEOUT + TOPUP_RESOLVE_INTERVAL * 3).await;
+    let sent = rpc.sent_nonces();
+    assert!(sent.len() >= 2, "the settle re-sent the topUp: {sent:?}");
+    assert!(
+        sent.iter().all(|nonce| *nonce == SCRIPTED_NONCE),
+        "every send is at the topUp's nonce: {sent:?}"
+    );
+    assert!(
+        svc.topup_in_flight.lock().unwrap().is_some(),
+        "the settle holds the slot"
+    );
+
+    rpc.mine(*topped_up_receipt_from(
+        DEPLOYMENT.payment_pool,
+        SCRIPTED_TX,
+        owner,
+        TOP_UP,
+        true,
+    ));
+    let landed = tokio::time::timeout(SETTLE_TEST_BOUND, shared)
+        .await
+        .expect("the late receipt settles the topUp")
+        .unwrap();
+    assert_eq!(landed.added, U256::from(TOP_UP));
+    assert_eq!(
+        store.get_by_owner(owner).unwrap().map(|row| row.deposit),
+        Some(U256::from(ROW_DEPOSIT + TOP_UP)),
+        "the row is credited once"
+    );
+    assert_eq!(counter(&svc.metrics, "decdn_buyer_topup_ok_total"), 1);
+    assert!(svc.topup_in_flight.lock().unwrap().is_none());
 }
 
 /// A transient fault on a receipt read, a re-send or a `getPool` waits for the

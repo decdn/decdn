@@ -779,8 +779,10 @@ impl std::fmt::Display for TopUpProof {
 /// - A nonce that the account has reached and no transaction holds gets a
 ///   fresh `topUp` at that same nonce ([`send_top_up_at`]). Two transactions at
 ///   one nonce cannot both mine. A re-send that reverts [`PoolNotOpen`] ends
-///   the settle: no `topUp` can escrow into a pool that is not open, and a pool
-///   never reopens.
+///   the settle once one block shows the nonce unspent and the pool not open:
+///   no `topUp` can escrow into a pool that is not open, and a pool never
+///   reopens. A re-send that reverts on the allowance sends an `approve` at
+///   the nonce instead, which restores the allowance and fills the nonce.
 ///
 /// A failed read and any other failed re-send wait for the next tick. A
 /// warning repeats every [`TOPUP_UNRESOLVED_WARN_INTERVAL`] with the elapsed
@@ -791,8 +793,9 @@ impl std::fmt::Display for TopUpProof {
 /// - A mined `topUp` reverted, or the nonce is spent and the pool's deposit
 ///   shows nothing escrowed. Neither carries the [`TopUpUnconfirmed`] marker,
 ///   because the outcome is known.
-/// - A re-send reverted `PoolNotOpen`: nothing escrowed, marked
-///   [`PoolNotOpen`] so the recovery step opens a new pool.
+/// - A re-send reverted `PoolNotOpen`, and one block shows the nonce unspent
+///   and the pool not open: nothing escrowed, marked [`PoolNotOpen`] so the
+///   recovery step opens a new pool.
 /// - The nonce is spent, and the row did not track `pool_id` when the settle
 ///   began, so the deposit cannot be compared; marked [`EscrowedUntracked`],
 ///   so no caller funds again on top of it.
@@ -950,9 +953,18 @@ impl TopUpSettling {
         }
     }
 
-    /// Send a fresh `topUp` at the nonce no transaction holds. A re-send that
-    /// reverts [`PoolNotOpen`] ends the settle: nothing at the nonce can escrow
-    /// into a pool that is not open.
+    /// Send a fresh `topUp` at the nonce no transaction holds.
+    ///
+    /// A re-send that reverts at gas estimation says the `topUp` cannot escrow
+    /// now, but the original may still mine. Two reverts are acted on:
+    ///
+    /// - [`PoolNotOpen`]: the pool is confirmed closed at one block
+    ///   ([`Self::confirm_closed`]) before the settle ends.
+    /// - [`AllowanceShortfall`](decdn_client::buyer_pool::AllowanceShortfall):
+    ///   an `approve` at the nonce restores the allowance
+    ///   ([`Self::approve_at_nonce`]). A `topUp` at the nonce would revert on
+    ///   the allowance anyway, so the `approve` ends the wait for the nonce
+    ///   without letting a second `topUp` escrow.
     async fn resend<P: Provider + Clone + 'static>(
         &mut self,
         handles: &FundingHandles<P>,
@@ -980,13 +992,14 @@ impl TopUpSettling {
                 Tick::Wait(format!("re-sent topUp at the nonce as {tx}"))
             }
             Err(err) if err.downcast_ref::<PoolNotOpen>().is_some() => {
-                let nonce = self.nonce;
-                Tick::Done(Err(anyhow::anyhow!(
-                    "no transaction holds the topUp nonce {nonce}, and a re-send reverts \
-                     PoolNotOpen, so the topUp escrowed nothing: {}",
-                    self.original
-                )
-                .context(PoolNotOpen)))
+                self.confirm_closed(handles).await
+            }
+            Err(err)
+                if err
+                    .downcast_ref::<decdn_client::buyer_pool::AllowanceShortfall>()
+                    .is_some() =>
+            {
+                self.approve_at_nonce(handles).await
             }
             Err(err) => {
                 let seen = format!(
@@ -994,6 +1007,106 @@ impl TopUpSettling {
                     sanitize_err_chain(&err)
                 );
                 debug!(nonce = self.nonce, last = %seen, "could not re-send the topUp");
+                Tick::Wait(seen)
+            }
+        }
+    }
+
+    /// End the settle once one block shows the nonce unspent and the pool not
+    /// open, after a re-send reverted `PoolNotOpen`.
+    ///
+    /// The revert reads the head, and the nonce was read at an earlier block,
+    /// so the original `topUp` may have mined between the two while the pool
+    /// was still open. Reading both at one block `B` closes that gap: an
+    /// unspent nonce at `B` means nothing at it mined by `B`, and anything
+    /// that mines after `B` reverts, because a pool never reopens. A nonce
+    /// spent at `B` waits for the next tick to resolve it, and a pool still
+    /// open at `B` (a lagging RPC backend) waits too.
+    async fn confirm_closed<P: Provider + Clone + 'static>(
+        &self,
+        handles: &FundingHandles<P>,
+    ) -> Tick<SettledTopUp> {
+        let nonce = self.nonce;
+        let provider = handles.contract.provider();
+        let read = async {
+            let block = provider
+                .get_block_number()
+                .await
+                .context("read the block number")?;
+            let confirmed = provider
+                .get_transaction_count(handles.owner)
+                .number(block)
+                .await
+                .context("read the confirmed nonce")?;
+            let pool = handles
+                .contract
+                .getPool(self.pool_id)
+                .call()
+                .block(BlockId::Number(block.into()))
+                .await
+                .context("read the pool's status")?;
+            anyhow::Ok((block, confirmed, pool.status))
+        };
+        match read.await {
+            Err(err) => {
+                let seen = format!(
+                    "a re-send reverts PoolNotOpen, and confirming it failed: {}",
+                    sanitize_err_chain(&err)
+                );
+                debug!(nonce, last = %seen, "could not confirm the pool is closed");
+                Tick::Wait(seen)
+            }
+            Ok((block, confirmed, _)) if confirmed > nonce => Tick::Wait(format!(
+                "a re-send reverts PoolNotOpen, and the nonce is spent at block {block}"
+            )),
+            Ok((block, _, PaymentPool::Status::Closing | PaymentPool::Status::Closed)) => {
+                Tick::Done(Err(anyhow::anyhow!(
+                    "the topUp nonce {nonce} is unspent at block {block}, where the pool is no \
+                     longer open, so the topUp escrowed nothing: {}",
+                    self.original
+                )
+                .context(PoolNotOpen)))
+            }
+            Ok((block, ..)) => Tick::Wait(format!(
+                "a re-send reverts PoolNotOpen, but the pool reads open at block {block}"
+            )),
+        }
+    }
+
+    /// Send an unlimited USDC `approve` at the nonce, after a re-send reverted
+    /// on the allowance. It restores the daemon's standing allowance, and it
+    /// fills the nonce, so the chain then resolves it and the deposit shows
+    /// whether the original `topUp` escrowed.
+    async fn approve_at_nonce<P: Provider + Clone + 'static>(
+        &self,
+        handles: &FundingHandles<P>,
+    ) -> Tick<SettledTopUp> {
+        let nonce = self.nonce;
+        match Erc20::new(handles.token, handles.contract.provider().clone())
+            .approve(handles.payment_pool_addr, U256::MAX)
+            .from(handles.owner)
+            .nonce(nonce)
+            .send()
+            .await
+        {
+            Ok(pending) => {
+                let tx = *pending.tx_hash();
+                info!(
+                    nonce,
+                    %tx,
+                    "a topUp re-send reverts on the allowance; sent approve at the unconfirmed \
+                     topUp's nonce"
+                );
+                Tick::Wait(format!(
+                    "a re-send reverts on the allowance; sent approve {tx} at the nonce"
+                ))
+            }
+            Err(err) => {
+                let seen = format!(
+                    "a re-send reverts on the allowance, and the approve at the nonce failed: {}",
+                    sanitize_error_sources(&err)
+                );
+                debug!(nonce, last = %seen, "could not send the approve");
                 Tick::Wait(seen)
             }
         }

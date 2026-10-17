@@ -1097,7 +1097,10 @@ since project inception and will roll into the first tagged release.
   no transaction holds gets a re-send at that nonce, and a spent nonce with no
   receipt credits what the pool's on-chain deposit holds above the row as it
   stood when the settle began. A re-send that reverts `PoolNotOpen` ends the
-  settle, so the recovery step opens a new pool. A settle that may have
+  settle once one block shows the nonce unspent and the pool closed, so the
+  recovery step opens a new pool. A re-send that reverts on the allowance
+  sends an `approve` at the nonce, which restores the allowance and fills the
+  nonce. A settle that may have
   escrowed but cannot credit the row logs the "ESCROWED AND UNTRACKED" error,
   and so does a funding task that dies mid-settle, which no joiner then funds
   over. The
