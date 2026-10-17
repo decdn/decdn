@@ -7183,7 +7183,7 @@ async fn raw_request(
     write_frame(&mut send, &payload)
         .await
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
-    let frame = read_frame(&mut recv)
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read frame (stream reset?): {e}"))?;
     let (msg, rest) =
@@ -12110,6 +12110,42 @@ async fn a_zero_byte_voucher_after_paying_counts_as_rejected() -> anyhow::Result
     Ok(())
 }
 
+/// A payment-proof frame announced past
+/// [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`] ends the stream on its length
+/// prefix alone (ADR 013 § Wire Framing). A proof is a few hundred bytes at most,
+/// so the node does not buffer toward the announced length or wait out the
+/// 10 s voucher wait for it. The fault is the payer's, not the node's.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_proof_frame_ends_the_stream_on_its_prefix() -> anyhow::Result<()> {
+    let mut fx = drive_to_second_interval_awaiting_voucher().await?;
+
+    let mut bytes = support::frame_len_prefix(decdn_protocol::MAX_CLIENT_CONTROL_FRAME + 1);
+    bytes.extend_from_slice(&[0u8; 512]);
+    fx.send
+        .write_all(&bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("write oversized proof prefix: {e}"))?;
+
+    match tokio::time::timeout(Duration::from_secs(3), read_client_msg(&mut fx.recv)).await {
+        Err(_elapsed) => anyhow::bail!("the node waited on an oversized proof frame"),
+        Ok(Ok(ClientMessage::ChunkData(chunk))) => anyhow::bail!(
+            "the node delivered {} more wire bytes after an oversized proof frame",
+            chunk.bytes().len()
+        ),
+        Ok(Ok(other)) => anyhow::bail!("expected the stream to fail, got {other:?}"),
+        Ok(Err(_)) => {}
+    }
+    support::assert_inbound_failures_attributed(&fx.metrics, 1).await?;
+    anyhow::ensure!(
+        counter(&fx.metrics, "decdn_serve_stream_node_fault_total")? == 0,
+        "an oversized proof frame is the payer's fault, not the node's"
+    );
+
+    fx.conn.close(0u32.into(), b"done");
+    shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
+    Ok(())
+}
+
 /// A client that leaves after a voucher credited bytes counts as an abandon,
 /// not a decline and not a node fault (#2073).
 #[tokio::test(flavor = "multi_thread")]
@@ -12194,7 +12230,9 @@ async fn an_unreadable_request_is_reset_and_counted() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("write garbage frame: {e}"))?;
     anyhow::ensure!(
-        read_frame(&mut recv).await.is_err(),
+        read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
+            .await
+            .is_err(),
         "the node must not answer an undecodable request"
     );
 
@@ -12592,6 +12630,144 @@ async fn over_cap_stream_is_reset_without_signing_a_response() -> anyhow::Result
         counter(&metrics, "decdn_serve_stream_client_declined_total")? == 1,
         "the parked stream ends unpaid"
     );
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// An over-cap stream is refused before its request is read (ADR 005
+/// §Concurrent stream limits). One stream holds the sole permit; a second stream
+/// announces a request frame and never sends its body. The handler resets the
+/// second stream with `RATE_LIMITED` at once. It does not buffer the announced
+/// frame or wait out the request-read timeout for it, so over-cap streams cannot
+/// each pin a frame of memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn over_cap_stream_is_reset_before_its_request_is_read() -> anyhow::Result<()> {
+    let payload = vec![0x4Cu8; 64 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let wire_bytes = support::bao_wire_len_whole(payload.len() as u64);
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&fresh_lane(signer.address(), U256::from(10_000_000u64)))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        1,
+        |_deps| {},
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let client_node_id = B256::from(*client_ep.id().as_bytes());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let _held =
+        stall_delivery_at_closing_voucher(&conn, *hash.as_bytes(), wire_bytes, Some(&ext)).await?;
+
+    // A legal-sized announcement with no body: before the fix the handler parks in
+    // the request read until its 5 s timeout, holding the announced buffer.
+    let (mut send2, mut recv2) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi (second stream): {e}"))?;
+    send2
+        .write_all(&support::frame_len_prefix(
+            decdn_protocol::MAX_CLIENT_CONTROL_FRAME,
+        ))
+        .await
+        .map_err(|e| anyhow::anyhow!("write prefix: {e}"))?;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        assert_stream_reset(&mut recv2, decdn_protocol::APP_ERR_RATE_LIMITED),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the over-cap stream waited on its request body"))??;
+    anyhow::ensure!(
+        counter(
+            &metrics,
+            "decdn_serve_stream_rejected_stream_cap_full_total"
+        )? == 1,
+        "the over-cap stream is counted as a cap reject, not an unreadable request"
+    );
+
+    conn.close(0u32.into(), b"done");
+    support::assert_inbound_failures_attributed(&metrics, 2).await?;
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A request frame announced past [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`]
+/// is reset with `MESSAGE_TOO_LARGE` (`0x02`) on its length prefix alone (ADR 013
+/// § Wire Framing). The handler does not buffer the payload or wait for it, so an
+/// oversized frame cannot pin memory for the request-read timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_request_frame_is_refused_on_its_prefix() -> anyhow::Result<()> {
+    let payload = vec![0x4Du8; 1024];
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let store_dyn: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        4,
+        |_deps| {},
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    // The prefix and a little of the body, then a stall: the reader must refuse on
+    // the prefix rather than wait for the rest.
+    let mut bytes = support::frame_len_prefix(decdn_protocol::MAX_CLIENT_CONTROL_FRAME + 1);
+    bytes.extend_from_slice(&[0u8; 512]);
+    send.write_all(&bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("write prefix: {e}"))?;
+    tokio::time::timeout(Duration::from_secs(2), assert_stream_reset(&mut recv, 0x02))
+        .await
+        .map_err(|_| anyhow::anyhow!("the oversized request was not refused on its prefix"))??;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_request_unreadable_total")? == 1,
+        "an oversized request is counted as unreadable"
+    );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+
+    conn.close(0u32.into(), b"done");
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
@@ -13081,23 +13257,21 @@ async fn client_pays_nothing_for_an_inflated_garbage_claim() -> anyhow::Result<(
 
 /// The exposure bound (#1985): what an inflated-garbage provider can bill is the
 /// wire bytes that arrived before the first unverifiable chunk group — here one
-/// oversized 3 MiB frame, which releases its whole reveals before the decoder
-/// sees a byte — and never the 32 MiB it signed for. A reveal pays for received
+/// frame of the largest legal size, a full [`decdn_protocol::CHUNK_BYTES`]
+/// payload — and never the 32 MiB it signed for. A reveal pays for received
 /// bytes, not verified ones, so the bound is a frame plus a metering interval,
 /// not zero; pinning it here is what keeps verification from ever being
 /// deferred to stream end, with every reveal released before it.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_spend_on_a_garbage_stream_is_bounded_by_one_frame() -> anyhow::Result<()> {
-    let frame: usize = 3 * 1024 * 1024;
+    let frame = usize::try_from(decdn_protocol::CHUNK_BYTES)?;
     let (err, progress) = fetch_inflated_garbage(frame).await?;
     anyhow::ensure!(
         err.downcast_ref::<HashMismatch>().is_some(),
         "garbage must surface the typed HashMismatch, got: {err:#}"
     );
-    // The bound under test is the UPPER one. A frame larger than the metering
-    // interval releases its reveals before the decoder sees a byte, so the buyer
-    // pays here; a stricter receiver that paid nothing would tighten the bound,
-    // not break it.
+    // The bound under test is the UPPER one. A stricter receiver that paid
+    // nothing would tighten the bound, not break it.
     let paid_bytes = progress.advanced().map_or(U256::ZERO, |(bytes, _)| bytes);
     anyhow::ensure!(
         paid_bytes <= U256::from(frame),
@@ -13106,6 +13280,25 @@ async fn client_spend_on_a_garbage_stream_is_bounded_by_one_frame() -> anyhow::R
     anyhow::ensure!(
         paid_bytes < U256::from(32u64 << 20),
         "paid {paid_bytes} bytes against a 32 MiB claim: the claim must never be billed"
+    );
+    Ok(())
+}
+
+/// A frame past [`decdn_protocol::MAX_CHUNK_FRAME`] never reaches the decoder or
+/// the meter (ADR 013 § Wire Framing): the payer refuses it on its length prefix,
+/// so a provider cannot make the buyer buffer an oversized frame or pay any of its
+/// reveals. Here a 3 MiB garbage frame fails the fetch with nothing paid.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_refuses_a_frame_past_the_chunk_ceiling_and_pays_nothing() -> anyhow::Result<()> {
+    let (err, progress) = fetch_inflated_garbage(3 * 1024 * 1024).await?;
+    anyhow::ensure!(
+        format!("{err:#}").contains("exceeds the frame ceiling"),
+        "an oversized frame must fail on the frame ceiling, got: {err:#}"
+    );
+    anyhow::ensure!(
+        progress.advanced().is_none(),
+        "an oversized frame is refused before any byte is metered: {:?}",
+        progress.advanced()
     );
     Ok(())
 }
@@ -13228,7 +13421,11 @@ async fn request_read_timeout_resets_a_silent_opener() -> anyhow::Result<()> {
     // The parked read is reset (or the connection closed) once the timeout fires;
     // either way no frame is ever readable. A clean empty EOF would mean the peer
     // FIN'd — impossible here, `send` is still open — so it is not accepted.
-    let ended = tokio::time::timeout(Duration::from_secs(15), read_frame(&mut recv)).await;
+    let ended = tokio::time::timeout(
+        Duration::from_secs(15),
+        read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME),
+    )
+    .await;
     match ended {
         Ok(Err(_)) => {}
         Ok(Ok(frame)) => {

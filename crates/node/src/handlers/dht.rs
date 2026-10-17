@@ -713,7 +713,7 @@ impl ProtocolHandler for DhtHandler {
 
 const fn frame_err_code(e: &FrameError) -> u32 {
     match e {
-        FrameError::TooLarge(_) => APP_ERR_MESSAGE_TOO_LARGE,
+        FrameError::TooLarge { .. } => APP_ERR_MESSAGE_TOO_LARGE,
         FrameError::Io(_) | FrameError::Varint | FrameError::Decode(_) => APP_ERR_MALFORMED_MESSAGE,
     }
 }
@@ -749,7 +749,14 @@ async fn read_dht_request(
         let _ = recv.stop(v);
     };
 
-    let frame = match tokio::time::timeout(READ_TIMEOUT, read_frame(recv)).await {
+    // The largest request is a full `BatchStore`; the ceiling refuses a larger
+    // frame before it is buffered (ADR 013 § Wire Framing).
+    let frame = match tokio::time::timeout(
+        READ_TIMEOUT,
+        read_frame(recv, decdn_protocol::MAX_DHT_FRAME),
+    )
+    .await
+    {
         Err(_) => {
             reset(send, recv, 0);
             return Err(DhtReadError {

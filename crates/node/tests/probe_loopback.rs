@@ -26,7 +26,7 @@ use decdn_node::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer}
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, DISCOVERY_BLOCK_BYTES, MAX_MESSAGE_SIZE,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, DISCOVERY_BLOCK_BYTES, MAX_PROBE_FRAME,
     ProbeMessage, ProbeResponseExt, SLASH_SIG_LEN, decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse, ProbeResponseBody},
     num_blocks, parse_probe_response_ext, read_frame, write_frame,
@@ -524,7 +524,7 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
-    let frame = read_frame(&mut recv)
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_PROBE_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read: {e}"))?;
     let (msg, tail) = decode_message::<ProbeMessage>(&frame)?;
@@ -653,9 +653,9 @@ async fn probe_oversized_frame_returns_too_large_code() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
 
-    // Write a varint length-prefix that exceeds MAX_MESSAGE_SIZE with no payload.
+    // Write a varint length-prefix that exceeds MAX_PROBE_FRAME with no payload.
     let mut bogus = Vec::new();
-    let mut v = MAX_MESSAGE_SIZE + 1;
+    let mut v = MAX_PROBE_FRAME + 1;
     loop {
         let byte = (v & 0x7F) as u8;
         v >>= 7;
@@ -1337,7 +1337,7 @@ async fn run_one_probe_as(
         .await
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
-    let frame = read_frame(&mut recv)
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_PROBE_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read: {e}"))?;
     let (msg, tail) = decode_message::<ProbeMessage>(&frame)?;

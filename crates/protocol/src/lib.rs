@@ -23,8 +23,10 @@
 //!
 //! # Frames and extensions
 //!
-//! Every message is a postcard encoding behind a varint length prefix, capped at
-//! [`MAX_MESSAGE_SIZE`] ([ADR 013 § Wire Framing]). A signed message has a frozen
+//! Every message is a postcard encoding behind a varint length prefix. Each read
+//! caps the prefix at its ALPN's frame ceiling — [`MAX_PROBE_FRAME`],
+//! [`MAX_CLIENT_CONTROL_FRAME`], [`MAX_CHUNK_FRAME`] or [`MAX_DHT_FRAME`]
+//! ([ADR 013 § Wire Framing]). A signed message has a frozen
 //! base: the fields its signature covers. Unsigned fields travel as trailing
 //! bytes after the base. [`decode_message`] returns them as a remainder, and the
 //! `parse_*_ext` functions read them ([ADR 013 § Three Tiers of Evolution]).
@@ -64,10 +66,10 @@ pub mod region;
 
 pub use client::{
     BINDING_SIG_LEN, CHUNK_BYTES, ChunkData, ChunkPreimage, ClientBinding, ClientMessage,
-    MAX_CHAIN_LENGTH, MB_BYTES, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
-    StreamResponseBody, StreamResponseExt, VOUCHER_SIG_LEN, Voucher, VoucherRejectReason,
-    encode_chunk_frame, encode_stream_request, encode_stream_response, parse_stream_request_ext,
-    parse_stream_response_ext,
+    MAX_CHAIN_LENGTH, MAX_CHUNK_FRAME, MAX_CLIENT_CONTROL_FRAME, MB_BYTES, StreamError,
+    StreamRequest, StreamRequestExt, StreamResponse, StreamResponseBody, StreamResponseExt,
+    VOUCHER_SIG_LEN, Voucher, VoucherRejectReason, encode_chunk_frame, encode_stream_request,
+    encode_stream_response, parse_stream_request_ext, parse_stream_response_ext,
 };
 pub use coverage::{Coverage, DISCOVERY_BLOCK_BYTES, discovery_block_bytes, num_blocks};
 #[cfg(feature = "test-support")]
@@ -75,18 +77,18 @@ pub use coverage::{TestBlockSizeGuard, override_discovery_block_bytes_for_test};
 pub use dht::{
     BatchStoreAck, BatchStoreRequest, CloserNodes, CloserNodesError, DhtMessage, FindNodeRequest,
     FindNodeResponse, FindValueRequest, FindValueResponse, FindValueResponseExt,
-    MAX_BATCH_STORE_HASHES, MAX_CLOSER_NODES, MAX_PROVIDERS_PER_HASH, StoreAck, StoreRequest,
-    StoreRequestExt, encode_find_value_response, encode_store_request,
+    MAX_BATCH_STORE_HASHES, MAX_CLOSER_NODES, MAX_DHT_FRAME, MAX_PROVIDERS_PER_HASH, StoreAck,
+    StoreRequest, StoreRequestExt, encode_find_value_response, encode_store_request,
     parse_find_value_response_ext, parse_store_request_ext,
 };
 pub use framing::{
-    FrameError, MAX_MESSAGE_SIZE, TopLevelEnum, decode_message, encode_message, is_unknown_variant,
-    read_frame, write_frame,
+    FrameError, TopLevelEnum, decode_message, encode_message, is_unknown_variant, read_frame,
+    write_frame,
 };
 pub use identity::{ContentHash, ID_LEN, NodeId};
 pub use message::{
-    MAX_RATE_PER_MB, MessageValidationError, ProbeMessage, ProbeRequest, ProbeResponse,
-    ProbeResponseBody, ProbeResponseExt, SLASH_SIG_LEN, encode_probe_response,
+    MAX_PROBE_FRAME, MAX_RATE_PER_MB, MessageValidationError, ProbeMessage, ProbeRequest,
+    ProbeResponse, ProbeResponseBody, ProbeResponseExt, SLASH_SIG_LEN, encode_probe_response,
     parse_probe_response_ext,
 };
 pub use region::{InvalidRegion, Region, is_valid_region};

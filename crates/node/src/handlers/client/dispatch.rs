@@ -308,7 +308,7 @@ impl ClientHandler {
     /// `conn` is the stream's connection: each proof wait reads its transport
     /// progress ([`proof_wait`](super::proof_wait)).
     ///
-    /// Kept as one linear, ADR-ordered sequence (read → bind → blob gate →
+    /// Kept as one linear, ADR-ordered sequence (admit → read → bind → blob gate →
     /// lane → sign → deliver); splitting it would scatter the ADR-005
     /// ordering invariants across helpers — same rationale as the probe
     /// handler's `serve`.
@@ -322,6 +322,17 @@ impl ClientHandler {
         bound_addr: Arc<ArcSwapOption<Address>>,
         peer: PublicKey,
     ) -> anyhow::Result<ServeEnd> {
+        // Stream-cap exhausted: reset the stream before reading anything and with
+        // no signed response (ADR 005 §Concurrent stream limits). Reading first
+        // would let every over-cap stream buffer a request frame for the read
+        // timeout; signing a `StreamResponse` per rejected request would let a
+        // request flood amplify into CPU exhaustion (an ECDSA signature per
+        // reject). The cap exists to shed load, not to add work to the reject path.
+        if permit.is_none() {
+            reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
+            return Ok(ServeEnd::Reset(ResetCause::StreamCapFull));
+        }
+
         let client_node_id = B256::from(*peer.as_bytes());
         let first = match read_first_message(&mut recv).await {
             Ok(first) => first,
@@ -338,15 +349,6 @@ impl ClientHandler {
         // The time-to-first-byte window opens on the decoded request: the accept
         // and the request read run at the peer's pace, so they stay outside it.
         let request_decoded_at = std::time::Instant::now();
-
-        // Stream-cap exhausted: reset the stream with no signed response.
-        // Signing a `StreamResponse` per rejected request would let a request
-        // flood amplify into CPU exhaustion (an ECDSA signature per reject) — the
-        // cap exists to shed load, not to add work to the reject path.
-        if permit.is_none() {
-            reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
-            return Ok(ServeEnd::Reset(ResetCause::StreamCapFull));
-        }
 
         let FirstMessage::Delivery(req, ext) = first;
         let _stream_guard = self.metrics.inbound_stream_guard();

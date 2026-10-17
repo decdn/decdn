@@ -4,39 +4,22 @@
 //! The varint uses postcard's native continuation-bit encoding (7 data bits per
 //! byte, MSB = continuation, little-endian, 1–5 bytes for `u32`).
 //!
-//! Receivers read the varint length, reject anything above [`MAX_MESSAGE_SIZE`]
-//! before allocation, allocate exactly that many bytes, then deserialize the
-//! frame with [`decode_message`] (a thin wrapper over
+//! Receivers read the varint length, reject anything above the ALPN's frame
+//! ceiling before allocation, allocate exactly that many bytes, then deserialize
+//! the frame with [`decode_message`] (a thin wrapper over
 //! [`postcard::take_from_bytes`] that preserves the trailing remainder for
 //! future Tier-1 extension fields).
+//!
+//! Every read names its own ceiling, sized to the largest legitimate message
+//! that can arrive at that read (ADR 013 § Wire Framing). The ceilings live
+//! beside the messages they bound: [`crate::message::MAX_PROBE_FRAME`],
+//! [`crate::client::MAX_CLIENT_CONTROL_FRAME`], [`crate::client::MAX_CHUNK_FRAME`]
+//! and [`crate::dht::MAX_DHT_FRAME`]. There is no global ceiling, so no read can
+//! fall back to a bound far above what its ALPN carries.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
-/// Maximum framed message size. Pinned at exactly 16 MiB by ADR 013 §Wire
-/// Framing, uniformly across all ALPNs in v1.
-///
-/// The ceiling is a pre-allocation denial-of-service bound: [`read_frame`]
-/// allocates exactly `len` bytes after decoding the length prefix, so an
-/// unbounded length would let a peer force arbitrary-sized allocations. 16 MiB
-/// sits well above every documented ALPN message (`cdn/probe/v1` ≤ ~200 B,
-/// `cdn/client/v1` non-`ChunkData` ≤ ~1 KiB) and pairs with QUIC's
-/// `MAX_STREAMS` (ADR 005) for the total per-peer memory bound.
-///
-/// Changing this constant is a protocol-wide wire-compatibility decision —
-/// any edit, whether bump or shrink, requires an ADR 013 amendment first.
-/// The compile-time guard below catches accidental edits. Per-deployment
-/// tightening for memory-constrained nodes is a runtime-config concern
-/// (ADR 013 §Wire Framing), not a change to the constant itself.
-pub const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
-
-// Compile-time guardrail tying MAX_MESSAGE_SIZE to ADR 013. Any change to
-// the constant without an ADR 013 amendment fails the build.
-const _: () = assert!(
-    MAX_MESSAGE_SIZE == 16 * 1024 * 1024,
-    "MAX_MESSAGE_SIZE must be exactly 16 MiB per ADR 013 §Wire Framing; any change (bump or shrink) requires an ADR amendment",
-);
 
 /// Errors produced by the framing helpers. The handler-layer mapping to QUIC
 /// application error codes lives in the node crate.
@@ -45,10 +28,15 @@ pub enum FrameError {
     /// The underlying stream failed while reading or writing the frame.
     #[error("frame I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// The length prefix names more bytes than [`MAX_MESSAGE_SIZE`] allows.
+    /// The length prefix names more bytes than the reader's ceiling allows.
     /// Rejected before anything is buffered.
-    #[error("frame length {0} exceeds MAX_MESSAGE_SIZE ({MAX_MESSAGE_SIZE})")]
-    TooLarge(u32),
+    #[error("frame length {len} exceeds the frame ceiling ({max})")]
+    TooLarge {
+        /// The announced payload length, in bytes.
+        len: u32,
+        /// The ceiling the reader applied, in bytes.
+        max: u32,
+    },
     /// The length prefix is not a well-formed varint — a non-terminating
     /// continuation run through all five bytes, or a fifth byte overflowing
     /// `u32`. A short or empty buffer reads as truncated, not malformed.
@@ -141,22 +129,22 @@ fn leading_varint_u32(frame: &[u8]) -> Option<u32> {
 /// decodes it with [`decode_message`], then drains `header_len + payload_len`
 /// bytes.
 ///
-/// The announced length is validated against [`MAX_MESSAGE_SIZE`] as soon as the
-/// varint is complete — before the caller waits for (or allocates) the payload —
-/// mirroring [`read_frame`]'s pre-allocation denial-of-service bound.
+/// The announced length is validated against `max` — the ALPN's frame ceiling —
+/// as soon as the varint is complete, before the caller waits for (or buffers)
+/// the payload. This mirrors [`read_frame`]'s pre-allocation denial-of-service
+/// bound.
 ///
 /// # Errors
 ///
 /// [`FrameError::Varint`] for a malformed length prefix (a non-terminating
 /// continuation run within the first 5 bytes, or a 5th byte overflowing `u32`);
-/// [`FrameError::TooLarge`] when the announced length exceeds
-/// [`MAX_MESSAGE_SIZE`].
-pub fn parse_frame(buf: &[u8]) -> Result<Option<(usize, usize)>, FrameError> {
+/// [`FrameError::TooLarge`] when the announced length exceeds `max`.
+pub fn parse_frame(buf: &[u8], max: u32) -> Result<Option<(usize, usize)>, FrameError> {
     let Some((len, header_len)) = decode_varint_prefix(buf)? else {
         return Ok(None);
     };
-    if len > MAX_MESSAGE_SIZE {
-        return Err(FrameError::TooLarge(len));
+    if len > max {
+        return Err(FrameError::TooLarge { len, max });
     }
     let payload_len = len as usize;
     if buf.len().saturating_sub(header_len) < payload_len {
@@ -197,13 +185,21 @@ fn decode_varint_prefix(buf: &[u8]) -> Result<Option<(u32, usize)>, FrameError> 
 
 /// Read one length-prefixed frame from an async reader.
 ///
-/// The length prefix is validated against [`MAX_MESSAGE_SIZE`] *before* any
-/// payload allocation, so a malicious peer cannot trigger a large allocation
-/// by sending a single oversized varint.
-pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>, FrameError> {
+/// The length prefix is validated against `max` *before* any payload
+/// allocation, so a peer cannot make the reader buffer more than `max` bytes.
+/// Pass the ALPN's frame ceiling for the messages that can arrive at this read
+/// (ADR 013 § Wire Framing): a ceiling sized to the largest legitimate message
+/// keeps a stalled oversized frame from pinning memory.
+///
+/// # Errors
+///
+/// [`FrameError::TooLarge`] when the announced length exceeds `max`,
+/// [`FrameError::Varint`] for a malformed length prefix, and
+/// [`FrameError::Io`] when the stream fails or ends mid-frame.
+pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, max: u32) -> Result<Vec<u8>, FrameError> {
     let len = read_varint_u32(r).await?;
-    if len > MAX_MESSAGE_SIZE {
-        return Err(FrameError::TooLarge(len));
+    if len > max {
+        return Err(FrameError::TooLarge { len, max });
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf).await?;
@@ -211,14 +207,23 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>, Fram
 }
 
 /// Write one length-prefixed frame to an async writer.
+///
+/// The writer checks only that the length fits the `u32` prefix. Each message's
+/// encoder keeps it under its ALPN's frame ceiling; the worst-case encode tests
+/// beside each ceiling pin that.
+///
+/// # Errors
+///
+/// [`FrameError::TooLarge`] when the payload length does not fit a `u32`, and
+/// [`FrameError::Io`] when the stream fails.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     payload: &[u8],
 ) -> Result<(), FrameError> {
-    let len = u32::try_from(payload.len()).map_err(|_| FrameError::TooLarge(u32::MAX))?;
-    if len > MAX_MESSAGE_SIZE {
-        return Err(FrameError::TooLarge(len));
-    }
+    let len = u32::try_from(payload.len()).map_err(|_| FrameError::TooLarge {
+        len: u32::MAX,
+        max: u32::MAX,
+    })?;
     write_varint_u32(w, len).await?;
     w.write_all(payload).await?;
     Ok(())

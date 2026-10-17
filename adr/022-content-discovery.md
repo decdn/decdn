@@ -191,7 +191,7 @@ Checks fire cheapest-first (global → per-IP → per-peer) so a request rejecte
 
 Total tokens consumed: `k`, matching what the per-hash equivalent would have charged. The work done per second is bounded the same whether the publisher sends `n` separate `StoreRequest`s or one `BatchStoreRequest` of size `n`. The wire-framing, `holder`-de-duplication, and ack-shape savings are real; the throughput ceiling is unchanged. Partial admission avoids forcing a publisher to retransmit a full batch when only the tail is over budget — the ack identifies rejected hashes by their request-order position, and the publisher retries only those.
 
-**Why three layers, not one.** Per-peer alone is bypassable: any QUIC client can initiate a `cdn/dht/v1` connection and rotate `NodeId` at zero cost (the STORE bonded-operator-set check applies only after admission, and FIND_VALUE / FIND_NODE require no bonded-operator membership at all). The per-IP layer raises the cost of single-source flooding — IP rotation requires money (proxies, IPv6 prefix delegation, cloud bills). The global cap is defence in depth against distributed attacks across many IPs that would otherwise exhaust the node's routing-table-lookup and response-serialization capacity. The asymmetry between cheap request (`FindValueRequest` is ~40 bytes on the wire) and expensive response (full k-bucket walk plus serialization of K closer-node entries) is what makes DHT flooding economical to mount without these limits.
+**Why three layers, not one.** Per-peer alone is bypassable: any QUIC client can initiate a `cdn/dht/v1` connection and rotate `NodeId` at zero cost (the STORE bonded-operator-set check applies only after admission, and FIND_VALUE / FIND_NODE require no bonded-operator membership at all). The per-IP layer raises the cost of single-source flooding — IP rotation requires money (proxies, IPv6 prefix delegation, cloud bills). The global cap is defence in depth against distributed attacks across many IPs that would otherwise exhaust the node's routing-table-lookup and response-serialization capacity. The asymmetry between cheap request (`FindValueRequest` is 65 bytes on the wire) and expensive response (full k-bucket walk plus serialization of K closer-node entries) is what makes DHT flooding economical to mount without these limits.
 
 **Interaction with the per-publisher quota.** STORE admission additionally consumes one slot from the publisher's record quota ([§ Content Records and TTL](#content-records-and-ttl)); the rate limit fires first, so a rate-limited STORE never consumes a quota slot. FIND_VALUE responses that route the requester onward (via `closer_nodes`) do not multiply rate-limit consumption on the responder — one inbound request, one bucket token, regardless of response size.
 
@@ -261,13 +261,14 @@ The registry-seeded peer list participates in DHT lookups immediately, so there 
 
 ### DHT Bandwidth Analysis
 
-Per-RPC wire costs (32B hashes and NodeIds, varint framing, QUIC stream overhead). Each `FindValue` provider carries a range-keyed `Coverage` bitmap alongside its `NodeId` (§ Content Records and TTL), which puts a single-block holder's per-provider cost at ~34B rather than a bare NodeId's 32B:
+Per-RPC wire costs (32B hashes and NodeIds, varint framing, QUIC stream overhead). Each `FindValue` provider carries a range-keyed `Coverage` bitmap alongside its `NodeId` (§ Content Records and TTL). A single-block holder's per-provider cost is ~34B. A provider at the 200-byte bitmap cap costs 234B. Every DHT read refuses a frame above `MAX_DHT_FRAME` (64 KiB, [ADR 013 § Wire Framing](013-schema-evolution.md#wire-framing)). The largest message, a full `BatchStore`, is 59,939B:
 
 | RPC | Request | Response | Round-trip typical |
 |-----|---------|----------|--------------------|
-| FindValue | ~100B | ~500B typical, ~2.45 KB max (50 providers × 34B + 20 closer_nodes × 32B) | ~600B |
+| FindValue | ~100B | ~500B typical, 12,375B max (50 providers × 234B + 20 closer_nodes × 32B) | ~600B |
 | Store | ~100B | ~70B `StoreAck` | ~170B |
 | FindNode | ~100B | ~700B (20 closer_nodes) | ~800B |
+| BatchStore | 59,939B max (256 entries × up to 234B) | 259B max `BatchStoreAck` | depends on batch size |
 
 #### Steady state
 

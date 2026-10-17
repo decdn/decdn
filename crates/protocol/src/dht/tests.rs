@@ -292,58 +292,82 @@ fn dht_message_rejects_unknown_discriminant() {
     assert!(r.is_err());
 }
 
-// ADR 022 §DHT Bandwidth Analysis pins the max FindValueResponse at
-// ~2.3 KB on the wire (50 providers × 32 B + 20 closer_nodes × 32 B +
-// framing). We measure the **fully wrapped** `DhtMessage` payload (one
-// discriminant byte for the outer enum + the inner struct) PLUS the
-// length-prefix varint added by `crate::framing::write_frame` so the
-// bound matches the operator-observable wire shape — measuring only
-// the inner struct would let drift creep in via discriminant or
-// framing-layer changes.
+/// A `Coverage` at its 200-byte wire cap: the widest bitmap a peer may send.
+fn widest_coverage() -> Coverage {
+    let blocks =
+        u32::try_from(crate::coverage::MAX_COVERAGE_BYTES * 8).expect("1600 blocks fit u32");
+    Coverage::full(blocks)
+}
+
+/// Every `cdn/dht/v1` message at its widest legitimate encoding fits
+/// [`MAX_DHT_FRAME`] (ADR 013 § Wire Framing; sizes in ADR 022 § DHT Bandwidth
+/// Analysis): every list at its wire cap and every coverage bitmap at 200 bytes.
+/// Both reads (the server's request read and the client's response read) use
+/// that ceiling. The two largest messages are pinned exactly, so a wire-shape
+/// change that grows or drops a field fails here and not on a live node.
 #[test]
-fn find_value_response_max_framed_size_under_ceiling() -> Result<(), postcard::Error> {
-    let inner = FindValueResponse {
-        hash: ch(0xFF),
-        providers: (0..MAX_PROVIDERS_PER_HASH)
-            .map(|_| provider(nid(0xCD)))
-            .collect(),
-        closer_nodes: closer(vec![nid(0xCD); MAX_CLOSER_NODES]),
+fn dht_frame_ceiling_holds_the_largest_message() -> Result<(), postcard::Error> {
+    let ceiling = MAX_DHT_FRAME as usize;
+    let widest_provider = Provider {
+        node: nid(0xCD),
+        coverage: widest_coverage(),
     };
-    let msg = DhtMessage::FindValueResponse(inner.clone());
-    let payload = postcard::to_allocvec(&msg)?;
-    // Account for the framing varint length prefix the writer prepends.
-    // postcard `to_allocvec(&u32)` produces the same varint layout, so
-    // its length is the right proxy for the prefix's byte count.
-    let payload_len_u32: u32 =
-        u32::try_from(payload.len()).expect("payload length must fit in u32 for framing varint");
-    let length_prefix_len = postcard::to_allocvec(&payload_len_u32)?.len();
-    let framed_len = payload.len() + length_prefix_len;
-    // 1 (enum discriminant) + 32 (hash) + 1 (providers len varint, 50 fits
-    // 1B) + 50×34 (providers: 32B `NodeId` + 2B `Coverage` — a
-    // single-block-covering `Coverage` encodes as a 1-byte varint length
-    // + 1 payload byte) = 1700 + 1 (closer len varint, 20 fits 1B) +
-    // 20×32 (closer) = 640 → 1 + 32 + 1 + 1700 + 1 + 640 = 2375 B inner;
-    // + ~2B varint length prefix = ~2377 B on the wire. Range-keyed
-    // discovery (this module's `Provider.coverage` field) grew the
-    // per-provider cost from 32B to 34B over the plain-`NodeId` shape
-    // the original 2.3 KB ADR 022 ceiling assumed; round up to 2.45 KB.
-    assert!(
-        framed_len <= 2_450,
-        "framed max DhtMessage::FindValueResponse = {framed_len} B exceeds the 2.45 KB ceiling"
-    );
-    // Lower-bound guard: a future regression that drops `providers` or
-    // `closer_nodes` from the wire shape would shrink the encoded
-    // size well below the modeled payload (~2.38 KB) without failing
-    // the upper-bound assert. Pin the lower bound at 2.3 KB so any
-    // accidental field removal trips the test loudly.
-    assert!(
-        framed_len > 2_300,
-        "framed max DhtMessage::FindValueResponse shrank to {framed_len} B \
-         — has the wire shape lost providers/closer_nodes/coverage?"
-    );
-    // Sanity: round-trips through the outer enum.
-    let decoded: DhtMessage = postcard::from_bytes(&payload)?;
-    assert_eq!(decoded, msg);
+    let batch = DhtMessage::BatchStore(BatchStoreRequest {
+        entries: (0..MAX_BATCH_STORE_HASHES)
+            .map(|_| (ch(0xEE), widest_coverage()))
+            .collect(),
+        holder: nid(0xAB),
+    });
+    let find_value_response = DhtMessage::FindValueResponse(FindValueResponse {
+        hash: ch(0xFF),
+        providers: vec![widest_provider; MAX_PROVIDERS_PER_HASH],
+        closer_nodes: closer(vec![nid(0xCD); MAX_CLOSER_NODES]),
+    });
+
+    let batch_len = postcard::to_allocvec(&batch)?.len();
+    // 1 discriminant + 2 (entry count 256) + 256 × (32 hash + 2 + 200 bitmap)
+    // + 32 holder.
+    assert_eq!(batch_len, 59_939, "BatchStoreRequest at full width");
+    let response_len = postcard::to_allocvec(&find_value_response)?.len();
+    // 1 + 32 hash + 1 + 50 × (32 node + 2 + 200 bitmap) + 1 + 20 × 32.
+    assert_eq!(response_len, 12_375, "FindValueResponse at full width");
+
+    let others = [
+        DhtMessage::FindValue(sample_find_value_request()),
+        DhtMessage::Store(StoreRequest {
+            hash: ch(0x01),
+            holder: nid(0x02),
+            coverage: widest_coverage(),
+        }),
+        DhtMessage::StoreAck(StoreAck {
+            hash: ch(0x03),
+            accepted: true,
+        }),
+        DhtMessage::BatchStoreAck(BatchStoreAck {
+            results: vec![true; MAX_BATCH_STORE_HASHES],
+        }),
+        DhtMessage::FindNode(FindNodeRequest {
+            target: nid(0x04),
+            requester: nid(0x05),
+        }),
+        DhtMessage::FindNodeResponse(FindNodeResponse {
+            target: nid(0x06),
+            closer_nodes: closer(vec![nid(0x07); MAX_CLOSER_NODES]),
+        }),
+    ];
+    let mut lens = vec![batch_len, response_len];
+    for msg in &others {
+        lens.push(postcard::to_allocvec(msg)?.len());
+    }
+    for len in lens {
+        assert!(
+            len <= ceiling,
+            "a DHT message of {len} B exceeds MAX_DHT_FRAME"
+        );
+    }
+    // Sanity: the widest message still round-trips through the outer enum.
+    let decoded: DhtMessage = postcard::from_bytes(&postcard::to_allocvec(&batch)?)?;
+    assert_eq!(decoded, batch);
     Ok(())
 }
 

@@ -771,7 +771,7 @@ pub(crate) async fn assert_inbound_failures_attributed(
 /// private `decdn_client::read_client_message`, exposed for the raw fake
 /// clients/servers the `cdn/client/v1` integration binaries hand-roll.
 pub(crate) async fn read_client_msg(recv: &mut RecvStream) -> anyhow::Result<ClientMessage> {
-    let frame = read_frame(recv)
+    let frame = read_frame(recv, decdn_protocol::MAX_CHUNK_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read frame: {e}"))?;
     let (msg, _rest) =
@@ -803,8 +803,9 @@ impl BufferedClientReader {
     /// future is dropped, the bytes it read stay buffered for the next call.
     pub(crate) async fn read(&mut self, recv: &mut RecvStream) -> anyhow::Result<ClientMessage> {
         loop {
-            if let Some((header_len, payload_len)) = decdn_protocol::framing::parse_frame(&self.buf)
-                .map_err(|e| anyhow::anyhow!("parse frame: {e}"))?
+            if let Some((header_len, payload_len)) =
+                decdn_protocol::framing::parse_frame(&self.buf, decdn_protocol::MAX_CHUNK_FRAME)
+                    .map_err(|e| anyhow::anyhow!("parse frame: {e}"))?
             {
                 let total = header_len.saturating_add(payload_len);
                 let frame: Vec<u8> = self.buf.drain(..total).skip(header_len).collect();
@@ -843,7 +844,7 @@ pub(crate) async fn read_stream_response(
     decdn_protocol::StreamResponse,
     decdn_protocol::StreamResponseExt,
 )> {
-    let frame = read_frame(recv)
+    let frame = read_frame(recv, decdn_protocol::MAX_CLIENT_CONTROL_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read frame: {e}"))?;
     let (msg, tail) =
@@ -866,6 +867,23 @@ pub(crate) async fn write_client_msg(
     write_frame(send, &payload)
         .await
         .map_err(|e| anyhow::anyhow!("write: {e}"))
+}
+
+/// The varint length prefix `write_frame` puts in front of a `len`-byte frame,
+/// on its own. A test writes it with no payload to announce a frame the server
+/// must refuse (or wait on) on the header alone.
+pub(crate) fn frame_len_prefix(len: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut v = len;
+    loop {
+        let byte = u8::try_from(v & 0x7F).unwrap_or(0);
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
+    }
 }
 
 /// Accept exactly one inbound connection on `ep` — the [`spawn_server`] accept

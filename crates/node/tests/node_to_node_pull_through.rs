@@ -673,7 +673,7 @@ async fn lying_upstream(
     // `StreamEnd`. A reject here would give the requester a voucher error instead
     // of the integrity error the test asserts. Only the frame read tolerates a
     // peer close; the decode below does not.
-    let frame = match read_frame(&mut recv).await {
+    let frame = match read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME).await {
         Err(_) if peer_closed(&conn) => return Ok(()),
         frame => frame.map_err(|e| anyhow::anyhow!("read frame: {e}"))?,
     };

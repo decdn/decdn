@@ -174,7 +174,10 @@ fn an_unmarked_error_is_a_node_fault() {
 /// errors carry.
 #[test]
 fn an_oversized_frame_is_a_node_fault_but_a_write_io_error_is_the_peer() {
-    let too_large = write_frame_error(FrameError::TooLarge(1 << 30));
+    let too_large = write_frame_error(FrameError::TooLarge {
+        len: 1 << 30,
+        max: 1 << 20,
+    });
     assert!(
         !is_peer_attributable(&too_large),
         "an oversized frame must reach error!: {too_large}"
@@ -287,6 +290,8 @@ fn paid_progress_tags_only_a_paid_stream() {
 /// `encode_chunk_frame` + `write_frame`. The chunk
 /// counts span what a real frame looks like — one queued item, a handful, and
 /// the ~130 a default 1 MiB frame spans over 64 B proof nodes and 16 KiB leaves.
+/// A combination past one `CHUNK_BYTES` payload is skipped: no legal frame holds
+/// it, and the encoders refuse it against `MAX_CHUNK_FRAME`.
 #[tokio::test]
 async fn chunk_frame_bufs_match_the_single_buffer_encoder() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -296,6 +301,9 @@ async fn chunk_frame_bufs_match_the_single_buffer_encoder() -> Result<(), Box<dy
                 .map(|i| Bytes::from(vec![u8::try_from(i % 251).unwrap_or(0); chunk_len]))
                 .collect();
             let total: usize = chunks.iter().map(Bytes::len).sum();
+            if u64::try_from(total)? > decdn_protocol::CHUNK_BYTES {
+                continue;
+            }
 
             // Build the frame the only way production does: push the items onto a
             // `FrameQueue`, then cut all of them into one `FrameChunks`.

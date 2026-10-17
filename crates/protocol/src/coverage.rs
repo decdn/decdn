@@ -46,7 +46,8 @@ pub const MAX_DISCOVERABLE_BLOB_BYTES: u64 = 100 << 30;
 /// coverage for one over the DHT.
 ///
 /// Without this cap a bonded publisher could pin arbitrary receiver memory:
-/// coverage length is otherwise bounded only by the 16 MiB frame, and the
+/// coverage length is otherwise bounded only by the 64 KiB DHT frame
+/// ([`crate::dht::MAX_DHT_FRAME`]), and the
 /// per-publisher record quota multiplies it (stored memory ≈ records × bitmap).
 /// The cap makes an oversized bitmap unrepresentable rather than defended after
 /// the fact. For 100 GiB it is 200 bytes.
@@ -195,7 +196,7 @@ pub struct Coverage {
 /// rather than stored, and an untrusted peer cannot amplify one record into
 /// arbitrary receiver memory. This bounds what the wire represents, not what a
 /// node may serve. Decoding the
-/// bytes before the length check is safe: the enclosing 16 MiB frame cap and
+/// bytes before the length check is safe: the enclosing frame ceiling and
 /// serde's cautious capacity hint bound the allocation independently of the
 /// wire length prefix, so the prefix is never trusted for sizing (#845).
 fn deserialize_bounded_blocks<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
