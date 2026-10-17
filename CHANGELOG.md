@@ -533,7 +533,8 @@ since project inception and will roll into the first tagged release.
 
 - **`cdn/client/v1`: `ChunkData` frame size is now the sender's choice.** The
   protocol bounded a payload at 1,024 bytes; it now bounds it only as non-empty,
-  with the framing layer's 16 MiB `MAX_MESSAGE_SIZE` as the effective ceiling.
+  with the framing layer's `MAX_CHUNK_FRAME` (one `CHUNK_BYTES` payload) as the
+  effective ceiling.
   `decdn_protocol::CHUNK_SIZE` and `MessageValidationError::ChunkTooLarge` are
   removed. A serving node coalesces to `payment.frame_target_bytes` (new, default
   1 MiB) instead of chopping at 1 KiB, so a served MiB costs about one frame
@@ -4292,6 +4293,31 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: a peer could pin up to 16 MiB per stream with an oversized frame
+  (#2501).** Every frame read accepted a length prefix up to a global 16 MiB
+  `MAX_MESSAGE_SIZE` and allocated the buffer before the payload arrived, though
+  no request is larger than a few hundred bytes. A peer with no stake or funds
+  could announce a near-16 MiB request, send most of it, and stall, holding the
+  buffer for the 5 s read timeout. On `cdn/client/v1` the node read the request
+  before it checked the per-connection stream cap, so one connection could hold
+  100 such buffers (about 1.6 GiB); the only bound was the attacker's upload
+  bandwidth. Every read now names a ceiling sized to its ALPN's largest
+  legitimate message (ADR 013 § Wire Framing): `MAX_PROBE_FRAME` (1 KiB),
+  `MAX_CLIENT_CONTROL_FRAME` (4 KiB) for requests, payment proofs and
+  `StreamResponse`, `MAX_CHUNK_FRAME` (one `CHUNK_BYTES` `ChunkData`) for the
+  delivery stream, and `MAX_DHT_FRAME` (64 KiB) for DHT requests and responses.
+  The node resets an over-cap client stream with `RATE_LIMITED` before it reads
+  the request. The node's QUIC transport also had no connection-level receive
+  window, so a peer could park about 1.25 MB of out-of-order data per stream
+  below the reader; a new 8 MiB connection window (`QUIC_CONNECTION_RECEIVE_WINDOW`)
+  bounds it, which also caps one connection's in-flight download at about
+  80 MB/s at a 100 ms round trip. At the default 256 handlers the memory stalled
+  peers can hold is now bounded at about 2.2 GiB (ADR 013 § Wire Framing);
+  operators with less memory lower `security.max_concurrent_handlers`.
+  Legitimate traffic is unchanged, so this is not wire-breaking.
+  **API break (`decdn-protocol`):** `read_frame` and `framing::parse_frame` take
+  a required `max`, `MAX_MESSAGE_SIZE` is removed, and `FrameError::TooLarge` is
+  now `{ len: u64, max: u32 }`. Reported by Radeonares32.
 - `aws-smithy-json` → 0.62.7 (CVE-2026-18140: uncontrolled recursion on deeply
   nested JSON, a denial of service). It reaches the node through the S3
   origin's AWS SDK: `aws-sdk-s3` and the `aws-config` credential chain (SSO,

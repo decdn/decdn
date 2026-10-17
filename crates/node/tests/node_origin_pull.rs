@@ -351,7 +351,7 @@ async fn answer_probe_with_coverage(
         .accept_bi()
         .await
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
-    let frame = read_frame(&mut recv)
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_PROBE_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read probe request: {e}"))?;
     let (msg, _) = decode_message::<ProbeMessage>(&frame)
@@ -1705,7 +1705,7 @@ async fn serve_wrong_bytes(
         .await
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req_msg = {
-        let frame = read_frame(&mut recv)
+        let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
             .await
             .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
         decode_message::<ClientMessage>(&frame)
@@ -1746,7 +1746,7 @@ async fn serve_wrong_bytes(
     // Read the closing voucher; acceptance is implicit (continued delivery is the
     // ack, ADR 005), so the server just proceeds to the integrity check.
     let voucher_msg = {
-        let frame = read_frame(&mut recv)
+        let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
             .await
             .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
         decode_message::<ClientMessage>(&frame)
@@ -1838,7 +1838,7 @@ async fn serve_gated_correct_bytes(
             return Ok(());
         };
         let req_msg = {
-            let frame = read_frame(&mut recv)
+            let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
                 .await
                 .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
             decode_message::<ClientMessage>(&frame)
@@ -1890,7 +1890,7 @@ async fn serve_gated_correct_bytes(
         // anything else so a future protocol drift surfaces here, not as an opaque
         // buyer-side stall.
         let voucher_msg = {
-            let frame = read_frame(&mut recv)
+            let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
                 .await
                 .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
             decode_message::<ClientMessage>(&frame)
@@ -2032,7 +2032,7 @@ async fn serve_then_reject_voucher(
         .await
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req_msg = {
-        let frame = read_frame(&mut recv)
+        let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
             .await
             .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
         decode_message::<ClientMessage>(&frame)
@@ -2073,7 +2073,7 @@ async fn serve_then_reject_voucher(
     // Reject the closing voucher instead of acking it — the buyer's own payment
     // fault, surfaced as a mid-stream `StreamError`.
     let voucher_msg = {
-        let frame = read_frame(&mut recv)
+        let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
             .await
             .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
         decode_message::<ClientMessage>(&frame)
@@ -2119,7 +2119,7 @@ async fn serve_then_error_on_voucher(
         .await
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req_msg = {
-        let frame = read_frame(&mut recv)
+        let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
             .await
             .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
         decode_message::<ClientMessage>(&frame)
@@ -2158,7 +2158,7 @@ async fn serve_then_error_on_voucher(
         .map_err(|e| anyhow::anyhow!("write chunk: {e}"))?;
     }
     let voucher_msg = {
-        let frame = read_frame(&mut recv)
+        let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
             .await
             .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
         decode_message::<ClientMessage>(&frame)
@@ -2357,7 +2357,7 @@ fn spawn_a_stalling_server(
                     // rather than seeing EOF. Read the request, then go quiet
                     // until the buyer gives up and drops the connection.
                     if let Ok((_send, mut recv)) = conn.accept_bi().await {
-                        let _ = read_frame(&mut recv).await;
+                        let _ = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME).await;
                         conn.closed().await;
                     }
                 });
@@ -2392,7 +2392,7 @@ fn spawn_a_counting_stalling_server(
                 streams.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     if let Ok((_send, mut recv)) = conn.accept_bi().await {
-                        let _ = read_frame(&mut recv).await;
+                        let _ = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME).await;
                         conn.closed().await;
                     }
                 });
@@ -3775,7 +3775,7 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
 /// Read the buyer's opening `StreamRequest` off a freshly-accepted client
 /// stream — the first move every hand-rolled upstream below makes.
 async fn read_stream_request(recv: &mut iroh::endpoint::RecvStream) -> Result<StreamRequest> {
-    let frame = read_frame(recv)
+    let frame = read_frame(recv, decdn_protocol::MAX_CHUNK_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
     let (msg, _) = decode_message::<ClientMessage>(&frame)
@@ -4093,7 +4093,7 @@ async fn serve_a_paid_interval_then_go_silent(
     }
 
     let voucher_msg = {
-        let frame = read_frame(&mut recv)
+        let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
             .await
             .map_err(|e| anyhow::anyhow!("read voucher: {e}"))?;
         decode_message::<ClientMessage>(&frame)
@@ -6882,7 +6882,7 @@ async fn leaf_ranged_paid_pull(
 }
 
 async fn read_client(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMessage> {
-    let frame = read_frame(recv)
+    let frame = read_frame(recv, decdn_protocol::MAX_CHUNK_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("leaf read frame: {e}"))?;
     let (msg, _) =
@@ -6896,7 +6896,7 @@ async fn read_client(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMess
 async fn read_client_response(
     recv: &mut iroh::endpoint::RecvStream,
 ) -> Result<(StreamResponse, StreamResponseExt)> {
-    let frame = read_frame(recv)
+    let frame = read_frame(recv, decdn_protocol::MAX_CHUNK_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("leaf read frame: {e}"))?;
     let (msg, tail) =
@@ -8556,7 +8556,7 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
     write_frame(&mut send2, &payload2)
         .await
         .map_err(|e| anyhow::anyhow!("write req: {e}"))?;
-    let frame2 = read_frame(&mut recv2)
+    let frame2 = read_frame(&mut recv2, decdn_protocol::MAX_CHUNK_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read resp: {e}"))?;
     let (msg2, rest2) = decode_message::<ClientMessage>(&frame2)
@@ -9481,7 +9481,7 @@ enum Credit {
 /// Read one payment proof — a `Voucher` or a `ChunkPreimage`, the whole
 /// payer→node vocabulary after the opening request.
 async fn read_proof(recv: &mut iroh::endpoint::RecvStream) -> Result<ClientMessage> {
-    let frame = read_frame(recv)
+    let frame = read_frame(recv, decdn_protocol::MAX_CHUNK_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read proof: {e}"))?;
     let (msg, _) =
@@ -9531,7 +9531,7 @@ async fn serve_wire_paced(
         .await
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req_msg = {
-        let frame = read_frame(&mut recv)
+        let frame = read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME)
             .await
             .map_err(|e| anyhow::anyhow!("read request: {e}"))?;
         decode_message::<ClientMessage>(&frame)

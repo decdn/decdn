@@ -261,7 +261,7 @@ async fn write_request(
 /// check are the caller's obligation (ADR 005 / ADR 014 §1), not enforced
 /// here — see [`probe_once`].
 async fn read_response(mut recv: RecvStream) -> anyhow::Result<(ProbeResponse, ProbeResponseExt)> {
-    let frame = read_frame(&mut recv)
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_PROBE_FRAME)
         .await
         .map_err(|e| transport_error("read response", e))?;
     let (msg, rest) = decode_message::<ProbeMessage>(&frame)

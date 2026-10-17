@@ -131,6 +131,7 @@ const APP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 // finishes the stream so the reason survives.
 const APP_ERR_NO_ERROR: u32 = 0x00;
 const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
+const APP_ERR_MESSAGE_TOO_LARGE: u32 = 0x02;
 const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 
 /// Per-lane delivery state: the validated voucher watermark plus the lane-wide
@@ -2563,7 +2564,7 @@ struct StreamReadError {
 
 const fn frame_err_code(e: &FrameError) -> u32 {
     match e {
-        FrameError::TooLarge(_) => 0x02,
+        FrameError::TooLarge { .. } => APP_ERR_MESSAGE_TOO_LARGE,
         FrameError::Io(_) => APP_ERR_NO_ERROR,
         FrameError::Varint | FrameError::Decode(_) => APP_ERR_MALFORMED_MESSAGE,
     }
@@ -2610,8 +2611,18 @@ enum FirstMessage {
 /// [`StreamRequestExt`] parsed from the trailing bytes — the ADR 005 two-phase
 /// pattern; an absent extension yields `StreamRequestExt::default()`). Any other
 /// variant is a protocol fault.
+///
+/// The read is capped at [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`]. A request
+/// is a few hundred bytes, so a length prefix past the ceiling is refused with
+/// `MESSAGE_TOO_LARGE` before the payload is buffered: a stalled oversized
+/// frame cannot pin memory for the read timeout (ADR 013 § Wire Framing).
 async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, StreamReadError> {
-    let frame = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_frame(recv)).await {
+    let frame = match tokio::time::timeout(
+        REQUEST_READ_TIMEOUT,
+        read_frame(recv, decdn_protocol::MAX_CLIENT_CONTROL_FRAME),
+    )
+    .await
+    {
         Err(_) => {
             return Err(StreamReadError {
                 err: anyhow::anyhow!("stream request timed out after {REQUEST_READ_TIMEOUT:?}"),
@@ -2791,16 +2802,21 @@ impl BufferedProofReader {
     /// read more. The inner `Result` is the frame's own outcome: its bytes are
     /// consumed either way, so one bad frame cannot wedge the buffer.
     ///
-    /// A malformed length prefix, an undecodable body, and a message that is
-    /// neither a `Voucher` nor a `ChunkPreimage` are all the peer's doing and
-    /// carry [`PeerFault`](wire::PeerFault). The bounds check between them is this
+    /// A malformed length prefix, a length past
+    /// [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`], an undecodable body, and a
+    /// message that is neither a `Voucher` nor a `ChunkPreimage` are all the
+    /// peer's doing and carry [`PeerFault`](wire::PeerFault). The ceiling is
+    /// checked on the length prefix alone, so the buffer never holds more than
+    /// one ceiling's worth of frame plus one read. The bounds check between them is this
     /// node's own invariant and carries no marker.
     fn take_buffered(&mut self) -> anyhow::Result<Option<anyhow::Result<Proof>>> {
-        let Some((header_len, payload_len)) = decdn_protocol::framing::parse_frame(&self.buf)
-            .map_err(|e| {
-                anyhow::Error::new(wire::PeerFault)
-                    .context(format!("proof frame parse failed: {e}"))
-            })?
+        let Some((header_len, payload_len)) = decdn_protocol::framing::parse_frame(
+            &self.buf,
+            decdn_protocol::MAX_CLIENT_CONTROL_FRAME,
+        )
+        .map_err(|e| {
+            anyhow::Error::new(wire::PeerFault).context(format!("proof frame parse failed: {e}"))
+        })?
         else {
             return Ok(None);
         };

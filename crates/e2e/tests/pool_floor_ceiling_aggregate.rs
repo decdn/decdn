@@ -534,10 +534,13 @@ async fn open_and_hold(
         .await
         .context("write StreamRequest")?;
 
-    let first = tokio::time::timeout(FIRST_FRAME_BUDGET, decdn_protocol::read_frame(&mut recv))
-        .await
-        .context("node sent no open frame within budget")?
-        .context("read open frame")?;
+    let first = tokio::time::timeout(
+        FIRST_FRAME_BUDGET,
+        decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_CLIENT_CONTROL_FRAME),
+    )
+    .await
+    .context("node sent no open frame within budget")?
+    .context("read open frame")?;
     let (msg, tail) =
         decdn_protocol::decode_message::<ClientMessage>(&first).context("decode open frame")?;
     let ClientMessage::StreamResponse(resp) = msg else {
@@ -560,7 +563,12 @@ async fn open_and_hold(
     // A park SHORT of the floor is the only case the `IDLE_BUDGET` gap catches.
     let mut delivered: usize = 0;
     while delivered < floor_bytes {
-        match tokio::time::timeout(IDLE_BUDGET, decdn_protocol::read_frame(&mut recv)).await {
+        match tokio::time::timeout(
+            IDLE_BUDGET,
+            decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME),
+        )
+        .await
+        {
             Ok(Ok(frame)) => delivered += frame.len(),
             // Idle before the floor arrived, or a clean close: the stream parked
             // (or ended) short of its floor. Stop and let the caller's floor check

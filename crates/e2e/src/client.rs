@@ -508,7 +508,12 @@ impl ClientFixture {
             } else {
                 WIRE_TAP_IDLE
             };
-            match tokio::time::timeout(budget, decdn_protocol::read_frame(&mut recv)).await {
+            match tokio::time::timeout(
+                budget,
+                decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME),
+            )
+            .await
+            {
                 Ok(Ok(frame)) => frames.push(frame),
                 // Idle: the expected terminator on a successful delivery.
                 Err(_) => break,
@@ -578,11 +583,13 @@ impl ClientFixture {
             .await
             .context("write delivery-capture StreamRequest")?;
 
-        let frame =
-            tokio::time::timeout(WIRE_TAP_FIRST_FRAME, decdn_protocol::read_frame(&mut recv))
-                .await
-                .context("delivery capture: node sent no open frame")?
-                .context("delivery capture: read frame")?;
+        let frame = tokio::time::timeout(
+            WIRE_TAP_FIRST_FRAME,
+            decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_CLIENT_CONTROL_FRAME),
+        )
+        .await
+        .context("delivery capture: node sent no open frame")?
+        .context("delivery capture: read frame")?;
         conn.close(0u32.into(), b"delivery capture complete");
 
         let (msg, _rest) = decode_message::<ClientMessage>(&frame)

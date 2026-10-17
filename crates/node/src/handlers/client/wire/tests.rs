@@ -174,7 +174,10 @@ fn an_unmarked_error_is_a_node_fault() {
 /// errors carry.
 #[test]
 fn an_oversized_frame_is_a_node_fault_but_a_write_io_error_is_the_peer() {
-    let too_large = write_frame_error(FrameError::TooLarge(1 << 30));
+    let too_large = write_frame_error(FrameError::TooLarge {
+        len: 1 << 30,
+        max: 1 << 20,
+    });
     assert!(
         !is_peer_attributable(&too_large),
         "an oversized frame must reach error!: {too_large}"
@@ -285,17 +288,21 @@ fn paid_progress_tags_only_a_paid_stream() {
 /// This is the claim the whole zero-copy path rests on: the serve loops build no
 /// `ChunkData` frame at all, so nothing else proves the header they emit matches
 /// `encode_chunk_frame` + `write_frame`. The chunk
-/// counts span what a real frame looks like — one queued item, a handful, and
-/// the ~130 a default 1 MiB frame spans over 64 B proof nodes and 16 KiB leaves.
+/// counts span what a real frame looks like — one queued item, a handful, 64 (a
+/// full 1 MiB frame of 16 KiB leaves, exactly at `MAX_CHUNK_FRAME`) and the ~130
+/// a default 1 MiB frame spans over 64 B proof nodes and 16 KiB leaves. A
+/// combination past one `CHUNK_BYTES` payload holds no legal frame: it must be
+/// refused, never encoded.
 #[tokio::test]
 async fn chunk_frame_bufs_match_the_single_buffer_encoder() -> Result<(), Box<dyn std::error::Error>>
 {
-    for count in [1usize, 2, 4, 5, 130] {
+    for count in [1usize, 2, 4, 5, 64, 65, 130] {
         for chunk_len in [1usize, 64, 16 * 1024] {
             let chunks: Vec<Bytes> = (0..count)
                 .map(|i| Bytes::from(vec![u8::try_from(i % 251).unwrap_or(0); chunk_len]))
                 .collect();
             let total: usize = chunks.iter().map(Bytes::len).sum();
+            let past_ceiling = u64::try_from(total)? > decdn_protocol::CHUNK_BYTES;
 
             // Build the frame the only way production does: push the items onto a
             // `FrameQueue`, then cut all of them into one `FrameChunks`.
@@ -305,6 +312,13 @@ async fn chunk_frame_bufs_match_the_single_buffer_encoder() -> Result<(), Box<dy
             }
             let frame = fq.cut(total).expect("a non-empty queue cuts a frame");
 
+            if past_ceiling {
+                assert!(
+                    chunk_frame_bufs(&frame).is_err(),
+                    "{count} chunks of {chunk_len} bytes exceed MAX_CHUNK_FRAME and must be refused"
+                );
+                continue;
+            }
             let bufs = chunk_frame_bufs(&frame)?;
             let mut via_bufs = Vec::new();
             for b in &bufs {

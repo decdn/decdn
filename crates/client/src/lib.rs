@@ -3517,7 +3517,7 @@ impl UpstreamPull {
     /// the floor trips before the first byte (`cumulative == 0`). A malformed `ChunkData` is
     /// not raised here: an empty payload is rejected at decode by `ChunkData`'s
     /// `serde(try_from)` (#1088) and an oversized frame by the framing layer's
-    /// `MAX_MESSAGE_SIZE` before it allocates, so both surface out of `read_client_message`.
+    /// `MAX_CHUNK_FRAME` before it allocates, so both surface out of `read_client_message`.
     pub async fn next_chunk(&mut self) -> anyhow::Result<Option<Bytes>> {
         if self.ended {
             return Ok(None);
@@ -4342,10 +4342,14 @@ async fn write_message(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Re
 /// Separate from [`read_client_message`] because only this message carries an
 /// extension: every mid-stream variant is a single postcard value, and widening
 /// the shared reader would push an always-`default()` ext onto all of them.
+///
+/// The read is capped at [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`]: a
+/// `StreamResponse` is a few hundred bytes, so a node cannot make the payer
+/// buffer a chunk-sized frame before the stream has opened.
 async fn read_stream_response(
     recv: &mut RecvStream,
 ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
-    let frame = read_frame(recv)
+    let frame = read_frame(recv, decdn_protocol::MAX_CLIENT_CONTROL_FRAME)
         .await
         .map_err(|e| rate_limited::transport_error("frame read failed", e))?;
     let (msg, tail) = decode_message::<ClientMessage>(&frame)
@@ -4365,7 +4369,8 @@ async fn read_client_message<R: tokio::io::AsyncRead + Unpin>(
     // open-stage sites (`connect` / `open_bi` / the initial request write and
     // [`read_stream_response`]), never here — the limiters shed before any stream
     // exists (ADR 013 §Application Error Codes). Plain text, not `transport_error`.
-    let frame = read_frame(recv)
+    // Capped at one full `ChunkData` interval, the largest message after the open.
+    let frame = read_frame(recv, decdn_protocol::MAX_CHUNK_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("frame read failed: {e}"))?;
     let (msg, _rest) = decode_message::<ClientMessage>(&frame)

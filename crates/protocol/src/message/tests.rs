@@ -375,3 +375,37 @@ fn probe_response_wire_format_is_stable() -> Result<(), postcard::Error> {
     assert_eq!(framed, expected_framed);
     Ok(())
 }
+
+/// Both `cdn/probe/v1` messages at their widest legitimate encoding fit
+/// [`MAX_PROBE_FRAME`] (ADR 013 § Wire Framing): every `u64` at full varint
+/// width, an EOA `slash_sig`, and the extension's coverage bitmap at its
+/// 200-byte wire cap. The sizes are pinned exactly so the headroom stays visible.
+#[test]
+fn probe_frame_ceiling_holds_the_largest_message() -> Result<(), Box<dyn std::error::Error>> {
+    let request = crate::framing::encode_message(&ProbeMessage::Request(ProbeRequest {
+        hash: [0x01; 32],
+        timestamp_us: u64::MAX,
+    }))?;
+    assert_eq!(request.len(), 43, "ProbeRequest at full width");
+
+    let response = ProbeResponse {
+        body: ProbeResponseBody {
+            hash: [0x02; 32],
+            has_blob: true,
+            rate_per_mb: MAX_RATE_PER_MB,
+            timestamp_us: u64::MAX,
+        },
+        slash_sig: vec![0x03; SLASH_SIG_LEN],
+    };
+    let ext = ProbeResponseExt {
+        total_bytes: Some(u64::MAX),
+        coverage: crate::Coverage::full(u32::try_from(crate::coverage::MAX_COVERAGE_BYTES * 8)?),
+    };
+    let response = encode_probe_response(&response, Some(&ext))?;
+    assert_eq!(response.len(), 325, "ProbeResponse + ext at full width");
+
+    for len in [request.len(), response.len()] {
+        assert!(len <= MAX_PROBE_FRAME as usize);
+    }
+    Ok(())
+}

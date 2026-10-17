@@ -215,7 +215,7 @@ async fn find_node_returns_closer_peers_from_routing_table() -> anyhow::Result<(
         .map_err(|e| anyhow::anyhow!("write: {e}"))?;
     send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
 
-    let frame = read_frame(&mut recv)
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_DHT_FRAME)
         .await
         .map_err(|e| anyhow::anyhow!("read: {e}"))?;
     let (msg, _rest) = decode_message::<wire::DhtMessage>(&frame)?;
@@ -326,7 +326,7 @@ async fn find_value_with_empty_store_returns_no_providers_but_closer_nodes() -> 
     let payload = encode_message(&wire::DhtMessage::FindValue(req))?;
     write_frame(&mut send, &payload).await?;
     send.finish()?;
-    let frame = read_frame(&mut recv).await?;
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_DHT_FRAME).await?;
     let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
     let resp = match msg {
         wire::DhtMessage::FindValueResponse(r) => r,
@@ -418,7 +418,7 @@ async fn find_node_does_not_insert_attacker_supplied_requester() -> anyhow::Resu
     let payload = encode_message(&wire::DhtMessage::FindNode(req))?;
     write_frame(&mut send, &payload).await?;
     send.finish()?;
-    let frame = read_frame(&mut recv).await?;
+    let frame = read_frame(&mut recv, decdn_protocol::MAX_DHT_FRAME).await?;
     let (_msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
 
     conn.close(0u32.into(), b"bye");
@@ -452,12 +452,7 @@ mod adr_013_error_codes {
     use iroh::endpoint::{ConnectionError, ReadError, ReadToEndError, VarInt};
 
     const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
-    // `APP_ERR_MESSAGE_TOO_LARGE = 0x02` is mapped by `frame_err_code`
-    // when the framing layer reports `FrameError::TooLarge` — exercising
-    // it requires sending a length-prefix above `MAX_MESSAGE_SIZE`
-    // without going through `write_frame` (which caps before writing).
-    // Left for a future low-level framing test once a raw-bytes helper
-    // is available.
+    const APP_ERR_MESSAGE_TOO_LARGE: u32 = 0x02;
     const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
 
     /// Spin up a permissive DHT server, return its address + a join handle
@@ -521,6 +516,76 @@ mod adr_013_error_codes {
                 "expected close code {expected_code:#x} (RESET or ApplicationClosed), got {other:?}"
             ),
         }
+    }
+
+    /// A DHT response announced past [`decdn_protocol::MAX_DHT_FRAME`] fails the
+    /// requester's lookup on its length prefix alone (ADR 013 § Wire Framing).
+    /// The node queries peers it cannot trust, so it must not buffer toward the
+    /// announced length or wait out `DHT_CLIENT_TIMEOUT` for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_refuses_an_oversized_response_on_its_prefix() -> anyhow::Result<()> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let responder =
+            support::spawn_oversized_responder(server_ep.clone(), decdn_protocol::MAX_DHT_FRAME);
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+        let started = std::time::Instant::now();
+        let result = decdn_node::dht::client::find_value(
+            &client_ep,
+            target,
+            ContentHash::from_bytes([0x11; 32]),
+            NodeId::from_bytes(*client_ep.id().as_bytes()),
+        )
+        .await;
+        let Err(err) = result else {
+            anyhow::bail!("an oversized response must fail the lookup");
+        };
+        anyhow::ensure!(
+            started.elapsed() < decdn_node::dht::client::DHT_CLIENT_TIMEOUT / 2,
+            "the lookup waited {:?} on an oversized response",
+            started.elapsed()
+        );
+        anyhow::ensure!(
+            format!("{err:#}").contains("exceeds the frame ceiling"),
+            "an oversized response must fail on the frame ceiling, got: {err:#}"
+        );
+        shutdown([responder], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
+    /// A request frame announced past [`decdn_protocol::MAX_DHT_FRAME`] →
+    /// `APP_ERR_MESSAGE_TOO_LARGE` (0x02), refused on the length prefix alone
+    /// (ADR 013 § Wire Framing). The client writes the prefix and a few body
+    /// bytes, then stalls with its send side open: the server must not wait for
+    /// the announced payload.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_frame_returns_message_too_large_code() -> anyhow::Result<()> {
+        let (server_ep, server_addr, server_id, accept_task) = spin_up_dht_server().await?;
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        let conn = client_ep
+            .connect(target, ALPN_DHT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let mut bytes = support::frame_len_prefix(decdn_protocol::MAX_DHT_FRAME + 1);
+        bytes.extend_from_slice(&[0u8; 512]);
+        send.write_all(&bytes).await?;
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_to_end(64))
+            .await
+            .map_err(|_| anyhow::anyhow!("the server waited on an oversized frame"))?;
+        assert_close_code(r, APP_ERR_MESSAGE_TOO_LARGE);
+        conn.close(0u32.into(), b"bye");
+        shutdown([], [&client_ep]).await?;
+        let _ = support::reap("accept", accept_task).await;
+        shutdown([], [&server_ep]).await?;
+        Ok(())
     }
 
     /// Malformed postcard body under a *known* discriminant →
@@ -786,7 +851,7 @@ mod adr_013_error_codes {
         let payload = encode_message(&req)?;
         write_frame(&mut s1, &payload).await?;
         s1.finish()?;
-        let frame = read_frame(&mut r1).await?;
+        let frame = read_frame(&mut r1, decdn_protocol::MAX_DHT_FRAME).await?;
         let _ = decode_message::<wire::DhtMessage>(&frame)?;
 
         // Second request on the same connection must be rate-limited.
@@ -897,7 +962,7 @@ mod store_admission {
             let payload = encode_message(&req)?;
             write_frame(&mut s, &payload).await?;
             s.finish()?;
-            let frame = read_frame(&mut r).await?;
+            let frame = read_frame(&mut r, decdn_protocol::MAX_DHT_FRAME).await?;
             let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
             let ack = match msg {
                 wire::DhtMessage::StoreAck(a) => a,
@@ -920,7 +985,7 @@ mod store_admission {
             let payload = encode_message(&req)?;
             write_frame(&mut s, &payload).await?;
             s.finish()?;
-            let frame = read_frame(&mut r).await?;
+            let frame = read_frame(&mut r, decdn_protocol::MAX_DHT_FRAME).await?;
             let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
             let resp = match msg {
                 wire::DhtMessage::FindValueResponse(r) => r,
@@ -1017,7 +1082,7 @@ mod store_admission {
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
         s.finish()?;
-        let frame = read_frame(&mut r).await?;
+        let frame = read_frame(&mut r, decdn_protocol::MAX_DHT_FRAME).await?;
         let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
         let ack = match msg {
             wire::DhtMessage::StoreAck(a) => a,
@@ -1111,7 +1176,7 @@ mod store_admission {
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
         s.finish()?;
-        let frame = read_frame(&mut r).await?;
+        let frame = read_frame(&mut r, decdn_protocol::MAX_DHT_FRAME).await?;
         let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
         let ack = match msg {
             wire::DhtMessage::StoreAck(a) => a,
@@ -1213,7 +1278,7 @@ mod batch_store_admission {
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
         s.finish()?;
-        let frame = read_frame(&mut r).await?;
+        let frame = read_frame(&mut r, decdn_protocol::MAX_DHT_FRAME).await?;
         let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
         let ack = match msg {
             wire::DhtMessage::BatchStoreAck(a) => a,
@@ -1439,7 +1504,7 @@ mod batch_store_admission {
         let payload = encode_message(&req)?;
         write_frame(&mut s, &payload).await?;
         s.finish()?;
-        let frame = read_frame(&mut r).await?;
+        let frame = read_frame(&mut r, decdn_protocol::MAX_DHT_FRAME).await?;
         let (msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
         let ack = match msg {
             wire::DhtMessage::BatchStoreAck(a) => a,

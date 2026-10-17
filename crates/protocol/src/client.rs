@@ -66,6 +66,34 @@ pub const CHUNK_BYTES: u64 = MB_BYTES;
 /// 255 MiB at [`CHUNK_BYTES`]. 256 slots = one payable base + 255 increments.
 pub const MAX_CHAIN_LENGTH: u8 = 255;
 
+/// Frame ceiling for every `cdn/client/v1` message except
+/// [`ClientMessage::ChunkData`], in payload bytes (ADR 013 § Wire Framing).
+///
+/// The node reads a [`StreamRequest`] and every later payment proof against it,
+/// and a payer reads the [`StreamResponse`] against it. The largest legitimate
+/// message is a [`StreamRequest`] with a client binding and a capability: 301
+/// bytes, since every signature on the wire is a 65-byte EOA signature. The
+/// ceiling leaves headroom for Tier-1 extension fields and refuses a larger
+/// frame before the reader buffers it. It is also the wire bound on
+/// `owner_signature`, which decode checks only for being non-empty. The
+/// `client_control_frame_ceiling_holds_the_largest_message` test pins the margin.
+pub const MAX_CLIENT_CONTROL_FRAME: u32 = 4 * 1024;
+
+/// Frame ceiling for the node → payer delivery stream, in payload bytes
+/// (ADR 013 § Wire Framing): one [`ClientMessage::ChunkData`] that carries a
+/// full [`CHUNK_BYTES`] payload — 1,048,580 bytes.
+///
+/// ADR 005 §`cdn/client/v1` forbids a sender to cross a [`CHUNK_BYTES`] payment
+/// boundary inside one frame, so no legitimate `ChunkData` carries more. The
+/// payer reads every post-response frame (`ChunkData`, `StreamEnd`,
+/// `StreamError`) against this ceiling, and every `encode_chunk_*` helper
+/// refuses a frame above it.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "CHUNK_BYTES is 1 MiB, so its frame (1 MiB + 4) is far inside u32"
+)]
+pub const MAX_CHUNK_FRAME: u32 = chunk_frame_postcard_len(CHUNK_BYTES as usize) as u32;
+
 /// Exact byte length of an EOA secp256k1 voucher signature (`r‖s‖v`, 32+32+1).
 /// Mirrors [`SLASH_SIG_LEN`]; both are the EOA off-chain signing form (ADR 024
 /// §Off-Chain Signature Verification — EOA Recovery Only). Carried as a `Vec<u8>` on the wire (serde
@@ -562,10 +590,9 @@ impl StreamResponse {
 }
 
 /// Node → payer chunk of blob bytes. The payload carries at least one byte; its
-/// length is the sender's choice, bounded above by the framing layer's
-/// [`MAX_MESSAGE_SIZE`](crate::framing::MAX_MESSAGE_SIZE); ADR 005
-/// §`cdn/client/v1` additionally requires a sender not to cross a `CHUNK_BYTES`
-/// payment boundary, so in practice a frame runs to at most one interval. Frames need not be uniform, and the frame before
+/// length is the sender's choice. ADR 005 §`cdn/client/v1` requires a sender not
+/// to cross a `CHUNK_BYTES` payment boundary, so a frame runs to at most one
+/// interval, and the payer reads it against [`MAX_CHUNK_FRAME`]. Frames need not be uniform, and the frame before
 /// [`ClientMessage::StreamEnd`] is commonly shorter than the ones before it.
 ///
 /// Frame size is independent of both verification and payment. The bao codec is
@@ -645,8 +672,8 @@ impl ChunkData {
     /// The only constructor. Enforces the payload floor: non-empty.
     ///
     /// There is no ceiling here. An oversized frame is refused by the framing
-    /// layer against [`MAX_MESSAGE_SIZE`](crate::framing::MAX_MESSAGE_SIZE),
-    /// which is the bound that runs before the receiver allocates.
+    /// layer against [`MAX_CHUNK_FRAME`], which is the bound that runs before
+    /// the receiver allocates.
     ///
     /// # Errors
     ///
@@ -701,15 +728,15 @@ const CHUNK_DATA_DISCRIMINANT: u8 = 2;
 
 /// Stack-buffer size for a `ChunkData` header (discriminant + varint payload
 /// length). Sized to the unconditioned `u32` varint width — 1 + 5 — so the buffer
-/// needs no reasoning about [`crate::framing::MAX_MESSAGE_SIZE`]. That cap keeps
-/// the bytes actually written to at most 5.
+/// needs no reasoning about [`MAX_CHUNK_FRAME`]. That cap keeps the bytes
+/// actually written to at most 4.
 pub(crate) const CHUNK_DATA_HEADER_MAX: usize = 6;
 
 /// Stack-buffer size for the full framing + `ChunkData` header: varint
 /// `postcard_len` + the one-byte `ChunkData` discriminant + varint `payload_len`.
 /// Sized to
 /// the unconditioned `u32` varint width — 5 + 1 + 5 — for the same reason as the
-/// `ChunkData` header buffer; the cap keeps the bytes actually written to at most 9.
+/// `ChunkData` header buffer; the cap keeps the bytes actually written to at most 7.
 pub const CHUNK_FRAME_HEADERS_MAX: usize = 11;
 
 /// Encode one [`ClientMessage::ChunkData`] frame body directly from its payload.
@@ -731,14 +758,14 @@ pub const CHUNK_FRAME_HEADERS_MAX: usize = 11;
 ///
 /// [`MessageValidationError::EmptyChunk`] for a zero-length payload, or
 /// [`MessageValidationError::ChunkTooLarge`] if the frame would exceed
-/// [`crate::framing::MAX_MESSAGE_SIZE`].
+/// [`MAX_CHUNK_FRAME`].
 pub fn encode_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, MessageValidationError> {
     if payload.is_empty() {
         return Err(MessageValidationError::EmptyChunk);
     }
     // Postcard payload length `1 + varint(payload_len) + payload_len` must fit.
     let postcard_len = chunk_frame_postcard_len(payload.len());
-    if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
+    if postcard_len > MAX_CHUNK_FRAME as usize {
         return Err(MessageValidationError::ChunkTooLarge {
             frame_len: postcard_len,
         });
@@ -775,7 +802,7 @@ pub fn encode_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, MessageValidationEr
 ///
 /// [`MessageValidationError::EmptyChunk`] for `payload_len == 0`, or
 /// [`MessageValidationError::ChunkTooLarge`] if the frame would exceed
-/// [`crate::framing::MAX_MESSAGE_SIZE`].
+/// [`MAX_CHUNK_FRAME`].
 pub(crate) fn encode_chunk_data_header(
     payload_len: usize,
     out: &mut [u8; CHUNK_DATA_HEADER_MAX],
@@ -785,7 +812,7 @@ pub(crate) fn encode_chunk_data_header(
     }
     // Postcard payload length `1 + varint(payload_len) + payload_len` must fit.
     let postcard_len = chunk_frame_postcard_len(payload_len);
-    if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
+    if postcard_len > MAX_CHUNK_FRAME as usize {
         return Err(MessageValidationError::ChunkTooLarge {
             frame_len: postcard_len,
         });
@@ -829,7 +856,7 @@ pub(crate) fn encode_chunk_data_header(
 ///
 /// [`MessageValidationError::EmptyChunk`] for `payload_len == 0`, or
 /// [`MessageValidationError::ChunkTooLarge`] if the frame would exceed
-/// [`crate::framing::MAX_MESSAGE_SIZE`].
+/// [`MAX_CHUNK_FRAME`].
 pub fn encode_chunk_frame_headers(
     payload_len: usize,
     out: &mut [u8; CHUNK_FRAME_HEADERS_MAX],
@@ -842,7 +869,7 @@ pub fn encode_chunk_frame_headers(
     let mut hdr = [0u8; CHUNK_DATA_HEADER_MAX];
     let hdr_len = encode_chunk_data_header(payload_len, &mut hdr)?;
     let postcard_len = hdr_len.saturating_add(payload_len);
-    if postcard_len > crate::framing::MAX_MESSAGE_SIZE as usize {
+    if postcard_len > MAX_CHUNK_FRAME as usize {
         return Err(MessageValidationError::ChunkTooLarge {
             frame_len: postcard_len,
         });

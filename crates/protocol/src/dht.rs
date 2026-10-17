@@ -32,10 +32,10 @@
 //!
 //! Network responses with `Vec` fields are bounded at decode time via
 //! `#[serde(deserialize_with = ...)]` hooks that enforce the wire-level
-//! caps below. The framing layer caps the whole message at 16 MiB
-//! ([`crate::framing::MAX_MESSAGE_SIZE`]), but the per-field caps stop
-//! peers from forcing the responder to allocate up to a megabyte of
-//! 32-byte `NodeId`s (or up to `~16M / 8B` booleans) inside one frame.
+//! caps below. The framing layer caps the whole message at
+//! [`MAX_DHT_FRAME`], but the per-field caps stop peers from forcing the
+//! responder to allocate thousands of 32-byte `NodeId`s (or tens of thousands
+//! of booleans) inside one frame.
 //! Pattern mirrors `ProbeResponseBody::rate_per_mb`.
 
 use serde::de::{self, Deserializer};
@@ -45,8 +45,9 @@ use crate::coverage::Coverage;
 use crate::identity::{ContentHash, NodeId};
 
 /// Wire-level maximum number of providers a [`FindValueResponse`] may carry
-/// (ADR 022 §Content Records and TTL). Bounds the response size at the
-/// `~2.3 KB` ceiling documented in ADR 022 §DHT Bandwidth Analysis.
+/// (ADR 022 §Content Records and TTL). With 200-byte coverage bitmaps it bounds
+/// a full response to the 12,375 bytes in ADR 022 §DHT Bandwidth Analysis,
+/// inside [`MAX_DHT_FRAME`].
 ///
 /// Enforced at the wire boundary by `deserialize_providers`; oversize values
 /// fail decode rather than being silently truncated.
@@ -67,6 +68,16 @@ pub const MAX_CLOSER_NODES: usize = 20;
 /// close the stream with `MALFORMED_MESSAGE` (`0x03`) — the decode-time
 /// reject here surfaces as that error code via the framing layer.
 pub const MAX_BATCH_STORE_HASHES: usize = 256;
+
+/// Frame ceiling for `cdn/dht/v1`, in payload bytes (ADR 013 § Wire Framing).
+///
+/// Every DHT read passes this to [`crate::read_frame`], for requests and
+/// responses alike. The largest legitimate message is a full
+/// [`BatchStoreRequest`]: [`MAX_BATCH_STORE_HASHES`] entries, each a 32-byte
+/// hash and a [`Coverage`] of up to 202 bytes, plus the holder — 59,939 bytes.
+/// The largest response is a full [`FindValueResponse`] at 12,375 bytes. The
+/// `dht_frame_ceiling_holds_the_largest_message` test pins the margin.
+pub const MAX_DHT_FRAME: u32 = 64 * 1024;
 
 /// A bounded list of the K closest [`NodeId`]s a responder returns in a
 /// `closer_nodes` field (ADR 022 §Routing Table). Wraps `Vec<NodeId>` and
@@ -236,8 +247,9 @@ pub struct Provider {
 /// in XOR keyspace, used by the requester to continue iterative lookup.
 ///
 /// Responders MUST NOT emit more than [`MAX_PROVIDERS_PER_HASH`] providers or
-/// more than [`MAX_CLOSER_NODES`] closer nodes — the wire-cost ceiling
-/// (~2.3 KB) in ADR 022 §DHT Bandwidth Analysis depends on these bounds.
+/// more than [`MAX_CLOSER_NODES`] closer nodes — the 12,375-byte worst case in
+/// ADR 022 §DHT Bandwidth Analysis, and so [`MAX_DHT_FRAME`], depend on these
+/// bounds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindValueResponse {
     /// Echoes the requested hash.

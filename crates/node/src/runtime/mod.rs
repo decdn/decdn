@@ -139,6 +139,19 @@ const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// connection and then closing.
 const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 
+/// Connection-level QUIC receive window: the most stream data one peer may have
+/// in flight to this node, across every stream of one connection, before QUIC
+/// flow control blocks it (ADR 013 § Wire Framing).
+///
+/// The frame ceilings bound what a handler buffers, but the transport buffers
+/// below them: a peer can send a stream's later bytes and hold back its first,
+/// and the transport keeps the out-of-order data until the read times out.
+/// Without this window the only limit is one stream window (1.25 MB) per stream,
+/// so one connection could park about 125 MB. Eight `CHUNK_BYTES` intervals keep
+/// a node-to-node pull at about 80 MB/s per connection at a 100 ms round trip.
+/// The per-stream window stays at the transport default.
+const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+
 /// The `FeeRouter` contract's own `OPERATOR_BPS_FLOOR` (`contracts/src/FeeRouter.sol`):
 /// the minimum operator share governance can configure. Used as the startup
 /// fallback for the live operator fee-share seed (ADR 041) — a conservative
@@ -274,6 +287,7 @@ fn quic_transport_config() -> anyhow::Result<QuicTransportConfig> {
         .max_idle_timeout(Some(idle_timeout))
         .keep_alive_interval(QUIC_KEEP_ALIVE_INTERVAL)
         .max_concurrent_bidi_streams(VarInt::from_u32(QUIC_MAX_CONCURRENT_BIDI_STREAMS))
+        .receive_window(VarInt::from_u32(QUIC_CONNECTION_RECEIVE_WINDOW))
         // BBR3 over the default Cubic. Congestion control lives at the sender, so
         // this governs the bytes the node serves to a downstream client or node.
         // BBR paces to the path's measured bandwidth and round trip instead of
