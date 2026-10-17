@@ -1072,23 +1072,67 @@ async fn send_top_up<P: Provider + Clone>(
                 .context("submit topUp")
                 .context(TopUpUnconfirmed { tx: None, nonce }));
         }
-        // A deterministic allowance shortfall is caught at gas estimation and
-        // surfaces here with ABI revert data attached. Match it so the node can
-        // re-`approve` and retry once; every other revert stays terminal (an
-        // `approve` cannot fix a balance shortfall or a paused pool). A pool
-        // that is no longer open reverts `PoolNotOpen` the same way, which the
-        // funding recovery step answers with a new pool.
-        let revert_data = err.as_revert_data();
-        let allowance_short = decdn_incentive::is_erc20_allowance_shortfall(revert_data.as_ref());
-        let not_open = decdn_incentive::is_pool_not_open(revert_data.as_ref());
-        let submit_err = anyhow::Error::new(err).context("submit topUp");
-        return Err(if allowance_short {
-            submit_err.context(AllowanceShortfall)
-        } else if not_open {
-            submit_err.context(PoolNotOpen)
-        } else {
-            submit_err
-        });
+        return Err(top_up_submit_error(err, "submit topUp"));
+    }
+}
+
+/// Wrap a failed `topUp` submit in `context`, marked by its revert.
+///
+/// A deterministic allowance shortfall is caught at gas estimation and
+/// surfaces with ABI revert data attached. It is marked [`AllowanceShortfall`]
+/// so the node can re-`approve` and retry once; every other revert stays
+/// terminal (an `approve` cannot fix a balance shortfall or a paused pool). A
+/// pool that is no longer open reverts `PoolNotOpen` the same way and is marked
+/// [`PoolNotOpen`], which the funding recovery step answers with a new pool.
+fn top_up_submit_error(err: alloy::contract::Error, context: impl Into<String>) -> anyhow::Error {
+    let revert_data = err.as_revert_data();
+    let allowance_short = decdn_incentive::is_erc20_allowance_shortfall(revert_data.as_ref());
+    let not_open = decdn_incentive::is_pool_not_open(revert_data.as_ref());
+    let submit_err = anyhow::Error::new(err).context(context.into());
+    if allowance_short {
+        submit_err.context(AllowanceShortfall)
+    } else if not_open {
+        submit_err.context(PoolNotOpen)
+    } else {
+        submit_err
+    }
+}
+
+/// Send `topUp(pool_id, additional)` from `owner` at exactly `nonce`, and
+/// return its hash without waiting for a receipt.
+///
+/// A caller resolving a [`TopUpUnconfirmed`] whose nonce no transaction holds
+/// re-sends with that same nonce. Two transactions at one nonce cannot both
+/// mine, so the re-send and a first `topUp` that resurfaces escrow at most one
+/// top-up between them. A receipt wait here would never end if the other
+/// transaction took the nonce, so the caller reads receipts itself
+/// ([`topped_up_from_receipt`]).
+///
+/// # Errors
+///
+/// The amount overflows `uint64`, or the send fails. A revert carries the
+/// markers [`top_up`]'s submit errors carry ([`AllowanceShortfall`],
+/// [`PoolNotOpen`]).
+pub async fn send_top_up_at<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
+    pool_id: B256,
+    additional: U256,
+    nonce: u64,
+) -> Result<TxHash> {
+    let amount = to_pool_u64(additional, "top-up")?;
+    match contract
+        .topUp(pool_id, amount)
+        .from(owner)
+        .nonce(nonce)
+        .send()
+        .await
+    {
+        Ok(pending) => Ok(*pending.tx_hash()),
+        Err(err) => Err(top_up_submit_error(
+            err,
+            format!("re-send topUp at nonce {nonce}"),
+        )),
     }
 }
 
@@ -1121,12 +1165,11 @@ async fn send_top_up<P: Provider + Clone>(
 /// top-up can lose its nonce to a redemption sent at the same moment.
 ///
 /// `receipt_timeout` bounds the receipt wait when it is `Some`, as for
-/// [`open_pool`]. The CLI passes [`RECEIPT_TIMEOUT`]. A caller that bounds the
-/// wait must not send another `topUp` on the pool while this one is
-/// unconfirmed: `decdn get` holds the first for the run and refuses the rest.
-/// The node passes `None`:
-/// the task that runs this holds the node's top-up slot until it returns, so a
-/// lapse would free the slot while the `topUp` may still mine.
+/// [`open_pool`]. A caller that bounds the wait must not send another `topUp`
+/// on the pool while this one is unconfirmed. `decdn get` holds the first for
+/// the run and refuses the rest. The node keeps its top-up slot and settles the
+/// unconfirmed `topUp` against the chain ([`send_top_up_at`],
+/// [`topped_up_from_receipt`]).
 ///
 /// # Errors
 ///
@@ -1158,6 +1201,27 @@ pub async fn top_up<P: Provider + Clone>(
                     nonce,
                 })
         })?;
+    topped_up_from_receipt(&receipt, tx, *contract.address(), pool_id, additional)
+}
+
+/// Build the [`ToppedUpPool`] a `topUp` tx bought, from its mined `receipt`.
+///
+/// [`top_up`] calls this once its receipt arrives. A caller that holds a
+/// [`TopUpUnconfirmed`] calls it with the receipt it read later, so a `topUp`
+/// whose first receipt read failed is credited like any other. `payment_pool`
+/// is the `PaymentPool` the `topUp` was sent to, and `additional` the amount it
+/// requested. See [`top_up`] for how the credited amount is read.
+///
+/// # Errors
+///
+/// The tx reverted: nothing was escrowed.
+pub fn topped_up_from_receipt(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+    tx: TxHash,
+    payment_pool: Address,
+    pool_id: B256,
+    additional: U256,
+) -> Result<ToppedUpPool> {
     if !receipt.status() {
         anyhow::bail!("topUp reverted for pool {pool_id} (tx {tx:#x})");
     }
@@ -1168,7 +1232,7 @@ pub async fn top_up<P: Provider + Clone>(
         .inner
         .logs()
         .iter()
-        .filter(|log| log.address() == *contract.address())
+        .filter(|log| log.address() == payment_pool)
         .filter_map(|log| log.log_decode::<PaymentPool::PoolToppedUp>().ok())
         .map(|decoded| decoded.inner.data)
         .find(|ev| ev.poolId == pool_id)

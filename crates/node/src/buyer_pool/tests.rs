@@ -2242,6 +2242,8 @@ enum Step {
     Fails(&'static str),
     /// The `topUp` mined but its deposit is escrowed and untracked.
     Untracked,
+    /// The `topUp` was broadcast and its outcome is unknown.
+    Unconfirmed,
 }
 
 /// A scripted `join_or_spawn` for [`top_up_at_least`]: each call pops the next
@@ -2263,6 +2265,12 @@ fn scripted(
             Step::Untracked => Err(Arc::new(
                 anyhow::anyhow!("row replaced").context(EscrowedUntracked),
             )),
+            Step::Unconfirmed => Err(Arc::new(anyhow::anyhow!("receipt read failed").context(
+                TopUpUnconfirmed {
+                    tx: Some(TxHash::repeat_byte(0xAB)),
+                    nonce: 5,
+                },
+            ))),
         };
         (futures_util::future::ready(outcome), claim)
     }
@@ -2420,6 +2428,19 @@ async fn top_up_at_least_failed_join_funds_with_its_own_topup() {
 
     assert_eq!(got, landed(1_100, 100));
     assert_eq!(*asked.borrow(), vec![u(100), u(100)]);
+}
+
+/// A joined `topUp` whose outcome is unknown stops the top-up: it may still
+/// mine, and a second `topUp` beside it escrows twice (#2489).
+#[tokio::test]
+async fn top_up_at_least_unconfirmed_join_is_not_retried() {
+    let asked = std::cell::RefCell::new(Vec::new());
+    let f = scripted(vec![(joined(100, 100), Step::Unconfirmed)], &asked);
+
+    let err = top_up_at_least(POOL, u(100), f).await.unwrap_err();
+
+    assert!(format!("{err:#}").contains("may have mined"), "{err:#}");
+    assert_eq!(asked.borrow().len(), 1, "no second topUp is sent");
 }
 
 /// An escrowed-but-untracked joined `topUp` stops the top-up: a second `topUp`
@@ -2988,7 +3009,7 @@ async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()>
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone(),
     )?;
-    assert!(text.contains("reclaim receipt failed"), "{text}");
+    assert!(text.contains("reclaim receipt not read"), "{text}");
     assert!(text.contains(&format!("{hash:#x}")), "{text}");
     let exported = metrics.encode()?;
     assert!(
@@ -3098,10 +3119,22 @@ fn opened_receipt(
         owner,
         deposit: U256::from(deposit),
     };
+    mined_receipt(tx, owner, event.encode_log_data(), status)
+}
+
+/// A mined receipt for `tx` from `owner` whose one log, emitted by the
+/// [`bare_pool_contract`], is `data`, with the given execution `status`. A
+/// reverted receipt holds no logs.
+fn mined_receipt(
+    tx: TxHash,
+    owner: Address,
+    data: alloy::primitives::LogData,
+    status: bool,
+) -> Box<alloy::rpc::types::TransactionReceipt> {
     let log = alloy::rpc::types::Log {
         inner: alloy::primitives::Log {
             address: Address::ZERO,
-            data: event.encode_log_data(),
+            data,
         },
         block_hash: None,
         block_number: None,
@@ -3308,15 +3341,15 @@ async fn an_unconfirmed_open_resolves_by_receipt_then_nonce() {
     for (name, txs, replies, want) in cases {
         let asserter = script(replies);
         let contract = bare_pool_contract(asserter.clone());
-        let got = match resolve_unconfirmed_open(&contract, owner, 5, txs)
+        let got = match resolve_unconfirmed_tx(&contract, owner, 5, txs)
             .await
             .expect(name)
         {
-            OpenResolution::Mined(_) => "mined".to_owned(),
-            OpenResolution::NonceSpent { block } => format!("spent at {block}"),
-            OpenResolution::Pending => "pending".to_owned(),
-            OpenResolution::Queued => "queued".to_owned(),
-            OpenResolution::Vacant => "vacant".to_owned(),
+            NonceResolution::Mined(_) => "mined".to_owned(),
+            NonceResolution::NonceSpent { block } => format!("spent at {block}"),
+            NonceResolution::Pending => "pending".to_owned(),
+            NonceResolution::Queued => "queued".to_owned(),
+            NonceResolution::Vacant => "vacant".to_owned(),
         };
         assert_eq!(got, want, "{name}");
         assert!(asserter.read_q().is_empty(), "{name}: every read was made");
@@ -3817,4 +3850,242 @@ async fn a_top_up_that_never_mines_keeps_the_top_up_slot() {
         svc.topup_in_flight.lock().unwrap().is_some(),
         "the topUp task still holds the slot"
     );
+    let (_, again) = svc.join_or_spawn_topup(
+        PoolId::from([0xAA; 32]),
+        U256::from(1_000u64),
+        TopUpFunder::Refill,
+    );
+    assert!(
+        matches!(again, TopUpClaim::Joined { .. }),
+        "a refill meanwhile joins the held topUp instead of sending a second one"
+    );
+}
+
+// ---- unconfirmed `topUp` (#2489) ---------------------------------------
+
+/// The pool the settle tests top up.
+const TOPPED: PoolId = PoolId::repeat_byte(0xAA);
+
+/// The deposit the settle tests' pool row records.
+const ROW_DEPOSIT: u64 = 10_000_000;
+
+/// The amount every settle test's `topUp` requests.
+const TOP_UP: u64 = 1_000;
+
+/// A store whose row tracks `pool_id` for `owner` at [`ROW_DEPOSIT`].
+fn store_tracking(owner: Address, pool_id: PoolId) -> Arc<dyn BuyerPoolStore> {
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    store
+        .record(&BuyerPoolState::new(
+            pool_id,
+            DEPLOYMENT,
+            owner,
+            Address::repeat_byte(2),
+            U256::from(ROW_DEPOSIT),
+        ))
+        .unwrap();
+    store
+}
+
+/// A mined `topUp` receipt for `tx` whose `PoolToppedUp` log credits
+/// `credited` to [`TOPPED`].
+fn topped_up_receipt(
+    tx: TxHash,
+    owner: Address,
+    credited: u64,
+    status: bool,
+) -> Box<alloy::rpc::types::TransactionReceipt> {
+    use alloy::sol_types::SolEvent;
+
+    let event = PaymentPool::PoolToppedUp {
+        poolId: TOPPED,
+        additionalDeposit: U256::from(credited),
+        newDeposit: U256::from(ROW_DEPOSIT + credited),
+    };
+    mined_receipt(tx, owner, event.encode_log_data(), status)
+}
+
+/// A `getPool` answer: `owner`'s open pool holding `deposit`.
+fn deposit_reply(owner: Address, deposit: u64) -> Reply {
+    use alloy::sol_types::SolValue;
+
+    Reply::Call(
+        onchain_pool(owner, PaymentPool::Status::Open, deposit)
+            .abi_encode()
+            .into(),
+    )
+}
+
+/// Settle `unconfirmed`, a [`TOP_UP`] on [`TOPPED`], against `replies`,
+/// asserting every reply was read.
+async fn settle_top_up(
+    replies: Vec<Reply>,
+    unconfirmed: TopUpUnconfirmed,
+    store: Arc<dyn BuyerPoolStore>,
+    owner: Address,
+) -> Result<SettledTopUp> {
+    let asserter = script(replies);
+    let contract = bare_pool_contract(asserter.clone());
+    let handles = FundingHandles {
+        rpc: contract.provider().clone(),
+        contract,
+        store,
+        token: Address::repeat_byte(2),
+        owner,
+        payment_pool_addr: Address::ZERO,
+        metrics: metrics(),
+    };
+    let err = anyhow::anyhow!("await topUp receipt").context(unconfirmed);
+    let settled = tokio::time::timeout(
+        SETTLE_TEST_BOUND,
+        settle_unconfirmed_top_up(&handles, TOPPED, U256::from(TOP_UP), unconfirmed, err),
+    )
+    .await
+    .expect("the topUp settles within the scripted replies");
+    assert!(asserter.read_q().is_empty(), "every scripted read was made");
+    settled
+}
+
+/// The `topUp` whose receipt read failed, sent with nonce 5.
+fn unread_top_up() -> TopUpUnconfirmed {
+    TopUpUnconfirmed {
+        tx: Some(open_tx()),
+        nonce: 5,
+    }
+}
+
+/// A `topUp` whose receipt read failed waits out the pending transaction at
+/// its nonce, then credits the amount its receipt's `PoolToppedUp` names.
+#[tokio::test(start_paused = true)]
+async fn an_unconfirmed_top_up_waits_out_its_pending_tx_and_credits_its_receipt() {
+    let owner = Address::repeat_byte(1);
+    let settled = settle_top_up(
+        vec![
+            // First tick: no receipt, and a pending transaction holds nonce 5.
+            Reply::NoReceipt,
+            Reply::Block(100),
+            Reply::Nonce(5),
+            Reply::Nonce(6),
+            // Second tick: the `topUp` mined, crediting less than requested.
+            Reply::Receipt(topped_up_receipt(open_tx(), owner, 900, true)),
+        ],
+        unread_top_up(),
+        store_tracking(owner, TOPPED),
+        owner,
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.credited, U256::from(900u64));
+    assert_eq!(settled.tx, Some(open_tx()));
+}
+
+/// A nonce that no transaction holds gets a fresh `topUp` at that nonce, and
+/// the re-send's receipt settles the `topUp`.
+#[tokio::test(start_paused = true)]
+async fn a_vacant_top_up_nonce_is_re_sent_at_that_nonce() {
+    let owner = Address::repeat_byte(1);
+    let settled = settle_top_up(
+        vec![
+            // First tick: vacant, so the `topUp` is re-sent at nonce 5.
+            Reply::NoReceipt,
+            Reply::Block(100),
+            Reply::Nonce(5),
+            Reply::Nonce(5),
+            Reply::Sent(resent_tx()),
+            // Second tick: the first `topUp` has no receipt; the re-send mined.
+            Reply::NoReceipt,
+            Reply::Receipt(topped_up_receipt(resent_tx(), owner, TOP_UP, true)),
+        ],
+        unread_top_up(),
+        store_tracking(owner, TOPPED),
+        owner,
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.credited, U256::from(TOP_UP));
+    assert_eq!(settled.tx, Some(resent_tx()));
+}
+
+/// A submit that failed in transport has no hash to poll. Once its nonce is
+/// spent, the pool's deposit at that block above the row's is what escrowed.
+#[tokio::test(start_paused = true)]
+async fn a_spent_nonce_credits_what_the_pool_holds_above_the_row() {
+    let owner = Address::repeat_byte(1);
+    let settled = settle_top_up(
+        vec![
+            Reply::Block(100),
+            Reply::Nonce(6),
+            deposit_reply(owner, ROW_DEPOSIT + TOP_UP),
+        ],
+        TopUpUnconfirmed { tx: None, nonce: 5 },
+        store_tracking(owner, TOPPED),
+        owner,
+    )
+    .await
+    .unwrap();
+    assert_eq!(settled.credited, U256::from(TOP_UP));
+    assert_eq!(settled.tx, None, "no known hash mined");
+}
+
+/// A spent nonce with no receipt and a pool deposit equal to the row's means
+/// the `topUp` escrowed nothing: a known outcome, so the error drops the
+/// [`TopUpUnconfirmed`] marker.
+#[tokio::test(start_paused = true)]
+async fn a_spent_nonce_with_no_deposit_growth_escrowed_nothing() {
+    let owner = Address::repeat_byte(1);
+    let err = settle_top_up(
+        vec![
+            Reply::NoReceipt,
+            Reply::Block(100),
+            Reply::Nonce(6),
+            Reply::NoReceipt,
+            deposit_reply(owner, ROW_DEPOSIT),
+        ],
+        unread_top_up(),
+        store_tracking(owner, TOPPED),
+        owner,
+    )
+    .await
+    .err()
+    .expect("nothing escrowed");
+    assert!(format!("{err:#}").contains("escrowed nothing"), "{err:#}");
+    assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
+}
+
+/// A spent nonce whose pool the row no longer tracks cannot be compared, so
+/// the settle ends escrowed-but-untracked and no caller funds on top of it.
+#[tokio::test(start_paused = true)]
+async fn a_spent_nonce_on_a_replaced_row_is_untracked() {
+    let owner = Address::repeat_byte(1);
+    let err = settle_top_up(
+        vec![Reply::Block(100), Reply::Nonce(6)],
+        TopUpUnconfirmed { tx: None, nonce: 5 },
+        store_tracking(owner, PoolId::repeat_byte(0xBB)),
+        owner,
+    )
+    .await
+    .err()
+    .expect("the row no longer tracks the pool");
+    assert!(err.downcast_ref::<EscrowedUntracked>().is_some(), "{err:#}");
+}
+
+/// A mined `topUp` that reverted escrowed nothing, and says so.
+#[tokio::test(start_paused = true)]
+async fn a_reverted_unconfirmed_top_up_escrowed_nothing() {
+    let owner = Address::repeat_byte(1);
+    let err = settle_top_up(
+        vec![Reply::Receipt(topped_up_receipt(
+            open_tx(),
+            owner,
+            TOP_UP,
+            false,
+        ))],
+        unread_top_up(),
+        store_tracking(owner, TOPPED),
+        owner,
+    )
+    .await
+    .err()
+    .expect("a revert");
+    assert!(format!("{err:#}").contains("reverted"), "{err:#}");
 }
