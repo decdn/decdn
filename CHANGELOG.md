@@ -1065,11 +1065,14 @@ since project inception and will roll into the first tagged release.
 - **Node: a funding recovery step fails at once while a `topUp` settles
   (#2494).** A recovery top-up that found the top-up slot held for an
   unconfirmed `topUp` joined it and waited for the whole settle, which lasts
-  as long as the chain takes. Each such cache miss spent its budget on every
-  candidate and then dropped. The recovery step now fails at once as a local
-  fault, like a miss that finds the open slot held. A recovery step that
-  joined before the settle began still waits for its outcome, and a low-water
-  refill still does nothing.
+  as long as the chain takes. Each such cache miss waited until its deadline
+  dropped it. The recovery step now fails at once as a local fault, like a
+  miss that finds the open slot held, and counts on
+  `decdn_node_pull_recovery_step_refused_total`. A recovery step that joined
+  before the settle began still waits for its outcome, and a low-water refill
+  still does nothing and no longer logs that it funds. A recovery top-up whose
+  earlier join already landed returns that headroom when a later funding call
+  finds the slot held.
 - **CLI: a transaction dropped from the mempool no longer hangs the command
   (#2433).** alloy's receipt wait has no bound, so a broadcast transaction
   that never mined left these commands waiting forever: `decdn pool {open,

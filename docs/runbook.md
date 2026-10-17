@@ -596,41 +596,6 @@ It is read-only, so it is not refused on a node's data dir the way `close --all`
 is. When the two views disagree, believe the chain: the disagreement is the
 diagnostic.
 
-**`decdn_buyer_pool_open_unresolved` at 1 means the node holds its pool open for
-an `openPool` it could not confirm.** The submit failed in transport, or the
-receipt read failed, so the transaction may still mine. The node opens no second
-pool until the chain resolves it, and every cache miss that needs a pool is
-refused as a local fault meanwhile. The node re-reads the chain every 5 s: a
-receipt, or the account's nonce passing the open's, ends the wait. A nonce that
-no transaction holds gets a fresh `openPool` at that same nonce, so at most one
-of them escrows. `still holding the open slot for an unconfirmed openPool`
-repeats every minute with the elapsed time and the last thing the chain said. A
-gauge that stays at 1 means the RPC cannot answer, a pending transaction from
-this key holds the open's nonce or an earlier one, or every re-send at that
-nonce fails because the wallet cannot fund the deposit or the gas, or the
-contract refuses the open. Read `last` in the repeating warning, then fix the
-RPC, let that transaction mine, or fund the wallet. Do not restart to clear it:
-a restart forgets the wait, and a transaction that mines after the restart is a
-deposit the node does not track until the next restart adopts or reports it.
-
-**`decdn_buyer_topup_unresolved` at 1 means the node holds its top-up slot for a
-`topUp` it could not confirm.** The submit failed in transport, or the receipt
-read failed, so the transaction may still mine. The node sends no other `topUp`
-until the chain resolves it: a low-water refill does nothing, and a funding
-recovery step fails at once as a local fault, so a cache miss whose upstream
-refuses this node's funding fails fast. The node re-reads the chain every 5 s: a
-receipt, or the account's nonce passing the `topUp`'s, ends the wait and credits
-what escrowed. A nonce that no transaction holds gets a fresh `topUp` at that
-same nonce, so at most one of them escrows. `still holding the top-up slot for an
-unconfirmed topUp` repeats every minute with the elapsed time and the last thing
-the chain said. A gauge that stays at 1 means the RPC cannot answer, a pending
-transaction from this key holds the `topUp`'s nonce or an earlier one, or every
-re-send at that nonce fails. Read `last` in the repeating warning, then fix the
-RPC, let that transaction mine, or fund the wallet's gas. Do not restart to clear
-it: a restart forgets the settle, and a `topUp` that mines after it escrows into
-the pool without the local row being credited. Compare `decdn node pools` with
-`decdn pool list --all` to find that deposit.
-
 1. Run `decdn node pools`, and `decdn pool list --all` beside it. The first
    reports every pool the daemon tracks, its deposit, and the per-lane amounts
    already signed away; the second reports every pool the wallet owns on chain.
@@ -675,6 +640,48 @@ the pool without the local row being credited. Compare `decdn node pools` with
 5. Lanes on an adopted pool resume from their on-chain watermark, so a provider
    still holding an unredeemed voucher is briefly ahead of the node and rejects
    its first vouchers. That clears on the provider's next redemption; no action.
+
+**`decdn_buyer_pool_open_unresolved` at 1 means the node holds its pool open for
+an `openPool` it could not confirm.** The submit failed in transport, or the
+receipt read failed, so the transaction may still mine. The node opens no second
+pool until the chain resolves it, and every cache miss that needs a pool is
+refused as a local fault meanwhile. The node re-reads the chain every 5 s: a
+receipt, or the account's nonce passing the open's, ends the wait. A nonce that
+no transaction holds gets a fresh `openPool` at that same nonce, so at most one
+of them escrows. `still holding the open slot for an unconfirmed openPool`
+repeats every minute with the elapsed time and the last thing the chain said. A
+gauge that stays at 1 means the RPC cannot answer, a pending transaction from
+this key holds the open's nonce or an earlier one, or every re-send at that
+nonce fails because the wallet cannot fund the deposit or the gas, or the
+contract refuses the open. Read `last` in the repeating warning, then fix the
+RPC, let that transaction mine, or fund the wallet. Do not restart to clear it:
+a restart forgets the wait, and a transaction that mines after the restart is a
+deposit the node does not track until the next restart adopts or reports it.
+
+**`decdn_buyer_topup_unresolved` at 1 means the node holds its top-up slot for a
+`topUp` it could not confirm.** The submit failed in transport, or the receipt
+read failed, so the transaction may still mine. The node sends no other `topUp`
+until the chain resolves it. A low-water refill does nothing. A funding recovery
+step that arrives meanwhile fails at once as a local fault and counts on
+`decdn_node_pull_recovery_step_refused_total`, so a cache miss whose upstreams
+all refuse it `Unfunded` fails fast instead of waiting out its deadline. A step
+that joined the `topUp` before the settle began, during its receipt wait, still
+waits for the outcome. The node re-reads the chain every 5 s. A receipt, or the
+account's nonce passing the `topUp`'s, ends the wait and credits what escrowed.
+A re-send that shows the pool closed also ends it, and the recovery step then
+opens a new pool. A nonce that no transaction holds gets a fresh `topUp` at that
+same nonce, so at most one of them escrows. `still holding the top-up slot for an
+unconfirmed topUp` repeats every minute with the elapsed time and the last thing
+the chain said. A gauge that stays at 1 means the RPC cannot answer, a pending
+transaction from this key holds the `topUp`'s nonce or an earlier one, or every
+re-send at that nonce fails because the wallet cannot fund the `topUp` amount or
+the gas. Read `last` in the repeating warning, then fix the RPC, let that
+transaction mine, or fund the wallet with USDC and gas. Do not restart to clear
+it: a restart forgets the settle, and a `topUp` that mines after it raises the
+pool's on-chain deposit without crediting the local row. `decdn pool list --all`
+then shows a larger `deposit` for the tracked pool than `decdn node pools`
+reports. A later settle that resolves through a spent nonce credits that surplus
+with its own `topUp`.
 
 ## Refusing paying clients (insufficient deposit)
 

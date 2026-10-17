@@ -476,9 +476,11 @@ pub struct DecdnMetrics {
     /// The submit or the receipt read of that `topUp` failed, and the
     /// transaction may still mine, so the node sends no other `topUp` until the
     /// chain shows the outcome. A low-water refill meanwhile does nothing, and a
-    /// funding recovery step fails at once as a local fault. A value that stays
-    /// at 1 means the chain lane cannot answer, a pending transaction holds the
-    /// `topUp`'s nonce or an earlier one, or every re-send at that nonce fails.
+    /// funding recovery step that arrives meanwhile fails at once as a local
+    /// fault. A value that stays at 1 means the RPC cannot answer, a pending
+    /// transaction holds the `topUp`'s nonce or an earlier one, or every re-send
+    /// at that nonce fails: the wallet cannot fund the `topUp` amount or the
+    /// gas.
     pub buyer_topup_unresolved: Gauge,
     /// Total raw USDC this node holds in accepted vouchers that it has not yet
     /// redeemed on-chain — the sum of `owed − paid` across every inbound lane
@@ -1462,9 +1464,11 @@ pub struct DecdnMetrics {
     pub node_pull_recovery_step: Counter,
     /// `decdn_node_pull_recovery_step_refused_total` (#1530): a fill's funding
     /// recovery step had no way to fund the next pass: the working deposit is
-    /// zero (funding off), the top-up landed nothing, or the funding
+    /// zero (funding off), the top-up landed nothing, the funding
     /// transaction failed (allowance, revert, RPC, or a mined `topUp` the local
-    /// pool row could not credit).
+    /// pool row could not credit), or the top-up slot is held for an
+    /// unconfirmed `topUp` (`decdn_buyer_topup_unresolved` reads 1, and no
+    /// transaction is sent).
     ///
     /// A failed funding transaction also ticks `decdn_buyer_topup_failure_total`.
     pub node_pull_recovery_step_refused: Counter,
