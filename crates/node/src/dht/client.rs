@@ -10,11 +10,17 @@
 //! in [`crate::dht::lookup`].
 //!
 //! Each call:
-//! 1. Connects to the peer's [`EndpointAddr`] with ALPN `cdn/dht/v1`.
+//! 1. Takes the peer's pooled `cdn/dht/v1` connection from the node's
+//!    [`Connections`] map, which dials one when the peer has none.
 //! 2. Opens a bi stream.
 //! 3. Writes one framed [`wire::DhtMessage`] request.
 //! 4. Reads one framed response, decodes, and returns it.
-//! 5. Closes the connection with `0u32` (no app error).
+//! 5. Leaves the connection open for the next call to the same peer. The
+//!    server closes it once it idles past its window or spends its budget.
+//!
+//! A call whose pinned connection turns out closed (the server closed it
+//! between calls) redials once and retries. A call that fails on a
+//! connection it dialled itself does not retry: that is the peer's failure.
 //!
 //! The signatures mirror the server-side message types: callers
 //! provide the request fields, get back the response struct. Error
@@ -25,16 +31,19 @@
 
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use anyhow::Context;
+use decdn_client::{Connections, WarmConnection};
 use decdn_protocol::{
     ALPN_DHT, ContentHash, Coverage, NodeId, decode_message, dht as wire, encode_message,
     encode_store_request, read_frame, write_frame,
 };
-use iroh::endpoint::{ConnectOptions, Connection};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::EndpointAddr;
+use iroh::endpoint::Connection;
 
 /// Per-request hard timeout for outbound DHT exchanges. Shorter than
-/// the sum of the server-side accept-bi timeout (5s) and read
+/// the sum of the server-side first-stream timeout (5s) and read
 /// timeout (5s) in [`crate::handlers::dht`] so a hung peer doesn't
 /// wedge a republish sweep.
 pub const DHT_CLIENT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -45,7 +54,7 @@ pub const DHT_CLIENT_TIMEOUT: Duration = Duration::from_secs(8);
 /// routing table) and by the bucket-refresh task
 /// (`FindNode(random_id_in_bucket)`).
 pub async fn find_node(
-    endpoint: &Endpoint,
+    conns: &Connections,
     target: EndpointAddr,
     target_id: NodeId,
     requester: NodeId,
@@ -54,7 +63,7 @@ pub async fn find_node(
         target: target_id,
         requester,
     });
-    let response = exchange(endpoint, target, &request).await?;
+    let response = exchange(conns, target, &request).await?;
     match response {
         wire::DhtMessage::FindNodeResponse(r) => Ok(r),
         other => anyhow::bail!(
@@ -69,7 +78,7 @@ pub async fn find_node(
 /// Used by the republish scheduler's eager publish of a newly advertisable
 /// hash — one call per K+3 closest peer, per ADR 022 §STORE Flow steps 1-2.
 pub async fn store(
-    endpoint: &Endpoint,
+    conns: &Connections,
     target: EndpointAddr,
     hash: ContentHash,
     holder: NodeId,
@@ -86,7 +95,7 @@ pub async fn store(
     // sent as pre-encoded bytes via `exchange_payload`.
     let payload =
         encode_store_request(&request, None).context("dht client: encode store request")?;
-    let response = exchange_payload(endpoint, target, &payload).await?;
+    let response = exchange_payload(conns, target, &payload).await?;
     match response {
         wire::DhtMessage::StoreAck(a) => Ok(a),
         other => anyhow::bail!(
@@ -108,14 +117,14 @@ pub async fn store(
 /// `MALFORMED_MESSAGE` and surfaces here as an error (the caller must
 /// split the set, not retry).
 pub async fn batch_store(
-    endpoint: &Endpoint,
+    conns: &Connections,
     target: EndpointAddr,
     entries: Vec<(ContentHash, Coverage)>,
     holder: NodeId,
 ) -> anyhow::Result<wire::BatchStoreAck> {
     let n = entries.len();
     let request = wire::DhtMessage::BatchStore(wire::BatchStoreRequest { entries, holder });
-    let response = exchange(endpoint, target, &request).await?;
+    let response = exchange(conns, target, &request).await?;
     match response {
         // A conformant receiver returns exactly one `bool` per request hash
         // (`results[i]` ↔ `hashes[i]`); the wire type only caps the max
@@ -139,13 +148,13 @@ pub async fn batch_store(
 /// Exposed here so the same connect/encode/decode plumbing isn't
 /// duplicated across the bootstrap / republish / lookup call sites.
 pub async fn find_value(
-    endpoint: &Endpoint,
+    conns: &Connections,
     target: EndpointAddr,
     hash: ContentHash,
     requester: NodeId,
 ) -> anyhow::Result<wire::FindValueResponse> {
     let request = wire::DhtMessage::FindValue(wire::FindValueRequest { hash, requester });
-    let response = exchange(endpoint, target, &request).await?;
+    let response = exchange(conns, target, &request).await?;
     match response {
         wire::DhtMessage::FindValueResponse(r) => Ok(r),
         other => anyhow::bail!(
@@ -155,56 +164,80 @@ pub async fn find_value(
     }
 }
 
-/// Inner: connect, `open_bi`, write request frame, read response
-/// frame, decode. Wraps the whole sequence in a single
-/// [`DHT_CLIENT_TIMEOUT`] so a hung peer can't block the caller's
-/// scheduler indefinitely.
+/// Inner: encode `request`, then [`exchange_payload`].
 async fn exchange(
-    endpoint: &Endpoint,
+    conns: &Connections,
     target: EndpointAddr,
     request: &wire::DhtMessage,
 ) -> anyhow::Result<wire::DhtMessage> {
     let payload = encode_message(request).context("dht client: encode request")?;
-    exchange_payload(endpoint, target, &payload).await
+    exchange_payload(conns, target, &payload).await
 }
 
-/// Inner: connect, `open_bi`, write a pre-encoded request frame, read
-/// response frame, decode. The payload is already encoded so a caller
-/// that needs a typed two-phase encode (e.g. `store` via
-/// [`encode_store_request`]) can hand over its bytes directly, keeping
-/// the connect/exchange plumbing in one place.
+/// Inner: take `target`'s pooled connection, `open_bi`, write a
+/// pre-encoded request frame, read the response frame, decode. The
+/// payload is already encoded so a caller that needs a typed two-phase
+/// encode (e.g. `store` via [`encode_store_request`]) can hand over its
+/// bytes directly.
+///
+/// Wraps the whole call, retry included, in one [`DHT_CLIENT_TIMEOUT`]
+/// so a hung peer can't block the caller's scheduler indefinitely. A call
+/// that times out unpins the connection it used, so the next call to the
+/// peer dials afresh rather than queueing on a connection that stopped
+/// answering.
 async fn exchange_payload(
-    endpoint: &Endpoint,
+    conns: &Connections,
     target: EndpointAddr,
     payload: &[u8],
 ) -> anyhow::Result<wire::DhtMessage> {
-    let response = tokio::time::timeout(DHT_CLIENT_TIMEOUT, async {
-        let connecting = endpoint
-            .connect_with_opts(target, ALPN_DHT, ConnectOptions::new())
+    debug_assert_eq!(
+        conns.alpn(),
+        ALPN_DHT,
+        "the DHT client needs a cdn/dht/v1 map"
+    );
+    let node = target.id;
+    let mut used: Option<Arc<WarmConnection>> = None;
+    let outcome = tokio::time::timeout(DHT_CLIENT_TIMEOUT, async {
+        let (warm, dialled) = conns
+            .get_or_dial(&target)
             .await
             .context("dht client: connect failed")?;
-        let conn = connecting.await.context("dht client: handshake failed")?;
-        let resp = exchange_on(&conn, payload).await?;
-        // `0u32` = "no app error"; matches the server's normal-close
-        // code so the peer's `conn.closed()` arm reads the same way
-        // it does for a probe.
-        conn.close(0u32.into(), b"dht-done");
-        Ok::<_, anyhow::Error>(resp)
+        used = Some(Arc::clone(&warm));
+        let err = match exchange_on(warm.connection(), payload).await {
+            Ok(resp) => return Ok(resp),
+            Err(err) => err,
+        };
+        if !warm.is_closed() {
+            return Err(err);
+        }
+        conns.invalidate(node, &warm).await;
+        if dialled {
+            return Err(err);
+        }
+        // The pinned connection closed under this call (the server spent
+        // its budget or idled it out between calls): redial once.
+        let (fresh, _) = conns
+            .get_or_dial(&target)
+            .await
+            .context("dht client: connect failed")?;
+        used = Some(Arc::clone(&fresh));
+        exchange_on(fresh.connection(), payload).await
     })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
+    .await;
+    let Ok(result) = outcome else {
+        if let Some(warm) = used {
+            conns.invalidate(node, &warm).await;
+        }
+        anyhow::bail!(
             "dht client: request timed out after {} ms",
             DHT_CLIENT_TIMEOUT.as_millis()
-        )
-    })??;
-    Ok(response)
+        );
+    };
+    result
 }
 
-/// Inner-inner: do the bi-stream exchange on an already-connected
-/// [`Connection`]. A separate function so a caller that wants to bundle
-/// multiple DHT requests on one connection (e.g. a republish sweep to
-/// the same target peer) can re-use the connection.
+/// Inner-inner: do one bi-stream exchange on an already-connected
+/// [`Connection`], leaving the connection open.
 async fn exchange_on(conn: &Connection, payload: &[u8]) -> anyhow::Result<wire::DhtMessage> {
     let (mut send, mut recv) = conn
         .open_bi()

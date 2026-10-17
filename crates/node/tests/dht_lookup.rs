@@ -195,7 +195,7 @@ async fn prime_iroh_cache(
 ) -> anyhow::Result<()> {
     let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
     let _ = client::find_node(
-        client_ep,
+        &support::dht_conns(client_ep),
         target,
         NodeId::from_bytes(*server.id.as_bytes()),
         NodeId::from_bytes(*client_id),
@@ -270,7 +270,7 @@ async fn find_providers_returns_directly_reachable_provider() -> anyhow::Result<
     let neg = NegativeProbeCache::new();
 
     let providers = find_providers(
-        &client_ep,
+        &support::dht_conns(&client_ep),
         &routing,
         &staker_set,
         &neg,
@@ -328,7 +328,7 @@ async fn find_providers_drops_providers_in_negative_cache() -> anyhow::Result<()
     );
 
     let providers = find_providers(
-        &client_ep,
+        &support::dht_conns(&client_ep),
         &routing,
         &staker_set,
         &neg,
@@ -380,7 +380,7 @@ async fn find_providers_drops_non_staked_provider() -> anyhow::Result<()> {
     let neg = NegativeProbeCache::new();
 
     let providers = find_providers(
-        &client_ep,
+        &support::dht_conns(&client_ep),
         &routing,
         &staker_set,
         &neg,
@@ -416,7 +416,7 @@ async fn find_providers_with_empty_routing_table_returns_empty() -> anyhow::Resu
     let neg = NegativeProbeCache::new();
 
     let providers = find_providers(
-        &client_ep,
+        &support::dht_conns(&client_ep),
         &routing,
         &staker_set,
         &neg,
@@ -532,7 +532,7 @@ async fn find_providers_stops_at_the_round_ceiling_even_while_still_finding_clos
     let providers = tokio::time::timeout(
         Duration::from_mins(1),
         find_providers(
-            &client_ep,
+            &support::dht_conns(&client_ep),
             &routing,
             &staker_set,
             &neg,

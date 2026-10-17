@@ -1935,9 +1935,6 @@ enum ConnSource<'a> {
     Dial {
         endpoint: &'a Endpoint,
         target: EndpointAddr,
-        /// The runtime the dial and the connection's driver run on; `None` runs
-        /// them on the caller's (see [`connection::dial`]).
-        runtime: Option<&'a tokio::runtime::Handle>,
     },
     /// Reuse a caller-owned [`WarmConnection`]'s connection. The pull borrows it
     /// and leaves it open for the next hash; the [`WarmConnection`] closes it once.
@@ -1987,11 +1984,16 @@ async fn open_stream(
 )> {
     tokio::time::timeout(open, async move {
         let conn = match source {
-            ConnSource::Dial {
-                endpoint,
-                target,
-                runtime,
-            } => connection::dial(endpoint, target, runtime, "connect failed").await?,
+            ConnSource::Dial { endpoint, target } => {
+                connection::dial(
+                    endpoint,
+                    target,
+                    decdn_protocol::ALPN_CLIENT,
+                    None,
+                    "connect failed",
+                )
+                .await?
+            }
             // Already dialled and warm — reuse the handle. A fresh `open_bi` below
             // gives this hash its own stream.
             ConnSource::Reuse(conn) => conn.clone(),
@@ -2219,8 +2221,6 @@ async fn fetch_in_memory_once(
         deadlines,
         // Whole tail: the in-memory wrapper has no store to compute gaps against.
         0,
-        // One long-lived test runtime: the dial runs on it.
-        None,
     )
     .await?;
     let total_bytes = header.total_bytes;
@@ -3041,10 +3041,10 @@ impl std::fmt::Debug for UpstreamPull {
 /// (`AmountRegression`, #1145 review). The caller reads what to
 /// persist from it — including after a drop — via [`PoolLedger::settlement`].
 ///
-/// `dial_runtime` is the runtime the dial and the connection's QUIC driver run
-/// on; `None` runs them on the caller's. A caller that drops the runtime it pulls
-/// on passes a long-lived one — see
-/// [`PeerSource::with_dial_runtime`](crate::source::PeerSource::with_dial_runtime).
+/// The dial and the connection's QUIC driver run on the caller's runtime, so the
+/// caller's runtime must outlive the endpoint's close. A caller that pulls on a
+/// runtime it drops opens its pulls through a [`Connections`] map with a dial
+/// runtime instead.
 ///
 /// Runs inside an `open_progressive_pull` span that covers the dial and the
 /// signed-response handshake — the time to first byte. Its `hash`, `pool_id`,
@@ -3082,14 +3082,9 @@ pub async fn open_progressive_pull(
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
     byte_len: u64,
-    dial_runtime: Option<&tokio::runtime::Handle>,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     open_progressive_pull_impl(
-        ConnSource::Dial {
-            endpoint,
-            target,
-            runtime: dial_runtime,
-        },
+        ConnSource::Dial { endpoint, target },
         // One-shot dial: the pull owns this connection and closes it on teardown.
         connection::ConnOwner::Owned,
         ctx,

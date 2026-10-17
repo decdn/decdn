@@ -66,7 +66,7 @@ use decdn_bao_range::align_range;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
 use decdn_client::{
-    BudgetPacer, PeerSource, PrimedSource, RecoveryGate, Stepped, drive, first_leg,
+    BudgetPacer, Connections, PeerSource, PrimedSource, RecoveryGate, Stepped, drive, first_leg,
 };
 use decdn_common::redact::sanitize_err_chain;
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
@@ -531,19 +531,23 @@ impl NodeOriginConfig {
 /// completes (see the module docs). Built and handed to [`NodeOrigin::provision`]
 /// by the runtime.
 pub struct NodeOriginDeps {
-    /// The node's shared iroh endpoint (dials probes + pulls).
+    /// The node's shared iroh endpoint (dials probes).
     pub endpoint: Endpoint,
-    /// The runtime every upstream dial of a pull leg runs on: the node's main
-    /// runtime, which outlives `endpoint`'s close.
+    /// The node's pooled `cdn/client/v1` connections: one per upstream, shared
+    /// by every pull leg. Each leg opens its own stream on the upstream's
+    /// connection.
     ///
-    /// A pull leg runs on its own current-thread runtime, which drops when the leg
-    /// returns. A connection dialled there would lose its QUIC driver with that
-    /// runtime, never reach QUIC's draining state, and hang `Endpoint::close` at
-    /// shutdown. Every upstream dial this node makes, on a pull thread or not, goes
-    /// through
-    /// [`PeerSource::with_dial_runtime`](decdn_client::source::PeerSource::with_dial_runtime)
-    /// with this handle, so every driver lives here.
-    pub dial_runtime: tokio::runtime::Handle,
+    /// The map dials on the node's main runtime, which outlives `endpoint`'s
+    /// close. A pull leg runs on its own current-thread runtime, which drops
+    /// when the leg returns. A connection dialled there would lose its QUIC
+    /// driver with that runtime, never reach QUIC's draining state, and hang
+    /// `Endpoint::close` at shutdown. Every upstream dial goes through this map,
+    /// so every driver lives on the main runtime.
+    pub connections: Connections,
+    /// The node's pooled `cdn/dht/v1` connections (one per peer, dialled on
+    /// the main runtime), shared with the DHT background tasks.
+    /// `find_providers` asks each peer on its warm connection.
+    pub dht_connections: Connections,
     /// DHT routing table handle for `find_providers`.
     pub routing_table: Arc<Mutex<RoutingTable>>,
     /// Active-staker set (lookup integrity filter).
@@ -1069,7 +1073,7 @@ async fn discover(
     // skip probing a candidate whose stale coverage already misses the whole
     // pull range; today every discovered candidate is still probed.
     let providers: Vec<DhtNodeId> = crate::dht::find_providers(
-        &deps.endpoint,
+        &deps.dht_connections,
         &deps.routing_table,
         &deps.staker_set,
         &deps.negative_cache,
@@ -2241,8 +2245,9 @@ async fn pull_from_candidate_in_span(
     // than the upstream serving a throwaway open and then the same range again.
     // `NO_NAMESPACE`, as this hash-only populate path carries no served-client
     // namespace. `rate_ceiling` folds the ADR 041 buy cap in (computed above with
-    // the skip decision). Its dial runs on the node's main runtime, so its
-    // connection's driver lives there and outlives the pull thread that adopts it.
+    // the skip decision). It opens a stream on the node's shared connection to
+    // the upstream, whose driver runs on the main runtime and outlives the pull
+    // thread that adopts the pull.
     let handshake_source = PeerSource::new(
         &deps.endpoint,
         EndpointAddr::new(pk),
@@ -2254,11 +2259,8 @@ async fn pull_from_candidate_in_span(
         deps.config.max_blob_size_bytes,
         rate_ceiling,
         deadlines,
-        // A pull leg runs on a per-serve runtime, so it dials per leg on the
-        // long-lived dial runtime and shares no connection map (#1675).
-        None,
-    )
-    .with_dial_runtime(deps.dial_runtime.clone());
+        Some(deps.connections.clone()),
+    );
     let handshake = timed_open(
         handshake_source.open_whole(hash_bytes),
         Arc::clone(&deps.metrics),
@@ -2307,14 +2309,15 @@ async fn pull_from_candidate_in_span(
     //   `Arc`, and persists the FINAL watermark (#852) only after `drive` has fully
     //   stopped advancing it. Settling from the outer future would race the still-running
     //   thread and persist a STALE cumulative, wedging the lane.
-    // - DIALS ON THE MAIN RUNTIME. The pull thread's runtime drops when the thread
-    //   returns, so every upstream dial runs on `deps.dial_runtime` instead. Each
-    //   connection's QUIC driver lives there and carries a clean finish, a cancel or
-    //   an error through its close to draining, so the node's `Endpoint::close()`
-    //   never waits on a connection whose driver died with this runtime.
+    // - CONNECTIONS ON THE MAIN RUNTIME. The pull thread's runtime drops when the
+    //   thread returns, so every leg opens its stream on the node's shared
+    //   connection to the upstream (`deps.connections`), which dials on the main
+    //   runtime. Each connection's QUIC driver lives there and carries its close
+    //   through to draining, so the node's `Endpoint::close()` never waits on a
+    //   connection whose driver died with this runtime.
     let hash = Hash::from(hash_bytes);
     let endpoint = deps.endpoint.clone();
-    let dial_runtime = deps.dial_runtime.clone();
+    let connections = deps.connections.clone();
     let slash_domain = deps.slash_domain.clone();
     let engine = deps.engine.clone();
     let metrics = Arc::clone(&deps.metrics);
@@ -2366,10 +2369,10 @@ async fn pull_from_candidate_in_span(
                 max_blob_size_bytes,
                 rate_ceiling,
                 deadlines,
-                // Per-serve runtime: dial per leg (#1675).
-                None,
-            )
-            .with_dial_runtime(dial_runtime);
+                // A stream on the node's shared connection to the upstream,
+                // whose driver runs on the main runtime.
+                Some(connections),
+            );
             let source = PrimedSource::new(TimedSource::new(source, Arc::clone(&metrics)));
             // The handshake's pull is the drive's first leg only when that leg is
             // the whole blob: this node holds none of it.

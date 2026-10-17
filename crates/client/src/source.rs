@@ -385,11 +385,6 @@ pub struct PeerSource<'a> {
     max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
-    /// The runtime every dial of this source runs on, so each connection's QUIC
-    /// driver lives there rather than on the runtime the pull runs on. `None`
-    /// dials on the caller's runtime. See
-    /// [`with_dial_runtime`](Self::with_dial_runtime).
-    dial_runtime: Option<tokio::runtime::Handle>,
     /// The command's shared connection per node, or `None` to dial per open.
     connections: Option<Connections>,
 }
@@ -421,9 +416,10 @@ impl<'a> PeerSource<'a> {
     ///
     /// `connections` is the command's map of one connection per node: with
     /// `Some`, every open takes a new stream on `target`'s shared connection
-    /// and dials only when `target` has no live one. With `None`, every open
-    /// dials its own connection. Pass `Some` only from a single long-lived
-    /// runtime (see [`Connections`]).
+    /// and dials only when `target` has no live one, on the map's dial
+    /// runtime (see [`Connections`]). With `None`, every open dials its own
+    /// connection on the caller's runtime, so the caller's runtime must
+    /// outlive the endpoint's close.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
@@ -450,29 +446,25 @@ impl<'a> PeerSource<'a> {
             max_blob_size_bytes,
             max_rate_per_mb,
             deadlines,
-            dial_runtime: None,
             connections,
         }
     }
 
-    /// Run every dial of this source on `runtime`.
+    /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end)
+    /// as a raw pull, unaligned, for a caller that reads only the signed
+    /// header and then aborts the pull.
     ///
-    /// A dial spawns the connection's QUIC driver on the runtime that runs it, and
-    /// the driver is what carries the connection through its close to QUIC's
-    /// draining state. A caller that runs a pull on a runtime it drops afterwards
-    /// (`decdn-node`'s per-serve pull legs) passes a runtime that outlives its
-    /// endpoint here. Otherwise a connection the pull dialled that has not reached
-    /// draining when the pull's runtime drops loses its driver, stays in the
-    /// endpoint's active set, and `Endpoint::close` waits for it forever.
-    /// The dial and the connection's driver move to `runtime`; the pull still
-    /// opens and polls its streams from the caller's runtime. A source with a
-    /// [`Connections`] map dials through the map instead, on the caller's
-    /// runtime.
-    #[must_use]
+    /// # Errors
+    ///
+    /// The same faults as [`BlobSource::open`].
     #[doc(hidden)]
-    pub fn with_dial_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
-        self.dial_runtime = Some(runtime);
-        self
+    pub fn open_span(
+        &self,
+        hash: [u8; 32],
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> SourceFuture<'_, (UpstreamPullHeader, UpstreamPull)> {
+        Box::pin(self.open_pull(hash, byte_offset, byte_len))
     }
 
     /// Open the whole blob (`byte_len == 0`, "to end") from offset 0.
@@ -530,7 +522,6 @@ impl<'a> PeerSource<'a> {
                 self.max_rate_per_mb,
                 self.deadlines,
                 byte_len,
-                self.dial_runtime.as_ref(),
             )
             .await
         }

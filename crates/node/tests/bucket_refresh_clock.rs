@@ -60,7 +60,7 @@ async fn bucket_refresh_stamps_clock_after_first_pass() {
     assert_eq!(clock.load(Ordering::Relaxed), 0);
 
     let join = tokio::spawn(run_bucket_refresh(
-        endpoint,
+        decdn_client::Connections::with_options(endpoint, decdn_protocol::ALPN_DHT, None),
         public,
         Arc::clone(&routing),
         stop_rx,

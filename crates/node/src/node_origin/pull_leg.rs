@@ -68,7 +68,7 @@ use super::timed_source::{TimedReader, TimedSource, timed_open};
 use super::{
     EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, PullMiss, PullOutcome, PullVerdict,
     SettleOnDrop, bind_upstream_ctx, cached_candidates, classify_pull_failure, coverage_spans,
-    discover, economic_ceiling, heat_of, lane_ledger, mb_of, now_micros, probe_and_rank,
+    discover, economic_ceiling, heat_of, lane_ledger, mb_of, probe_and_rank,
     record_backpressure_exhausted, record_backpressure_refusal, record_outcome,
     record_pool_open_failure,
 };
@@ -77,9 +77,7 @@ use crate::dht::routing::NodeId as DhtNodeId;
 use crate::handlers::client::PROOF_WAIT_CEILING;
 use crate::runtime::QUIC_MAX_IDLE_TIMEOUT;
 use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, POOL_OPEN_CALLER_BUDGET};
-use decdn_client::{
-    PoolContext, PullDeadlines, open_progressive_pull as open_progressive_upstream,
-};
+use decdn_client::{PoolContext, PullDeadlines};
 
 /// Bytes per [`bao_tree::ChunkNum`] — a 1 KiB bao chunk. A chunk-range's byte span
 /// is its boundaries scaled by this (twin of the driver's private constant).
@@ -813,8 +811,9 @@ impl NodeOrigin {
         let stream_guard = deps.metrics.outbound_stream_guard();
 
         // The pull leg's own first leg, when the probe reported the size to cut it
-        // from. Its dial runs on the node's main runtime, so its connection's
-        // driver lives there and outlives the pull thread that adopts it.
+        // from. It opens a stream on the node's shared connection to the
+        // upstream, whose driver runs on the main runtime and outlives the pull
+        // thread that adopts the pull.
         let hint = candidate.total_bytes_hint;
         // Set when the primed open runs past the blob's end: the probed size is
         // wrong, so no range cut from it can be trusted.
@@ -836,10 +835,10 @@ impl NodeOrigin {
                 deps.config.max_blob_size_bytes,
                 rate_ceiling,
                 deadlines,
-                // Per-serve runtime: dial per leg (#1675).
-                None,
-            )
-            .with_dial_runtime(deps.dial_runtime.clone());
+                // A stream on the node's shared connection to the upstream,
+                // whose driver runs on the main runtime.
+                Some(deps.connections.clone()),
+            );
             let handshake = timed_open(
                 source.open(hash_bytes, range.clone()),
                 Arc::clone(&deps.metrics),
@@ -908,26 +907,24 @@ impl NodeOrigin {
             .filter(|_| !hint_wrong)
             .and_then(|total| covered_handshake_range(&candidate.coverage, total))
             .unwrap_or((0, 0));
-        let (header, probe) = match open_progressive_upstream(
+        let header_source = PeerSource::new(
             &deps.endpoint,
             EndpointAddr::new(pk),
-            &ctx,
+            Arc::new(std::sync::Mutex::new(ctx.clone())),
             Arc::clone(&ledger),
             &deps.slash_domain,
             provider_addr,
-            hash_bytes,
             namespace_bytes,
-            byte_offset,
-            now_micros(),
             deps.config.max_blob_size_bytes,
             rate_ceiling,
             deadlines,
-            byte_len,
-            // Every dial this node makes runs on its main runtime, wherever the
-            // caller runs.
-            Some(&deps.dial_runtime),
-        )
-        .await
+            // A stream on the node's shared connection to the upstream, whose
+            // driver runs on the main runtime.
+            Some(deps.connections.clone()),
+        );
+        let (header, probe) = match header_source
+            .open_span(hash_bytes, byte_offset, byte_len)
+            .await
         {
             Ok(pair) => pair,
             Err(err) => {
@@ -1024,10 +1021,11 @@ fn handshake_verdict(
 /// `&deps.slash_domain` are borrowed only within this runtime's scope. The shared
 /// coordination state (the shared [`FillSession`]'s [`DownstreamWatch`]) crosses
 /// runtimes safely — atomics and `Notify` wakers are runtime-agnostic — and the
-/// [`CacheEngine`] store actor is reached through its own channel. Upstream dials
-/// are the exception: a connection's QUIC driver runs on the runtime that dials
-/// it, and this runtime drops when the leg returns, so every dial goes through
-/// [`NodeOriginDeps::dial_runtime`].
+/// [`CacheEngine`] store actor is reached through its own channel. Upstream
+/// connections are the exception: a connection's QUIC driver runs on the runtime
+/// that dials it, and this runtime drops when the leg returns, so every leg opens
+/// its stream on the shared [`NodeOriginDeps::connections`] map, which dials on
+/// the main runtime.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_pull_leg(
     deps_lock: Arc<OnceLock<NodeOriginDeps>>,
@@ -1536,10 +1534,10 @@ impl PeerRunSink<'_> {
             self.deps.config.max_blob_size_bytes,
             rate_ceiling,
             self.deadlines,
-            // Per-serve runtime: dial per leg (#1675).
-            None,
-        )
-        .with_dial_runtime(self.deps.dial_runtime.clone());
+            // A stream on the node's shared connection to the upstream, whose
+            // driver runs on the main runtime.
+            Some(self.deps.connections.clone()),
+        );
         let peer_source = PrimedSource::new(TimedSource::new(
             peer_source,
             Arc::clone(&self.deps.metrics),

@@ -70,6 +70,7 @@ async fn dial_from_a_dropped_runtime(
                 rt.block_on(super::dial(
                     &dialer,
                     peer_addr,
+                    ALPN_CLIENT,
                     dial_runtime.as_ref(),
                     "connect failed",
                 ))
@@ -129,7 +130,7 @@ async fn a_dial_on_a_shut_down_runtime_is_a_local_fault() {
 
     let err = tokio::time::timeout(
         Duration::from_secs(10),
-        super::dial(&ep, peer_addr, Some(&handle), "connect failed"),
+        super::dial(&ep, peer_addr, ALPN_CLIENT, Some(&handle), "connect failed"),
     )
     .await
     .expect("a dial on a shut-down runtime must fail, not hang")
@@ -353,6 +354,89 @@ async fn a_leg_that_times_out_unpins_its_connection() {
         .expect("get after the fault");
     assert!(!std::sync::Arc::ptr_eq(&pinned, &next));
     assert_eq!(connections.dials(), 2);
+}
+
+/// A map built for another ALPN dials on that ALPN: a peer that accepts
+/// only `cdn/dht/v1` takes the dial, and the connection carries the ALPN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn map_dials_its_alpn() {
+    use decdn_protocol::ALPN_DHT;
+
+    let (peer, peer_addr) = loopback_endpoint(vec![ALPN_DHT.to_vec()]).await;
+    let accept_peer = peer.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Some(incoming) = accept_peer.accept().await {
+            if let Ok(connecting) = incoming.accept()
+                && let Ok(conn) = connecting.await
+            {
+                held.push(conn);
+            }
+        }
+    });
+    let (ep, _) = loopback_endpoint(Vec::new()).await;
+    let connections = super::Connections::with_options(ep.clone(), ALPN_DHT, None);
+    assert_eq!(connections.alpn(), ALPN_DHT);
+
+    let warm = tokio::time::timeout(Duration::from_secs(10), connections.get(&peer_addr))
+        .await
+        .expect("the dial must finish")
+        .expect("a DHT-only peer takes a DHT dial");
+    assert_eq!(warm.connection().alpn(), ALPN_DHT);
+    assert_eq!(connections.dials(), 1);
+}
+
+/// A map with a dial runtime keeps every connection's driver there: a get
+/// and a stream from a throwaway runtime that is then dropped leave the
+/// endpoint free to close once the map drops (#1675).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn map_with_dial_runtime_survives_caller_runtime_drop() {
+    let (_peer, peer_addr) = echo_peer().await;
+    let (ep, _) = loopback_endpoint(Vec::new()).await;
+    let connections =
+        super::Connections::with_options(ep.clone(), ALPN_CLIENT, Some(Handle::current()));
+
+    let leg_map = connections.clone();
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build throwaway runtime");
+        rt.block_on(async {
+            let warm = leg_map.get(&peer_addr).await.expect("get on the leg");
+            let (mut send, mut recv) = warm.connection().open_bi().await.expect("open_bi");
+            send.write_all(b"x").await.expect("write");
+            let mut echo = [0u8; 1];
+            recv.read_exact(&mut echo).await.expect("read");
+            send.finish().expect("finish");
+        });
+        drop(rt);
+    })
+    .await
+    .expect("leg thread");
+
+    assert_eq!(connections.dials(), 1);
+    drop(connections);
+    tokio::time::timeout(Duration::from_secs(2), ep.close())
+        .await
+        .expect("the endpoint must close: the driver lives on the dial runtime");
+}
+
+/// Concurrent gets on a map built with options share one dial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_gets_share_one_dial() {
+    let (_peer, peer_addr, accepted) = holding_peer().await;
+    let (ep, _) = loopback_endpoint(Vec::new()).await;
+    let connections =
+        super::Connections::with_options(ep.clone(), ALPN_CLIENT, Some(Handle::current()));
+
+    let (a, b) = tokio::join!(connections.get(&peer_addr), connections.get(&peer_addr));
+    assert!(std::sync::Arc::ptr_eq(
+        &a.expect("first get"),
+        &b.expect("second get")
+    ));
+    assert_eq!(connections.dials(), 1);
+    assert_accepted(&accepted, 1).await;
 }
 
 /// The control: the same dial on the dropped runtime itself takes the

@@ -41,6 +41,11 @@ fn fresh_key() -> SecretKey {
     SecretKey::generate()
 }
 
+/// A `cdn/dht/v1` connection map on `ep`, dialling on the caller's runtime.
+fn dht_conns(ep: &Endpoint) -> decdn_client::Connections {
+    decdn_client::Connections::with_options(ep.clone(), ALPN_DHT, None)
+}
+
 fn permissive_limiter(metrics: &Arc<Metrics>) -> Arc<ConnectionLimiter> {
     let cfg = ResolvedSecurity {
         max_concurrent_handlers: u32::MAX,
@@ -166,7 +171,7 @@ async fn client_find_node_roundtrip_via_dht_client_module() -> anyhow::Result<()
     let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
     let target_id = NodeId::from_bytes([0xABu8; 32]);
     let resp = client::find_node(
-        &client_ep,
+        &dht_conns(&client_ep),
         target,
         target_id,
         NodeId::from_bytes(*client_ep.id().as_bytes()),
@@ -227,7 +232,7 @@ async fn bootstrap_seeds_routing_and_runs_self_lookup() -> anyhow::Result<()> {
     {
         let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
         let _ = client::find_node(
-            &client_ep,
+            &dht_conns(&client_ep),
             target,
             NodeId::from_bytes(*server.id.as_bytes()),
             NodeId::from_bytes(*client_id.as_bytes()),
@@ -235,7 +240,13 @@ async fn bootstrap_seeds_routing_and_runs_self_lookup() -> anyhow::Result<()> {
         .await?;
     }
 
-    let outcome = bootstrap::bootstrap(&client_ep, client_id, &client_routing, &staker_set).await;
+    let outcome = bootstrap::bootstrap(
+        &dht_conns(&client_ep),
+        client_id,
+        &client_routing,
+        &staker_set,
+    )
+    .await;
     assert_eq!(outcome.seeds_seen, 1);
     assert_eq!(outcome.seeds_inserted, 1, "S goes into C's table");
     assert!(outcome.find_node_ok >= 1, "at least one FindNode succeeded");
@@ -272,7 +283,7 @@ async fn client_store_lands_record_at_server() -> anyhow::Result<()> {
     let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
     let hash = ContentHash::from_bytes([0x77u8; 32]);
     let ack = client::store(
-        &client_ep,
+        &dht_conns(&client_ep),
         target,
         hash,
         NodeId::from_bytes(*client_id.as_bytes()),
@@ -335,7 +346,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     // republish task can't connect by NodeId alone).
     let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
     let _ = client::find_node(
-        &publisher_ep,
+        &dht_conns(&publisher_ep),
         target,
         NodeId::from_bytes(*server.id.as_bytes()),
         NodeId::from_bytes(*publisher_id.as_bytes()),
@@ -355,7 +366,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     let (inserts_tx, inserts_rx) = broadcast::channel::<iroh_blobs::Hash>(16);
     let stop = CancellationToken::new();
     let task = tokio::spawn(run_republish(
-        publisher_ep.clone(),
+        dht_conns(&publisher_ep),
         publisher_id,
         Arc::clone(&routing),
         Arc::clone(&scheduler),
@@ -470,7 +481,7 @@ async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow:
     let metrics = Arc::new(Metrics::new());
     let stop = CancellationToken::new();
     let task = tokio::spawn(run_republish(
-        publisher_ep.clone(),
+        dht_conns(&publisher_ep),
         publisher_id,
         // Empty routing table: with no peers the publish fan-out is a no-op,
         // which is what keeps this test about the sweep.
@@ -587,7 +598,7 @@ async fn sweep_scheduled_count(relay_foreign_namespaces: bool) -> anyhow::Result
     let scheduler = Arc::new(RepublishScheduler::new());
     let stop = CancellationToken::new();
     let task = tokio::spawn(run_republish(
-        publisher_ep.clone(),
+        dht_conns(&publisher_ep),
         publisher_id,
         Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
             *publisher_id.as_bytes(),
@@ -832,7 +843,7 @@ impl Publisher {
         // Loopback tests disable discovery; one `FindNode` resolves the path.
         let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
         let _ = client::find_node(
-            &ep,
+            &dht_conns(&ep),
             target,
             NodeId::from_bytes(*server.id.as_bytes()),
             holder,
@@ -846,7 +857,7 @@ impl Publisher {
         seed(&cache, &scheduler);
         let stop = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn(run_republish(
-            ep.clone(),
+            dht_conns(&ep),
             id,
             routing,
             Arc::clone(&scheduler),
