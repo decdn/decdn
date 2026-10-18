@@ -16446,6 +16446,18 @@ struct HolderPull {
     /// How many `cdn/client/v1` connections the full holder O answers with a
     /// signed `NotFound` before it serves.
     full_holder_refusals: usize,
+    /// How S discovers its holders.
+    discovery: HolderDiscovery,
+}
+
+/// How serving node S discovers the holders in a [`HolderPull`]. The directory
+/// lists the full holder O in both shapes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HolderDiscovery {
+    /// A probe-cache entry lists the first-ranked holder F and O.
+    CachedBoth,
+    /// The probe cache is empty and the DHT record for the hash names F alone.
+    DhtNamesFirst,
 }
 
 /// What [`holder_pull_case`] observed at the first-ranked holder.
@@ -16508,19 +16520,28 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
         total_bytes_hint: Some(total_bytes),
     };
     let probe_cache = PositiveProbeCache::new();
-    probe_cache.insert(
-        ContentHash::from_bytes(*hash.as_bytes()),
-        vec![
-            probed(f_dht, first_coverage, 1),
-            probed(o_dht, Coverage::full(2), 500),
-        ],
-    );
-    let discovery = FixtureDiscovery {
+    let mut discovery = FixtureDiscovery {
         stakers: HashSet::from([f_dht, o_dht]),
         directory: HashMap::from([(U256::ZERO, vec![o_dht])]),
         dht_peers: Vec::new(),
         probe_fanout: 5,
     };
+    let mut dht_server = None;
+    match case.discovery {
+        HolderDiscovery::CachedBoth => probe_cache.insert(
+            ContentHash::from_bytes(*hash.as_bytes()),
+            vec![
+                probed(f_dht, first_coverage, 1),
+                probed(o_dht, Coverage::full(2), 500),
+            ],
+        ),
+        HolderDiscovery::DhtNamesFirst => {
+            let (dht_id, dht_addr, dht_ep, dht_task) =
+                spawn_dht_record_server(hash, f_dht, first_coverage).await?;
+            discovery.dht_peers.push((dht_id, dht_addr));
+            dht_server = Some((dht_ep, dht_task));
+        }
+    }
     let addr_map = HashMap::from([(f_dht, f_eth), (o_dht, o_eth)]);
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
@@ -16586,10 +16607,27 @@ async fn holder_pull_case(case: HolderPull) -> Result<FirstHolderSeen> {
         inbound_streams: inbound_streams_ended(&metrics_f)?,
         full_holder_streams: inbound_streams_ended(&metrics_o)?,
     };
-    if own_leaf {
-        shutdown([task_s, task_f, task_o], [&leaf_ep, &ep_s, &ep_f, &ep_o]).await?;
-    } else {
-        shutdown([task_s, task_f, task_o], [&ep_s, &ep_f, &ep_o]).await?;
+    match (own_leaf, dht_server) {
+        (true, Some((dht_ep, dht_task))) => {
+            shutdown(
+                [task_s, task_f, task_o, dht_task],
+                [&leaf_ep, &ep_s, &ep_f, &ep_o, &dht_ep],
+            )
+            .await?;
+        }
+        (true, None) => {
+            shutdown([task_s, task_f, task_o], [&leaf_ep, &ep_s, &ep_f, &ep_o]).await?;
+        }
+        (false, Some((dht_ep, dht_task))) => {
+            shutdown(
+                [task_s, task_f, task_o, dht_task],
+                [&ep_s, &ep_f, &ep_o, &dht_ep],
+            )
+            .await?;
+        }
+        (false, None) => {
+            shutdown([task_s, task_f, task_o], [&ep_s, &ep_f, &ep_o]).await?;
+        }
     }
     Ok(seen)
 }
@@ -16605,6 +16643,7 @@ async fn a_serve_miss_asks_a_partial_holder_only_for_blocks_it_holds() -> Result
         first_blocks: &[1],
         leaf_is_first: false,
         full_holder_refusals: 0,
+        discovery: HolderDiscovery::CachedBoth,
     })
     .await?;
     anyhow::ensure!(
@@ -16629,6 +16668,7 @@ async fn a_refused_first_run_handshake_asks_the_partial_holder_only_for_blocks_i
         first_blocks: &[1],
         leaf_is_first: false,
         full_holder_refusals: 2,
+        discovery: HolderDiscovery::CachedBoth,
     })
     .await?;
     anyhow::ensure!(
@@ -16654,6 +16694,7 @@ async fn a_serve_miss_handshakes_with_the_first_runs_holder() -> Result<()> {
         first_blocks: &[1],
         leaf_is_first: false,
         full_holder_refusals: 0,
+        discovery: HolderDiscovery::CachedBoth,
     })
     .await?;
     anyhow::ensure!(
@@ -16681,6 +16722,34 @@ async fn a_serve_miss_never_pulls_from_its_requester() -> Result<()> {
         first_blocks: &[0, 1],
         leaf_is_first: true,
         full_holder_refusals: 0,
+        discovery: HolderDiscovery::CachedBoth,
+    })
+    .await?;
+    anyhow::ensure!(
+        seen.paid_bytes == U256::ZERO,
+        "S pulled {} bytes from the node that asked it",
+        seen.paid_bytes
+    );
+    anyhow::ensure!(
+        seen.refused_misses == 0,
+        "the requester was sent a request it had to refuse"
+    );
+    Ok(())
+}
+
+/// A DHT answer that names only the requester takes the origin-directory
+/// fallback (#2534). A partial holder asks S for the blob while the DHT record
+/// for the hash names that holder alone. S drops the requester, so the DHT
+/// answer is empty, and S reads the directory, which lists the origin O. O
+/// fills the serve. A node that judged the fallback before the drop refused the
+/// request with no provider and never asked the directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dht_answer_naming_only_the_requester_falls_back_to_the_directory() -> Result<()> {
+    let seen = holder_pull_case(HolderPull {
+        first_blocks: &[1],
+        leaf_is_first: true,
+        full_holder_refusals: 0,
+        discovery: HolderDiscovery::DhtNamesFirst,
     })
     .await?;
     anyhow::ensure!(

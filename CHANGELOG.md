@@ -1090,6 +1090,18 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node-origin: a DHT answer that names only the requester falls back to
+  the origin directory (#2534).** The serve-miss pull leg drops the node that
+  sent the request from its candidates, because a node never pulls from the
+  node it answers. The drop ran after discovery had chosen between the DHT
+  answer and the directory fallback, so when the requester was the hash's
+  only DHT provider (a partial holder asking for the blocks it lacks) the leg
+  ended with no provider and refused `NotFound` with
+  `source=dht discovered=0`, without reading the directory that lists the
+  origin. Discovery now drops the requester from both the DHT answer and the
+  directory list before it judges the fallback, so that answer reads the
+  directory and the origin fills the serve
+  ([ADR 022 § FIND_VALUE Flow](adr/022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)).
 - **Probe: a node advertises the empty blob, and a requester accepts the
   answer (#2471).** The empty (0-byte) blob spans zero discovery blocks, so
   its coverage bitmap is empty on every holder. The probe handler derived
