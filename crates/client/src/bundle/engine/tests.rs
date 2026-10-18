@@ -890,6 +890,58 @@ fn an_interrupted_replacement_is_reported_without_a_rerun() {
     );
 }
 
+/// A gate that holds the replacement of pool `0x01` by pool `0x02`, as a
+/// recovery step leaves it.
+async fn gate_replaced() -> RecoveryGate {
+    let gate = RecoveryGate::new();
+    let funder = crate::source::FakeFunder::new(crate::Recovery::Replaced(replacement(0x01, 0x02)));
+    let mut top_ups = 0;
+    let deposit = alloy::primitives::U256::from(1_000u64);
+    let _ = gate
+        .step(
+            &funder,
+            deposit,
+            &mut top_ups,
+            || deposit,
+            alloy::primitives::U256::ZERO,
+        )
+        .await;
+    gate
+}
+
+/// A pull that starts with a replacement on the gate from an earlier pull
+/// (here reported without a rerun) starts as a pass against the new pool. Its
+/// funding facts name no pool yet, so its recovery step funds the pool its
+/// lanes reuse, not the closed one, which would open yet another pool. The
+/// escrow handle carries over.
+#[tokio::test]
+async fn a_pull_after_a_carried_replacement_starts_on_the_new_pool() {
+    let gate = gate_replaced().await;
+    let escrows = crate::buyer_pool::UnconfirmedEscrows::default();
+    let mut funding = RunFunding::reporting_escrows_to(escrows.clone());
+    funding.note_pool(alloy::primitives::B256::repeat_byte(0x01));
+    let mut ledgers = LaneLedgers::new();
+    leave_carried_replacement(&gate, &mut ledgers, &mut funding);
+    assert_eq!(gate.replaced(), None, "the gate steps on the new pool");
+    assert_eq!(funding.pool_id(), None, "the closed pool is not the run's");
+    let _ = escrows.hold_untracked(&crate::buyer_pool::escrowed_but_untracked(
+        "pool 0x01 topped up by 5 µUSDC",
+        alloy::primitives::TxHash::repeat_byte(0xab),
+        "disk full",
+    ));
+    assert_eq!(funding.escrows().untracked().len(), 1, "the same handle");
+
+    // With nothing carried, the run keeps its pool.
+    let gate = RecoveryGate::new();
+    let mut funding = RunFunding::default();
+    funding.note_pool(alloy::primitives::B256::repeat_byte(0x02));
+    leave_carried_replacement(&gate, &mut ledgers, &mut funding);
+    assert_eq!(
+        funding.pool_id(),
+        Some(alloy::primitives::B256::repeat_byte(0x02))
+    );
+}
+
 /// #2517: a group the pull never settled counts each of its entries as not
 /// run, so the counts add up to the entry count.
 #[test]

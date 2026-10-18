@@ -1214,9 +1214,9 @@ since project inception and will roll into the first tagged release.
   "reclaim it with: decdn pool reclaim" note for the closed pool. The pull now
   reads the replacement from the recovery gate, and reports it in
   `BundleOutcome::replaced`. Only a replacement that ended the first pass runs
-  the rest again. A later pull on the same `BundlePuller` starts clear of an
-  earlier replacement, so it no longer runs an extra pass at once against
-  it. Second, entries the pull did not run were in no count, so
+  the rest again. A later pull on the same `BundlePuller` starts as a pass
+  against the new pool, with fresh lane and funding state: it runs no extra
+  pass, and its recovery step tops up the new pool, not the closed one. Second, entries the pull did not run were in no count, so
   the summary did not add up to the entry count. The new
   `BundleReport::not_run` counts them, the summary line adds `N not run` when
   there are some, and `--json` carries `not_run`. Third, a `BundlePuller` pull

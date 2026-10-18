@@ -1042,6 +1042,39 @@ fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
         .copied()
 }
 
+/// Start a pass against the pool a funding recovery step opened (ADR 003 §
+/// Funding recovery). Lanes key on the pool, so the pass starts with fresh
+/// `ledgers` and `funding` facts on the same escrow handle: the funding
+/// recovery step tops up the pool the run's first lane names
+/// ([`RunFunding::note_pool`]), and a run that kept the closed pool there
+/// would open yet another pool instead of funding the new one. The gate
+/// steps on the new pool ([`RecoveryGate::start_next_pass`]).
+fn start_pass_on_new_pool(
+    recovery: &RecoveryGate,
+    ledgers: &mut LaneLedgers,
+    funding: &mut RunFunding,
+) {
+    *ledgers = LaneLedgers::new();
+    *funding = RunFunding::reporting_escrows_to(funding.escrows().clone());
+    recovery.start_next_pass();
+}
+
+/// Start a pull clear of a replacement the gate holds from before it: a
+/// manifest fetch's, or an earlier pull's that ran nothing again or came in
+/// its second pass. It was reported then, and its new pool is the one this
+/// pull's lanes reuse, so the pull starts as a pass against that pool
+/// ([`start_pass_on_new_pool`]). Left on the gate, it would answer the pull's
+/// first recovery step with no step.
+fn leave_carried_replacement(
+    recovery: &RecoveryGate,
+    ledgers: &mut LaneLedgers,
+    funding: &mut RunFunding,
+) {
+    if recovery.replaced().is_some() {
+        start_pass_on_new_pool(recovery, ledgers, funding);
+    }
+}
+
 /// What a first pass's pool replacement asks of the pull
 /// ([`pass_replacement`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1872,6 +1905,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // advisory, so a flush failure is logged (inside the flush) and never
         // fails the pull.
         let saved = skip_cache::load(out_root);
+        leave_carried_replacement(&self.recovery, &mut self.ledgers, &mut self.funding);
         // The lanes outlive one pull (a manifest fetch or an earlier pull of
         // this puller drew on them), so this pull's payment is what the
         // lanes' paid bytes grew by while it ran.
@@ -1881,13 +1915,6 @@ impl<P: Provider + Clone> PullCtx<P> {
         // fetch or pull of this puller, nor a pull after one its caller
         // dropped mid-pass.
         self.stop = self.stop.next_pass();
-        // A replacement the gate holds from before this pull (a manifest
-        // fetch's, or an earlier pull's that ran nothing again) was reported
-        // then, and its pool is the one this pull's lanes reuse. Left on the
-        // gate, it would answer this pull's first recovery step with no step.
-        if self.recovery.replaced().is_some() {
-            self.recovery.start_next_pass();
-        }
         let mut run = self
             .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
             .await;
@@ -1901,9 +1928,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             }
             // Every lane in the fresh registry counts from its own seed, so
             // the second pass's payment is the new registry's whole total.
-            self.ledgers = LaneLedgers::new();
-            self.funding = RunFunding::reporting_escrows_to(self.funding.escrows().clone());
-            self.recovery.start_next_pass();
+            start_pass_on_new_pool(&self.recovery, &mut self.ledgers, &mut self.funding);
             let saved = skip_cache::load(out_root);
             let second = self
                 .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
