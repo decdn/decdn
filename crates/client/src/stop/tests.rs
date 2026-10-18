@@ -85,3 +85,17 @@ fn a_limit_between_whole_minutes_prints_in_seconds() {
     };
     assert_eq!(whole.to_string(), "no progress for 2m; rerun to resume");
 }
+
+#[tokio::test]
+async fn a_halt_holds_for_one_pass_on_the_same_clock() {
+    let clock = Arc::new(ProgressClock::new());
+    let policy = StopPolicy::new(false, Some(Duration::from_mins(1)), Arc::clone(&clock));
+    assert!(!policy.is_halted());
+    policy.halt();
+    assert!(policy.is_halted());
+    assert_eq!(policy.halted().await, super::Halted);
+    let next = policy.next_pass();
+    assert!(!next.is_halted());
+    assert!(Arc::ptr_eq(&next.clock, &clock));
+    assert_eq!(next.give_up_after, policy.give_up_after);
+}

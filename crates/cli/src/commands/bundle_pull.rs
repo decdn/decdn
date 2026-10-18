@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use super::buyer_store::open_client_store_for_buy;
 use super::fetch;
 use super::get::Destination;
-use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_escrows};
+use super::interrupt::{Interrupt, Interrupted, name_held_escrows};
 use super::manifest::build_glob_set;
 use super::pull_progress::{self, PullProgress};
 
@@ -572,7 +572,9 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 ///
 /// `excluded` counts the manifest entries this run does not pull: the ones the
 /// `--include`/`--exclude` filter dropped and the ones deselected under
-/// `--select`.
+/// `--select`. `not_run` counts the entries it meant to pull but did not run:
+/// another entry ended the pull, or Ctrl-C stopped it, before their fetch
+/// ended. A rerun runs them.
 ///
 /// `reused` and `reused_bytes` report the whole-file dedup outcome, counted per
 /// distinct blob exactly as `fetched`/`downloaded` are (a blob reused at several
@@ -598,6 +600,8 @@ struct PullReport {
     /// Entries the filter or `--select` dropped.
     excluded: u64,
     failed: u64,
+    /// Entries the pull ended before their fetch ended.
+    not_run: u64,
     downloaded: u64,
     /// Wire bytes this run's vouchers and hash-chain reveals paid for, over
     /// every lane.
@@ -755,7 +759,8 @@ async fn pull_over(
 
     let observer = Arc::new(PullObserver::new(args.json, run_label(out)));
     // Outlives the puller's passes, so an `openPool` or `topUp` that a Ctrl-C
-    // or a fault dropped before its receipt was read is still named.
+    // or a fault dropped before its record committed is still named, and so is
+    // one that escrowed untracked in an entry the pull dropped.
     let escrows = UnconfirmedEscrows::default();
     let mut puller = BundlePuller::builder(
         chain.config.clone(),
@@ -794,9 +799,13 @@ async fn pull_over(
         (filter, filters_given),
     )
     .await;
+    // On every exit, the manifest fetch's and a cancelled pull's included:
+    // each pool a recovery step closed may still hold a balance.
+    fetch::print_reclaim_notes(&puller.replacements());
     // Every exit of the manifest or the pull can drop an `openPool` or a
-    // `topUp` before its receipt is read, and the transaction may still escrow.
-    let result = name_unconfirmed_escrows(result, &escrows.pending());
+    // `topUp` before its record commits, and the transaction may still escrow,
+    // or leave an untracked escrow on the handle that no returned error names.
+    let result = name_held_escrows(result, &escrows);
     // On every exit, a Ctrl-C's included: what the entries queued is durable
     // before the command returns.
     puller.finish().await;
@@ -864,9 +873,6 @@ async fn pull_manifest(
             never = watch => match never {},
         }
     };
-    if let Some(replaced) = outcome.replaced {
-        print_reclaim_note(replaced);
-    }
     observer.finish();
     warn_leftover_partials(out, &manifest.entries, uri.hash);
     let reported = report(&outcome.report, excluded, out, args.json);
@@ -878,16 +884,6 @@ async fn pull_manifest(
         BundleEnd::FundingNeeded { error, .. } | BundleEnd::Stopped(error) => Err(error),
         _ => reported,
     }
-}
-
-/// Name the pool a funding recovery step closed, which may still hold a
-/// balance, and the command that reclaims it.
-fn print_reclaim_note(replaced: PoolReplaced) {
-    eprintln!(
-        "note: pool {} accepts no more funds and may still hold a balance; once its \
-         dispute window ends, reclaim it with: decdn pool reclaim --pool {}",
-        replaced.closed, replaced.closed
-    );
 }
 
 /// The kept manifest for the run: the bundle blob fetched and filtered here.
@@ -1277,6 +1273,7 @@ fn pull_report(rep: &BundleReport, excluded: u64, output: &Path) -> PullReport {
         skipped: rep.skipped,
         excluded,
         failed: rep.failed,
+        not_run: rep.not_run,
         downloaded: rep.downloaded,
         paid_bytes: rep.paid_bytes,
         reconstructed: rep.reconstructed,
@@ -1289,9 +1286,16 @@ fn pull_report(rep: &BundleReport, excluded: u64, output: &Path) -> PullReport {
 }
 
 /// The summary's first line: where the run pulled to, and every entry count.
+/// The entries the pull did not run are named only when there are some.
 fn counts_line(rep: &PullReport) -> String {
+    let not_run = if rep.not_run == 0 {
+        String::new()
+    } else {
+        format!(", {} not run", rep.not_run)
+    };
     format!(
-        "pulled into {} ({} fetched, {} linked, {} skipped, {} reused, {} excluded, {} failed)",
+        "pulled into {} ({} fetched, {} linked, {} skipped, {} reused, {} excluded, {} \
+         failed{not_run})",
         rep.output, rep.fetched, rep.linked, rep.skipped, rep.reused, rep.excluded, rep.failed
     )
 }

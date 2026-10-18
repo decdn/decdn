@@ -16,6 +16,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
 use decdn_incentive::{LaneKey, PoolId};
 use iroh::RelayUrl;
+use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::WatermarkRow;
 use crate::discovery::NodeCandidate;
@@ -466,7 +467,11 @@ where
     /// extra stream leaves the last free one for a sibling entry, and a lane
     /// refused a stream claims the next permit that frees
     /// ([`LaneStreamCap::widen`]).
-    async fn build(&self, holder: &Holder) -> anyhow::Result<StreamCandidate<PeerSource<'a>>> {
+    async fn build(
+        &self,
+        holder: &Holder,
+        ended: &CancellationToken,
+    ) -> anyhow::Result<StreamCandidate<PeerSource<'a>>> {
         let parked = self
             .parked
             .lock()
@@ -476,7 +481,7 @@ where
             lane
         } else {
             let lease = lane_lease(self.lane_cap, holder.provider).await?;
-            let mut lane = self.build_fresh(holder).await?;
+            let mut lane = self.build_fresh(holder, ended).await?;
             lane.lease = lease;
             lane
         };
@@ -488,10 +493,12 @@ where
         Ok(lane)
     }
 
-    /// Build `holder`'s lane and record its watermark handle.
+    /// Build `holder`'s lane and record its watermark handle. `ended` fires
+    /// once the fetch the lane serves has ended ([`SourceProvider::connect`]).
     async fn build_fresh(
         &self,
         holder: &Holder,
+        ended: &CancellationToken,
     ) -> anyhow::Result<StreamCandidate<PeerSource<'a>>> {
         let candidate = self
             .lock_nodes()
@@ -512,6 +519,7 @@ where
             target,
             self.open_lock,
             self.ledgers,
+            ended,
         )
         .await?;
         self.deps.funding.note_pool(lane.pool_id);
@@ -645,8 +653,9 @@ where
     fn connect<'b>(
         &'b self,
         holder: &'b Holder,
+        ended: &'b CancellationToken,
     ) -> SourceFuture<'b, StreamCandidate<Self::Source>> {
-        Box::pin(self.build(holder))
+        Box::pin(self.build(holder, ended))
     }
 
     fn on_source_fault(&self, holder: &Holder) {

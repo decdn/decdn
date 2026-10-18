@@ -39,7 +39,9 @@
 //!    ([`decdn_incentive::BuyerPoolStore::get_by_owner`]). If there is none,
 //!    approve the deposit ([`buyer_pool::ensure_allowance`]), open a pool
 //!    ([`buyer_pool::open_pool`]), and record the returned state at once: the
-//!    deposit is escrowed from the moment `open_pool` returns.
+//!    deposit is escrowed from the moment `open_pool` returns. Then resolve
+//!    the [`buyer_pool::UnrecordedEscrow`] returned beside it, so a handle you
+//!    passed names the open until the record commits.
 //! 3. **Bring up an endpoint** with [`endpoint::client_endpoint`].
 //! 4. **Find the holders.** Read the registered nodes
 //!    ([`discovery::bootstrap_nodes`]), pick a sample
@@ -783,7 +785,7 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
     total_bytes: u64,
     hash: [u8; 32],
 ) -> anyhow::Result<()> {
-    if total_bytes == 0 && hash != *blake3::hash(&[]).as_bytes() {
+    if total_bytes == 0 && hash != decdn_protocol::EMPTY_ROOT {
         return Err(anyhow::Error::new(HashMismatch));
     }
     Ok(())

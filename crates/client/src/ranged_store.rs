@@ -166,11 +166,6 @@ fn lock_poisoned(what: &str) -> RangedStoreError {
     RangedStoreError::Backend(format!("{what} lock poisoned").into())
 }
 
-/// The BLAKE3 root of the empty blob.
-fn empty_root() -> [u8; 32] {
-    *blake3::hash(&[]).as_bytes()
-}
-
 /// The chunk ranges of the whole `[0, size)` blob.
 fn whole(size: u64) -> ChunkRanges {
     ChunkRanges::from(ChunkNum(0)..ChunkNum::chunks(size))
@@ -313,7 +308,7 @@ impl ClientRangedStore {
         ranges_path: PathBuf,
         mut state: StoreState,
     ) -> Self {
-        if root == empty_root() {
+        if root == decdn_protocol::EMPTY_ROOT {
             state.prove(0);
         }
         Self {
@@ -777,7 +772,7 @@ impl ClientRangedStore {
         // The empty blob has no leaf to verify and no chunk for a decoder to
         // anchor: its claim holds only against the empty root, which proves it.
         if claimed_total == 0 {
-            if self.root != empty_root() {
+            if self.root != decdn_protocol::EMPTY_ROOT {
                 return Err(anyhow::Error::new(crate::HashMismatch));
             }
             self.lock_state().prove(0);

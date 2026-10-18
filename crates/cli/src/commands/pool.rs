@@ -44,7 +44,7 @@ use super::buyer_store::{
     open_client_store_for_escrow,
 };
 use super::chain_ctx;
-use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_escrows};
+use super::interrupt::{Interrupt, Interrupted, name_held_escrows};
 
 /// Dispatch `decdn pool <subcommand>`.
 pub async fn pool_dispatch(args: &cli::PoolArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
@@ -202,29 +202,14 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
     // `openPool`, so the command names it rather than dying with no hash.
     let escrows = UnconfirmedEscrows::default();
     let mut interrupt = Interrupt::watch(escrows.clone());
-    let opened = async {
-        let opened = open_pool(
-            &contract,
-            deployment,
-            token,
-            owner,
-            deposit,
-            Some(&escrows),
-            Some(RECEIPT_TIMEOUT),
-        )
-        .await?;
-        // The deposit is escrowed on-chain; a failed local record leaves it
-        // untracked (reconcile against the tx).
-        store
-            .record(&opened.state)
-            .map_err(|e| escrowed_but_untracked("buyer pool opened", opened.tx, e))?;
-        anyhow::Ok(opened.state.pool_id)
-    };
+    let opened = open_and_record(
+        &contract, &store, deployment, token, owner, deposit, &escrows,
+    );
     let result = tokio::select! {
         result = opened => result,
         () = interrupt.wait() => Err(Interrupted.into()),
     };
-    let pool_id = name_unconfirmed_escrows(result, &escrows.pending())?;
+    let pool_id = name_held_escrows(result, &escrows)?;
 
     let out = PoolOpenJson {
         pool_id: format!("{pool_id:#x}"),
@@ -232,6 +217,53 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
     serde_json::to_writer_pretty(std::io::stdout(), &out)?;
     println!();
     Ok(())
+}
+
+/// Escrow `deposit` in a fresh pool (`openPool`) from `owner`, record it in
+/// `store`, and return its id. `escrows` names the open from before its submit
+/// until the record resolves, so a second Ctrl-C during the write still names
+/// it.
+///
+/// # Errors
+///
+/// The `openPool` fails or is not confirmed, or the record write fails after
+/// it mined: the deposit is then escrowed and untracked, and `escrows` holds
+/// it.
+async fn open_and_record<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    store: &dyn BuyerPoolStore,
+    deployment: Deployment,
+    token: Address,
+    owner: Address,
+    deposit: U256,
+    escrows: &UnconfirmedEscrows,
+) -> anyhow::Result<PoolId>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let (opened, unrecorded) = open_pool(
+        contract,
+        deployment,
+        token,
+        owner,
+        deposit,
+        Some(escrows),
+        Some(RECEIPT_TIMEOUT),
+    )
+    .await?;
+    // The deposit is escrowed on-chain; a failed local record leaves it
+    // untracked (reconcile against the tx).
+    match store.record(&opened.state) {
+        Ok(()) => unrecorded.recorded(),
+        Err(e) => {
+            return Err(unrecorded.untracked(escrowed_but_untracked(
+                "buyer pool opened",
+                opened.tx,
+                e,
+            )));
+        }
+    }
+    Ok(opened.state.pool_id)
 }
 
 /// `decdn pool open` machine-readable output.
@@ -274,35 +306,62 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
     // `topUp`, so the command names it rather than dying with no hash.
     let escrows = UnconfirmedEscrows::default();
     let mut interrupt = Interrupt::watch(escrows.clone());
-    let topped_up = async {
-        let ToppedUpPool { credited, tx, .. } = top_up(
-            &contract,
-            owner,
-            pool_id,
-            additional,
-            Some(&escrows),
-            Some(RECEIPT_TIMEOUT),
-        )
-        .await?;
-        // `add_deposit` reports a backend fault as `Err` and a committed-row
-        // mismatch as a non-`Added` `Ok` (the row vanished or now tracks a
-        // different pool). Both mean the same thing here: the USDC is escrowed
-        // and the local deposit is short by `credited`. Exiting 0 on either
-        // would let a wrapper record the pool as funded — after which the
-        // low-water check re-fires on every later fetch, and re-running this
-        // command escrows again.
-        let effect = topped_up_effect(pool_id, credited);
-        let new_deposit =
-            grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx)?;
-        anyhow::Ok((credited, new_deposit))
-    };
+    let topped_up = top_up_and_credit(&contract, &store, owner, pool_id, additional, &escrows);
     let result = tokio::select! {
         result = topped_up => result,
         () = interrupt.wait() => Err(Interrupted.into()),
     };
-    let (credited, new_deposit) = name_unconfirmed_escrows(result, &escrows.pending())?;
+    let (credited, new_deposit) = name_held_escrows(result, &escrows)?;
     println!("topped up pool {pool_id} by {credited} µUSDC; deposit now {new_deposit} µUSDC");
     Ok(())
+}
+
+/// Add `additional` to `owner`'s pool `pool_id` (`topUp`), credit it in
+/// `store`, and return the credited amount with the new local deposit.
+/// `escrows` names the `topUp` from before its submit until the credit
+/// resolves, so a second Ctrl-C during the write still names it.
+///
+/// # Errors
+///
+/// The `topUp` fails or is not confirmed, or the credit does not land after
+/// it mined: the USDC is then escrowed and untracked, and `escrows` holds it.
+async fn top_up_and_credit<P>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    store: &dyn BuyerPoolStore,
+    owner: Address,
+    pool_id: PoolId,
+    additional: U256,
+    escrows: &UnconfirmedEscrows,
+) -> anyhow::Result<(U256, U256)>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let (ToppedUpPool { credited, tx, .. }, unrecorded) = top_up(
+        contract,
+        owner,
+        pool_id,
+        additional,
+        Some(escrows),
+        Some(RECEIPT_TIMEOUT),
+    )
+    .await?;
+    // `add_deposit` reports a backend fault as `Err` and a committed-row
+    // mismatch as a non-`Added` `Ok` (the row vanished or now tracks a
+    // different pool). Both mean the same thing here: the USDC is escrowed
+    // and the local deposit is short by `credited`. Exiting 0 on either
+    // would let a wrapper record the pool as funded — after which the
+    // low-water check re-fires on every later fetch, and re-running this
+    // command escrows again.
+    let effect = topped_up_effect(pool_id, credited);
+    let new_deposit =
+        match grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx) {
+            Ok(deposit) => {
+                unrecorded.recorded();
+                deposit
+            }
+            Err(err) => return Err(unrecorded.untracked(err)),
+        };
+    Ok((credited, new_deposit))
 }
 
 /// Where `pool close` / `pool reclaim` record that a pool is gone: after a

@@ -1,9 +1,9 @@
 use super::{
-    AllowanceShortfall, EscrowUnconfirmed, LOW_WATER_DIVISOR, OpenUnconfirmed, OwnedPayer,
-    PaymentPool, TopUpUnconfirmed, UnconfirmedEscrows, approval_floor, approve_decision,
-    ensure_allowance, escrowed_but_untracked, grade_deposit_credit, issue_self_capability,
-    open_pool, pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool,
-    send_top_up_at, top_up, topped_up_from_receipt,
+    AllowanceShortfall, EscrowUnconfirmed, EscrowUntracked, LOW_WATER_DIVISOR, OpenUnconfirmed,
+    OwnedPayer, PaymentPool, TopUpUnconfirmed, UnconfirmedEscrows, approval_floor,
+    approve_decision, ensure_allowance, escrowed_but_untracked, grade_deposit_credit,
+    issue_self_capability, open_pool, pool_accepts_funds, refill_amount, self_owned_lane_ctx,
+    send_open_pool, send_top_up_at, top_up, top_up_unless_ended, topped_up_from_receipt,
 };
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
@@ -82,7 +82,7 @@ async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
 async fn top_up_mocked(
     asserter: alloy::providers::mock::Asserter,
     escrows: &UnconfirmedEscrows,
-) -> anyhow::Result<super::ToppedUpPool> {
+) -> anyhow::Result<(super::ToppedUpPool, super::UnrecordedEscrow)> {
     top_up(
         &mocked_pool(asserter),
         Address::repeat_byte(0x22),
@@ -139,6 +139,49 @@ async fn a_top_up_out_of_nonce_retries_holds_nothing() {
     assert!(asserter.read_q().is_empty(), "four sends were tried");
 }
 
+/// #2520: a lane build's `topUp` that lost its nonce sends no re-send once
+/// its fetch ends during the backoff. The collision broadcast nothing, so the
+/// refusal escrows nothing, and the re-send's nonce read never runs.
+#[tokio::test(start_paused = true)]
+async fn a_collided_top_up_sends_no_re_send_after_the_fetch_ends() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    asserter.push_failure_msg("nonce too low");
+    asserter.push_success(&U256::from(6u64));
+    asserter.push_success(&B256::repeat_byte(0xab));
+    let escrows = UnconfirmedEscrows::default();
+    let ended = tokio_util::sync::CancellationToken::new();
+    let end_in_the_backoff = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        ended.cancel();
+    };
+    let pool = mocked_pool(asserter.clone());
+    let started = tokio::time::Instant::now();
+    let (result, ()) = tokio::join!(
+        top_up_unless_ended(
+            &pool,
+            Address::repeat_byte(0x22),
+            B256::repeat_byte(0x33),
+            U256::from(1_000u64),
+            Some(&escrows),
+            None,
+            Some(&ended),
+        ),
+        end_in_the_backoff,
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.downcast_ref::<crate::funding::FetchEnded>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(escrows.pending(), vec![]);
+    assert_eq!(asserter.read_q().len(), 2, "the re-send was never tried");
+    assert!(
+        started.elapsed() < super::TOPUP_NONCE_BACKOFF,
+        "the backoff ends with the fetch"
+    );
+}
+
 /// Two calls that hold equal entries each release their own: releasing one
 /// leaves the other held.
 #[test]
@@ -164,7 +207,7 @@ async fn open_tracked(
     contract: PaymentPool::PaymentPoolInstance<impl Provider + Clone>,
     opens: &UnconfirmedEscrows,
     receipt_timeout: Option<std::time::Duration>,
-) -> anyhow::Result<super::OpenedPool> {
+) -> anyhow::Result<(super::OpenedPool, super::UnrecordedEscrow)> {
     let deployment = decdn_incentive::Deployment {
         chain_id: CHAIN_ID,
         payment_pool: *contract.address(),
@@ -290,7 +333,10 @@ async fn a_bounded_open_receipt_wait_lapses_unconfirmed() {
 /// `receipt_timeout`, for at most twice [`RECEIPT_TIMEOUT`].
 async fn top_up_parked(
     receipt_timeout: Option<std::time::Duration>,
-) -> Result<anyhow::Result<super::ToppedUpPool>, tokio::time::error::Elapsed> {
+) -> Result<
+    anyhow::Result<(super::ToppedUpPool, super::UnrecordedEscrow)>,
+    tokio::time::error::Elapsed,
+> {
     tokio::time::timeout(
         RECEIPT_TIMEOUT * 2,
         top_up(
@@ -338,7 +384,7 @@ async fn an_unbounded_top_up_receipt_wait_keeps_waiting() {
 async fn top_up_tracked(
     script: ScriptedRpc,
     escrows: &UnconfirmedEscrows,
-) -> anyhow::Result<super::ToppedUpPool> {
+) -> anyhow::Result<(super::ToppedUpPool, super::UnrecordedEscrow)> {
     top_up(
         &scripted_pool(script),
         Address::repeat_byte(0x22),
@@ -469,6 +515,121 @@ async fn a_read_receipt_leaves_no_unconfirmed_top_up() {
     .unwrap_err();
     assert!(format!("{err:#}").contains("topUp reverted"), "{err:#}");
     assert_eq!(escrows.pending(), vec![]);
+}
+
+/// #2515: a mined `topUp` stays pending on the handle until its caller
+/// resolves the credit, so a command that ends during the credit still names
+/// it. A committed credit releases it.
+#[tokio::test(start_paused = true)]
+async fn a_mined_top_up_stays_pending_until_its_record_resolves() {
+    let pool = Address::repeat_byte(0x01);
+    let receipt = top_up_receipt(
+        vec![topped_up_log(pool, B256::repeat_byte(0x33), 1_000)],
+        true,
+    );
+    let escrows = UnconfirmedEscrows::default();
+    let (topped_up, unrecorded) = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        top_up_tracked(ScriptedRpc::mined(receipt), &escrows),
+    )
+    .await
+    .expect("the receipt is answered")
+    .unwrap();
+    assert_eq!(topped_up.tx, SCRIPTED_TX);
+    let held = TopUpUnconfirmed {
+        tx: Some(SCRIPTED_TX),
+        nonce: SCRIPTED_NONCE,
+    };
+    assert_eq!(escrows.top_ups(), vec![held], "the credit is not resolved");
+    unrecorded.recorded();
+    assert_eq!(escrows.pending(), vec![]);
+    assert_eq!(escrows.untracked(), vec![]);
+}
+
+/// #2515: a credit that fails holds the escrow untracked and releases its
+/// pending entry: the handle names it once.
+#[tokio::test(start_paused = true)]
+async fn a_failed_record_holds_the_escrow_untracked() {
+    let pool = Address::repeat_byte(0x01);
+    let receipt = top_up_receipt(
+        vec![topped_up_log(pool, B256::repeat_byte(0x33), 1_000)],
+        true,
+    );
+    let escrows = UnconfirmedEscrows::default();
+    let (topped_up, unrecorded) = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        top_up_tracked(ScriptedRpc::mined(receipt), &escrows),
+    )
+    .await
+    .expect("the receipt is answered")
+    .unwrap();
+    let err = unrecorded.untracked(escrowed_but_untracked(
+        "pool 0x33 topped up by 1000 µUSDC",
+        topped_up.tx,
+        "disk full",
+    ));
+    assert!(err.downcast_ref::<EscrowUntracked>().is_some(), "{err:#}");
+    assert_eq!(escrows.pending(), vec![]);
+    let held: Vec<_> = escrows
+        .untracked()
+        .into_iter()
+        .map(|held| held.tx)
+        .collect();
+    assert_eq!(held, [SCRIPTED_TX]);
+}
+
+/// An error that names no escrow the handle can hold leaves the transaction
+/// pending: releasing it would leave the tx named nowhere.
+#[tokio::test(start_paused = true)]
+async fn an_unheld_record_error_keeps_the_escrow_pending() {
+    let pool = Address::repeat_byte(0x01);
+    let receipt = top_up_receipt(
+        vec![topped_up_log(pool, B256::repeat_byte(0x33), 1_000)],
+        true,
+    );
+    let escrows = UnconfirmedEscrows::default();
+    let (_, unrecorded) = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        top_up_tracked(ScriptedRpc::mined(receipt), &escrows),
+    )
+    .await
+    .expect("the receipt is answered")
+    .unwrap();
+    let _ = unrecorded.untracked(anyhow::anyhow!("disk full"));
+    let held = TopUpUnconfirmed {
+        tx: Some(SCRIPTED_TX),
+        nonce: SCRIPTED_NONCE,
+    };
+    assert_eq!(escrows.top_ups(), vec![held]);
+    assert_eq!(escrows.untracked(), vec![]);
+}
+
+/// #2515: a mined `openPool` whose receipt holds no `PoolOpened` event
+/// escrowed a deposit no record can name. `open_pool` holds it untracked on
+/// the handle before it releases the pending entry, so the handle names it
+/// at every moment.
+#[tokio::test(start_paused = true)]
+async fn a_mined_open_with_no_pool_opened_event_is_held_untracked() {
+    let escrows = UnconfirmedEscrows::default();
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        open_tracked(
+            scripted_pool(ScriptedRpc::mined(top_up_receipt(Vec::new(), true))),
+            &escrows,
+            None,
+        ),
+    )
+    .await
+    .expect("the receipt is answered")
+    .unwrap_err();
+    assert!(err.downcast_ref::<EscrowUntracked>().is_some(), "{err:#}");
+    assert_eq!(escrows.pending(), vec![]);
+    let held: Vec<_> = escrows
+        .untracked()
+        .into_iter()
+        .map(|held| held.tx)
+        .collect();
+    assert_eq!(held, [SCRIPTED_TX]);
 }
 
 /// A receipt read that fails leaves the open unconfirmed in `opens` as well as
@@ -1061,6 +1222,46 @@ fn escrowed_but_untracked_names_the_tx_and_the_action() {
          double-spends: {msg}"
     );
     assert!(msg.contains("disk full"), "the cause must survive: {msg}");
+}
+
+/// A handle holds every untracked escrow once, oldest first, and nothing
+/// else: a second `openPool` that passed its check before the first escrow
+/// went untracked can go untracked too, and the command names both (#2511).
+#[test]
+fn a_handle_holds_each_untracked_escrow_once() {
+    let escrows = UnconfirmedEscrows::default();
+    let (first, second) = (B256::repeat_byte(0x01), B256::repeat_byte(0x02));
+    escrows.hold_untracked(&escrowed_but_untracked(
+        "buyer pool opened",
+        first,
+        "disk full",
+    ));
+    escrows.hold_untracked(&anyhow::anyhow!("a transient fault"));
+    let late = escrowed_but_untracked("buyer pool opened", second, "disk full");
+    escrows.hold_untracked(&late.context("building the payment lane failed"));
+    escrows.hold_untracked(&escrowed_but_untracked(
+        "buyer pool opened",
+        first,
+        "a later cause",
+    ));
+
+    let held = escrows.untracked();
+    let txs: Vec<B256> = held.iter().map(|escrow| escrow.tx).collect();
+    assert_eq!(txs, [first, second]);
+    let texts: Vec<&str> = held.iter().map(|escrow| escrow.text.as_str()).collect();
+    assert!(
+        texts[0].contains("disk full") && !texts[0].contains("a later cause"),
+        "{texts:?}"
+    );
+    assert!(
+        texts[1].contains("building the payment lane failed"),
+        "{texts:?}"
+    );
+    assert_eq!(
+        escrows.clone().untracked(),
+        held,
+        "a clone shares the held escrows"
+    );
 }
 
 #[test]

@@ -514,6 +514,32 @@ fn a_replaced_pool_runs_the_work_again_at_most_once() {
     assert_eq!(replaced, None);
 }
 
+/// #2519: a late lane build's escrow folded over the `PoolReplaced` that
+/// ended the pass leaves the replacement only as text (`fold_late_escrow`,
+/// whose shape the bundle engine's tests pin). The escrow error ends the
+/// command with no second pass; the gate still lists the replacement for the
+/// command to name.
+#[test]
+fn a_replacement_under_a_late_escrow_runs_nothing_again() {
+    let new = replacement(1, 2);
+    let mut replaced = None;
+    let err = next_pass(
+        Err(
+            anyhow::anyhow!("a lane build may have escrowed USDC no record credits")
+                .context(format!("the fetch failed ({new})")),
+        ),
+        &mut replaced,
+        false,
+    )
+    .expect("an escrow error runs nothing again")
+    .expect_err("it ends the command");
+    assert!(
+        !format!("{err:#}").contains("now the current pool"),
+        "{err:#}"
+    );
+    assert_eq!(replaced, None);
+}
+
 /// A stream to stdout never runs again: the bytes it wrote cannot be taken
 /// back. Its replacement ends the command and names the new pool.
 #[test]

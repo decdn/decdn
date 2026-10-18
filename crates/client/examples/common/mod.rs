@@ -123,7 +123,8 @@ impl Buyer {
         } else {
             let token = contract.usdc().call().await?;
             ensure_allowance(&rpc, token, owner, env.payment_pool, Some(env.deposit)).await?;
-            let opened = open_pool(
+            // With no handle, nothing reads the pending entry the guard holds.
+            let (opened, _unrecorded) = open_pool(
                 &contract,
                 deployment,
                 token,
@@ -197,8 +198,7 @@ impl Buyer {
                 hash,
                 timestamp_us,
             );
-            if verified.is_err() || !ext.consistent_with(resp.body.has_blob) || !resp.body.has_blob
-            {
+            if verified.is_err() || !ext.consistent_with(&resp.body) || !resp.body.has_blob {
                 continue;
             }
             total_bytes = total_bytes.or(ext.total_bytes);

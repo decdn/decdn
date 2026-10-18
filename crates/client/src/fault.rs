@@ -10,6 +10,7 @@ use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
 use crate::buyer_pool::{EscrowUntracked, OpenUnconfirmed, TopUpUnconfirmed, WalletShortfall};
 use crate::driver::PoolExhausted;
+use crate::funding::RefusedAfterUntracked;
 use crate::source::PoolReplaced;
 use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
 
@@ -101,10 +102,38 @@ impl std::error::Error for HealExhausted {}
 /// Whether `err` reports a `topUp` or `openPool` that may have escrowed USDC
 /// no local record credits ([`EscrowUntracked`], [`TopUpUnconfirmed`],
 /// [`OpenUnconfirmed`]). A retry escrows again, so it is fatal to the command.
-fn escrow_untracked(err: &anyhow::Error) -> bool {
+pub(crate) fn escrow_untracked(err: &anyhow::Error) -> bool {
     err.downcast_ref::<EscrowUntracked>().is_some()
         || err.downcast_ref::<TopUpUnconfirmed>().is_some()
         || err.downcast_ref::<OpenUnconfirmed>().is_some()
+}
+
+/// Whether `err` reports a `topUp` or `openPool` that may have escrowed USDC
+/// no local record credits ([`escrow_untracked`]), directly or as the error a
+/// [`LaneBuildFault`] holds: that wrapper hides it from a downcast.
+pub(crate) fn carries_untracked_escrow(err: &anyhow::Error) -> bool {
+    escrow_untracked(err)
+        || err
+            .downcast_ref::<LaneBuildFault>()
+            .is_some_and(|LaneBuildFault(inner)| escrow_untracked(inner))
+}
+
+/// Fold `err`, one more possible untracked escrow ([`carries_untracked_escrow`]),
+/// into `late`, the escrows found so far: the first stays the error a caller
+/// downcasts, and each later one is added to it as text context after `also`,
+/// so every tx is named.
+pub(crate) fn fold_escrow(
+    late: Option<anyhow::Error>,
+    err: anyhow::Error,
+    also: &str,
+) -> anyhow::Error {
+    match late {
+        None => err,
+        Some(first) => first.context(format!(
+            "{also}: {}",
+            decdn_common::redact::sanitize_err_chain(&err)
+        )),
+    }
 }
 
 /// Whether a mid-stream voucher rejection for `reason` acts as `Unfunded`
@@ -173,6 +202,7 @@ pub fn classify(err: &anyhow::Error) -> Fault {
         || err
             .downcast_ref::<crate::credential::FundingNeeded>()
             .is_some()
+        || err.downcast_ref::<RefusedAfterUntracked>().is_some()
     {
         return Fault::Fatal(FatalScope::Command);
     }

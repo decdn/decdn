@@ -10,8 +10,8 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, Hash, ProbeHoldOutcome};
 use decdn_incentive::ProbeSlashData;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, FrameError, ProbeMessage, ProbeResponseBody,
-    ProbeResponseExt, decode_message, encode_probe_response, is_unknown_variant,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, EMPTY_ROOT, FrameError, ProbeMessage,
+    ProbeResponseBody, ProbeResponseExt, decode_message, encode_probe_response, is_unknown_variant,
     message::ProbeResponse, num_blocks, read_frame, write_frame,
 };
 use iroh::PublicKey;
@@ -564,7 +564,10 @@ impl ProbeHandler {
         // "holds the whole blob" to "will serve at least one discovery
         // block", so it is derived FROM `coverage` rather than the other way
         // around — the two are a biconditional by construction, never two
-        // independently-set fields that could drift apart.
+        // independently-set fields that could drift apart. The one blob with
+        // no block to serve is the empty one: its coverage is empty on a
+        // holder too, so the presence verdict above carries `has_blob` for
+        // it (#2471, below).
         //
         // - Origin-sourced (`has_blob` flipped true by the fold above, not by
         //   the store branch): an origin serves every block and already
@@ -588,8 +591,9 @@ impl ProbeHandler {
         // ADR 005 asks a node to include the size whenever it knows it.
         let (coverage, total_bytes) = if chain_stale {
             // Chain-stale (above): advertise no coverage, so the re-derived
-            // `has_blob` below stays false. This is the arm that actually binds the
-            // stale answer — `has_blob` is the coverage biconditional.
+            // `has_blob` below stays false. This arm binds the stale answer for
+            // every blob with a block; the presence gate above binds it for the
+            // empty root (#2471).
             (Coverage::empty(), total_bytes)
         } else if is_origin_sourced {
             (
@@ -619,11 +623,32 @@ impl ProbeHandler {
                 }
             }
         };
-        let has_blob = !coverage.is_empty();
-        debug_assert_eq!(
-            has_blob,
-            !coverage.is_empty(),
-            "has_blob must be the coverage biconditional by construction"
+        // The empty root (#2471): zero blocks, so an empty coverage says
+        // nothing about presence. Every arm that suppresses an advertisement
+        // (chain-stale, holds disabled, origin-only miss) settles presence as
+        // `false` above, so the presence verdict is the honest answer here.
+        // The coverage-read fault arm leaves presence as the store answered
+        // it; for the empty root that is still honest, because it has no
+        // block to read. The `refuses` re-check narrows the window the
+        // `await`s above open: a denial or eviction that lands after the
+        // presence check empties the coverage for every other blob through
+        // `coverage_sized`'s own refusal gate, and the empty root must not
+        // bypass that, because signing `has_blob: true` for a blacklisted
+        // hash is a blacklist-violation offense (ADR 014).
+        let has_blob = !coverage.is_empty()
+            || (has_blob && *hash.as_bytes() == EMPTY_ROOT && !self.cache.refuses(hash));
+        debug_assert!(
+            ProbeResponseExt {
+                total_bytes,
+                coverage: coverage.clone(),
+            }
+            .consistent_with(&ProbeResponseBody {
+                hash: *hash.as_bytes(),
+                has_blob,
+                rate_per_mb: 0,
+                timestamp_us: 0,
+            }),
+            "has_blob must agree with the coverage by construction"
         );
 
         // The node advertises its configured rate verbatim. The delivery floor

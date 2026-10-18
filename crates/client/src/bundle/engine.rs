@@ -87,13 +87,16 @@ use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
     FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, manifest_cache, parse_hash,
 };
-use crate::buyer_pool::OwnedPayer;
+use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
+use crate::fault::{carries_untracked_escrow, fold_escrow};
 use crate::funding::RunFunding;
 use crate::lane_sources::LaneSources;
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
+use crate::scheduler::{BUILD_DRAIN, fold_late_escrow};
 use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PullSite};
+use crate::stop::Halted;
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
     ProbeOpts, ProbeRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
@@ -696,7 +699,7 @@ enum Slot<'a> {
 /// destination materialized from an already-fetched sibling (hard link or copy),
 /// kept distinct from `Fetched` (a paid network pull) so the summary never
 /// implies a blob was paid for twice — the whole point of #1306.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum EntryOutcome {
     Fetched(u64),
     Linked,
@@ -710,6 +713,11 @@ enum EntryOutcome {
         path: String,
         err: String,
     },
+    /// A destination the pull did not run: a sibling's halt left it unwritten
+    /// ([`Halted`]), or its group never settled ([`SettledGroup::not_run`]).
+    /// The run summary counts it as not run, and the skip-cache does not
+    /// record it.
+    NotRun,
 }
 
 /// One hash-group's result.
@@ -745,8 +753,14 @@ impl GroupRun {
     }
 
     /// The group's blob fetch failed with `err`: every writable slot fails,
-    /// and `err` ends the whole pull when [`ends_the_pull`] says so.
+    /// and `err` ends the whole pull when [`ends_the_pull`] says so. A sibling
+    /// that ended the pull before this fetch finished halts it ([`Halted`]):
+    /// every writable slot is then [`EntryOutcome::NotRun`], and the halt ends
+    /// nothing.
     fn fetch_failed(slots: Vec<Slot<'_>>, err: anyhow::Error) -> Self {
+        if err.downcast_ref::<Halted>().is_some() {
+            return Self::done(not_run_all(slots));
+        }
         Self {
             outcomes: fail_all(slots, &err),
             bytes: None,
@@ -1000,10 +1014,10 @@ async fn warn_when_unpolled() -> std::convert::Infallible {
     }
 }
 
-/// What [`PullCtx::pull_all`] hands back: every settled entry's outcome, the
-/// run's byte tally, whether a cancel stopped it, and the fault that ended it
-/// early. A run that stopped early leaves out the entries that had not
-/// settled.
+/// What [`PullCtx::pull_all`] hands back: every entry's outcome, the run's
+/// byte tally, whether a cancel stopped it, and the fault that ended it
+/// early. An entry that a run that stopped early did not settle is
+/// [`EntryOutcome::NotRun`].
 struct PullRun {
     outcomes: Vec<EntryOutcome>,
     /// One line per landed entry whose blob differs in size from its
@@ -1016,7 +1030,12 @@ struct PullRun {
 }
 
 /// The pool replacement that ended `run`, when a funding recovery step opened
-/// a new pool and the pass was not interrupted.
+/// a new pool and the pass was not interrupted: the one the rest runs again
+/// against. Any other replacement runs nothing again: a sibling entry's step
+/// that replaced the pool while another entry's fault ended the pass, one
+/// that an untracked escrow ended the pass over (it survives in the error
+/// only as text), or one in an interrupted pass. The gate lists each of them
+/// ([`RecoveryGate::replacements`]).
 fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
     if run.interrupted {
         return None;
@@ -1027,11 +1046,156 @@ fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
         .copied()
 }
 
+/// Start a pass against the pool a funding recovery step opened (ADR 003 §
+/// Funding recovery). Lanes key on the pool, so the pass starts with fresh
+/// `ledgers` and `funding` facts on the same escrow handle: the funding
+/// recovery step tops up the pool the run's first lane names
+/// ([`RunFunding::note_pool`]), and a run that kept the closed pool there
+/// would open yet another pool instead of funding the new one. The gate
+/// steps on the new pool ([`RecoveryGate::start_next_pass`]).
+fn start_pass_on_new_pool(
+    recovery: &RecoveryGate,
+    ledgers: &mut LaneLedgers,
+    funding: &mut RunFunding,
+) {
+    *ledgers = LaneLedgers::new();
+    *funding = RunFunding::reporting_escrows_to(funding.escrows().clone());
+    recovery.start_next_pass();
+}
+
+/// Start a pull clear of a replacement the gate holds from before it: a
+/// manifest fetch's, or an earlier pull's that ran nothing again or came in
+/// its second pass. Its new pool is the one this pull's lanes reuse, so the
+/// pull starts as a pass against that pool ([`start_pass_on_new_pool`]). Left
+/// on the gate, it would answer the pull's first recovery step with no step.
+/// The gate still lists it ([`RecoveryGate::replacements`]).
+fn leave_carried_replacement(
+    recovery: &RecoveryGate,
+    ledgers: &mut LaneLedgers,
+    funding: &mut RunFunding,
+) {
+    if recovery.leave_carried().is_some() {
+        start_pass_on_new_pool(recovery, ledgers, funding);
+    }
+}
+
+/// `err`, the fault that ended a manifest fetch, with what comes next. A
+/// manifest fetch runs nothing again against a pool a recovery step opened:
+/// the pull that follows it pays from that pool.
+fn manifest_fetch_error(err: anyhow::Error) -> anyhow::Error {
+    let err = match err.downcast_ref::<PoolReplaced>().copied() {
+        Some(replaced) => err.context(format!(
+            "pool {} is now the current pool; run the pull again to fetch from it",
+            replaced.opened
+        )),
+        None => err,
+    };
+    err.context("fetch bundle manifest blob")
+}
+
+/// How a pull that ended with `stopped` ends, once every pass ran.
+/// `rerun` is the pool replacement a second pass ran against, `pending` the
+/// `openPool` and `topUp` transactions the puller's handle holds with no
+/// receipt read ([`crate::buyer_pool::UnconfirmedEscrows::pending`]), and
+/// `untracked` the escrows it holds with no local record crediting them
+/// ([`crate::buyer_pool::UnconfirmedEscrows::untracked`]).
+///
+/// An interrupted pull ends [`BundleEnd::Interrupted`], which carries no
+/// error: its caller names what the handle holds. Otherwise each escrow that
+/// `stopped` does not already name is folded into it: the untracked ones,
+/// then the pending ones, the first as the error's root
+/// ([`crate::buyer_pool::EscrowUntracked`], [`crate::buyer_pool::OpenUnconfirmed`]
+/// or [`crate::buyer_pool::TopUpUnconfirmed`]). An entry dropped before it
+/// reported its escrow, an entry dropped while its receipt read was pending,
+/// or an earlier pull on the handle, leaves that escrow named nowhere else.
+/// The escrow wins over any outcome, as a late lane build's does for one
+/// fetch: a pull that completed stops, and the stop survives only as text, so
+/// a [`crate::GaveUp`], a [`PoolReplaced`] or a [`FundingNeeded`] cannot send
+/// the caller into a rerun that escrows again. A second replacement in one
+/// run ends the pull "funding needed".
+fn pull_end(
+    interrupted: bool,
+    stopped: Option<anyhow::Error>,
+    rerun: Option<PoolReplaced>,
+    pending: Vec<EscrowUnconfirmed>,
+    untracked: Vec<UntrackedEscrow>,
+) -> BundleEnd {
+    if interrupted {
+        return BundleEnd::Interrupted;
+    }
+    // An error that invites a rerun never names an escrow: its text does not
+    // stop the caller from rerunning.
+    let named = stopped
+        .as_ref()
+        .filter(|err| !invites_rerun(err))
+        .map(|err| format!("{err:#}"));
+    let unnamed = untracked.into_iter().filter(|held| {
+        named
+            .as_ref()
+            .is_none_or(|named| !named.contains(&held.tx.to_string()))
+    });
+    // The oldest escrow is the root, and each later one is context on it.
+    let escrows = unnamed.fold(None, |escrows: Option<anyhow::Error>, held| {
+        Some(match escrows {
+            None => held.into_error(),
+            Some(err) => err.context(format!(
+                "another openPool or topUp of this command also escrowed USDC no record \
+                 credits: {held}"
+            )),
+        })
+    });
+    let unnamed = pending.into_iter().filter(|escrow| {
+        named
+            .as_ref()
+            .is_none_or(|named| !named.contains(&escrow.to_string()))
+    });
+    let escrows = unnamed.fold(escrows, |escrows, escrow| {
+        Some(match escrows {
+            None => escrow.into_error(),
+            Some(err) => err.context(format!(
+                "another openPool or topUp of this command may still escrow USDC: {escrow}"
+            )),
+        })
+    });
+    let stopped = match (stopped, escrows) {
+        (stopped, None) => stopped,
+        (None, Some(escrows)) => Some(escrows),
+        (Some(err), Some(escrows)) => Some(escrows.context(format!(
+            "the pull stopped ({}), and an openPool or topUp of this command may have escrowed \
+             USDC no record credits",
+            sanitize_err_chain(&err)
+        ))),
+    };
+    let stopped = stopped.map(|err| match (rerun, err.downcast_ref::<PoolReplaced>()) {
+        (Some(_), Some(_)) => err.context(
+            "funding needed: the pool this pull opened accepts no more funds either; run the \
+             pull again",
+        ),
+        _ => err,
+    });
+    match stopped {
+        None => BundleEnd::Complete,
+        Some(error) => match error.downcast_ref::<FundingNeeded>().copied() {
+            Some(needed) => BundleEnd::FundingNeeded { needed, error },
+            None => BundleEnd::Stopped(error),
+        },
+    }
+}
+
+/// Whether `err` tells its caller to rerun the pull, or to fund the pool and
+/// rerun it: a rerun escrows again while an untracked escrow is held, so such
+/// an error never stands for one, even when its text names the escrow's tx.
+fn invites_rerun(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::GaveUp>().is_some()
+        || err.downcast_ref::<PoolReplaced>().is_some()
+        || err.downcast_ref::<FundingNeeded>().is_some()
+}
+
 /// One run's result from its `first` pass, which a pool replacement ended,
 /// and its `second` pass against the new pool. Both passes walk the same
 /// entries in the same order, so an entry the first pass landed and the
-/// second found present keeps the first pass's outcome; every other entry
-/// takes the second's. The two transfers add up.
+/// second found present keeps the first pass's outcome, and so does any
+/// entry the second did not run; every other entry takes the second's. The two transfers add up.
 fn merge_passes(first: PullRun, second: PullRun) -> PullRun {
     let outcomes = if first.outcomes.len() == second.outcomes.len() {
         first
@@ -1042,7 +1206,8 @@ fn merge_passes(first: PullRun, second: PullRun) -> PullRun {
                 (
                     EntryOutcome::Fetched(_) | EntryOutcome::Linked | EntryOutcome::Deduped(_),
                     EntryOutcome::Skipped,
-                ) => was,
+                )
+                | (_, EntryOutcome::NotRun) => was,
                 _ => now,
             })
             .collect()
@@ -1102,12 +1267,25 @@ fn settle_group_run(
 /// A hash-group's result, kept for the run summary: its per-entry outcomes
 /// and the content bytes its landed fetch paid for and resumed (see
 /// [`GroupRun::bytes`]).
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct SettledGroup {
     outcomes: Vec<EntryOutcome>,
     /// The group's size warnings ([`size_warnings`]).
     warnings: Vec<String>,
     bytes: Option<EntryBytes>,
+}
+
+impl SettledGroup {
+    /// The result of a group of `entries` entries the pull never settled:
+    /// each entry not run.
+    fn not_run(entries: usize) -> Self {
+        Self {
+            outcomes: std::iter::repeat_with(|| EntryOutcome::NotRun)
+                .take(entries)
+                .collect(),
+            ..Self::default()
+        }
+    }
 }
 
 /// Run `items` through `run` once, at most `jobs` at a time. A bundle pull
@@ -1116,31 +1294,106 @@ struct SettledGroup {
 ///
 /// `settle` sees every result as it lands, with the item's index in `items`,
 /// and returns the fault that ends the whole run, if the result carries one.
-/// That fault starts no further item, drops the items in flight, and is what
-/// this returns. `None` means every item ran and settled.
+///
+/// Once `settle` returns that fault, no further item starts, and this calls
+/// `halt` once: every item still in flight stops at its next wait or loop
+/// pass ([`crate::StopPolicy`]). An item can be in the middle of an on-chain
+/// `topUp` or `openPool` lane build, so this waits for the items, for at most
+/// [`GROUP_DRAIN`], and `settle` sees each one that lands. Each later fault
+/// `settle` returns that may have escrowed USDC no record credits
+/// ([`carries_untracked_escrow`]) is folded into the first fault the way one
+/// fetch folds a late lane build's ([`fold_late_escrow`]): the escrow wins, so
+/// a [`crate::GaveUp`] cannot send the caller into a rerun that escrows
+/// again. Every other later fault is logged and dropped: the run already
+/// ends. An item still running at the bound is dropped where it stands.
+///
+/// Returns the first fault, or the late escrow with the first fault folded
+/// into it as text. `None` means every item ran and settled.
 async fn run_groups<G, R, Fut>(
     items: Vec<G>,
     jobs: usize,
     run: impl Fn(G) -> Fut,
     mut settle: impl FnMut(usize, R) -> Option<anyhow::Error>,
+    halt: impl FnOnce(),
 ) -> Option<anyhow::Error>
 where
     Fut: std::future::Future<Output = R>,
 {
     let width = jobs.min(items.len()).max(1);
+    // Set once the run ends: no item starts after it.
+    let ended = std::cell::Cell::new(false);
+    // Items started and items settled, for the count a lapsed drain drops.
+    let (started, settled) = (std::cell::Cell::new(0usize), std::cell::Cell::new(0usize));
     let mut stream = futures_util::stream::iter(items.into_iter().enumerate())
+        .take_while(|_| std::future::ready(!ended.get()))
         .map(|(i, item)| {
+            started.set(started.get() + 1);
             let fut = run(item);
             async move { (i, fut.await) }
         })
         .buffer_unordered(width);
-    while let Some((i, result)) = stream.next().await {
+    let stop = loop {
+        let (i, result) = stream.next().await?;
+        settled.set(settled.get() + 1);
         if let Some(err) = settle(i, result) {
-            return Some(err);
+            break err;
         }
+    };
+    ended.set(true);
+    halt();
+    let mut late: Option<anyhow::Error> = None;
+    let drained = tokio::time::timeout(GROUP_DRAIN, async {
+        while let Some((i, result)) = stream.next().await {
+            settled.set(settled.get() + 1);
+            let Some(err) = settle(i, result) else {
+                continue;
+            };
+            if !carries_untracked_escrow(&err) {
+                tracing::warn!(
+                    item = i,
+                    error = %sanitize_err_chain(&err),
+                    "a fault that ends the pull, after another one ended it, is dropped"
+                );
+                continue;
+            }
+            late = Some(fold_escrow(
+                late.take(),
+                err,
+                "another entry may also have escrowed USDC no record credits as the pull ended",
+            ));
+        }
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            entries = started.get().saturating_sub(settled.get()),
+            "bundle entries still running {GROUP_DRAIN:?} after the pull ended are dropped; \
+             an openPool or topUp one of them sent is named as unconfirmed"
+        );
     }
-    None
+    fold_late_escrow(Err::<(), _>(stop), late).err()
 }
+
+/// The fault a pass of [`PullCtx::pull_plain`] ends with: `stopped`, the one
+/// [`run_groups`] returned. A pass that `halted` with no fault ran on a halt
+/// left over from before it, so its halted entries never ran: it fails
+/// rather than end complete with nothing pulled.
+fn pass_stop(stopped: Option<anyhow::Error>, halted: bool) -> Option<anyhow::Error> {
+    match stopped {
+        None if halted => Some(anyhow!(
+            "the pull ran on a halt no entry of it set, so its halted entries never ran; run \
+             the pull again"
+        )),
+        stopped => stopped,
+    }
+}
+
+/// How long [`run_groups`] waits for the items still in flight once one ends
+/// the run: one lane-build drain ([`BUILD_DRAIN`]) plus 10 s for an item to
+/// reach it. A recovery step in progress when the halt lands runs first, and
+/// can outlast the bound.
+const GROUP_DRAIN: std::time::Duration =
+    BUILD_DRAIN.saturating_add(std::time::Duration::from_secs(10));
 
 /// The run's jobs cap ([`PullCtx::gate`]): its permits, and the admission
 /// queue a new group's first permit waits in.
@@ -1378,7 +1631,8 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// across the entry's holders ([`Self::entry_targets`]). See
     /// [`Self::acquire_entry`] for the fetch itself and what it returns.
     ///
-    /// `slot` is the caller's jobs permit; the fetch runs under it.
+    /// `slot` is the caller's jobs permit; the fetch runs under it, and stops
+    /// on `stop`.
     async fn fetch_to_staging(
         &self,
         hash: [u8; 32],
@@ -1386,10 +1640,11 @@ impl<P: Provider + Clone> PullCtx<P> {
         total: Option<u64>,
         progress: Option<&ProgressCallback>,
         slot: &FetchSlot<'_>,
+        stop: &StopPolicy,
     ) -> anyhow::Result<bool> {
         slot.ensure().await?;
         let targets = self.entry_targets(hash).await?;
-        self.acquire_entry(&targets, hash, staging, total, None, progress)
+        self.acquire_entry(&targets, hash, staging, total, None, progress, stop)
             .await
     }
 
@@ -1448,8 +1703,10 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// A holder that faults cools in the command-wide [`PeerHealth`] and
     /// returns inside the same loop, so a holder that fails one entry is
     /// rested for every entry. The fetch ends on done, a fault only the user
-    /// can fix, a unanimous verdict of the holders, or the command's
-    /// [`StopPolicy`]. Every lane draws vouchers from the run's shared
+    /// can fix, a unanimous verdict of the holders, or `stop`: the pull's own
+    /// policy for an entry, which a sibling entry halts, and an unhalted copy
+    /// on the same clock for a manifest. Every lane draws vouchers from the
+    /// run's shared
     /// `LaneLedgers` (ADR 039), serializes its pool open-or-reuse on
     /// `open_lock`, and holds one of its provider's stream permits
     /// ([`LaneStreamCap`]). Each lane's voucher watermark is persisted before
@@ -1460,6 +1717,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// the fetch dropped every byte the store held and fetched the blob again
     /// ([`Downloader::refetched_targets`]). A prefix an earlier run left is
     /// then fetched and paid again.
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_entry(
         &self,
         targets: &ResolvedTargets,
@@ -1468,6 +1726,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         total: Option<u64>,
         ranges: Option<&[(u64, u64)]>,
         progress: Option<&ProgressCallback>,
+        stop: &StopPolicy,
     ) -> anyhow::Result<bool> {
         let max_blob_bytes = self.max_blob_bytes;
         let deps = self.drive_deps(max_blob_bytes)?;
@@ -1486,8 +1745,9 @@ impl<P: Provider + Clone> PullCtx<P> {
             &self.recovery,
         );
         let holders = sources.holders_from(targets);
-        // A fetch dropped by a cancel, or by a sibling's command-wide fault,
-        // queues every lane's vouchers for recording too.
+        // A fetch dropped by a cancel, or still running [`GROUP_DRAIN`] after
+        // a sibling's command-wide fault ([`run_groups`]), queues every lane's
+        // vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
             // The manifest's size is the entry's first claim; without one, the
@@ -1496,7 +1756,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 (total, holders)
             } else {
                 let claim = sources
-                    .first_claim(hash, holders, &self.health, &self.stop)
+                    .first_claim(hash, holders, &self.health, stop)
                     .await?;
                 (claim.total_bytes, claim.holders)
             };
@@ -1521,7 +1781,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 }],
                 &self.ledgers,
                 progress,
-                &self.stop,
+                stop,
             ))
             .await
             .map(|_paths| downloader.refetched_targets() > 0)
@@ -1565,7 +1825,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             let fetched = self
                 .fetch_to_memory(hash, out_root)
                 .await
-                .context("fetch bundle manifest blob")?;
+                .map_err(manifest_fetch_error)?;
             if let Some(warning) = manifest_cache::store(out_root, hash, &fetched) {
                 self.warn(&warning);
             }
@@ -1587,7 +1847,10 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// remaining entries run once more against the new pool: lanes key on the
     /// pool, so the pass starts with fresh ledgers and funding facts, and each
     /// entry resumes the partial data it holds (ADR 003 § Funding recovery). A
-    /// second replacement ends the pull "funding needed".
+    /// second replacement that ends the pass against the new pool ends the
+    /// pull "funding needed". A replacement that did not end the first pass
+    /// runs nothing again ([`replaced_pool`]). The outcome lists every
+    /// replacement the pull made, a second one too.
     pub(super) async fn run(
         &mut self,
         manifest: &super::BundleManifest,
@@ -1613,28 +1876,36 @@ impl<P: Provider + Clone> PullCtx<P> {
         // advisory, so a flush failure is logged (inside the flush) and never
         // fails the pull.
         let saved = skip_cache::load(out_root);
+        leave_carried_replacement(&self.recovery, &mut self.ledgers, &mut self.funding);
+        // The replacements this pull's steps make are the gate's from here on.
+        let replaced_before = self.recovery.replacements().len();
         // The lanes outlive one pull (a manifest fetch or an earlier pull of
         // this puller drew on them), so this pull's payment is what the
         // lanes' paid bytes grew by while it ran.
         let paid_before = self.ledgers.paid_bytes();
+        // A halt lasts one pass ([`run_groups`]). Clear it as each pass starts
+        // and ends, so it halts neither the next pass, nor a later manifest
+        // fetch or pull of this puller, nor a pull after one its caller
+        // dropped mid-pass.
+        self.stop = self.stop.next_pass();
         let mut run = self
             .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
             .await;
+        self.stop = self.stop.next_pass();
         let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
-        let replaced = replaced_pool(&run);
-        if let Some(new) = replaced {
+        let rerun = replaced_pool(&run);
+        if let Some(new) = rerun {
             if let Some(observer) = &self.observer {
                 observer.pool_replaced(&new);
             }
             // Every lane in the fresh registry counts from its own seed, so
             // the second pass's payment is the new registry's whole total.
-            self.ledgers = LaneLedgers::new();
-            self.funding = RunFunding::reporting_escrows_to(self.funding.escrows().clone());
-            self.recovery.start_next_pass();
+            start_pass_on_new_pool(&self.recovery, &mut self.ledgers, &mut self.funding);
             let saved = skip_cache::load(out_root);
             let second = self
                 .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
                 .await;
+            self.stop = self.stop.next_pass();
             run = merge_passes(run, second);
             paid = paid.saturating_add(self.ledgers.paid_bytes());
         }
@@ -1645,30 +1916,25 @@ impl<P: Provider + Clone> PullCtx<P> {
             interrupted,
             stopped,
         } = run;
-        // A second replacement in one run ends it "funding needed".
-        let stopped = stopped.map(|err| match (replaced, err.downcast_ref::<PoolReplaced>()) {
-            (Some(_), Some(_)) => err.context(
-                "funding needed: the pool this pull opened accepts no more funds either; run the \
-                 pull again",
-            ),
-            _ => err,
-        });
         warnings.extend(self.funding.shortfall());
         // Every entry has joined, so the shared dedup counters are now stable.
         let dedup = self.dedup_stats.take();
         let mut report = bundle_report(&outcomes, transfer, dedup, warnings);
         report.paid_bytes = u64::try_from(paid).unwrap_or(u64::MAX);
-        let end = if interrupted {
-            BundleEnd::Interrupted
-        } else {
-            match stopped {
-                None => BundleEnd::Complete,
-                Some(error) => match error.downcast_ref::<FundingNeeded>().copied() {
-                    Some(needed) => BundleEnd::FundingNeeded { needed, error },
-                    None => BundleEnd::Stopped(error),
-                },
-            }
-        };
+        let replaced = self
+            .recovery
+            .replacements()
+            .get(replaced_before..)
+            .unwrap_or_default()
+            .to_vec();
+        let escrows = self.funding.escrows();
+        let end = pull_end(
+            interrupted,
+            stopped,
+            rerun,
+            escrows.pending(),
+            escrows.untracked(),
+        );
         BundleOutcome {
             report,
             end,
@@ -1692,7 +1958,10 @@ impl<P: Provider + Clone> PullCtx<P> {
         // The manifest blob fetch is silent (no bar): `progress` is disabled here
         // anyway, and the per-file bars belong to the entries, not the manifest.
         let slot = FetchSlot::acquire(&self.gate).await?;
-        self.fetch_to_staging(hash, &staging, None, None, &slot)
+        // A manifest belongs to no pass: a halt a pull left set, by a caller
+        // that dropped it mid-drain, does not stop it.
+        let stop = self.stop.next_pass();
+        self.fetch_to_staging(hash, &staging, None, None, &slot, &stop)
             .await?;
         let bytes =
             std::fs::read(&staging).with_context(|| format!("read {}", staging.display()))?;
@@ -1820,9 +2089,16 @@ impl<P: Provider + Clone> PullCtx<P> {
         // each run completes, forward its recordable files (built here while
         // the group's entries are in scope) to the flush task and keep its
         // outcomes for the run summary. A fault that ends the whole pull
-        // ([`ends_the_pull`]) drops every group still in flight, so none that
-        // waits for a slot starts.
-        let mut groups: Vec<SettledGroup> = vec![SettledGroup::default(); groups_by_hash.len()];
+        // ([`ends_the_pull`]) halts every group still in flight: none that
+        // waits for a slot starts a fetch (one that links from an on-disk
+        // donor still does), and each running fetch stops and drains its lane
+        // builds ([`run_groups`]).
+        // A group the pull never settles (dropped at `GROUP_DRAIN`, by a
+        // cancel, or never started) keeps its entries not run.
+        let mut groups: Vec<SettledGroup> = groups_by_hash
+            .iter()
+            .map(|g| SettledGroup::not_run(g.entries.len()))
+            .collect();
         let mut stopped: Option<anyhow::Error> = None;
         let drive = async {
             let run = |group: HashGroup<'e>| {
@@ -1867,8 +2143,10 @@ impl<P: Provider + Clone> PullCtx<P> {
                 |i, (run, updates, warnings)| {
                     settle_group_run(&mut groups, &flush_tx, i, run, updates, warnings)
                 },
+                || self.stop.halt(),
             )
             .await;
+            stopped = pass_stop(stopped.take(), self.stop.is_halted());
             // Closing the channel tells the flush task to do its final write.
             drop(flush_tx);
         };
@@ -1903,7 +2181,9 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// Run [`Self::pull_entry_untimed`] and, when the entry lands, report it
     /// with its size and the time the whole entry took
     /// ([`BundleObserver::entry_landed`], #2120, #2189). Returns the entry's
-    /// [`EntryBytes`] (see [`Self::pull_entry_untimed`]).
+    /// [`EntryBytes`] (see [`Self::pull_entry_untimed`]), or an error carrying
+    /// [`Halted`] once a sibling ends the pull: before this entry starts, or
+    /// mid-fetch (see [`crate::acquire`]).
     #[allow(clippy::too_many_arguments)]
     async fn pull_entry(
         &self,
@@ -1916,6 +2196,8 @@ impl<P: Provider + Clone> PullCtx<P> {
         file: Option<&FileBar>,
         slot: &FetchSlot<'_>,
     ) -> anyhow::Result<EntryBytes> {
+        // A sibling ended the pull while this entry waited for its slot.
+        self.stop.ensure_running()?;
         let started = std::time::Instant::now();
         self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file, slot)
             .await
@@ -2061,7 +2343,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             // manifest's `size`, when it gives one, is the entry's first size claim,
             // a hint; the paid count is the verified blob's length.
             let refetched = self
-                .fetch_to_staging(hash, staging, total, progress, slot)
+                .fetch_to_staging(hash, staging, total, progress, slot, &self.stop)
                 .await?;
             index.register(hints, staging);
             let len = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
@@ -2620,6 +2902,7 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, '_, P> {
                     Some(self.total),
                     Some(ranges),
                     self.progress,
+                    &self.ctx.stop,
                 )
                 .await?;
             if refetched {
@@ -3838,6 +4121,19 @@ fn fail_all(slots: Vec<Slot<'_>>, e: &anyhow::Error) -> Vec<EntryOutcome> {
         .collect()
 }
 
+/// Mark every `Write` slot [`EntryOutcome::NotRun`], preserving
+/// `Failed`/`Skip` classification, for a fetch a sibling halted.
+fn not_run_all(slots: Vec<Slot<'_>>) -> Vec<EntryOutcome> {
+    slots
+        .into_iter()
+        .map(|s| match s {
+            Slot::Failed(o) => o,
+            Slot::Skip => EntryOutcome::Skipped,
+            Slot::Write { .. } => EntryOutcome::NotRun,
+        })
+        .collect()
+}
+
 impl EntryOutcome {
     fn failed(path: &str, err: &anyhow::Error) -> Self {
         Self::Failed {
@@ -4116,6 +4412,7 @@ fn bundle_report(
                     error: err.clone(),
                 });
             }
+            EntryOutcome::NotRun => report.not_run += 1,
         }
     }
     report

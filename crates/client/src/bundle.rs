@@ -520,10 +520,18 @@ pub struct BundleOutcome {
     pub report: BundleReport,
     /// Why the pull ended.
     pub end: BundleEnd,
-    /// The pool replacement a funding recovery step made, if one did. The
-    /// closed pool may still hold a balance to reclaim once its dispute
-    /// window ends.
-    pub replaced: Option<PoolReplaced>,
+    /// Every pool replacement this pull's funding recovery steps made, in the
+    /// order they made them. Each closed pool may still hold a balance to
+    /// reclaim once its dispute window ends. A replacement that ended the
+    /// first pass runs the rest again against the new pool. One a sibling
+    /// entry's step made while another entry ended the pull, or one that an
+    /// untracked escrow ended the pull over, runs nothing again, and is still
+    /// listed here. A second replacement, in the pass against the new pool,
+    /// runs nothing again and is listed after the first: the pool the first
+    /// one opened is the one it closed. One that ends that pass ends the pull
+    /// "funding needed". [`BundlePuller::replacements`] also lists a manifest
+    /// fetch's.
+    pub replaced: Vec<PoolReplaced>,
 }
 
 /// Why a bundle pull ended.
@@ -534,6 +542,11 @@ pub enum BundleEnd {
     /// ([`BundleReport::failures`]); a rerun retries them.
     Complete,
     /// The cancel token fired. What landed is recorded, and a rerun resumes.
+    /// The caller names what the puller's handle
+    /// ([`BundlePuller::unconfirmed_escrows`]) still holds: each pending
+    /// `openPool` and `topUp` ([`UnconfirmedEscrows::pending`]) and each
+    /// untracked escrow ([`UnconfirmedEscrows::untracked`]). A rerun before
+    /// those resolve escrows again.
     Interrupted,
     /// The pool cannot pay for the rest: the capability is spent, expired or
     /// revoked, or the delegated pool is unfunded. `error` is the whole
@@ -545,11 +558,18 @@ pub enum BundleEnd {
         error: anyhow::Error,
     },
     /// A fault only the user can fix ended the pull, or it gave up after
-    /// making no progress for its whole limit ([`crate::GaveUp`]).
+    /// making no progress for its whole limit ([`crate::GaveUp`]). A pull that
+    /// is not interrupted ends here while its handle holds an untracked escrow
+    /// ([`UnconfirmedEscrows::untracked`]) or a pending `openPool` or `topUp`
+    /// ([`UnconfirmedEscrows::pending`]), with an error that names each tx:
+    /// an entry dropped while its receipt read was pending leaves one there.
+    /// This includes every later pull on the same handle.
     Stopped(anyhow::Error),
 }
 
-/// What a bundle pull did. Counts are per entry. Every byte total but
+/// What a bundle pull did. Counts are per entry, and `fetched`, `linked`,
+/// `skipped`, `reused`, `failed` and `not_run` add up to the manifest's entry
+/// count. Every byte total but
 /// [`Self::paid_bytes`] is content bytes and leaves out the bao proof
 /// overhead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -563,6 +583,9 @@ pub struct BundleReport {
     pub skipped: u64,
     /// Entries that failed ([`Self::failures`]).
     pub failed: u64,
+    /// Entries this pull did not run: another entry ended the pull, or the
+    /// cancel token fired, before their fetch ended. A rerun runs them.
+    pub not_run: u64,
     /// Distinct blobs linked from a byte-identical file already in the output
     /// directory, with no download.
     pub reused: u64,
@@ -726,11 +749,30 @@ impl BundlePuller {
         Box::pin(self.ctx.run(manifest, out_dir, overwrite, cancel)).await
     }
 
+    /// Every pool replacement this puller's funding recovery steps made, in
+    /// order: its manifest fetches' and its pulls' alike, and a step in a
+    /// pull its caller dropped or cancelled. Each closed pool may still hold
+    /// a balance to reclaim once its dispute window ends. A replacement that
+    /// ended a manifest fetch is in no [`BundleOutcome`].
+    #[must_use]
+    pub fn replacements(&self) -> Vec<PoolReplaced> {
+        self.ctx.recovery.replacements()
+    }
+
     /// The warning for a wallet seen to hold too little USDC to top the pool
     /// up during this run, if one was.
     #[must_use]
     pub fn funding_shortfall(&self) -> Option<String> {
         self.ctx.funding.shortfall()
+    }
+
+    /// The handle that holds each `openPool` and `topUp` of the puller that no
+    /// local record credits yet, and each that escrowed with no local record
+    /// crediting it: the one passed to
+    /// [`BundlePullerBuilder::unconfirmed_escrows`], or the puller's own.
+    #[must_use]
+    pub const fn unconfirmed_escrows(&self) -> &UnconfirmedEscrows {
+        self.ctx.funding.escrows()
     }
 
     /// Wait for every queued peer-record and watermark write to land. Call it
@@ -797,12 +839,19 @@ impl BundlePullerBuilder {
         self
     }
 
-    /// Where the pull holds each `openPool` and `topUp` whose receipt it has
-    /// not read, across every pass. A cancel or a fault that ends the pull can
-    /// drop a receipt wait, and the transaction may still escrow, so the
-    /// caller keeps a clone and names what is left when the pull ends. A
-    /// `topUp` the handle holds also refuses every later `topUp` of the pull,
-    /// across passes. A private handle by default.
+    /// Where the pull holds each `openPool` and `topUp` that no local record
+    /// credits yet ([`UnconfirmedEscrows::pending`]), across every pass. A
+    /// cancel or a fault that ends the pull can drop a receipt wait, and the
+    /// transaction may still escrow. A pull that is not interrupted ends
+    /// [`BundleEnd::Stopped`] on each one, and the caller keeps a clone to
+    /// name what is left on [`BundleEnd::Interrupted`]. A `topUp` the handle
+    /// holds also refuses every later `topUp` of the pull, across passes. The
+    /// handle also holds each `openPool` and `topUp` that escrowed with no
+    /// local record crediting it ([`UnconfirmedEscrows::untracked`]). It
+    /// refuses every later `openPool` and `topUp`, ends every later pull on
+    /// the handle [`BundleEnd::Stopped`], and is the caller's to name on
+    /// [`BundleEnd::Interrupted`]. A private handle by default
+    /// ([`BundlePuller::unconfirmed_escrows`]).
     pub fn unconfirmed_escrows(mut self, escrows: UnconfirmedEscrows) -> Self {
         self.escrows = escrows;
         self

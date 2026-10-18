@@ -605,7 +605,8 @@ async fn fund_pool<P: Provider + Clone + 'static>(
         },
     )
     .await
-    .map(|topped_up| SettledTopUp {
+    // With no handle, nothing reads the pending entry the guard holds.
+    .map(|(topped_up, _unrecorded)| SettledTopUp {
         credited: topped_up.credited,
         proof: TopUpProof::Receipt(topped_up.tx),
     });
@@ -3170,7 +3171,8 @@ async fn run_open<P: Provider + Clone>(
     )
     .await
     {
-        Ok(opened) => Ok(Landed::Opened(Box::new(opened))),
+        // With no handle, nothing reads the pending entry the guard holds.
+        Ok((opened, _unrecorded)) => Ok(Landed::Opened(Box::new(opened))),
         Err(err) => match err.downcast_ref::<OpenUnconfirmed>().copied() {
             Some(unconfirmed) => {
                 settle_unconfirmed_open(contract, store, &open, unconfirmed, err, hold, metrics)

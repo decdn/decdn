@@ -1742,3 +1742,352 @@ fn batch_result_names_every_cause() {
         "{msg}"
     );
 }
+
+// ---- the escrow stays named during the record write (#2515, #2521) -----
+
+/// An in-memory store that notes, at each pool record and deposit credit,
+/// whether `escrows` names [`SCRIPTED_TX`](decdn_incentive::test_rpc::SCRIPTED_TX)
+/// as the write runs.
+/// A failing one faults every pool record and deposit credit.
+struct WatchingStore {
+    inner: decdn_incentive::MemoryBuyerPoolStore,
+    escrows: UnconfirmedEscrows,
+    writes: std::sync::Mutex<Vec<bool>>,
+    failing: bool,
+}
+
+impl WatchingStore {
+    fn new(inner: decdn_incentive::MemoryBuyerPoolStore, escrows: UnconfirmedEscrows) -> Self {
+        Self {
+            inner,
+            escrows,
+            writes: std::sync::Mutex::default(),
+            failing: false,
+        }
+    }
+
+    /// A store whose every pool record and deposit credit faults.
+    fn failing(inner: decdn_incentive::MemoryBuyerPoolStore, escrows: UnconfirmedEscrows) -> Self {
+        Self {
+            failing: true,
+            ..Self::new(inner, escrows)
+        }
+    }
+
+    /// The fault a failing write returns.
+    fn fault(&self) -> Result<(), decdn_incentive::StoreError> {
+        if self.failing {
+            return Err(decdn_incentive::StoreError::Backend("disk full".into()));
+        }
+        Ok(())
+    }
+
+    /// Note whether the handle names the scripted tx now.
+    fn note_write(&self) {
+        use decdn_client::buyer_pool::EscrowUnconfirmed;
+        use decdn_incentive::test_rpc::SCRIPTED_TX;
+
+        let pending = self.escrows.pending().iter().any(|escrow| match escrow {
+            EscrowUnconfirmed::Open(open) => open.tx == Some(SCRIPTED_TX),
+            EscrowUnconfirmed::TopUp(top_up) => top_up.tx == Some(SCRIPTED_TX),
+        });
+        let untracked = self
+            .escrows
+            .untracked()
+            .iter()
+            .any(|held| held.tx == SCRIPTED_TX);
+        self.writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pending || untracked);
+    }
+
+    /// For each pool record and deposit credit, whether the handle named the
+    /// scripted tx as the write ran.
+    fn named_writes(&self) -> Vec<bool> {
+        self.writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl BuyerPoolStore for WatchingStore {
+    fn load_all(&self) -> Result<BuyerLoad, decdn_incentive::StoreError> {
+        self.inner.load_all()
+    }
+    fn record(&self, state: &BuyerPoolState) -> Result<(), decdn_incentive::StoreError> {
+        self.note_write();
+        self.fault()?;
+        self.inner.record(state)
+    }
+    fn forget(&self, owner: Address) -> Result<(), decdn_incentive::StoreError> {
+        self.inner.forget(owner)
+    }
+    fn get_by_pool_id(
+        &self,
+        pool_id: PoolId,
+    ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
+        self.inner.get_by_pool_id(pool_id)
+    }
+    fn forget_if_pool(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+    ) -> Result<bool, decdn_incentive::StoreError> {
+        self.inner.forget_if_pool(owner, pool_id)
+    }
+    fn get_by_owner(
+        &self,
+        owner: Address,
+    ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
+        self.inner.get_by_owner(owner)
+    }
+    fn advance_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: decdn_incentive::LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.inner
+            .advance_progress(owner, pool_id, lane, bytes, amount)
+    }
+    fn rebase_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: decdn_incentive::LaneKey,
+        anchor: decdn_incentive::BuyerLaneProgress,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.inner
+            .rebase_progress(owner, pool_id, lane, anchor, totals)
+    }
+    fn seed_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: decdn_incentive::LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.inner
+            .seed_progress(owner, pool_id, lane, bytes, amount)
+    }
+    fn add_deposit(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        additional: U256,
+    ) -> Result<decdn_incentive::DepositOutcome, decdn_incentive::StoreError> {
+        self.note_write();
+        self.fault()?;
+        self.inner.add_deposit(owner, pool_id, additional)
+    }
+    fn delegate_lanes(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+        signer: Address,
+    ) -> Result<Vec<(Address, decdn_incentive::BuyerLaneProgress)>, decdn_incentive::StoreError>
+    {
+        self.inner.delegate_lanes(deployment, pool_id, signer)
+    }
+    fn advance_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: decdn_incentive::LaneKey,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.inner
+            .advance_delegate_progress(deployment, lane, totals)
+    }
+    fn rebase_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: decdn_incentive::LaneKey,
+        anchor: decdn_incentive::BuyerLaneProgress,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.inner
+            .rebase_delegate_progress(deployment, lane, anchor, totals)
+    }
+    fn lane_salt(
+        &self,
+    ) -> Result<decdn_incentive::lane_signer::LaneSalt, decdn_incentive::StoreError> {
+        self.inner.lane_salt()
+    }
+}
+
+/// A `PaymentPool` at [`DEPLOYMENT`] whose every transaction mines with
+/// `receipt`.
+fn pool_that_mines(
+    receipt: alloy::rpc::types::TransactionReceipt,
+) -> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone> {
+    PaymentPool::new(
+        DEPLOYMENT.payment_pool,
+        decdn_incentive::test_rpc::ScriptedRpc::mined(receipt).provider(),
+    )
+}
+
+/// #2521: `pool open` keeps its mined `openPool` named on the handle while
+/// the pool record is written, so a second Ctrl-C during the write still
+/// names it, and releases it once the record commits.
+#[tokio::test(start_paused = true)]
+async fn pool_open_names_the_open_while_its_record_is_written() {
+    let owner = Address::repeat_byte(0x22);
+    let pool_id = B256::repeat_byte(0x33);
+    let deposit = U256::from(1_000_000_u64);
+    let receipt = mined_open(owner, pool_id, deposit);
+    let escrows = UnconfirmedEscrows::default();
+    let store = WatchingStore::new(store_with(&[]), escrows.clone());
+    let opened = open_and_record(
+        &pool_that_mines(receipt),
+        &store,
+        DEPLOYMENT,
+        Address::repeat_byte(0xcd),
+        owner,
+        deposit,
+        &escrows,
+    )
+    .await
+    .expect("the open is recorded");
+    assert_eq!(opened, pool_id);
+    assert_eq!(
+        store.named_writes(),
+        [true],
+        "the record write names the open"
+    );
+    assert_eq!(tracked(&store, owner), Some(pool_id));
+    assert!(escrows.pending().is_empty(), "the record released the open");
+    assert!(escrows.untracked().is_empty());
+}
+
+/// #2521: `pool top-up` keeps its mined `topUp` named on the handle while
+/// the deposit credit is written, and releases it once the credit commits.
+#[tokio::test(start_paused = true)]
+async fn pool_top_up_names_the_top_up_while_its_credit_is_written() {
+    let owner = Address::repeat_byte(0x22);
+    let pool_id = B256::repeat_byte(0x33);
+    let escrows = UnconfirmedEscrows::default();
+    let store = WatchingStore::new(store_with(&[row(0x33, owner)]), escrows.clone());
+    // No `PoolToppedUp` log, so the credit is the amount asked for.
+    let receipt = decdn_incentive::test_rpc::mined_receipt(DEPLOYMENT.payment_pool, Vec::new());
+    let (credited, deposit) = top_up_and_credit(
+        &pool_that_mines(receipt),
+        &store,
+        owner,
+        pool_id,
+        U256::from(5_000_u64),
+        &escrows,
+    )
+    .await
+    .expect("the topUp is credited");
+    assert_eq!(credited, U256::from(5_000_u64));
+    assert_eq!(deposit, U256::from(1_005_000_u64));
+    assert_eq!(store.named_writes(), [true], "the credit names the topUp");
+    assert!(
+        escrows.pending().is_empty(),
+        "the credit released the topUp"
+    );
+    assert!(escrows.untracked().is_empty());
+}
+
+/// The receipt of an `openPool` that opened `pool_id` for `owner` at
+/// `deposit`.
+fn mined_open(
+    owner: Address,
+    pool_id: PoolId,
+    deposit: U256,
+) -> alloy::rpc::types::TransactionReceipt {
+    use alloy::sol_types::SolEvent;
+
+    let opened = PaymentPool::PoolOpened {
+        poolId: pool_id,
+        owner,
+        deposit,
+    };
+    decdn_incentive::test_rpc::mined_receipt(
+        DEPLOYMENT.payment_pool,
+        vec![alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: DEPLOYMENT.payment_pool,
+                data: opened.encode_log_data(),
+            },
+            ..Default::default()
+        }],
+    )
+}
+
+/// Assert that `escrows` holds the scripted tx as untracked, and nothing
+/// pending: the command names it on every exit.
+fn holds_the_escrow_untracked(err: &anyhow::Error, escrows: &UnconfirmedEscrows) {
+    assert!(
+        err.downcast_ref::<decdn_client::buyer_pool::EscrowUntracked>()
+            .is_some(),
+        "{err:#}"
+    );
+    let untracked = escrows.untracked();
+    assert!(
+        untracked
+            .iter()
+            .any(|held| held.tx == decdn_incentive::test_rpc::SCRIPTED_TX),
+        "{untracked:?}"
+    );
+    assert!(escrows.pending().is_empty(), "{:?}", escrows.pending());
+}
+
+/// #2521: a `pool open` whose record write fails after the `openPool` mined
+/// holds the deposit as untracked on the handle, so the command names the tx.
+#[tokio::test(start_paused = true)]
+async fn pool_open_whose_record_fails_holds_the_escrow_untracked() {
+    let owner = Address::repeat_byte(0x22);
+    let deposit = U256::from(1_000_000_u64);
+    let escrows = UnconfirmedEscrows::default();
+    let store = WatchingStore::failing(store_with(&[]), escrows.clone());
+    let err = open_and_record(
+        &pool_that_mines(mined_open(owner, B256::repeat_byte(0x33), deposit)),
+        &store,
+        DEPLOYMENT,
+        Address::repeat_byte(0xcd),
+        owner,
+        deposit,
+        &escrows,
+    )
+    .await
+    .expect_err("the record fails");
+    holds_the_escrow_untracked(&err, &escrows);
+    assert_eq!(tracked(&store, owner), None);
+}
+
+/// #2521: a `pool top-up` whose credit does not land after the `topUp` mined,
+/// on a fault or on a row that no longer tracks the pool, holds the escrow as
+/// untracked on the handle.
+#[tokio::test(start_paused = true)]
+async fn pool_top_up_whose_credit_fails_holds_the_escrow_untracked() {
+    let owner = Address::repeat_byte(0x22);
+    let pool_id = B256::repeat_byte(0x33);
+    for (store_rows, failing) in [(vec![row(0x33, owner)], true), (Vec::new(), false)] {
+        let escrows = UnconfirmedEscrows::default();
+        let inner = store_with(&store_rows);
+        let store = if failing {
+            WatchingStore::failing(inner, escrows.clone())
+        } else {
+            WatchingStore::new(inner, escrows.clone())
+        };
+        let receipt = decdn_incentive::test_rpc::mined_receipt(DEPLOYMENT.payment_pool, Vec::new());
+        let err = top_up_and_credit(
+            &pool_that_mines(receipt),
+            &store,
+            owner,
+            pool_id,
+            U256::from(5_000_u64),
+            &escrows,
+        )
+        .await
+        .expect_err("the credit does not land");
+        holds_the_escrow_untracked(&err, &escrows);
+    }
+}

@@ -7,7 +7,7 @@ use super::{
     write_frame_error,
 };
 use crate::handlers::client::{CoverageShortfall, MissPath};
-use crate::node_origin::PullMiss;
+use crate::node_origin::{CandidateSource, PullLegMiss, PullLegTrail, PullMiss};
 
 #[derive(Clone, Default)]
 struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -26,6 +26,22 @@ impl std::io::Write for CapturedLog {
     }
 }
 
+/// Namespace 1 as the big-endian `namespace_id` a `StreamRequest` carries.
+const NAMESPACE_ONE: [u8; 32] = {
+    let mut id = [0; 32];
+    id[31] = 1;
+    id
+};
+
+/// A pull-leg miss whose walk saw nothing: the shape a test that is not about
+/// the trail builds.
+const fn clean_leg_miss(miss: PullMiss) -> PullLegMiss {
+    PullLegMiss {
+        miss,
+        trail: PullLegTrail::EMPTY,
+    }
+}
+
 /// A coverage shortfall with every detail field set.
 const SHORTFALL: CoverageShortfall = CoverageShortfall {
     pull_offset: 32_768,
@@ -40,7 +56,10 @@ const SHORTFALL: CoverageShortfall = CoverageShortfall {
 fn a_miss_refusal_carries_the_fault_reason_and_a_stable_path_name() {
     let paths = [
         (MissPath::CoverageGate(SHORTFALL), "coverage_gate"),
-        (MissPath::PullLegMiss(PullMiss::Clean), "pull_leg_miss"),
+        (
+            MissPath::PullLegMiss(clean_leg_miss(PullMiss::Clean)),
+            "pull_leg_miss",
+        ),
         (MissPath::PullLegTimeout, "pull_leg_timeout"),
         (MissPath::BufferedMiss, "buffered_miss"),
         (MissPath::NoPullThrough, "no_pull_through"),
@@ -70,7 +89,7 @@ fn refusal_line(refusal: MissRefusal, suppressed: Option<u64>) -> String {
         .finish();
     let req = StreamRequest {
         hash: [0xAB; 32],
-        namespace_id: [0; 32],
+        namespace_id: NAMESPACE_ONE,
         pool_id: [0xCD; 32],
         byte_offset: 16_384,
         byte_len: 82_251,
@@ -98,7 +117,10 @@ fn refusal_line(refusal: MissRefusal, suppressed: Option<u64>) -> String {
 #[test]
 fn a_miss_refusal_logs_one_info_line_with_hash_range_reason_path_and_cause() {
     let line = refusal_line(
-        MissRefusal::new(false, MissPath::PullLegMiss(PullMiss::BelowMargin)),
+        MissRefusal::new(
+            false,
+            MissPath::PullLegMiss(clean_leg_miss(PullMiss::BelowMargin)),
+        ),
         None,
     );
     assert!(line.contains(" INFO "), "{line}");
@@ -112,9 +134,91 @@ fn a_miss_refusal_logs_one_info_line_with_hash_range_reason_path_and_cause() {
     assert!(line.contains("reason=\"cache_miss\""), "{line}");
     assert!(line.contains("path=\"pull_leg_miss\""), "{line}");
     assert!(line.contains("cause=\"below_margin\""), "{line}");
+    assert!(line.contains("namespace_id=1"), "{line}");
     for absent in ["pull_offset=", "candidates=", "suppressed="] {
         assert!(!line.contains(absent), "unexpected `{absent}`: {line}");
     }
+}
+
+/// A pull-leg miss names the walk that ended without a target (#2366): where
+/// the candidates came from, how many were skipped, probed, unreachable,
+/// absent or dropped, how many holders the round admitted and whether they
+/// span the blob, how many handshakes ran, and why the last one failed. A
+/// walk that ran no handshake records no `last_fault`.
+#[test]
+fn a_pull_leg_miss_logs_the_walk_that_found_no_target() {
+    let trail = PullLegTrail {
+        source: CandidateSource::Directory,
+        discovered: 1,
+        skipped: 2,
+        probed: 1,
+        unreachable: 1,
+        absent: 0,
+        dropped: 0,
+        holders: 0,
+        spans: false,
+        handshakes: 0,
+        last_fault: None,
+    };
+    let line = refusal_line(
+        MissRefusal::new(
+            false,
+            MissPath::PullLegMiss(PullLegMiss {
+                miss: PullMiss::Clean,
+                trail,
+            }),
+        ),
+        None,
+    );
+    assert!(line.contains("cause=\"clean_miss\""), "{line}");
+    assert!(line.contains("source=\"directory\""), "{line}");
+    for field in [
+        "discovered=1",
+        "skipped=2",
+        "probed=1",
+        "unreachable=1",
+        "absent=0",
+        "dropped=0",
+        "holders=0",
+        "spans=false",
+        "handshakes=0",
+    ] {
+        assert!(line.contains(field), "missing `{field}`: {line}");
+    }
+    assert!(!line.contains("last_fault="), "{line}");
+}
+
+/// The last handshake's fault is the one answer the walk ended on.
+#[test]
+fn a_pull_leg_miss_names_the_fault_of_its_last_handshake() {
+    let trail = PullLegTrail {
+        source: CandidateSource::Dht,
+        discovered: 3,
+        skipped: 0,
+        probed: 3,
+        unreachable: 0,
+        absent: 1,
+        dropped: 0,
+        holders: 2,
+        spans: true,
+        handshakes: 2,
+        last_fault: Some("refused"),
+    };
+    let line = refusal_line(
+        MissRefusal::new(
+            false,
+            MissPath::PullLegMiss(PullLegMiss {
+                miss: PullMiss::Clean,
+                trail,
+            }),
+        ),
+        None,
+    );
+    assert!(line.contains("source=\"dht\""), "{line}");
+    assert!(line.contains("holders=2"), "{line}");
+    assert!(line.contains("spans=true"), "{line}");
+    assert!(line.contains("handshakes=2"), "{line}");
+    assert!(line.contains("last_fault=\"refused\""), "{line}");
 }
 
 /// The coverage-gate line carries the shortfall that tells one partial
@@ -131,6 +235,8 @@ fn a_coverage_gate_refusal_logs_its_shortfall() {
     assert!(line.contains("candidates=2"), "{line}");
     assert!(line.contains("first_uncovered_chunk=48"), "{line}");
     assert!(!line.contains("cause="), "{line}");
+    assert!(!line.contains("source="), "{line}");
+    assert!(!line.contains("probed="), "{line}");
 }
 
 /// A throttled no-lane line counts the lines it stands for.

@@ -297,7 +297,8 @@ pub struct decdn_protocol::message::ProbeResponseExt
 pub decdn_protocol::message::ProbeResponseExt::coverage: decdn_protocol::coverage::Coverage
 pub decdn_protocol::message::ProbeResponseExt::total_bytes: core::option::Option<u64>
 impl decdn_protocol::message::ProbeResponseExt
-pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, bool) -> bool
+pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, &decdn_protocol::message::ProbeResponseBody) -> bool
+pub const decdn_protocol::message::EMPTY_ROOT: [u8; 32]
 pub const decdn_protocol::message::MAX_PROBE_FRAME: u32
 pub const decdn_protocol::message::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::message::SLASH_SIG_LEN: usize
@@ -508,7 +509,7 @@ pub struct decdn_protocol::ProbeResponseExt
 pub decdn_protocol::ProbeResponseExt::coverage: decdn_protocol::coverage::Coverage
 pub decdn_protocol::ProbeResponseExt::total_bytes: core::option::Option<u64>
 impl decdn_protocol::message::ProbeResponseExt
-pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, bool) -> bool
+pub fn decdn_protocol::message::ProbeResponseExt::consistent_with(&self, &decdn_protocol::message::ProbeResponseBody) -> bool
 pub struct decdn_protocol::Region(_)
 impl decdn_protocol::region::Region
 pub fn decdn_protocol::region::Region::as_str(&self) -> &str
@@ -580,6 +581,7 @@ pub const decdn_protocol::APP_ERR_RATE_LIMITED: u32
 pub const decdn_protocol::BINDING_SIG_LEN: usize
 pub const decdn_protocol::CHUNK_BYTES: u64
 pub const decdn_protocol::DISCOVERY_BLOCK_BYTES: u64
+pub const decdn_protocol::EMPTY_ROOT: [u8; 32]
 pub const decdn_protocol::ID_LEN: usize
 pub const decdn_protocol::MAX_BATCH_STORE_HASHES: usize
 pub const decdn_protocol::MAX_CHAIN_LENGTH: u8

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use tokio::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 /// The no-progress limit when stderr is not a terminal.
 pub const SCRIPT_GIVE_UP: Duration = Duration::from_mins(10);
@@ -77,12 +78,21 @@ impl Default for ProgressClock {
 }
 
 /// When the command stops for lack of progress.
+///
+/// A bundle pull also halts it: once one entry ends the pull, every sibling
+/// entry's fetch stops at its next wait or loop pass and lets its lane builds
+/// drain, rather than being dropped in the middle of one. A recovery step in
+/// progress runs to its outcome first. A clone shares the halt, which holds
+/// for one pass of the pull.
 #[derive(Debug, Clone)]
 pub struct StopPolicy {
     /// The no-progress limit. `None` waits until the caller interrupts.
     pub give_up_after: Option<Duration>,
     /// The command-wide progress clock.
     pub clock: std::sync::Arc<ProgressClock>,
+    /// Cancelled once a sibling entry ends this pass of the pull. A clone
+    /// shares it; [`StopPolicy::next_pass`] starts a fresh one.
+    halt: CancellationToken,
 }
 
 impl StopPolicy {
@@ -98,7 +108,48 @@ impl StopPolicy {
         Self {
             give_up_after,
             clock,
+            halt: CancellationToken::new(),
         }
+    }
+
+    /// The same policy, on the same clock, for the next pass of a pull: a
+    /// halt of this pass does not carry over.
+    #[must_use]
+    pub(crate) fn next_pass(&self) -> Self {
+        Self {
+            give_up_after: self.give_up_after,
+            clock: std::sync::Arc::clone(&self.clock),
+            halt: CancellationToken::new(),
+        }
+    }
+
+    /// Halt every fetch on this policy at its next wait or loop pass.
+    pub(crate) fn halt(&self) {
+        self.halt.cancel();
+    }
+
+    /// Whether this policy is halted.
+    pub(crate) fn is_halted(&self) -> bool {
+        self.halt.is_cancelled()
+    }
+
+    /// `Ok` until this policy is halted.
+    ///
+    /// # Errors
+    ///
+    /// [`Halted`] once it is.
+    pub(crate) fn ensure_running(&self) -> Result<(), Halted> {
+        if self.is_halted() {
+            Err(Halted)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Resolve once this policy is halted.
+    pub(crate) async fn halted(&self) -> Halted {
+        self.halt.cancelled().await;
+        Halted
     }
 
     /// Resolve once the command has made no progress for the limit. Never
@@ -136,6 +187,20 @@ impl std::fmt::Display for GaveUp {
 }
 
 impl std::error::Error for GaveUp {}
+
+/// A sibling entry ended the pull, so this entry's fetch stopped
+/// ([`StopPolicy::halt`]). The pull ends with the sibling's error, so this
+/// one reaches a caller only as the text a late lane build's escrow folds in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Halted;
+
+impl std::fmt::Display for Halted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another entry ended the pull")
+    }
+}
+
+impl std::error::Error for Halted {}
 
 #[cfg(test)]
 mod tests;

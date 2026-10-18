@@ -385,7 +385,7 @@ where
 ///         .await?;
 ///     let mut out = tokio::io::stdout();
 ///     drive.alongside(tokio::io::copy(&mut reader, &mut out)).await?;
-///     Ok(())
+///     drive.finish().await
 /// }
 /// ```
 pub struct Streamer<'a, P, F> {
@@ -640,8 +640,8 @@ impl StreamDrive<'_> {
     /// `consume`'s output. The drive is polled first on every wake, so an open
     /// paid leg is never starved by a slow consumer. If the drive finishes first,
     /// `consume` keeps running to the end of the stream. If `consume` finishes
-    /// first, the drive stays where it is: call this again to resume it, or drop
-    /// it to stop the fetch.
+    /// first, the drive stays where it is: call this again to resume it,
+    /// [`Self::finish`] it, or drop it to stop the fetch.
     pub async fn alongside<T>(&mut self, consume: impl Future<Output = T>) -> T {
         tokio::pin!(consume);
         tokio::select! {
@@ -658,6 +658,22 @@ impl StreamDrive<'_> {
     /// to act on the error's type takes it here.
     pub const fn take_error(&mut self) -> Option<anyhow::Error> {
         self.error.take()
+    }
+
+    /// Run the drive to its end and return the error the fetch ended with. A
+    /// consumer that read to the end of the stream calls this before it reports
+    /// success: after the last verified byte, the fetch still awaits its lane
+    /// builds in flight (for at most 30 s), and one that may have escrowed USDC
+    /// no record credits ends the fetch with an error. The reader's end of
+    /// stream does not carry that error.
+    ///
+    /// # Errors
+    ///
+    /// The error the fetch ended with, typed as [`Self::take_error`] returns
+    /// it, unless an earlier [`Self::take_error`] took it.
+    pub async fn finish(&mut self) -> anyhow::Result<()> {
+        (&mut *self).await;
+        self.take_error().map_or(Ok(()), Err)
     }
 }
 

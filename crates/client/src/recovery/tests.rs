@@ -106,6 +106,78 @@ async fn a_replaced_pool_stays_replaced_for_every_later_step() {
     assert_eq!(funder.calls().len(), 1);
 }
 
+/// #2517: the gate reports the replacement a step made in this pass, so a
+/// bundle pull whose pass ended on another fault still reports it, until the
+/// next pass starts.
+#[tokio::test]
+async fn the_gate_reports_its_replacement_until_the_next_pass() {
+    let gate = RecoveryGate::new();
+    assert_eq!(gate.replaced(), None);
+    let mut top_ups = 0;
+    let funder = FakeFunder::new(Recovery::Replaced(replaced()));
+    let stepped = gate
+        .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
+        .await;
+    assert_matches!(stepped, Stepped::Replaced(_));
+    assert_eq!(gate.replaced(), Some(replaced()));
+    gate.start_next_pass();
+    assert_eq!(gate.replaced(), None);
+}
+
+/// #2519: the gate lists every replacement its steps made, across passes
+/// and across a fetch that starts clear of an earlier one's, so a command
+/// names each closed pool once it ends, however it ends.
+#[tokio::test]
+async fn the_gate_lists_every_replacement_across_passes_and_fetches() {
+    let gate = RecoveryGate::new();
+    assert_eq!(gate.replacements(), []);
+    let second = PoolReplaced {
+        closed: B256::repeat_byte(2),
+        opened: B256::repeat_byte(3),
+    };
+    let mut top_ups = 0;
+    let funder = FakeFunder::scripted(vec![
+        Recovery::Replaced(replaced()),
+        Recovery::Replaced(second),
+    ]);
+    let _ = gate
+        .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
+        .await;
+    gate.start_next_pass();
+    gate.record_verified(1);
+    let _ = gate
+        .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
+        .await;
+    assert_eq!(gate.leave_carried(), Some(second));
+    assert_eq!(gate.replacements(), [replaced(), second]);
+}
+
+/// A fetch that starts after an earlier fetch's replacement starts clear of
+/// it: its first step funds the new pool, rather than reporting the old
+/// replacement with no step. A gate with nothing carried is unchanged.
+#[tokio::test]
+async fn a_fetch_after_a_carried_replacement_steps_on_the_new_pool() {
+    let gate = RecoveryGate::new();
+    assert_eq!(gate.leave_carried(), None);
+    let mut top_ups = 0;
+    let funder = FakeFunder::scripted(vec![
+        Recovery::Replaced(replaced()),
+        Recovery::ToppedUp(U256::from(2_000u64)),
+    ]);
+    let _ = gate
+        .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
+        .await;
+    assert_eq!(gate.leave_carried(), Some(replaced()));
+    assert_eq!(gate.replaced(), None);
+    assert_eq!(gate.leave_carried(), None, "it is carried once");
+    gate.record_verified(1);
+    let stepped = gate
+        .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
+        .await;
+    assert_matches!(stepped, Stepped::Raised(d) if d == U256::from(2_000u64));
+    assert_eq!(gate.replacements(), [replaced()]);
+}
+
 /// The pass against the new pool steps on the new pool, under the same
 /// progress rule: no verified byte since the replacement, no step.
 #[tokio::test]

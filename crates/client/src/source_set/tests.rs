@@ -48,6 +48,7 @@ impl SourceProvider for FakeProvider {
     fn connect<'a>(
         &'a self,
         _holder: &'a Holder,
+        _ended: &'a tokio_util::sync::CancellationToken,
     ) -> SourceFuture<'a, StreamCandidate<ScriptedSource>> {
         Box::pin(async { anyhow::bail!("tests call lane_built directly") })
     }

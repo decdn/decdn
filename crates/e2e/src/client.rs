@@ -625,7 +625,8 @@ impl ClientFixture {
         // The shared open kernel escrows the deposit and decodes the
         // authoritative `poolId` from the `PoolOpened` receipt.
         let deployment = self.deployment(chain);
-        let opened = open_pool(
+        // With no handle, nothing reads the pending entry the guard holds.
+        let (opened, _unrecorded) = open_pool(
             &contract,
             deployment,
             chain.usdc(),

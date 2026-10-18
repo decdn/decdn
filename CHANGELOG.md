@@ -28,6 +28,29 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-protocol`: `ProbeResponseExt::consistent_with` takes the signed
+  `&ProbeResponseBody`, not `has_blob` alone (#2471).** The rule keys on
+  `body.hash`: for `EMPTY_ROOT` (new constant, the BLAKE3 hash of zero bytes)
+  the coverage must be empty and `has_blob` alone says whether the node serves
+  the blob; every other hash keeps `has_blob ⟺ non-empty coverage`. On the
+  wire, a node signs `has_blob: true` for the empty root, which an older
+  requester rejects as malformed. The fix is under Fixed.
+- **`decdn-client`: `BundleOutcome::replaced` is a `Vec<PoolReplaced>`
+  (#2519).** It lists every pool replacement the pull made, in order, a
+  second-pass replacement too. Iterate it where code matched the `Option`.
+  `BundlePuller::replacements` lists the puller's every replacement, a
+  manifest fetch's and a cancelled pull's included, and
+  `RecoveryGate::replacements` does the same for one gate.
+- **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` return
+  an `UnrecordedEscrow` beside the outcome (#2515).** `open_pool` returns
+  `(OpenedPool, UnrecordedEscrow)` and `top_up` returns
+  `(ToppedUpPool, UnrecordedEscrow)`. The `UnconfirmedEscrows` handle keeps a
+  mined transaction pending until the caller resolves the guard:
+  `recorded()` once its record or credit commits, or `untracked(err)` once it
+  fails, which holds the escrow as untracked before it releases the pending
+  entry. A guard dropped unresolved leaves the transaction pending. A caller
+  that passes no handle can drop it. An `openPool` whose receipt holds no
+  `PoolOpened` event is now held as untracked by `open_pool` itself.
 - **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` take a
   `receipt_timeout: Option<Duration>` (#2433).** `Some` bounds the receipt
   wait. A lapse returns `OpenUnconfirmed` / `TopUpUnconfirmed` with the tx
@@ -85,7 +108,8 @@ since project inception and will roll into the first tagged release.
 - **`decdn_client::buyer_pool::open_pool` and `top_up` take an `escrows`
   handle (#2418, #2491).** The argument before `receipt_timeout`,
   `Option<&UnconfirmedEscrows>`, holds the `openPool` or `topUp` from before
-  its submit until its receipt is read. Pass `None` when nothing can drop the
+  its submit until the caller resolves the returned `UnrecordedEscrow`
+  (#2515). Pass `None` when nothing can drop the
   future or its error. `UnconfirmedEscrows::pending` returns
   `EscrowUnconfirmed` entries (`Open` or `TopUp`).
   `BundlePullerBuilder::unconfirmed_escrows` hands a bundle pull the same
@@ -1066,6 +1090,31 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Probe: a node advertises the empty blob, and a requester accepts the
+  answer (#2471).** The empty (0-byte) blob spans zero discovery blocks, so
+  its coverage bitmap is empty on every holder. The probe handler derived
+  `has_blob` from the bitmap and signed `has_blob: false` for a blob every
+  store holds and serves, and the requester's consistency rule
+  (`has_blob ⟺ non-empty coverage`) rejected a `has_blob: true` answer for it
+  as malformed. A client saw no holder, dropped the size hint, and opened a
+  paid lane for zero bytes; a node pulling through for the empty root found no
+  provider. Now the handler signs `has_blob: true` for the empty root when its
+  presence check passes, and `ProbeResponseExt::consistent_with` takes the
+  signed body: for the empty root the bitmap must be empty and `has_blob`
+  alone decides. The rule keys on the signed hash, never on the unsigned
+  `total_bytes` hint. `decdn_protocol::EMPTY_ROOT` names the hash. ADR 022
+  § Consistency rule records the exception. The API change is under Changed
+  (BREAKING).
+- **Node-origin: the coverage-union probe round spans the empty root once one
+  holder is admitted (#2526).** The ranged pull leg gathers holders until their
+  coverage union covers every discovery block of the blob. The empty blob has
+  zero blocks, so the block target stayed at zero and the union never spanned
+  it: the probe round waited for every probe to answer or time out, the
+  origin-directory lookup always ran, and a cached holder list never counted
+  as a probe-cache hit. Now the union spans the empty root once one holder is
+  admitted. The rule keys on the requested hash, never on the unsigned
+  `total_bytes` hint, so a holder that reports a zero size for a real blob
+  closes nothing.
 - **CLI: a `decdn get` that ends before a `topUp` confirms names the tx
   (#2491).** A refill or a funding recovery step can still wait on its `topUp`
   receipt when the command ends: on a give-up after the no-progress limit, a
@@ -1081,6 +1130,169 @@ since project inception and will roll into the first tagged release.
   the `topUp` instead of dying with no output. A `topUp` whose submit
   returned no hash reads "returned no tx hash", not "failed in transport",
   since a submit dropped in flight holds no hash either.
+- **Client: a late lane build that may have escrowed with no record fails the
+  fetch (#2500).** During the 30 s drain of late lane builds, a build could
+  send a `topUp` or `openPool` that mined, or may have mined, with no local
+  record to credit it. The drain logged that error at debug only. A completed
+  `decdn get` exited 0, a give-up exited 75, and nothing named a tx the
+  receipt read had already cleared from the pending-escrow handle. Now such a
+  build fails `acquire` with a `LaneBuildFault` that names the tx when the
+  submit returned one, whatever the fetch's own outcome was. A fetch that
+  completed fails. A fetch that failed keeps its error only as text, so its
+  give-up cannot exit 75 and a `PoolReplaced` cannot start a second pass,
+  either of which would invite a rerun that escrows again. Any other late
+  build failure leaves the result unchanged. `decdn get -o -` and the manifest
+  fetch of an entry URI also dropped the drain once the reader hit the end of
+  the stream. They now wait for it through the new `StreamDrive::finish`,
+  which runs a stream's drive to its end and returns the error the fetch
+  ended with. A consumer that reads a stream to its end calls it before it
+  reports success.
+- **Client: no second escrow after an untracked one (#2506).** When a run's
+  `topUp` mined and its local credit failed, the build failed as escrowed and
+  untracked, but a sibling lane build of the same run could still escrow
+  again. Builds of one fetch wait behind each other on the pool lock. The
+  next one in line ran before the acquire loop saw the first one's error, or
+  in the drain after it. That build read the uncredited row, saw the pool low,
+  and sent a second `topUp`: the receipt read had already cleared the first
+  one, so nothing refused it. A failed record after a mined `openPool` could
+  let the next build open a second pool the same way. Now a run that holds an
+  untracked `topUp` or `openPool` refuses every later `topUp` and `openPool`
+  of that command, across passes, before its allowance read or send, from a lane build or a
+  funding recovery step. The refusal names the held escrow and ends the
+  command. It is not reported as a second escrow. An `openPool` that mined
+  with no `PoolOpened` event for the owner also fails as escrowed and
+  untracked (`EscrowUntracked`), not as a plain error: the acquire loop
+  retried that lane build, and the retry opened a second pool.
+- **Client, CLI: every end of a command names its untracked escrows (#2511).**
+  The hold on a run's untracked `topUp` or `openPool` lived in the run's
+  per-pass state, and no end of the command read it. A Ctrl-C during the 30 s
+  drain of late lane builds dropped the fetch, and `decdn get` printed
+  "interrupted; run the same command again to resume": the receipt read had
+  already cleared the tx from the pending-escrow handle, and a re-run read the
+  uncredited row and escrowed again. A bundle pull whose entry with the escrow
+  was dropped could give up with exit 75 the same way. The hold also kept
+  only the first such escrow, so a second one in a dropped entry was named
+  nowhere. Now the command's `UnconfirmedEscrows` handle holds every
+  untracked escrow (`UnconfirmedEscrows::untracked`, a new `UntrackedEscrow`
+  with the tx; `EscrowUntracked::tx` reads it from the error). The hold
+  outlives a dropped fetch, a dropped bundle entry and a pass, and every
+  later pass on the handle refuses to escrow. `decdn get`, for a blob or a
+  bundle, names each one on every end that does not already name its tx: a
+  Ctrl-C says `interrupted: <escrow>` and still exits 130, a give-up exits 1,
+  not 75, and a success exits 1. A second Ctrl-C names them too. `decdn pool
+  open` and `decdn pool top-up` hold theirs too, and their own error names the
+  tx, so it is named once. A `BundlePuller` pull that is not interrupted ends
+  `BundleEnd::Stopped` while
+  its handle holds one, with the escrow as its error and the pull's own stop
+  as text, so a give-up, a pool replacement or "funding needed" cannot invite
+  a rerun. An interrupted pull stays `Interrupted`, and its caller names what
+  the handle holds through the new `BundlePuller::unconfirmed_escrows`.
+- **Client: a bundle pull lets sibling entries finish their lane builds
+  (#2509).** When one entry ended the pull (a give-up, a pool replacement, a
+  fault that stops every entry), every other entry was dropped where it
+  stood. An entry in the middle of a `topUp` or `openPool` lane build lost it
+  before the receipt read and the local record, which left a tx for the
+  operator to reconcile by hand. Now the pull halts the other entries. Each
+  stops at its next wait or loop pass, starts no new lane build or funding
+  recovery step, and waits up to 30 s for the builds in flight, as one fetch
+  does when it ends. A recovery step already in progress runs to its outcome
+  first. The pull waits up to 40 s for them all, then drops any entry still
+  running, as before: the command names an `openPool` or `topUp` it left
+  unconfirmed. A build that may have escrowed USDC no record credits wins
+  over the stop: the pull ends on the escrow, with the stop kept as text, so a
+  give-up does not exit 75. A halted entry, like a dropped one, counts as not
+  run in the summary (#2517), and a pass that keeps an entry's earlier
+  landing does so for a halted one too. The first open of a blob (its size
+  from a header) waits for its lane build the same way on a give-up. A
+  funding recovery step there runs to its outcome, so a give-up can land
+  after the limit while the step finishes.
+- **Client: a fatal lane build names every escrow in its batch (#2508).** The
+  acquire loop takes every lane build that is ready as one batch. When one
+  build in the batch was fatal, the loop returned at once and dropped the rest
+  of the batch. Those builds were already out of the set the drain of late
+  builds awaits, so a second build in the batch that may have escrowed USDC no
+  record credits was named nowhere. A full disk that failed a lane's record
+  write beside a mined `topUp` whose credit failed reported only the disk
+  fault, and a re-run after the operator freed space escrowed again. Now each
+  such escrow in the batch is folded into the error the fetch ends with, as
+  the drain folds a late build's: the escrow is the error a caller downcasts,
+  and the fault that ended the fetch survives as text.
+- **Client: a lane build sends no `openPool` or `topUp` after its fetch ended
+  (#2513).** When a fetch ends, it awaits its lane builds still in flight for
+  up to 30 s. A build in that drain that had not yet read its pool could still
+  run the proactive refill and send a `topUp`, or open a pool, for a lane that
+  never runs. The escrow was recorded and withdrawable, but no fetch needed
+  it. Now each fetch ends for its builds as its drain starts. A build that
+  reaches its `openPool` or `topUp` after that sends none and reads no wallet
+  balance. It fails, and the drain logs it at `debug`. The build checks before
+  its allowance leg and again before the send, so a fetch that ends during an
+  `approve` sends no `topUp` after it. A build already inside its `openPool` or
+  `topUp` send (its nonce read, its submit) runs to its receipt, as before. The first open of a blob ends
+  its builds the same way on a stop or an error. A re-fetch on the same
+  lanes after a hash mismatch is a new fetch, so its builds can still escrow.
+- **Client, CLI: an escrow stays named until its record commits (#2515).**
+  `open_pool` and `top_up` released a mined transaction from the
+  pending-escrow handle as soon as they read its receipt. The caller wrote the
+  pool record or the deposit credit after that, with an fsync. During that
+  write the transaction was in neither the pending nor the untracked list. A
+  second Ctrl-C there exited at once, named no escrow, and left the record
+  unwritten, so a re-run read an uncredited row and escrowed again. Now the
+  handle keeps the transaction pending until the record commits, and a failed
+  record holds it as untracked before it releases the pending entry. `decdn
+  get`, for a blob or a bundle, `decdn pool open` and `decdn pool top-up` name
+  it on every exit during the write. The pending line reads "was broadcast and
+  no local record credits it", which holds before and after the receipt
+  read.
+- **Client, CLI: a halted bundle pull reports its replacement, the entries it
+  did not run, and its pending escrows (#2517).** Three gaps remained at the
+  end of a pull that one entry ended. First, the pull took its pool
+  replacement only from the fault that ended it. A sibling entry's recovery
+  step that replaced the pool during the drain, or a replacement that a late
+  escrow folded over, went unreported, and `decdn get` of a bundle printed no
+  "reclaim it with: decdn pool reclaim" note for the closed pool. The pull now
+  reads the replacement from the recovery gate, and lists it in
+  `BundleOutcome::replaced`. Only a replacement that ended the first pass runs
+  the rest again. A later pull on the same `BundlePuller` starts as a pass
+  against the new pool, with fresh lane and funding state: it runs no extra
+  pass, and its recovery step tops up the new pool, not the closed one. Second, entries the pull did not run were in no count, so
+  the summary did not add up to the entry count. The new
+  `BundleReport::not_run` counts them, the summary line adds `N not run` when
+  there are some, and `--json` carries `not_run`. Third, a `BundlePuller` pull
+  that dropped an entry while its `topUp` or `openPool` receipt read was
+  pending ended with only its own stop. Only `decdn get` named the tx, from
+  the handle. A pull that is not interrupted now ends
+  `BundleEnd::Stopped` on each pending escrow, as it does on an untracked one.
+  `decdn get` names each one once.
+- **Client, CLI: `decdn get` names every pool a replacement closed, on
+  every exit (#2519).** Several paths printed no "reclaim it with: decdn pool
+  reclaim" note for a closed pool that may still hold a balance:
+  - a blob `get` took its replacement only from the error that ended the
+    pass, so a late lane build's escrow folded over it hid it;
+  - after a second replacement, in the pass against the new pool, the
+    command named only the first closed pool, for a blob or a bundle alike,
+    though it had funded the pool the second one closed at the full working
+    deposit;
+  - a Ctrl-C during a blob `get` dropped the note with the fetch;
+  - a bundle `get` whose manifest fetch replaced the pool named it nowhere,
+    and its error said the remaining work runs again, though nothing did.
+  Now the recovery gate lists every replacement its steps make, and the
+  command prints one reclaim note per closed pool as it ends, however it
+  ends. A replacement runs the rest again only when it ended the first pass.
+  A replaced manifest fetch says the new pool is current and the pull must
+  be run again. An entry URI's fetch starts clear of the replacement its
+  manifest fetch left, as a bundle pull does.
+- **Client: a lane build drained after its fetch ended sends no `topUp`
+  re-send, and waits on no lock (#2520).** A `topUp` that lost its nonce to a
+  concurrent transaction was re-sent after a quarter-second backoff even when
+  the fetch ended meanwhile, so the run escrowed a top-up no lane would use.
+  A drained build also waited for the open-or-reuse lock (bundle-wide, or the
+  payer's for a blob `get`) and the run's `topUp` lock before it checked the
+  fetch end. A sibling that held either
+  through its receipt wait kept the build waiting for the whole 30 s drain,
+  which then logged "lane builds still running". Now the backoff ends with
+  the fetch and the re-send is refused, and a build queued on either lock
+  ends at once with the fetch. Neither sent anything, so neither escrows. A
+  refill refused so logs that it was not sent, beside its "topping up" line.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its
@@ -2938,6 +3150,18 @@ since project inception and will roll into the first tagged release.
 
 #### Node serve path
 
+- **A `pull_leg_miss` refusal names the walk that found no target (#2366).**
+  The `serve-miss: refusing the request` line for a pull-leg miss now records
+  where the candidate list came from (`source`: `cache`, `dht`, `directory`
+  or `none`), how many providers it held (`discovered`), how many the probe
+  rounds skipped as suppressed or wedged (`skipped`), probed (`probed`), lost
+  to a failed probe (`unreachable`), heard `has_blob: false` from (`absent`)
+  or dropped on this node's own policy (`dropped`), how many holders they
+  admitted (`holders`) and whether those span the blob (`spans`), how many
+  handshakes ran (`handshakes`) and why the last one failed (`last_fault`).
+  Every serve-miss refusal line also carries the request's `namespace_id`.
+  Before, the line said only `cause=clean_miss`, so a fleet logging at info
+  could not tell an unreachable sole candidate from an empty directory.
 - **A fault in this node is no longer signed to clients as a `NotFound` about
   the content (#1560).** When a node-to-node pull failed for a reason that was
   *ours* — a buyer key that cannot sign the ADR 005 client binding, a voucher
@@ -3407,6 +3631,14 @@ since project inception and will roll into the first tagged release.
 
 #### Node selection & observability
 
+- **The node's upstream probe budget is 1 s (#2366).** `PROBE_TIMEOUT` was
+  500 ms. A probe dials a fresh connection, so it costs two RTTs (the
+  connection handshake and the request); at inter-continental RTTs that sits
+  at or past 500 ms, and a node whose only candidate was a far origin dropped it as
+  unreachable and signed `NotFound` for content that origin serves. On the
+  testnet, 106 of hel1's 156 probe rounds in one day overran the old ceiling.
+  The outer pull-through deadline at defaults is 168 s (was 167.5 s). ADR 001
+  § Probe response collection and ADR 005 carry the new figure.
 - **`Candidate.stake` is now `u64`, not `Option<u64>`** (internal API,
   `decdn-node`). The `Option` conflated "not looked up" with "looked up, holds
   no bond", and the stake tie-break ranked unknown strictly *below* a known
@@ -3680,8 +3912,8 @@ since project inception and will roll into the first tagged release.
   a failed discovery costs no key unlock. `Funding` is the buyer's own pool or
   a delegated `CredentialSlot`. Progress reaches a `BundleObserver`, a
   `CancellationToken` stops the pull, and the result is a typed
-  `BundleOutcome` (`Complete`, `Interrupted`, `FundingNeeded`, `Stopped`) with
-  a `BundleReport`. The new public `decdn_client::session` module holds the
+  `BundleOutcome`: how it ended (`BundleEnd`: `Complete`, `Interrupted`,
+  `FundingNeeded`, `Stopped`), the pool replacements, and a `BundleReport`. The new public `decdn_client::session` module holds the
   inputs: `ChainConfig`, `PullSite`, `DepositPolicy`, `DiscoveryOptions`.
   `decdn bundle pull` is now a caller of it; its output, `--json` report and
   exit codes do not change. The pull future is not `Send`.
