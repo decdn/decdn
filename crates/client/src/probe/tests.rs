@@ -106,7 +106,7 @@ fn ms(n: u64) -> Duration {
 }
 
 /// The node probes its upstream with a tight budget (decdn-node
-/// `PROBE_TIMEOUT`, 500 ms). A cold dial that answers on the relay must keep
+/// `PROBE_TIMEOUT`, 1 s). A cold dial that answers on the relay must keep
 /// its answer when hole punching does not select a direct path before the
 /// budget runs out.
 #[tokio::test(start_paused = true)]

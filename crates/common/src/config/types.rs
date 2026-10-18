@@ -632,7 +632,7 @@ pub struct CacheConfig {
     ///
     /// "Longer" is multiplied, not added. A silent candidate costs one full window of this,
     /// and the derived outer deadline budgets that for EVERY candidate, so a second here is
-    /// ~3 seconds of worst-case client wait on a total miss (167.5 s at defaults).
+    /// ~3 seconds of worst-case client wait on a total miss (168 s at defaults).
     ///
     /// It also sets the head start of the time budget for each own-origin range-pull read
     /// (ADR 037): one `{H}.obao4` fetch or one data window of at most 4 MiB. That budget is

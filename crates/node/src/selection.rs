@@ -22,11 +22,13 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// unpaid probe request/response. `probe_once` dials a fresh connection every call, and
 /// the protocol has no 0-RTT path, so even a resumable session pays a handshake round trip
 /// before the request goes out — every probe costs two RTTs, not one. At the 250-300 ms
-/// inter-continental RTTs this budget is sized against, that puts the furthest candidates
-/// at or past this ceiling. Dropping them is the intended trade (a slow candidate must not
-/// burn the caller's miss-latency budget), but this is the first term to revisit if
-/// distant-region selection looks too sparse. Both the figure and the trade are ADR 001
-/// § Probe response collection.
+/// inter-continental RTTs this budget is sized against, two RTTs plus the handshake take
+/// 500-700 ms, so the ceiling sits above the far candidates' tail: a node whose only
+/// candidate is an inter-continental origin keeps it instead of dropping it as unreachable
+/// and signing a `NotFound` for content that origin serves (#2366). A sparse round still
+/// ends well inside the DHT round timeout that precedes it. A candidate past this ceiling
+/// is dropped, by design: it must not burn the caller's miss-latency budget. Both the
+/// figure and the trade are ADR 001 § Probe response collection.
 ///
 /// What is left of the budget after the exchange goes to `probe_once`'s wait for hole
 /// punching to select a direct path. A candidate whose answer arrives in time is kept even
@@ -36,7 +38,7 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// Lives here, beside the deadline arithmetic that has to budget for it, rather than in
 /// `node_origin` where it is used (#1145 review). Every term of [`outer_pull_deadline`] is
 /// then visible in one file, which is what stops the next one from being guessed.
-pub const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How many blob-holding candidates a SINGLE-SOURCE probe round collects before
 /// it stops waiting on the rest. [`PROBE_TIMEOUT`] stays the ceiling — a sparse
@@ -70,12 +72,12 @@ pub const PROBE_EARLY_EXIT_CANDIDATES: usize = MAX_PROVIDER_ATTEMPTS;
 /// **Derived, not chosen** (#1145 review). A flat constant would be smaller than the thing
 /// it is named for:
 ///
-/// - probing is concurrent, so it costs one [`PROBE_TIMEOUT`] — 500 ms; but
+/// - probing is concurrent, so it costs one [`PROBE_TIMEOUT`] — 1 s; but
 /// - discovery is `find_providers`, whose rounds are each bounded by
 ///   [`DEFAULT_ROUND_TIMEOUT`] (8 s) and whose round count is capped by
 ///   [`MAX_LOOKUP_ROUNDS`] (4).
 ///
-/// At those defaults, four discovery rounds plus the probe phase can cost 32.5 s. A flat
+/// At those defaults, four discovery rounds plus the probe phase can cost 33 s. A flat
 /// budget short of that leaves the outer deadline short of what the fetch can actually spend,
 /// so the `tokio::time::timeout` around `discover → probe → rank → pull` can fire while
 /// candidate #3 is still in its stall window — the #859 fallback starvation this formula

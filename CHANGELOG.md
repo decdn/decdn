@@ -3631,6 +3631,14 @@ since project inception and will roll into the first tagged release.
 
 #### Node selection & observability
 
+- **The node's upstream probe budget is 1 s (#2366).** `PROBE_TIMEOUT` was
+  500 ms. A probe dials a fresh connection, so it costs two RTTs plus the
+  connection handshake; at inter-continental RTTs that sits at or past
+  500 ms, and a node whose only candidate was a far origin dropped it as
+  unreachable and signed `NotFound` for content that origin serves. On the
+  testnet, 106 of hel1's 156 probe rounds in one day overran the old ceiling.
+  The outer pull-through deadline at defaults is 168 s (was 167.5 s). ADR 001
+  § Probe response collection and ADR 005 carry the new figure.
 - **`Candidate.stake` is now `u64`, not `Option<u64>`** (internal API,
   `decdn-node`). The `Option` conflated "not looked up" with "looked up, holds
   no bond", and the stake tie-break ranked unknown strictly *below* a known
