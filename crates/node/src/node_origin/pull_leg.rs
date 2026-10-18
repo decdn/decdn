@@ -598,12 +598,18 @@ impl CandidateSource {
 /// `source` and `discovered` describe the last candidate list the walk built.
 /// A probe-cache hit that fails its handshakes and falls through to a fresh
 /// lookup reports that lookup's source; `handshakes` counts both walks.
+/// `skipped` and `probed` also count the origin-directory supplement round,
+/// whose peers are not in `discovered`, so they can exceed it. A probe the
+/// round cancels at its early stop counts in `probed` only. `holders` and
+/// `spans` describe the candidates the handshake walk has, after the
+/// requester drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct PullLegTrail {
     /// Where the last candidate list came from.
     pub(crate) source: CandidateSource,
-    /// Providers in that list after the negative-cache filter and the
-    /// requester drop.
+    /// Providers in that list after the requester drop. A DHT answer is also
+    /// negative-cache filtered by the lookup; a directory list is not, so its
+    /// suppressed peers count here and in `skipped`.
     pub(crate) discovered: u16,
     /// Peers the probe rounds skipped before probing: suppressed for the hash
     /// in the negative cache, or wedged as a provider.
@@ -618,9 +624,10 @@ pub(crate) struct PullLegTrail {
     /// limiter, an unverifiable signature, a `has_blob`/coverage mismatch, or
     /// a peer with no operator address.
     pub(crate) dropped: u16,
-    /// Candidates the rounds admitted.
+    /// Candidates the handshake walk has: admitted by the rounds, less the
+    /// requester.
     pub(crate) holders: u16,
-    /// Whether the admitted holders' coverage union spans the blob.
+    /// Whether those candidates' coverage union spans the blob.
     pub(crate) spans: bool,
     /// Candidates the handshake walks tried.
     pub(crate) handshakes: u16,
@@ -780,6 +787,10 @@ impl NodeOrigin {
         .await;
         tally.fold_into(&mut trail);
         ranked.retain(|candidate| candidate.node_id != requester);
+        // The requester can answer the directory supplement's probe as a
+        // holder; the walk drops it, so the trail counts what the walk has.
+        trail.holders = count_u16(ranked.len());
+        trail.spans = coverage_spans(hash_bytes, &ranked);
         let outcome = self
             .handshake_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget, prime)
             .await;

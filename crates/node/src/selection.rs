@@ -22,8 +22,8 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// unpaid probe request/response. `probe_once` dials a fresh connection every call, and
 /// the protocol has no 0-RTT path, so even a resumable session pays a handshake round trip
 /// before the request goes out — every probe costs two RTTs, not one. At the 250-300 ms
-/// inter-continental RTTs this budget is sized against, two RTTs plus the handshake take
-/// 500-700 ms, so the ceiling sits above the far candidates' tail: a node whose only
+/// inter-continental RTTs this budget is sized against, two RTTs take 500-600 ms, so the
+/// ceiling sits above the far candidates' tail: a node whose only
 /// candidate is an inter-continental origin keeps it instead of dropping it as unreachable
 /// and signing a `NotFound` for content that origin serves (#2366). A sparse round still
 /// ends well inside the DHT round timeout that precedes it. A candidate past this ceiling

@@ -65,9 +65,9 @@ fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
 // The defaults an operator actually runs: `node_pull_timeout_sec = 20` and
 // `node_pull_stall_window_sec = 20` (both `DEFAULT_*` in decdn-common, which this
 // crate does not depend on — hence the literals). Pinned because the worst-case client
-// wait is a user-visible number RESTATED IN PROSE elsewhere, and it moved three times
-// while the formula was corrected — most recently when the slack stopped being a guess
-// (#1145 review): 10 s -> 1 + 4×8 = 33 s, so 145 s -> 168 s.
+// wait is a user-visible number RESTATED IN PROSE elsewhere. At defaults:
+// (5 + 20 + 20) × 3 + (1 + 4 × 8) = 168 s, where the slack is one `PROBE_TIMEOUT` plus
+// `MAX_LOOKUP_ROUNDS` rounds of `DEFAULT_ROUND_TIMEOUT` (#1145 review).
 //
 // The sites that restate it, so the next person to move it can find them all — this list
 // is the whole reason the number keeps going stale, and the previous version of this

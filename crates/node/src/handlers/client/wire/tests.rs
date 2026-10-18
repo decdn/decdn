@@ -202,7 +202,7 @@ fn a_pull_leg_miss_names_the_fault_of_its_last_handshake() {
         holders: 2,
         spans: true,
         handshakes: 2,
-        last_fault: Some("refused_not_found"),
+        last_fault: Some("refused"),
     };
     let line = refusal_line(
         MissRefusal::new(
@@ -218,7 +218,7 @@ fn a_pull_leg_miss_names_the_fault_of_its_last_handshake() {
     assert!(line.contains("holders=2"), "{line}");
     assert!(line.contains("spans=true"), "{line}");
     assert!(line.contains("handshakes=2"), "{line}");
-    assert!(line.contains("last_fault=\"refused_not_found\""), "{line}");
+    assert!(line.contains("last_fault=\"refused\""), "{line}");
 }
 
 /// The coverage-gate line carries the shortfall that tells one partial

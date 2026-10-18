@@ -90,9 +90,9 @@ const STALL_RATE: u64 = RATE / 2;
 /// that must rank on a live cold probe and so cannot seed the probe cache.
 ///
 /// The score is `rate × max(rtt_ms, 1) / rep²` (`selection::compute_score`), and a
-/// probe slower than `PROBE_TIMEOUT` (500 ms) is dropped. Two accepted probes thus
-/// differ in RTT by less than 500×, and a 1000× rate gap outweighs any RTT a loaded
-/// runner measures (#2268).
+/// probe slower than `PROBE_TIMEOUT` (1 s) is dropped. Two accepted probes thus
+/// differ in RTT by less than 1000×, so a 1000× rate gap — the most
+/// `MAX_RATE_PER_MB` allows — outweighs any RTT a loaded runner measures (#2268).
 const RANK_LAST_RATE: u64 = 1_000;
 
 const fn slash_verifying() -> Address {
@@ -339,6 +339,9 @@ async fn answer_probe(
 /// [`answer_probe`] with an explicit [`Coverage`], so a PARTIAL holder can
 /// advertise only the discovery blocks it serves (#1506 ranged assembly). The
 /// two-holder loopback drives one holder covering block 0 and another block 1.
+/// `has_blob` follows the coverage as a holder's does: an empty coverage is
+/// `has_blob: false`, except for the empty blob (`total_bytes: 0`), whose
+/// coverage is empty on a holder too (#2471).
 async fn answer_probe_with_coverage(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
@@ -359,15 +362,16 @@ async fn answer_probe_with_coverage(
     let ProbeMessage::Request(req) = msg else {
         anyhow::bail!("expected a ProbeMessage::Request");
     };
+    let has_blob = total_bytes == 0 || !coverage.is_empty();
     let body = ProbeResponseBody {
         hash: req.hash,
-        has_blob: true,
+        has_blob,
         rate_per_mb: rate,
         timestamp_us: req.timestamp_us,
     };
     let slash_sig = ProbeSlashData {
         hash: B256::from(req.hash),
-        has_blob: true,
+        has_blob,
         rate_per_mb: rate,
         timestamp_us: req.timestamp_us,
     }
@@ -16316,6 +16320,100 @@ async fn no_covering_candidate_refuses_before_commit() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_only_candidate_refuses_with_the_walk_on_the_line() -> Result<()> {
     serve_miss_discovery_case(DiscoveryCase::DeadOnly, 0).await
+}
+
+/// A directory origin that answers `has_blob: false` is probed once and then
+/// negative-cached. The next serve for the hash skips it in the first round,
+/// and the origin-directory supplement does not count the skip again: the
+/// refusal line reads `skipped=1`, not `skipped=2` (#2366).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_negative_cached_only_candidate_is_skipped_once_per_walk() -> Result<()> {
+    let spans = support::capture_spans();
+    let (_block_guard, payload, hash) = two_block_blob()?;
+    let ab_pool_id = B256::repeat_byte(0xA4);
+    let s_buyer = Arc::new(PrivateKeySigner::random());
+    // A holds no block of the blob, so its probe answers `has_blob: false`.
+    let (a_id, a_addr, a_eth, ep_a, task_a, _store_a) = spawn_partial_holder(
+        &payload,
+        ab_pool_id,
+        s_buyer.address(),
+        Coverage::from_block_indices(2, std::iter::empty()),
+        0,
+    )
+    .await?;
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let discovery = FixtureDiscovery::directory_only(vec![a_dht], U256::ZERO);
+    let addr_map = HashMap::from([(a_dht, a_eth)]);
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_pool_id = B256::repeat_byte(0x3F);
+    let (handler_s, s_target, ep_s, _recorded, _cache_s, s_operator, _s_metrics, _) =
+        build_serving_node(
+            hash,
+            ab_pool_id,
+            &s_buyer,
+            discovery,
+            PositiveProbeCache::new(),
+            addr_map,
+            &[(a_id, a_addr)],
+            &[(leaf_pool_id, leaf_eth.address())],
+            U256::from(DEPOSIT_MICRO_USDC),
+        )
+        .await?;
+    let task_s = spawn_server(ep_s.clone(), handler_s);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    for _ in 0..2 {
+        let pulled = leaf_paced_pull(
+            &leaf_ep,
+            s_target.clone(),
+            leaf_node_id,
+            &leaf_eth,
+            s_operator,
+            leaf_pool_id,
+            hash,
+            RATE,
+            None,
+        )
+        .await;
+        let Err(err) = pulled else {
+            anyhow::bail!("S must refuse when its only candidate holds nothing");
+        };
+        anyhow::ensure!(
+            format!("{err:#}").contains("delivery refused"),
+            "S must refuse before committing: {err:#}"
+        );
+    }
+    let lines: Vec<_> = spans
+        .events(
+            "serve-miss: refusing the request",
+            "hash",
+            &hash.to_string(),
+        )
+        .into_iter()
+        .filter(|l| l.get("path").map(String::as_str) == Some("pull_leg_miss"))
+        .collect();
+    let [first, second] = lines.as_slice() else {
+        anyhow::bail!("expected two pull_leg_miss refusal lines, got {lines:?}");
+    };
+    let field = |line: &std::collections::HashMap<String, String>, name: &str| {
+        line.get(name).cloned().unwrap_or_default()
+    };
+    for (line, skipped, probed, absent) in [(first, "0", "1", "1"), (second, "1", "0", "0")] {
+        anyhow::ensure!(
+            field(line, "source") == "directory"
+                && field(line, "discovered") == "1"
+                && field(line, "skipped") == skipped
+                && field(line, "probed") == probed
+                && field(line, "absent") == absent
+                && field(line, "holders") == "0"
+                && field(line, "handshakes") == "0",
+            "expected skipped={skipped} probed={probed} absent={absent}: {line:?}"
+        );
+    }
+    shutdown([task_s, task_a], [&leaf_ep, &ep_s, &ep_a]).await?;
+    Ok(())
 }
 
 /// The end-past-the-blob twin of `no_covering_candidate_refuses_before_commit`:

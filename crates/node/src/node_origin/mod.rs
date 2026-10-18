@@ -1235,10 +1235,11 @@ fn count_u16(len: usize) -> u16 {
 ///
 /// Under [`ProbeGather::CoverageUnion`], a round whose holders cannot span the
 /// blob also probes the origin directory's candidates for `namespace_id` that the
-/// first round did not probe (ADR 022 §`FIND_VALUE` Flow, #2195). A DHT answer can
+/// first round did not resolve (ADR 022 §`FIND_VALUE` Flow, #2195). A DHT answer can
 /// hold only partial holders, and the ranged assembly needs a candidate set that
 /// covers every block. An origin past the first round's `probe_fanout` cut is
-/// probed here even when `providers` named it.
+/// probed here even when `providers` named it; an origin the first round skipped
+/// as suppressed or wedged is not asked again.
 async fn probe_and_rank(
     deps: &NodeOriginDeps,
     providers: Vec<DhtNodeId>,
@@ -1249,13 +1250,13 @@ async fn probe_and_rank(
 ) -> Vec<Candidate> {
     let target = DhtHash::from_bytes(hash_bytes);
     let mut candidates: Vec<Candidate> = Vec::new();
-    let probed = probe_round(deps, &providers, hash_bytes, gather, &mut candidates, tally).await;
+    let resolved = probe_round(deps, &providers, hash_bytes, gather, &mut candidates, tally).await;
     if matches!(gather, ProbeGather::CoverageUnion) && !coverage_spans(hash_bytes, &candidates) {
         let directory = directory_origins(deps, namespace_id).await;
         let listed = directory.len();
         let origins: Vec<DhtNodeId> = directory
             .into_iter()
-            .filter(|origin| !probed.contains(origin))
+            .filter(|origin| !resolved.contains(origin))
             .collect();
         let hash = Hash::from_bytes(hash_bytes);
         let holders = candidates.len();
@@ -1313,10 +1314,12 @@ async fn probe_and_rank(
 
 /// One concurrent probe round over `peers`, pushing each holder into
 /// `candidates` until `gather`'s stop condition holds or the round drains.
-/// Returns the peers it probed: those left after the negative-cache, wedged, and
-/// `probe_fanout` filters. `tally` counts the peers the filters skipped, the
-/// probes sent, and each probe that admitted no candidate; a probe still pending
-/// when the stop condition holds counts as sent and nothing else.
+/// Returns the peers the round resolved: those it probed, and those the
+/// negative-cache and wedged filters skipped. A peer past the `probe_fanout`
+/// cut is in neither, so a later round can probe it. `tally` counts the peers
+/// the filters skipped, the probes sent, and each probe that admitted no
+/// candidate; a probe still pending when the stop condition holds counts as
+/// sent and nothing else.
 ///
 /// Under [`ProbeGather::CoverageUnion`] the stop condition counts the holders
 /// already in `candidates`, so a second round stops as soon as its answers close
@@ -1343,7 +1346,7 @@ async fn probe_round(
     // The collection window opens here: every probe, dial included, starts at once on
     // the first poll.
     let collection_started = Instant::now();
-    let unsuppressed: Vec<DhtNodeId> = peers
+    let (unsuppressed, skipped): (Vec<DhtNodeId>, Vec<DhtNodeId>) = peers
         .iter()
         .copied()
         // Drop peers already known to answer "no" for THIS hash within the TTL.
@@ -1356,7 +1359,6 @@ async fn probe_round(
         //
         // Filtered BEFORE `take`, so a suppressed peer does not consume a probe-fanout
         // slot that a viable provider could have used.
-        .filter(|peer| !deps.negative_cache.contains_active(peer, &target))
         // Also drop WEDGED providers, for ALL hashes until the suppression window elapses
         // (#1145 review): a provider whose voucher we just failed to pay on lane-terminal terms
         // is one we cannot pay for any blob right now. Nothing else SUPPRESSES it — the
@@ -1364,11 +1366,11 @@ async fn probe_round(
         // it lapses for any other blob, and the arm deliberately scores no reputation. Without
         // this the peer is re-selected on the next miss for a different hash and re-wedged —
         // burning a candidate slot each time.
-        .filter(|peer| !deps.provider_is_wedged(peer, now_secs))
-        .collect();
-    tally.skipped = tally
-        .skipped
-        .saturating_add(count_u16(peers.len().saturating_sub(unsuppressed.len())));
+        .partition(|peer| {
+            !deps.negative_cache.contains_active(peer, &target)
+                && !deps.provider_is_wedged(peer, now_secs)
+        });
+    tally.skipped = tally.skipped.saturating_add(count_u16(skipped.len()));
     let selected: Vec<DhtNodeId> = unsuppressed
         .into_iter()
         .take(deps.config.probe_fanout)
@@ -1425,7 +1427,9 @@ async fn probe_round(
         deps.metrics
             .probe_collection_latency(collection_started.elapsed());
     }
-    selected
+    let mut resolved = selected;
+    resolved.extend(skipped);
+    resolved
 }
 
 /// Read one probe's RTT as evidence about the peer's region claim.
