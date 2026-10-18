@@ -512,8 +512,10 @@ pub(crate) fn manifest_cap_mb(max_blob_mb: u64) -> u64 {
 /// ends with an `openPool` or `topUp` whose receipt it did not read, or with
 /// one that escrowed with no local record crediting it, carries
 /// [`super::interrupt::UnreconciledEscrows`], as context on any of those or as the
-/// error of a fetch that otherwise succeeded. A transaction the error already
-/// names itself is not repeated there.
+/// error of a fetch that otherwise succeeded. A pending transaction the error
+/// carries, or an untracked one whose tx a failure's text names, is not
+/// repeated there. A Ctrl-C or a give-up names every untracked one, because
+/// `main` prints only its stop line.
 pub(crate) async fn fetch(
     args: &cli::GetArgs,
     output: &Path,

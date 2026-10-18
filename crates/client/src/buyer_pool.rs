@@ -903,7 +903,7 @@ struct Shared {
 /// credits ([`EscrowUntracked`]), as an [`UnconfirmedEscrows`] holds it for
 /// its command to name when it ends. Displays its error chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
+#[non_exhaustive]
 pub struct UntrackedEscrow {
     /// The transaction that escrowed.
     pub tx: TxHash,

@@ -1034,7 +1034,8 @@ fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
 ///
 /// An interrupted pull ends [`BundleEnd::Interrupted`], which carries no
 /// error: its caller names what the handle holds. Otherwise each untracked
-/// escrow that `stopped` does not already name is folded into it. An entry
+/// escrow that `stopped` does not already name is folded into it, the oldest
+/// as the error's root ([`crate::buyer_pool::EscrowUntracked`]). An entry
 /// dropped before it reported its escrow, or an earlier pull on the handle,
 /// leaves that escrow named nowhere else. The escrow wins over any outcome,
 /// as a late lane build's does for one fetch: a pull that completed stops,
@@ -1051,18 +1052,36 @@ fn pull_end(
     if interrupted {
         return BundleEnd::Interrupted;
     }
-    let stopped = untracked.into_iter().fold(stopped, |stopped, held| {
-        let tx = held.tx.to_string();
-        match stopped {
-            Some(err) if !invites_rerun(&err) && format!("{err:#}").contains(&tx) => Some(err),
-            None => Some(held.into_error()),
-            Some(err) => Some(held.into_error().context(format!(
-                "the pull stopped ({}), and an earlier openPool or topUp of this command \
-                 escrowed USDC no record credits",
-                sanitize_err_chain(&err)
-            ))),
-        }
+    // An error that invites a rerun never names an escrow: its text does not
+    // stop the caller from rerunning.
+    let named = stopped
+        .as_ref()
+        .filter(|err| !invites_rerun(err))
+        .map(|err| format!("{err:#}"));
+    let unnamed = untracked.into_iter().filter(|held| {
+        named
+            .as_ref()
+            .is_none_or(|named| !named.contains(&held.tx.to_string()))
     });
+    // The oldest escrow is the root, and each later one is context on it.
+    let escrows = unnamed.fold(None, |escrows: Option<anyhow::Error>, held| {
+        Some(match escrows {
+            None => held.into_error(),
+            Some(err) => err.context(format!(
+                "another openPool or topUp of this command also escrowed USDC no record \
+                 credits: {held}"
+            )),
+        })
+    });
+    let stopped = match (stopped, escrows) {
+        (stopped, None) => stopped,
+        (None, Some(escrows)) => Some(escrows),
+        (Some(err), Some(escrows)) => Some(escrows.context(format!(
+            "the pull stopped ({}), and an openPool or topUp of this command escrowed USDC no \
+             record credits",
+            sanitize_err_chain(&err)
+        ))),
+    };
     let stopped = stopped.map(|err| match (replaced, err.downcast_ref::<PoolReplaced>()) {
         (Some(_), Some(_)) => err.context(
             "funding needed: the pool this pull opened accepts no more funds either; run the \

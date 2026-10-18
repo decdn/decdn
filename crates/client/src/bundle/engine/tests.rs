@@ -292,19 +292,52 @@ fn a_stop_that_names_the_escrow_is_kept() {
     );
 }
 
-/// Every untracked escrow the handle holds is named.
+/// Every untracked escrow the handle holds is named, the oldest as the root.
+/// A pull that completed is not said to have stopped.
 #[test]
 fn every_untracked_escrow_is_named() {
     let (first, second) = (held_escrow(0xab), held_escrow(0xcd));
-    stopped_on(
-        pull_end(
-            false,
-            Some(give_up()),
-            None,
-            vec![first.clone(), second.clone()],
-        ),
+    let both = || vec![first.clone(), second.clone()];
+    let err = stopped_on(
+        pull_end(false, Some(give_up()), None, both()),
         &[&first, &second],
     );
+    assert!(format!("{err:#}").contains("no progress"), "{err:#}");
+
+    let err = stopped_on(pull_end(false, None, None, both()), &[&first, &second]);
+    let root = err
+        .downcast_ref::<crate::buyer_pool::EscrowUntracked>()
+        .unwrap();
+    assert_eq!(root.tx(), first.tx);
+    assert!(!format!("{err:#}").contains("the pull stopped"), "{err:#}");
+}
+
+/// A "funding needed" or pool-replaced stop whose text names the escrow's tx
+/// still stops on the escrow: a caller that funds the pool, or runs the next
+/// pass, would escrow again.
+#[test]
+fn a_funding_stop_that_names_the_escrow_still_stops_on_it() {
+    let held = held_escrow(0xab);
+    let named = funding_needed().context(format!("a late lane build: {held}"));
+    let err = stopped_on(
+        pull_end(false, Some(named), None, vec![held.clone()]),
+        &[&held],
+    );
+    assert!(
+        err.downcast_ref::<crate::FundingNeeded>().is_none(),
+        "{err:#}"
+    );
+
+    let replaced = PoolReplaced {
+        closed: alloy::primitives::B256::repeat_byte(0x02),
+        opened: alloy::primitives::B256::repeat_byte(0x03),
+    };
+    let named = anyhow::Error::new(replaced).context(format!("a late lane build: {held}"));
+    let err = stopped_on(
+        pull_end(false, Some(named), None, vec![held.clone()]),
+        &[&held],
+    );
+    assert!(err.downcast_ref::<PoolReplaced>().is_none(), "{err:#}");
 }
 
 /// An interrupted pull ends `Interrupted` whatever the handle holds: its
