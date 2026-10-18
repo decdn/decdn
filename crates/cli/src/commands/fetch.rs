@@ -1054,9 +1054,18 @@ pub(crate) async fn fetch_on(
     // One funding recovery state for everything the payer pays for, both passes
     // included.
     let recovery = &payer.recovery;
-    // Set once a funding recovery step replaced the pool: the second pass then
-    // runs the remaining work against the new pool, and resumes the `.partial`.
-    let mut replaced: Option<PoolReplaced> = None;
+    // A replacement the gate carries from an earlier fetch under this payer (an
+    // entry's manifest fetch, an earlier gateway request) was reported then,
+    // and its new pool is the one this fetch's lanes reuse. Left on the gate, it
+    // would answer this fetch's first recovery step with no step, and be
+    // reported again as this fetch's own.
+    if recovery.replaced().is_some() {
+        recovery.start_next_pass();
+    }
+    // Every replacement this fetch's recovery steps made. The first one that
+    // ends a pass runs the remaining work again against the new pool, which
+    // resumes the `.partial`.
+    let mut replaced: Vec<PoolReplaced> = Vec::new();
     loop {
         // Per pass: the funding facts, the lanes and their handles all name the
         // pool the pass pays from.
@@ -1098,7 +1107,7 @@ pub(crate) async fn fetch_on(
             recovery,
         );
         let holders = sources.holders_from(&resolved);
-        if replaced.is_none() {
+        if replaced.is_empty() {
             timings.set_holders_start(holders.len());
         }
         // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
@@ -1143,7 +1152,7 @@ pub(crate) async fn fetch_on(
             eprintln!("warning: {shortfall}");
         }
         let result = result.map_err(|err| annotate(err, &sources.fault_context()));
-        match next_pass(result, &mut replaced, streams) {
+        match next_pass(result, recovery.replaced(), &mut replaced, streams) {
             Some(pass_result) => return pass_result,
             None => recovery.start_next_pass(),
         }
@@ -1152,48 +1161,66 @@ pub(crate) async fn fetch_on(
 
 /// What a fetch pass that ended with `result` does next: `None` to run the
 /// remaining work again against the pool a funding recovery step just opened,
-/// or the command's result (ADR 003 § Funding recovery).
+/// or the command's result (ADR 003 § Funding recovery). `on_gate` is the
+/// replacement the fetch's recovery gate holds as the pass ends, and
+/// `replaced` every replacement the fetch made before this pass.
 ///
-/// A pass runs again at most once: a second replacement in one command ends it
-/// "funding needed". A stream (stdout or a writer) never runs again, because
-/// the bytes it already wrote cannot be taken back; its replacement ends the
-/// command with the new pool named. Once a pass replaced the pool, the closed
-/// pool's remaining balance is named on stderr, with the reclaim command.
+/// Only a pass that a [`PoolReplaced`] ended runs again, and at most once: a
+/// second replacement in one command ends it "funding needed". A replacement
+/// that an untracked escrow ended the pass over survives in `result` only as
+/// text; the gate still holds it, so it is reported, and runs nothing again. A
+/// stream (stdout or a writer) never runs again, because the bytes it already
+/// wrote cannot be taken back; its replacement ends the command with the new
+/// pool named. Once the command ends, each pool a replacement closed is named
+/// on stderr with its remaining balance and the reclaim command.
 fn next_pass(
     result: anyhow::Result<()>,
-    replaced: &mut Option<PoolReplaced>,
+    on_gate: Option<PoolReplaced>,
+    replaced: &mut Vec<PoolReplaced>,
     streams: bool,
 ) -> Option<anyhow::Result<()>> {
-    let now_replaced = result
+    let stopped_on = result
         .as_ref()
         .err()
         .and_then(|err| err.downcast_ref::<PoolReplaced>().copied());
-    if let Some(new) = now_replaced
-        && replaced.is_none()
+    let first_pass = replaced.is_empty();
+    if let Some(new) = stopped_on
+        && first_pass
         && !streams
     {
         eprintln!("note: {new}");
-        *replaced = Some(new);
+        replaced.push(new);
         return None;
     }
-    if let Some(earlier) = (*replaced).or(now_replaced) {
-        eprintln!(
-            "note: pool {} accepts no more funds and may still hold a balance; once its \
-             dispute window ends, reclaim it with: decdn pool reclaim --pool {}",
-            earlier.closed, earlier.closed
-        );
+    for new in stopped_on.into_iter().chain(on_gate) {
+        if !replaced.contains(&new) {
+            replaced.push(new);
+        }
     }
-    Some(result.map_err(|err| match (now_replaced, *replaced) {
-        (Some(_), Some(_)) => err.context(
+    for each in replaced.iter() {
+        print_reclaim_note(each);
+    }
+    Some(result.map_err(|err| match stopped_on {
+        Some(_) if !first_pass => err.context(
             "funding needed: the pool this command opened accepts no more funds either; run \
              the command again",
         ),
-        (Some(new), None) => err.context(format!(
+        Some(new) => err.context(format!(
             "pool {} is now the current pool; run the command again to stream from it",
             new.opened
         )),
-        _ => err,
+        None => err,
     }))
+}
+
+/// Name the pool a funding recovery step closed, which may still hold a
+/// balance, and the command that reclaims it.
+pub(crate) fn print_reclaim_note(replaced: &PoolReplaced) {
+    eprintln!(
+        "note: pool {} accepts no more funds and may still hold a balance; once its \
+         dispute window ends, reclaim it with: decdn pool reclaim --pool {}",
+        replaced.closed, replaced.closed
+    );
 }
 
 /// Reconnect a delegated fetch that ended "funding needed" (ADR 003 §Funding

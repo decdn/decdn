@@ -890,6 +890,28 @@ fn an_interrupted_replacement_is_reported_without_a_rerun() {
     );
 }
 
+/// #2519: a pull lists every replacement it made. A second pass that
+/// replaced the pool again lists the pool the first one opened as closed, so
+/// its balance is named too.
+#[test]
+fn a_pull_lists_every_replacement_it_made() {
+    let first = replacement(0x01, 0x02);
+    let second = replacement(0x02, 0x03);
+    assert_eq!(
+        pull_replacements(PassReplacement::Rerun(first), Some(second)),
+        [first, second]
+    );
+    assert_eq!(
+        pull_replacements(PassReplacement::Rerun(first), None),
+        [first]
+    );
+    assert_eq!(
+        pull_replacements(PassReplacement::ReportOnly(first), None),
+        [first]
+    );
+    assert_eq!(pull_replacements(PassReplacement::None, None), []);
+}
+
 /// A gate that holds the replacement of pool `0x01` by pool `0x02`, as a
 /// recovery step leaves it.
 async fn gate_replaced() -> RecoveryGate {

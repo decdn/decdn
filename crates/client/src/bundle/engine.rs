@@ -1123,6 +1123,14 @@ fn pass_replacement(run: &PullRun, now: Option<PoolReplaced>) -> PassReplacement
     }
 }
 
+/// Every pool replacement a pull made, in the order the steps made them:
+/// `first`, the first pass's ([`pass_replacement`]), then `second`, the one
+/// the gate holds after the pass against the new pool. Each closed pool may
+/// still hold a balance to reclaim.
+fn pull_replacements(first: PassReplacement, second: Option<PoolReplaced>) -> Vec<PoolReplaced> {
+    first.reported().into_iter().chain(second).collect()
+}
+
 /// How a pull that ended with `stopped` ends, once every pass ran.
 /// `rerun` is the pool replacement a second pass ran against, `pending` the
 /// `openPool` and `topUp` transactions the puller's handle holds with no
@@ -1878,8 +1886,8 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// pool, so the pass starts with fresh ledgers and funding facts, and each
     /// entry resumes the partial data it holds (ADR 003 § Funding recovery). A
     /// second replacement ends the pull "funding needed". A replacement that
-    /// did not end the pass runs nothing again, and the outcome still reports
-    /// it ([`pass_replacement`]).
+    /// did not end the pass runs nothing again. The outcome reports every
+    /// replacement, a second one too ([`pull_replacements`]).
     pub(super) async fn run(
         &mut self,
         manifest: &super::BundleManifest,
@@ -1922,6 +1930,8 @@ impl<P: Provider + Clone> PullCtx<P> {
         let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
         let replacement = pass_replacement(&run, self.recovery.replaced());
         let rerun = replacement.rerun();
+        // The second pass's own replacement: the gate was cleared as it began.
+        let mut second_replaced = None;
         if let Some(new) = rerun {
             if let Some(observer) = &self.observer {
                 observer.pool_replaced(&new);
@@ -1934,6 +1944,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
                 .await;
             self.stop = self.stop.next_pass();
+            second_replaced = self.recovery.replaced();
             run = merge_passes(run, second);
             paid = paid.saturating_add(self.ledgers.paid_bytes());
         }
@@ -1960,7 +1971,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         BundleOutcome {
             report,
             end,
-            replaced: replacement.reported(),
+            replaced: pull_replacements(replacement, second_replaced),
         }
     }
 

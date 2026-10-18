@@ -480,16 +480,24 @@ fn replacement(closed: u8, opened: u8) -> PoolReplaced {
 /// it "funding needed"; a pass that ends any other way ends the command.
 #[test]
 fn a_replaced_pool_runs_the_work_again_at_most_once() {
-    let mut replaced = None;
+    let mut replaced = Vec::new();
     let first = replacement(1, 2);
     assert!(
-        next_pass(Err(anyhow::Error::new(first)), &mut replaced, false).is_none(),
+        next_pass(
+            Err(anyhow::Error::new(first)),
+            Some(first),
+            &mut replaced,
+            false
+        )
+        .is_none(),
         "the first replacement runs the work again"
     );
-    assert_eq!(replaced, Some(first));
+    assert_eq!(replaced, [first]);
 
+    let second = replacement(2, 3);
     let err = next_pass(
-        Err(anyhow::Error::new(replacement(2, 3))),
+        Err(anyhow::Error::new(second)),
+        Some(second),
         &mut replaced,
         false,
     )
@@ -500,37 +508,84 @@ fn a_replaced_pool_runs_the_work_again_at_most_once() {
         "{err:#}"
     );
 
-    let mut replaced = Some(first);
+    let mut replaced = vec![first];
     assert_matches!(
-        next_pass(Ok(()), &mut replaced, false),
+        next_pass(Ok(()), None, &mut replaced, false),
         Some(Ok(())),
         "the second pass completes"
     );
-    let mut replaced = None;
-    let err = next_pass(Err(anyhow::anyhow!("not found")), &mut replaced, false)
-        .expect("any other end ends the command")
-        .expect_err("with its own error");
+    assert_eq!(replaced, [first]);
+    let mut replaced = Vec::new();
+    let err = next_pass(
+        Err(anyhow::anyhow!("not found")),
+        None,
+        &mut replaced,
+        false,
+    )
+    .expect("any other end ends the command")
+    .expect_err("with its own error");
     assert_eq!(format!("{err}"), "not found");
-    assert_eq!(replaced, None);
+    assert_eq!(replaced, []);
+}
+
+/// #2519: a second replacement in one command lists both: the pool the
+/// first one opened is the one the second closed, and this command funded it
+/// at the full working deposit, so its balance is named too.
+#[test]
+fn a_second_replacement_names_both_closed_pools() {
+    let first = replacement(1, 2);
+    let second = replacement(2, 3);
+    let mut replaced = vec![first];
+    let _ = next_pass(
+        Err(anyhow::Error::new(second)),
+        Some(second),
+        &mut replaced,
+        false,
+    )
+    .expect("a second replacement ends the command");
+    assert_eq!(replaced, [first, second]);
+}
+
+/// #2519: a late lane build's escrow folded over the `PoolReplaced` that
+/// ended the pass leaves the replacement only as text. The gate still holds
+/// it, so it is reported, and the escrow error ends the command with no
+/// second pass.
+#[test]
+fn a_replacement_under_a_late_escrow_is_reported_without_a_rerun() {
+    let new = replacement(1, 2);
+    let mut replaced = Vec::new();
+    let err = next_pass(
+        Err(
+            anyhow::anyhow!("a lane build may have escrowed USDC no record credits")
+                .context(format!("the fetch failed ({new})")),
+        ),
+        Some(new),
+        &mut replaced,
+        false,
+    )
+    .expect("an escrow error runs nothing again")
+    .expect_err("it ends the command");
+    assert!(
+        !format!("{err:#}").contains("now the current pool"),
+        "{err:#}"
+    );
+    assert_eq!(replaced, [new]);
 }
 
 /// A stream to stdout never runs again: the bytes it wrote cannot be taken
 /// back. Its replacement ends the command and names the new pool.
 #[test]
 fn a_stdout_stream_names_the_new_pool_and_does_not_run_again() {
-    let mut replaced = None;
-    let err = next_pass(
-        Err(anyhow::Error::new(replacement(1, 2))),
-        &mut replaced,
-        true,
-    )
-    .expect("a stdout stream ends the command")
-    .expect_err("with the replacement");
+    let new = replacement(1, 2);
+    let mut replaced = Vec::new();
+    let err = next_pass(Err(anyhow::Error::new(new)), Some(new), &mut replaced, true)
+        .expect("a stdout stream ends the command")
+        .expect_err("with the replacement");
     assert!(
         format!("{err:#}").contains(&B256::repeat_byte(2).to_string()),
         "{err:#}"
     );
-    assert_eq!(replaced, None);
+    assert_eq!(replaced, [new], "the closed pool is named");
 }
 
 /// A self-owned pool no provider's voucher fits names the top-up command

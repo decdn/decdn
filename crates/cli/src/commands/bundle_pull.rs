@@ -870,8 +870,8 @@ async fn pull_manifest(
             never = watch => match never {},
         }
     };
-    if let Some(replaced) = outcome.replaced {
-        print_reclaim_note(replaced);
+    for replaced in &outcome.replaced {
+        fetch::print_reclaim_note(replaced);
     }
     observer.finish();
     warn_leftover_partials(out, &manifest.entries, uri.hash);
@@ -884,16 +884,6 @@ async fn pull_manifest(
         BundleEnd::FundingNeeded { error, .. } | BundleEnd::Stopped(error) => Err(error),
         _ => reported,
     }
-}
-
-/// Name the pool a funding recovery step closed, which may still hold a
-/// balance, and the command that reclaims it.
-fn print_reclaim_note(replaced: PoolReplaced) {
-    eprintln!(
-        "note: pool {} accepts no more funds and may still hold a balance; once its \
-         dispute window ends, reclaim it with: decdn pool reclaim --pool {}",
-        replaced.closed, replaced.closed
-    );
 }
 
 /// The kept manifest for the run: the bundle blob fetched and filtered here.

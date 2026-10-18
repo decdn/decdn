@@ -520,15 +520,16 @@ pub struct BundleOutcome {
     pub report: BundleReport,
     /// Why the pull ended.
     pub end: BundleEnd,
-    /// The pool replacement a funding recovery step made, if one did. The
-    /// closed pool may still hold a balance to reclaim once its dispute
-    /// window ends. A replacement that ended the first pass runs the rest
-    /// again against the new pool. One a sibling entry's step made while
-    /// another entry ended the pull, or one that an untracked escrow ended the
-    /// pull over, runs nothing again, and is still reported here. A second
-    /// replacement, in the pass against the new pool, ends the pull "funding
-    /// needed" and is named only in its error.
-    pub replaced: Option<PoolReplaced>,
+    /// Every pool replacement the funding recovery steps made, in the order
+    /// they made them. Each closed pool may still hold a balance to reclaim
+    /// once its dispute window ends. A replacement that ended the first pass
+    /// runs the rest again against the new pool. One a sibling entry's step
+    /// made while another entry ended the pull, or one that an untracked
+    /// escrow ended the pull over, runs nothing again, and is still listed
+    /// here. A second replacement, in the pass against the new pool, ends the
+    /// pull "funding needed", and is listed after the first: the pool the
+    /// first one opened is the one it closed.
+    pub replaced: Vec<PoolReplaced>,
 }
 
 /// Why a bundle pull ended.

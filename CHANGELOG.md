@@ -28,6 +28,9 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-client`: `BundleOutcome::replaced` is a `Vec<PoolReplaced>`
+  (#2519).** It lists every pool replacement the pull made, in order, a
+  second-pass replacement too. Iterate it where code matched the `Option`.
 - **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` return
   an `UnrecordedEscrow` beside the outcome (#2515).** `open_pool` returns
   `(OpenedPool, UnrecordedEscrow)` and `top_up` returns
@@ -1212,7 +1215,7 @@ since project inception and will roll into the first tagged release.
   step that replaced the pool during the drain, or a replacement that a late
   escrow folded over, went unreported, and `decdn get` of a bundle printed no
   "reclaim it with: decdn pool reclaim" note for the closed pool. The pull now
-  reads the replacement from the recovery gate, and reports it in
+  reads the replacement from the recovery gate, and lists it in
   `BundleOutcome::replaced`. Only a replacement that ended the first pass runs
   the rest again. A later pull on the same `BundlePuller` starts as a pass
   against the new pool, with fresh lane and funding state: it runs no extra
@@ -1225,6 +1228,19 @@ since project inception and will roll into the first tagged release.
   the handle. A pull that is not interrupted now ends
   `BundleEnd::Stopped` on each pending escrow, as it does on an untracked one.
   `decdn get` names each one once.
+- **Client, CLI: `decdn get` names every pool a replacement closed, for a
+  blob too (#2519).** A blob `get` took its pool replacement only from the
+  error that ended the pass. A late lane build's escrow folded over the
+  replacement, and the command printed no "reclaim it with: decdn pool
+  reclaim" note for the closed pool. A second replacement, in the pass against
+  the new pool, named only the first closed pool, for a blob or a bundle
+  alike, though the command funded the pool the second one closed at the full
+  working deposit. Now a blob `get` also reads the replacement from the
+  recovery gate, and runs the rest again only when the replacement ended the
+  pass. Every closed pool gets its own reclaim note. A blob `get` under a
+  payer whose gate carries an earlier fetch's replacement (an entry's manifest
+  fetch, an earlier gateway request) starts clear of it, as a bundle pull
+  does.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

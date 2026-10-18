@@ -144,8 +144,13 @@ impl RecoveryGate {
     }
 
     /// The replacement a step made in this pass, which every later step of the
-    /// pass reports, until [`Self::start_next_pass`].
-    pub(crate) fn replaced(&self) -> Option<crate::PoolReplaced> {
+    /// pass reports, until [`Self::start_next_pass`]. A caller reads it as a
+    /// pass ends, so a replacement that an untracked escrow ended the pass
+    /// over, and so survives in the pass's error only as text, is still
+    /// reported.
+    #[must_use]
+    #[doc(hidden)]
+    pub fn replaced(&self) -> Option<crate::PoolReplaced> {
         self.lock().replaced
     }
 

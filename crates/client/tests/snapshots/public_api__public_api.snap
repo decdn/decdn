@@ -32,7 +32,7 @@ pub const fn decdn_client::bundle::BundleManifest::new([u8; 32], alloc::vec::Vec
 pub fn decdn_client::bundle::BundleManifest::parse(&[u8]) -> anyhow::Result<Self>
 #[non_exhaustive] pub struct decdn_client::bundle::BundleOutcome
 pub decdn_client::bundle::BundleOutcome::end: decdn_client::bundle::BundleEnd
-pub decdn_client::bundle::BundleOutcome::replaced: core::option::Option<decdn_client::source::PoolReplaced>
+pub decdn_client::bundle::BundleOutcome::replaced: alloc::vec::Vec<decdn_client::source::PoolReplaced>
 pub decdn_client::bundle::BundleOutcome::report: decdn_client::bundle::BundleReport
 pub struct decdn_client::bundle::BundlePuller
 impl decdn_client::bundle::BundlePuller
