@@ -710,11 +710,12 @@ impl crate::SourceProvider for LateEscrowBuild {
     fn connect<'a>(
         &'a self,
         holder: &'a crate::Holder,
+        ended: &'a tokio_util::sync::CancellationToken,
     ) -> SourceFuture<'a, StreamCandidate<ScriptedSource>> {
         let late = holder.provider == self.late;
         Box::pin(async move {
             if !late {
-                return self.lanes.connect(holder).await;
+                return self.lanes.connect(holder, ended).await;
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
             Err(crate::buyer_pool::escrowed_but_untracked(

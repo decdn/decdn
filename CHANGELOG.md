@@ -28,6 +28,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` return
+  an `UnrecordedEscrow` beside the outcome (#2515).** `open_pool` returns
+  `(OpenedPool, UnrecordedEscrow)` and `top_up` returns
+  `(ToppedUpPool, UnrecordedEscrow)`. The `UnconfirmedEscrows` handle keeps a
+  mined transaction pending until the caller resolves the guard:
+  `recorded()` once its record or credit commits, or `untracked(err)` once it
+  fails, which holds the escrow as untracked before it releases the pending
+  entry. A guard dropped unresolved leaves the transaction pending. A caller
+  that passes no handle can drop it. An `openPool` whose receipt holds no
+  `PoolOpened` event is now held as untracked by `open_pool` itself.
 - **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` take a
   `receipt_timeout: Option<Duration>` (#2433).** `Some` bounds the receipt
   wait. A lapse returns `OpenUnconfirmed` / `TopUpUnconfirmed` with the tx
@@ -85,7 +95,8 @@ since project inception and will roll into the first tagged release.
 - **`decdn_client::buyer_pool::open_pool` and `top_up` take an `escrows`
   handle (#2418, #2491).** The argument before `receipt_timeout`,
   `Option<&UnconfirmedEscrows>`, holds the `openPool` or `topUp` from before
-  its submit until its receipt is read. Pass `None` when nothing can drop the
+  its submit until the caller resolves the returned `UnrecordedEscrow`
+  (#2515). Pass `None` when nothing can drop the
   future or its error. `UnconfirmedEscrows::pending` returns
   `EscrowUnconfirmed` entries (`Open` or `TopUp`).
   `BundlePullerBuilder::unconfirmed_escrows` hands a bundle pull the same
@@ -1131,8 +1142,9 @@ since project inception and will roll into the first tagged release.
   bundle, names each one on every end that does not already name its tx: a
   Ctrl-C says `interrupted: <escrow>` and still exits 130, a give-up exits 1,
   not 75, and a success exits 1. A second Ctrl-C names them too. `decdn pool
-  open` and `decdn pool top-up` hold none: their own error names the tx. A
-  `BundlePuller` pull that is not interrupted ends `BundleEnd::Stopped` while
+  open` and `decdn pool top-up` hold theirs too, and their own error names the
+  tx, so it is named once. A `BundlePuller` pull that is not interrupted ends
+  `BundleEnd::Stopped` while
   its handle holds one, with the escrow as its error and the pull's own stop
   as text, so a give-up, a pool replacement or "funding needed" cannot invite
   a rerun. An interrupted pull stays `Interrupted`, and its caller names what
@@ -1150,12 +1162,69 @@ since project inception and will roll into the first tagged release.
   running, as before: the command names an `openPool` or `topUp` it left
   unconfirmed. A build that may have escrowed USDC no record credits wins
   over the stop: the pull ends on the escrow, with the stop kept as text, so a
-  give-up does not exit 75. A halted entry is not counted in the summary, as a
-  dropped one was not, and a pass that keeps an entry's earlier landing does
-  so for a halted one too. The first open of a blob (its size from a header)
-  waits for its lane build the same way on a give-up. A funding recovery step
-  there runs to its outcome, so a give-up can land after the limit while the
-  step finishes.
+  give-up does not exit 75. A halted entry, like a dropped one, counts as not
+  run in the summary (#2517), and a pass that keeps an entry's earlier
+  landing does so for a halted one too. The first open of a blob (its size
+  from a header) waits for its lane build the same way on a give-up. A
+  funding recovery step there runs to its outcome, so a give-up can land
+  after the limit while the step finishes.
+- **Client: a fatal lane build names every escrow in its batch (#2508).** The
+  acquire loop takes every lane build that is ready as one batch. When one
+  build in the batch was fatal, the loop returned at once and dropped the rest
+  of the batch. Those builds were already out of the set the drain of late
+  builds awaits, so a second build in the batch that may have escrowed USDC no
+  record credits was named nowhere. A full disk that failed a lane's record
+  write beside a mined `topUp` whose credit failed reported only the disk
+  fault, and a re-run after the operator freed space escrowed again. Now each
+  such escrow in the batch is folded into the error the fetch ends with, as
+  the drain folds a late build's: the escrow is the error a caller downcasts,
+  and the fault that ended the fetch survives as text.
+- **Client: a lane build sends no `openPool` or `topUp` after its fetch ended
+  (#2513).** When a fetch ends, it awaits its lane builds still in flight for
+  up to 30 s. A build in that drain that had not yet read its pool could still
+  run the proactive refill and send a `topUp`, or open a pool, for a lane that
+  never runs. The escrow was recorded and withdrawable, but no fetch needed
+  it. Now each fetch ends for its builds as its drain starts. A build that
+  reaches its `openPool` or `topUp` after that sends none and reads no wallet
+  balance. It fails, and the drain logs it at `debug`. The build checks before
+  its allowance leg and again before the send, so a fetch that ends during an
+  `approve` sends no `topUp` after it. A build already inside its `openPool` or
+  `topUp` call runs to its receipt, as before. The first open of a blob ends
+  its builds the same way on a stop or an error. A re-fetch on the same
+  lanes after a hash mismatch is a new fetch, so its builds can still escrow.
+- **Client, CLI: an escrow stays named until its record commits (#2515).**
+  `open_pool` and `top_up` released a mined transaction from the
+  pending-escrow handle as soon as they read its receipt. The caller wrote the
+  pool record or the deposit credit after that, with an fsync. During that
+  write the transaction was in neither the pending nor the untracked list. A
+  second Ctrl-C there exited at once, named no escrow, and left the record
+  unwritten, so a re-run read an uncredited row and escrowed again. Now the
+  handle keeps the transaction pending until the record commits, and a failed
+  record holds it as untracked before it releases the pending entry. `decdn
+  get`, for a blob or a bundle, `decdn pool open` and `decdn pool top-up` name
+  it on every exit during the write. The pending line reads "was broadcast and
+  no local record credits it", which holds before and after the receipt
+  read.
+- **Client, CLI: a halted bundle pull reports its replacement, the entries it
+  did not run, and its pending escrows (#2517).** Three gaps remained at the
+  end of a pull that one entry ended. First, the pull took its pool
+  replacement only from the fault that ended it. A sibling entry's recovery
+  step that replaced the pool during the drain, or a replacement that a late
+  escrow folded over, went unreported, and `decdn get` of a bundle printed no
+  "reclaim it with: decdn pool reclaim" note for the closed pool. The pull now
+  reads the replacement from the recovery gate, and reports it in
+  `BundleOutcome::replaced`. Only a replacement that ended the first pass runs
+  the rest again. A later pull on the same `BundlePuller` starts as a pass
+  against the new pool, with fresh lane and funding state: it runs no extra
+  pass, and its recovery step tops up the new pool, not the closed one. Second, entries the pull did not run were in no count, so
+  the summary did not add up to the entry count. The new
+  `BundleReport::not_run` counts them, the summary line adds `N not run` when
+  there are some, and `--json` carries `not_run`. Third, a `BundlePuller` pull
+  that dropped an entry while its `topUp` or `openPool` receipt read was
+  pending ended with only its own stop. Only `decdn get` named the tx, from
+  the handle. A pull that is not interrupted now ends
+  `BundleEnd::Stopped` on each pending escrow, as it does on an untracked one.
+  `decdn get` names each one once.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

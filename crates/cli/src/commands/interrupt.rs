@@ -8,7 +8,7 @@
 //!
 //! Stopping mid-transfer loses nothing already paid for: every fetch resumes
 //! from its on-disk `.partial` on the next run. Stopping an `openPool` or a
-//! `topUp` before its receipt is read does not cancel the transaction, so the
+//! `topUp` before its record commits does not cancel the transaction, so the
 //! command names it (`name_held_escrows`, and the immediate exit)
 //! instead of telling the user to run it again: a re-run before it confirms
 //! escrows a second time. An escrow that mined with no local record crediting
@@ -40,12 +40,12 @@ impl std::error::Error for Interrupted {}
 /// them. Displays one per line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreconciledEscrows {
-    /// The transactions whose receipt was not read
+    /// The transactions no local record credits yet
     /// ([`UnconfirmedEscrows::pending`]).
     pending: Vec<EscrowUnconfirmed>,
     /// The transactions that escrowed with no local record crediting them
-    /// ([`UnconfirmedEscrows::untracked`]). Their receipts were read, so they
-    /// are not pending.
+    /// ([`UnconfirmedEscrows::untracked`]). The handle releases each from the
+    /// pending list once it holds it.
     untracked: Vec<UntrackedEscrow>,
 }
 
@@ -80,9 +80,10 @@ pub(crate) fn name_held_escrows<T>(
 /// ([`UnconfirmedEscrows::pending`]), and `untracked` those that escrowed
 /// untracked ([`UnconfirmedEscrows::untracked`]).
 ///
-/// A pending transaction the error carries by type, or an untracked one whose
-/// tx the error's text names, is not named twice. A stop (an [`Interrupted`]
-/// or a [`GaveUp`]) never counts as naming an untracked escrow by its text:
+/// A pending transaction the error carries by type, or whose line the
+/// error's text holds, or an untracked one whose tx the error's text names, is
+/// not named twice. A stop (an [`Interrupted`]
+/// or a [`GaveUp`]) never counts as naming an escrow by its text:
 /// `main` prints only the stop's own line. With none left, `result` passes
 /// through. Otherwise they are attached to the result as
 /// [`UnreconciledEscrows`], so the command names each tx. An `Ok` becomes an
@@ -96,17 +97,23 @@ pub(crate) fn name_unconfirmed_escrows<T>(
 ) -> anyhow::Result<T> {
     let err = result.as_ref().err();
     let carried = err.and_then(carried);
-    let pending: Vec<EscrowUnconfirmed> = escrows
-        .iter()
-        .copied()
-        .filter(|escrow| Some(*escrow) != carried)
-        .collect();
-    // The error that reported an untracked escrow can sit inside one that
-    // hides it from a downcast, so its tx is looked for in the text.
+    // The error that reported an escrow can sit inside one that hides it from
+    // a downcast, so it is looked for in the text too: a bundle pull folds
+    // every escrow but the first in as text.
     let named = err
         .filter(|err| err.downcast_ref::<Interrupted>().is_none())
         .filter(|err| err.downcast_ref::<GaveUp>().is_none())
         .map(|err| format!("{err:#}"));
+    let pending: Vec<EscrowUnconfirmed> = escrows
+        .iter()
+        .copied()
+        .filter(|escrow| Some(*escrow) != carried)
+        .filter(|escrow| {
+            named
+                .as_ref()
+                .is_none_or(|named| !named.contains(&escrow.to_string()))
+        })
+        .collect();
     let untracked: Vec<UntrackedEscrow> = untracked
         .iter()
         .filter(|held| {

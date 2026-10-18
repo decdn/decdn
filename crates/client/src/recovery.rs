@@ -143,6 +143,12 @@ impl RecoveryGate {
         state.reached = None;
     }
 
+    /// The replacement a step made in this pass, which every later step of the
+    /// pass reports, until [`Self::start_next_pass`].
+    pub(crate) fn replaced(&self) -> Option<crate::PoolReplaced> {
+        self.lock().replaced
+    }
+
     /// Count `bytes` newly BLAKE3-verified content bytes toward the progress
     /// rule.
     #[doc(hidden)]

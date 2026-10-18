@@ -21,6 +21,7 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use futures_util::stream::FuturesUnordered;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::credential::{CredentialSlot, CredentialView, FundingNeeded, QuoteMax, unix_now};
 use crate::fault::{Fault, classify};
@@ -93,6 +94,7 @@ where
     Fut: Future<Output = anyhow::Result<T>>,
 {
     let mut connecting: Option<Connecting<'p, P::Source>> = None;
+    let ended = CancellationToken::new();
     let opened = open_loop(
         sources,
         stop,
@@ -101,15 +103,20 @@ where
         credentials,
         &open,
         &mut connecting,
+        &ended,
     )
     .await;
+    // A build still in flight here serves an open that ended on a stop or an
+    // error: one that reaches its `openPool` or `topUp` from now on sends
+    // none.
+    ended.cancel();
     if opened.is_ok() {
         stop.clock.tick();
     }
     // A lane build in flight as the open ends may be in the middle of an
     // on-chain top-up: await it before returning.
     let mut connecting: FuturesUnordered<_> = connecting.into_iter().collect();
-    let late = drain_builds(&mut connecting).await;
+    let late = drain_builds(&mut connecting, None).await;
     fold_late_escrow(opened, late)
 }
 
@@ -128,7 +135,9 @@ async fn poll_some<F: Future + Unpin>(fut: Option<&mut F>) -> F::Output {
 /// Discovery runs beside it in the same `select!`, so a slow discovery never
 /// holds back a source whose cooldown ended. The stop is a branch of the same
 /// `select!`: it leaves the loop with the lane build in flight still in
-/// `connecting`, for [`first_open`] to drain ([`drain_builds`]).
+/// `connecting`, for [`first_open`] to drain ([`drain_builds`]). Each build
+/// gets `ended`, which fires once the open has ended.
+#[allow(clippy::too_many_arguments)]
 async fn open_loop<'p, P, F, T, O, Fut>(
     sources: &mut SourceSet<'p, P>,
     stop: &StopPolicy,
@@ -137,6 +146,7 @@ async fn open_loop<'p, P, F, T, O, Fut>(
     credentials: Option<&CredentialSlot>,
     open: &O,
     connecting: &mut Option<Connecting<'p, P::Source>>,
+    ended: &CancellationToken,
 ) -> anyhow::Result<(Address, T)>
 where
     P: SourceProvider,
@@ -167,7 +177,7 @@ where
                         deposit = deposit.max(lane_deposit(&lane));
                         opening = Some((holder.provider, Box::pin(open(lane))));
                     }
-                    None => *connecting = Some(connect_future(sources.provider(), holder)),
+                    None => *connecting = Some(connect_future(sources.provider(), holder, ended)),
                 }
             }
         }

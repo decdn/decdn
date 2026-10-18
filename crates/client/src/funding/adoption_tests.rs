@@ -3,10 +3,11 @@ use alloy::primitives::{B256, Bytes};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 
 use crate::Cumulative;
-use crate::buyer_pool::{EscrowUntracked, OpenUnconfirmed};
+use crate::buyer_pool::{EscrowUnconfirmed, EscrowUntracked, OpenUnconfirmed};
 use alloy::providers::ProviderBuilder;
 use alloy::providers::mock::Asserter;
 use alloy::sol_types::SolValue;
+use decdn_incentive::test_rpc::SCRIPTED_TX;
 use std::assert_matches;
 
 const PP: Address = Address::repeat_byte(0x9c);
@@ -97,6 +98,7 @@ async fn run_in(
             max_approve: false,
             adoption,
         },
+        &CancellationToken::new(),
     )
     .await;
     (result, asserter.read_q().is_empty())
@@ -1170,7 +1172,7 @@ async fn step_on_a_full_pool(
 }
 
 /// [`step_on_a_full_pool`], in a run that holds `untracked` as an earlier
-/// escrow no record credits ([`RunFunding::note_untracked`]) when it is
+/// escrow no record credits ([`UnconfirmedEscrows::untracked`]) when it is
 /// `Some`.
 async fn step_on_a_full_pool_holding(
     asserter: Asserter,
@@ -1195,7 +1197,7 @@ async fn step_on_a_full_pool_holding(
     let funding = RunFunding::reporting_escrows_to(opens.clone());
     funding.note_pool(id);
     if let Some(err) = untracked {
-        let _ = funding.note_untracked(err);
+        funding.escrows().hold_untracked(&err);
     }
     let funder = PoolFunder {
         contract: &contract,
@@ -1318,6 +1320,7 @@ async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_escrows() {
             max_approve: false,
             adoption: ChainAdoption::Refused,
         },
+        &CancellationToken::new(),
     )
     .await
     .expect_err("the open's submit fails in transport");
@@ -1582,6 +1585,20 @@ async fn run_until_err(
     rpc: &decdn_incentive::test_rpc::ScriptedRpc,
     funding: &RunFunding,
 ) -> anyhow::Error {
+    run_scripted(store, signer, rpc, funding, &CancellationToken::new())
+        .await
+        .expect_err("the lane build must fail")
+}
+
+/// Run [`open_or_reuse_pool`] on `rpc`, for a fetch that `ended` marks the
+/// end of, for at most twice [`RECEIPT_TIMEOUT`].
+async fn run_scripted(
+    store: &dyn BuyerPoolStore,
+    signer: &Arc<PrivateKeySigner>,
+    rpc: &decdn_incentive::test_rpc::ScriptedRpc,
+    funding: &RunFunding,
+    ended: &CancellationToken,
+) -> anyhow::Result<(PoolContext, LaneSpend)> {
     let provider = rpc.clone().provider();
     let contract = PaymentPool::new(PP, provider.clone());
     tokio::time::timeout(
@@ -1599,11 +1616,11 @@ async fn run_until_err(
                 max_approve: false,
                 adoption: ChainAdoption::Refused,
             },
+            ended,
         ),
     )
     .await
     .expect("the lane build must end within twice RECEIPT_TIMEOUT")
-    .expect_err("the lane build must fail")
 }
 
 /// A lane build whose `openPool` never mines ends at [`RECEIPT_TIMEOUT`] with
@@ -1706,6 +1723,19 @@ async fn recover_until_err(
     rpc: &decdn_incentive::test_rpc::ScriptedRpc,
     funding: &RunFunding,
 ) -> anyhow::Error {
+    recover_scripted(store, signer, rpc, funding)
+        .await
+        .expect_err("the recovery step must fail")
+}
+
+/// Run a recovery step for `signer`'s pool on `rpc` for at most twice
+/// [`RECEIPT_TIMEOUT`].
+async fn recover_scripted(
+    store: &dyn BuyerPoolStore,
+    signer: &Arc<PrivateKeySigner>,
+    rpc: &decdn_incentive::test_rpc::ScriptedRpc,
+    funding: &RunFunding,
+) -> anyhow::Result<Recovery> {
     let provider = rpc.clone().provider();
     let contract = PaymentPool::new(PP, provider.clone());
     let funder = PoolFunder {
@@ -1723,7 +1753,6 @@ async fn recover_until_err(
     tokio::time::timeout(RECEIPT_TIMEOUT * 2, funder.recover(U256::ZERO))
         .await
         .expect("the recovery step must end within twice RECEIPT_TIMEOUT")
-        .expect_err("the recovery step must fail")
 }
 
 /// The `topUp` every [`ScriptedRpc`](decdn_incentive::test_rpc::ScriptedRpc)
@@ -2010,6 +2039,8 @@ fn mined_open(owner: Address, pool_id: PoolId) -> alloy::rpc::types::Transaction
 /// The store write [`StoreFaults`] fails.
 #[derive(Debug, Clone, Copy)]
 enum StoreFault {
+    /// No write faults.
+    None,
     /// Every deposit credit faults.
     Credit,
     /// Every pool record faults.
@@ -2019,10 +2050,13 @@ enum StoreFault {
 }
 
 /// A redb store with one [`StoreFault`]. Every other call reaches the store.
+/// A store [`StoreFaults::watching`] a handle notes, at each pool record and
+/// deposit credit, whether the handle names [`SCRIPTED_TX`] as the write runs.
 struct StoreFaults {
     inner: RedbBuyerPoolStore,
     fault: StoreFault,
     credited: std::sync::atomic::AtomicBool,
+    watch: Option<(UnconfirmedEscrows, Mutex<Vec<bool>>)>,
 }
 
 impl StoreFaults {
@@ -2031,7 +2065,46 @@ impl StoreFaults {
             inner,
             fault,
             credited: std::sync::atomic::AtomicBool::new(false),
+            watch: None,
         }
+    }
+
+    /// A store with no fault that watches `escrows` at each write.
+    fn watching(inner: RedbBuyerPoolStore, escrows: UnconfirmedEscrows) -> Self {
+        Self {
+            watch: Some((escrows, Mutex::default())),
+            ..Self::new(inner, StoreFault::None)
+        }
+    }
+
+    /// Note whether the watched handle names [`SCRIPTED_TX`] now.
+    fn note_write(&self) {
+        let Some((escrows, writes)) = &self.watch else {
+            return;
+        };
+        let pending = escrows.pending().iter().any(|escrow| match escrow {
+            EscrowUnconfirmed::Open(open) => open.tx == Some(SCRIPTED_TX),
+            EscrowUnconfirmed::TopUp(top_up) => top_up.tx == Some(SCRIPTED_TX),
+        });
+        let untracked = escrows
+            .untracked()
+            .iter()
+            .any(|held| held.tx == SCRIPTED_TX);
+        writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(pending || untracked);
+    }
+
+    /// For each pool record and deposit credit, whether the watched handle
+    /// named [`SCRIPTED_TX`] as the write ran.
+    fn named_writes(&self) -> Vec<bool> {
+        self.watch.as_ref().map_or_else(Vec::new, |(_, writes)| {
+            writes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        })
     }
 
     /// The fault a failed write returns.
@@ -2048,9 +2121,12 @@ impl BuyerPoolStore for StoreFaults {
         self.inner.load_all()
     }
     fn record(&self, state: &BuyerPoolState) -> Result<(), decdn_incentive::StoreError> {
+        self.note_write();
         match self.fault {
             StoreFault::Record => Err(Self::lost(state.pool_id, "pool record")),
-            StoreFault::Credit | StoreFault::RowAfterCredit => self.inner.record(state),
+            StoreFault::None | StoreFault::Credit | StoreFault::RowAfterCredit => {
+                self.inner.record(state)
+            }
         }
     }
     fn forget(&self, owner: Address) -> Result<(), decdn_incentive::StoreError> {
@@ -2117,9 +2193,12 @@ impl BuyerPoolStore for StoreFaults {
         pool_id: PoolId,
         additional: U256,
     ) -> Result<decdn_incentive::DepositOutcome, decdn_incentive::StoreError> {
+        self.note_write();
         match self.fault {
             StoreFault::Credit => Err(Self::lost(pool_id, "deposit credit")),
-            StoreFault::Record => self.inner.add_deposit(owner, pool_id, additional),
+            StoreFault::None | StoreFault::Record => {
+                self.inner.add_deposit(owner, pool_id, additional)
+            }
             StoreFault::RowAfterCredit => {
                 let credited = self.inner.add_deposit(owner, pool_id, additional);
                 self.credited
@@ -2246,6 +2325,264 @@ async fn a_top_up_after_an_untracked_refill_is_refused() {
     assert!(rpc.sent_nonces().is_empty(), "the refusal sends nothing");
 }
 
+/// Assert `err` refused an `openPool` or `topUp` because its fetch ended.
+fn ended_before_send(err: &anyhow::Error) {
+    assert!(err.downcast_ref::<FetchEnded>().is_some(), "{err:#}");
+}
+
+/// A fired token for a fetch that has ended.
+fn fetch_ended() -> CancellationToken {
+    let ended = CancellationToken::new();
+    ended.cancel();
+    ended
+}
+
+/// #2513: a lane build that reaches its refill after its fetch ended sends no
+/// `topUp`: the lane would never run. It reads no allowance and no wallet
+/// balance, and records no shortfall.
+#[tokio::test(start_paused = true)]
+async fn a_refill_after_the_fetch_ended_sends_no_top_up() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store, &signer);
+    let funding = RunFunding::default();
+    let rpc = ScriptedRpc::mined(mined_top_up()).answering_calls(refill_reads(signer.address()));
+    let err = run_scripted(&store, &signer, &rpc, &funding, &fetch_ended())
+        .await
+        .expect_err("the refill is refused");
+    ended_before_send(&err);
+    assert!(rpc.sent_nonces().is_empty(), "the refusal sends nothing");
+    assert!(!rpc.calls_drained(), "the refusal reads no allowance");
+    assert!(funding.shortfall().is_none(), "no wallet read explains it");
+    assert!(funding.escrows().pending().is_empty());
+}
+
+/// #2513: a lane build that finds no pool after its fetch ended opens none.
+#[tokio::test(start_paused = true)]
+async fn a_fresh_open_after_the_fetch_ended_sends_nothing() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let funding = RunFunding::default();
+    let rpc = ScriptedRpc::mined(mined_open(signer.address(), B256::repeat_byte(0xEE)))
+        .answering_calls([Bytes::from(TOKEN.abi_encode())]);
+    let err = run_scripted(&store, &signer, &rpc, &funding, &fetch_ended())
+        .await
+        .expect_err("the open is refused");
+    ended_before_send(&err);
+    assert!(rpc.sent_nonces().is_empty(), "the refusal sends nothing");
+    assert!(!rpc.calls_drained(), "the refusal reads no token");
+    assert!(store.get_by_owner(signer.address()).unwrap().is_none());
+}
+
+/// #2513: a refill whose fetch ends during its allowance leg sends no `topUp`
+/// after it: the check after that leg refuses it, with no wallet read and no
+/// shortfall.
+#[tokio::test(start_paused = true)]
+async fn a_refill_that_ends_during_its_allowance_leg_sends_no_top_up() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store, &signer);
+    let funding = RunFunding::default();
+    let ended = CancellationToken::new();
+    // The fetch ends as the refill reads its allowance, which is none, so
+    // the refill approves first and the `approve` mines.
+    let rpc = ScriptedRpc::mined(mined_top_up())
+        .answering_calls([
+            still_open(signer.address()),
+            Bytes::from(U256::ZERO.abi_encode()),
+        ])
+        .after_calls({
+            let ended = ended.clone();
+            move || ended.cancel()
+        });
+    let err = run_scripted(&store, &signer, &rpc, &funding, &ended)
+        .await
+        .expect_err("the topUp is refused");
+    ended_before_send(&err);
+    assert!(rpc.calls_drained(), "the refill read its allowance");
+    assert!(rpc.sent_nonces().is_empty(), "no topUp was sent");
+    assert!(funding.shortfall().is_none(), "no wallet read explains it");
+    assert!(funding.escrows().pending().is_empty());
+}
+
+/// #2513: a lane build whose fetch ends during its open's allowance leg
+/// opens no pool.
+#[tokio::test(start_paused = true)]
+async fn an_open_that_ends_during_its_allowance_leg_sends_nothing() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let funding = RunFunding::default();
+    let ended = CancellationToken::new();
+    let rpc = ScriptedRpc::mined(mined_open(signer.address(), B256::repeat_byte(0xEE)))
+        .answering_calls([
+            Bytes::from(TOKEN.abi_encode()),
+            Bytes::from(U256::MAX.abi_encode()),
+        ])
+        .after_calls({
+            let ended = ended.clone();
+            move || ended.cancel()
+        });
+    let err = run_scripted(&store, &signer, &rpc, &funding, &ended)
+        .await
+        .expect_err("the open is refused");
+    ended_before_send(&err);
+    assert!(rpc.calls_drained(), "the open read its allowance");
+    assert!(rpc.sent_nonces().is_empty(), "no openPool was sent");
+    assert!(store.get_by_owner(signer.address()).unwrap().is_none());
+}
+
+/// #2513: a refill already past its `topUp` send when the fetch ends runs to
+/// its receipt: the end refuses a send, never a receipt read. Here the
+/// `topUp` never mines, so the build lapses with it held.
+#[tokio::test(start_paused = true)]
+async fn a_refill_past_its_send_runs_to_its_receipt_after_the_fetch_ends() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store, &signer);
+    let funding = RunFunding::default();
+    let rpc = ScriptedRpc::parked_receipt().answering_calls(refill_reads(signer.address()));
+    let ended = CancellationToken::new();
+    let end_after_send = async {
+        while rpc.sent_nonces().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        ended.cancel();
+    };
+    let started = tokio::time::Instant::now();
+    let (built, ()) = tokio::join!(
+        run_scripted(&store, &signer, &rpc, &funding, &ended),
+        end_after_send
+    );
+    let err = built.expect_err("the topUp never mines");
+    lapsed(&err);
+    assert!(err.downcast_ref::<FetchEnded>().is_none(), "{err:#}");
+    assert!(
+        started.elapsed() >= RECEIPT_TIMEOUT,
+        "it waited on the receipt"
+    );
+    assert_eq!(funding.escrows().top_ups(), vec![HELD]);
+}
+
+/// #2515: a lane build's mined `openPool` stays on the run's handle while its
+/// pool record is written, and is released once the record commits. A
+/// process exit during the write, such as a second Ctrl-C, still names it.
+#[tokio::test(start_paused = true)]
+async fn a_lane_build_open_is_named_while_its_record_is_written() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let escrows = UnconfirmedEscrows::default();
+    let store = StoreFaults::watching(client_store(&dir), escrows.clone());
+    let signer = Arc::new(PrivateKeySigner::random());
+    let funding = RunFunding::reporting_escrows_to(escrows.clone());
+    let rpc = ScriptedRpc::mined(mined_open(signer.address(), B256::repeat_byte(0xEE)))
+        .answering_calls([
+            Bytes::from(TOKEN.abi_encode()),
+            Bytes::from(U256::MAX.abi_encode()),
+        ]);
+    run_scripted(&store, &signer, &rpc, &funding, &CancellationToken::new())
+        .await
+        .expect("the open is recorded");
+    assert_eq!(
+        store.named_writes(),
+        [true],
+        "the record write names the open"
+    );
+    assert!(escrows.pending().is_empty(), "the record released the open");
+    assert!(escrows.untracked().is_empty());
+}
+
+/// #2515: a refill's mined `topUp` stays on the run's handle while its
+/// deposit credit is written.
+#[tokio::test(start_paused = true)]
+async fn a_refill_is_named_while_its_credit_is_written() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let escrows = UnconfirmedEscrows::default();
+    let store = StoreFaults::watching(client_store(&dir), escrows.clone());
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store.inner, &signer);
+    let funding = RunFunding::reporting_escrows_to(escrows.clone());
+    let rpc = ScriptedRpc::mined(mined_top_up()).answering_calls(refill_reads(signer.address()));
+    run_scripted(&store, &signer, &rpc, &funding, &CancellationToken::new())
+        .await
+        .expect("the refill is credited");
+    assert_eq!(store.named_writes(), [true], "the credit names the topUp");
+    assert!(
+        escrows.pending().is_empty(),
+        "the credit released the topUp"
+    );
+    assert!(escrows.untracked().is_empty());
+}
+
+/// #2515: a recovery step's mined `topUp` stays on the run's handle while its
+/// deposit credit is written.
+#[tokio::test(start_paused = true)]
+async fn a_recovery_top_up_is_named_while_its_credit_is_written() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let escrows = UnconfirmedEscrows::default();
+    let store = StoreFaults::watching(client_store(&dir), escrows.clone());
+    let signer = Arc::new(PrivateKeySigner::random());
+    let pool_id = a_spent_pool(&store.inner, &signer);
+    let funding = RunFunding::reporting_escrows_to(escrows.clone());
+    funding.note_pool(pool_id);
+    let rpc = ScriptedRpc::mined(mined_top_up()).answering_calls(refill_reads(signer.address()));
+    let step = recover_scripted(&store, &signer, &rpc, &funding)
+        .await
+        .expect("the step tops the pool up");
+    assert!(matches!(step, Recovery::ToppedUp(_)), "{step:?}");
+    assert_eq!(store.named_writes(), [true], "the credit names the topUp");
+    assert!(
+        escrows.pending().is_empty(),
+        "the credit released the topUp"
+    );
+    assert!(escrows.untracked().is_empty());
+}
+
+/// #2515: a credit that fails holds the escrow untracked and releases its
+/// pending entry, so the handle names it once, as untracked.
+#[tokio::test(start_paused = true)]
+async fn a_failed_credit_moves_the_top_up_from_pending_to_untracked() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = StoreFaults::new(client_store(&dir), StoreFault::Credit);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store.inner, &signer);
+    let funding = RunFunding::default();
+    let rpc = ScriptedRpc::mined(mined_top_up()).answering_calls(refill_reads(signer.address()));
+    untracked(
+        &run_until_err(&store, &signer, &rpc, &funding).await,
+        "deposit credit lost",
+    );
+    assert!(funding.escrows().pending().is_empty());
+    let held: Vec<_> = funding
+        .escrows()
+        .untracked()
+        .into_iter()
+        .map(|held| held.tx)
+        .collect();
+    assert_eq!(held, [SCRIPTED_TX]);
+}
+
 /// The handle holds a run's untracked escrow after the run's state is
 /// dropped, so the command can name it at its end, and a later pass's
 /// `RunFunding` on the same handle refuses its refill (#2511).
@@ -2339,11 +2676,13 @@ async fn a_top_up_parked_behind_an_untracked_one_is_refused() {
             .is_err(),
         "the step must wait for the run's topUp lock"
     );
-    let _ = funding.note_untracked(crate::buyer_pool::escrowed_but_untracked(
-        "pool 0x01 topped up by 5 µUSDC",
-        decdn_incentive::test_rpc::SCRIPTED_TX,
-        "deposit credit lost",
-    ));
+    funding
+        .escrows()
+        .hold_untracked(&crate::buyer_pool::escrowed_but_untracked(
+            "pool 0x01 topped up by 5 µUSDC",
+            decdn_incentive::test_rpc::SCRIPTED_TX,
+            "deposit credit lost",
+        ));
     drop(in_flight);
     refused_after_untracked(&step.await, "deposit credit lost");
     assert!(
@@ -2369,6 +2708,7 @@ async fn a_credited_row_that_vanishes_holds_the_escrow() {
         &run_until_err(&store, &signer, &rpc, &funding).await,
         "the credited row vanished",
     );
+    assert!(funding.escrows().pending().is_empty(), "held, not pending");
     refused_after_untracked(
         &funding
             .refuse_after_untracked()
@@ -2404,6 +2744,7 @@ async fn an_open_after_an_unrecorded_open_is_refused() {
         1,
         "the first build sent its openPool"
     );
+    assert!(funding.escrows().pending().is_empty(), "held, not pending");
 
     let rpc = ScriptedRpc::mined(mined_open(signer.address(), B256::repeat_byte(0xEF)))
         .answering_calls([Bytes::from(TOKEN.abi_encode())]);

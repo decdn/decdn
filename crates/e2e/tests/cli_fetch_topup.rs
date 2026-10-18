@@ -134,7 +134,7 @@ async fn run() -> anyhow::Result<()> {
         payment_pool: chain.addrs().payment_pool,
     };
 
-    let opened = open_pool(
+    let (opened, _unrecorded) = open_pool(
         &pool,
         deployment,
         chain.usdc(),
@@ -190,7 +190,7 @@ async fn run() -> anyhow::Result<()> {
     // measured on-chain amount into the local record via `add_deposit`.
     let remaining = deposit - prior_amount; // == 1
     let additional = deposit - remaining; // restore to a full `deposit`
-    let topped_up = top_up(&pool, buyer_addr, pool_id, additional, None, None)
+    let (topped_up, _unrecorded) = top_up(&pool, buyer_addr, pool_id, additional, None, None)
         .await
         .context("top_up")?;
     // The tx is the only handle an operator has to reconcile an escrow whose
@@ -503,7 +503,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // Escrowed as configured — no on-chain floor to clamp up to, only a
     // non-zero requirement (`openPool` reverts `ZeroAmount`).
     let working_deposit = U256::from(MULTI_WORKING_DEPOSIT_MICRO_USDC);
-    let opened = open_pool(
+    let (opened, _unrecorded) = open_pool(
         &pool,
         deployment,
         chain.usdc(),
@@ -804,7 +804,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     .await
     .context("approve PaymentPool")?;
     let pool = PaymentPool::new(chain.addrs().payment_pool, chain.provider_for(&buyer));
-    let opened = open_pool(
+    let (opened, _unrecorded) = open_pool(
         &pool,
         deployment,
         chain.usdc(),

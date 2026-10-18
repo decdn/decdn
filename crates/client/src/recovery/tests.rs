@@ -106,6 +106,24 @@ async fn a_replaced_pool_stays_replaced_for_every_later_step() {
     assert_eq!(funder.calls().len(), 1);
 }
 
+/// #2517: the gate reports the replacement a step made in this pass, so a
+/// bundle pull whose pass ended on another fault still reports it, until the
+/// next pass starts.
+#[tokio::test]
+async fn the_gate_reports_its_replacement_until_the_next_pass() {
+    let gate = RecoveryGate::new();
+    assert_eq!(gate.replaced(), None);
+    let mut top_ups = 0;
+    let funder = FakeFunder::new(Recovery::Replaced(replaced()));
+    let stepped = gate
+        .step(&funder, DEPOSIT, &mut top_ups, || DEPOSIT, U256::ZERO)
+        .await;
+    assert_matches!(stepped, Stepped::Replaced(_));
+    assert_eq!(gate.replaced(), Some(replaced()));
+    gate.start_next_pass();
+    assert_eq!(gate.replaced(), None);
+}
+
 /// The pass against the new pool steps on the new pool, under the same
 /// progress rule: no verified byte since the replacement, no step.
 #[tokio::test]

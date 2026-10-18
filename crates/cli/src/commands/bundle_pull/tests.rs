@@ -224,6 +224,22 @@ fn the_summary_counts_reused_and_excluded_entries() {
     assert!(json.get("deduped").is_none(), "{json}");
 }
 
+/// #2517: a pull that ended before it ran every entry says how many it did
+/// not run, in the summary and in `--json`, so the counts add up.
+#[test]
+fn the_summary_counts_entries_the_pull_did_not_run() {
+    let mut rep = report_of(1, 0, 0, &[]);
+    rep.not_run = 2;
+    let rep = pull_report(&rep, 0, Path::new("/out"));
+    assert_eq!(
+        counts_line(&rep),
+        "pulled into /out (1 fetched, 0 linked, 0 skipped, 0 reused, 0 excluded, 0 failed, 2 \
+         not run)"
+    );
+    let json = serde_json::to_value(&rep).expect("serialize");
+    assert_eq!(json["not_run"], 2);
+}
+
 #[test]
 fn human_bytes_scales_units() {
     assert_eq!(human_bytes(0), "0 B");

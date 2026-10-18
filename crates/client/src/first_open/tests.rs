@@ -83,8 +83,9 @@ impl crate::SourceProvider for ScriptedDiscovery {
     fn connect<'a>(
         &'a self,
         holder: &'a crate::Holder,
+        ended: &'a tokio_util::sync::CancellationToken,
     ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
-        self.lanes.connect(holder)
+        self.lanes.connect(holder, ended)
     }
 }
 
@@ -491,12 +492,14 @@ async fn a_delegated_first_open_ends_with_a_typed_funding_needed() -> anyhow::Re
 }
 
 /// Static lanes whose builds each take `delay`, then end with `fail` when it
-/// is set: a build still in flight when the open stops.
+/// is set: a build still in flight when the open stops. Each build records
+/// whether its open had ended as it started and as it finished, in `ends`.
 struct SlowBuilds {
     lanes: StaticSources<ScriptedSource>,
     delay: Duration,
     fail: Option<fn() -> anyhow::Error>,
     connects: AtomicU32,
+    ends: std::sync::Mutex<Vec<(bool, bool)>>,
 }
 
 impl crate::SourceProvider for SlowBuilds {
@@ -509,13 +512,19 @@ impl crate::SourceProvider for SlowBuilds {
     fn connect<'a>(
         &'a self,
         holder: &'a crate::Holder,
+        ended: &'a tokio_util::sync::CancellationToken,
     ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
         self.connects.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
+            let at_start = ended.is_cancelled();
             tokio::time::sleep(self.delay).await;
+            self.ends
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((at_start, ended.is_cancelled()));
             match self.fail {
                 Some(fail) => Err(fail()),
-                None => self.lanes.connect(holder).await,
+                None => self.lanes.connect(holder, ended).await,
             }
         })
     }
@@ -527,6 +536,7 @@ fn slow_builds(fail: Option<fn() -> anyhow::Error>) -> anyhow::Result<SlowBuilds
         delay: Duration::from_secs(20),
         fail,
         connects: AtomicU32::new(0),
+        ends: std::sync::Mutex::default(),
     })
 }
 
@@ -540,7 +550,8 @@ fn escrow() -> anyhow::Error {
 }
 
 /// #2509: the give-up does not drop a lane build in flight: the open awaits
-/// it, then gives up.
+/// it, then gives up. The open ends for the build first (#2513), so one that
+/// reaches its `openPool` or `topUp` in the drain sends none.
 #[tokio::test(start_paused = true)]
 async fn a_give_up_awaits_the_lane_build_in_flight() -> anyhow::Result<()> {
     let provider = slow_builds(None)?;
@@ -556,6 +567,14 @@ async fn a_give_up_awaits_the_lane_build_in_flight() -> anyhow::Result<()> {
     .ok_or_else(|| anyhow::anyhow!("the open must give up"))?;
     assert!(err.downcast_ref::<GaveUp>().is_some(), "{err:#}");
     assert_eq!(tokio::time::Instant::now() - start, provider.delay);
+    assert_eq!(
+        *provider
+            .ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        [(false, true)],
+        "the build started in the open and ended in the drain"
+    );
     Ok(())
 }
 

@@ -572,7 +572,9 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 ///
 /// `excluded` counts the manifest entries this run does not pull: the ones the
 /// `--include`/`--exclude` filter dropped and the ones deselected under
-/// `--select`.
+/// `--select`. `not_run` counts the entries it meant to pull but did not run:
+/// another entry ended the pull, or Ctrl-C stopped it, before their fetch
+/// ended. A rerun runs them.
 ///
 /// `reused` and `reused_bytes` report the whole-file dedup outcome, counted per
 /// distinct blob exactly as `fetched`/`downloaded` are (a blob reused at several
@@ -598,6 +600,8 @@ struct PullReport {
     /// Entries the filter or `--select` dropped.
     excluded: u64,
     failed: u64,
+    /// Entries the pull ended before their fetch ended.
+    not_run: u64,
     downloaded: u64,
     /// Wire bytes this run's vouchers and hash-chain reveals paid for, over
     /// every lane.
@@ -755,7 +759,7 @@ async fn pull_over(
 
     let observer = Arc::new(PullObserver::new(args.json, run_label(out)));
     // Outlives the puller's passes, so an `openPool` or `topUp` that a Ctrl-C
-    // or a fault dropped before its receipt was read is still named, and so is
+    // or a fault dropped before its record committed is still named, and so is
     // one that escrowed untracked in an entry the pull dropped.
     let escrows = UnconfirmedEscrows::default();
     let mut puller = BundlePuller::builder(
@@ -796,7 +800,7 @@ async fn pull_over(
     )
     .await;
     // Every exit of the manifest or the pull can drop an `openPool` or a
-    // `topUp` before its receipt is read, and the transaction may still escrow,
+    // `topUp` before its record commits, and the transaction may still escrow,
     // or leave an untracked escrow on the handle that no returned error names.
     let result = name_held_escrows(result, &escrows);
     // On every exit, a Ctrl-C's included: what the entries queued is durable
@@ -1279,6 +1283,7 @@ fn pull_report(rep: &BundleReport, excluded: u64, output: &Path) -> PullReport {
         skipped: rep.skipped,
         excluded,
         failed: rep.failed,
+        not_run: rep.not_run,
         downloaded: rep.downloaded,
         paid_bytes: rep.paid_bytes,
         reconstructed: rep.reconstructed,
@@ -1291,9 +1296,16 @@ fn pull_report(rep: &BundleReport, excluded: u64, output: &Path) -> PullReport {
 }
 
 /// The summary's first line: where the run pulled to, and every entry count.
+/// The entries the pull did not run are named only when there are some.
 fn counts_line(rep: &PullReport) -> String {
+    let not_run = if rep.not_run == 0 {
+        String::new()
+    } else {
+        format!(", {} not run", rep.not_run)
+    };
     format!(
-        "pulled into {} ({} fetched, {} linked, {} skipped, {} reused, {} excluded, {} failed)",
+        "pulled into {} ({} fetched, {} linked, {} skipped, {} reused, {} excluded, {} \
+         failed{not_run})",
         rep.output, rep.fetched, rep.linked, rep.skipped, rep.reused, rep.excluded, rep.failed
     )
 }

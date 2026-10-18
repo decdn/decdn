@@ -118,6 +118,24 @@ pub(crate) fn carries_untracked_escrow(err: &anyhow::Error) -> bool {
             .is_some_and(|LaneBuildFault(inner)| escrow_untracked(inner))
 }
 
+/// Fold `err`, one more possible untracked escrow ([`carries_untracked_escrow`]),
+/// into `late`, the escrows found so far: the first stays the error a caller
+/// downcasts, and each later one is added to it as text context after `also`,
+/// so every tx is named.
+pub(crate) fn fold_escrow(
+    late: Option<anyhow::Error>,
+    err: anyhow::Error,
+    also: &str,
+) -> anyhow::Error {
+    match late {
+        None => err,
+        Some(first) => first.context(format!(
+            "{also}: {}",
+            decdn_common::redact::sanitize_err_chain(&err)
+        )),
+    }
+}
+
 /// Whether a mid-stream voucher rejection for `reason` acts as `Unfunded`
 /// from its source: the pool's deposit or the signer's capability no longer
 /// covers the stream (ADR 005 §`VoucherRejected` semantics).
