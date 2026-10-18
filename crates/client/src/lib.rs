@@ -785,7 +785,7 @@ pub(crate) fn reject_empty_claim_for_nonempty_root(
     total_bytes: u64,
     hash: [u8; 32],
 ) -> anyhow::Result<()> {
-    if total_bytes == 0 && hash != *blake3::hash(&[]).as_bytes() {
+    if total_bytes == 0 && hash != decdn_protocol::EMPTY_ROOT {
         return Err(anyhow::Error::new(HashMismatch));
     }
     Ok(())

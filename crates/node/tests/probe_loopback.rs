@@ -1406,6 +1406,100 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #2471: every store holds the empty blob (iroh-blobs reports the empty root
+/// complete at size 0 on any backend), and it spans zero discovery blocks. A
+/// node signs `has_blob: true` for it over an empty coverage, with a
+/// `total_bytes` of 0, and the pair passes the requester's consistency check.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_has_blob_true_for_the_empty_blob() -> anyhow::Result<()> {
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let hash = Hash::new(b"");
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let (handler, signer, domain) = build_handler(server_id, 7, &metrics, limiter, cache);
+
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: 0xabc_def,
+    };
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        resp.body.has_blob,
+        "a node serves the empty blob, so it must advertise it"
+    );
+    anyhow::ensure!(
+        resp_ext.total_bytes == Some(0),
+        "the empty blob reports a size of 0, got {:?}",
+        resp_ext.total_bytes
+    );
+    anyhow::ensure!(
+        resp_ext.coverage.is_empty(),
+        "the empty blob spans no discovery block"
+    );
+    anyhow::ensure!(
+        resp_ext.consistent_with(&resp.body),
+        "has_blob:true over an empty coverage is well-formed for the empty root"
+    );
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
+/// #2471 with the ADR 011 chain-stale gate: the empty blob is suppressed like
+/// any other held blob, so the signed `has_blob: true` is never emitted while
+/// the node cannot confirm the hash was not taken down.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_has_blob_false_for_the_empty_blob_when_chain_stale() -> anyhow::Result<()> {
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let hash = Hash::new(b"");
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let domain = test_slash_domain();
+    let stale = decdn_node::chain_freshness::ChainFreshness::new(Duration::from_mins(30));
+    let handler = Arc::new(ProbeHandler::new(
+        server_id,
+        7,
+        Arc::clone(&metrics),
+        limiter,
+        permissive_probe_rate_limiter(&metrics),
+        cache,
+        Arc::clone(&signer),
+        domain.clone(),
+        None,
+        true,
+        Some(stale),
+    ));
+
+    let req = ProbeRequest {
+        hash: *hash.as_bytes(),
+        timestamp_us: 0xabc_def,
+    };
+    let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
+
+    anyhow::ensure!(
+        !resp.body.has_blob,
+        "a chain-stale node must not advertise the empty blob"
+    );
+    anyhow::ensure!(
+        resp_ext.total_bytes.is_none(),
+        "a suppressed advertisement carries no size, got {:?}",
+        resp_ext.total_bytes
+    );
+    anyhow::ensure!(
+        resp_ext.consistent_with(&resp.body),
+        "has_blob:false over an empty coverage is well-formed for the empty root"
+    );
+    assert_slash_sig_valid(&resp, &signer, &domain)?;
+    Ok(())
+}
+
 /// ADR 011 §Serving while chain-stale: a node holding the blob but whose chain
 /// reads are stale answers `has_blob: false` — advertising it would be signed
 /// slash evidence for a hash the node can no longer confirm is not taken down.
@@ -1455,7 +1549,7 @@ async fn probe_has_blob_false_when_chain_stale() -> anyhow::Result<()> {
         resp_ext.total_bytes
     );
     anyhow::ensure!(
-        resp_ext.consistent_with(resp.body.has_blob),
+        resp_ext.consistent_with(&resp.body),
         "has_blob and coverage.is_empty() must be a biconditional"
     );
     // Still a well-formed, signed response — this is a compliance posture, not a
@@ -1518,7 +1612,7 @@ async fn probe_has_blob_true_and_partial_coverage_for_cached_partial_holder() ->
         resp_ext.total_bytes
     );
     anyhow::ensure!(
-        resp_ext.consistent_with(resp.body.has_blob),
+        resp_ext.consistent_with(&resp.body),
         "has_blob and coverage.is_empty() must be a biconditional"
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
@@ -1584,7 +1678,7 @@ async fn probe_origin_held_advertises_full_coverage_without_caching() -> anyhow:
         "an origin can serve every block, so coverage must be all-ones"
     );
     anyhow::ensure!(
-        resp_ext.consistent_with(resp.body.has_blob),
+        resp_ext.consistent_with(&resp.body),
         "has_blob and coverage.is_empty() must be a biconditional"
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;

@@ -26,6 +26,9 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 # would serialize a `&str` length-prefixed, which cannot assert the property
 # under test — that a `Region` encodes as the plain 2-character string.
 serde_json = { workspace = true }
+# Proves `EMPTY_ROOT` is the BLAKE3 hash of zero bytes. Dev-only: the leaf
+# crate names the constant and never hashes.
+blake3 = { workspace = true }
 # Public-API stability snapshot (issue #304). Only exercised by the
 # `public_api` test target below, which is gated behind `public-api-test`.
 public-api = { workspace = true }

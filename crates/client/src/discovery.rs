@@ -708,7 +708,8 @@ pub struct Probed {
     /// differently. The requester-side `has_blob`/`coverage.is_empty()`
     /// consistency check (ADR 013 §Tier 1, `ProbeResponseExt::consistent_with`)
     /// runs before a `Probed` is ever constructed, so a malformed pairing never
-    /// reaches this field.
+    /// reaches this field. Empty here only for the empty root, which spans no
+    /// block (#2471).
     pub coverage: Coverage,
 }
 

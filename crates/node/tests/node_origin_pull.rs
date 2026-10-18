@@ -6278,6 +6278,128 @@ async fn node_origin_oversized_blob_aborts_on_received_bytes_without_scoring() -
     Ok(())
 }
 
+/// #2471: the empty blob spans zero discovery blocks, so A's probe answer is
+/// `has_blob: true` over an EMPTY coverage with `total_bytes: 0`. B's probe
+/// consumer must accept that answer for the empty root (it is the one hash whose
+/// holder coverage is empty) and pull through to A, instead of dropping it as a
+/// `has_blob`/coverage mismatch and answering `NotFound` with no provider.
+///
+/// `max_blob_size_bytes` is the buyer ceiling: `0` leaves it unbounded, and a
+/// positive one must not refuse a 0-byte blob.
+async fn empty_blob_fetch_at_ceiling(ceiling: u64) -> Result<()> {
+    let payload: Vec<u8> = Vec::new();
+    let hash = Hash::new(&payload);
+    anyhow::ensure!(
+        *hash.as_bytes() == decdn_protocol::EMPTY_ROOT,
+        "fixture must be the empty root"
+    );
+
+    // --- Node A: honest server whose probe responder advertises size 0. ------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let pool_id = B256::repeat_byte(0xA1);
+    let store_a = Arc::new(MemoryPoolStateStore::new());
+    store_a.record(&LaneState::hydrate(
+        pool_id,
+        b_buyer.address(),
+        a_eth.address(),
+        U256::from(DEPOSIT_MICRO_USDC),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn PoolStateStore>,
+        RATE,
+        &domains,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        0,
+        RATE,
+    );
+
+    // --- Node B: dial-only endpoint that discovers A through the probe. -------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let (origin, _engine, _engine_tmp) = provisioned_origin_with_ceiling(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        pool_id,
+        &b_buyer,
+        &local_rep,
+        &b_metrics,
+        providers,
+        addr_map,
+        ceiling,
+    )
+    .await;
+
+    let got = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::AlreadyAdmitted),
+        "the empty blob must be discovered and admitted, got {got:?}"
+    );
+    // A was ranked and pulled from: the probe answer was accepted, not dropped.
+    assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_no_providers_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_too_large_total", 0)?;
+
+    shutdown([task_a], [&ep_b, &ep_a]).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_origin_discovers_the_empty_blob_by_probe() -> Result<()> {
+    empty_blob_fetch_at_ceiling(0).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_origin_discovers_the_empty_blob_by_probe_under_a_ceiling() -> Result<()> {
+    empty_blob_fetch_at_ceiling(1_048_576).await
+}
+
 /// #1375: the buyer-side rate ceiling on the real node pull path — and specifically
 /// its PROBE-RELATIVE bound, with the absolute config ceiling left unbounded (`0`).
 /// Node A probes cheap (`RATE/2`) but its `ClientHandler` signs a stream quote at

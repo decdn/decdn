@@ -198,8 +198,7 @@ impl Buyer {
                 hash,
                 timestamp_us,
             );
-            if verified.is_err() || !ext.consistent_with(resp.body.has_blob) || !resp.body.has_blob
-            {
+            if verified.is_err() || !ext.consistent_with(&resp.body) || !resp.body.has_blob {
                 continue;
             }
             total_bytes = total_bytes.or(ext.total_bytes);

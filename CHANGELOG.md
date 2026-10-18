@@ -1083,6 +1083,20 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Probe: a node advertises the empty blob, and a requester accepts the
+  answer (#2471).** The empty (0-byte) blob spans zero discovery blocks, so
+  its coverage bitmap is empty on every holder. The probe handler derived
+  `has_blob` from the bitmap and signed `has_blob: false` for a blob every
+  store holds and serves, and the requester's consistency rule
+  (`has_blob ⟺ non-empty coverage`) rejected a `has_blob: true` answer for it
+  as malformed. A client saw no holder, dropped the size hint, and opened a
+  paid lane for zero bytes; a node pulling through for the empty root found no
+  provider. Now the handler signs `has_blob: true` for the empty root when its
+  presence check passes, and `ProbeResponseExt::consistent_with` takes the
+  signed body: for the empty root the bitmap must be empty and `has_blob`
+  alone decides. The rule keys on the signed hash, never on the unsigned
+  `total_bytes` hint. `decdn_protocol::EMPTY_ROOT` names the hash. ADR 022
+  § Consistency rule records the exception.
 - **CLI: a `decdn get` that ends before a `topUp` confirms names the tx
   (#2491).** A refill or a funding recovery step can still wait on its `topUp`
   receipt when the command ends: on a give-up after the no-progress limit, a

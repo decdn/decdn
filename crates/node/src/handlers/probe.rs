@@ -10,8 +10,8 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, Hash, ProbeHoldOutcome};
 use decdn_incentive::ProbeSlashData;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, FrameError, ProbeMessage, ProbeResponseBody,
-    ProbeResponseExt, decode_message, encode_probe_response, is_unknown_variant,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, Coverage, EMPTY_ROOT, FrameError, ProbeMessage,
+    ProbeResponseBody, ProbeResponseExt, decode_message, encode_probe_response, is_unknown_variant,
     message::ProbeResponse, num_blocks, read_frame, write_frame,
 };
 use iroh::PublicKey;
@@ -564,7 +564,10 @@ impl ProbeHandler {
         // "holds the whole blob" to "will serve at least one discovery
         // block", so it is derived FROM `coverage` rather than the other way
         // around — the two are a biconditional by construction, never two
-        // independently-set fields that could drift apart.
+        // independently-set fields that could drift apart. The one blob with
+        // no block to serve is the empty one: its coverage is empty on a
+        // holder too, so the presence verdict above carries `has_blob` for
+        // it (#2471, below).
         //
         // - Origin-sourced (`has_blob` flipped true by the fold above, not by
         //   the store branch): an origin serves every block and already
@@ -619,11 +622,23 @@ impl ProbeHandler {
                 }
             }
         };
-        let has_blob = !coverage.is_empty();
-        debug_assert_eq!(
-            has_blob,
-            !coverage.is_empty(),
-            "has_blob must be the coverage biconditional by construction"
+        // The empty root (#2471): zero blocks, so an empty coverage says
+        // nothing about presence. Every arm that suppresses an advertisement
+        // (chain-stale, holds disabled, origin-only miss) settles presence as
+        // `false` above, so the presence verdict is the honest answer here.
+        let has_blob = !coverage.is_empty() || (has_blob && *hash.as_bytes() == EMPTY_ROOT);
+        debug_assert!(
+            ProbeResponseExt {
+                total_bytes,
+                coverage: coverage.clone(),
+            }
+            .consistent_with(&ProbeResponseBody {
+                hash: *hash.as_bytes(),
+                has_blob,
+                rate_per_mb: 0,
+                timestamp_us: 0,
+            }),
+            "has_blob must agree with the coverage by construction"
         );
 
         // The node advertises its configured rate verbatim. The delivery floor

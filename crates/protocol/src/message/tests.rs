@@ -114,18 +114,29 @@ fn probe_message_response_discriminant_is_one() -> Result<(), postcard::Error> {
     Ok(())
 }
 
+fn body_for(hash: [u8; 32], has_blob: bool) -> ProbeResponseBody {
+    ProbeResponseBody {
+        hash,
+        has_blob,
+        ..sample_body()
+    }
+}
+
+fn one_block_ext() -> ProbeResponseExt {
+    ProbeResponseExt {
+        total_bytes: Some(4096),
+        coverage: crate::Coverage::full(1),
+    }
+}
+
 #[test]
 fn consistent_with_accepts_matching_pairs() {
     assert!(
-        ProbeResponseExt {
-            total_bytes: Some(4096),
-            coverage: crate::Coverage::full(1),
-        }
-        .consistent_with(true),
+        one_block_ext().consistent_with(&body_for([7u8; 32], true)),
         "has_blob:true + non-empty coverage must be consistent"
     );
     assert!(
-        ProbeResponseExt::default().consistent_with(false),
+        ProbeResponseExt::default().consistent_with(&body_for([7u8; 32], false)),
         "has_blob:false + empty (default) coverage must be consistent"
     );
 }
@@ -133,17 +144,48 @@ fn consistent_with_accepts_matching_pairs() {
 #[test]
 fn consistent_with_rejects_mismatched_pairs() {
     assert!(
-        !ProbeResponseExt {
-            total_bytes: Some(4096),
-            coverage: crate::Coverage::full(1),
-        }
-        .consistent_with(false),
+        !one_block_ext().consistent_with(&body_for([7u8; 32], false)),
         "has_blob:false with non-empty coverage must be flagged inconsistent"
     );
     assert!(
-        !ProbeResponseExt::default().consistent_with(true),
+        !ProbeResponseExt::default().consistent_with(&body_for([7u8; 32], true)),
         "has_blob:true with empty coverage must be flagged inconsistent"
     );
+}
+
+/// The empty blob spans zero blocks, so its coverage is empty whether or not
+/// the node serves it: `has_blob` alone carries the answer (#2471).
+#[test]
+fn consistent_with_reads_has_blob_alone_for_the_empty_root() {
+    let holder = ProbeResponseExt {
+        total_bytes: Some(0),
+        coverage: crate::Coverage::empty(),
+    };
+    assert!(
+        holder.consistent_with(&body_for(EMPTY_ROOT, true)),
+        "a node that serves the empty blob signs has_blob:true over an empty coverage"
+    );
+    assert!(
+        holder.consistent_with(&body_for(EMPTY_ROOT, false)),
+        "a node that does not serve the empty blob signs has_blob:false over an empty coverage"
+    );
+}
+
+#[test]
+fn consistent_with_rejects_a_block_claimed_for_the_empty_root() {
+    assert!(
+        !one_block_ext().consistent_with(&body_for(EMPTY_ROOT, true)),
+        "no block exists in the empty blob, so a set bit is malformed"
+    );
+    assert!(
+        !one_block_ext().consistent_with(&body_for(EMPTY_ROOT, false)),
+        "no block exists in the empty blob, so a set bit is malformed"
+    );
+}
+
+#[test]
+fn empty_root_is_the_blake3_hash_of_zero_bytes() {
+    assert_eq!(EMPTY_ROOT, *blake3::hash(&[]).as_bytes());
 }
 
 #[test]
