@@ -534,6 +534,10 @@ pub enum BundleEnd {
     /// ([`BundleReport::failures`]); a rerun retries them.
     Complete,
     /// The cancel token fired. What landed is recorded, and a rerun resumes.
+    /// The puller's [`UnconfirmedEscrows`] may still hold an `openPool` or
+    /// `topUp` that escrowed USDC no record credits
+    /// ([`UnconfirmedEscrows::untracked`]): the caller names it, because a
+    /// rerun escrows again.
     Interrupted,
     /// The pool cannot pay for the rest: the capability is spent, expired or
     /// revoked, or the delegated pool is unfunded. `error` is the whole
@@ -545,7 +549,10 @@ pub enum BundleEnd {
         error: anyhow::Error,
     },
     /// A fault only the user can fix ended the pull, or it gave up after
-    /// making no progress for its whole limit ([`crate::GaveUp`]).
+    /// making no progress for its whole limit ([`crate::GaveUp`]). A pull
+    /// whose command holds an untracked escrow
+    /// ([`UnconfirmedEscrows::untracked`]) always ends here, with an error
+    /// that names its tx.
     Stopped(anyhow::Error),
 }
 

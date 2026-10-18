@@ -796,7 +796,7 @@ async fn pull_over(
     .await;
     // Every exit of the manifest or the pull can drop an `openPool` or a
     // `topUp` before its receipt is read, and the transaction may still escrow.
-    let result = name_unconfirmed_escrows(result, &escrows.pending());
+    let result = name_unconfirmed_escrows(result, &escrows.pending(), escrows.untracked().as_ref());
     // On every exit, a Ctrl-C's included: what the entries queued is durable
     // before the command returns.
     puller.finish().await;

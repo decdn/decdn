@@ -175,6 +175,70 @@ fn a_give_up_ends_the_whole_pull() {
     assert!(!ends_the_pull(&anyhow!("stream reset")));
 }
 
+/// An escrow the command's handle holds with no record crediting it.
+fn held_escrow() -> UntrackedEscrow {
+    let tx = alloy::primitives::TxHash::repeat_byte(0xab);
+    UntrackedEscrow {
+        tx,
+        text: format!(
+            "pool 0x01 topped up by 5 µUSDC on-chain (tx {tx}) but the local record did not survive"
+        ),
+    }
+}
+
+fn give_up() -> anyhow::Error {
+    anyhow::Error::new(crate::GaveUp {
+        idle: std::time::Duration::from_secs(1),
+    })
+}
+
+/// A give-up while the command holds an untracked escrow stops on the escrow,
+/// with the give-up kept as text: a caller that retries a give-up would
+/// escrow again (#2511).
+#[test]
+fn a_give_up_with_an_untracked_escrow_stops_on_the_escrow() {
+    let held = held_escrow();
+    let err = fold_untracked_escrow(Some(give_up()), false, Some(held.clone())).unwrap();
+    assert!(err.downcast_ref::<crate::GaveUp>().is_none(), "{err:#}");
+    assert!(
+        err.downcast_ref::<crate::buyer_pool::EscrowUntracked>()
+            .is_some(),
+        "{err:#}"
+    );
+    let text = format!("{err:#}");
+    assert!(text.contains(&held.tx.to_string()), "{text}");
+    assert!(
+        text.contains("no progress"),
+        "the give-up survives as text: {text}"
+    );
+}
+
+/// A pull that completed while the command holds an untracked escrow stops
+/// on it.
+#[test]
+fn a_complete_pull_with_an_untracked_escrow_stops() {
+    let held = held_escrow();
+    let err = fold_untracked_escrow(None, false, Some(held.clone())).unwrap();
+    assert_eq!(format!("{err:#}"), held.text);
+}
+
+/// A stop that already names the escrow's tx, an interrupted pull, and a
+/// command that holds no untracked escrow are unchanged.
+#[test]
+fn a_stop_that_names_the_escrow_is_unchanged() {
+    let held = held_escrow();
+    let named = anyhow!("building the payment lane failed: {}", held.text);
+    let err = fold_untracked_escrow(Some(named), false, Some(held.clone())).unwrap();
+    assert_eq!(
+        format!("{err:#}"),
+        format!("building the payment lane failed: {}", held.text)
+    );
+
+    assert!(fold_untracked_escrow(None, true, Some(held)).is_none());
+    let err = fold_untracked_escrow(Some(give_up()), false, None).unwrap();
+    assert!(err.downcast_ref::<crate::GaveUp>().is_some());
+}
+
 /// A command-wide fault stops the pull: no group after it starts, and the
 /// fault is what the pull ends with.
 #[tokio::test]

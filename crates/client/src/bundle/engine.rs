@@ -87,7 +87,7 @@ use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
     FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, manifest_cache, parse_hash,
 };
-use crate::buyer_pool::OwnedPayer;
+use crate::buyer_pool::{OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
 use crate::funding::RunFunding;
 use crate::lane_sources::LaneSources;
@@ -1027,6 +1027,35 @@ fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
         .copied()
 }
 
+/// Fold the command's untracked escrow ([`UntrackedEscrow`]), when its handle
+/// holds one, into the pull's `stopped` error. An entry dropped before it
+/// reported the escrow, or an earlier pull on the same handle, leaves it
+/// named nowhere else. The escrow wins over any outcome, as a late lane
+/// build's does for one fetch: a pull that completed stops, and a stop that
+/// does not already name the escrow's tx survives only as text, so a
+/// retryable [`crate::GaveUp`] cannot send the caller into a retry that
+/// escrows again. An interrupted pull is unchanged, because its end carries no
+/// error: its caller names the hold from the handle.
+fn fold_untracked_escrow(
+    stopped: Option<anyhow::Error>,
+    interrupted: bool,
+    held: Option<UntrackedEscrow>,
+) -> Option<anyhow::Error> {
+    let Some(held) = held.filter(|_| !interrupted) else {
+        return stopped;
+    };
+    let tx = held.tx.to_string();
+    match stopped {
+        Some(err) if format!("{err:#}").contains(&tx) => Some(err),
+        None => Some(held.into_error()),
+        Some(err) => Some(held.into_error().context(format!(
+            "the pull stopped ({}), and an earlier openPool or topUp of this command escrowed \
+             USDC no record credits",
+            sanitize_err_chain(&err)
+        ))),
+    }
+}
+
 /// One run's result from its `first` pass, which a pool replacement ended,
 /// and its `second` pass against the new pool. Both passes walk the same
 /// entries in the same order, so an entry the first pass landed and the
@@ -1654,6 +1683,8 @@ impl<P: Provider + Clone> PullCtx<P> {
             _ => err,
         });
         warnings.extend(self.funding.shortfall());
+        let stopped =
+            fold_untracked_escrow(stopped, interrupted, self.funding.escrows().untracked());
         // Every entry has joined, so the shared dedup counters are now stable.
         let dedup = self.dedup_stats.take();
         let mut report = bundle_report(&outcomes, transfer, dedup, warnings);

@@ -149,7 +149,7 @@ pub struct decdn_client::buyer_pool::AllowanceShortfall
 impl core::error::Error for decdn_client::buyer_pool::AllowanceShortfall
 impl core::fmt::Display for decdn_client::buyer_pool::AllowanceShortfall
 pub fn decdn_client::buyer_pool::AllowanceShortfall::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-pub struct decdn_client::buyer_pool::EscrowUntracked(_)
+pub struct decdn_client::buyer_pool::EscrowUntracked
 impl core::error::Error for decdn_client::buyer_pool::EscrowUntracked
 impl core::fmt::Display for decdn_client::buyer_pool::EscrowUntracked
 pub fn decdn_client::buyer_pool::EscrowUntracked::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -190,6 +190,12 @@ pub decdn_client::buyer_pool::ToppedUpPool::tx: alloy_primitives::aliases::TxHas
 pub struct decdn_client::buyer_pool::UnconfirmedEscrows(_)
 impl decdn_client::buyer_pool::UnconfirmedEscrows
 pub fn decdn_client::buyer_pool::UnconfirmedEscrows::pending(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::EscrowUnconfirmed>
+pub fn decdn_client::buyer_pool::UnconfirmedEscrows::untracked(&self) -> core::option::Option<decdn_client::buyer_pool::UntrackedEscrow>
+pub struct decdn_client::buyer_pool::UntrackedEscrow
+pub decdn_client::buyer_pool::UntrackedEscrow::text: alloc::string::String
+pub decdn_client::buyer_pool::UntrackedEscrow::tx: alloy_primitives::aliases::TxHash
+impl core::fmt::Display for decdn_client::buyer_pool::UntrackedEscrow
+pub fn decdn_client::buyer_pool::UntrackedEscrow::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::buyer_pool::WalletShortfall
 impl core::error::Error for decdn_client::buyer_pool::WalletShortfall
 impl core::fmt::Display for decdn_client::buyer_pool::WalletShortfall

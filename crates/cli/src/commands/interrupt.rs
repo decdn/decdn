@@ -11,11 +11,13 @@
 //! `topUp` before its receipt is read does not cancel the transaction, so the
 //! command names it (`name_unconfirmed_escrows`, and the immediate exit)
 //! instead of telling the user to run it again: a re-run before it confirms
-//! escrows a second time.
+//! escrows a second time. An escrow that mined with no local record crediting
+//! it is named the same way: a re-run reads the uncredited row and escrows
+//! again.
 
 use decdn_client::GaveUp;
 use decdn_client::buyer_pool::{
-    EscrowUnconfirmed, OpenUnconfirmed, TopUpUnconfirmed, UnconfirmedEscrows,
+    EscrowUnconfirmed, OpenUnconfirmed, TopUpUnconfirmed, UnconfirmedEscrows, UntrackedEscrow,
 };
 
 /// The error a command returns when Ctrl-C stopped it. `main` prints
@@ -33,17 +35,27 @@ impl std::fmt::Display for Interrupted {
 impl std::error::Error for Interrupted {}
 
 /// The `openPool` and `topUp` transactions a command ended with and did not
-/// see confirm. Each may still mine and escrow USDC. Displays one per line.
+/// see confirm, and the one it holds that mined with no local record crediting
+/// it. Each may still escrow USDC, or already has. Displays one per line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingEscrows(Vec<EscrowUnconfirmed>);
+pub struct PendingEscrows {
+    /// The transactions whose receipt was not read
+    /// ([`UnconfirmedEscrows::pending`]).
+    pending: Vec<EscrowUnconfirmed>,
+    /// The transaction that escrowed with no local record crediting it
+    /// ([`UnconfirmedEscrows::untracked`]).
+    untracked: Option<UntrackedEscrow>,
+}
 
 impl std::fmt::Display for PendingEscrows {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, escrow) in self.0.iter().enumerate() {
+        let pending = self.pending.iter().map(ToString::to_string);
+        let untracked = self.untracked.iter().map(ToString::to_string);
+        for (i, escrow) in pending.chain(untracked).enumerate() {
             if i > 0 {
                 f.write_str("\n")?;
             }
-            write!(f, "{escrow}")?;
+            f.write_str(&escrow)?;
         }
         Ok(())
     }
@@ -52,32 +64,41 @@ impl std::fmt::Display for PendingEscrows {
 impl std::error::Error for PendingEscrows {}
 
 /// End a command that may have dropped an `openPool` or a `topUp` before its
-/// receipt was read. `escrows` are the transactions it did not see confirm
-/// ([`UnconfirmedEscrows::pending`]).
+/// receipt was read, or that holds one that escrowed with no local record.
+/// `escrows` are the transactions it did not see confirm
+/// ([`UnconfirmedEscrows::pending`]), and `untracked` the one it holds
+/// ([`UnconfirmedEscrows::untracked`]).
 ///
-/// A transaction the error already carries is not named twice. With none
-/// left, `result` passes through. Otherwise they are attached to the result as
+/// A transaction the error already names is not named twice. With none left,
+/// `result` passes through. Otherwise they are attached to the result as
 /// [`PendingEscrows`], so the command names each tx. An `Ok` becomes an error:
-/// the USDC may escrow with no local record, and only a non-zero exit makes
-/// sure someone reconciles it. An error keeps its own type underneath, so an
-/// [`Interrupted`] still exits 130.
+/// the USDC may escrow, or has escrowed, with no local record, and only a
+/// non-zero exit makes sure someone reconciles it. An error keeps its own type
+/// underneath, so an [`Interrupted`] still exits 130.
 pub(crate) fn name_unconfirmed_escrows<T>(
     result: anyhow::Result<T>,
     escrows: &[EscrowUnconfirmed],
+    untracked: Option<&UntrackedEscrow>,
 ) -> anyhow::Result<T> {
-    let carried = result.as_ref().err().and_then(carried);
-    let left: Vec<EscrowUnconfirmed> = escrows
+    let err = result.as_ref().err();
+    let carried = err.and_then(carried);
+    let pending: Vec<EscrowUnconfirmed> = escrows
         .iter()
         .copied()
         .filter(|escrow| Some(*escrow) != carried)
         .collect();
-    if left.is_empty() {
+    // The error that reported the untracked escrow can sit inside one that
+    // hides it from a downcast, so its tx is looked for in the text.
+    let untracked = untracked
+        .filter(|held| err.is_none_or(|err| !format!("{err:#}").contains(&held.tx.to_string())))
+        .cloned();
+    if pending.is_empty() && untracked.is_none() {
         return result;
     }
-    let pending = PendingEscrows(left);
+    let named = PendingEscrows { pending, untracked };
     match result {
-        Ok(_) => Err(anyhow::Error::new(pending)),
-        Err(err) => Err(err.context(pending)),
+        Ok(_) => Err(anyhow::Error::new(named)),
+        Err(err) => Err(err.context(named)),
     }
 }
 
@@ -145,8 +166,8 @@ pub const GAVE_UP_EXIT: u8 = 75;
 
 /// A handle that resolves on the first Ctrl-C. Dropping it hands Ctrl-C back
 /// to an immediate exit. The immediate exit first names every `openPool` and
-/// `topUp` in the command's [`UnconfirmedEscrows`]: it skips the command's own
-/// return, which is where the first Ctrl-C names them.
+/// `topUp` in the command's [`UnconfirmedEscrows`], pending or untracked: it
+/// skips the command's own return, which is where the first Ctrl-C names them.
 pub(crate) struct Interrupt {
     /// Fires on the first Ctrl-C while this handle lives.
     rx: tokio::sync::oneshot::Receiver<()>,
@@ -173,6 +194,9 @@ impl Interrupt {
                 // `exit` would skip, name what may still escrow, then quit.
                 super::tab_progress::remove_now();
                 for escrow in escrows.pending() {
+                    eprintln!("interrupted: {escrow}");
+                }
+                if let Some(escrow) = escrows.untracked() {
                     eprintln!("interrupted: {escrow}");
                 }
                 std::process::exit(i32::from(INTERRUPTED_EXIT));

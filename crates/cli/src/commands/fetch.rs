@@ -509,10 +509,11 @@ pub(crate) fn manifest_cap_mb(max_blob_mb: u64) -> u64 {
 ///
 /// [`Interrupted`] on Ctrl-C, [`decdn_client::GaveUp`] once the stop policy's
 /// no-progress limit passes, or the fault that ended the fetch. A fetch that
-/// ends with an `openPool` or `topUp` whose receipt it did not read carries
+/// ends with an `openPool` or `topUp` whose receipt it did not read, or with
+/// one that escrowed with no local record crediting it, carries
 /// [`super::interrupt::PendingEscrows`], as context on any of those or as the
 /// error of a fetch that otherwise succeeded. A transaction the error already
-/// carries itself is not repeated there.
+/// names itself is not repeated there.
 pub(crate) async fn fetch(
     args: &cli::GetArgs,
     output: &Path,
@@ -532,7 +533,11 @@ pub(crate) async fn fetch(
         result = fetch_target(&host, &payer, args, output, uri, &timings) => result,
         () = interrupt.wait() => Err(Interrupted.into()),
     };
-    let result = name_unconfirmed_escrows(result, &host.escrows.pending());
+    let result = name_unconfirmed_escrows(
+        result,
+        &host.escrows.pending(),
+        host.escrows.untracked().as_ref(),
+    );
     let output = if wants_stdout(output) {
         "stdout"
     } else {

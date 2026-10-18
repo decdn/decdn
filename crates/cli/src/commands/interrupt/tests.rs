@@ -45,16 +45,41 @@ fn gave_up() -> anyhow::Error {
     .into()
 }
 
+/// [`name_unconfirmed_escrows`] for a command that holds no untracked escrow.
+fn name<T>(result: anyhow::Result<T>, escrows: &[EscrowUnconfirmed]) -> anyhow::Result<T> {
+    name_unconfirmed_escrows(result, escrows, None)
+}
+
+fn pending(pending: Vec<EscrowUnconfirmed>) -> PendingEscrows {
+    PendingEscrows {
+        pending,
+        untracked: None,
+    }
+}
+
+/// A `topUp` that mined with no local record crediting it, as the command's
+/// handle holds it.
+fn untracked(byte: u8) -> UntrackedEscrow {
+    let tx = alloy::primitives::B256::repeat_byte(byte);
+    UntrackedEscrow {
+        tx,
+        text: format!(
+            "pool 0x01 topped up by 5 µUSDC on-chain (tx {tx}) but the local record did not \
+             survive; the deposit is escrowed but untracked"
+        ),
+    }
+}
+
 #[test]
 fn a_command_with_no_dropped_open_ends_as_it_did() {
-    assert_eq!(name_unconfirmed_escrows(Ok(7), &[]).unwrap(), 7);
-    let err = name_unconfirmed_escrows::<()>(Err(Interrupted.into()), &[]).unwrap_err();
+    assert_eq!(name(Ok(7), &[]).unwrap(), 7);
+    let err = name::<()>(Err(Interrupted.into()), &[]).unwrap_err();
     assert_eq!(
         stop_message(&err).unwrap(),
         "interrupted; run the same command again to resume"
     );
     assert_eq!(stop_exit(&err), Some(INTERRUPTED_EXIT));
-    let err = name_unconfirmed_escrows::<()>(Err(gave_up()), &[]).unwrap_err();
+    let err = name::<()>(Err(gave_up()), &[]).unwrap_err();
     assert_eq!(
         stop_message(&err).unwrap(),
         "no progress for 10m; rerun to resume"
@@ -66,10 +91,10 @@ fn a_command_with_no_dropped_open_ends_as_it_did() {
 /// the tx: the deposit may escrow with no local record.
 #[test]
 fn a_dropped_open_turns_success_into_an_error_naming_the_tx() {
-    let err = name_unconfirmed_escrows(Ok(()), &[open(0xef, 5)]).unwrap_err();
+    let err = name(Ok(()), &[open(0xef, 5)]).unwrap_err();
     assert_eq!(
         err.downcast_ref::<PendingEscrows>(),
-        Some(&PendingEscrows(vec![open(0xef, 5)]))
+        Some(&pending(vec![open(0xef, 5)]))
     );
     assert!(format!("{err:#}").contains("nonce 5"), "{err:#}");
     assert_eq!(stop_message(&err), None);
@@ -80,8 +105,7 @@ fn a_dropped_open_turns_success_into_an_error_naming_the_tx() {
 /// instead of telling the user to run the command again.
 #[test]
 fn an_interrupted_open_keeps_the_interrupt_and_names_the_tx() {
-    let err =
-        name_unconfirmed_escrows::<()>(Err(Interrupted.into()), &[open(0xef, 5)]).unwrap_err();
+    let err = name::<()>(Err(Interrupted.into()), &[open(0xef, 5)]).unwrap_err();
     assert!(err.downcast_ref::<Interrupted>().is_some());
     assert_eq!(stop_exit(&err), Some(INTERRUPTED_EXIT));
     let message = stop_message(&err).unwrap();
@@ -96,7 +120,7 @@ fn an_interrupted_open_keeps_the_interrupt_and_names_the_tx() {
 /// exits 1: `EX_TEMPFAIL` would tell a wrapper the re-run is safe.
 #[test]
 fn a_give_up_during_an_open_names_the_tx_and_is_not_a_tempfail() {
-    let err = name_unconfirmed_escrows::<()>(Err(gave_up()), &[open(0xef, 5)]).unwrap_err();
+    let err = name::<()>(Err(gave_up()), &[open(0xef, 5)]).unwrap_err();
     let message = stop_message(&err).unwrap();
     assert!(
         message.starts_with("no progress for 600s: openPool tx 0xefef"),
@@ -109,9 +133,7 @@ fn a_give_up_during_an_open_names_the_tx_and_is_not_a_tempfail() {
 /// Every open left pending is named, one per line.
 #[test]
 fn every_pending_open_is_named() {
-    let err =
-        name_unconfirmed_escrows::<()>(Err(Interrupted.into()), &[open(0xef, 5), open(0xab, 6)])
-            .unwrap_err();
+    let err = name::<()>(Err(Interrupted.into()), &[open(0xef, 5), open(0xab, 6)]).unwrap_err();
     let message = stop_message(&err).unwrap();
     assert!(
         message.contains("0xefef") && message.contains("0xabab"),
@@ -125,15 +147,14 @@ fn every_pending_open_is_named() {
 #[test]
 fn an_open_the_error_carries_is_not_named_twice() {
     let carried = anyhow::anyhow!("receipt read failed").context(open_tx(0xef, 5));
-    let err = name_unconfirmed_escrows::<()>(Err(carried), &[open(0xef, 5)]).unwrap_err();
+    let err = name::<()>(Err(carried), &[open(0xef, 5)]).unwrap_err();
     assert!(err.downcast_ref::<PendingEscrows>().is_none(), "{err:#}");
     assert_eq!(format!("{err:#}").matches("0xefef").count(), 1, "{err:#}");
     let carried = anyhow::anyhow!("receipt read failed").context(open_tx(0xef, 5));
-    let err =
-        name_unconfirmed_escrows::<()>(Err(carried), &[open(0xef, 5), open(0xab, 6)]).unwrap_err();
+    let err = name::<()>(Err(carried), &[open(0xef, 5), open(0xab, 6)]).unwrap_err();
     assert_eq!(
         err.downcast_ref::<PendingEscrows>(),
-        Some(&PendingEscrows(vec![open(0xab, 6)]))
+        Some(&pending(vec![open(0xab, 6)]))
     );
 }
 
@@ -142,7 +163,7 @@ fn an_open_the_error_carries_is_not_named_twice() {
 /// it confirms escrows a second top-up (#2491).
 #[test]
 fn a_give_up_during_a_top_up_names_the_tx_and_is_not_a_tempfail() {
-    let err = name_unconfirmed_escrows::<()>(Err(gave_up()), &[top_up(0xcd, 7)]).unwrap_err();
+    let err = name::<()>(Err(gave_up()), &[top_up(0xcd, 7)]).unwrap_err();
     let message = stop_message(&err).unwrap();
     assert!(
         message.starts_with("no progress for 600s: topUp tx 0xcdcd"),
@@ -158,10 +179,10 @@ fn a_give_up_during_a_top_up_names_the_tx_and_is_not_a_tempfail() {
 /// the tx.
 #[test]
 fn a_dropped_top_up_turns_success_into_an_error_naming_the_tx() {
-    let err = name_unconfirmed_escrows(Ok(()), &[top_up(0xcd, 7)]).unwrap_err();
+    let err = name(Ok(()), &[top_up(0xcd, 7)]).unwrap_err();
     assert_eq!(
         err.downcast_ref::<PendingEscrows>(),
-        Some(&PendingEscrows(vec![top_up(0xcd, 7)]))
+        Some(&pending(vec![top_up(0xcd, 7)]))
     );
     assert!(format!("{err:#}").contains("topUp tx 0xcdcd"), "{err:#}");
     assert_eq!(stop_message(&err), None);
@@ -172,9 +193,7 @@ fn a_dropped_top_up_turns_success_into_an_error_naming_the_tx() {
 /// still exits 130.
 #[test]
 fn an_interrupt_names_pending_opens_and_top_ups() {
-    let err =
-        name_unconfirmed_escrows::<()>(Err(Interrupted.into()), &[open(0xef, 5), top_up(0xcd, 7)])
-            .unwrap_err();
+    let err = name::<()>(Err(Interrupted.into()), &[open(0xef, 5), top_up(0xcd, 7)]).unwrap_err();
     assert_eq!(stop_exit(&err), Some(INTERRUPTED_EXIT));
     let message = stop_message(&err).unwrap();
     assert!(
@@ -191,7 +210,7 @@ fn an_interrupt_names_pending_opens_and_top_ups() {
 #[test]
 fn a_top_up_the_error_carries_is_not_named_twice() {
     let carried = anyhow::anyhow!("receipt wait lapsed").context(top_up_tx(0xcd, 7));
-    let err = name_unconfirmed_escrows::<()>(Err(carried), &[top_up(0xcd, 7)]).unwrap_err();
+    let err = name::<()>(Err(carried), &[top_up(0xcd, 7)]).unwrap_err();
     assert!(err.downcast_ref::<PendingEscrows>().is_none(), "{err:#}");
     assert_eq!(format!("{err:#}").matches("0xcdcd").count(), 1, "{err:#}");
 
@@ -206,12 +225,95 @@ fn a_top_up_the_error_carries_is_not_named_twice() {
 #[test]
 fn a_top_up_dropped_mid_submit_names_its_nonce() {
     let submitted = TopUpUnconfirmed { tx: None, nonce: 7 };
-    let err =
-        name_unconfirmed_escrows::<()>(Err(Interrupted.into()), &[submitted.into()]).unwrap_err();
+    let err = name::<()>(Err(Interrupted.into()), &[submitted.into()]).unwrap_err();
     let message = stop_message(&err).unwrap();
     assert!(
         message.starts_with("interrupted: topUp submit (nonce 7) returned no tx hash"),
         "{message}"
     );
     assert!(!message.contains("transport"), "{message}");
+}
+
+/// A Ctrl-C while the command holds an untracked escrow (a lane build's
+/// drain, after the receipt read released its `topUp`) names the tx in place
+/// of "run the same command again", and still exits 130 (#2511).
+#[test]
+fn an_interrupt_names_the_untracked_escrow() {
+    let held = untracked(0x9a);
+    let err =
+        name_unconfirmed_escrows::<()>(Err(Interrupted.into()), &[], Some(&held)).unwrap_err();
+    assert_eq!(stop_exit(&err), Some(INTERRUPTED_EXIT));
+    let message = stop_message(&err).unwrap();
+    assert!(
+        message.starts_with("interrupted: pool 0x01 topped up"),
+        "{message}"
+    );
+    assert!(message.contains(&held.tx.to_string()), "{message}");
+    assert!(!message.contains("run the same command again"), "{message}");
+}
+
+/// A give-up while the command holds an untracked escrow names the tx and is
+/// not `EX_TEMPFAIL`: a re-run reads the uncredited row and escrows again.
+#[test]
+fn a_give_up_with_an_untracked_escrow_is_not_a_tempfail() {
+    let held = untracked(0x9a);
+    let err = name_unconfirmed_escrows::<()>(Err(gave_up()), &[], Some(&held)).unwrap_err();
+    assert_eq!(stop_exit(&err), None);
+    let message = stop_message(&err).unwrap();
+    assert!(message.contains(&held.tx.to_string()), "{message}");
+    assert!(!message.contains("rerun"), "{message}");
+}
+
+/// A command that succeeded while it holds an untracked escrow exits
+/// non-zero, naming the tx.
+#[test]
+fn an_untracked_escrow_turns_success_into_an_error() {
+    let held = untracked(0x9a);
+    let err = name_unconfirmed_escrows(Ok(()), &[], Some(&held)).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<PendingEscrows>(),
+        Some(&PendingEscrows {
+            pending: Vec::new(),
+            untracked: Some(held),
+        })
+    );
+    assert_eq!(stop_exit(&err), None);
+}
+
+/// An error that already names the untracked escrow's tx, even through a
+/// wrapper that hides its type, does not name it twice. A pending escrow
+/// beside it is still named.
+#[test]
+fn an_untracked_escrow_the_error_names_is_not_named_twice() {
+    let held = untracked(0x9a);
+    let tx = held.tx.to_string();
+    let reported = anyhow::anyhow!("building the payment lane failed: {held}");
+    let err = name_unconfirmed_escrows::<()>(Err(reported), &[], Some(&held)).unwrap_err();
+    assert!(err.downcast_ref::<PendingEscrows>().is_none(), "{err:#}");
+    assert_eq!(format!("{err:#}").matches(&tx).count(), 1, "{err:#}");
+
+    let reported = anyhow::anyhow!("building the payment lane failed: {held}");
+    let err =
+        name_unconfirmed_escrows::<()>(Err(reported), &[top_up(0xcd, 7)], Some(&held)).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<PendingEscrows>(),
+        Some(&pending(vec![top_up(0xcd, 7)]))
+    );
+    assert_eq!(format!("{err:#}").matches(&tx).count(), 1, "{err:#}");
+}
+
+/// A pending `topUp` and an untracked escrow are both named, one per line.
+#[test]
+fn a_pending_and_an_untracked_escrow_are_both_named() {
+    let held = untracked(0x9a);
+    let err =
+        name_unconfirmed_escrows::<()>(Err(Interrupted.into()), &[top_up(0xcd, 7)], Some(&held))
+            .unwrap_err();
+    let message = stop_message(&err).unwrap();
+    assert!(
+        message.starts_with("interrupted: topUp tx 0xcdcd"),
+        "{message}"
+    );
+    assert!(message.contains(&held.tx.to_string()), "{message}");
+    assert_eq!(message.lines().count(), 2, "{message}");
 }

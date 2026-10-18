@@ -1114,6 +1114,24 @@ since project inception and will roll into the first tagged release.
   with no `PoolOpened` event for the owner also fails as escrowed and
   untracked (`EscrowUntracked`), not as a plain error: the acquire loop
   retried that lane build, and the retry opened a second pool.
+- **Client, CLI: every end of a command names its untracked escrow (#2511).**
+  The hold on a run's untracked `topUp` or `openPool` lived in the run's
+  per-pass state, and no end of the command read it. A Ctrl-C during the 30 s
+  drain of late lane builds dropped the fetch, and `decdn get` printed
+  "interrupted; run the same command again to resume": the receipt read had
+  already cleared the tx from the pending-escrow handle, and a re-run read the
+  uncredited row and escrowed again. A bundle pull whose entry with the escrow
+  was dropped could give up with exit 75 the same way. Now the hold lives on
+  the command's `UnconfirmedEscrows` handle (`UnconfirmedEscrows::untracked`,
+  a new `UntrackedEscrow` with the tx). It outlives a dropped fetch, a dropped
+  bundle entry and a pass, and every later pass on the handle refuses to
+  escrow. `decdn get`, `decdn pool open` and `decdn pool top-up` name it on
+  every end that does not already name its tx: a Ctrl-C says
+  `interrupted: <escrow>` and still exits 130, a give-up does not exit 75,
+  and a success exits non-zero. A second Ctrl-C names it too. A
+  `BundlePuller` pull whose handle holds one ends `BundleEnd::Stopped` with
+  the escrow as its error and the pull's own stop as text; an interrupted
+  pull stays `Interrupted`, and its caller names the hold from the handle.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

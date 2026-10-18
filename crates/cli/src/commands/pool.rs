@@ -224,7 +224,8 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
         result = opened => result,
         () = interrupt.wait() => Err(Interrupted.into()),
     };
-    let pool_id = name_unconfirmed_escrows(result, &escrows.pending())?;
+    let pool_id =
+        name_unconfirmed_escrows(result, &escrows.pending(), escrows.untracked().as_ref())?;
 
     let out = PoolOpenJson {
         pool_id: format!("{pool_id:#x}"),
@@ -300,7 +301,8 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         result = topped_up => result,
         () = interrupt.wait() => Err(Interrupted.into()),
     };
-    let (credited, new_deposit) = name_unconfirmed_escrows(result, &escrows.pending())?;
+    let (credited, new_deposit) =
+        name_unconfirmed_escrows(result, &escrows.pending(), escrows.untracked().as_ref())?;
     println!("topped up pool {pool_id} by {credited} µUSDC; deposit now {new_deposit} µUSDC");
     Ok(())
 }
