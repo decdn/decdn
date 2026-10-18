@@ -968,9 +968,12 @@ impl Origin for NodeOrigin {
                 // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
                 // This is the generic `Origin::fetch` path (the buffered `populate` fill),
                 // a hash-only pull with no client namespace, so it takes no on-chain
-                // origin-directory fallback (`NO_NAMESPACE`). The namespace-aware
-                // client-serve serve-miss path is `open_pull_leg`.
-                let providers = discover(deps, hash_bytes, U256::ZERO).await.providers;
+                // origin-directory fallback (`NO_NAMESPACE`), and no requester to
+                // drop. The namespace-aware client-serve serve-miss path is
+                // `open_pull_leg`.
+                let providers = discover(deps, hash_bytes, U256::ZERO, None)
+                    .await
+                    .providers;
                 if providers.is_empty() {
                     // `node_pull_no_providers` means "the blob is unavailable on the
                     // network, NOT a pull failure" — mutually exclusive with
@@ -1086,9 +1089,9 @@ fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
 struct Discovered {
     /// The providers to probe.
     providers: Vec<DhtNodeId>,
-    /// [`CandidateSource::Dht`] for a non-empty lookup answer,
-    /// [`CandidateSource::Directory`] for a non-empty directory fallback,
-    /// [`CandidateSource::None`] when both are empty.
+    /// [`CandidateSource::Dht`] for a lookup answer that is non-empty once the
+    /// requester is dropped, [`CandidateSource::Directory`] for a non-empty
+    /// directory fallback, [`CandidateSource::None`] when both are empty.
     source: CandidateSource,
 }
 
@@ -1099,6 +1102,12 @@ struct Discovered {
 /// span the blob gets the directory's origins in [`probe_and_rank`] instead,
 /// because only a probe reports the blob size that decides it.
 ///
+/// `requester` is the node the serve answers, when there is one. It is never a
+/// candidate (ADR 037 § Node serving), so both lists drop it here, before the
+/// fallback is judged: a DHT answer that names only the requester is an empty
+/// answer, and the directory is read (#2534). A partial holder that asks for the
+/// blocks it lacks is often the hash's only DHT record.
+///
 /// `namespace_id` is the namespace the serving node received on the client
 /// `StreamRequest`. Within the pull it is consumed at the two directory reads:
 /// the fallback here and the supplement in [`probe_and_rank`]. A DHT-discovered
@@ -1108,7 +1117,12 @@ struct Discovered {
 /// client-serve path). Origin backends (S3/HTTP/FS) are hash-keyed and never see
 /// it. `NO_NAMESPACE` (0) resolves to no authorized origins, so a hash-only pull
 /// (the buffered fill) simply gets no directory fallback (ADR 002 §Namespace 0).
-async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32], namespace_id: U256) -> Discovered {
+async fn discover(
+    deps: &NodeOriginDeps,
+    hash_bytes: [u8; 32],
+    namespace_id: U256,
+    requester: Option<DhtNodeId>,
+) -> Discovered {
     let target = DhtHash::from_bytes(hash_bytes);
     // `find_providers` carries each holder's range-keyed `Coverage` alongside
     // its `NodeId` (ADR 039-adjacent partial-holder discovery) — a STALE
@@ -1131,6 +1145,7 @@ async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32], namespace_id: U25
     .await
     .into_iter()
     .map(|(node, _coverage)| node)
+    .filter(|node| Some(*node) != requester)
     .collect();
     if !providers.is_empty() {
         return Discovered {
@@ -1138,7 +1153,7 @@ async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32], namespace_id: U25
             source: CandidateSource::Dht,
         };
     }
-    let origins = directory_origins(deps, namespace_id).await;
+    let origins = directory_origins(deps, namespace_id, requester).await;
     let source = if origins.is_empty() {
         CandidateSource::None
     } else {
@@ -1150,12 +1165,18 @@ async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32], namespace_id: U25
     }
 }
 
-/// The origin directory's candidates for `namespace_id`, without this node. The
-/// DHT lookup drops this node by `self_id`; the directory lists every active
-/// origin operator, this node included, and a node never pulls from itself.
-async fn directory_origins(deps: &NodeOriginDeps, namespace_id: U256) -> Vec<DhtNodeId> {
+/// The origin directory's candidates for `namespace_id`, without this node and
+/// without the `requester`. The DHT lookup drops this node by `self_id`; the
+/// directory lists every active origin operator, this node included, and the
+/// requester can be one. A node never pulls from itself or from the node it
+/// answers.
+async fn directory_origins(
+    deps: &NodeOriginDeps,
+    namespace_id: U256,
+    requester: Option<DhtNodeId>,
+) -> Vec<DhtNodeId> {
     let mut origins = deps.origin_directory.lookup_origins(namespace_id).await;
-    origins.retain(|origin| *origin != deps.self_id);
+    origins.retain(|origin| *origin != deps.self_id && Some(*origin) != requester);
     origins
 }
 
@@ -1252,7 +1273,9 @@ async fn probe_and_rank(
     let mut candidates: Vec<Candidate> = Vec::new();
     let resolved = probe_round(deps, &providers, hash_bytes, gather, &mut candidates, tally).await;
     if matches!(gather, ProbeGather::CoverageUnion) && !coverage_spans(hash_bytes, &candidates) {
-        let directory = directory_origins(deps, namespace_id).await;
+        // The supplement can list the requester; the pull leg drops it from the
+        // ranked list after this round.
+        let directory = directory_origins(deps, namespace_id, None).await;
         let listed = directory.len();
         let origins: Vec<DhtNodeId> = directory
             .into_iter()
