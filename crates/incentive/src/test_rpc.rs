@@ -24,8 +24,8 @@ pub const SCRIPTED_TX: B256 = B256::repeat_byte(0xef);
 /// The pending nonce [`ScriptedRpc`] returns.
 pub const SCRIPTED_NONCE: u64 = 5;
 
-/// A receipt for [`SCRIPTED_TX`], sent to `to`, that mined with `logs`: the
-/// receipt a [`ScriptedRpc::mined`] transport hands back.
+/// A successful receipt for [`SCRIPTED_TX`], sent to `to`, that mined with
+/// `logs`: one to hand [`ScriptedRpc::mined`].
 #[must_use]
 pub const fn mined_receipt(to: Address, logs: Vec<Log>) -> TransactionReceipt {
     TransactionReceipt {

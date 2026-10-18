@@ -136,7 +136,8 @@ impl std::fmt::Display for RefusedAfterUntracked {
 impl std::error::Error for RefusedAfterUntracked {}
 
 /// The refusal of an `openPool` or `topUp` that a lane build reaches after the
-/// fetch it serves has ended ([`crate::SourceProvider::connect`]): the lane
+/// fetch it serves has ended, or of a build still queued on the open or
+/// `topUp` lock as it ends ([`crate::SourceProvider::connect`]): the lane
 /// would never run, so the escrow would fund nothing this fetch needs. The
 /// refused call escrows nothing. The build fails, and the drain of late lane
 /// builds logs it at `debug`.
@@ -165,7 +166,7 @@ pub(crate) fn refuse_after_end(ended: Option<&CancellationToken>) -> anyhow::Res
 /// comes first. A lane build queued behind a sibling that holds the lock
 /// through a receipt wait has sent nothing, so it ends at once rather than at
 /// the drain's bound. A fired `ended` refuses even a free lock. `None` takes
-/// the lock as a plain wait, as [`refuse_after_end`] refuses nothing.
+/// the lock as a plain wait, as `refuse_after_end(None)` refuses nothing.
 pub(crate) async fn lock_unless_ended<'a>(
     lock: &'a tokio::sync::Mutex<()>,
     ended: Option<&CancellationToken>,
@@ -1376,8 +1377,15 @@ where
         }
         Err(err) => err,
     };
+    if err.downcast_ref::<FetchEnded>().is_some() {
+        tracing::info!(
+            "buyer pool {} not topped up: the fetch ended before the topUp was sent",
+            state.pool_id,
+        );
+        return Err(err);
+    }
     // A refusal names its own cause; no wallet balance explains it.
-    if escrow_held(&err) || err.downcast_ref::<FetchEnded>().is_some() {
+    if escrow_held(&err) {
         return Err(err);
     }
     let Some(shortfall) = funding

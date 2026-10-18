@@ -31,6 +31,9 @@ since project inception and will roll into the first tagged release.
 - **`decdn-client`: `BundleOutcome::replaced` is a `Vec<PoolReplaced>`
   (#2519).** It lists every pool replacement the pull made, in order, a
   second-pass replacement too. Iterate it where code matched the `Option`.
+  `BundlePuller::replacements` lists the puller's every replacement, a
+  manifest fetch's and a cancelled pull's included, and
+  `RecoveryGate::replacements` does the same for one gate.
 - **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` return
   an `UnrecordedEscrow` beside the outcome (#2515).** `open_pool` returns
   `(OpenedPool, UnrecordedEscrow)` and `top_up` returns
@@ -1192,7 +1195,7 @@ since project inception and will roll into the first tagged release.
   balance. It fails, and the drain logs it at `debug`. The build checks before
   its allowance leg and again before the send, so a fetch that ends during an
   `approve` sends no `topUp` after it. A build already inside its `openPool` or
-  `topUp` call runs to its receipt, as before. The first open of a blob ends
+  `topUp` send (its nonce read, its submit) runs to its receipt, as before. The first open of a blob ends
   its builds the same way on a stop or an error. A re-fetch on the same
   lanes after a hash mismatch is a new fetch, so its builds can still escrow.
 - **Client, CLI: an escrow stays named until its record commits (#2515).**
@@ -1228,29 +1231,36 @@ since project inception and will roll into the first tagged release.
   the handle. A pull that is not interrupted now ends
   `BundleEnd::Stopped` on each pending escrow, as it does on an untracked one.
   `decdn get` names each one once.
-- **Client, CLI: `decdn get` names every pool a replacement closed, for a
-  blob too (#2519).** A blob `get` took its pool replacement only from the
-  error that ended the pass. A late lane build's escrow folded over the
-  replacement, and the command printed no "reclaim it with: decdn pool
-  reclaim" note for the closed pool. A second replacement, in the pass against
-  the new pool, named only the first closed pool, for a blob or a bundle
-  alike, though the command funded the pool the second one closed at the full
-  working deposit. Now a blob `get` also reads the replacement from the
-  recovery gate, and runs the rest again only when the replacement ended the
-  pass. Every closed pool gets its own reclaim note. A blob `get` under a
-  payer whose gate carries an earlier fetch's replacement (an entry's manifest
-  fetch, an earlier gateway request) starts clear of it, as a bundle pull
-  does.
+- **Client, CLI: `decdn get` names every pool a replacement closed, on
+  every exit (#2519).** Several paths printed no "reclaim it with: decdn pool
+  reclaim" note for a closed pool that may still hold a balance:
+  - a blob `get` took its replacement only from the error that ended the
+    pass, so a late lane build's escrow folded over it hid it;
+  - after a second replacement, in the pass against the new pool, the
+    command named only the first closed pool, for a blob or a bundle alike,
+    though it had funded the pool the second one closed at the full working
+    deposit;
+  - a Ctrl-C during a blob `get` dropped the note with the fetch;
+  - a bundle `get` whose manifest fetch replaced the pool named it nowhere,
+    and its error said the remaining work runs again, though nothing did.
+  Now the recovery gate lists every replacement its steps make, and the
+  command prints one reclaim note per closed pool as it ends, however it
+  ends. A replacement runs the rest again only when it ended the first pass.
+  A replaced manifest fetch says the new pool is current and the pull must
+  be run again. An entry URI's fetch starts clear of the replacement its
+  manifest fetch left, as a bundle pull does.
 - **Client: a lane build drained after its fetch ended sends no `topUp`
   re-send, and waits on no lock (#2520).** A `topUp` that lost its nonce to a
   concurrent transaction was re-sent after a quarter-second backoff even when
   the fetch ended meanwhile, so the run escrowed a top-up no lane would use.
-  A drained build also waited for the bundle-wide open lock and the run's
-  `topUp` lock before it checked the fetch end. A sibling that held either
+  A drained build also waited for the open-or-reuse lock (bundle-wide, or the
+  payer's for a blob `get`) and the run's `topUp` lock before it checked the
+  fetch end. A sibling that held either
   through its receipt wait kept the build waiting for the whole 30 s drain,
   which then logged "lane builds still running". Now the backoff ends with
   the fetch and the re-send is refused, and a build queued on either lock
-  ends at once with the fetch. Neither sent anything, so neither escrows.
+  ends at once with the fetch. Neither sent anything, so neither escrows. A
+  refill refused so logs that it was not sent, beside its "topping up" line.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its
@@ -3850,8 +3860,8 @@ since project inception and will roll into the first tagged release.
   a failed discovery costs no key unlock. `Funding` is the buyer's own pool or
   a delegated `CredentialSlot`. Progress reaches a `BundleObserver`, a
   `CancellationToken` stops the pull, and the result is a typed
-  `BundleOutcome` (`Complete`, `Interrupted`, `FundingNeeded`, `Stopped`) with
-  a `BundleReport`. The new public `decdn_client::session` module holds the
+  `BundleOutcome`: how it ended (`BundleEnd`: `Complete`, `Interrupted`,
+  `FundingNeeded`, `Stopped`), the pool replacements, and a `BundleReport`. The new public `decdn_client::session` module holds the
   inputs: `ChainConfig`, `PullSite`, `DepositPolicy`, `DiscoveryOptions`.
   `decdn bundle pull` is now a caller of it; its output, `--json` report and
   exit codes do not change. The pull future is not `Send`.

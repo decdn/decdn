@@ -41,6 +41,7 @@ pub async fn decdn_client::bundle::BundlePuller::fetch_manifest(&self, [u8; 32],
 pub async fn decdn_client::bundle::BundlePuller::finish(self)
 pub fn decdn_client::bundle::BundlePuller::funding_shortfall(&self) -> core::option::Option<alloc::string::String>
 pub async fn decdn_client::bundle::BundlePuller::pull(&mut self, &decdn_client::bundle::BundleManifest, &std::path::Path, bool, &tokio_util::sync::cancellation_token::CancellationToken) -> decdn_client::bundle::BundleOutcome
+pub fn decdn_client::bundle::BundlePuller::replacements(&self) -> alloc::vec::Vec<decdn_client::source::PoolReplaced>
 pub const fn decdn_client::bundle::BundlePuller::unconfirmed_escrows(&self) -> &decdn_client::buyer_pool::UnconfirmedEscrows
 impl core::fmt::Debug for decdn_client::bundle::BundlePuller
 pub fn decdn_client::bundle::BundlePuller::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -348,6 +349,7 @@ pub mod decdn_client::recovery
 pub struct decdn_client::recovery::RecoveryGate
 impl decdn_client::recovery::RecoveryGate
 pub fn decdn_client::recovery::RecoveryGate::new() -> Self
+pub fn decdn_client::recovery::RecoveryGate::replacements(&self) -> alloc::vec::Vec<decdn_client::source::PoolReplaced>
 pub fn decdn_client::recovery::RecoveryGate::start_next_pass(&self)
 pub fn decdn_client::recovery::RecoveryGate::with_settle(core::time::Duration) -> Self
 impl core::default::Default for decdn_client::recovery::RecoveryGate
@@ -778,6 +780,7 @@ pub fn decdn_client::RateAboveCeiling::fmt(&self, &mut core::fmt::Formatter<'_>)
 pub struct decdn_client::RecoveryGate
 impl decdn_client::recovery::RecoveryGate
 pub fn decdn_client::recovery::RecoveryGate::new() -> Self
+pub fn decdn_client::recovery::RecoveryGate::replacements(&self) -> alloc::vec::Vec<decdn_client::source::PoolReplaced>
 pub fn decdn_client::recovery::RecoveryGate::start_next_pass(&self)
 pub fn decdn_client::recovery::RecoveryGate::with_settle(core::time::Duration) -> Self
 impl core::default::Default for decdn_client::recovery::RecoveryGate

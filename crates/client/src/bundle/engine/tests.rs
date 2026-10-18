@@ -826,90 +826,65 @@ fn replacement(closed: u8, opened: u8) -> PoolReplaced {
     }
 }
 
-/// #2517: a replacement that ends the first pass runs the rest again and is
-/// reported.
+/// #2517: a replacement that ends the first pass runs the rest again.
 #[test]
 fn a_replacement_that_ends_the_pass_runs_again() {
     let new = replacement(0x01, 0x02);
     let run = ended_on(Some(anyhow::Error::new(new)), false);
-    let replacement = pass_replacement(&run, Some(new));
-    assert_eq!(replacement, PassReplacement::Rerun(new));
-    assert_eq!(
-        (replacement.rerun(), replacement.reported()),
-        (Some(new), Some(new))
-    );
+    assert_eq!(replaced_pool(&run), Some(new));
 }
 
 /// #2517: a sibling entry's recovery step replaces the pool while another
-/// entry's give-up ends the pass. Nothing runs again, since the pull ends,
-/// but the replacement is reported, so the caller names the closed pool's
+/// entry's give-up ends the pass. Nothing runs again, since the pull ends;
+/// the gate lists the replacement, so the caller names the closed pool's
 /// balance to reclaim.
 #[test]
-fn a_give_up_beside_a_siblings_replacement_reports_it_without_a_rerun() {
-    let new = replacement(0x01, 0x02);
+fn a_give_up_beside_a_siblings_replacement_runs_nothing_again() {
     let run = ended_on(Some(give_up()), false);
-    let replacement = pass_replacement(&run, Some(new));
-    assert_eq!(replacement, PassReplacement::ReportOnly(new));
-    assert_eq!(
-        (replacement.rerun(), replacement.reported()),
-        (None, Some(new))
-    );
+    assert_eq!(replaced_pool(&run), None);
 }
 
 /// #2517: a late escrow folded over the `PoolReplaced` that ended the pass
-/// leaves the replacement only as text, so it runs nothing again. The gate
-/// still reports it.
+/// leaves the replacement only as text, so it runs nothing again.
 #[test]
-fn a_replacement_under_a_late_escrow_is_reported_without_a_rerun() {
+fn a_replacement_under_a_late_escrow_runs_nothing_again() {
     let new = replacement(0x01, 0x02);
     let stopped = crate::scheduler::fold_late_escrow(
         Err::<(), _>(anyhow::Error::new(new)),
         Some(late_escrow(0xab)),
     )
     .err();
-    let run = ended_on(stopped, false);
-    assert_eq!(
-        pass_replacement(&run, Some(new)),
-        PassReplacement::ReportOnly(new)
-    );
+    assert_eq!(replaced_pool(&ended_on(stopped, false)), None);
 }
 
-/// #2517: an interrupted pass runs nothing again, but reports its
-/// replacement, and a pass with no replacement reports none.
+/// #2517: an interrupted pass runs nothing again, and a pass with no
+/// replacement has none to run against.
 #[test]
-fn an_interrupted_replacement_is_reported_without_a_rerun() {
+fn an_interrupted_replacement_runs_nothing_again() {
     let new = replacement(0x02, 0x03);
     let run = ended_on(Some(anyhow::Error::new(new)), true);
-    assert_eq!(
-        pass_replacement(&run, Some(new)),
-        PassReplacement::ReportOnly(new)
-    );
-    assert_eq!(
-        pass_replacement(&ended_on(None, false), None),
-        PassReplacement::None
-    );
+    assert_eq!(replaced_pool(&run), None);
+    assert_eq!(replaced_pool(&ended_on(None, false)), None);
 }
 
-/// #2519: a pull lists every replacement it made. A second pass that
-/// replaced the pool again lists the pool the first one opened as closed, so
-/// its balance is named too.
+/// #2519: a manifest fetch that a replacement ended runs nothing again, so
+/// its error names the new pool as the current one to run the pull against.
+/// Any other fault keeps its own text.
 #[test]
-fn a_pull_lists_every_replacement_it_made() {
-    let first = replacement(0x01, 0x02);
-    let second = replacement(0x02, 0x03);
-    assert_eq!(
-        pull_replacements(PassReplacement::Rerun(first), Some(second)),
-        [first, second]
+fn a_replaced_manifest_fetch_names_the_new_pool() {
+    let new = replacement(0x01, 0x02);
+    let err = manifest_fetch_error(anyhow::Error::new(new));
+    let text = format!("{err:#}");
+    assert!(
+        text.contains(&format!("pool {} is now the current pool", new.opened)),
+        "{text}"
     );
+    assert!(text.starts_with("fetch bundle manifest blob: "), "{text}");
+    assert_eq!(err.downcast_ref::<PoolReplaced>(), Some(&new));
     assert_eq!(
-        pull_replacements(PassReplacement::Rerun(first), None),
-        [first]
+        format!("{:#}", manifest_fetch_error(anyhow::anyhow!("not found"))),
+        "fetch bundle manifest blob: not found"
     );
-    assert_eq!(
-        pull_replacements(PassReplacement::ReportOnly(first), None),
-        [first]
-    );
-    assert_eq!(pull_replacements(PassReplacement::None, None), []);
 }
 
 /// A gate that holds the replacement of pool `0x01` by pool `0x02`, as a
@@ -945,6 +920,11 @@ async fn a_pull_after_a_carried_replacement_starts_on_the_new_pool() {
     let mut ledgers = LaneLedgers::new();
     leave_carried_replacement(&gate, &mut ledgers, &mut funding);
     assert_eq!(gate.replaced(), None, "the gate steps on the new pool");
+    assert_eq!(
+        gate.replacements(),
+        [replacement(0x01, 0x02)],
+        "the gate still lists it, for the caller to name"
+    );
     assert_eq!(funding.pool_id(), None, "the closed pool is not the run's");
     let _ = escrows.hold_untracked(&crate::buyer_pool::escrowed_but_untracked(
         "pool 0x01 topped up by 5 µUSDC",

@@ -156,6 +156,7 @@ async fn a_collided_top_up_sends_no_re_send_after_the_fetch_ends() {
         ended.cancel();
     };
     let pool = mocked_pool(asserter.clone());
+    let started = tokio::time::Instant::now();
     let (result, ()) = tokio::join!(
         top_up_unless_ended(
             &pool,
@@ -175,6 +176,10 @@ async fn a_collided_top_up_sends_no_re_send_after_the_fetch_ends() {
     );
     assert_eq!(escrows.pending(), vec![]);
     assert_eq!(asserter.read_q().len(), 2, "the re-send was never tried");
+    assert!(
+        started.elapsed() < super::TOPUP_NONCE_BACKOFF,
+        "the backoff ends with the fetch"
+    );
 }
 
 /// Two calls that hold equal entries each release their own: releasing one

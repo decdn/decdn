@@ -799,6 +799,9 @@ async fn pull_over(
         (filter, filters_given),
     )
     .await;
+    // On every exit, the manifest fetch's and a cancelled pull's included:
+    // each pool a recovery step closed may still hold a balance.
+    fetch::print_reclaim_notes(&puller.replacements());
     // Every exit of the manifest or the pull can drop an `openPool` or a
     // `topUp` before its record commits, and the transaction may still escrow,
     // or leave an untracked escrow on the handle that no returned error names.
@@ -870,9 +873,6 @@ async fn pull_manifest(
             never = watch => match never {},
         }
     };
-    for replaced in &outcome.replaced {
-        fetch::print_reclaim_note(replaced);
-    }
     observer.finish();
     warn_leftover_partials(out, &manifest.entries, uri.hash);
     let reported = report(&outcome.report, excluded, out, args.json);

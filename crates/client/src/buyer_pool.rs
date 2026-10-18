@@ -1330,8 +1330,8 @@ async fn send_top_up<P: Provider + Clone>(
 ) -> Result<(PendingTransactionBuilder<Ethereum>, u64)> {
     let mut nonce_retries = 0u32;
     loop {
-        // A collision broadcast nothing, so a fetch that ended since needs no
-        // re-send: its lane would never run.
+        // Refuse a send once the fetch ended: its lane would never run. Before
+        // a re-send this costs nothing, since the collision broadcast nothing.
         crate::funding::refuse_after_end(ended)?;
         let nonce = contract
             .provider()
@@ -1466,7 +1466,8 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 /// A submit rejected as a same-account nonce collision
 /// ([`decdn_incentive::tx::is_nonce_collision`]) broadcast nothing, so it is
 /// re-sent up to three more times, a quarter second apart, each time on a fresh
-/// pending nonce. A lane build's `topUp` re-sends none once its fetch ends.
+/// pending nonce. `top_up` re-sends regardless of any fetch; the crate's lane
+/// builds use a variant that re-sends none once their fetch ends.
 /// A node signs its sellers' redemptions and its buyer top-ups with one key, so a
 /// top-up can lose its nonce to a redemption sent at the same moment.
 ///

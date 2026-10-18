@@ -146,6 +146,27 @@ fn lane_record(
         .ok_or_else(|| anyhow::anyhow!("lane record missing"))
 }
 
+/// A relay-free endpoint bound on loopback, speaking `alpns`, and the
+/// address that dials it.
+async fn loopback(alpns: Vec<Vec<u8>>) -> anyhow::Result<(Endpoint, EndpointAddr)> {
+    let ep = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .alpns(alpns)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .bind_addr(std::net::SocketAddrV4::new(
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        ))?
+        .bind()
+        .await?;
+    let socket = ep
+        .bound_sockets()
+        .into_iter()
+        .find(std::net::SocketAddr::is_ipv4)
+        .ok_or_else(|| anyhow::anyhow!("no IPv4 socket"))?;
+    let addr = EndpointAddr::new(ep.id()).with_ip_addr(socket);
+    Ok((ep, addr))
+}
+
 /// Two bundle entries on one provider share one connection: each entry
 /// builds its own deps and lane, and both lanes open their streams on the
 /// command's connection to the node.
@@ -157,25 +178,6 @@ fn lane_record(
 async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()> {
     use crate::source::BlobSource as _;
     use std::sync::atomic::{AtomicU64, Ordering};
-
-    async fn loopback(alpns: Vec<Vec<u8>>) -> anyhow::Result<(Endpoint, EndpointAddr)> {
-        let ep = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .alpns(alpns)
-            .relay_mode(iroh::RelayMode::Disabled)
-            .bind_addr(std::net::SocketAddrV4::new(
-                std::net::Ipv4Addr::LOCALHOST,
-                0,
-            ))?
-            .bind()
-            .await?;
-        let socket = ep
-            .bound_sockets()
-            .into_iter()
-            .find(std::net::SocketAddr::is_ipv4)
-            .ok_or_else(|| anyhow::anyhow!("no IPv4 socket"))?;
-        let addr = EndpointAddr::new(ep.id()).with_ip_addr(socket);
-        Ok((ep, addr))
-    }
 
     // A node that accepts every connection and drops every stream it is
     // sent, so each open fails on a connection that stays up.
@@ -642,5 +644,96 @@ fn persist_watermark_records_a_delegated_lane() -> anyhow::Result<()> {
             )],
         "a rebase moves the delegate lane down"
     );
+    Ok(())
+}
+
+/// #2520: a lane build queued on the open-or-reuse lock behind a sibling that
+/// holds it through a receipt wait ends at once when its fetch ends, with the
+/// lock still held. It has sent nothing, so it does not wait out the drain of
+/// late lane builds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result<()> {
+    let (ep, addr) = loopback(Vec::new()).await?;
+    let dir = tempfile::tempdir()?;
+    let store: Arc<dyn BuyerPoolStore> =
+        Arc::new(RedbBuyerPoolStore::open(&dir.path().join("data"))?);
+    // An empty script: a build past the lock would fail its first chain read.
+    let rpc = alloy::providers::ProviderBuilder::new()
+        .connect_mocked_client(alloy::providers::mock::Asserter::new());
+    let contract = PaymentPool::new(Address::repeat_byte(0x33), rpc.clone());
+    let chain = ChainConfig {
+        rpc_url: "http://config:8545".to_string(),
+        chain_id: 1,
+        payment_pool: Address::repeat_byte(0x33),
+        slash_judge: Address::repeat_byte(0x44),
+        capacity_bond: None,
+    };
+    let site = PullSite {
+        data_dir: dir.path().to_path_buf(),
+        region: None,
+        region_allowlist: Vec::new(),
+    };
+    let slash_dom = decdn_incentive::slash_judge_domain(1, Address::repeat_byte(0x44));
+    let connections = Connections::new(ep.clone());
+    let writes = OrderedWrites::default();
+    let funding = RunFunding::default();
+    let deps = LaneDeps {
+        marks: None,
+        endpoint: &ep,
+        store: &store,
+        contract: &contract,
+        rpc: &rpc,
+        slash_dom: &slash_dom,
+        self_address: Address::repeat_byte(0x0A),
+        token: Address::repeat_byte(0x22),
+        chain: &chain,
+        site: &site,
+        deposit: DepositPolicy {
+            working_deposit: U256::from(1_000_000u64),
+            max_approve: false,
+            adoption: ChainAdoption::Refused,
+        },
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        max_rate_per_mb: 0,
+        max_blob_bytes: 0,
+        deadlines: PullDeadlines::new(Duration::from_secs(5), Duration::from_secs(5), 0)?,
+        connections: &connections,
+        writes: &writes,
+        funding: &funding,
+    };
+    let payer = OwnedPayer::for_store(Arc::new(PrivateKeySigner::random()), store.as_ref())?;
+    let voucher_dom = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+    let open_lock = tokio::sync::Mutex::new(());
+    let sibling = open_lock.lock().await;
+    let ended = CancellationToken::new();
+    let build = build_multi_lane(
+        &deps,
+        LanePayer::Owned(&payer),
+        &voucher_dom,
+        Address::repeat_byte(0xB0),
+        addr,
+        Some(&open_lock),
+        None,
+        &ended,
+    );
+    tokio::pin!(build);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut build)
+            .await
+            .is_err(),
+        "the build waits for the sibling's open"
+    );
+    ended.cancel();
+    let ended_build = tokio::time::timeout(Duration::from_secs(1), &mut build)
+        .await
+        .map_err(|_| anyhow::anyhow!("the build must end at once, the lock still held"))?;
+    let Err(err) = ended_build else {
+        anyhow::bail!("a build whose fetch ended must not build");
+    };
+    assert!(
+        err.downcast_ref::<crate::funding::FetchEnded>().is_some(),
+        "{err:#}"
+    );
+    drop(sibling);
     Ok(())
 }

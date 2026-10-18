@@ -2703,6 +2703,7 @@ async fn a_refill_queued_on_the_top_up_lock_ends_with_its_fetch() {
     ended_before_send(&err);
     drop(in_flight);
     assert!(rpc.sent_nonces().is_empty(), "the refill sends nothing");
+    assert!(funding.escrows().pending().is_empty(), "it holds nothing");
 }
 
 /// #2520: the open and `topUp` locks refuse a lane build once its fetch ended,
@@ -2719,6 +2720,26 @@ async fn a_lock_wait_ends_with_the_fetch() {
     let live = CancellationToken::new();
     drop(lock_unless_ended(&lock, Some(&live)).await.unwrap());
     drop(lock_unless_ended(&lock, None).await.unwrap());
+
+    // A wait that starts on a live token behind a held lock ends as the token
+    // fires, with the lock still held.
+    let held = lock.lock().await;
+    let wait = lock_unless_ended(&lock, Some(&live));
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
+            .await
+            .is_err(),
+        "the wait parks on the held lock"
+    );
+    live.cancel();
+    ended_before_send(
+        &tokio::time::timeout(std::time::Duration::from_millis(1), &mut wait)
+            .await
+            .expect("the wait ends as the token fires")
+            .unwrap_err(),
+    );
+    drop(held);
 }
 
 /// A credit that lands but whose row then reads as gone leaves the escrow

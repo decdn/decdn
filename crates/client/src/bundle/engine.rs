@@ -1031,7 +1031,11 @@ struct PullRun {
 
 /// The pool replacement that ended `run`, when a funding recovery step opened
 /// a new pool and the pass was not interrupted: the one the rest runs again
-/// against.
+/// against. Any other replacement runs nothing again: a sibling entry's step
+/// that replaced the pool while another entry's fault ended the pass, one
+/// that an untracked escrow ended the pass over (it survives in the error
+/// only as text), or one in an interrupted pass. The gate lists each of them
+/// ([`RecoveryGate::replacements`]).
 fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
     if run.interrupted {
         return None;
@@ -1061,74 +1065,32 @@ fn start_pass_on_new_pool(
 
 /// Start a pull clear of a replacement the gate holds from before it: a
 /// manifest fetch's, or an earlier pull's that ran nothing again or came in
-/// its second pass. It was reported then, and its new pool is the one this
-/// pull's lanes reuse, so the pull starts as a pass against that pool
-/// ([`start_pass_on_new_pool`]). Left on the gate, it would answer the pull's
-/// first recovery step with no step.
+/// its second pass. Its new pool is the one this pull's lanes reuse, so the
+/// pull starts as a pass against that pool ([`start_pass_on_new_pool`]). Left
+/// on the gate, it would answer the pull's first recovery step with no step.
+/// The gate still lists it ([`RecoveryGate::replacements`]).
 fn leave_carried_replacement(
     recovery: &RecoveryGate,
     ledgers: &mut LaneLedgers,
     funding: &mut RunFunding,
 ) {
-    if recovery.replaced().is_some() {
+    if recovery.leave_carried().is_some() {
         start_pass_on_new_pool(recovery, ledgers, funding);
     }
 }
 
-/// What a first pass's pool replacement asks of the pull
-/// ([`pass_replacement`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PassReplacement {
-    /// No step replaced the pool.
-    None,
-    /// The replacement ended the pass: the rest runs once more against the
-    /// new pool, and the caller is told of it.
-    Rerun(PoolReplaced),
-    /// A step replaced the pool, but something else ended the pass: nothing
-    /// runs again, since the pull ends, and the caller is told of it.
-    ReportOnly(PoolReplaced),
-}
-
-impl PassReplacement {
-    /// The replacement the rest runs again against.
-    const fn rerun(self) -> Option<PoolReplaced> {
-        match self {
-            Self::Rerun(replaced) => Some(replaced),
-            Self::None | Self::ReportOnly(_) => None,
-        }
-    }
-
-    /// The replacement the caller is told of.
-    const fn reported(self) -> Option<PoolReplaced> {
-        match self {
-            Self::Rerun(replaced) | Self::ReportOnly(replaced) => Some(replaced),
-            Self::None => None,
-        }
-    }
-}
-
-/// The pool replacement of `run`, a first pass, given `now`, the one the
-/// recovery gate holds as the pass ended ([`crate::RecoveryGate::replaced`]).
-///
-/// The replacement that ended the pass ([`replaced_pool`]) runs the rest
-/// again. Any other one the gate holds is only reported: a sibling entry's
-/// recovery step can replace the pool while another entry's fault ends the
-/// pass, and an untracked escrow can end the pass over the [`PoolReplaced`]
-/// that ended it. The closed pool may still hold a balance to reclaim.
-fn pass_replacement(run: &PullRun, now: Option<PoolReplaced>) -> PassReplacement {
-    match (replaced_pool(run), now) {
-        (Some(replaced), _) => PassReplacement::Rerun(replaced),
-        (None, Some(replaced)) => PassReplacement::ReportOnly(replaced),
-        (None, None) => PassReplacement::None,
-    }
-}
-
-/// Every pool replacement a pull made, in the order the steps made them:
-/// `first`, the first pass's ([`pass_replacement`]), then `second`, the one
-/// the gate holds after the pass against the new pool. Each closed pool may
-/// still hold a balance to reclaim.
-fn pull_replacements(first: PassReplacement, second: Option<PoolReplaced>) -> Vec<PoolReplaced> {
-    first.reported().into_iter().chain(second).collect()
+/// `err`, the fault that ended a manifest fetch, with what comes next. A
+/// manifest fetch runs nothing again against a pool a recovery step opened:
+/// the pull that follows it pays from that pool.
+fn manifest_fetch_error(err: anyhow::Error) -> anyhow::Error {
+    let err = match err.downcast_ref::<PoolReplaced>().copied() {
+        Some(replaced) => err.context(format!(
+            "pool {} is now the current pool; run the pull again to fetch from it",
+            replaced.opened
+        )),
+        None => err,
+    };
+    err.context("fetch bundle manifest blob")
 }
 
 /// How a pull that ended with `stopped` ends, once every pass ran.
@@ -1863,7 +1825,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             let fetched = self
                 .fetch_to_memory(hash, out_root)
                 .await
-                .context("fetch bundle manifest blob")?;
+                .map_err(manifest_fetch_error)?;
             if let Some(warning) = manifest_cache::store(out_root, hash, &fetched) {
                 self.warn(&warning);
             }
@@ -1885,9 +1847,10 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// remaining entries run once more against the new pool: lanes key on the
     /// pool, so the pass starts with fresh ledgers and funding facts, and each
     /// entry resumes the partial data it holds (ADR 003 § Funding recovery). A
-    /// second replacement ends the pull "funding needed". A replacement that
-    /// did not end the pass runs nothing again. The outcome reports every
-    /// replacement, a second one too ([`pull_replacements`]).
+    /// second replacement that ends the pass against the new pool ends the
+    /// pull "funding needed". A replacement that did not end the first pass
+    /// runs nothing again ([`replaced_pool`]). The outcome lists every
+    /// replacement the pull made, a second one too.
     pub(super) async fn run(
         &mut self,
         manifest: &super::BundleManifest,
@@ -1914,6 +1877,8 @@ impl<P: Provider + Clone> PullCtx<P> {
         // fails the pull.
         let saved = skip_cache::load(out_root);
         leave_carried_replacement(&self.recovery, &mut self.ledgers, &mut self.funding);
+        // The replacements this pull's steps make are the gate's from here on.
+        let replaced_before = self.recovery.replacements().len();
         // The lanes outlive one pull (a manifest fetch or an earlier pull of
         // this puller drew on them), so this pull's payment is what the
         // lanes' paid bytes grew by while it ran.
@@ -1928,10 +1893,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             .await;
         self.stop = self.stop.next_pass();
         let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
-        let replacement = pass_replacement(&run, self.recovery.replaced());
-        let rerun = replacement.rerun();
-        // The second pass's own replacement: the gate was cleared as it began.
-        let mut second_replaced = None;
+        let rerun = replaced_pool(&run);
         if let Some(new) = rerun {
             if let Some(observer) = &self.observer {
                 observer.pool_replaced(&new);
@@ -1944,7 +1906,6 @@ impl<P: Provider + Clone> PullCtx<P> {
                 .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
                 .await;
             self.stop = self.stop.next_pass();
-            second_replaced = self.recovery.replaced();
             run = merge_passes(run, second);
             paid = paid.saturating_add(self.ledgers.paid_bytes());
         }
@@ -1960,6 +1921,12 @@ impl<P: Provider + Clone> PullCtx<P> {
         let dedup = self.dedup_stats.take();
         let mut report = bundle_report(&outcomes, transfer, dedup, warnings);
         report.paid_bytes = u64::try_from(paid).unwrap_or(u64::MAX);
+        let replaced = self
+            .recovery
+            .replacements()
+            .get(replaced_before..)
+            .unwrap_or_default()
+            .to_vec();
         let escrows = self.funding.escrows();
         let end = pull_end(
             interrupted,
@@ -1971,7 +1938,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         BundleOutcome {
             report,
             end,
-            replaced: pull_replacements(replacement, second_replaced),
+            replaced,
         }
     }
 
