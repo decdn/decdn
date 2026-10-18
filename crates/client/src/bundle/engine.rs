@@ -1550,7 +1550,8 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// across the entry's holders ([`Self::entry_targets`]). See
     /// [`Self::acquire_entry`] for the fetch itself and what it returns.
     ///
-    /// `slot` is the caller's jobs permit; the fetch runs under it.
+    /// `slot` is the caller's jobs permit; the fetch runs under it, and stops
+    /// on `stop`.
     async fn fetch_to_staging(
         &self,
         hash: [u8; 32],
@@ -1558,10 +1559,11 @@ impl<P: Provider + Clone> PullCtx<P> {
         total: Option<u64>,
         progress: Option<&ProgressCallback>,
         slot: &FetchSlot<'_>,
+        stop: &StopPolicy,
     ) -> anyhow::Result<bool> {
         slot.ensure().await?;
         let targets = self.entry_targets(hash).await?;
-        self.acquire_entry(&targets, hash, staging, total, None, progress)
+        self.acquire_entry(&targets, hash, staging, total, None, progress, stop)
             .await
     }
 
@@ -1620,8 +1622,10 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// A holder that faults cools in the command-wide [`PeerHealth`] and
     /// returns inside the same loop, so a holder that fails one entry is
     /// rested for every entry. The fetch ends on done, a fault only the user
-    /// can fix, a unanimous verdict of the holders, or the command's
-    /// [`StopPolicy`]. Every lane draws vouchers from the run's shared
+    /// can fix, a unanimous verdict of the holders, or `stop`: the pull's own
+    /// policy for an entry, which a sibling entry halts, and an unhalted copy
+    /// on the same clock for a manifest. Every lane draws vouchers from the
+    /// run's shared
     /// `LaneLedgers` (ADR 039), serializes its pool open-or-reuse on
     /// `open_lock`, and holds one of its provider's stream permits
     /// ([`LaneStreamCap`]). Each lane's voucher watermark is persisted before
@@ -1632,6 +1636,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// the fetch dropped every byte the store held and fetched the blob again
     /// ([`Downloader::refetched_targets`]). A prefix an earlier run left is
     /// then fetched and paid again.
+    #[allow(clippy::too_many_arguments)]
     async fn acquire_entry(
         &self,
         targets: &ResolvedTargets,
@@ -1640,6 +1645,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         total: Option<u64>,
         ranges: Option<&[(u64, u64)]>,
         progress: Option<&ProgressCallback>,
+        stop: &StopPolicy,
     ) -> anyhow::Result<bool> {
         let max_blob_bytes = self.max_blob_bytes;
         let deps = self.drive_deps(max_blob_bytes)?;
@@ -1669,7 +1675,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 (total, holders)
             } else {
                 let claim = sources
-                    .first_claim(hash, holders, &self.health, &self.stop)
+                    .first_claim(hash, holders, &self.health, stop)
                     .await?;
                 (claim.total_bytes, claim.holders)
             };
@@ -1694,7 +1700,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 }],
                 &self.ledgers,
                 progress,
-                &self.stop,
+                stop,
             ))
             .await
             .map(|_paths| downloader.refetched_targets() > 0)
@@ -1859,7 +1865,10 @@ impl<P: Provider + Clone> PullCtx<P> {
         // The manifest blob fetch is silent (no bar): `progress` is disabled here
         // anyway, and the per-file bars belong to the entries, not the manifest.
         let slot = FetchSlot::acquire(&self.gate).await?;
-        self.fetch_to_staging(hash, &staging, None, None, &slot)
+        // A manifest belongs to no pass: a halt a pull left set, by a caller
+        // that dropped it mid-drain, does not stop it.
+        let stop = self.stop.next_pass();
+        self.fetch_to_staging(hash, &staging, None, None, &slot, &stop)
             .await?;
         let bytes =
             std::fs::read(&staging).with_context(|| format!("read {}", staging.display()))?;
@@ -2236,7 +2245,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             // manifest's `size`, when it gives one, is the entry's first size claim,
             // a hint; the paid count is the verified blob's length.
             let refetched = self
-                .fetch_to_staging(hash, staging, total, progress, slot)
+                .fetch_to_staging(hash, staging, total, progress, slot, &self.stop)
                 .await?;
             index.register(hints, staging);
             let len = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
@@ -2795,6 +2804,7 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, '_, P> {
                     Some(self.total),
                     Some(ranges),
                     self.progress,
+                    &self.ctx.stop,
                 )
                 .await?;
             if refetched {
