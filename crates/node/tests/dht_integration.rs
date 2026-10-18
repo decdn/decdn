@@ -279,12 +279,17 @@ const CONVERGENCE_ROUND_TIMEOUT: Duration = Duration::from_secs(10);
 /// scenarios back to measuring loopback latency and still green.
 const _: () = assert!(CONVERGENCE_ROUND_TIMEOUT.as_secs() > client::DHT_CLIENT_TIMEOUT.as_secs());
 
-/// Round budget for [`find_providers_tolerates_unreachable_peer`], where
-/// waiting a round out on a dead peer IS the scenario. Short, so the dead
-/// peer costs a 3s round rather than the 8s production default; nothing
-/// there has to answer within it, so no reachable peer's latency rides on
-/// this number.
+/// Round budget for [`find_providers_tolerates_unreachable_peer`], where a
+/// dead peer in the batch IS the scenario. It sits above
+/// `dht::client::DHT_DIAL_TIMEOUT` (2 s), so the dead peer's dial fails
+/// inside the round and the round drains on its own; a round that reaches
+/// this budget instead means the dial timeout did not bind. Short, so a
+/// regression costs 3 s rather than the 8 s production default; nothing here
+/// has to answer within it, so no reachable peer's latency rides on this
+/// number.
 const UNREACHABLE_ROUND_TIMEOUT: Duration = Duration::from_secs(3);
+
+const _: () = assert!(UNREACHABLE_ROUND_TIMEOUT.as_millis() > client::DHT_DIAL_TIMEOUT.as_millis());
 
 /// Wedge detector for [`find_providers_tolerates_unreachable_peer`], not
 /// a latency budget.
@@ -296,6 +301,17 @@ const UNREACHABLE_ROUND_TIMEOUT: Duration = Duration::from_secs(3);
 /// names the failure at the assertion rather than 150s later at the
 /// `.config/nextest.toml` backstop.
 const UNREACHABLE_HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// The value of the unlabeled counter `name` in `metrics`' Prometheus text, or
+/// 0 when it is absent.
+fn counter(metrics: &Metrics, name: &str) -> u64 {
+    let text = metrics.encode().expect("encode metrics");
+    let prefix = format!("{name} ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
 
 fn lookup_cfg_with_round_timeout(round_timeout: Duration) -> LookupConfig {
     LookupConfig {
@@ -481,9 +497,17 @@ async fn find_providers_converges_after_peer_departs() -> anyhow::Result<()> {
 /// folds in the live provider's record. The `find_providers` call is
 /// bounded by a wall-clock guard so a regression that *hangs* on an
 /// unresponsive peer surfaces as a clear failure rather than a stuck
-/// test (the lookup legitimately waits a round out while the dead peer's
-/// dial fails, then converges).
+/// test.
+///
+/// The dead peer costs the lookup its dial budget, not the round (#2532):
+/// the dial times out at `DHT_DIAL_TIMEOUT`, the round drains before
+/// `UNREACHABLE_ROUND_TIMEOUT`, the dial-timeout counter moves and the
+/// round-timeout counter does not, and the routing table marks the peer. A
+/// second lookup against the same table then skips the dead peer outright:
+/// no further dial timeout, and the provider comes back well inside one dial
+/// budget.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
     let client_sk = fresh_key();
     let client_id = client_sk.public();
@@ -525,12 +549,14 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
 
     // Guard against a hang regression. The routing table holds two peers and
     // `alpha` is 3, so round one queries both: the provider answers at once and
-    // the dead peer never does, which spends one whole
-    // `UNREACHABLE_ROUND_TIMEOUT` on the drain. The next pass then has no
-    // unqueried candidates and breaks BEFORE arming a second round, so one
-    // round is the real cost here — see `UNREACHABLE_HANG_GUARD` for why the
-    // guard is nonetheless sized against the lookup's `MAX_LOOKUP_ROUNDS`
+    // the dead peer never does, so its dial fails at `DHT_DIAL_TIMEOUT` and the
+    // round drains before `UNREACHABLE_ROUND_TIMEOUT`. The next pass then has
+    // no unqueried candidates and breaks BEFORE arming a second round, so one
+    // dial budget is the real cost here — see `UNREACHABLE_HANG_GUARD` for why
+    // the guard is nonetheless sized against the lookup's `MAX_LOOKUP_ROUNDS`
     // ceiling rather than against this scenario's own path.
+    let metrics = Metrics::new();
+    let started = std::time::Instant::now();
     let providers = tokio::time::timeout(
         UNREACHABLE_HANG_GUARD,
         find_providers(
@@ -541,11 +567,12 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
             NodeId::from_bytes(*client_id.as_bytes()),
             ContentHash::from_bytes(target),
             lookup_cfg_with_round_timeout(UNREACHABLE_ROUND_TIMEOUT),
-            None,
+            Some(&metrics),
         ),
     )
     .await
     .expect("lookup must not hang when a queried peer is unreachable");
+    let first_elapsed = started.elapsed();
 
     assert_eq!(
         providers,
@@ -558,6 +585,64 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
     assert!(
         !providers.iter().any(|(node, _)| *node == dead_id),
         "the unreachable peer must never appear as a provider"
+    );
+    assert!(
+        first_elapsed < UNREACHABLE_ROUND_TIMEOUT,
+        "the dead peer's dial must fail inside the round, not run it to its timeout: {first_elapsed:?}"
+    );
+    assert_eq!(
+        counter(&metrics, "decdn_dht_lookup_dial_timeouts_total"),
+        1,
+        "the dead peer's dial is one dial timeout"
+    );
+    assert_eq!(
+        counter(&metrics, "decdn_dht_lookup_round_timeouts_total"),
+        0,
+        "the round drains on the dial timeout; it does not reach its own"
+    );
+    assert!(
+        routing
+            .lock()
+            .expect("routing table mutex")
+            .is_cooling(&dead_id, std::time::Instant::now()),
+        "the routing table marks the peer whose dial timed out"
+    );
+
+    // The second lookup skips the dead peer: no dial, no second dial timeout,
+    // and the provider answers at loopback speed.
+    let started = std::time::Instant::now();
+    let providers = tokio::time::timeout(
+        UNREACHABLE_HANG_GUARD,
+        find_providers(
+            &client_ep,
+            &routing,
+            &staker_set,
+            &neg,
+            NodeId::from_bytes(*client_id.as_bytes()),
+            ContentHash::from_bytes(target),
+            lookup_cfg_with_round_timeout(UNREACHABLE_ROUND_TIMEOUT),
+            Some(&metrics),
+        ),
+    )
+    .await
+    .expect("lookup must not hang when a cooling peer is skipped");
+    let second_elapsed = started.elapsed();
+    assert_eq!(
+        providers,
+        vec![(
+            NodeId::from_bytes(*provider.id.as_bytes()),
+            Coverage::full(1)
+        )],
+        "the second lookup still reaches the live provider"
+    );
+    assert!(
+        second_elapsed < client::DHT_DIAL_TIMEOUT,
+        "a lookup that skips the dead peer must not spend a dial budget on it: {second_elapsed:?}"
+    );
+    assert_eq!(
+        counter(&metrics, "decdn_dht_lookup_dial_timeouts_total"),
+        1,
+        "the skipped peer is not dialed again"
     );
 
     let (provider_task, provider_ep) = provider.into_teardown_parts();
@@ -628,6 +713,118 @@ async fn find_providers_converges_via_closer_nodes_second_round() -> anyhow::Res
     let (seed_task, seed_ep) = seed.into_teardown_parts();
     let (holder_task, holder_ep) = holder.into_teardown_parts();
     support::shutdown([seed_task, holder_task], [&client_ep, &seed_ep, &holder_ep]).await?;
+    Ok(())
+}
+
+/// A dead peer reached through a `closer_nodes` referral is skipped by the
+/// next lookup like a dead table peer (#2532). The client's table holds only
+/// `seed`, which refers it to a `holder` that is shut down before the lookup
+/// runs. The holder is in no bucket of the client's table, so a cooldown that
+/// keyed on table membership would forget its dial timeout, and the next
+/// lookup that `seed` refers to it would spend another dial budget on it.
+///
+/// Round 2 against the dead holder fails at `DHT_DIAL_TIMEOUT`, the lookup
+/// returns no provider, and the client's table marks the holder without
+/// inserting it. A second lookup follows the same referral, skips the holder,
+/// and sends no second dial: the dial-timeout counter stays at one and the
+/// lookup finishes inside one dial budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn find_providers_skips_a_dead_referral_on_the_next_lookup() -> anyhow::Result<()> {
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+
+    let holder = spin_up_server(HashSet::new()).await?;
+    let holder_bytes = *holder.id.as_bytes();
+    let holder_id = NodeId::from_bytes(holder_bytes);
+    let target: [u8; 32] = holder_bytes;
+    prime_iroh_cache(&client_ep, client_id.as_bytes(), &holder).await?;
+
+    let seed = spin_up_server(HashSet::new()).await?;
+    let seed_id = NodeId::from_bytes(*seed.id.as_bytes());
+    seed.routing.lock().unwrap().insert(holder_id);
+    prime_iroh_cache(&client_ep, client_id.as_bytes(), &seed).await?;
+
+    holder.shutdown().await?;
+
+    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
+    routing.lock().unwrap().insert(seed_id);
+
+    let mut client_staked = HashSet::new();
+    client_staked.insert(seed_id);
+    client_staked.insert(holder_id);
+    let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
+    let neg = NegativeProbeCache::new();
+    let metrics = Metrics::new();
+
+    let providers = tokio::time::timeout(
+        UNREACHABLE_HANG_GUARD,
+        find_providers(
+            &client_ep,
+            &routing,
+            &staker_set,
+            &neg,
+            NodeId::from_bytes(*client_id.as_bytes()),
+            ContentHash::from_bytes(target),
+            lookup_cfg_with_round_timeout(UNREACHABLE_ROUND_TIMEOUT),
+            Some(&metrics),
+        ),
+    )
+    .await
+    .expect("lookup must not hang on a dead referral");
+    assert!(
+        providers.is_empty(),
+        "the only holder is dead, so the lookup finds no provider: {providers:?}"
+    );
+    assert_eq!(
+        counter(&metrics, "decdn_dht_lookup_dial_timeouts_total"),
+        1,
+        "the dead referral costs one dial timeout"
+    );
+    {
+        let table = routing.lock().expect("routing table mutex");
+        assert!(
+            !table.contains(&holder_id),
+            "a referral does not enter the table"
+        );
+        assert!(
+            table.is_cooling(&holder_id, std::time::Instant::now()),
+            "the table marks the dead referral all the same"
+        );
+    }
+
+    let started = std::time::Instant::now();
+    let providers = tokio::time::timeout(
+        UNREACHABLE_HANG_GUARD,
+        find_providers(
+            &client_ep,
+            &routing,
+            &staker_set,
+            &neg,
+            NodeId::from_bytes(*client_id.as_bytes()),
+            ContentHash::from_bytes(target),
+            lookup_cfg_with_round_timeout(UNREACHABLE_ROUND_TIMEOUT),
+            Some(&metrics),
+        ),
+    )
+    .await
+    .expect("lookup must not hang when a referral is skipped");
+    let elapsed = started.elapsed();
+    assert!(providers.is_empty());
+    assert_eq!(
+        counter(&metrics, "decdn_dht_lookup_dial_timeouts_total"),
+        1,
+        "the second lookup skips the dead referral instead of dialing it again"
+    );
+    assert!(
+        elapsed < client::DHT_DIAL_TIMEOUT,
+        "a lookup that skips the dead referral spends no dial budget on it: {elapsed:?}"
+    );
+
+    let (seed_task, seed_ep) = seed.into_teardown_parts();
+    support::shutdown([seed_task], [&client_ep, &seed_ep]).await?;
     Ok(())
 }
 

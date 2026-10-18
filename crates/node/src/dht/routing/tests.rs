@@ -248,3 +248,99 @@ fn non_empty_bucket_fills_reports_counts_ascending_and_omits_empty() {
     // Only the two populated buckets, ascending by index, with real counts.
     assert_eq!(fills, vec![(10, 3), (200, 1)]);
 }
+
+#[test]
+fn mark_unreachable_cools_a_peer_until_the_cooldown_lapses() {
+    let mut t = RoutingTable::new(id(0));
+    let now = Instant::now();
+    t.insert(id(1));
+    assert!(t.mark_unreachable(id(1), now));
+    assert!(t.is_cooling(&id(1), now));
+    assert!(t.is_cooling(
+        &id(1),
+        now + DIAL_FAILURE_COOLDOWN.saturating_sub(Duration::from_millis(1))
+    ));
+    assert!(!t.is_cooling(&id(1), now + DIAL_FAILURE_COOLDOWN));
+    assert_eq!(t.cooling_peers(now), HashSet::from([id(1)]));
+
+    // The lapsed snapshot sweeps the entry.
+    assert!(t.cooling_peers(now + DIAL_FAILURE_COOLDOWN).is_empty());
+    assert!(!t.is_cooling(&id(1), now));
+    assert!(
+        t.contains(&id(1)),
+        "the sweep leaves the peer in its bucket"
+    );
+}
+
+#[test]
+fn a_second_dial_timeout_extends_the_skip_from_its_own_instant() {
+    let mut t = RoutingTable::new(id(0));
+    t.insert(id(1));
+    let first = Instant::now();
+    let second = first + Duration::from_secs(100);
+    assert!(t.mark_unreachable(id(1), first));
+    assert!(t.mark_unreachable(id(1), second));
+    assert!(t.is_cooling(&id(1), first + DIAL_FAILURE_COOLDOWN));
+    assert!(!t.is_cooling(&id(1), second + DIAL_FAILURE_COOLDOWN));
+}
+
+#[test]
+fn a_cooling_peer_stays_in_the_table_and_in_closest() {
+    let mut t = RoutingTable::new(id(0));
+    t.insert(id(1));
+    t.insert(id(2));
+    let now = Instant::now();
+    assert!(t.mark_unreachable(id(1), now));
+    assert!(t.contains(&id(1)));
+    assert_eq!(t.len(), 2);
+    let closest = t.closest(id(1).as_bytes(), 2);
+    assert_eq!(
+        closest,
+        vec![id(1), id(2)],
+        "closest() does not apply the skip"
+    );
+}
+
+#[test]
+fn an_insert_or_refresh_of_a_cooling_peer_ends_the_skip() {
+    let mut t = RoutingTable::new(id(0));
+    t.insert(id(1));
+    let now = Instant::now();
+    assert!(t.mark_unreachable(id(1), now));
+    assert!(!t.insert(id(1)), "a refresh, not a fresh insert");
+    assert!(!t.is_cooling(&id(1), now));
+}
+
+#[test]
+fn a_removed_peer_is_no_longer_cooling() {
+    let mut t = RoutingTable::new(id(0));
+    t.insert(id(1));
+    let now = Instant::now();
+    assert!(t.mark_unreachable(id(1), now));
+    assert!(t.remove(&id(1)));
+    assert!(!t.is_cooling(&id(1), now));
+    assert!(t.cooling_peers(now).is_empty());
+}
+
+/// A lookup dials peers that a `closer_nodes` answer named, and such a peer
+/// need not be in a bucket of this table. Its dial failure is kept all the
+/// same, so the next lookup that is referred to it skips it.
+#[test]
+fn a_referred_peer_outside_the_table_is_marked_too() {
+    let mut t = RoutingTable::new(id(0));
+    let now = Instant::now();
+    assert!(!t.contains(&id(7)));
+    assert!(t.mark_unreachable(id(7), now));
+    assert!(t.is_cooling(&id(7), now));
+    assert_eq!(t.cooling_peers(now), HashSet::from([id(7)]));
+    assert!(!t.contains(&id(7)), "marking does not insert the peer");
+    assert!(t.cooling_peers(now + DIAL_FAILURE_COOLDOWN).is_empty());
+}
+
+#[test]
+fn mark_unreachable_ignores_the_self_id() {
+    let mut t = RoutingTable::new(id(0));
+    let now = Instant::now();
+    assert!(!t.mark_unreachable(id(0), now));
+    assert!(!t.is_cooling(&id(0), now));
+}

@@ -556,6 +556,49 @@ mod adr_013_error_codes {
         Ok(())
     }
 
+    /// A peer that never answers the QUIC handshake fails the exchange at
+    /// `DHT_DIAL_TIMEOUT` with a bare `DialTimeout` naming it, not at the
+    /// whole-exchange `DHT_CLIENT_TIMEOUT` (#2532). The peer's socket is
+    /// closed before the dial, so the handshake goes to an address nothing
+    /// listens on, which is what a bonded peer that is offline looks like
+    /// through the registry mirror.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_fails_an_unanswered_dial_at_the_dial_timeout() -> anyhow::Result<()> {
+        let dead_sk = fresh_key();
+        let dead_id = dead_sk.public();
+        let (dead_ep, dead_addr) = local_endpoint(dead_sk, vec![ALPN_DHT.to_vec()]).await?;
+        dead_ep.close().await;
+        let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+        let target = EndpointAddr::new(dead_id).with_ip_addr(dead_addr);
+
+        let started = std::time::Instant::now();
+        let result = decdn_node::dht::client::find_value(
+            &client_ep,
+            target,
+            ContentHash::from_bytes([0x11; 32]),
+            NodeId::from_bytes(*client_ep.id().as_bytes()),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let Err(err) = result else {
+            anyhow::bail!("a dial of a closed peer must fail");
+        };
+        let Some(timeout) = err.downcast_ref::<decdn_node::dht::client::DialTimeout>() else {
+            anyhow::bail!("the failure must be a bare DialTimeout, got: {err:#}");
+        };
+        anyhow::ensure!(
+            timeout.peer == NodeId::from_bytes(*dead_id.as_bytes()),
+            "the DialTimeout names the peer that did not answer"
+        );
+        anyhow::ensure!(
+            elapsed >= decdn_node::dht::client::DHT_DIAL_TIMEOUT
+                && elapsed < decdn_node::dht::client::DHT_CLIENT_TIMEOUT / 2,
+            "the dial must fail at the dial budget, not the exchange budget: {elapsed:?}"
+        );
+        shutdown([], [&client_ep]).await?;
+        Ok(())
+    }
+
     /// A request frame announced past [`decdn_protocol::MAX_DHT_FRAME`] →
     /// `APP_ERR_MESSAGE_TOO_LARGE` (0x02), refused on the length prefix alone
     /// (ADR 013 § Wire Framing). The client writes the prefix and a few body

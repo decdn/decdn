@@ -33,11 +33,48 @@ use decdn_protocol::{
 use iroh::endpoint::{ConnectOptions, Connection};
 use iroh::{Endpoint, EndpointAddr};
 
-/// Per-request hard timeout for outbound DHT exchanges. Shorter than
-/// the sum of the server-side accept-bi timeout (5s) and read
-/// timeout (5s) in [`crate::handlers::dht`] so a hung peer doesn't
-/// wedge a republish sweep.
+/// Per-request hard timeout for outbound DHT exchanges: the dial, the request
+/// and the response together. Shorter than the sum of the server-side
+/// accept-bi timeout (5s) and read timeout (5s) in [`crate::handlers::dht`] so
+/// a hung peer doesn't wedge a republish sweep. The dial inside it has its own,
+/// shorter budget, [`DHT_DIAL_TIMEOUT`].
 pub const DHT_CLIENT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Budget for the QUIC dial of an outbound DHT exchange: the connect and the
+/// handshake, before any request byte. A bonded peer that is offline still
+/// resolves an address from the registry mirror ([`super::dial_addrs`]), so
+/// the handshake goes out and nothing answers it, and iroh's own connect bound
+/// is 10 s. Two seconds is two inter-continental round trips with relay slack.
+/// It is well under the lookup's round timeout
+/// ([`super::lookup::DEFAULT_ROUND_TIMEOUT`]), so a dead peer costs a lookup
+/// one dial budget, not a whole round, and the lookup learns which peer it was
+/// (#2532). The probe path budgets 1 s for a dial and an exchange
+/// ([`crate::selection::PROBE_TIMEOUT`]).
+pub const DHT_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The QUIC dial of an outbound DHT exchange did not complete within
+/// [`DHT_DIAL_TIMEOUT`]. A distinct type, returned without further context, so
+/// a caller can `downcast_ref` it out of the [`anyhow::Error`] and tell a peer
+/// that did not answer the handshake from a stream drop or a malformed
+/// response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialTimeout {
+    /// The peer that did not answer the handshake.
+    pub peer: NodeId,
+}
+
+impl std::fmt::Display for DialTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dht client: dial of {} timed out after {} ms",
+            self.peer,
+            DHT_DIAL_TIMEOUT.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for DialTimeout {}
 
 /// Send a single `FindNode` request to `target` and return the response.
 ///
@@ -158,7 +195,7 @@ pub async fn find_value(
 /// Inner: connect, `open_bi`, write request frame, read response
 /// frame, decode. Wraps the whole sequence in a single
 /// [`DHT_CLIENT_TIMEOUT`] so a hung peer can't block the caller's
-/// scheduler indefinitely.
+/// scheduler indefinitely, and the dial inside it in [`DHT_DIAL_TIMEOUT`].
 async fn exchange(
     endpoint: &Endpoint,
     target: EndpointAddr,
@@ -173,17 +210,27 @@ async fn exchange(
 /// that needs a typed two-phase encode (e.g. `store` via
 /// [`encode_store_request`]) can hand over its bytes directly, keeping
 /// the connect/exchange plumbing in one place.
+///
+/// # Errors
+///
+/// A dial that [`DHT_DIAL_TIMEOUT`] cuts off is a bare [`DialTimeout`]; every
+/// other failure carries its stage as context.
 async fn exchange_payload(
     endpoint: &Endpoint,
     target: EndpointAddr,
     payload: &[u8],
 ) -> anyhow::Result<wire::DhtMessage> {
+    let peer = NodeId::from_bytes(*target.id.as_bytes());
     let response = tokio::time::timeout(DHT_CLIENT_TIMEOUT, async {
-        let connecting = endpoint
-            .connect_with_opts(target, ALPN_DHT, ConnectOptions::new())
-            .await
-            .context("dht client: connect failed")?;
-        let conn = connecting.await.context("dht client: handshake failed")?;
+        let conn = tokio::time::timeout(DHT_DIAL_TIMEOUT, async {
+            let connecting = endpoint
+                .connect_with_opts(target, ALPN_DHT, ConnectOptions::new())
+                .await
+                .context("dht client: connect failed")?;
+            connecting.await.context("dht client: handshake failed")
+        })
+        .await
+        .map_err(|_| anyhow::Error::new(DialTimeout { peer }))??;
         let resp = exchange_on(&conn, payload).await?;
         // `0u32` = "no app error"; matches the server's normal-close
         // code so the peer's `conn.closed()` arm reads the same way

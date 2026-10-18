@@ -122,6 +122,8 @@ Each node maintains a Kademlia routing table: **k-buckets** partitioned by XOR d
 | Bucket refresh interval | 1 hour | Keeps routing table fresh |
 | Routing table storage | In-memory | Rebuilt via bootstrap on restart |
 
+A bonded peer can be offline. The registry seeds every bonded peer into every routing table, and a bond does not say whether the node behind it answers. A node bounds the dial of each lookup RPC separately from the RPC itself, and the dial budget is shorter than the lookup's round timeout, so a peer that never answers its handshake costs a lookup one dial budget, not a round. The node then marks that peer in its routing table and its own lookups skip the peer for a cooldown. A lookup seeds itself from the nearest peers that are not skipped, and it does not follow a `closer_nodes` referral to a skipped peer. A peer the node reached only through a referral is marked the same way. The peer stays in the table, and the node still names it in `closer_nodes` answers: the skip is local. The skip ends when the cooldown lapses or when the node inserts or refreshes the peer again, which a request from that peer does.
+
 #### Content Records and TTL
 
 Content records are stored in-memory at the K nodes closest to the hash in keyspace.

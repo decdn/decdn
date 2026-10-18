@@ -40,7 +40,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use decdn_protocol::Coverage;
 use indexmap::IndexMap;
@@ -66,8 +66,15 @@ pub const DEFAULT_K: NonZeroUsize = match NonZeroUsize::new(K_BUCKET_SIZE) {
 };
 /// Default round timeout. Belt over the per-RPC 8s timeout in
 /// [`super::client`]; bounds the wall-clock budget for a single
-/// iteration even if a few peers hang.
+/// iteration even if a few peers hang. A peer that never answers its dial
+/// costs the round [`client::DHT_DIAL_TIMEOUT`], not this budget: the dial
+/// fails first, the round drains, and the lookup skips the peer for
+/// [`crate::dht::routing::DIAL_FAILURE_COOLDOWN`] (#2532).
 pub const DEFAULT_ROUND_TIMEOUT: Duration = Duration::from_secs(8);
+
+// The dial budget has to fail before the round does, or a dead peer costs the
+// whole round and the lookup never learns which peer it was.
+const _: () = assert!(client::DHT_DIAL_TIMEOUT.as_millis() < DEFAULT_ROUND_TIMEOUT.as_millis());
 
 /// Hard ceiling on the number of rounds one lookup may run (#1145 review).
 ///
@@ -127,12 +134,21 @@ impl Default for LookupConfig {
 /// `warn!`; round-timeout aborts log the aborted-peer count at
 /// `warn!`. The lookup is best-effort by spec; total failure
 /// manifests as an empty return.
+///
+/// A peer that does not answer its dial within [`client::DHT_DIAL_TIMEOUT`],
+/// or that a round timeout aborts, is marked in the routing table
+/// ([`RoutingTable::mark_unreachable`]), and this node's lookups skip it for
+/// [`crate::dht::routing::DIAL_FAILURE_COOLDOWN`]: it is left out of the seed
+/// and not added from a `closer_nodes` answer (#2532). The skip is this node's
+/// own; the peer stays in the table and in the answers this node gives.
+///
 /// `metrics` is optional so the DHT test suite can drive a lookup without standing one up;
 /// the production caller always passes `Some`, and it is the only way the round ceiling
-/// below becomes observable.
+/// and the dial timeouts below become observable.
 ///
-/// Runs inside a `dht_lookup` span that records the `rounds` run and the
-/// `providers` found; each round's per-peer RPCs run inside it too.
+/// Runs inside a `dht_lookup` span that records the `rounds` run, the
+/// `providers` found and the `cooling` peers skipped; each round's per-peer
+/// RPCs run inside it too.
 // One argument over the threshold, and every one of them is a distinct collaborator the
 // lookup genuinely needs. Bundling them into a struct would move the same list one level out
 // without making any call site clearer.
@@ -144,6 +160,7 @@ impl Default for LookupConfig {
         hash = %target,
         rounds = tracing::field::Empty,
         providers = tracing::field::Empty,
+        cooling = tracing::field::Empty,
     )
 )]
 pub async fn find_providers(
@@ -161,6 +178,7 @@ pub async fn find_providers(
     }
     let ctx = LookupCtx {
         endpoint,
+        routing_table,
         staker_set: staker_set.as_ref(),
         negative_cache,
         requester_id,
@@ -208,10 +226,12 @@ pub async fn find_providers(
         }
     }
 
+    let cooling_skipped = state.cooling_skipped;
     let providers = state.into_randomised_providers();
     let span = tracing::Span::current();
     span.record("rounds", rounds_run);
     span.record("providers", providers.len());
+    span.record("cooling", cooling_skipped);
     providers
 }
 
@@ -225,10 +245,11 @@ pub async fn find_providers(
 ///   invalid id: a corrupt routing table, or a staker-set seeded
 ///   with malformed `NodeId` bytes. Either is actionable and gets a
 ///   `warn!`.
-/// - **`Transport(_)`** — a generic transport-level RPC failure
-///   (connect timeout, stream drop, malformed response decode).
-///   Expected best-effort outcome per the function docstring;
-///   logged at `debug!`.
+/// - **`Transport(_)`** — a transport-level RPC failure: a dial that
+///   [`client::DHT_DIAL_TIMEOUT`] cut off (a bare [`client::DialTimeout`],
+///   which marks the peer in the routing table), a stream drop, or a
+///   malformed response decode. Expected best-effort outcome per the
+///   function docstring; logged at `debug!`.
 enum RoundRpcError {
     InvalidPubKey,
     Transport(anyhow::Error),
@@ -237,6 +258,7 @@ enum RoundRpcError {
 /// Shared inputs to a lookup round.
 struct LookupCtx<'a> {
     endpoint: &'a Endpoint,
+    routing_table: &'a Arc<Mutex<RoutingTable>>,
     staker_set: &'a dyn StakerSet,
     negative_cache: &'a NegativeProbeCache,
     requester_id: NodeId,
@@ -276,15 +298,18 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
     }
 
     let mut observed_closer = false;
+    let mut answered: HashSet<NodeId> = HashSet::with_capacity(batch.len());
     let drain = async {
         while let Some(joined) = tasks.join_next().await {
             match joined {
                 Ok((responder, Ok(resp))) => {
+                    answered.insert(responder);
                     if process_response(ctx, resp, responder, state) {
                         observed_closer = true;
                     }
                 }
                 Ok((responder, Err(RoundRpcError::InvalidPubKey))) => {
+                    answered.insert(responder);
                     // Bytes already survived the routing-table seed
                     // and/or three response filters; failing Ed25519
                     // decode here points at state corruption upstream.
@@ -294,6 +319,13 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
                     );
                 }
                 Ok((responder, Err(RoundRpcError::Transport(err)))) => {
+                    answered.insert(responder);
+                    if err.downcast_ref::<client::DialTimeout>().is_some() {
+                        if let Some(metrics) = ctx.metrics {
+                            metrics.dht_lookup_dial_timeout();
+                        }
+                        mark_unreachable(ctx, responder);
+                    }
                     debug!(peer = %responder, error = %err, "dht lookup: find_value RPC failed");
                 }
                 Err(err) => {
@@ -322,9 +354,35 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
             "dht lookup: round timeout fired; aborting in-flight RPCs"
         );
         tasks.abort_all();
+        // A peer still in flight at the round deadline accepted the dial
+        // and then stalled; the next lookups skip it like one that never
+        // answered.
+        for peer in batch.iter().filter(|peer| !answered.contains(peer)) {
+            mark_unreachable(ctx, *peer);
+        }
     }
 
     observed_closer
+}
+
+/// Mark `peer` in the routing table so this node's lookups skip it for
+/// [`crate::dht::routing::DIAL_FAILURE_COOLDOWN`].
+fn mark_unreachable(ctx: &LookupCtx<'_>, peer: NodeId) {
+    let now = Instant::now();
+    let marked = match ctx.routing_table.lock() {
+        Ok(mut table) => table.mark_unreachable(peer, now),
+        Err(poisoned) => {
+            warn!("dht lookup: routing table mutex poisoned; recovering inner state");
+            poisoned.into_inner().mark_unreachable(peer, now)
+        }
+    };
+    if marked {
+        debug!(
+            peer = %peer,
+            cooldown_s = crate::dht::routing::DIAL_FAILURE_COOLDOWN.as_secs(),
+            "dht lookup: peer did not answer; lookups skip it for the cooldown"
+        );
+    }
 }
 
 /// Apply the three lookup-integrity filters to one response and
@@ -461,6 +519,15 @@ struct LookupState {
     /// Smallest XOR distance among queried nodes so far. New
     /// candidates only count as "closer" if they beat this.
     best_queried_distance: [u8; NODE_ID_LEN],
+    /// Peers the routing table skips at the start of this lookup: a dial of
+    /// each timed out within the cooldown. A snapshot, taken under the same
+    /// lock as the seed; [`Self::add_candidate`] rejects them, from the seed
+    /// and from `closer_nodes` alike.
+    cooling: HashSet<NodeId>,
+    /// Candidates [`Self::add_candidate`] rejected as cooling, one per
+    /// rejection, so a peer that several answers name counts each time; the
+    /// `cooling` field of the `dht_lookup` span.
+    cooling_skipped: u32,
     k: usize,
     alpha: usize,
 }
@@ -479,32 +546,73 @@ impl LookupState {
             queried: HashSet::new(),
             providers: IndexMap::new(),
             best_queried_distance: [0xFFu8; NODE_ID_LEN],
+            cooling: HashSet::new(),
+            cooling_skipped: 0,
             k: cfg.k.get(),
             alpha: cfg.alpha.get(),
         };
         // Seed from the local routing table. Take more than α so the
         // first round has alternates if the closest few don't answer.
+        // The cooling snapshot comes from the same lock, so the seed and
+        // the skip list describe one table state. The seed is the nearest
+        // `seed_count` peers that are NOT cooling: the table is read past the
+        // seed count by the number of cooling peers, so cooling peers near the
+        // target cannot crowd a live peer out of the seed.
         let seed_count = cfg.alpha.get().saturating_mul(4);
-        let seed = match routing_table.lock() {
-            Ok(t) => t.closest(target.as_bytes(), seed_count),
+        let now = Instant::now();
+        let (seed, cooling, skipped) = match routing_table.lock() {
+            Ok(mut t) => Self::seed_from(&mut t, target, seed_count, now),
             Err(poisoned) => {
                 warn!("dht lookup: routing table mutex poisoned; recovering inner state");
-                poisoned.into_inner().closest(target.as_bytes(), seed_count)
+                Self::seed_from(&mut poisoned.into_inner(), target, seed_count, now)
             }
         };
+        state.cooling = cooling;
+        state.cooling_skipped = skipped;
         for peer in seed {
             state.add_candidate(peer);
         }
         state
     }
 
+    /// The nearest `seed_count` peers to `target` that are not cooling at
+    /// `now`, the cooling snapshot itself, and how many cooling peers the
+    /// seed passed over on its way to that count.
+    fn seed_from(
+        table: &mut RoutingTable,
+        target: &Hash,
+        seed_count: usize,
+        now: Instant,
+    ) -> (Vec<NodeId>, HashSet<NodeId>, u32) {
+        let cooling = table.cooling_peers(now);
+        let reach = seed_count.saturating_add(cooling.len());
+        let nearest = table.closest_unbounded(target.as_bytes(), reach);
+        let mut seed = Vec::with_capacity(seed_count);
+        let mut skipped: u32 = 0;
+        for peer in nearest {
+            if seed.len() == seed_count {
+                break;
+            }
+            if cooling.contains(&peer) {
+                skipped = skipped.saturating_add(1);
+            } else {
+                seed.push(peer);
+            }
+        }
+        (seed, cooling, skipped)
+    }
+
     /// Insert `peer` into the candidate set if not already present
     /// and not already queried. Returns whether the insertion brought
     /// in a candidate strictly closer than the current best queried
     /// distance (the convergence-tracking signal). Rejects
-    /// `requester_id`.
+    /// `requester_id` and a peer in the cooling snapshot.
     fn add_candidate(&mut self, peer: NodeId) -> bool {
         if peer == self.requester_id {
+            return false;
+        }
+        if self.cooling.contains(&peer) {
+            self.cooling_skipped = self.cooling_skipped.saturating_add(1);
             return false;
         }
         let dist = xor_distance_bytes(peer.as_bytes(), self.target.as_bytes());

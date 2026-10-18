@@ -341,3 +341,100 @@ fn lookup_state_rejects_self_in_candidates_and_providers() {
     assert_eq!(state.candidates.len(), 1);
     assert_eq!(state.providers.len(), 1);
 }
+
+/// A peer whose dial timed out within the cooldown is left out of the seed
+/// and is not added from a `closer_nodes` answer; the span count names both
+/// skips (#2532).
+#[test]
+fn lookup_state_skips_cooling_peers_from_the_seed_and_from_responses() {
+    let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
+    {
+        let mut t = routing.lock().expect("fresh mutex");
+        t.insert(nid(0x02));
+        t.insert(nid(0x10));
+        assert!(t.mark_unreachable(nid(0x02), Instant::now()));
+    }
+    let target = h(0);
+    let mut state = LookupState::new(&routing, &target, nid(0xFF), LookupConfig::default());
+    assert_eq!(
+        state.pick_round_batch(),
+        vec![nid(0x10)],
+        "the seed leaves out the cooling peer, closest or not"
+    );
+    assert!(
+        !state.add_candidate(nid(0x02)),
+        "a closer_nodes entry naming the cooling peer is not a candidate"
+    );
+    assert!(state.pick_round_batch().is_empty());
+    assert_eq!(state.cooling_skipped, 2);
+}
+
+/// Cooling peers nearer the target than the seed count do not crowd a live
+/// peer out of the seed: the seed is the nearest peers that are not cooling.
+/// With α = 3 the seed count is 12; twelve cooling peers sit nearer the target
+/// than the one live peer, and the live peer is still the whole seed.
+#[test]
+fn lookup_state_seed_is_the_nearest_peers_that_are_not_cooling() {
+    let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
+    let live = nid(0x20);
+    {
+        let mut t = routing.lock().expect("fresh mutex");
+        let now = Instant::now();
+        for byte in 0x01..=0x0C {
+            t.insert(nid(byte));
+            assert!(t.mark_unreachable(nid(byte), now));
+        }
+        t.insert(live);
+    }
+    let target = h(0);
+    let cfg = LookupConfig::default();
+    assert_eq!(
+        cfg.alpha.get() * 4,
+        12,
+        "the scenario is sized to the seed count"
+    );
+    let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
+    assert_eq!(
+        state.pick_round_batch(),
+        vec![live],
+        "the live peer seeds the lookup although twelve cooling peers are nearer"
+    );
+}
+
+/// A peer that a `closer_nodes` answer named, and that is in no bucket, can
+/// still be cooling: its dial timed out in an earlier lookup. The response
+/// filter rejects it like a table peer.
+#[test]
+fn lookup_state_rejects_a_cooling_referral_that_is_not_in_the_table() {
+    let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
+    {
+        let mut t = routing.lock().expect("fresh mutex");
+        t.insert(nid(0x10));
+        assert!(!t.contains(&nid(0x02)));
+        assert!(t.mark_unreachable(nid(0x02), Instant::now()));
+    }
+    let target = h(0);
+    let mut state = LookupState::new(&routing, &target, nid(0xFF), LookupConfig::default());
+    assert_eq!(state.pick_round_batch(), vec![nid(0x10)]);
+    assert!(!state.add_candidate(nid(0x02)));
+    assert_eq!(state.cooling_skipped, 1);
+}
+
+/// A lapsed cooldown no longer skips the peer: the snapshot is taken at the
+/// start of the lookup, from the table's clock.
+#[test]
+fn lookup_state_seeds_a_peer_whose_cooldown_lapsed() {
+    let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
+    {
+        let mut t = routing.lock().expect("fresh mutex");
+        t.insert(nid(0x02));
+        let long_ago = Instant::now()
+            .checked_sub(crate::dht::routing::DIAL_FAILURE_COOLDOWN + Duration::from_secs(1))
+            .expect("the process clock is past one cooldown");
+        assert!(t.mark_unreachable(nid(0x02), long_ago));
+    }
+    let target = h(0);
+    let mut state = LookupState::new(&routing, &target, nid(0xFF), LookupConfig::default());
+    assert_eq!(state.pick_round_batch(), vec![nid(0x02)]);
+    assert_eq!(state.cooling_skipped, 0);
+}
