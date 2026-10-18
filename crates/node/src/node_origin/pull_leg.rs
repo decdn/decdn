@@ -550,7 +550,7 @@ async fn spanning_cached_candidates(
 ) -> Option<Vec<Candidate>> {
     let mut cached = cached_candidates(deps, target).await?;
     cached.retain(|candidate| candidate.node_id != requester);
-    if coverage_spans(&cached) {
+    if coverage_spans(*hash.as_bytes(), &cached) {
         return Some(cached);
     }
     debug!(

@@ -111,7 +111,8 @@ pub(crate) enum ProbeGather {
     /// blob, so a set of partial holders whose fastest answers all cover the same
     /// discovery block is not mistaken for enough. A holder that reports its blob
     /// size (`ProbeResponseExt.total_bytes`) pins the block count the union must
-    /// span; absent any size the round drains to the probe-fanout ceiling.
+    /// span; absent any size the round drains to the probe-fanout ceiling. The
+    /// empty root has no block, so its first admitted holder spans it (#2526).
     ///
     /// A round whose holders cannot span the blob is followed by a second round
     /// over the namespace's origin-directory candidates it did not probe (#2195).
@@ -128,8 +129,18 @@ pub(crate) enum ProbeGather {
 /// bits past that count are ignored, because an untrusted wire bitmap may set
 /// spurious high bits (see `Coverage`). A holder that reports no size adds
 /// nothing, and the union spans nothing until some holder reports one.
-#[derive(Default)]
+///
+/// The empty blob ([`decdn_protocol::EMPTY_ROOT`]) spans zero blocks, so no
+/// holder reports a block for the union to cover. For that hash the union
+/// spans the blob once one holder is admitted (#2526). The rule keys on the
+/// requested hash, as `ProbeResponseExt::consistent_with` does, never on the
+/// unsigned `total_bytes` hint: one holder that reports `Some(0)` for a real
+/// blob must not close the gather after its own answer.
 struct CoverageUnionTracker {
+    /// Whether the requested hash is [`decdn_protocol::EMPTY_ROOT`].
+    empty_root: bool,
+    /// Holders admitted so far, a holder without a size hint included.
+    holders: usize,
     /// Covered discovery blocks seen so far.
     blocks: std::collections::BTreeSet<u32>,
     /// The largest block count any holder has reported for this blob.
@@ -137,9 +148,19 @@ struct CoverageUnionTracker {
 }
 
 impl CoverageUnionTracker {
-    /// The union of `candidates`' coverage.
-    fn from_candidates(candidates: &[Candidate]) -> Self {
-        let mut union = Self::default();
+    /// An empty union over the blob `hash_bytes`.
+    fn new(hash_bytes: [u8; 32]) -> Self {
+        Self {
+            empty_root: hash_bytes == decdn_protocol::EMPTY_ROOT,
+            holders: 0,
+            blocks: std::collections::BTreeSet::new(),
+            target: 0,
+        }
+    }
+
+    /// The union of `candidates`' coverage over the blob `hash_bytes`.
+    fn from_candidates(hash_bytes: [u8; 32], candidates: &[Candidate]) -> Self {
+        let mut union = Self::new(hash_bytes);
         for candidate in candidates {
             union.add(candidate);
         }
@@ -148,6 +169,7 @@ impl CoverageUnionTracker {
 
     /// Fold `candidate`'s coverage into the union.
     fn add(&mut self, candidate: &Candidate) {
+        self.holders += 1;
         let Some(bytes) = candidate.total_bytes_hint else {
             return;
         };
@@ -162,16 +184,19 @@ impl CoverageUnionTracker {
     }
 
     /// Every block `0..target` is in the union. False while no holder has
-    /// reported a size.
+    /// reported a size. For the empty root, true once one holder is admitted.
     fn spans(&self) -> bool {
+        if self.empty_root {
+            return self.holders > 0;
+        }
         self.target > 0 && (0..self.target).all(|block| self.blocks.contains(&block))
     }
 }
 
-/// Whether `candidates`' coverage union spans the blob — see
+/// Whether `candidates`' coverage union spans the blob `hash_bytes` — see
 /// [`CoverageUnionTracker`].
-pub(super) fn coverage_spans(candidates: &[Candidate]) -> bool {
-    CoverageUnionTracker::from_candidates(candidates).spans()
+pub(super) fn coverage_spans(hash_bytes: [u8; 32], candidates: &[Candidate]) -> bool {
+    CoverageUnionTracker::from_candidates(hash_bytes, candidates).spans()
 }
 
 /// Which arm of the pool-open ladder an error falls in, decided from its typed
@@ -1118,7 +1143,7 @@ async fn probe_and_rank(
     let target = DhtHash::from_bytes(hash_bytes);
     let mut candidates: Vec<Candidate> = Vec::new();
     let probed = probe_round(deps, &providers, hash_bytes, gather, &mut candidates).await;
-    if matches!(gather, ProbeGather::CoverageUnion) && !coverage_spans(&candidates) {
+    if matches!(gather, ProbeGather::CoverageUnion) && !coverage_spans(hash_bytes, &candidates) {
         let directory = directory_origins(deps, namespace_id).await;
         let listed = directory.len();
         let origins: Vec<DhtNodeId> = directory
@@ -1144,7 +1169,7 @@ async fn probe_and_rank(
                 holders,
                 origins = origins.len(),
                 admitted = candidates.len().saturating_sub(holders),
-                spans = coverage_spans(&candidates),
+                spans = coverage_spans(hash_bytes, &candidates),
                 "node-origin: probed holders did not span the blob; probed origin-directory \
                  candidates"
             );
@@ -1193,7 +1218,7 @@ async fn probe_round(
     candidates: &mut Vec<Candidate>,
 ) -> Vec<DhtNodeId> {
     use futures_util::stream::StreamExt;
-    let mut union = CoverageUnionTracker::from_candidates(candidates);
+    let mut union = CoverageUnionTracker::from_candidates(hash_bytes, candidates);
     let now_secs = crate::payment_settlement::unix_now();
     let target = DhtHash::from_bytes(hash_bytes);
     // Probe candidates CONCURRENTLY so the probe phase is bounded by a single
@@ -1260,7 +1285,8 @@ async fn probe_round(
                     union.add(&candidate);
                     candidates.push(candidate);
                     // With no holder-reported size this stays false and the round
-                    // drains to the probe-fanout ceiling.
+                    // drains to the probe-fanout ceiling. The empty root is the
+                    // exception: one admitted holder spans it (#2526).
                     union.spans()
                 }
             };

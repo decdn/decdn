@@ -924,32 +924,42 @@ fn holder(coverage: Coverage, total_bytes_hint: Option<u64>) -> Candidate {
 /// hints.
 #[test]
 fn coverage_spans_needs_every_block_from_a_sized_holder() {
+    let hash = [7u8; 32];
     let size = 3 * decdn_protocol::DISCOVERY_BLOCK_BYTES;
     let blocks = |set: &[u32]| Coverage::from_block_indices(3, set.iter().copied());
 
     assert!(
-        coverage_spans(&[holder(Coverage::full(3), Some(size))]),
+        coverage_spans(hash, &[holder(Coverage::full(3), Some(size))]),
         "one whole holder spans the blob"
     );
     assert!(
-        coverage_spans(&[
-            holder(blocks(&[0, 1]), Some(size)),
-            holder(blocks(&[2]), Some(size)),
-        ]),
+        coverage_spans(
+            hash,
+            &[
+                holder(blocks(&[0, 1]), Some(size)),
+                holder(blocks(&[2]), Some(size)),
+            ]
+        ),
         "partials whose union covers every block span the blob"
     );
     assert!(
-        !coverage_spans(&[
-            holder(blocks(&[0]), Some(size)),
-            holder(blocks(&[0, 1]), Some(size)),
-        ]),
+        !coverage_spans(
+            hash,
+            &[
+                holder(blocks(&[0]), Some(size)),
+                holder(blocks(&[0, 1]), Some(size)),
+            ]
+        ),
         "partials that leave a block uncovered do not span the blob"
     );
     assert!(
-        !coverage_spans(&[holder(blocks(&[0, 1]), None)]),
+        !coverage_spans(hash, &[holder(blocks(&[0, 1]), None)]),
         "a holder that reports no size spans nothing"
     );
-    assert!(!coverage_spans(&[]), "an empty candidate set spans nothing");
+    assert!(
+        !coverage_spans(hash, &[]),
+        "an empty candidate set spans nothing"
+    );
     // A two-block holder whose wire bitmap also sets bit 2 claims nothing
     // past its own size, so a third block stays uncovered.
     let spurious = holder(
@@ -957,7 +967,50 @@ fn coverage_spans_needs_every_block_from_a_sized_holder() {
         Some(2 * decdn_protocol::DISCOVERY_BLOCK_BYTES),
     );
     assert!(
-        !coverage_spans(&[spurious, holder(blocks(&[0]), Some(size))]),
+        !coverage_spans(hash, &[spurious, holder(blocks(&[0]), Some(size))]),
         "a coverage bit past the holder's own block count does not count"
+    );
+}
+
+/// #2526: the empty blob spans zero discovery blocks, so no holder can report a
+/// block for the union to cover. For `EMPTY_ROOT` one admitted holder spans
+/// the blob. The rule keys on the requested hash, never on the unsigned
+/// `total_bytes` hint: a holder of a real blob that reports `Some(0)` closes
+/// nothing.
+#[test]
+fn coverage_spans_for_the_empty_root_needs_one_admitted_holder() {
+    let empty_root = decdn_protocol::EMPTY_ROOT;
+    let other = [7u8; 32];
+    let size = decdn_protocol::DISCOVERY_BLOCK_BYTES;
+
+    assert!(
+        coverage_spans(empty_root, &[holder(Coverage::empty(), Some(0))]),
+        "one holder of the empty blob spans it"
+    );
+    assert!(
+        coverage_spans(empty_root, &[holder(Coverage::empty(), None)]),
+        "the empty-root rule reads the hash, not the size hint"
+    );
+    assert!(
+        !coverage_spans(empty_root, &[]),
+        "no admitted holder spans nothing, the empty root included"
+    );
+    assert!(
+        !coverage_spans(other, &[holder(Coverage::empty(), Some(0))]),
+        "a lying zero-size hint on a real blob closes nothing"
+    );
+    assert!(
+        coverage_spans(other, &[holder(Coverage::full(1), Some(size))]),
+        "a sized one-block holder spans a one-block blob"
+    );
+    assert!(
+        coverage_spans(
+            other,
+            &[
+                holder(Coverage::empty(), Some(0)),
+                holder(Coverage::full(1), Some(size)),
+            ]
+        ),
+        "a lying zero-size hint beside a real holder neither helps nor hurts"
     );
 }

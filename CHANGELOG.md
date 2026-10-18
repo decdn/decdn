@@ -1105,6 +1105,16 @@ since project inception and will roll into the first tagged release.
   `total_bytes` hint. `decdn_protocol::EMPTY_ROOT` names the hash. ADR 022
   § Consistency rule records the exception. The API change is under Changed
   (BREAKING).
+- **Node-origin: the coverage-union probe round spans the empty root once one
+  holder is admitted (#2526).** The ranged pull leg gathers holders until their
+  coverage union covers every discovery block of the blob. The empty blob has
+  zero blocks, so the block target stayed at zero and the union never spanned
+  it: the probe round waited for every probe to answer or time out, the
+  origin-directory round always ran, and a cached holder list never counted as
+  a probe-cache hit. Now the union spans the empty root once one holder is
+  admitted. The rule keys on the requested hash, never on the unsigned
+  `total_bytes` hint, so a holder that reports a zero size for a real blob
+  closes nothing.
 - **CLI: a `decdn get` that ends before a `topUp` confirms names the tx
   (#2491).** A refill or a funding recovery step can still wait on its `topUp`
   receipt when the command ends: on a give-up after the no-progress limit, a
