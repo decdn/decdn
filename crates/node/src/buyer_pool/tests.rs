@@ -3208,6 +3208,8 @@ async fn a_sweep_reclaim_that_never_mines_lapses_and_keeps_the_row() -> anyhow::
     )?;
     assert!(text.contains("reclaim receipt not read"), "{text}");
     assert!(text.contains(&format!("{SCRIPTED_TX:#x}")), "{text}");
+    // The bound lapsed; the read did not error.
+    assert!(text.contains("no receipt within"), "{text}");
     assert_eq!(
         counter(&svc.metrics, "decdn_buyer_reclaim_failures_total"),
         1

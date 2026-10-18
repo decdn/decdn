@@ -56,12 +56,13 @@ pub const fn mined_receipt(to: Address, logs: Vec<Log>) -> TransactionReceipt {
 /// `eth_call` with the next answer in its queue. `eth_sendTransaction` gets
 /// [`SCRIPTED_TX`] unless the send parks, and records the nonce it was sent
 /// at. `eth_getTransactionReceipt` gets the scripted receipt when there is
-/// one. `eth_getBlockByNumber` gets a head block at the timestamp
-/// [`ScriptedRpc::at_head`] set, when one is set. Every other call, and an
-/// `eth_call` past the end of the queue, never completes, so a send on it parks
-/// in its submit or its receipt wait. A [`ScriptedRpc::dropped`] transport also
-/// answers the block number, and a receipt read before [`ScriptedRpc::mine`]
-/// with "not mined".
+/// one. `eth_getBlockByNumber`, whatever block it names, gets a block at the
+/// timestamp [`ScriptedRpc::at_head`] set, with every other header field at its
+/// default. Every other call, an `eth_call` past the end of the queue, and an
+/// `eth_getBlockByNumber` with no head set, never completes, so a send on it
+/// parks in its submit or its receipt wait. A [`ScriptedRpc::dropped`]
+/// transport also answers the block number, and a receipt read before
+/// [`ScriptedRpc::mine`] with "not mined".
 ///
 /// A clone shares the receipt, the `eth_call` queue and the recorded nonces.
 #[derive(Clone, Debug)]
@@ -311,3 +312,7 @@ impl tower::Service<RequestPacket> for ScriptedRpc {
         })
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests;
