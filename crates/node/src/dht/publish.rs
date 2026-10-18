@@ -1165,7 +1165,8 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
 /// per-RPC re-derivation that could drift mid-fan-out. An empty coverage sends
 /// nothing: the record would advertise no block a requester can fetch. That
 /// covers a cache event for a hash the store no longer holds, a partial with no
-/// whole block, and a coverage query that faulted.
+/// whole block, a coverage query that faulted, and the empty blob, which spans
+/// no block and is discoverable by probe alone (ADR 022 § Consistency rule).
 ///
 /// Returns how many peers accepted the record.
 async fn publish_hash(

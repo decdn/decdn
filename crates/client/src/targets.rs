@@ -440,9 +440,9 @@ fn classify_probe(
     }
     // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
     // construction on an honest responder, except for the empty root, whose
-    // coverage is empty either way (#2471). Neither field is signed, and an
-    // inconsistency has no attributable author, so drop the candidate rather
-    // than score it.
+    // coverage is empty either way (#2471). `coverage` is not in the signed
+    // set, and an inconsistency has no attributable author, so drop the
+    // candidate rather than score it.
     if !resp_ext.consistent_with(&resp.body) {
         tracing::warn!(
             "dropping a probe response from {} with has_blob/coverage mismatch",

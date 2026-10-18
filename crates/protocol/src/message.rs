@@ -284,17 +284,18 @@ pub struct ProbeResponseExt {
     pub total_bytes: Option<u64>,
     /// Which discovery blocks (`decdn_protocol::coverage`) this node will
     /// serve. Unsigned: treat it as a hint, never as a commitment. A
-    /// requester MUST check it against the signed `body.has_blob` with
-    /// [`ProbeResponseExt::consistent_with`] and drop a response where they
-    /// disagree rather than trust either field alone.
+    /// requester MUST check it against the signed body (`hash` and
+    /// `has_blob`) with [`ProbeResponseExt::consistent_with`] and drop a
+    /// response where they disagree rather than trust either field alone.
     pub coverage: crate::Coverage,
 }
 
 /// The BLAKE3 hash of zero bytes: the root of the empty blob.
 ///
 /// The empty blob spans zero discovery blocks, so it is the one hash whose
-/// coverage is empty on every honest holder. [`ProbeResponseExt::consistent_with`]
-/// reads `has_blob` alone for it.
+/// coverage is empty on every honest holder. For it,
+/// [`ProbeResponseExt::consistent_with`] only requires an empty coverage, and
+/// the requester reads `has_blob` alone to learn whether the node serves it.
 pub const EMPTY_ROOT: [u8; 32] = [
     0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc, 0xc9, 0x49,
     0x9b, 0xcb, 0x25, 0xc9, 0xad, 0xc1, 0x12, 0xb7, 0xcc, 0x9a, 0x93, 0xca, 0xe4, 0x1f, 0x32, 0x62,

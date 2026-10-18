@@ -1415,10 +1415,10 @@ async fn probe_candidate(
     }
     // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
     // construction on an honest responder, except for the empty root, whose
-    // coverage is empty either way (#2471). Neither field is in the signed
-    // set (`coverage` is unsigned, and this mismatch has no attributable
-    // author to slash — same reasoning as an unrecovered `slash_sig` above),
-    // so a violation is dropped rather than scored to reputation.
+    // coverage is empty either way (#2471). `coverage` is not in the signed
+    // set, so this mismatch has no attributable author to slash (same
+    // reasoning as an unrecovered `slash_sig` above), and a violation is
+    // dropped rather than scored to reputation.
     if !resp_ext.consistent_with(&resp.body) {
         debug!(
             has_blob = resp.body.has_blob,
@@ -1460,9 +1460,9 @@ async fn probe_candidate(
         stake: 0,
         // The fresh, probe-confirmed coverage (#1506) — never the stale DHT
         // hint `discover` drops. The `consistent_with` check above already
-        // guarantees this is non-empty whenever `has_blob` is true, which is
-        // the only way execution reaches here — except for the empty root,
-        // whose zero blocks leave it empty on a holder too (#2471).
+        // guarantees this is non-empty whenever `has_blob` is true (the only
+        // way execution reaches here), except for the empty root: its zero
+        // blocks leave the coverage empty on a holder too (#2471).
         coverage: resp_ext.coverage,
         // The holder's reported blob size. The coverage-union gather (#1506)
         // reads it to know how many discovery blocks the union must span,

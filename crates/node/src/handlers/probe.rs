@@ -591,8 +591,9 @@ impl ProbeHandler {
         // ADR 005 asks a node to include the size whenever it knows it.
         let (coverage, total_bytes) = if chain_stale {
             // Chain-stale (above): advertise no coverage, so the re-derived
-            // `has_blob` below stays false. This is the arm that actually binds the
-            // stale answer — `has_blob` is the coverage biconditional.
+            // `has_blob` below stays false. This arm binds the stale answer for
+            // every blob with a block; the presence gate above binds it for the
+            // empty root (#2471).
             (Coverage::empty(), total_bytes)
         } else if is_origin_sourced {
             (
@@ -626,6 +627,9 @@ impl ProbeHandler {
         // nothing about presence. Every arm that suppresses an advertisement
         // (chain-stale, holds disabled, origin-only miss) settles presence as
         // `false` above, so the presence verdict is the honest answer here.
+        // The coverage-read fault arm leaves presence as the store answered
+        // it; for the empty root that is still honest, because it has no
+        // block to read.
         let has_blob = !coverage.is_empty() || (has_blob && *hash.as_bytes() == EMPTY_ROOT);
         debug_assert!(
             ProbeResponseExt {

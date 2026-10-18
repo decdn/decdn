@@ -759,8 +759,9 @@ fn failover_order_coverage_by_node_carries_each_holders_real_coverage() {
 
 /// #2471: a holder of the empty root answers `has_blob: true` over an empty
 /// coverage, because the blob spans no block. The consumer takes that answer
-/// as a holder with a size hint of 0 for the empty root, and drops the same
-/// pairing as malformed for every other hash.
+/// as a holder with a size hint of 0 for the empty root, takes a node that
+/// signs `has_blob: false` over the same coverage as a non-holder, and drops
+/// the `has_blob: true` pairing as malformed for every other hash.
 #[test]
 fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
@@ -777,20 +778,18 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
         region_hint: None,
         multiaddrs: alloy::primitives::Bytes::new(),
     };
-    let answer = |hash: [u8; 32]| -> anyhow::Result<(
-        ProbeResponse,
-        ProbeResponseExt,
-        crate::probe::ProbeRtt,
-    )> {
+    let answer = |hash: [u8; 32],
+                  has_blob: bool|
+     -> anyhow::Result<(ProbeResponse, ProbeResponseExt, crate::probe::ProbeRtt)> {
         let body = ProbeResponseBody {
             hash,
-            has_blob: true,
+            has_blob,
             rate_per_mb: 10,
             timestamp_us: TS,
         };
         let slash_sig = ProbeSlashData {
             hash: hash.into(),
-            has_blob: true,
+            has_blob,
             rate_per_mb: 10,
             timestamp_us: TS,
         }
@@ -811,17 +810,25 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
         ))
     };
 
-    match classify_probe(&cand, answer(EMPTY_ROOT), EMPTY_ROOT, TS, &domain) {
+    match classify_probe(&cand, answer(EMPTY_ROOT, true), EMPTY_ROOT, TS, &domain) {
         ProbeOutcome::Holder(probed, _) => {
             assert_eq!(probed.total_bytes, Some(0));
             assert!(probed.coverage.is_empty());
         }
         _ => anyhow::bail!("the empty root's holder must classify as a holder"),
     }
+    assert!(
+        matches!(
+            classify_probe(&cand, answer(EMPTY_ROOT, false), EMPTY_ROOT, TS, &domain),
+            ProbeOutcome::NonHolder(..)
+        ),
+        "a chain-stale or opted-out node signs has_blob:false for the empty root and is a \
+         non-holder, not a malformed answer"
+    );
     let other_hash = [0x11u8; 32];
     assert!(
         matches!(
-            classify_probe(&cand, answer(other_hash), other_hash, TS, &domain),
+            classify_probe(&cand, answer(other_hash, true), other_hash, TS, &domain),
             ProbeOutcome::Unusable
         ),
         "an empty coverage with has_blob:true is malformed for a non-empty root"

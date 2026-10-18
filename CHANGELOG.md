@@ -28,6 +28,13 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-protocol`: `ProbeResponseExt::consistent_with` takes the signed
+  `&ProbeResponseBody`, not `has_blob` alone (#2471).** The rule keys on
+  `body.hash`: for `EMPTY_ROOT` (new constant, the BLAKE3 hash of zero bytes)
+  the coverage must be empty and `has_blob` alone says whether the node serves
+  the blob; every other hash keeps `has_blob ⟺ non-empty coverage`. On the
+  wire, a node signs `has_blob: true` for the empty root, which an older
+  requester rejects as malformed. The fix is under Fixed.
 - **`decdn-client`: `BundleOutcome::replaced` is a `Vec<PoolReplaced>`
   (#2519).** It lists every pool replacement the pull made, in order, a
   second-pass replacement too. Iterate it where code matched the `Option`.
@@ -1096,7 +1103,8 @@ since project inception and will roll into the first tagged release.
   signed body: for the empty root the bitmap must be empty and `has_blob`
   alone decides. The rule keys on the signed hash, never on the unsigned
   `total_bytes` hint. `decdn_protocol::EMPTY_ROOT` names the hash. ADR 022
-  § Consistency rule records the exception.
+  § Consistency rule records the exception. The API change is under Changed
+  (BREAKING).
 - **CLI: a `decdn get` that ends before a `topUp` confirms names the tx
   (#2491).** A refill or a funding recovery step can still wait on its `topUp`
   receipt when the command ends: on a give-up after the no-progress limit, a
