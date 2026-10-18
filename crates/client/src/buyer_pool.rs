@@ -560,7 +560,9 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// `deposit` is the final escrow amount — the caller applies any
 /// `max(hint, default)` clamping before calling. The returned [`OpenedPool`] is
 /// **not yet persisted**: the caller records [`OpenedPool::state`] in its
-/// `BuyerPoolStore`, and on a record failure should log [`OpenedPool::tx`].
+/// `BuyerPoolStore`, and on a record failure names [`OpenedPool::tx`]
+/// ([`escrowed_but_untracked`]). It then resolves the [`UnrecordedEscrow`]
+/// returned beside it.
 ///
 /// # Errors
 ///
@@ -602,10 +604,12 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// A caller can also drop this future: a Ctrl-C, or a fault that ends the
 /// command. No error is returned then, and a caller can also drop an error a
 /// sibling task returned. So `escrows` holds the `openPool` from before its
-/// submit until its receipt is read: with no hash while the submit is in
-/// flight or failed in transport, with the hash after. A caller that may drop
-/// the future or its error passes `Some` and reads
-/// [`UnconfirmedEscrows::pending`] when it ends, so it can still name the tx.
+/// submit until the caller resolves the returned [`UnrecordedEscrow`]: with no
+/// hash while the submit is in flight or failed in transport, with the hash
+/// after. A caller that may drop the future or its error passes `Some` and
+/// reads [`UnconfirmedEscrows::pending`] when it ends, so it can still name the
+/// tx. An open whose receipt holds no `PoolOpened` event is held as untracked
+/// ([`UnconfirmedEscrows::untracked`]) instead.
 ///
 /// An `escrows` that already holds an unconfirmed open refuses a new one: the
 /// call fails with that [`OpenUnconfirmed`] before any chain read, because the
@@ -629,7 +633,7 @@ pub async fn open_pool<P: Provider + Clone>(
     deposit: U256,
     escrows: Option<&UnconfirmedEscrows>,
     receipt_timeout: Option<Duration>,
-) -> Result<OpenedPool> {
+) -> Result<(OpenedPool, UnrecordedEscrow)> {
     anyhow::ensure!(
         *contract.address() == deployment.payment_pool,
         "openPool: contract {} is not the deployment's PaymentPool {}",
@@ -691,8 +695,8 @@ pub async fn open_pool<P: Provider + Clone>(
     escrows.replace(submitted, unconfirmed);
 
     // Bounded only when the caller asks — see `# The caller picks the receipt
-    // bound` above. Only a receipt releases the entry: a drop here, a failed
-    // read or a lapse leaves it, which is the point.
+    // bound` above. A drop here, a failed read or a lapse leaves the entry,
+    // which is the point.
     let receipt = await_receipt(pending, receipt_timeout)
         .await
         .map_err(|err| {
@@ -702,8 +706,16 @@ pub async fn open_pool<P: Provider + Clone>(
             .context(unconfirmed)
             .context(PoolOpenFailureReason::RpcError)
         })?;
-    escrows.remove(unconfirmed);
-    opened_from_receipt(&receipt, tx, deployment, token, owner, deposit)
+    let unrecorded = UnrecordedEscrow {
+        escrows,
+        entry: unconfirmed.into(),
+    };
+    match opened_from_receipt(&receipt, tx, deployment, token, owner, deposit) {
+        Ok(opened) => Ok((opened, unrecorded)),
+        // A revert escrowed nothing, and an open with no `PoolOpened` event
+        // is held untracked before its entry is released.
+        Err(err) => Err(unrecorded.untracked(err)),
+    }
 }
 
 /// Build the [`OpenedPool`] an `openPool` tx bought, from its mined `receipt`.
@@ -871,20 +883,21 @@ impl std::fmt::Display for EscrowUnconfirmed {
 /// The `openPool` and `topUp` transactions a command submitted whose receipt
 /// it has not read, and those that mined with no local record crediting them.
 ///
-/// [`open_pool`] and [`top_up`] add an entry before their submit and remove it
-/// once they read the receipt, or once a submit is rejected without a
-/// broadcast. A future dropped mid-submit or mid-wait, or a receipt read that
-/// fails, leaves its entry. A command that ends while an entry remains names
-/// it, because the transaction may escrow after the command exits and a
-/// re-run before it confirms escrows again.
+/// [`open_pool`] and [`top_up`] add an entry before their submit. A submit
+/// rejected without a broadcast or a reverted receipt removes it. A mined one
+/// keeps it until the caller's record or credit resolves the
+/// [`UnrecordedEscrow`] the call returns. A future dropped mid-submit or
+/// mid-wait, or a receipt read that fails, leaves its entry. A command that
+/// ends while an entry remains names it, because the transaction may escrow
+/// after the command exits and a re-run before it confirms escrows again.
 ///
-/// The handle also holds every `openPool` and `topUp` that a run on it
-/// ([`crate::funding::RunFunding`]) saw mine with no local record crediting it
-/// ([`UnconfirmedEscrows::untracked`]). Their receipts were read, so they are
-/// not pending, but a command that ends while the handle holds one names it
-/// too: a re-run reads the uncredited row and escrows again. [`open_pool`] and
-/// [`top_up`] alone hold none: their caller returns the error that names the
-/// escrow.
+/// The handle also holds every `openPool` and `topUp` that mined with no local
+/// record crediting it ([`UnconfirmedEscrows::untracked`]): a record that
+/// failed ([`UnrecordedEscrow::untracked`]), or an `openPool` whose receipt
+/// holds no `PoolOpened` event. Their receipts were read, so they are not
+/// pending, but a command that ends while the handle holds one names it too: a
+/// re-run reads the uncredited row and escrows again. Each is held before its
+/// entry is released, so the handle names the transaction at every moment.
 ///
 /// A clone shares the same lists, so one handle can outlive the per-pass state
 /// that the transactions run under.
@@ -924,6 +937,43 @@ impl UntrackedEscrow {
             tx: self.tx,
             text: self.text,
         })
+    }
+}
+
+/// A mined `openPool` or `topUp` whose escrow no local record credits yet:
+/// [`open_pool`] and [`top_up`] return it beside the outcome, and their
+/// [`UnconfirmedEscrows`] keeps the transaction pending until the caller
+/// resolves it. The caller writes its record or credit, then calls
+/// [`UnrecordedEscrow::recorded`] once the write commits, or
+/// [`UnrecordedEscrow::untracked`] with the error once it fails.
+///
+/// A command that ends during the write, such as a process exit on a second
+/// Ctrl-C, still finds the transaction on the handle and names it. One that is
+/// dropped unresolved leaves the transaction pending: the command names it,
+/// and the handle refuses a later `openPool` or `topUp`, which is the safe
+/// side of a lost record.
+#[derive(Debug)]
+#[must_use = "the escrow stays pending until its record is resolved"]
+pub struct UnrecordedEscrow {
+    escrows: UnconfirmedEscrows,
+    entry: EscrowUnconfirmed,
+}
+
+impl UnrecordedEscrow {
+    /// The record or credit committed: release the transaction from the
+    /// handle.
+    pub fn recorded(self) {
+        self.escrows.remove(self.entry);
+    }
+
+    /// The record or credit failed with `err`: hold `err` as untracked when it
+    /// is an [`EscrowUntracked`], then release the transaction, and return
+    /// `err`. The handle names the transaction at every moment between the
+    /// two, so a command that ends there still names it.
+    pub fn untracked(self, err: anyhow::Error) -> anyhow::Error {
+        self.escrows.hold_untracked(&err);
+        self.escrows.remove(self.entry);
+        err
     }
 }
 
@@ -1344,7 +1394,8 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 /// mechanism behind the node's cache-miss buyer (#744) and the CLI fetch buyer's
 /// auto-refill (#1103). `topUp` does not extend any lifecycle deadline; the caller
 /// credits `credited` into its local [`BuyerPoolState`] via `add_deposit`, and
-/// names `tx` if that credit fails — see [`escrowed_but_untracked`].
+/// names `tx` if that credit fails — see [`escrowed_but_untracked`]. It then
+/// resolves the [`UnrecordedEscrow`] returned beside it.
 ///
 /// The amount credited is read back from `PoolToppedUp.additionalDeposit`, not
 /// assumed to equal `additional`: the contract credits a measured balance delta,
@@ -1375,9 +1426,10 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 /// the unconfirmed `topUp` against the chain ([`send_top_up_at`],
 /// [`topped_up_from_receipt`]).
 ///
-/// `escrows` holds the `topUp` from before its submit until its receipt is
-/// read, as [`open_pool`] holds an `openPool`: with no hash while the submit
-/// is in flight or failed in transport, with the hash after. A drop, a failed
+/// `escrows` holds the `topUp` from before its submit until the caller
+/// resolves the returned [`UnrecordedEscrow`], as [`open_pool`] holds an
+/// `openPool`: with no hash while the submit is in flight or failed in
+/// transport, with the hash after. A drop, a failed
 /// read or a lapse leaves the entry, so a caller that may drop the future or
 /// its error passes `Some` and reads [`UnconfirmedEscrows::pending`] when it
 /// ends. `top_up` itself refuses nothing on what `escrows` holds.
@@ -1396,7 +1448,7 @@ pub async fn top_up<P: Provider + Clone>(
     additional: U256,
     escrows: Option<&UnconfirmedEscrows>,
     receipt_timeout: Option<Duration>,
-) -> Result<ToppedUpPool> {
+) -> Result<(ToppedUpPool, UnrecordedEscrow)> {
     let amount = to_pool_u64(additional, "top-up")?;
     // A caller with no handle holds the entries in one nobody reads.
     let escrows = escrows.cloned().unwrap_or_default();
@@ -1411,13 +1463,22 @@ pub async fn top_up<P: Provider + Clone>(
         nonce,
     };
     escrows.replace(TopUpUnconfirmed { tx: None, nonce }, unconfirmed);
-    // Only a receipt releases the entry: a drop here, a failed read or a
-    // lapse leaves it.
+    // A drop here, a failed read or a lapse leaves the entry.
     let receipt = await_receipt(pending, receipt_timeout)
         .await
         .map_err(|err| err.context("await topUp receipt").context(unconfirmed))?;
-    escrows.remove(unconfirmed);
-    topped_up_from_receipt(&receipt, *contract.address(), pool_id, additional)
+    let unrecorded = UnrecordedEscrow {
+        escrows,
+        entry: unconfirmed.into(),
+    };
+    match topped_up_from_receipt(&receipt, *contract.address(), pool_id, additional) {
+        Ok(topped_up) => Ok((topped_up, unrecorded)),
+        // A revert escrowed nothing.
+        Err(err) => {
+            unrecorded.recorded();
+            Err(err)
+        }
+    }
 }
 
 /// Build the [`ToppedUpPool`] a `topUp` tx bought, from its mined `receipt`.

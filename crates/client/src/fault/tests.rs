@@ -222,11 +222,13 @@ fn a_possibly_escrowed_deposit_ends_the_command() {
 fn a_refusal_after_an_untracked_escrow_ends_the_command() -> anyhow::Result<()> {
     let tx = alloy::primitives::TxHash::repeat_byte(0xab);
     let funding = crate::funding::RunFunding::default();
-    let _ = funding.note_untracked(crate::buyer_pool::escrowed_but_untracked(
-        "pool 0x01 topped up by 5 µUSDC",
-        tx,
-        "disk",
-    ));
+    funding
+        .escrows()
+        .hold_untracked(&crate::buyer_pool::escrowed_but_untracked(
+            "pool 0x01 topped up by 5 µUSDC",
+            tx,
+            "disk",
+        ));
     let refused = || {
         funding
             .refuse_after_untracked()

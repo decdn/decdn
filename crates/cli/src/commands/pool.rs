@@ -203,7 +203,7 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
     let escrows = UnconfirmedEscrows::default();
     let mut interrupt = Interrupt::watch(escrows.clone());
     let opened = async {
-        let opened = open_pool(
+        let (opened, unrecorded) = open_pool(
             &contract,
             deployment,
             token,
@@ -214,10 +214,19 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
         )
         .await?;
         // The deposit is escrowed on-chain; a failed local record leaves it
-        // untracked (reconcile against the tx).
-        store
-            .record(&opened.state)
-            .map_err(|e| escrowed_but_untracked("buyer pool opened", opened.tx, e))?;
+        // untracked (reconcile against the tx). The handle names the open
+        // until the record resolves, so a second Ctrl-C during the write
+        // still names it.
+        match store.record(&opened.state) {
+            Ok(()) => unrecorded.recorded(),
+            Err(e) => {
+                return Err(unrecorded.untracked(escrowed_but_untracked(
+                    "buyer pool opened",
+                    opened.tx,
+                    e,
+                )));
+            }
+        }
         anyhow::Ok(opened.state.pool_id)
     };
     let result = tokio::select! {
@@ -275,7 +284,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
     let escrows = UnconfirmedEscrows::default();
     let mut interrupt = Interrupt::watch(escrows.clone());
     let topped_up = async {
-        let ToppedUpPool { credited, tx, .. } = top_up(
+        let (ToppedUpPool { credited, tx, .. }, unrecorded) = top_up(
             &contract,
             owner,
             pool_id,
@@ -291,9 +300,17 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         // would let a wrapper record the pool as funded — after which the
         // low-water check re-fires on every later fetch, and re-running this
         // command escrows again.
+        // The handle names the `topUp` until the credit resolves, so a second
+        // Ctrl-C during the write still names it.
         let effect = topped_up_effect(pool_id, credited);
         let new_deposit =
-            grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx)?;
+            match grade_deposit_credit(store.add_deposit(owner, pool_id, credited), &effect, tx) {
+                Ok(deposit) => {
+                    unrecorded.recorded();
+                    deposit
+                }
+                Err(err) => return Err(unrecorded.untracked(err)),
+            };
         anyhow::Ok((credited, new_deposit))
     };
     let result = tokio::select! {

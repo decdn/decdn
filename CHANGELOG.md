@@ -28,6 +28,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` return
+  an `UnrecordedEscrow` beside the outcome (#2515).** `open_pool` returns
+  `(OpenedPool, UnrecordedEscrow)` and `top_up` returns
+  `(ToppedUpPool, UnrecordedEscrow)`. The `UnconfirmedEscrows` handle keeps a
+  mined transaction pending until the caller resolves the guard:
+  `recorded()` once its record or credit commits, or `untracked(err)` once it
+  fails, which holds the escrow as untracked before it releases the pending
+  entry. A guard dropped unresolved leaves the transaction pending. A caller
+  that passes no handle can drop it. An `openPool` whose receipt holds no
+  `PoolOpened` event is now held as untracked by `open_pool` itself.
 - **`decdn-client`: `buyer_pool::open_pool` and `buyer_pool::top_up` take a
   `receipt_timeout: Option<Duration>` (#2433).** `Some` bounds the receipt
   wait. A lapse returns `OpenUnconfirmed` / `TopUpUnconfirmed` with the tx
@@ -1131,7 +1141,8 @@ since project inception and will roll into the first tagged release.
   bundle, names each one on every end that does not already name its tx: a
   Ctrl-C says `interrupted: <escrow>` and still exits 130, a give-up exits 1,
   not 75, and a success exits 1. A second Ctrl-C names them too. `decdn pool
-  open` and `decdn pool top-up` hold none: their own error names the tx. A
+  open` and `decdn pool top-up` hold theirs too, and their own error names the
+  tx, so it is named once. A
   `BundlePuller` pull that is not interrupted ends `BundleEnd::Stopped` while
   its handle holds one, with the escrow as its error and the pull's own stop
   as text, so a give-up, a pool replacement or "funding needed" cannot invite
@@ -1178,6 +1189,17 @@ since project inception and will roll into the first tagged release.
   to its receipt, as before. The first open of a blob ends its builds the same
   way on a stop or an error. A re-fetch on the same lanes after a hash
   mismatch is a new fetch, so its builds can still escrow.
+- **Client, CLI: an escrow stays named until its record commits (#2515).**
+  `open_pool` and `top_up` released a mined transaction from the
+  pending-escrow handle as soon as they read its receipt. The caller wrote the
+  pool record or the deposit credit after that, with an fsync. During that
+  write the transaction was in neither the pending nor the untracked list. A
+  second Ctrl-C there exited at once, named no escrow, and left the record
+  unwritten, so a re-run read an uncredited row and escrowed again. Now the
+  handle keeps the transaction pending until the record commits, and a failed
+  record holds it as untracked before it releases the pending entry. Every
+  `decdn get`, `decdn bundle pull`, `decdn pool open` and `decdn pool top-up`
+  names it on every exit during the write.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

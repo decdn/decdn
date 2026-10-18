@@ -24,9 +24,10 @@ use iroh::Endpoint;
 use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::{
-    LOW_WATER_DIVISOR, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, UnconfirmedEscrows,
-    WalletShortfall, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool,
-    pool_accepts_funds, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
+    LOW_WATER_DIVISOR, OpenedPool, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool,
+    UnconfirmedEscrows, UnrecordedEscrow, WalletShortfall, ensure_allowance,
+    escrowed_but_untracked, grade_deposit_credit, open_pool, pool_accepts_funds, refill_amount,
+    self_owned_lane_ctx, top_up, topped_up_effect,
 };
 use crate::lanes::LaneDeps;
 use crate::session::{ChainAdoption, ChainConfig, DepositPolicy};
@@ -82,7 +83,8 @@ pub fn cached_pool_token(
 /// lane pays from, which a funding recovery step tops up: every entry of a
 /// bundle pull shares it, the entries that have built no lane yet included.
 /// Every `openPool` and `topUp` a lane build or a recovery step sends is held
-/// in its [`UnconfirmedEscrows`] until its receipt is read. The run sends one
+/// in its [`UnconfirmedEscrows`] until its local record or credit resolves
+/// ([`UnrecordedEscrow`]). The run sends one
 /// `topUp` at a time, and while the handle holds one that may have been
 /// broadcast but is not known to have mined ([`TopUpUnconfirmed`]), every later
 /// `topUp` sent through the same handle is refused with it: in this run, or in
@@ -268,27 +270,18 @@ impl RunFunding {
         }))
     }
 
-    /// Hold `err` on the run's handle ([`UnconfirmedEscrows::untracked`]) when
-    /// it is an untracked escrow
-    /// ([`EscrowUntracked`](crate::buyer_pool::EscrowUntracked)). Return `err`
-    /// unchanged.
-    ///
-    /// Each call site notes the error with no `.await` after the record fails,
-    /// and the run's lane builds and recovery steps share one task. So a call
-    /// that reaches its refusal check ([`RunFunding::refuse_after_untracked`])
-    /// after the failure sees the note. A `topUp` checks under `top_up_serial`,
-    /// which an earlier `topUp` holds until its outcome, so it always sees that
-    /// `topUp`'s note. An `openPool` that passed its check before another
-    /// call's escrow went untracked still sends. When it also goes untracked,
-    /// the handle holds both.
-    pub(crate) fn note_untracked(&self, err: anyhow::Error) -> anyhow::Error {
-        self.escrows.hold_untracked(&err);
-        err
-    }
-
     /// Refuse an `openPool` or `topUp` once the run's handle holds an
-    /// untracked escrow ([`RunFunding::note_untracked`]), from this run or an
+    /// untracked escrow ([`UnconfirmedEscrows::untracked`]), from this run or an
     /// earlier one on the same handle.
+    ///
+    /// A failed record is held ([`UnrecordedEscrow::untracked`]) with no
+    /// `.await` after the failure, and the run's lane builds and recovery steps
+    /// share one task. So a call that reaches this check after the failure sees
+    /// the hold. A `topUp` checks under `top_up_serial`, which an earlier
+    /// `topUp` holds until its outcome, so it always sees that `topUp`'s hold.
+    /// An `openPool` that passed its check before another call's escrow went
+    /// untracked still sends. When it also goes untracked, the handle holds
+    /// both.
     ///
     /// # Errors
     ///
@@ -473,7 +466,7 @@ where
             .await;
             // A failure before any receipt names its cause once: a wallet
             // short of USDC is recorded for the run's closing warning.
-            let ToppedUpPool { credited, tx, .. } = match escrowed {
+            let (ToppedUpPool { credited, tx, .. }, unrecorded) = match escrowed {
                 Ok(topped_up) => topped_up,
                 Err(err) if escrow_held(&err) => return Err(err),
                 // The gas estimate reverted `PoolNotOpen`: the pool is closing
@@ -503,12 +496,17 @@ where
             // The escrow has moved: a credit that does not land names the tx
             // and the pool, and is fatal ([`grade_deposit_credit`]).
             let effect = topped_up_effect(pool_id, credited);
-            let new_deposit = grade_deposit_credit(
+            let new_deposit = match grade_deposit_credit(
                 self.store.add_deposit(self.owner, pool_id, credited),
                 &effect,
                 tx,
-            )
-            .map_err(|err| self.funding.note_untracked(err))?;
+            ) {
+                Ok(deposit) => {
+                    unrecorded.recorded();
+                    deposit
+                }
+                Err(err) => return Err(unrecorded.untracked(err)),
+            };
             Ok(Recovery::ToppedUp(new_deposit))
         })
     }
@@ -627,7 +625,7 @@ where
             },
         )
         .await?;
-        let opened = open_pool(
+        let (opened, unrecorded) = open_pool(
             self.contract,
             self.deployment,
             self.token,
@@ -636,12 +634,8 @@ where
             Some(self.funding.escrows()),
             Some(RECEIPT_TIMEOUT),
         )
-        .await
-        .map_err(|err| self.funding.note_untracked(err))?;
-        self.store.record(&opened.state).map_err(|e| {
-            self.funding
-                .note_untracked(escrowed_but_untracked("buyer pool opened", opened.tx, e))
-        })?;
+        .await?;
+        record_opened(self.store, &opened, unrecorded)?;
         tracing::info!(pool_id = %opened.state.pool_id, %deposit, "opened a new buyer pool");
         Ok(opened.state.pool_id)
     }
@@ -1149,6 +1143,25 @@ fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
     ))
 }
 
+/// Record the pool `opened` bought in `store`, then resolve its escrow on the
+/// run's handle. The deposit is escrowed on-chain, so a failed record leaves
+/// it untracked (reconcile against the tx), held on the handle.
+fn record_opened(
+    store: &dyn BuyerPoolStore,
+    opened: &OpenedPool,
+    unrecorded: UnrecordedEscrow,
+) -> anyhow::Result<()> {
+    match store.record(&opened.state) {
+        Ok(()) => {
+            unrecorded.recorded();
+            Ok(())
+        }
+        Err(e) => {
+            Err(unrecorded.untracked(escrowed_but_untracked("buyer pool opened", opened.tx, e)))
+        }
+    }
+}
+
 /// Whether an [`escrow_top_up`] error is about an escrow the run holds: a
 /// `topUp` that may still mine ([`TopUpUnconfirmed`]), or a refusal after an
 /// untracked escrow ([`RefusedAfterUntracked`]). Either is fatal as it is, and no
@@ -1195,7 +1208,7 @@ async fn escrow_top_up<P>(
     additional: U256,
     max_approve: bool,
     ended: Option<&CancellationToken>,
-) -> anyhow::Result<ToppedUpPool>
+) -> anyhow::Result<(ToppedUpPool, UnrecordedEscrow)>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -1242,7 +1255,7 @@ where
 /// receipt the escrow has moved, so a credit that fails, or a re-read that
 /// finds the row gone ([`escrowed_but_untracked`]), is fatal: the acquire loop
 /// ends the command instead of retrying, because a retry escrows again. The
-/// run's handle holds that escrow ([`RunFunding::note_untracked`]). A refill
+/// run's handle holds that escrow ([`UnrecordedEscrow::untracked`]). A refill
 /// after an earlier `topUp` on the handle went unconfirmed sends nothing and
 /// fails with that held [`TopUpUnconfirmed`] ([`escrow_top_up`]), and one
 /// after an untracked escrow on the handle fails with
@@ -1298,7 +1311,7 @@ where
     )
     .await;
     let err = match escrowed {
-        Ok(ToppedUpPool { credited, tx, .. }) => {
+        Ok((ToppedUpPool { credited, tx, .. }, unrecorded)) => {
             // The USDC is escrowed the moment `topUp` mines. A local credit that
             // does not land leaves the deposit untracked, and continuing would
             // fetch on a `state.deposit` that understates the chain — so the
@@ -1310,24 +1323,34 @@ where
             // in flight. The funding recovery step takes the same disposition
             // (`PoolFunder::recover`).
             let effect = topped_up_effect(state.pool_id, credited);
-            grade_deposit_credit(
+            if let Err(err) = grade_deposit_credit(
                 store.add_deposit(self_address, state.pool_id, credited),
                 &effect,
                 tx,
-            )
-            .map_err(|err| funding.note_untracked(err))?;
+            ) {
+                return Err(unrecorded.untracked(err));
+            }
             // The credit committed, so the row must be there. A `None` here
             // means it vanished between the write and this read — the local
             // record did not survive, which is the same untracked-escrow
             // condition, not something to paper over with the pre-top-up
-            // snapshot.
-            return store.get_by_pool_id(state.pool_id)?.ok_or_else(|| {
-                funding.note_untracked(escrowed_but_untracked(
+            // snapshot. A read that fails leaves the committed credit
+            // standing.
+            return match store.get_by_pool_id(state.pool_id) {
+                Ok(Some(row)) => {
+                    unrecorded.recorded();
+                    Ok(row)
+                }
+                Ok(None) => Err(unrecorded.untracked(escrowed_but_untracked(
                     &effect,
                     tx,
                     "the credited row vanished",
-                ))
-            });
+                ))),
+                Err(err) => {
+                    unrecorded.recorded();
+                    Err(err.into())
+                }
+            };
         }
         Err(err) => err,
     };
@@ -1479,7 +1502,7 @@ where
     let approve_amount = if max_approve { None } else { Some(deposit) };
     ensure_allowance(rpc, token, self_address, payment_pool_addr, approve_amount).await?;
     refuse_after_end(Some(ended))?;
-    let opened = open_pool(
+    let (opened, unrecorded) = open_pool(
         contract,
         deployment,
         token,
@@ -1488,13 +1511,8 @@ where
         Some(funding.escrows()),
         Some(RECEIPT_TIMEOUT),
     )
-    .await
-    .map_err(|err| funding.note_untracked(err))?;
-    // The deposit is escrowed on-chain; a failed local record leaves it
-    // untracked (reconcile against the tx).
-    store.record(&opened.state).map_err(|e| {
-        funding.note_untracked(escrowed_but_untracked("buyer pool opened", opened.tx, e))
-    })?;
+    .await?;
+    record_opened(store, &opened, unrecorded)?;
     // A fresh pool has spent nothing on any lane.
     let spend = LaneSpend {
         outside: U256::ZERO,

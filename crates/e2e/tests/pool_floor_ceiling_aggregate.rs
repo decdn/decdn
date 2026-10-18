@@ -237,7 +237,7 @@ async fn run() -> anyhow::Result<()> {
         chain.provider_for(owner.signer()),
     );
     let deposit = deposit_micro_usdc();
-    let opened = open_pool(
+    let (opened, _unrecorded) = open_pool(
         &contract,
         deployment,
         chain.usdc(),

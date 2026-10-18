@@ -123,7 +123,8 @@ impl Buyer {
         } else {
             let token = contract.usdc().call().await?;
             ensure_allowance(&rpc, token, owner, env.payment_pool, Some(env.deposit)).await?;
-            let opened = open_pool(
+            // With no handle, nothing reads the pending entry the guard holds.
+            let (opened, _unrecorded) = open_pool(
                 &contract,
                 deployment,
                 token,
