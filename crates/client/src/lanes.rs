@@ -17,6 +17,7 @@ use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolStore};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{CapabilityGrant, LaneKey, PoolId};
 use iroh::{Endpoint, EndpointAddr, RelayUrl};
+use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::{OwnedPayer, ProgressWrite, WatermarkRow};
 use crate::discovery::{self, NodeCandidate};
@@ -311,6 +312,7 @@ pub(crate) async fn build_multi_lane<'a, P>(
     target: EndpointAddr,
     open_lock: Option<&tokio::sync::Mutex<()>>,
     ledgers: Option<&LaneLedgers>,
+    ended: &CancellationToken,
 ) -> anyhow::Result<MultiLane<'a>>
 where
     P: alloy::providers::Provider + Clone,
@@ -338,7 +340,7 @@ where
             (Some(lock), LaneKeys::Owned(_)) => Some(lock.lock().await),
             _ => None,
         };
-        build_ctx_for_fetch(deps, &keys, voucher_dom, provider).await?
+        build_ctx_for_fetch(deps, &keys, voucher_dom, provider, ended).await?
     };
     let pool_id = ctx.pool_id;
     let prior_amount = ctx.prior_amount;

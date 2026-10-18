@@ -3404,6 +3404,7 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
         fn connect<'a>(
             &'a self,
             _holder: &'a crate::Holder,
+            _ended: &'a tokio_util::sync::CancellationToken,
         ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
             Box::pin(async { Err(late_escrow(0xab)) })
         }
@@ -3937,15 +3938,14 @@ async fn a_partial_holder_refusing_an_uncovered_block_is_barred_from_it() -> any
     let (store, dir) = fresh_store(root, total);
     // B's lane builds just inside the bar's time: without the bar, A
     // would be asked for block 1 again each time its cooldown ends.
-    let provider = SlowBuild {
-        lanes: StaticSources::new(vec![
+    let provider = SlowBuild::new(
+        StaticSources::new(vec![
             candidate(src_a.clone(), ledger_a, 0xA1, Some(cov(n, &[0]))),
             candidate(src_b.clone(), ledger_b, 0xB2, None),
         ])?,
-        slow: Address::repeat_byte(0xB2),
-        delay: crate::source_set::PULL_THROUGH_BAR.saturating_sub(Duration::from_secs(5)),
-        built: std::sync::atomic::AtomicBool::new(false),
-    };
+        0xB2,
+        crate::source_set::PULL_THROUGH_BAR.saturating_sub(Duration::from_secs(5)),
+    );
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
     let gate = recovery_gate();
@@ -4018,15 +4018,14 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
     let src_b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&ledger_b));
     let root = src_a.root();
     let (store, dir) = fresh_store(root, total);
-    let provider = SlowBuild {
-        lanes: StaticSources::new(vec![
+    let provider = SlowBuild::new(
+        StaticSources::new(vec![
             candidate(src_a.clone(), ledger_a, 0xA1, Some(cov(n, &[0, 1]))),
             candidate(src_b.clone(), ledger_b, 0xB2, None),
         ])?,
-        slow: Address::repeat_byte(0xB2),
-        delay: crate::source_set::PULL_THROUGH_BAR.saturating_sub(Duration::from_secs(5)),
-        built: std::sync::atomic::AtomicBool::new(false),
-    };
+        0xB2,
+        crate::source_set::PULL_THROUGH_BAR.saturating_sub(Duration::from_secs(5)),
+    );
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
     let gate = recovery_gate();
@@ -4196,12 +4195,37 @@ async fn a_probed_holder_saying_not_found_twice_then_serving_completes() -> anyh
 }
 
 /// Static lanes, one of whose builds takes `delay` and sets `built` when
-/// it finishes: a lane build in the middle of an on-chain top-up.
+/// it finishes: a lane build in the middle of an on-chain top-up. Each slow
+/// build records whether its fetch had ended as it started and as it
+/// finished, in `ends`.
 struct SlowBuild {
     lanes: StaticSources<ScriptedSource>,
     slow: Address,
     delay: Duration,
     built: std::sync::atomic::AtomicBool,
+    ends: Mutex<Vec<(bool, bool)>>,
+}
+
+impl SlowBuild {
+    /// `lanes`, the build of `slow`'s lane taking `delay`.
+    fn new(lanes: StaticSources<ScriptedSource>, slow: u8, delay: Duration) -> Self {
+        Self {
+            lanes,
+            slow: Address::repeat_byte(slow),
+            delay,
+            built: std::sync::atomic::AtomicBool::new(false),
+            ends: Mutex::default(),
+        }
+    }
+
+    /// For each slow build, whether its fetch had ended as it started and as
+    /// it finished.
+    fn ends(&self) -> Vec<(bool, bool)> {
+        self.ends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl crate::SourceProvider for SlowBuild {
@@ -4214,20 +4238,27 @@ impl crate::SourceProvider for SlowBuild {
     fn connect<'a>(
         &'a self,
         holder: &'a crate::Holder,
+        ended: &'a tokio_util::sync::CancellationToken,
     ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
         let slow = holder.provider == self.slow;
         Box::pin(async move {
             if slow {
+                let at_start = ended.is_cancelled();
                 tokio::time::sleep(self.delay).await;
                 self.built.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.ends
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((at_start, ended.is_cancelled()));
             }
-            self.lanes.connect(holder).await
+            self.lanes.connect(holder, ended).await
         })
     }
 }
 
 /// A lane build still in flight when the loop decides to return is awaited,
-/// not dropped mid-way.
+/// not dropped mid-way. Its fetch ends as the drain starts (#2513), so a build
+/// that reaches its `openPool` or `topUp` there sends none.
 #[tokio::test(start_paused = true)]
 async fn a_lane_build_in_flight_is_awaited_before_acquire_returns() -> anyhow::Result<()> {
     let data = blob(1024 * 1024);
@@ -4237,44 +4268,61 @@ async fn a_lane_build_in_flight_is_awaited_before_acquire_returns() -> anyhow::R
     let b = ScriptedSource::new(data)?.paying(Arc::clone(&lb));
     let (root, total) = (a.root(), a.total_bytes());
     let (store, _dir) = fresh_store(root, total);
-    let provider = SlowBuild {
-        lanes: StaticSources::new(vec![
+    let provider = SlowBuild::new(
+        StaticSources::new(vec![
             candidate(a, la, 0xA1, None),
             candidate(b, lb, 0xB2, None),
         ])?,
-        slow: Address::repeat_byte(0xB2),
-        delay: Duration::from_secs(5),
-        built: std::sync::atomic::AtomicBool::new(false),
-    };
-    let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
-    let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
-    let gate = recovery_gate();
-    acquire(
-        AcquireTarget {
-            store: &store,
-            hash: root,
-            total_bytes: total,
-            ranges: &[(0, total)],
-        },
-        &mut set,
-        &AcquireEnv {
-            pacer: &BudgetPacer::new(),
-            funder: &no_funding(),
-            recovery: &gate,
-            credentials: None,
-            max_lanes: 2,
-            stop: &stop,
-            on_progress: None,
-            ledgers: None,
-            pacing: None,
-            max_blob_bytes: 0,
-            run: None,
-        },
-    )
-    .await?;
+        0xB2,
+        Duration::from_secs(5),
+    );
+    acquire_over(&store, &provider, provider.lanes.holders(), root, 2).await?;
     assert!(
         provider.built.load(std::sync::atomic::Ordering::SeqCst),
         "the slow build ran to its end before acquire returned"
+    );
+    assert_eq!(
+        provider.ends(),
+        [(false, true)],
+        "the build started in the fetch and ended in the drain"
+    );
+    Ok(())
+}
+
+/// #2513: each acquire's builds serve that acquire's fetch. A provider that
+/// serves a second acquire, as one fetch's lanes serve a re-fetch after a
+/// hash mismatch, builds under a fetch that has not ended.
+#[tokio::test(start_paused = true)]
+async fn each_acquire_gives_its_builds_a_fresh_fetch_end() -> anyhow::Result<()> {
+    let data = blob(1024 * 1024);
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    let lb = Arc::new(PoolLedger::new(Cumulative::default()));
+    let a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&la));
+    let b = ScriptedSource::new(data)?.paying(Arc::clone(&lb));
+    let (root, total) = (a.root(), a.total_bytes());
+    let provider = SlowBuild::new(
+        StaticSources::new(vec![
+            candidate(a, la, 0xA1, None),
+            candidate(b, lb, 0xB2, None),
+        ])?,
+        0xB2,
+        Duration::from_secs(5),
+    );
+    let (store, _dir) = fresh_store(root, total);
+    acquire_over(&store, &provider, provider.lanes.holders(), root, 2).await?;
+    // The static lanes are spent, so this acquire builds no lane and gives
+    // up. Its slow builds still start, once per retry.
+    let (store, _dir) = fresh_store(root, total);
+    let again = acquire_over(&store, &provider, provider.lanes.holders(), root, 2).await;
+    assert!(again.is_err(), "no lane serves the second acquire");
+    let ends = provider.ends();
+    assert!(
+        ends.len() >= 2,
+        "each acquire built the slow lane: {ends:?}"
+    );
+    assert!(
+        ends.iter().all(|(at_start, _)| !at_start),
+        "no build started after its own fetch ended: {ends:?}"
     );
     Ok(())
 }
@@ -4316,6 +4364,7 @@ impl crate::SourceProvider for LateBuilds {
     fn connect<'a>(
         &'a self,
         holder: &'a crate::Holder,
+        ended: &'a tokio_util::sync::CancellationToken,
     ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
         let late = self
             .late
@@ -4323,7 +4372,7 @@ impl crate::SourceProvider for LateBuilds {
             .find(|late| Address::repeat_byte(late.byte) == holder.provider);
         Box::pin(async move {
             let Some(late) = late else {
-                return self.lanes.connect(holder).await;
+                return self.lanes.connect(holder, ended).await;
             };
             tokio::time::sleep(late.delay).await;
             late.ended.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4724,10 +4773,11 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
         fn connect<'a>(
             &'a self,
             holder: &'a crate::Holder,
+            ended: &'a tokio_util::sync::CancellationToken,
         ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                self.lanes.connect(holder).await
+                self.lanes.connect(holder, ended).await
             })
         }
     }
@@ -4800,15 +4850,14 @@ async fn a_refill_a_later_lane_build_made_raises_the_running_lanes() -> anyhow::
     let before = U256::from(u64::MAX);
     let refilled = U256::from(u128::MAX);
     let a_ctx = Arc::new(Mutex::new(ctx_with(0xA1, before)));
-    let provider = SlowBuild {
-        lanes: StaticSources::new(vec![
+    let provider = SlowBuild::new(
+        StaticSources::new(vec![
             candidate_ctx(a, la, Arc::clone(&a_ctx), None),
             candidate_ctx(b, lb, Arc::new(Mutex::new(ctx_with(0xB2, refilled))), None),
         ])?,
-        slow: Address::repeat_byte(0xB2),
-        delay: Duration::from_secs(1),
-        built: std::sync::atomic::AtomicBool::new(false),
-    };
+        0xB2,
+        Duration::from_secs(1),
+    );
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
     let gate = recovery_gate();
@@ -4863,15 +4912,14 @@ async fn a_lane_built_on_a_lower_deposit_never_lowers_the_running_lanes() -> any
     let before = U256::from(u128::MAX);
     let refilled = U256::from(u64::MAX);
     let a_ctx = Arc::new(Mutex::new(ctx_with(0xA1, before)));
-    let provider = SlowBuild {
-        lanes: StaticSources::new(vec![
+    let provider = SlowBuild::new(
+        StaticSources::new(vec![
             candidate_ctx(a, la, Arc::clone(&a_ctx), None),
             candidate_ctx(b, lb, Arc::new(Mutex::new(ctx_with(0xB2, refilled))), None),
         ])?,
-        slow: Address::repeat_byte(0xB2),
-        delay: Duration::from_secs(1),
-        built: std::sync::atomic::AtomicBool::new(false),
-    };
+        0xB2,
+        Duration::from_secs(1),
+    );
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
     let gate = recovery_gate();
@@ -5674,8 +5722,9 @@ impl crate::SourceProvider for FaultLog<'_> {
     fn connect<'b>(
         &'b self,
         holder: &'b crate::Holder,
+        ended: &'b tokio_util::sync::CancellationToken,
     ) -> crate::SourceFuture<'b, StreamCandidate<ScriptedSource>> {
-        self.inner.connect(holder)
+        self.inner.connect(holder, ended)
     }
 
     fn on_source_fault(&self, holder: &crate::Holder) {
@@ -5726,8 +5775,9 @@ impl crate::SourceProvider for Arriving<'_> {
     fn connect<'b>(
         &'b self,
         holder: &'b crate::Holder,
+        ended: &'b tokio_util::sync::CancellationToken,
     ) -> crate::SourceFuture<'b, StreamCandidate<ScriptedSource>> {
-        self.inner.connect(holder)
+        self.inner.connect(holder, ended)
     }
 
     fn arrivals(&self) -> Option<crate::SourceStream<'_, crate::Holder>> {
@@ -7126,6 +7176,7 @@ impl crate::SourceProvider for SlotSources {
     fn connect<'a>(
         &'a self,
         _holder: &'a crate::Holder,
+        _ended: &'a tokio_util::sync::CancellationToken,
     ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
         let credential = self.slot.current();
         let signer = credential.signer.address();

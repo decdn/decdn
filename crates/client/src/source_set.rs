@@ -24,6 +24,7 @@ use alloy::primitives::{Address, U256};
 use decdn_protocol::Coverage;
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use tokio::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 use crate::UpstreamRefused;
 use crate::fault::{Fault, LaneBuildFault, classify};
@@ -128,8 +129,16 @@ pub trait SourceProvider: Send + Sync {
 
     /// Build the paid lane to `holder`. An error here is chain-side: the set
     /// retries it later and never blames the holder.
-    fn connect<'a>(&'a self, holder: &'a Holder)
-    -> SourceFuture<'a, StreamCandidate<Self::Source>>;
+    ///
+    /// `ended` fires once the fetch the build serves has ended. A build sends
+    /// no `openPool` or `topUp` after it fires: the lane would never run. A
+    /// build already past its send runs to its end, so its receipt is read
+    /// and its escrow recorded.
+    fn connect<'a>(
+        &'a self,
+        holder: &'a Holder,
+        ended: &'a CancellationToken,
+    ) -> SourceFuture<'a, StreamCandidate<Self::Source>>;
 
     /// Called once for each delivery fault `holder` raises.
     fn on_source_fault(&self, _holder: &Holder) {}
@@ -149,8 +158,9 @@ impl<P: SourceProvider> SourceProvider for &P {
     fn connect<'a>(
         &'a self,
         holder: &'a Holder,
+        ended: &'a CancellationToken,
     ) -> SourceFuture<'a, StreamCandidate<Self::Source>> {
-        (**self).connect(holder)
+        (**self).connect(holder, ended)
     }
 
     fn on_source_fault(&self, holder: &Holder) {
@@ -1449,7 +1459,11 @@ impl<S: BlobSource> SourceProvider for StaticSources<S> {
         Box::pin(async move { Ok(holders) })
     }
 
-    fn connect<'a>(&'a self, holder: &'a Holder) -> SourceFuture<'a, StreamCandidate<S>> {
+    fn connect<'a>(
+        &'a self,
+        holder: &'a Holder,
+        _ended: &'a CancellationToken,
+    ) -> SourceFuture<'a, StreamCandidate<S>> {
         let taken = self
             .lanes
             .lock()

@@ -1167,6 +1167,17 @@ since project inception and will roll into the first tagged release.
   such escrow in the batch is folded into the error the fetch ends with, as
   the drain folds a late build's: the escrow is the error a caller downcasts,
   and the fault that ended the fetch survives as text.
+- **Client: a lane build sends no `openPool` or `topUp` after its fetch ended
+  (#2513).** When a fetch ends, it awaits its lane builds still in flight for
+  up to 30 s. A build in that drain that had not yet read its pool could still
+  run the proactive refill and send a `topUp`, or open a pool, for a lane that
+  never runs. The escrow was recorded and withdrawable, but no fetch needed
+  it. Now each fetch ends for its builds as its drain starts. A build that
+  reaches its `openPool` or `topUp` after that sends none, reads no allowance
+  or wallet balance, and fails at `debug`. A build already past its send runs
+  to its receipt, as before. The first open of a blob ends its builds the same
+  way on a stop or an error. A re-fetch on the same lanes after a hash
+  mismatch is a new fetch, so its builds can still escrow.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

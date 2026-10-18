@@ -128,6 +128,7 @@ use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::coverage_plan::{
     SourceCoverage, covered_part, covered_suffix_start, covers_byte_range, spread_segments,
@@ -2963,13 +2964,16 @@ pub(crate) type Connecting<'p, S> = std::pin::Pin<
     Box<dyn Future<Output = (Address, anyhow::Result<StreamCandidate<S>>)> + Send + 'p>,
 >;
 
-/// Build `holder`'s lane through `provider`.
-pub(crate) fn connect_future<P: SourceProvider>(
-    provider: &P,
+/// Build `holder`'s lane through `provider` for the fetch that `ended`
+/// marks the end of ([`SourceProvider::connect`]).
+pub(crate) fn connect_future<'p, P: SourceProvider>(
+    provider: &'p P,
     holder: Holder,
-) -> Connecting<'_, P::Source> {
+    ended: &CancellationToken,
+) -> Connecting<'p, P::Source> {
+    let ended = ended.clone();
     Box::pin(async move {
-        let built = provider.connect(&holder).await;
+        let built = provider.connect(&holder, &ended).await;
         (holder.provider, built)
     })
 }
@@ -3318,10 +3322,12 @@ where
 /// Every started lane's lease is released at the latest when it returns or
 /// is dropped. Before it returns, it stops every lane and awaits each lane
 /// build still in flight, for at most 30 s: a build can be in the middle of an
-/// on-chain top-up. A lane built there never starts, and a build that ends
-/// there with a `topUp` or `openPool` that may have escrowed USDC no record
-/// credits fails the acquire. A caller that drops the acquire skips this
-/// drain, and a build there drops mid top-up.
+/// on-chain top-up. A lane built there never starts, so the fetch ends for
+/// its builds first: one that has not sent its `openPool` or `topUp` sends
+/// none ([`SourceProvider::connect`]), and one already past its send runs to
+/// its receipt. A build that ends there with a `topUp` or `openPool` that may
+/// have escrowed USDC no record credits fails the acquire. A caller that drops
+/// the acquire skips this drain, and a build there drops mid top-up.
 ///
 /// # Errors
 ///
@@ -3586,6 +3592,9 @@ where
     // lane unpolled for as long as it takes (#2211). A tick that finds a write
     // still in flight skips, which keeps this loop the single record writer.
     let mut record: Option<SourceFuture<'_, ()>> = None;
+    // Fires as the fetch ends: a lane build that has not sent its `openPool`
+    // or `topUp` by then sends none.
+    let ended = CancellationToken::new();
     // The possible untracked escrows of the builds that end beside the fatal
     // one that ends the fetch ([`fold_late_build`]).
     let mut batch_late: Option<anyhow::Error> = None;
@@ -3733,7 +3742,7 @@ where
                     ready.push((holder.provider, lane));
                 } else {
                     connecting_set.insert(holder.provider);
-                    connecting.push(connect_future(sources.provider(), holder));
+                    connecting.push(connect_future(sources.provider(), holder, &ended));
                 }
             }
 
@@ -4194,6 +4203,7 @@ where
         }
     }
     .await;
+    ended.cancel();
     // Stop every lane first, so no paid leg sits open while the builds drain.
     drop(workers);
     drop(discovering);

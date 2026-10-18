@@ -21,6 +21,7 @@ use decdn_incentive::payment_pool::{PaymentPool, newest_solvent_owned_pool};
 use decdn_incentive::tx::RECEIPT_TIMEOUT;
 use decdn_incentive::{CapabilityGrant, Deployment, LaneKey, PoolId, bind_node_id_domain};
 use iroh::Endpoint;
+use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::{
     LOW_WATER_DIVISOR, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, UnconfirmedEscrows,
@@ -131,6 +132,32 @@ impl std::fmt::Display for RefusedAfterUntracked {
 }
 
 impl std::error::Error for RefusedAfterUntracked {}
+
+/// The refusal of an `openPool` or `topUp` that a lane build reaches after the
+/// fetch it serves has ended ([`crate::SourceProvider::connect`]): the lane
+/// would never run, so the escrow would fund nothing this fetch needs. The
+/// refused call escrows nothing. The build fails, and the drain of late lane
+/// builds logs it at `debug`.
+#[derive(Debug)]
+pub(crate) struct FetchEnded;
+
+impl std::fmt::Display for FetchEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the fetch ended before this lane build's openPool or topUp; it sends none")
+    }
+}
+
+impl std::error::Error for FetchEnded {}
+
+/// Refuse an `openPool` or `topUp` once `ended` fires ([`FetchEnded`]).
+/// `None` is a caller outside any lane build, such as the funding recovery
+/// step, which runs only while its fetch does.
+fn refuse_after_end(ended: Option<&CancellationToken>) -> anyhow::Result<()> {
+    if ended.is_some_and(CancellationToken::is_cancelled) {
+        return Err(anyhow::Error::new(FetchEnded));
+    }
+    Ok(())
+}
 
 /// What a lane build learned about the pool's spend, for
 /// [`RunFunding::join_lane`].
@@ -441,6 +468,7 @@ where
                 pool_id,
                 additional,
                 self.max_approve,
+                None,
             )
             .await;
             // A failure before any receipt names its cause once: a wallet
@@ -644,12 +672,14 @@ impl LaneKeys<'_> {
 
 /// Select the pool context for one lane of `deps`' run: the delegated
 /// adoption path for [`LaneKeys::Delegated`] (adopt the named pool, present
-/// the owner's capability, no open), else the self-owned open-or-reuse path.
+/// the owner's capability, no open), else the self-owned open-or-reuse path,
+/// which sends no `openPool` or `topUp` once `ended` fires.
 pub(crate) async fn build_ctx_for_fetch<P>(
     deps: &LaneDeps<'_, P>,
     keys: &LaneKeys<'_>,
     voucher_dom: &Eip712Domain,
     provider: Address,
+    ended: &CancellationToken,
 ) -> anyhow::Result<(PoolContext, Option<LaneSpend>)>
 where
     P: alloy::providers::Provider + Clone,
@@ -667,7 +697,7 @@ where
         )
         .await
         .map(|ctx| (ctx, None)),
-        LaneKeys::Owned(payer) => build_pool_ctx(deps, payer, provider)
+        LaneKeys::Owned(payer) => build_pool_ctx(deps, payer, provider, ended)
             .await
             .map(|(ctx, spend)| (ctx, Some(spend))),
     }
@@ -688,6 +718,7 @@ async fn build_pool_ctx<P>(
     deps: &LaneDeps<'_, P>,
     payer: &OwnedPayer,
     provider: Address,
+    ended: &CancellationToken,
 ) -> anyhow::Result<(PoolContext, LaneSpend)>
 where
     P: alloy::providers::Provider + Clone,
@@ -701,6 +732,7 @@ where
         provider,
         deps.chain.deployment(),
         deps.deposit,
+        ended,
     )
     .await?;
     Ok((
@@ -1144,12 +1176,16 @@ fn escrow_held(err: &anyhow::Error) -> bool {
 /// command ([`crate::Fault::Fatal`]). A `funding` whose handle holds an
 /// untracked escrow ([`UnconfirmedEscrows::untracked`]) refuses too, with
 /// [`RefusedAfterUntracked`]. Both refusals read the handle, so a later pass
-/// on the same handle refuses the same way.
+/// on the same handle refuses the same way. A lane build's call refuses with
+/// [`FetchEnded`] once `ended` fires, checked before the allowance leg and
+/// again before the `topUp` leg; a call past its `topUp` send runs to its
+/// receipt.
 ///
 /// # Errors
 ///
 /// The run's handle holds an unconfirmed `topUp` or an untracked escrow, or
 /// the allowance or `topUp` leg fails.
+#[allow(clippy::too_many_arguments)]
 async fn escrow_top_up<P>(
     funding: &RunFunding,
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -1158,6 +1194,7 @@ async fn escrow_top_up<P>(
     pool_id: PoolId,
     additional: U256,
     max_approve: bool,
+    ended: Option<&CancellationToken>,
 ) -> anyhow::Result<ToppedUpPool>
 where
     P: alloy::providers::Provider + Clone,
@@ -1168,6 +1205,7 @@ where
             .context("refusing a second topUp while an earlier one is unconfirmed"));
     }
     funding.refuse_after_untracked()?;
+    refuse_after_end(ended)?;
     ensure_allowance(
         contract.provider(),
         token,
@@ -1176,6 +1214,7 @@ where
         if max_approve { None } else { Some(additional) },
     )
     .await?;
+    refuse_after_end(ended)?;
     top_up(
         contract,
         owner,
@@ -1207,7 +1246,9 @@ where
 /// after an earlier `topUp` on the handle went unconfirmed sends nothing and
 /// fails with that held [`TopUpUnconfirmed`] ([`escrow_top_up`]), and one
 /// after an untracked escrow on the handle fails with
-/// [`RefusedAfterUntracked`], each fatal the same way.
+/// [`RefusedAfterUntracked`], each fatal the same way. A refill that `ended`
+/// finds fired sends nothing and fails with [`FetchEnded`]: the lane would
+/// never run.
 #[allow(clippy::too_many_arguments)]
 async fn refill_if_low<P>(
     store: &dyn BuyerPoolStore,
@@ -1219,6 +1260,7 @@ async fn refill_if_low<P>(
     spent: U256,
     working_deposit: U256,
     max_approve: bool,
+    ended: &CancellationToken,
 ) -> anyhow::Result<BuyerPoolState>
 where
     P: alloy::providers::Provider + Clone,
@@ -1237,6 +1279,7 @@ where
         }
         return Ok(state);
     }
+    refuse_after_end(Some(ended))?;
     tracing::info!(
         "buyer pool {} low on deposit ({remaining} µUSDC remaining of {} deposited); \
          topping up {additional} µUSDC",
@@ -1251,6 +1294,7 @@ where
         state.pool_id,
         additional,
         max_approve,
+        Some(ended),
     )
     .await;
     let err = match escrowed {
@@ -1287,7 +1331,8 @@ where
         }
         Err(err) => err,
     };
-    if escrow_held(&err) {
+    // A refusal names its own cause; no wallet balance explains it.
+    if escrow_held(&err) || err.downcast_ref::<FetchEnded>().is_some() {
         return Err(err);
     }
     let Some(shortfall) = funding
@@ -1330,13 +1375,15 @@ where
 /// voucher EIP-712 domain derives from it. `deposit` is how the pool is
 /// funded: the working deposit a new pool opens at and a low pool refills
 /// toward, the allowance mode, and whether a lost row adopts from chain.
+/// `ended` fires once the fetch the lane serves has ended.
 ///
 /// # Errors
 ///
 /// A chain read, allowance, `openPool` or `topUp` fails, the buyer store
 /// cannot record a pool the chain escrowed (fatal: the escrow is untracked),
-/// or the run's handle holds an untracked escrow, so no `openPool` or `topUp`
-/// is sent ([`RefusedAfterUntracked`], fatal).
+/// the run's handle holds an untracked escrow, so no `openPool` or `topUp`
+/// is sent ([`RefusedAfterUntracked`], fatal), or `ended` fired before the
+/// `openPool` or `topUp` was sent ([`FetchEnded`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_or_reuse_pool<P>(
     store: &dyn BuyerPoolStore,
@@ -1347,6 +1394,7 @@ pub(crate) async fn open_or_reuse_pool<P>(
     provider: Address,
     deployment: Deployment,
     deposit: DepositPolicy,
+    ended: &CancellationToken,
 ) -> anyhow::Result<(PoolContext, LaneSpend)>
 where
     P: alloy::providers::Provider + Clone,
@@ -1393,6 +1441,7 @@ where
             spent,
             working_deposit,
             max_approve,
+            ended,
         )
         .await?;
         let lane_spend = LaneSpend {
@@ -1413,6 +1462,7 @@ where
     }
 
     funding.refuse_after_untracked()?;
+    refuse_after_end(Some(ended))?;
     // Authoritative USDC token for the pool, from the contract itself.
     let token = contract
         .usdc()
@@ -1428,6 +1478,7 @@ where
     // exactly the deposit being escrowed.
     let approve_amount = if max_approve { None } else { Some(deposit) };
     ensure_allowance(rpc, token, self_address, payment_pool_addr, approve_amount).await?;
+    refuse_after_end(Some(ended))?;
     let opened = open_pool(
         contract,
         deployment,

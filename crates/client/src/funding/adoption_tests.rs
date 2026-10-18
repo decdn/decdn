@@ -97,6 +97,7 @@ async fn run_in(
             max_approve: false,
             adoption,
         },
+        &CancellationToken::new(),
     )
     .await;
     (result, asserter.read_q().is_empty())
@@ -1318,6 +1319,7 @@ async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_escrows() {
             max_approve: false,
             adoption: ChainAdoption::Refused,
         },
+        &CancellationToken::new(),
     )
     .await
     .expect_err("the open's submit fails in transport");
@@ -1582,6 +1584,20 @@ async fn run_until_err(
     rpc: &decdn_incentive::test_rpc::ScriptedRpc,
     funding: &RunFunding,
 ) -> anyhow::Error {
+    run_scripted(store, signer, rpc, funding, &CancellationToken::new())
+        .await
+        .expect_err("the lane build must fail")
+}
+
+/// Run [`open_or_reuse_pool`] on `rpc`, for a fetch that `ended` marks the
+/// end of, for at most twice [`RECEIPT_TIMEOUT`].
+async fn run_scripted(
+    store: &dyn BuyerPoolStore,
+    signer: &Arc<PrivateKeySigner>,
+    rpc: &decdn_incentive::test_rpc::ScriptedRpc,
+    funding: &RunFunding,
+    ended: &CancellationToken,
+) -> anyhow::Result<(PoolContext, LaneSpend)> {
     let provider = rpc.clone().provider();
     let contract = PaymentPool::new(PP, provider.clone());
     tokio::time::timeout(
@@ -1599,11 +1615,11 @@ async fn run_until_err(
                 max_approve: false,
                 adoption: ChainAdoption::Refused,
             },
+            ended,
         ),
     )
     .await
     .expect("the lane build must end within twice RECEIPT_TIMEOUT")
-    .expect_err("the lane build must fail")
 }
 
 /// A lane build whose `openPool` never mines ends at [`RECEIPT_TIMEOUT`] with
@@ -2244,6 +2260,96 @@ async fn a_top_up_after_an_untracked_refill_is_refused() {
         "the refusal makes no call past the pool read"
     );
     assert!(rpc.sent_nonces().is_empty(), "the refusal sends nothing");
+}
+
+/// Assert `err` refused an `openPool` or `topUp` because its fetch ended.
+fn ended_before_send(err: &anyhow::Error) {
+    assert!(err.downcast_ref::<FetchEnded>().is_some(), "{err:#}");
+}
+
+/// A fired token for a fetch that has ended.
+fn fetch_ended() -> CancellationToken {
+    let ended = CancellationToken::new();
+    ended.cancel();
+    ended
+}
+
+/// #2513: a lane build that reaches its refill after its fetch ended sends no
+/// `topUp`: the lane would never run. It reads no allowance and no wallet
+/// balance, and records no shortfall.
+#[tokio::test(start_paused = true)]
+async fn a_refill_after_the_fetch_ended_sends_no_top_up() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store, &signer);
+    let funding = RunFunding::default();
+    let rpc = ScriptedRpc::mined(mined_top_up()).answering_calls(refill_reads(signer.address()));
+    let err = run_scripted(&store, &signer, &rpc, &funding, &fetch_ended())
+        .await
+        .expect_err("the refill is refused");
+    ended_before_send(&err);
+    assert!(rpc.sent_nonces().is_empty(), "the refusal sends nothing");
+    assert!(!rpc.calls_drained(), "the refusal reads no allowance");
+    assert!(funding.shortfall().is_none(), "no wallet read explains it");
+    assert!(funding.escrows().pending().is_empty());
+}
+
+/// #2513: a lane build that finds no pool after its fetch ended opens none.
+#[tokio::test(start_paused = true)]
+async fn a_fresh_open_after_the_fetch_ended_sends_nothing() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let funding = RunFunding::default();
+    let rpc = ScriptedRpc::mined(mined_open(signer.address(), B256::repeat_byte(0xEE)))
+        .answering_calls([Bytes::from(TOKEN.abi_encode())]);
+    let err = run_scripted(&store, &signer, &rpc, &funding, &fetch_ended())
+        .await
+        .expect_err("the open is refused");
+    ended_before_send(&err);
+    assert!(rpc.sent_nonces().is_empty(), "the refusal sends nothing");
+    assert!(!rpc.calls_drained(), "the refusal reads no token");
+    assert!(store.get_by_owner(signer.address()).unwrap().is_none());
+}
+
+/// #2513: a refill already past its `topUp` send when the fetch ends runs to
+/// its receipt: the end refuses a send, never a receipt read. Here the
+/// `topUp` never mines, so the build lapses with it held.
+#[tokio::test(start_paused = true)]
+async fn a_refill_past_its_send_runs_to_its_receipt_after_the_fetch_ends() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store, &signer);
+    let funding = RunFunding::default();
+    let rpc = ScriptedRpc::parked_receipt().answering_calls(refill_reads(signer.address()));
+    let ended = CancellationToken::new();
+    let end_after_send = async {
+        while rpc.sent_nonces().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        ended.cancel();
+    };
+    let started = tokio::time::Instant::now();
+    let (built, ()) = tokio::join!(
+        run_scripted(&store, &signer, &rpc, &funding, &ended),
+        end_after_send
+    );
+    let err = built.expect_err("the topUp never mines");
+    lapsed(&err);
+    assert!(err.downcast_ref::<FetchEnded>().is_none(), "{err:#}");
+    assert!(
+        started.elapsed() >= RECEIPT_TIMEOUT,
+        "it waited on the receipt"
+    );
+    assert_eq!(funding.escrows().top_ups(), vec![HELD]);
 }
 
 /// The handle holds a run's untracked escrow after the run's state is

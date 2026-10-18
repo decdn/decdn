@@ -83,8 +83,9 @@ impl crate::SourceProvider for ScriptedDiscovery {
     fn connect<'a>(
         &'a self,
         holder: &'a crate::Holder,
+        ended: &'a tokio_util::sync::CancellationToken,
     ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
-        self.lanes.connect(holder)
+        self.lanes.connect(holder, ended)
     }
 }
 
@@ -509,13 +510,14 @@ impl crate::SourceProvider for SlowBuilds {
     fn connect<'a>(
         &'a self,
         holder: &'a crate::Holder,
+        ended: &'a tokio_util::sync::CancellationToken,
     ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
         self.connects.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             tokio::time::sleep(self.delay).await;
             match self.fail {
                 Some(fail) => Err(fail()),
-                None => self.lanes.connect(holder).await,
+                None => self.lanes.connect(holder, ended).await,
             }
         })
     }
