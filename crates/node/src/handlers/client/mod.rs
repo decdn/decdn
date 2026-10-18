@@ -896,8 +896,10 @@ enum MissPath {
     /// the buy ceiling (`below_margin`), a fault in this node (`local_fault`),
     /// this node's own wallet unable to fund a pool (`funding_needed`), or every
     /// candidate refusing this node's funding with no recovery step left
-    /// (`unfunded`).
-    PullLegMiss(crate::node_origin::PullMiss),
+    /// (`unfunded`). It carries the walk's
+    /// [`PullLegTrail`](crate::node_origin::PullLegTrail), which the refusal's
+    /// log line records (#2366).
+    PullLegMiss(crate::node_origin::PullLegMiss),
     /// The pull leg open ran past its deadline: the configured pull-through
     /// timeout, or [`WINDOW_PULL_FALLBACK_DEADLINE`] when none is set.
     PullLegTimeout,

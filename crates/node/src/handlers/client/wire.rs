@@ -352,26 +352,41 @@ pub(super) fn record_stream_error(detail: impl std::fmt::Display) {
 
 /// The info line [`ClientHandler::respond_miss`] writes for one serve-miss
 /// refusal. `reason` is the same snake-case value the `serve_stream` span
-/// records. A pull-leg miss adds its `cause`; a coverage-gate refusal adds the
-/// pull range, the candidate count and the first uncovered chunk; a throttled
-/// line adds the count of lines it `suppressed`. An absent field is not
-/// recorded.
+/// records; `namespace_id` is the request's, as a decimal. A pull-leg miss adds
+/// its `cause` and the walk's trail (`source`, `discovered`, `skipped`,
+/// `probed`, `unreachable`, `absent`, `dropped`, `holders`, `spans`,
+/// `handshakes`, `last_fault`; #2366); a coverage-gate refusal adds the pull
+/// range, the candidate count and the first uncovered chunk; a throttled line
+/// adds the count of lines it `suppressed`. An absent field is not recorded.
 fn log_miss_refusal(req: &StreamRequest, refusal: MissRefusal, suppressed: Option<u64>) {
-    let cause = match refusal.path {
-        MissPath::PullLegMiss(miss) => Some(miss.as_str()),
+    let leg = match refusal.path {
+        MissPath::PullLegMiss(leg) => Some(leg),
         _ => None,
     };
+    let trail = leg.map(|leg| leg.trail);
     let shortfall = match refusal.path {
         MissPath::CoverageGate(shortfall) => Some(shortfall),
         _ => None,
     };
     tracing::info!(
         hash = %Hash::from_bytes(req.hash),
+        namespace_id = %alloy::primitives::U256::from_be_bytes(req.namespace_id),
         byte_offset = req.byte_offset,
         byte_len = req.byte_len,
         reason = super::outcome::refusal_reason(refusal.reason),
         path = refusal.path.as_str(),
-        cause,
+        cause = leg.map(|leg| leg.miss.as_str()),
+        source = trail.map(|t| t.source.as_str()),
+        discovered = trail.map(|t| t.discovered),
+        skipped = trail.map(|t| t.skipped),
+        probed = trail.map(|t| t.probed),
+        unreachable = trail.map(|t| t.unreachable),
+        absent = trail.map(|t| t.absent),
+        dropped = trail.map(|t| t.dropped),
+        holders = trail.map(|t| t.holders),
+        spans = trail.map(|t| t.spans),
+        handshakes = trail.map(|t| t.handshakes),
+        last_fault = trail.and_then(|t| t.last_fault),
         pull_offset = shortfall.map(|s| s.pull_offset),
         pull_len = shortfall.map(|s| s.pull_len),
         candidates = shortfall.map(|s| s.candidates),

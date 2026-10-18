@@ -3150,6 +3150,18 @@ since project inception and will roll into the first tagged release.
 
 #### Node serve path
 
+- **A `pull_leg_miss` refusal names the walk that found no target (#2366).**
+  The `serve-miss: refusing the request` line for a pull-leg miss now records
+  where the candidate list came from (`source`: `cache`, `dht`, `directory`
+  or `none`), how many providers it held (`discovered`), how many the probe
+  rounds skipped as suppressed or wedged (`skipped`), probed (`probed`), lost
+  to a failed probe (`unreachable`), heard `has_blob: false` from (`absent`)
+  or dropped on this node's own policy (`dropped`), how many holders they
+  admitted (`holders`) and whether those span the blob (`spans`), how many
+  handshakes ran (`handshakes`) and why the last one failed (`last_fault`).
+  Every serve-miss refusal line also carries the request's `namespace_id`.
+  Before, the line said only `cause=clean_miss`, so a fleet logging at info
+  could not tell an unreachable sole candidate from an empty directory.
 - **A fault in this node is no longer signed to clients as a `NotFound` about
   the content (#1560).** When a node-to-node pull failed for a reason that was
   *ours* — a buyer key that cannot sign the ADR 005 client binding, a voucher
@@ -3619,6 +3631,14 @@ since project inception and will roll into the first tagged release.
 
 #### Node selection & observability
 
+- **The node's upstream probe budget is 1 s (#2366).** `PROBE_TIMEOUT` was
+  500 ms. A probe dials a fresh connection, so it costs two RTTs (the
+  connection handshake and the request); at inter-continental RTTs that sits
+  at or past 500 ms, and a node whose only candidate was a far origin dropped it as
+  unreachable and signed `NotFound` for content that origin serves. On the
+  testnet, 106 of hel1's 156 probe rounds in one day overran the old ceiling.
+  The outer pull-through deadline at defaults is 168 s (was 167.5 s). ADR 001
+  § Probe response collection and ADR 005 carry the new figure.
 - **`Candidate.stake` is now `u64`, not `Option<u64>`** (internal API,
   `decdn-node`). The `Option` conflated "not looked up" with "looked up, holds
   no bond", and the stake tie-break ranked unknown strictly *below* a known

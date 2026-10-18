@@ -33,7 +33,7 @@ use crate::load_shed::RequestClass;
 
 /// Bucket upper bounds of `decdn_probe_collection_latency_seconds`, per the
 /// registry row in `adr/appendix-observability.md`. The collection window has a
-/// 500 ms ceiling, so the top finite bucket leaves room for a slow scheduler.
+/// 1 s ceiling, so the top finite bucket leaves room for a slow scheduler.
 const PROBE_COLLECTION_BUCKETS: [f64; 8] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
 
 /// Bucket upper bounds shared by the time-to-first-byte histograms. A cache hit

@@ -1023,9 +1023,9 @@ impl ClientHandler {
         let open = origin.open_pull_leg(hash, namespace_id, prime, requester.0);
         match tokio::time::timeout(deadline, open).await {
             Ok(Ok(target)) => Ok(target),
-            Ok(Err(miss)) => Err(MissRefusal::new(
-                fault_seen || miss.is_local_fault(),
-                MissPath::PullLegMiss(miss),
+            Ok(Err(leg)) => Err(MissRefusal::new(
+                fault_seen || leg.miss.is_local_fault(),
+                MissPath::PullLegMiss(leg),
             )),
             Err(_elapsed) => {
                 self.metrics.node_pull_through_timeout();

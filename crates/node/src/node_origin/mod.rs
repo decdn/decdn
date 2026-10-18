@@ -51,7 +51,10 @@ pub(crate) use admit_store::NodeAdmitStore;
 pub(crate) use backend_source::BackendSource;
 pub(crate) use funder::NodeFunder;
 use funder::{SETTLE_POLL_STEP, settle_window};
-pub(crate) use pull_leg::{PrimeLeg, PullLegTarget, run_local_pull_leg, run_pull_leg};
+pub(crate) use pull_leg::{
+    CandidateSource, PrimeLeg, PullLegMiss, PullLegTarget, PullLegTrail, run_local_pull_leg,
+    run_pull_leg,
+};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -223,6 +226,20 @@ enum PoolOpenArm {
     Reported,
     /// Marked by nobody, so raised outside the open task and counted here.
     Residual,
+}
+
+impl PoolOpenArm {
+    /// The `last_fault` value a pull-leg trail records for a handshake that
+    /// ended on this arm (#2366).
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pool_open_pending",
+            Self::FundingNeeded => "funding_needed",
+            Self::LocalFault => "local_fault",
+            Self::Reported => "pool_open_reported",
+            Self::Residual => "pool_open_failed",
+        }
+    }
 }
 
 /// Read the ladder arm for `err` from its typed markers.
@@ -953,7 +970,7 @@ impl Origin for NodeOrigin {
                 // a hash-only pull with no client namespace, so it takes no on-chain
                 // origin-directory fallback (`NO_NAMESPACE`). The namespace-aware
                 // client-serve serve-miss path is `open_pull_leg`.
-                let providers = discover(deps, hash_bytes, U256::ZERO).await;
+                let providers = discover(deps, hash_bytes, U256::ZERO).await.providers;
                 if providers.is_empty() {
                     // `node_pull_no_providers` means "the blob is unavailable on the
                     // network, NOT a pull failure" — mutually exclusive with
@@ -981,6 +998,7 @@ impl Origin for NodeOrigin {
                     hash_bytes,
                     ProbeGather::EarlyExit,
                     U256::ZERO,
+                    &mut ProbeTally::default(),
                 )
                 .await;
                 let outcome = try_pull(&deps_lock, deps, &ranked, hash_bytes, budget, &gate).await;
@@ -1064,6 +1082,16 @@ fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
     }
 }
 
+/// A discovery's answer: the providers and where they came from (#2366).
+struct Discovered {
+    /// The providers to probe.
+    providers: Vec<DhtNodeId>,
+    /// [`CandidateSource::Dht`] for a non-empty lookup answer,
+    /// [`CandidateSource::Directory`] for a non-empty directory fallback,
+    /// [`CandidateSource::None`] when both are empty.
+    source: CandidateSource,
+}
+
 /// Discover candidate providers for `hash`: the DHT iterative lookup first,
 /// falling back to the on-chain origin directory keyed on `namespace_id` when the
 /// lookup converges empty (ADR 022 §`FIND_VALUE` Flow). On the ranged pull leg
@@ -1080,11 +1108,7 @@ fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
 /// client-serve path). Origin backends (S3/HTTP/FS) are hash-keyed and never see
 /// it. `NO_NAMESPACE` (0) resolves to no authorized origins, so a hash-only pull
 /// (the buffered fill) simply gets no directory fallback (ADR 002 §Namespace 0).
-async fn discover(
-    deps: &NodeOriginDeps,
-    hash_bytes: [u8; 32],
-    namespace_id: U256,
-) -> Vec<DhtNodeId> {
+async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32], namespace_id: U256) -> Discovered {
     let target = DhtHash::from_bytes(hash_bytes);
     // `find_providers` carries each holder's range-keyed `Coverage` alongside
     // its `NodeId` (ADR 039-adjacent partial-holder discovery) — a STALE
@@ -1108,10 +1132,21 @@ async fn discover(
     .into_iter()
     .map(|(node, _coverage)| node)
     .collect();
-    if providers.is_empty() {
-        directory_origins(deps, namespace_id).await
+    if !providers.is_empty() {
+        return Discovered {
+            providers,
+            source: CandidateSource::Dht,
+        };
+    }
+    let origins = directory_origins(deps, namespace_id).await;
+    let source = if origins.is_empty() {
+        CandidateSource::None
     } else {
-        providers
+        CandidateSource::Directory
+    };
+    Discovered {
+        providers: origins,
+        source,
     }
 }
 
@@ -1124,32 +1159,104 @@ async fn directory_origins(deps: &NodeOriginDeps, namespace_id: U256) -> Vec<Dht
     origins
 }
 
+/// Why one probe admitted no candidate (#2366). The side effects of each arm
+/// (reputation, negative cache, metrics) run at the drop site in
+/// [`probe_candidate`]; this is what the round tallies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeDrop {
+    /// The probe failed: a timeout, a failed dial, a dropped connection.
+    Unreachable,
+    /// The peer answered `has_blob: false`.
+    Absent,
+    /// The peer shed the probe with `APP_ERR_RATE_LIMITED`.
+    RateLimited,
+    /// The peer has no resolvable operator address, or its id does not decode.
+    NoAddress,
+    /// The response failed shape, correlation or `slash_sig` recovery.
+    Unverifiable,
+    /// The response's `has_blob` and coverage disagree.
+    Inconsistent,
+}
+
+/// What the probe rounds of one discovery saw (#2366): the counts a
+/// [`PullLegTrail`] records. Counts saturate at `u16::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ProbeTally {
+    /// Peers skipped before probing: suppressed for the hash, or wedged.
+    skipped: u16,
+    /// Probes sent.
+    probed: u16,
+    /// Probes that failed.
+    unreachable: u16,
+    /// Probes answered `has_blob: false`.
+    absent: u16,
+    /// Probes dropped on this node's own policy.
+    dropped: u16,
+    /// Candidates admitted.
+    holders: u16,
+    /// Whether the admitted holders' coverage union spans the blob.
+    spans: bool,
+}
+
+impl ProbeTally {
+    /// Count one dropped probe under its arm.
+    const fn record(&mut self, drop: ProbeDrop) {
+        let slot = match drop {
+            ProbeDrop::Unreachable => &mut self.unreachable,
+            ProbeDrop::Absent => &mut self.absent,
+            ProbeDrop::RateLimited
+            | ProbeDrop::NoAddress
+            | ProbeDrop::Unverifiable
+            | ProbeDrop::Inconsistent => &mut self.dropped,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    /// Copy the counts into `trail`.
+    const fn fold_into(self, trail: &mut PullLegTrail) {
+        trail.skipped = self.skipped;
+        trail.probed = self.probed;
+        trail.unreachable = self.unreachable;
+        trail.absent = self.absent;
+        trail.dropped = self.dropped;
+        trail.holders = self.holders;
+        trail.spans = self.spans;
+    }
+}
+
+/// `len` as a saturating `u16` count.
+fn count_u16(len: usize) -> u16 {
+    u16::try_from(len).unwrap_or(u16::MAX)
+}
+
 /// Probe up to `probe_fanout` providers for rate + RTT, build a [`Candidate`]
 /// for each that reports holding the blob, and rank them by the combined
-/// reputation-weighted selection score.
+/// reputation-weighted selection score. `tally` receives what the rounds saw.
 ///
 /// Under [`ProbeGather::CoverageUnion`], a round whose holders cannot span the
 /// blob also probes the origin directory's candidates for `namespace_id` that the
-/// first round did not probe (ADR 022 §`FIND_VALUE` Flow, #2195). A DHT answer can
+/// first round did not resolve (ADR 022 §`FIND_VALUE` Flow, #2195). A DHT answer can
 /// hold only partial holders, and the ranged assembly needs a candidate set that
 /// covers every block. An origin past the first round's `probe_fanout` cut is
-/// probed here even when `providers` named it.
+/// probed here even when `providers` named it; an origin the first round skipped
+/// as suppressed or wedged is not asked again.
 async fn probe_and_rank(
     deps: &NodeOriginDeps,
     providers: Vec<DhtNodeId>,
     hash_bytes: [u8; 32],
     gather: ProbeGather,
     namespace_id: U256,
+    tally: &mut ProbeTally,
 ) -> Vec<Candidate> {
     let target = DhtHash::from_bytes(hash_bytes);
     let mut candidates: Vec<Candidate> = Vec::new();
-    let probed = probe_round(deps, &providers, hash_bytes, gather, &mut candidates).await;
+    let resolved = probe_round(deps, &providers, hash_bytes, gather, &mut candidates, tally).await;
     if matches!(gather, ProbeGather::CoverageUnion) && !coverage_spans(hash_bytes, &candidates) {
         let directory = directory_origins(deps, namespace_id).await;
         let listed = directory.len();
         let origins: Vec<DhtNodeId> = directory
             .into_iter()
-            .filter(|origin| !probed.contains(origin))
+            .filter(|origin| !resolved.contains(origin))
             .collect();
         let hash = Hash::from_bytes(hash_bytes);
         let holders = candidates.len();
@@ -1163,7 +1270,7 @@ async fn probe_and_rank(
                  adds no unprobed candidate"
             );
         } else {
-            probe_round(deps, &origins, hash_bytes, gather, &mut candidates).await;
+            probe_round(deps, &origins, hash_bytes, gather, &mut candidates, tally).await;
             debug!(
                 %hash,
                 %namespace_id,
@@ -1176,6 +1283,8 @@ async fn probe_and_rank(
             );
         }
     }
+    tally.holders = count_u16(candidates.len());
+    tally.spans = coverage_spans(hash_bytes, &candidates);
     let ranked = rank(candidates);
     // ADR 001 §Probe cache: retain the top 10 by selection score, so a repeat
     // miss for this hash inside the TTL skips the lookup and the probe fanout.
@@ -1205,8 +1314,12 @@ async fn probe_and_rank(
 
 /// One concurrent probe round over `peers`, pushing each holder into
 /// `candidates` until `gather`'s stop condition holds or the round drains.
-/// Returns the peers it probed: those left after the negative-cache, wedged, and
-/// `probe_fanout` filters.
+/// Returns the peers the round resolved: those it probed, and those the
+/// negative-cache and wedged filters skipped. A peer past the `probe_fanout`
+/// cut is in neither, so a later round can probe it. `tally` counts the peers
+/// the filters skipped, the probes sent, and each probe that admitted no
+/// candidate; a probe still pending when the stop condition holds counts as
+/// sent and nothing else.
 ///
 /// Under [`ProbeGather::CoverageUnion`] the stop condition counts the holders
 /// already in `candidates`, so a second round stops as soon as its answers close
@@ -1217,6 +1330,7 @@ async fn probe_round(
     hash_bytes: [u8; 32],
     gather: ProbeGather,
     candidates: &mut Vec<Candidate>,
+    tally: &mut ProbeTally,
 ) -> Vec<DhtNodeId> {
     use futures_util::stream::StreamExt;
     let mut union = CoverageUnionTracker::from_candidates(hash_bytes, candidates);
@@ -1232,7 +1346,7 @@ async fn probe_round(
     // The collection window opens here: every probe, dial included, starts at once on
     // the first poll.
     let collection_started = Instant::now();
-    let selected: Vec<DhtNodeId> = peers
+    let (unsuppressed, skipped): (Vec<DhtNodeId>, Vec<DhtNodeId>) = peers
         .iter()
         .copied()
         // Drop peers already known to answer "no" for THIS hash within the TTL.
@@ -1245,7 +1359,6 @@ async fn probe_round(
         //
         // Filtered BEFORE `take`, so a suppressed peer does not consume a probe-fanout
         // slot that a viable provider could have used.
-        .filter(|peer| !deps.negative_cache.contains_active(peer, &target))
         // Also drop WEDGED providers, for ALL hashes until the suppression window elapses
         // (#1145 review): a provider whose voucher we just failed to pay on lane-terminal terms
         // is one we cannot pay for any blob right now. Nothing else SUPPRESSES it — the
@@ -1253,9 +1366,16 @@ async fn probe_round(
         // it lapses for any other blob, and the arm deliberately scores no reputation. Without
         // this the peer is re-selected on the next miss for a different hash and re-wedged —
         // burning a candidate slot each time.
-        .filter(|peer| !deps.provider_is_wedged(peer, now_secs))
+        .partition(|peer| {
+            !deps.negative_cache.contains_active(peer, &target)
+                && !deps.provider_is_wedged(peer, now_secs)
+        });
+    tally.skipped = tally.skipped.saturating_add(count_u16(skipped.len()));
+    let selected: Vec<DhtNodeId> = unsuppressed
+        .into_iter()
         .take(deps.config.probe_fanout)
         .collect();
+    tally.probed = tally.probed.saturating_add(count_u16(selected.len()));
     let mut probes: futures_util::stream::FuturesUnordered<_> = selected
         .iter()
         .map(|&peer| probe_candidate(deps, peer, hash_bytes))
@@ -1275,24 +1395,29 @@ async fn probe_round(
     // set of partial holders whose fastest answers all cover the same block must not stop
     // short of the holders that cover the rest.
     while let Some(result) = probes.next().await {
-        if let Some(candidate) = result {
-            let done = match gather {
-                ProbeGather::EarlyExit => {
-                    candidates.push(candidate);
-                    candidates.len() >= PROBE_EARLY_EXIT_CANDIDATES
-                }
-                ProbeGather::CoverageUnion => {
-                    // `union` also carries every holder an earlier round admitted.
-                    union.add(&candidate);
-                    candidates.push(candidate);
-                    // With no holder-reported size this stays false and the round
-                    // drains to the probe-fanout ceiling.
-                    union.spans()
-                }
-            };
-            if done {
-                break;
+        let candidate = match result {
+            Ok(candidate) => candidate,
+            Err(drop) => {
+                tally.record(drop);
+                continue;
             }
+        };
+        let done = match gather {
+            ProbeGather::EarlyExit => {
+                candidates.push(candidate);
+                candidates.len() >= PROBE_EARLY_EXIT_CANDIDATES
+            }
+            ProbeGather::CoverageUnion => {
+                // `union` also carries every holder an earlier round admitted.
+                union.add(&candidate);
+                candidates.push(candidate);
+                // With no holder-reported size this stays false and the round
+                // drains to the probe-fanout ceiling.
+                union.spans()
+            }
+        };
+        if done {
+            break;
         }
     }
     // Cancel any probes still pending: the loop has enough (or the set is drained). Their
@@ -1302,7 +1427,9 @@ async fn probe_round(
         deps.metrics
             .probe_collection_latency(collection_started.elapsed());
     }
-    selected
+    let mut resolved = selected;
+    resolved.extend(skipped);
+    resolved
 }
 
 /// Read one probe's RTT as evidence about the peer's region claim.
@@ -1355,7 +1482,8 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
 /// Probe a single provider, returning a ranked-ready [`Candidate`], carrying
 /// the holder's reported blob size (`ProbeResponseExt.total_bytes`) as its
 /// [`Candidate::total_bytes_hint`], iff it responds, validates, and reports
-/// holding the blob. Side effects: a failed probe scores the provider [`Outcome::Unreachable`],
+/// holding the blob; otherwise the [`ProbeDrop`] that says why not. Side
+/// effects: a failed probe scores the provider [`Outcome::Unreachable`],
 /// except a probe the provider shed with `APP_ERR_RATE_LIMITED`, which suppresses
 /// the pair for [`REFUSAL_SUPPRESSION_TTL`] and scores nothing (#1986); a
 /// same-region claim answered slower than [`REGION_LATENCY_MAX_MS`] scores
@@ -1370,11 +1498,11 @@ async fn probe_candidate(
     deps: &NodeOriginDeps,
     peer: DhtNodeId,
     hash_bytes: [u8; 32],
-) -> Option<Candidate> {
+) -> Result<Candidate, ProbeDrop> {
     let Ok(pk) = PublicKey::from_bytes(peer.as_bytes()) else {
         // A staker-filtered routing entry should always decode; a failure
         // implies upstream state corruption — skip rather than panic.
-        return None;
+        return Err(ProbeDrop::NoAddress);
     };
     let probe_ts = now_micros();
     let (resp, resp_ext, probe_rtt) = match probe_once(
@@ -1402,7 +1530,7 @@ async fn probe_candidate(
                     DhtHash::from_bytes(hash_bytes),
                     REFUSAL_SUPPRESSION_TTL,
                 );
-                return None;
+                return Err(ProbeDrop::RateLimited);
             }
             // A failed probe is a reachability signal: the upstream could not be
             // reached for this interaction (ADR 008 §Local Score).
@@ -1413,7 +1541,7 @@ async fn probe_candidate(
                 "node-origin: probe failed; scoring provider unreachable"
             );
             record_outcome(deps, pk, &Outcome::Unreachable);
-            return None;
+            return Err(ProbeDrop::Unreachable);
         }
     };
     // Shape, echoed-field correlation, and `slash_sig` recovery to the peer's
@@ -1427,7 +1555,7 @@ async fn probe_candidate(
     // does not recover attributes nothing to anyone (ADR 008).
     let Some(provider_addr) = deps.addr_resolver.address_of(&peer) else {
         debug!("node-origin: probed peer has no resolvable operator address; skipping");
-        return None;
+        return Err(ProbeDrop::NoAddress);
     };
     if let Err(err) = decdn_client::probe::verify_probe_response(
         &resp,
@@ -1437,7 +1565,7 @@ async fn probe_candidate(
         probe_ts,
     ) {
         debug!(error = %err, "node-origin: dropping an unverifiable probe response");
-        return None;
+        return Err(ProbeDrop::Unverifiable);
     }
     // #1506: `has_blob` and `coverage.is_empty()` are a biconditional by
     // construction on an honest responder, except for the empty root, whose
@@ -1450,7 +1578,7 @@ async fn probe_candidate(
             has_blob = resp.body.has_blob,
             "node-origin: dropping a probe response with has_blob/coverage mismatch"
         );
-        return None;
+        return Err(ProbeDrop::Inconsistent);
     }
     if !resp.body.has_blob {
         // Reachable but does not hold the blob — not a reputation event (no
@@ -1458,7 +1586,7 @@ async fn probe_candidate(
         // hash skips it within the TTL.
         deps.negative_cache
             .record_failure(peer, DhtHash::from_bytes(hash_bytes));
-        return None;
+        return Err(ProbeDrop::Absent);
     }
     let rtt = ms_to_u32(probe_rtt.ms);
     // Peer's self-attested region (ADR 030), resolved from the on-chain
@@ -1470,7 +1598,7 @@ async fn probe_candidate(
     )
     .unwrap_or_default();
     score_probe_latency(deps, pk, &region, rtt, probe_rtt.direct);
-    Some(Candidate {
+    Ok(Candidate {
         node_id: *peer.as_bytes(),
         rate_per_mb: resp.body.rate_per_mb,
         rtt_ms: rtt,
@@ -1616,6 +1744,9 @@ struct PullOutcome<T> {
     /// The tried candidates that refused this node's funding
     /// ([`PullMiss::Unfunded`]): the ones a funding recovery step asks again.
     unfunded: Vec<Candidate>,
+    /// Why the last attempt failed, as the pull-leg trail names it (#2366).
+    /// `None` when no attempt ran, or on a walk that does not record it.
+    last_fault: Option<&'static str>,
 }
 
 /// Why an attempt — one candidate, or a whole walk of them — produced no payload
@@ -1912,6 +2043,7 @@ async fn try_pull(
                     payload: Ok(()),
                     attempts,
                     unfunded,
+                    last_fault: None,
                 };
             }
             Err(failed) => {
@@ -1926,6 +2058,7 @@ async fn try_pull(
         payload: Err(miss),
         attempts,
         unfunded,
+        last_fault: None,
     }
 }
 
@@ -2788,6 +2921,29 @@ enum PullVerdict {
     /// Everything else: a failed dial, a dropped connection, a bad slash signature, an
     /// unexpected frame. The residual — and the arm that actually scores a dead node.
     Unreachable,
+}
+
+impl PullVerdict {
+    /// The `last_fault` value a pull-leg trail records for a handshake that
+    /// ended on this verdict (#2366).
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Oversize => "oversize",
+            Self::RateCeiling => "rate_ceiling",
+            Self::OurDeadline => "our_deadline",
+            Self::Stalled => "stalled",
+            Self::RateLimited => "rate_limited",
+            Self::OurDeadLane(_) => "dead_lane",
+            Self::OurVoucherRetryable(_) => "voucher_retryable",
+            Self::Refused(RefusalVerdict::DurableMiss) => "declined",
+            Self::Refused(RefusalVerdict::Transient) => "refused",
+            Self::Refused(RefusalVerdict::OurFault) => "refused_our_fault",
+            Self::OurLocalFault => "local_fault",
+            Self::Corruption => "corruption",
+            Self::LegNoProgress => "no_progress",
+            Self::Unreachable => "unreachable",
+        }
+    }
 }
 
 /// A buyer lane that can no longer pay but whose shared pool DEPOSIT is still escrowed.

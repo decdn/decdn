@@ -3,7 +3,7 @@ use rand::SeedableRng;
 
 #[test]
 fn probe_timeout_matches_the_adr_collection_ceiling() {
-    assert_eq!(PROBE_TIMEOUT, Duration::from_millis(500));
+    assert_eq!(PROBE_TIMEOUT, Duration::from_secs(1));
 }
 
 // #859 regression guard: the derived outer pull-through deadline must strictly
@@ -65,9 +65,9 @@ fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
 // The defaults an operator actually runs: `node_pull_timeout_sec = 20` and
 // `node_pull_stall_window_sec = 20` (both `DEFAULT_*` in decdn-common, which this
 // crate does not depend on — hence the literals). Pinned because the worst-case client
-// wait is a user-visible number RESTATED IN PROSE elsewhere, and it moved three times
-// while the formula was corrected — most recently when the slack stopped being a guess
-// (#1145 review): 10 s -> 0.5 + 4×8 = 32.5 s, so 145 s -> 167.5 s.
+// wait is a user-visible number RESTATED IN PROSE elsewhere. At defaults:
+// (5 + 20 + 20) × 3 + (1 + 4 × 8) = 168 s, where the slack is one `PROBE_TIMEOUT` plus
+// `MAX_LOOKUP_ROUNDS` rounds of `DEFAULT_ROUND_TIMEOUT` (#1145 review).
 //
 // The sites that restate it, so the next person to move it can find them all — this list
 // is the whole reason the number keeps going stale, and the previous version of this
@@ -77,12 +77,12 @@ fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
 //   - `common::config` (the `node_pull_timeout_sec` / `node_pull_stall_window_sec` docs)
 //   - `cli::commands::config` (the DEFAULT_CONFIG template)
 #[test]
-fn outer_pull_deadline_at_defaults_is_167_5s() {
+fn outer_pull_deadline_at_defaults_is_168s() {
     let outer = outer_pull_deadline(Duration::from_secs(20), Duration::from_secs(20));
     assert_eq!(
         outer,
-        Duration::from_millis(167_500),
-        "(5s + 20s + 20s) × 3 + (500ms + 4 × 8s)"
+        Duration::from_secs(168),
+        "(5s + 20s + 20s) × 3 + (1s + 4 × 8s)"
     );
 }
 
