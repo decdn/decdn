@@ -629,8 +629,14 @@ impl ProbeHandler {
         // `false` above, so the presence verdict is the honest answer here.
         // The coverage-read fault arm leaves presence as the store answered
         // it; for the empty root that is still honest, because it has no
-        // block to read.
-        let has_blob = !coverage.is_empty() || (has_blob && *hash.as_bytes() == EMPTY_ROOT);
+        // block to read. The `refuses` re-check narrows the window the
+        // `await`s above open: a denial or eviction that lands after the
+        // presence check empties the coverage for every other blob through
+        // `coverage_sized`'s own refusal gate, and the empty root must not
+        // bypass that, because signing `has_blob: true` for a blacklisted
+        // hash is a blacklist-violation offense (ADR 014).
+        let has_blob = !coverage.is_empty()
+            || (has_blob && *hash.as_bytes() == EMPTY_ROOT && !self.cache.refuses(hash));
         debug_assert!(
             ProbeResponseExt {
                 total_bytes,
