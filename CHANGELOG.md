@@ -3150,6 +3150,18 @@ since project inception and will roll into the first tagged release.
 
 #### Node serve path
 
+- **A `pull_leg_miss` refusal names the walk that found no target (#2366).**
+  The `serve-miss: refusing the request` line for a pull-leg miss now records
+  where the candidate list came from (`source`: `cache`, `dht`, `directory`
+  or `none`), how many providers it held (`discovered`), how many the probe
+  rounds skipped as suppressed or wedged (`skipped`), probed (`probed`), lost
+  to a failed probe (`unreachable`), heard `has_blob: false` from (`absent`)
+  or dropped on this node's own policy (`dropped`), how many holders they
+  admitted (`holders`) and whether those span the blob (`spans`), how many
+  handshakes ran (`handshakes`) and why the last one failed (`last_fault`).
+  Every serve-miss refusal line also carries the request's `namespace_id`.
+  Before, the line said only `cause=clean_miss`, so a fleet logging at info
+  could not tell an unreachable sole candidate from an empty directory.
 - **A fault in this node is no longer signed to clients as a `NotFound` about
   the content (#1560).** When a node-to-node pull failed for a reason that was
   *ours* — a buyer key that cannot sign the ADR 005 client binding, a voucher

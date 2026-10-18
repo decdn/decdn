@@ -11515,6 +11515,14 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
         line.get("cause").map(String::as_str) == Some("clean_miss"),
         "pull-leg miss cause: {line:?}"
     );
+    // An unprovisioned pull leg builds no candidate list, and the line says so
+    // (#2366).
+    anyhow::ensure!(
+        line.get("source").map(String::as_str) == Some("none")
+            && line.get("discovered").map(String::as_str) == Some("0")
+            && line.get("handshakes").map(String::as_str) == Some("0"),
+        "pull-leg miss trail: {line:?}"
+    );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())

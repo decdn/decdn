@@ -15968,6 +15968,8 @@ enum DiscoveryCase {
     DirectoryPastFanout,
     /// The DHT is empty; the directory lists P and a dead peer D; no origin.
     NoCoveringCandidate,
+    /// The DHT is empty; the directory lists only the dead peer D.
+    DeadOnly,
 }
 
 impl DiscoveryCase {
@@ -15975,7 +15977,10 @@ impl DiscoveryCase {
     const fn probe_rounds(self) -> u64 {
         match self {
             Self::CachedSpanning => 0,
-            Self::CachedPartial | Self::DhtSpanning | Self::NoCoveringCandidate => 1,
+            Self::CachedPartial
+            | Self::DhtSpanning
+            | Self::NoCoveringCandidate
+            | Self::DeadOnly => 1,
             Self::DhtPartial | Self::DirectoryPastFanout => 2,
         }
     }
@@ -16034,6 +16039,7 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
         DiscoveryCase::DhtSpanning => vec![p_dht],
         DiscoveryCase::DirectoryPastFanout => vec![p_dht, o_dht],
         DiscoveryCase::NoCoveringCandidate => vec![p_dht, d_dht],
+        DiscoveryCase::DeadOnly => vec![d_dht],
     };
     let mut discovery = FixtureDiscovery {
         stakers: HashSet::from([p_dht, o_dht, d_dht]),
@@ -16064,7 +16070,9 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
             );
             None
         }
-        DiscoveryCase::DirectoryPastFanout | DiscoveryCase::NoCoveringCandidate => None,
+        DiscoveryCase::DirectoryPastFanout
+        | DiscoveryCase::NoCoveringCandidate
+        | DiscoveryCase::DeadOnly => None,
     };
     let mut dht_server = None;
     if let Some((holder, coverage)) = dht_record {
@@ -16123,7 +16131,57 @@ async fn serve_miss_discovery_case(case: DiscoveryCase, byte_len: u64) -> Result
         .await
     };
 
-    if case == DiscoveryCase::NoCoveringCandidate {
+    if case == DiscoveryCase::DeadOnly {
+        // The only candidate never answers its probe, so the walk ends with no
+        // holder and S refuses on the pull-leg path. The refusal line names the
+        // walk: one directory candidate, one probe sent, one unreachable, no
+        // holder, no handshake (#2366).
+        let Err(err) = pulled else {
+            anyhow::bail!("S must refuse when its only candidate is unreachable");
+        };
+        anyhow::ensure!(
+            format!("{err:#}").contains("delivery refused"),
+            "S must refuse before committing: {err:#}"
+        );
+        let lines: Vec<_> = spans
+            .events(
+                "serve-miss: refusing the request",
+                "hash",
+                &hash.to_string(),
+            )
+            .into_iter()
+            .filter(|l| l.get("path").map(String::as_str) == Some("pull_leg_miss"))
+            .collect();
+        let [line] = lines.as_slice() else {
+            anyhow::bail!("expected one pull_leg_miss refusal line, got {lines:?}");
+        };
+        let expected = [
+            ("reason", "cache_miss"),
+            ("cause", "clean_miss"),
+            ("namespace_id", "0"),
+            ("source", "directory"),
+            ("discovered", "1"),
+            ("skipped", "0"),
+            ("probed", "1"),
+            ("unreachable", "1"),
+            ("absent", "0"),
+            ("dropped", "0"),
+            ("holders", "0"),
+            ("spans", "false"),
+            ("handshakes", "0"),
+        ];
+        for (field, value) in expected {
+            anyhow::ensure!(
+                line.get(field).map(String::as_str) == Some(value),
+                "expected {field}={value} on the pull_leg_miss line: {line:?}"
+            );
+        }
+        anyhow::ensure!(
+            !line.contains_key("last_fault"),
+            "a walk with no handshake names no last_fault: {line:?}"
+        );
+        assert_counter(&s_metrics, "node_pull_unreachable_total", 1)?;
+    } else if case == DiscoveryCase::NoCoveringCandidate {
         // No candidate covers block 1, so S refuses with a signed miss before
         // `ok: true` rather than committing and truncating.
         let Err(err) = pulled else {
@@ -16251,6 +16309,13 @@ async fn a_directory_origin_past_the_probe_fanout_is_probed() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn no_covering_candidate_refuses_before_commit() -> Result<()> {
     serve_miss_discovery_case(DiscoveryCase::NoCoveringCandidate, 0).await
+}
+
+/// The refusal for a walk whose only candidate is unreachable names that
+/// walk on its log line (#2366).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_only_candidate_refuses_with_the_walk_on_the_line() -> Result<()> {
+    serve_miss_discovery_case(DiscoveryCase::DeadOnly, 0).await
 }
 
 /// The end-past-the-blob twin of `no_covering_candidate_refuses_before_commit`:

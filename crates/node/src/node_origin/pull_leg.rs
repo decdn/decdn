@@ -66,11 +66,11 @@ use super::funder::{SETTLE_POLL_STEP, settle_window};
 use super::ranged_pull::{AssembleOutcome, RecoveryEnd, RunOutcome, RunSink, assemble};
 use super::timed_source::{TimedReader, TimedSource, timed_open};
 use super::{
-    EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, PullMiss, PullOutcome, PullVerdict,
-    SettleOnDrop, bind_upstream_ctx, cached_candidates, classify_pull_failure, coverage_spans,
-    discover, economic_ceiling, heat_of, lane_ledger, mb_of, now_micros, probe_and_rank,
-    record_backpressure_exhausted, record_backpressure_refusal, record_outcome,
-    record_pool_open_failure,
+    EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, ProbeTally, PullMiss, PullOutcome,
+    PullVerdict, SettleOnDrop, bind_upstream_ctx, cached_candidates, classify_pool_open_arm,
+    classify_pull_failure, count_u16, coverage_spans, discover, economic_ceiling, heat_of,
+    lane_ledger, mb_of, now_micros, probe_and_rank, record_backpressure_exhausted,
+    record_backpressure_refusal, record_outcome, record_pool_open_failure,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::NodeId as DhtNodeId;
@@ -561,6 +561,100 @@ async fn spanning_cached_candidates(
     None
 }
 
+/// Where the pull leg's last candidate list came from (#2366).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum CandidateSource {
+    /// No list: pull-through is not provisioned, or discovery named nobody.
+    #[default]
+    None,
+    /// A probe-cache entry whose coverage spans the blob.
+    Cache,
+    /// The DHT lookup's answer.
+    Dht,
+    /// The origin directory, as the fallback for an empty DHT answer.
+    Directory,
+}
+
+impl CandidateSource {
+    /// The `source` value a serve-miss refusal's log line records.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Cache => "cache",
+            Self::Dht => "dht",
+            Self::Directory => "directory",
+        }
+    }
+}
+
+/// What the pull leg's walk saw before it ended without a target (#2366).
+///
+/// A serve-miss refusal on the `pull_leg_miss` path records every field, so
+/// the fleet's info-level log says which stage left the walk empty: nobody
+/// discovered, every candidate skipped or unreachable, holders that do not
+/// span the blob, or handshakes that all failed. Counts saturate at
+/// `u16::MAX`; the probe fanout and the attempt budget keep them far below it.
+///
+/// `source` and `discovered` describe the last candidate list the walk built.
+/// A probe-cache hit that fails its handshakes and falls through to a fresh
+/// lookup reports that lookup's source; `handshakes` counts both walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PullLegTrail {
+    /// Where the last candidate list came from.
+    pub(crate) source: CandidateSource,
+    /// Providers in that list after the negative-cache filter and the
+    /// requester drop.
+    pub(crate) discovered: u16,
+    /// Peers the probe rounds skipped before probing: suppressed for the hash
+    /// in the negative cache, or wedged as a provider.
+    pub(crate) skipped: u16,
+    /// Probes the rounds sent.
+    pub(crate) probed: u16,
+    /// Probes that failed: a timeout, a failed dial, a dropped connection.
+    pub(crate) unreachable: u16,
+    /// Probes answered `has_blob: false`.
+    pub(crate) absent: u16,
+    /// Probes dropped on this node's own policy: shed by the peer's rate
+    /// limiter, an unverifiable signature, a `has_blob`/coverage mismatch, or
+    /// a peer with no operator address.
+    pub(crate) dropped: u16,
+    /// Candidates the rounds admitted.
+    pub(crate) holders: u16,
+    /// Whether the admitted holders' coverage union spans the blob.
+    pub(crate) spans: bool,
+    /// Candidates the handshake walks tried.
+    pub(crate) handshakes: u16,
+    /// Why the last handshake failed, or `None` when none ran.
+    pub(crate) last_fault: Option<&'static str>,
+}
+
+impl PullLegTrail {
+    /// The trail of a walk that saw nothing.
+    pub(crate) const EMPTY: Self = Self {
+        source: CandidateSource::None,
+        discovered: 0,
+        skipped: 0,
+        probed: 0,
+        unreachable: 0,
+        absent: 0,
+        dropped: 0,
+        holders: 0,
+        spans: false,
+        handshakes: 0,
+        last_fault: None,
+    };
+}
+
+/// A pull leg open that ended without a target: the [`PullMiss`] the serve
+/// answers with, and the [`PullLegTrail`] its refusal line records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PullLegMiss {
+    /// The miss the walk is, which decides the wire answer.
+    pub(crate) miss: PullMiss,
+    /// What the walk saw.
+    pub(crate) trail: PullLegTrail,
+}
+
 impl NodeOrigin {
     /// Discover, probe, rank, and open a lane to the best available provider for
     /// `hash`, returning the bound [`PullLegTarget`] (with the upstream `total_bytes`)
@@ -587,16 +681,23 @@ impl NodeOrigin {
     /// # Errors
     ///
     /// The [`PullMiss`] this failure is — unprovisioned, no reachable provider, or
-    /// every candidate declined. A [`PullMiss::LocalFault`] must not be signed to the
-    /// client as a clean `NotFound` about the content (#1560).
+    /// every candidate declined — with the [`PullLegTrail`] of the walk. A
+    /// [`PullMiss::LocalFault`] must not be signed to the client as a clean
+    /// `NotFound` about the content (#1560).
     pub(crate) async fn open_pull_leg(
         &self,
         hash: Hash,
         namespace_id: U256,
         prime: Option<PrimeLeg>,
         requester: [u8; 32],
-    ) -> Result<PullLegTarget, PullMiss> {
-        let deps = self.deps.get().ok_or(PullMiss::Clean)?;
+    ) -> Result<PullLegTarget, PullLegMiss> {
+        let mut trail = PullLegTrail::EMPTY;
+        let Some(deps) = self.deps.get() else {
+            return Err(PullLegMiss {
+                miss: PullMiss::Clean,
+                trail,
+            });
+        };
         let _pending = self.enter_open(hash);
         let hash_bytes = *hash.as_bytes();
         let target = DhtHash::from_bytes(hash_bytes);
@@ -609,9 +710,17 @@ impl NodeOrigin {
             deps.metrics.probe_cache_hit();
             deps.metrics.node_pull_attempt();
             attempt_metered = true;
+            // A cached list is admitted as it stands, and it spans the blob by
+            // construction (`spanning_cached_candidates`).
+            trail.source = CandidateSource::Cache;
+            trail.discovered = count_u16(cached.len());
+            trail.holders = trail.discovered;
+            trail.spans = true;
             let outcome = self
                 .handshake_from_candidates(deps, &cached, hash_bytes, namespace_id, budget, prime)
                 .await;
+            trail.handshakes = count_u16(outcome.attempts);
+            trail.last_fault = outcome.last_fault;
             match outcome.payload {
                 Ok((total_bytes, primed)) => {
                     return Ok(PullLegTarget {
@@ -627,21 +736,28 @@ impl NodeOrigin {
             deps.probe_cache.invalidate(&target);
             if budget == 0 {
                 debug!(%hash, "node-origin: probe-cache candidates exhausted the pull-leg budget");
-                return Err(miss);
+                return Err(PullLegMiss { miss, trail });
             }
         } else {
             deps.metrics.probe_cache_miss();
         }
 
-        let mut providers = discover(deps, hash_bytes, namespace_id).await;
+        let discovered = discover(deps, hash_bytes, namespace_id).await;
+        let mut providers = discovered.providers;
         let requester_id = DhtNodeId::from_bytes(requester);
         providers.retain(|provider| *provider != requester_id);
+        // The trail now describes this list; the cached walk keeps only its
+        // handshake count and fault.
+        trail.source = discovered.source;
+        trail.discovered = count_u16(providers.len());
+        let mut tally = ProbeTally::default();
+        tally.fold_into(&mut trail);
         if providers.is_empty() {
             if !attempt_metered {
                 deps.metrics.node_pull_no_providers();
             }
             debug!(%hash, "node-origin: no providers discovered for the pull leg");
-            return Err(miss);
+            return Err(PullLegMiss { miss, trail });
         }
         if !attempt_metered {
             deps.metrics.node_pull_attempt();
@@ -659,12 +775,18 @@ impl NodeOrigin {
             hash_bytes,
             ProbeGather::CoverageUnion,
             namespace_id,
+            &mut tally,
         )
         .await;
+        tally.fold_into(&mut trail);
         ranked.retain(|candidate| candidate.node_id != requester);
         let outcome = self
             .handshake_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget, prime)
             .await;
+        trail.handshakes = trail.handshakes.saturating_add(count_u16(outcome.attempts));
+        if outcome.last_fault.is_some() {
+            trail.last_fault = outcome.last_fault;
+        }
         match outcome.payload {
             Ok((total_bytes, primed)) => Ok(PullLegTarget {
                 total_bytes,
@@ -672,7 +794,10 @@ impl NodeOrigin {
                 candidates: ranked,
                 primed,
             }),
-            Err(failed) => Err(miss.or(failed)),
+            Err(failed) => Err(PullLegMiss {
+                miss: miss.or(failed),
+                trail,
+            }),
         }
     }
 
@@ -698,6 +823,7 @@ impl NodeOrigin {
     ) -> PullOutcome<(u64, Option<PrimedHandshake>)> {
         let mut attempts = 0;
         let mut miss = PullMiss::Clean;
+        let mut last_fault = None;
         let coverages: Vec<decdn_protocol::Coverage> =
             ranked.iter().map(|c| c.coverage.clone()).collect();
         // The size the order plans over is a probe hint; each candidate's own
@@ -724,9 +850,13 @@ impl NodeOrigin {
                         payload: Ok(answer),
                         attempts,
                         unfunded: Vec::new(),
+                        last_fault: None,
                     };
                 }
-                Err(failed) => miss = miss.or(failed),
+                Err(fault) => {
+                    miss = miss.or(fault.miss);
+                    last_fault = Some(fault.why);
+                }
             }
         }
         // The handshake pays nothing, so it runs no funding recovery step; the
@@ -735,6 +865,7 @@ impl NodeOrigin {
             payload: Err(miss),
             attempts,
             unfunded: Vec::new(),
+            last_fault,
         }
     }
 
@@ -763,16 +894,16 @@ impl NodeOrigin {
         hash_bytes: [u8; 32],
         namespace_id: U256,
         prime: Option<PrimeLeg>,
-    ) -> Result<(u64, Option<PrimedHandshake>), PullMiss> {
+    ) -> Result<(u64, Option<PrimedHandshake>), HandshakeFault> {
         let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
-            return Err(PullMiss::Clean);
+            return Err(HandshakeFault::clean("no_address"));
         };
         let Some(provider_addr) = deps
             .addr_resolver
             .address_of(&DhtNodeId::from_bytes(candidate.node_id))
         else {
             debug!("node-origin: pull-leg candidate has no resolvable operator address; skipping");
-            return Err(PullMiss::Clean);
+            return Err(HandshakeFault::clean("no_address"));
         };
         // ADR 041 buy-side gate: refuse a candidate quoting above this node's buy
         // ceiling BEFORE opening or reusing the pool. A skip folds into the walk as
@@ -781,7 +912,12 @@ impl NodeOrigin {
         let rate_ceiling =
             match economic_ceiling(deps, candidate.node_id.into(), heat, candidate.rate_per_mb) {
                 EconGate::Allow { rate_ceiling, .. } => rate_ceiling,
-                EconGate::Skip => return Err(PullMiss::BelowMargin),
+                EconGate::Skip => {
+                    return Err(HandshakeFault {
+                        miss: PullMiss::BelowMargin,
+                        why: "below_margin",
+                    });
+                }
             };
         let ctx = match deps
             .buyer
@@ -789,7 +925,13 @@ impl NodeOrigin {
             .await
         {
             Ok(ctx) => ctx,
-            Err(err) => return Err(record_pool_open_failure(deps, provider_addr, &err)),
+            Err(err) => {
+                let why = classify_pool_open_arm(&err).as_str();
+                return Err(HandshakeFault {
+                    miss: record_pool_open_failure(deps, provider_addr, &err),
+                    why,
+                });
+            }
         };
         // Every setup fault from here to the header handshake classifies the
         // same way: it is ours, not the candidate's, so it folds into the walk
@@ -797,7 +939,7 @@ impl NodeOrigin {
         // is one of them — it is a signing operation, so a remote or hardware
         // signer can refuse it.
         let local_miss = |err: &anyhow::Error| {
-            PullMiss::for_verdict(classify_pull_failure(
+            HandshakeFault::for_verdict(classify_pull_failure(
                 deps,
                 pk,
                 provider_addr,
@@ -890,7 +1032,7 @@ impl NodeOrigin {
                     drop(stream_guard);
                     let verdict =
                         handshake_verdict(deps, pk, provider_addr, hash_bytes, ctx.pool_id, &err);
-                    return Err(PullMiss::for_verdict(verdict));
+                    return Err(HandshakeFault::for_verdict(verdict));
                 }
             }
         }
@@ -934,13 +1076,41 @@ impl NodeOrigin {
                 drop(stream_guard);
                 let verdict =
                     handshake_verdict(deps, pk, provider_addr, hash_bytes, ctx.pool_id, &err);
-                return Err(PullMiss::for_verdict(verdict));
+                return Err(HandshakeFault::for_verdict(verdict));
             }
         };
         let total_bytes = header.total_bytes;
         let _ = probe.abort();
         drop(stream_guard);
         Ok((total_bytes, None))
+    }
+}
+
+/// Why one handshake failed: the miss it folds into the walk, and the
+/// `last_fault` the pull-leg trail records (#2366).
+#[derive(Debug, Clone, Copy)]
+struct HandshakeFault {
+    /// The miss this failure is.
+    miss: PullMiss,
+    /// The fault's name on the refusal line.
+    why: &'static str,
+}
+
+impl HandshakeFault {
+    /// A clean miss named `why`.
+    const fn clean(why: &'static str) -> Self {
+        Self {
+            miss: PullMiss::Clean,
+            why,
+        }
+    }
+
+    /// The fault a classified verdict is.
+    const fn for_verdict(verdict: PullVerdict) -> Self {
+        Self {
+            miss: PullMiss::for_verdict(verdict),
+            why: verdict.as_str(),
+        }
     }
 }
 

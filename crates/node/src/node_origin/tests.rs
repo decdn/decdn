@@ -1018,3 +1018,62 @@ fn coverage_spans_for_the_empty_root_needs_one_admitted_holder() {
         "a lying zero-size hint beside a real holder neither helps nor hurts"
     );
 }
+
+/// Each probe drop lands in one trail count: a failed probe is unreachable, a
+/// `has_blob: false` answer is absent, and every drop on this node's own
+/// policy is dropped. The fold copies the round's counts over the trail and
+/// leaves the walk's own fields alone (#2366).
+#[test]
+fn each_probe_drop_lands_in_one_trail_count() {
+    let mut tally = ProbeTally::default();
+    for drop in [
+        ProbeDrop::Unreachable,
+        ProbeDrop::Absent,
+        ProbeDrop::RateLimited,
+        ProbeDrop::NoAddress,
+        ProbeDrop::Unverifiable,
+        ProbeDrop::Inconsistent,
+    ] {
+        tally.record(drop);
+    }
+    tally.skipped = 1;
+    tally.probed = 6;
+    tally.holders = 2;
+    tally.spans = true;
+    let mut trail = PullLegTrail {
+        source: CandidateSource::Dht,
+        discovered: 7,
+        handshakes: 1,
+        last_fault: Some("declined"),
+        ..PullLegTrail::EMPTY
+    };
+    tally.fold_into(&mut trail);
+    assert_eq!(
+        trail,
+        PullLegTrail {
+            source: CandidateSource::Dht,
+            discovered: 7,
+            skipped: 1,
+            probed: 6,
+            unreachable: 1,
+            absent: 1,
+            dropped: 4,
+            holders: 2,
+            spans: true,
+            handshakes: 1,
+            last_fault: Some("declined"),
+        }
+    );
+}
+
+/// Trail counts saturate rather than wrap (#2366).
+#[test]
+fn trail_counts_saturate() {
+    assert_eq!(count_u16(usize::MAX), u16::MAX);
+    let mut tally = ProbeTally {
+        dropped: u16::MAX,
+        ..ProbeTally::default()
+    };
+    tally.record(ProbeDrop::NoAddress);
+    assert_eq!(tally.dropped, u16::MAX);
+}
