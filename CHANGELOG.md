@@ -1241,6 +1241,16 @@ since project inception and will roll into the first tagged release.
   payer whose gate carries an earlier fetch's replacement (an entry's manifest
   fetch, an earlier gateway request) starts clear of it, as a bundle pull
   does.
+- **Client: a lane build drained after its fetch ended sends no `topUp`
+  re-send, and waits on no lock (#2520).** A `topUp` that lost its nonce to a
+  concurrent transaction was re-sent after a quarter-second backoff even when
+  the fetch ended meanwhile, so the run escrowed a top-up no lane would use.
+  A drained build also waited for the bundle-wide open lock and the run's
+  `topUp` lock before it checked the fetch end. A sibling that held either
+  through its receipt wait kept the build waiting for the whole 30 s drain,
+  which then logged "lane builds still running". Now the backoff ends with
+  the fetch and the re-send is refused, and a build queued on either lock
+  ends at once with the fetch. Neither sent anything, so neither escrows.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

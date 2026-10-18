@@ -2692,6 +2692,55 @@ async fn a_top_up_parked_behind_an_untracked_one_is_refused() {
     assert!(rpc.sent_nonces().is_empty(), "the refusal sends nothing");
 }
 
+/// #2520: a refill queued on the run's `topUp` lock behind a sibling's
+/// receipt wait ends at once when its fetch ends, with the lock still held. It
+/// sent nothing, so it does not wait out the drain of late lane builds.
+#[tokio::test(start_paused = true)]
+async fn a_refill_queued_on_the_top_up_lock_ends_with_its_fetch() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store, &signer);
+    let funding = RunFunding::default();
+    let in_flight = funding.top_up_serial.lock().await;
+    let rpc = ScriptedRpc::mined(mined_top_up()).answering_calls(refill_reads(signer.address()));
+    let ended = CancellationToken::new();
+    let build = run_scripted(&store, &signer, &rpc, &funding, &ended);
+    tokio::pin!(build);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut build)
+            .await
+            .is_err(),
+        "the refill must wait for the run's topUp lock"
+    );
+    ended.cancel();
+    let err = tokio::time::timeout(std::time::Duration::from_millis(1), &mut build)
+        .await
+        .expect("the refill ends at once, with the lock still held")
+        .unwrap_err();
+    ended_before_send(&err);
+    drop(in_flight);
+    assert!(rpc.sent_nonces().is_empty(), "the refill sends nothing");
+}
+
+/// #2520: the open and `topUp` locks refuse a lane build once its fetch ended,
+/// whether the lock is held or free, and are a plain wait for a caller outside
+/// any lane build.
+#[tokio::test(start_paused = true)]
+async fn a_lock_wait_ends_with_the_fetch() {
+    let lock = tokio::sync::Mutex::new(());
+    let ended = fetch_ended();
+    ended_before_send(&lock_unless_ended(&lock, Some(&ended)).await.unwrap_err());
+    let held = lock.lock().await;
+    ended_before_send(&lock_unless_ended(&lock, Some(&ended)).await.unwrap_err());
+    drop(held);
+    let live = CancellationToken::new();
+    drop(lock_unless_ended(&lock, Some(&live)).await.unwrap());
+    drop(lock_unless_ended(&lock, None).await.unwrap());
+}
+
 /// A credit that lands but whose row then reads as gone leaves the escrow
 /// untracked too, and the run holds it.
 #[tokio::test(start_paused = true)]
