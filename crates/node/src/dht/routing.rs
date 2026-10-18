@@ -22,9 +22,33 @@
 //! reachable" property — the LRU is the one least recently confirmed to
 //! be live, so evicting it is the safest bet among entries already in
 //! the bucket.
+//!
+//! # Unreachable peers
+//!
+//! A peer whose DHT dial timed out ([`crate::dht::client::DHT_DIAL_TIMEOUT`])
+//! stays in the table. The lookup marks it with [`RoutingTable::mark_unreachable`],
+//! and this node's lookups skip it for [`DIAL_FAILURE_COOLDOWN`]. A peer the
+//! lookup reached through a `closer_nodes` referral, and that is in no bucket,
+//! is marked the same way. [`RoutingTable::closest`] still returns a marked
+//! peer, so `closer_nodes` answers to other nodes and the republish fan-out
+//! are unchanged; the skip is this node's own, and the lookup takes its seed
+//! from the nearest peers that are not skipped. The skip ends when the
+//! cooldown lapses or when the table inserts or refreshes the peer again,
+//! which an inbound request from it does (#2532). The registry seeds every
+//! bonded peer into every table, and a bond does not say whether the node
+//! behind it is up.
+
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use decdn_protocol::MAX_CLOSER_NODES;
 pub use decdn_protocol::NodeId;
+
+/// How long this node's lookups skip a peer after a dial of it timed out. Long
+/// enough that a dead bonded peer costs about one dial budget per node per
+/// window instead of one per lookup; short enough that a peer that comes back
+/// is dialed again within minutes even if it never contacts this node first.
+pub const DIAL_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
 
 /// Number of bytes in an iroh `NodeId` (32-byte Ed25519 public key).
 /// Matches the `[u8; 32]` representation used on the wire in
@@ -109,6 +133,11 @@ pub struct RoutingTable {
     /// table itself stays a thin pointer on the stack — 256 × 20 × 32B is
     /// 160 KiB and lives on the heap once.
     buckets: Box<[Vec<NodeId>; KEYSPACE_BITS]>,
+    /// Peers whose dial timed out, keyed to the instant their skip ends. A
+    /// peer need not be in a bucket: a referral from a `closer_nodes` answer
+    /// is marked too. An insert, a refresh or a removal of the peer clears its
+    /// entry, and a lapsed entry is swept on the next read.
+    cooling: HashMap<NodeId, Instant>,
 }
 
 impl RoutingTable {
@@ -122,7 +151,11 @@ impl RoutingTable {
         // 160 KiB live on the heap rather than the stack.
         let buckets: Box<[Vec<NodeId>; KEYSPACE_BITS]> =
             Box::new(std::array::from_fn(|_| Vec::new()));
-        Self { self_id, buckets }
+        Self {
+            self_id,
+            buckets,
+            cooling: HashMap::new(),
+        }
     }
 
     /// Own `NodeId` (the routing-table anchor).
@@ -150,6 +183,9 @@ impl RoutingTable {
     /// On bucket overflow the least-recently-seen entry is evicted to make
     /// room. See the module docs for the LRU rationale vs. classic
     /// ping-then-evict.
+    ///
+    /// An insert or a refresh ends the peer's dial-failure skip: the table has
+    /// a fresh reason to hold the peer.
     pub fn insert(&mut self, peer: NodeId) -> bool {
         if peer == self.self_id {
             return false;
@@ -162,6 +198,7 @@ impl RoutingTable {
             // bucket_index returns < KEYSPACE_BITS by construction.
             return false;
         };
+        self.cooling.remove(&peer);
         if let Some(pos) = bucket.iter().position(|p| p == &peer) {
             // Already present — move to tail (most-recently-seen).
             let entry = bucket.remove(pos);
@@ -188,11 +225,44 @@ impl RoutingTable {
         let Some(bucket) = self.buckets.get_mut(idx) else {
             return false;
         };
+        self.cooling.remove(peer);
         if let Some(pos) = bucket.iter().position(|p| p == peer) {
             bucket.remove(pos);
             return true;
         }
         false
+    }
+
+    /// Record that a dial of `peer` timed out at `now`: this node's lookups
+    /// skip `peer` until `now + DIAL_FAILURE_COOLDOWN`. The peer need not be
+    /// in a bucket: a lookup also dials peers that a `closer_nodes` answer
+    /// named, and a referral to a dead peer is worth skipping too. The map
+    /// stays bounded because every dialed peer is an active staker and a
+    /// lapsed entry is swept on the next read. Returns `false` only for this
+    /// node's own id. A second timeout inside the window extends the skip
+    /// from its own `now`.
+    pub fn mark_unreachable(&mut self, peer: NodeId, now: Instant) -> bool {
+        if peer == self.self_id {
+            return false;
+        }
+        self.cooling.insert(peer, now + DIAL_FAILURE_COOLDOWN);
+        true
+    }
+
+    /// True while this node's lookups skip `peer`: a dial of it timed out less
+    /// than [`DIAL_FAILURE_COOLDOWN`] before `now` and nothing has refreshed it
+    /// since.
+    #[must_use]
+    pub fn is_cooling(&self, peer: &NodeId, now: Instant) -> bool {
+        self.cooling.get(peer).is_some_and(|until| now < *until)
+    }
+
+    /// The peers this node's lookups skip at `now`, and sweep the entries whose
+    /// skip has lapsed. One snapshot per lookup, taken under the same lock as
+    /// the seed.
+    pub fn cooling_peers(&mut self, now: Instant) -> HashSet<NodeId> {
+        self.cooling.retain(|_, until| now < *until);
+        self.cooling.keys().copied().collect()
     }
 
     /// True if `peer` is currently in the table.

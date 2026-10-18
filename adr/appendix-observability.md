@@ -256,6 +256,8 @@ Per [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) (`cd
 | `decdn_dht_store_published_total` | Counter | R | live | — | DHT STORE records a peer accepted from this node ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). A batched STORE adds one per accepted hash. |
 | `decdn_dht_findvalue_queries_total` | Counter | R | live | — | DHT FIND_VALUE lookups this node ran to discover providers. |
 | `decdn_dht_lookup_round_timeouts_total` | Counter | R | live | — | Lookup rounds that hit the round timeout and aborted their in-flight RPCs. |
+| `decdn_dht_lookup_dial_timeouts_total` | Counter | R | live | — | Lookup `FIND_VALUE` RPCs whose QUIC dial did not complete within the dial budget. A steady rate names a bonded peer that is offline; the lookup skips it for a cooldown, so the rate is about one per node per cooldown while it stays down ([ADR 022 § Routing Table](022-content-discovery.md#routing-table)). |
+| `decdn_dht_lookup_round_ceiling_total` | Counter | R | live | — | Lookups cut off at the round ceiling while still finding closer nodes. A sustained rate says the ceiling is too low for the network size. |
 | `decdn_dht_routing_table_size` | Gauge | R | live | — | Distinct entries in the local Kademlia routing table, set after bootstrap and on every bucket-refresh tick. |
 | `decdn_dht_bucket_refresh_failures_total` | Counter | R | live | — | Bucket refreshes that failed: a `FIND_NODE` RPC error, a routing-table peer that is not a valid public key, or a panicked refresh task. |
 | `decdn_dht_bootstrap_find_node_failures_total` | Counter | R | live | — | Bootstrap `FIND_NODE` RPCs against a seed that failed. |

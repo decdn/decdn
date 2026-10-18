@@ -883,6 +883,8 @@ fn observability_counters_export_at_zero() {
         "decdn_chain_get_logs_deferred_total",
         "decdn_dht_findvalue_queries_total",
         "decdn_dht_lookup_round_timeouts_total",
+        "decdn_dht_lookup_dial_timeouts_total",
+        "decdn_dht_lookup_round_ceiling_total",
         "decdn_dht_store_published_total",
         "decdn_dht_routing_table_size",
         "decdn_dht_bucket_refresh_failures_total",

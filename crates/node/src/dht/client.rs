@@ -42,11 +42,48 @@ use decdn_protocol::{
 use iroh::EndpointAddr;
 use iroh::endpoint::Connection;
 
-/// Per-request hard timeout for outbound DHT exchanges. Shorter than
-/// the sum of the server-side first-stream timeout (5s) and read
-/// timeout (5s) in [`crate::handlers::dht`] so a hung peer doesn't
-/// wedge a republish sweep.
+/// Per-request hard timeout for outbound DHT exchanges: the dial, the request
+/// and the response together. Shorter than the sum of the server-side
+/// first-stream timeout (5s) and read timeout (5s) in [`crate::handlers::dht`]
+/// so a hung peer doesn't wedge a republish sweep. The dial inside it has its
+/// own, shorter budget, [`DHT_DIAL_TIMEOUT`].
 pub const DHT_CLIENT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Budget for the QUIC dial of an outbound DHT exchange: the connect and the
+/// handshake, before any request byte. A bonded peer that is offline still
+/// resolves an address from the registry mirror ([`super::dial_addrs`]), so
+/// the handshake goes out and nothing answers it, and iroh's own connect bound
+/// is 10 s. Two seconds is two inter-continental round trips with relay slack.
+/// It is well under the lookup's round timeout
+/// ([`super::lookup::DEFAULT_ROUND_TIMEOUT`]), so a dead peer costs a lookup
+/// one dial budget, not a whole round, and the lookup learns which peer it was
+/// (#2532). The probe path budgets 1 s for a dial and an exchange
+/// ([`crate::selection::PROBE_TIMEOUT`]).
+pub const DHT_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The QUIC dial of an outbound DHT exchange did not complete within
+/// [`DHT_DIAL_TIMEOUT`]. A distinct type, returned without further context, so
+/// a caller can `downcast_ref` it out of the [`anyhow::Error`] and tell a peer
+/// that did not answer the handshake from a stream drop or a malformed
+/// response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialTimeout {
+    /// The peer that did not answer the handshake.
+    pub peer: NodeId,
+}
+
+impl std::fmt::Display for DialTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dht client: dial of {} timed out after {} ms",
+            self.peer,
+            DHT_DIAL_TIMEOUT.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for DialTimeout {}
 
 /// Send a single `FindNode` request to `target` and return the response.
 ///
@@ -181,10 +218,15 @@ async fn exchange(
 /// bytes directly.
 ///
 /// Wraps the whole call, retry included, in one [`DHT_CLIENT_TIMEOUT`]
-/// so a hung peer can't block the caller's scheduler indefinitely. A call
-/// that times out unpins the connection it used, so the next call to the
-/// peer dials afresh rather than queueing on a connection that stopped
-/// answering.
+/// so a hung peer can't block the caller's scheduler indefinitely, and
+/// each dial inside it in [`DHT_DIAL_TIMEOUT`]. A call that times out
+/// unpins the connection it used, so the next call to the peer dials
+/// afresh rather than queueing on a connection that stopped answering.
+///
+/// # Errors
+///
+/// A dial that [`DHT_DIAL_TIMEOUT`] cuts off is a bare [`DialTimeout`]; every
+/// other failure carries its stage as context.
 async fn exchange_payload(
     conns: &Connections,
     target: EndpointAddr,
@@ -196,12 +238,10 @@ async fn exchange_payload(
         "the DHT client needs a cdn/dht/v1 map"
     );
     let node = target.id;
+    let peer = NodeId::from_bytes(*node.as_bytes());
     let mut used: Option<Arc<WarmConnection>> = None;
     let outcome = tokio::time::timeout(DHT_CLIENT_TIMEOUT, async {
-        let (warm, dialled) = conns
-            .get_or_dial(&target)
-            .await
-            .context("dht client: connect failed")?;
+        let (warm, dialled) = pooled(conns, &target, peer).await?;
         used = Some(Arc::clone(&warm));
         let err = match exchange_on(warm.connection(), payload).await {
             Ok(resp) => return Ok(resp),
@@ -216,10 +256,7 @@ async fn exchange_payload(
         }
         // The pinned connection closed under this call (the server spent
         // its budget or idled it out between calls): redial once.
-        let (fresh, _) = conns
-            .get_or_dial(&target)
-            .await
-            .context("dht client: connect failed")?;
+        let (fresh, _) = pooled(conns, &target, peer).await?;
         used = Some(Arc::clone(&fresh));
         exchange_on(fresh.connection(), payload).await
     })
@@ -234,6 +271,25 @@ async fn exchange_payload(
         );
     };
     result
+}
+
+/// `target`'s pooled connection, dialled when it has none, and whether this
+/// call dialled it. The dial (or the wait on another caller's dial) is bounded
+/// by [`DHT_DIAL_TIMEOUT`]; a pinned live connection returns at once.
+///
+/// # Errors
+///
+/// A bare [`DialTimeout`] naming `peer` when the dial runs past its budget;
+/// a connect or handshake fault as `dht client: connect failed: {err}`.
+async fn pooled(
+    conns: &Connections,
+    target: &EndpointAddr,
+    peer: NodeId,
+) -> anyhow::Result<(Arc<WarmConnection>, bool)> {
+    tokio::time::timeout(DHT_DIAL_TIMEOUT, conns.get_or_dial(target))
+        .await
+        .map_err(|_| anyhow::Error::new(DialTimeout { peer }))?
+        .context("dht client: connect failed")
 }
 
 /// Inner-inner: do one bi-stream exchange on an already-connected

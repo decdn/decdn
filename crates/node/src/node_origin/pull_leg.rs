@@ -569,7 +569,8 @@ pub(crate) enum CandidateSource {
     Cache,
     /// The DHT lookup's answer.
     Dht,
-    /// The origin directory, as the fallback for an empty DHT answer.
+    /// The origin directory, as the fallback for a DHT answer that is empty
+    /// once the requester is dropped.
     Directory,
 }
 
@@ -747,10 +748,10 @@ impl NodeOrigin {
             deps.metrics.probe_cache_miss();
         }
 
-        let discovered = discover(deps, hash_bytes, namespace_id).await;
-        let mut providers = discovered.providers;
-        let requester_id = DhtNodeId::from_bytes(requester);
-        providers.retain(|provider| *provider != requester_id);
+        // `discover` drops the requester before it judges the directory fallback.
+        let requester_id = Some(DhtNodeId::from_bytes(requester));
+        let discovered = discover(deps, hash_bytes, namespace_id, requester_id).await;
+        let providers = discovered.providers;
         // The trail now describes this list; the cached walk keeps only its
         // handshake count and fault.
         trail.source = discovered.source;

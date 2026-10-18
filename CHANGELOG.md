@@ -1090,6 +1090,37 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **DHT: a bonded peer that is offline costs a lookup one dial budget, once
+  per cooldown, not the 8 s round on every lookup that picks it (#2532).**
+  The registry seeds every bonded peer into every routing table, and a bond
+  does not say whether the node behind it answers. One such peer resolved an
+  address from the registry mirror, so every `FIND_VALUE` dial to it sent a
+  handshake that nothing answered, and the single 8 s exchange timeout ran
+  level with the 8 s round timeout: a third of the fleet's lookups waited the
+  whole round, and nothing recorded which peer it was. The DHT client now
+  bounds the connect and handshake separately at `DHT_DIAL_TIMEOUT` (2 s)
+  and fails them as a typed `DialTimeout`; the lookup marks that peer in the
+  routing table (`RoutingTable::mark_unreachable`), and this node's lookups
+  skip it for `DIAL_FAILURE_COOLDOWN` (5 min): the seed is the nearest peers
+  that are not skipped, a `closer_nodes` referral to a skipped peer is not
+  followed, and a dead peer reached only through a referral is marked too.
+  The peer stays in the table and in the
+  answers this node gives; an inbound request from it ends the skip. The
+  `dht_lookup` span records the `cooling` peers skipped, and
+  `decdn_dht_lookup_dial_timeouts_total` counts the dials that timed out
+  ([ADR 022 § Routing Table](adr/022-content-discovery.md#routing-table)).
+- **Node-origin: a DHT answer that names only the requester falls back to
+  the origin directory (#2534).** The serve-miss pull leg drops the node that
+  sent the request from its candidates, because a node never pulls from the
+  node it answers. The drop ran after discovery had chosen between the DHT
+  answer and the directory fallback, so when the requester was the hash's
+  only DHT provider (a partial holder asking for the blocks it lacks) the leg
+  ended with no provider and refused `NotFound` with
+  `source=dht discovered=0`, without reading the directory that lists the
+  origin. Discovery now drops the requester from both the DHT answer and the
+  directory list before it judges the fallback, so that answer reads the
+  directory and the origin fills the serve
+  ([ADR 022 § FIND_VALUE Flow](adr/022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)).
 - **Probe: a node advertises the empty blob, and a requester accepts the
   answer (#2471).** The empty (0-byte) blob spans zero discovery blocks, so
   its coverage bitmap is empty on every holder. The probe handler derived

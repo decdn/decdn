@@ -2241,6 +2241,12 @@ pub struct DecdnMetrics {
     /// `decdn_dht_lookup_round_timeouts_total`: lookup rounds that hit the round
     /// timeout and aborted their in-flight RPCs.
     pub dht_lookup_round_timeouts: Counter,
+    /// `decdn_dht_lookup_dial_timeouts_total`: lookup `FIND_VALUE` RPCs whose
+    /// QUIC dial did not complete within `DHT_DIAL_TIMEOUT` (#2532). A steady
+    /// rate names a bonded peer that is offline. The lookup skips such a peer
+    /// for `DIAL_FAILURE_COOLDOWN`, so while it stays down the rate is about one
+    /// per node per cooldown, not one per lookup.
+    pub dht_lookup_dial_timeouts: Counter,
     /// `decdn_dht_store_published_total`: DHT `STORE` records a peer accepted
     /// from this node.
     pub dht_store_published: Counter,
@@ -3693,6 +3699,8 @@ recorders! {
     dht_findvalue_query => dht_findvalue_queries.inc();
     /// A lookup round hit its timeout and aborted its in-flight RPCs.
     dht_lookup_round_timeout => dht_lookup_round_timeouts.inc();
+    /// A lookup `FIND_VALUE` RPC's dial did not complete within the dial budget.
+    dht_lookup_dial_timeout => dht_lookup_dial_timeouts.inc();
     /// `count` peers accepted a `STORE` record from this node.
     dht_store_published(count: u64) => dht_store_published.inc_by(count);
     /// Publish the routing table's entry count.
