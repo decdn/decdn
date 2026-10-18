@@ -133,13 +133,14 @@ pub(crate) enum ProbeGather {
 /// The empty blob ([`decdn_protocol::EMPTY_ROOT`]) spans zero blocks, so no
 /// holder reports a block for the union to cover. For that hash the union
 /// spans the blob once one holder is admitted (#2526). The rule keys on the
-/// requested hash, as `ProbeResponseExt::consistent_with` does, never on the
-/// unsigned `total_bytes` hint: one holder that reports `Some(0)` for a real
-/// blob must not close the gather after its own answer.
+/// requested hash, never on the unsigned `total_bytes` hint.
+/// `ProbeResponseExt::consistent_with` keys on the hash the same way. A holder
+/// that reports `Some(0)` for a real blob therefore closes nothing.
 struct CoverageUnionTracker {
     /// Whether the requested hash is [`decdn_protocol::EMPTY_ROOT`].
     empty_root: bool,
-    /// Holders admitted so far, a holder without a size hint included.
+    /// Holders admitted so far, a holder without a size hint included. Read
+    /// only when `empty_root` is set.
     holders: usize,
     /// Covered discovery blocks seen so far.
     blocks: std::collections::BTreeSet<u32>,
@@ -1285,8 +1286,7 @@ async fn probe_round(
                     union.add(&candidate);
                     candidates.push(candidate);
                     // With no holder-reported size this stays false and the round
-                    // drains to the probe-fanout ceiling. The empty root is the
-                    // exception: one admitted holder spans it (#2526).
+                    // drains to the probe-fanout ceiling.
                     union.spans()
                 }
             };

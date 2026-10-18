@@ -1110,8 +1110,8 @@ since project inception and will roll into the first tagged release.
   coverage union covers every discovery block of the blob. The empty blob has
   zero blocks, so the block target stayed at zero and the union never spanned
   it: the probe round waited for every probe to answer or time out, the
-  origin-directory round always ran, and a cached holder list never counted as
-  a probe-cache hit. Now the union spans the empty root once one holder is
+  origin-directory lookup always ran, and a cached holder list never counted
+  as a probe-cache hit. Now the union spans the empty root once one holder is
   admitted. The rule keys on the requested hash, never on the unsigned
   `total_bytes` hint, so a holder that reports a zero size for a real blob
   closes nothing.

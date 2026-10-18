@@ -992,6 +992,10 @@ fn coverage_spans_for_the_empty_root_needs_one_admitted_holder() {
         "the empty-root rule reads the hash, not the size hint"
     );
     assert!(
+        coverage_spans(empty_root, &[holder(Coverage::empty(), Some(size))]),
+        "an empty-root holder that reports a size still spans it: the hint is ignored"
+    );
+    assert!(
         !coverage_spans(empty_root, &[]),
         "no admitted holder spans nothing, the empty root included"
     );
