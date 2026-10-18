@@ -302,7 +302,9 @@ pub(crate) fn lane_target(
 /// any streaming, and skipped entirely on the delegated path, which opens
 /// nothing on-chain. A caller that holds a provider's stream permit takes it
 /// before `open_lock`, so the lock order stays permit → `open_lock` and no
-/// hold-and-wait cycle can form.
+/// hold-and-wait cycle can form. A build still queued on `open_lock` when
+/// `ended` fires has sent nothing, and ends at once with
+/// [`FetchEnded`](crate::funding::FetchEnded).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_multi_lane<'a, P>(
     deps: &LaneDeps<'a, P>,
@@ -337,7 +339,9 @@ where
         // pool), so it skips the guard: holding the bundle-wide lock there
         // would serialize unrelated fetches for no mutual-exclusion win.
         let _open_guard = match (open_lock, &keys) {
-            (Some(lock), LaneKeys::Owned(_)) => Some(lock.lock().await),
+            (Some(lock), LaneKeys::Owned(_)) => {
+                Some(crate::funding::lock_unless_ended(lock, Some(ended)).await?)
+            }
             _ => None,
         };
         build_ctx_for_fetch(deps, &keys, voucher_dom, provider, ended).await?

@@ -30,6 +30,7 @@ use decdn_incentive::{
     AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, Capability, Deployment,
     DepositOutcome, LaneKey, PoolOpenFailureReason, SignedCapability, StoreError,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::{PoolContext, VoucherProgress};
@@ -1312,7 +1313,8 @@ const TOPUP_NONCE_BACKOFF: Duration = Duration::from_millis(250);
 /// Send `topUp(pool_id, amount)` from `owner` at its pending nonce, re-sent on
 /// a fresh nonce after a same-account nonce collision, and return the pending
 /// transaction with the nonce it holds. The errors are [`top_up`]'s submit
-/// errors.
+/// errors, and [`FetchEnded`](crate::funding::FetchEnded) once `ended` fires
+/// before a send or during the backoff before a re-send.
 ///
 /// `escrows` holds each submit while it is in flight, and keeps one that
 /// failed in transport: either may have been broadcast with no hash returned.
@@ -1324,9 +1326,13 @@ async fn send_top_up<P: Provider + Clone>(
     pool_id: B256,
     amount: u64,
     escrows: &UnconfirmedEscrows,
+    ended: Option<&CancellationToken>,
 ) -> Result<(PendingTransactionBuilder<Ethereum>, u64)> {
     let mut nonce_retries = 0u32;
     loop {
+        // Refuse a send once the fetch ended: its lane would never run. Before
+        // a re-send this costs nothing, since the collision broadcast nothing.
+        crate::funding::refuse_after_end(ended)?;
         let nonce = contract
             .provider()
             .get_transaction_count(owner)
@@ -1349,7 +1355,16 @@ async fn send_top_up<P: Provider + Clone>(
                 %pool_id, nonce_retries,
                 "topUp lost its nonce to a concurrent transaction; re-sending"
             );
-            tokio::time::sleep(TOPUP_NONCE_BACKOFF).await;
+            let backoff = tokio::time::sleep(TOPUP_NONCE_BACKOFF);
+            match ended {
+                Some(ended) => {
+                    tokio::select! {
+                        () = ended.cancelled() => {}
+                        () = backoff => {}
+                    }
+                }
+                None => backoff.await,
+            }
             continue;
         }
         // A transport failure may have reached the node and broadcast the
@@ -1451,7 +1466,8 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 /// A submit rejected as a same-account nonce collision
 /// ([`decdn_incentive::tx::is_nonce_collision`]) broadcast nothing, so it is
 /// re-sent up to three more times, a quarter second apart, each time on a fresh
-/// pending nonce.
+/// pending nonce. `top_up` re-sends regardless of any fetch; the crate's lane
+/// builds use a variant that re-sends none once their fetch ends.
 /// A node signs its sellers' redemptions and its buyer top-ups with one key, so a
 /// top-up can lose its nonce to a redemption sent at the same moment.
 ///
@@ -1486,10 +1502,41 @@ pub async fn top_up<P: Provider + Clone>(
     escrows: Option<&UnconfirmedEscrows>,
     receipt_timeout: Option<Duration>,
 ) -> Result<(ToppedUpPool, UnrecordedEscrow)> {
+    top_up_unless_ended(
+        contract,
+        owner,
+        pool_id,
+        additional,
+        escrows,
+        receipt_timeout,
+        None,
+    )
+    .await
+}
+
+/// [`top_up`] for a lane build, which sends no `topUp` once `ended` fires
+/// ([`crate::funding::FetchEnded`]): neither the first send nor a re-send
+/// after a nonce collision. A collision broadcast nothing, so the refused
+/// re-send escrows nothing. A `topUp` already sent runs to its receipt.
+/// `None` refuses nothing, as for [`top_up`].
+///
+/// # Errors
+///
+/// As [`top_up`], and [`crate::funding::FetchEnded`] once `ended` fires
+/// before a send.
+pub(crate) async fn top_up_unless_ended<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    owner: Address,
+    pool_id: B256,
+    additional: U256,
+    escrows: Option<&UnconfirmedEscrows>,
+    receipt_timeout: Option<Duration>,
+    ended: Option<&CancellationToken>,
+) -> Result<(ToppedUpPool, UnrecordedEscrow)> {
     let amount = to_pool_u64(additional, "top-up")?;
     // A caller with no handle holds the entries in one nobody reads.
     let escrows = escrows.cloned().unwrap_or_default();
-    let (pending, nonce) = send_top_up(contract, owner, pool_id, amount, &escrows).await?;
+    let (pending, nonce) = send_top_up(contract, owner, pool_id, amount, &escrows, ended).await?;
     // Capture the hash before the wait consumes `pending`: past this point the
     // transaction is broadcast and may mine, so every receipt failure names it
     // (see [`TopUpUnconfirmed`]). A lapse does not cancel the transaction.

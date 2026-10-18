@@ -41,8 +41,12 @@ pub(crate) const SETTLE_STEP: Duration = Duration::from_millis(500);
 ///
 /// One gate spans one fetch. A bundle pull is one fetch for every entry, so
 /// its entries share one gate; a command that runs its remaining work again
-/// against a replaced pool keeps the gate for that pass too. Steps run one at
-/// a time. A caller whose exhausted set a sibling's step already answered
+/// against a replaced pool keeps the gate for that pass too. A caller may
+/// share one gate across fetches it runs one after another (the CLI's
+/// per-payer gate, a [`crate::bundle::BundlePuller`]'s manifest fetch and
+/// pulls): each fetch then starts clear of the replacement an earlier one
+/// left ([`Self::leave_carried`]), and [`Self::replacements`] lists the
+/// replacements of all of them. Steps run one at a time. A caller whose exhausted set a sibling's step already answered
 /// takes no step of its own: the sibling topped up or settled since the
 /// caller's last step, raised the deposit above the one the caller saw, or
 /// swapped in a credential past the one the caller ran under.
@@ -66,6 +70,9 @@ struct GateState {
     last_step: Option<u64>,
     /// The step that replaced the pool, which every later step reports.
     replaced: Option<PoolReplaced>,
+    /// Every replacement a step of the gate made, in order. No pass or fetch
+    /// clears it.
+    made: Vec<PoolReplaced>,
     /// The top-up and settle steps the gate has taken. A caller that last saw
     /// fewer makes one more pass on the latest.
     top_ups: u64,
@@ -116,7 +123,7 @@ impl Default for RecoveryGate {
 }
 
 impl RecoveryGate {
-    /// A gate for one fetch, with the [`RECOVERY_SETTLE`] settle window.
+    /// A gate with the [`RECOVERY_SETTLE`] settle window.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -145,8 +152,38 @@ impl RecoveryGate {
 
     /// The replacement a step made in this pass, which every later step of the
     /// pass reports, until [`Self::start_next_pass`].
+    #[cfg(test)]
     pub(crate) fn replaced(&self) -> Option<crate::PoolReplaced> {
         self.lock().replaced
+    }
+
+    /// Start a fetch clear of the replacement an earlier fetch on the gate
+    /// left, and return it. That fetch's lanes and record name the new pool,
+    /// so this fetch starts as a pass against it ([`Self::start_next_pass`]).
+    /// Left on the gate, it would answer this fetch's first recovery step with
+    /// no step. [`Self::replacements`] still lists it.
+    ///
+    /// Only a caller that runs its fetches one after another clears the gate
+    /// so: a fetch still in its pass on the closed pool would take its next
+    /// step on that pool, and open yet another one.
+    #[doc(hidden)]
+    pub fn leave_carried(&self) -> Option<crate::PoolReplaced> {
+        let mut state = self.lock();
+        let carried = state.replaced.take();
+        if carried.is_some() {
+            state.reached = None;
+        }
+        carried
+    }
+
+    /// Every pool replacement the gate's recovery steps made, in the order
+    /// they made them, across every pass and fetch on the gate. Each closed
+    /// pool may still hold a balance to reclaim once its dispute window ends.
+    /// The list outlives a fetch its caller dropped, so a command names each
+    /// closed pool on every exit.
+    #[must_use]
+    pub fn replacements(&self) -> Vec<crate::PoolReplaced> {
+        self.lock().made.clone()
     }
 
     /// Count `bytes` newly BLAKE3-verified content bytes toward the progress
@@ -225,7 +262,9 @@ impl RecoveryGate {
                 Stepped::Raised(new_deposit)
             }
             Ok(Recovery::Replaced(replaced)) => {
-                self.lock().replaced = Some(replaced);
+                let mut state = self.lock();
+                state.replaced = Some(replaced);
+                state.made.push(replaced);
                 Stepped::Replaced(replaced)
             }
             Ok(Recovery::Unavailable) => Stepped::Unavailable,

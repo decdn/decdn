@@ -132,8 +132,10 @@ pub trait SourceProvider: Send + Sync {
     ///
     /// `ended` fires once the fetch the build serves has ended: the lane
     /// would never run. A build that reaches its `openPool` or `topUp` after
-    /// it fires sends none. One already inside the call (its nonce read, its
-    /// submit) or past it runs to its receipt.
+    /// it fires sends none, and one queued on the open or `topUp` lock ends
+    /// at once. A `topUp` that lost its nonce sends no re-send once it fires.
+    /// One already inside a send (its nonce read, its submit) or past it runs
+    /// to its receipt.
     fn connect<'a>(
         &'a self,
         holder: &'a Holder,

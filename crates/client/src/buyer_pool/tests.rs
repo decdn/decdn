@@ -3,7 +3,7 @@ use super::{
     OwnedPayer, PaymentPool, TopUpUnconfirmed, UnconfirmedEscrows, approval_floor,
     approve_decision, ensure_allowance, escrowed_but_untracked, grade_deposit_credit,
     issue_self_capability, open_pool, pool_accepts_funds, refill_amount, self_owned_lane_ctx,
-    send_open_pool, send_top_up_at, top_up, topped_up_from_receipt,
+    send_open_pool, send_top_up_at, top_up, top_up_unless_ended, topped_up_from_receipt,
 };
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
@@ -137,6 +137,49 @@ async fn a_top_up_out_of_nonce_retries_holds_nothing() {
     assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
     assert_eq!(escrows.pending(), vec![]);
     assert!(asserter.read_q().is_empty(), "four sends were tried");
+}
+
+/// #2520: a lane build's `topUp` that lost its nonce sends no re-send once
+/// its fetch ends during the backoff. The collision broadcast nothing, so the
+/// refusal escrows nothing, and the re-send's nonce read never runs.
+#[tokio::test(start_paused = true)]
+async fn a_collided_top_up_sends_no_re_send_after_the_fetch_ends() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    asserter.push_failure_msg("nonce too low");
+    asserter.push_success(&U256::from(6u64));
+    asserter.push_success(&B256::repeat_byte(0xab));
+    let escrows = UnconfirmedEscrows::default();
+    let ended = tokio_util::sync::CancellationToken::new();
+    let end_in_the_backoff = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        ended.cancel();
+    };
+    let pool = mocked_pool(asserter.clone());
+    let started = tokio::time::Instant::now();
+    let (result, ()) = tokio::join!(
+        top_up_unless_ended(
+            &pool,
+            Address::repeat_byte(0x22),
+            B256::repeat_byte(0x33),
+            U256::from(1_000u64),
+            Some(&escrows),
+            None,
+            Some(&ended),
+        ),
+        end_in_the_backoff,
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.downcast_ref::<crate::funding::FetchEnded>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(escrows.pending(), vec![]);
+    assert_eq!(asserter.read_q().len(), 2, "the re-send was never tried");
+    assert!(
+        started.elapsed() < super::TOPUP_NONCE_BACKOFF,
+        "the backoff ends with the fetch"
+    );
 }
 
 /// Two calls that hold equal entries each release their own: releasing one

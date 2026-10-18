@@ -520,15 +520,18 @@ pub struct BundleOutcome {
     pub report: BundleReport,
     /// Why the pull ended.
     pub end: BundleEnd,
-    /// The pool replacement a funding recovery step made, if one did. The
-    /// closed pool may still hold a balance to reclaim once its dispute
-    /// window ends. A replacement that ended the first pass runs the rest
-    /// again against the new pool. One a sibling entry's step made while
-    /// another entry ended the pull, or one that an untracked escrow ended the
-    /// pull over, runs nothing again, and is still reported here. A second
-    /// replacement, in the pass against the new pool, ends the pull "funding
-    /// needed" and is named only in its error.
-    pub replaced: Option<PoolReplaced>,
+    /// Every pool replacement this pull's funding recovery steps made, in the
+    /// order they made them. Each closed pool may still hold a balance to
+    /// reclaim once its dispute window ends. A replacement that ended the
+    /// first pass runs the rest again against the new pool. One a sibling
+    /// entry's step made while another entry ended the pull, or one that an
+    /// untracked escrow ended the pull over, runs nothing again, and is still
+    /// listed here. A second replacement, in the pass against the new pool,
+    /// runs nothing again and is listed after the first: the pool the first
+    /// one opened is the one it closed. One that ends that pass ends the pull
+    /// "funding needed". [`BundlePuller::replacements`] also lists a manifest
+    /// fetch's.
+    pub replaced: Vec<PoolReplaced>,
 }
 
 /// Why a bundle pull ended.
@@ -744,6 +747,16 @@ impl BundlePuller {
         cancel: &CancellationToken,
     ) -> BundleOutcome {
         Box::pin(self.ctx.run(manifest, out_dir, overwrite, cancel)).await
+    }
+
+    /// Every pool replacement this puller's funding recovery steps made, in
+    /// order: its manifest fetches' and its pulls' alike, and a step in a
+    /// pull its caller dropped or cancelled. Each closed pool may still hold
+    /// a balance to reclaim once its dispute window ends. A replacement that
+    /// ended a manifest fetch is in no [`BundleOutcome`].
+    #[must_use]
+    pub fn replacements(&self) -> Vec<PoolReplaced> {
+        self.ctx.recovery.replacements()
     }
 
     /// The warning for a wallet seen to hold too little USDC to top the pool

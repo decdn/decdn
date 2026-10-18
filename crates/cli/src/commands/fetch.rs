@@ -535,6 +535,9 @@ pub(crate) async fn fetch(
         result = fetch_target(&host, &payer, args, output, uri, &timings) => result,
         () = interrupt.wait() => Err(Interrupted.into()),
     };
+    // On every exit, a Ctrl-C's included: the gate lists a replacement whose
+    // fetch was dropped too.
+    print_reclaim_notes(&payer.recovery.replacements());
     let result = name_held_escrows(result, &host.escrows);
     let output = if wants_stdout(output) {
         "stdout"
@@ -1054,8 +1057,15 @@ pub(crate) async fn fetch_on(
     // One funding recovery state for everything the payer pays for, both passes
     // included.
     let recovery = &payer.recovery;
-    // Set once a funding recovery step replaced the pool: the second pass then
-    // runs the remaining work against the new pool, and resumes the `.partial`.
+    // A replacement the gate carries from an earlier fetch under this payer (an
+    // entry URI's manifest fetch) names the pool this fetch's lanes reuse; the
+    // gate still lists it for the command to name. A keystore payer runs its
+    // fetches one after another, so no fetch is still on the closed pool. A
+    // held payer funds nothing, so its gate never holds one.
+    recovery.leave_carried();
+    // Set once a funding recovery step's replacement ended the first pass of a
+    // file fetch: the second pass then runs the remaining work against the new
+    // pool, and resumes the `.partial`.
     let mut replaced: Option<PoolReplaced> = None;
     loop {
         // Per pass: the funding facts, the lanes and their handles all name the
@@ -1152,13 +1162,16 @@ pub(crate) async fn fetch_on(
 
 /// What a fetch pass that ended with `result` does next: `None` to run the
 /// remaining work again against the pool a funding recovery step just opened,
-/// or the command's result (ADR 003 § Funding recovery).
+/// or the command's result (ADR 003 § Funding recovery). `replaced` is the
+/// replacement that ended an earlier pass, which a rerun sets.
 ///
-/// A pass runs again at most once: a second replacement in one command ends it
-/// "funding needed". A stream (stdout or a writer) never runs again, because
-/// the bytes it already wrote cannot be taken back; its replacement ends the
-/// command with the new pool named. Once a pass replaced the pool, the closed
-/// pool's remaining balance is named on stderr, with the reclaim command.
+/// Only a pass that a [`PoolReplaced`] ended runs again, and at most once: a
+/// second replacement in one command ends it "funding needed". A replacement
+/// that an untracked escrow ended the pass over survives in `result` only as
+/// text, and runs nothing again. A stream (stdout or a writer) never runs
+/// again, because the bytes it already wrote cannot be taken back; its
+/// replacement ends the command with the new pool named. The command names
+/// each closed pool as it ends, from the gate ([`print_reclaim_notes`]).
 fn next_pass(
     result: anyhow::Result<()>,
     replaced: &mut Option<PoolReplaced>,
@@ -1176,13 +1189,6 @@ fn next_pass(
         *replaced = Some(new);
         return None;
     }
-    if let Some(earlier) = (*replaced).or(now_replaced) {
-        eprintln!(
-            "note: pool {} accepts no more funds and may still hold a balance; once its \
-             dispute window ends, reclaim it with: decdn pool reclaim --pool {}",
-            earlier.closed, earlier.closed
-        );
-    }
     Some(result.map_err(|err| match (now_replaced, *replaced) {
         (Some(_), Some(_)) => err.context(
             "funding needed: the pool this command opened accepts no more funds either; run \
@@ -1194,6 +1200,19 @@ fn next_pass(
         )),
         _ => err,
     }))
+}
+
+/// Name each pool in `replacements` that a funding recovery step closed
+/// ([`decdn_client::RecoveryGate::replacements`]): it may still hold a
+/// balance, and the note gives the command that reclaims it.
+pub(crate) fn print_reclaim_notes(replacements: &[PoolReplaced]) {
+    for replaced in replacements {
+        eprintln!(
+            "note: pool {} accepts no more funds and may still hold a balance; once its \
+             dispute window ends, reclaim it with: decdn pool reclaim --pool {}",
+            replaced.closed, replaced.closed
+        );
+    }
 }
 
 /// Reconnect a delegated fetch that ended "funding needed" (ADR 003 §Funding

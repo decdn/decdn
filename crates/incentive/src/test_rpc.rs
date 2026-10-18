@@ -10,10 +10,11 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use alloy::primitives::{B256, Bytes, U256};
+use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+use alloy::primitives::{Address, B256, Bloom, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::client::RpcClient;
-use alloy::rpc::types::TransactionReceipt;
+use alloy::rpc::types::{Log, TransactionReceipt};
 use alloy::transports::{TransportError, TransportErrorKind, TransportFut};
 use alloy_json_rpc::{RequestPacket, Response, ResponsePacket, ResponsePayload};
 
@@ -22,6 +23,33 @@ pub const SCRIPTED_TX: B256 = B256::repeat_byte(0xef);
 
 /// The pending nonce [`ScriptedRpc`] returns.
 pub const SCRIPTED_NONCE: u64 = 5;
+
+/// A successful receipt for [`SCRIPTED_TX`], sent to `to`, that mined with
+/// `logs`: one to hand [`ScriptedRpc::mined`].
+#[must_use]
+pub const fn mined_receipt(to: Address, logs: Vec<Log>) -> TransactionReceipt {
+    TransactionReceipt {
+        inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 0,
+                logs,
+            },
+            logs_bloom: Bloom::ZERO,
+        }),
+        transaction_hash: SCRIPTED_TX,
+        transaction_index: Some(0),
+        block_hash: Some(B256::repeat_byte(0x01)),
+        block_number: Some(1),
+        gas_used: 0,
+        effective_gas_price: 0,
+        blob_gas_used: None,
+        blob_gas_price: None,
+        from: Address::repeat_byte(0x22),
+        to: Some(to),
+        contract_address: None,
+    }
+}
 
 /// Answers `eth_getTransactionCount` with [`SCRIPTED_NONCE`], and each
 /// `eth_call` with the next answer in its queue. `eth_sendTransaction` gets

@@ -27,7 +27,7 @@ use crate::buyer_pool::{
     LOW_WATER_DIVISOR, OpenedPool, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool,
     UnconfirmedEscrows, UnrecordedEscrow, WalletShortfall, ensure_allowance,
     escrowed_but_untracked, grade_deposit_credit, open_pool, pool_accepts_funds, refill_amount,
-    self_owned_lane_ctx, top_up, topped_up_effect,
+    self_owned_lane_ctx, top_up_unless_ended, topped_up_effect,
 };
 use crate::lanes::LaneDeps;
 use crate::session::{ChainAdoption, ChainConfig, DepositPolicy};
@@ -136,7 +136,8 @@ impl std::fmt::Display for RefusedAfterUntracked {
 impl std::error::Error for RefusedAfterUntracked {}
 
 /// The refusal of an `openPool` or `topUp` that a lane build reaches after the
-/// fetch it serves has ended ([`crate::SourceProvider::connect`]): the lane
+/// fetch it serves has ended, or of a build still queued on the open or
+/// `topUp` lock as it ends ([`crate::SourceProvider::connect`]): the lane
 /// would never run, so the escrow would fund nothing this fetch needs. The
 /// refused call escrows nothing. The build fails, and the drain of late lane
 /// builds logs it at `debug`.
@@ -154,11 +155,30 @@ impl std::error::Error for FetchEnded {}
 /// Refuse an `openPool` or `topUp` once `ended` fires ([`FetchEnded`]).
 /// `None` is a caller outside any lane build, such as the funding recovery
 /// step, which runs only while its fetch does.
-fn refuse_after_end(ended: Option<&CancellationToken>) -> anyhow::Result<()> {
+pub(crate) fn refuse_after_end(ended: Option<&CancellationToken>) -> anyhow::Result<()> {
     if ended.is_some_and(CancellationToken::is_cancelled) {
         return Err(anyhow::Error::new(FetchEnded));
     }
     Ok(())
+}
+
+/// Take `lock`, or refuse with [`FetchEnded`] once `ended` fires, whichever
+/// comes first. A lane build queued behind a sibling that holds the lock
+/// through a receipt wait has sent nothing, so it ends at once rather than at
+/// the drain's bound. A fired `ended` refuses even a free lock. `None` takes
+/// the lock as a plain wait, as `refuse_after_end(None)` refuses nothing.
+pub(crate) async fn lock_unless_ended<'a>(
+    lock: &'a tokio::sync::Mutex<()>,
+    ended: Option<&CancellationToken>,
+) -> anyhow::Result<tokio::sync::MutexGuard<'a, ()>> {
+    let Some(ended) = ended else {
+        return Ok(lock.lock().await);
+    };
+    tokio::select! {
+        biased;
+        () = ended.cancelled() => Err(anyhow::Error::new(FetchEnded)),
+        guard = lock.lock() => Ok(guard),
+    }
 }
 
 /// What a lane build learned about the pool's spend, for
@@ -1190,9 +1210,9 @@ fn escrow_held(err: &anyhow::Error) -> bool {
 /// untracked escrow ([`UnconfirmedEscrows::untracked`]) refuses too, with
 /// [`RefusedAfterUntracked`]. Both refusals read the handle, so a later pass
 /// on the same handle refuses the same way. A lane build's call refuses with
-/// [`FetchEnded`] once `ended` fires, checked before the allowance leg and
-/// again before the `topUp` leg; a call already in its `topUp` leg runs to
-/// its receipt.
+/// [`FetchEnded`] once `ended` fires: while it waits for the run's `topUp`
+/// lock, before the allowance leg, and before each `topUp` send, a re-send
+/// after a nonce collision too. A `topUp` already sent runs to its receipt.
 ///
 /// Returns the [`ToppedUpPool`] with the [`UnrecordedEscrow`] the caller
 /// resolves once its credit commits or fails.
@@ -1216,13 +1236,12 @@ async fn escrow_top_up<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    let _serial = funding.top_up_serial.lock().await;
+    let _serial = lock_unless_ended(&funding.top_up_serial, ended).await?;
     if let Some(earlier) = funding.escrows.top_ups().first().copied() {
         return Err(anyhow::Error::new(earlier)
             .context("refusing a second topUp while an earlier one is unconfirmed"));
     }
     funding.refuse_after_untracked()?;
-    refuse_after_end(ended)?;
     ensure_allowance(
         contract.provider(),
         token,
@@ -1231,14 +1250,14 @@ where
         if max_approve { None } else { Some(additional) },
     )
     .await?;
-    refuse_after_end(ended)?;
-    top_up(
+    top_up_unless_ended(
         contract,
         owner,
         pool_id,
         additional,
         Some(&funding.escrows),
         Some(RECEIPT_TIMEOUT),
+        ended,
     )
     .await
 }
@@ -1358,8 +1377,15 @@ where
         }
         Err(err) => err,
     };
+    if err.downcast_ref::<FetchEnded>().is_some() {
+        tracing::info!(
+            "buyer pool {} not topped up: the fetch ended before the topUp was sent",
+            state.pool_id,
+        );
+        return Err(err);
+    }
     // A refusal names its own cause; no wallet balance explains it.
-    if escrow_held(&err) || err.downcast_ref::<FetchEnded>().is_some() {
+    if escrow_held(&err) {
         return Err(err);
     }
     let Some(shortfall) = funding
