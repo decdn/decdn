@@ -714,8 +714,9 @@ enum EntryOutcome {
         err: String,
     },
     /// A destination the pull did not run: a sibling's halt left it unwritten
-    /// ([`Halted`]), or its group never settled ([`fill_not_run`]). The run
-    /// summary counts it as not run, and the skip-cache does not record it.
+    /// ([`Halted`]), or its group never settled ([`SettledGroup::not_run`]).
+    /// The run summary counts it as not run, and the skip-cache does not
+    /// record it.
     NotRun,
 }
 
@@ -1041,25 +1042,52 @@ fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
         .copied()
 }
 
-/// The pool replacements of `run`, a first pass, as `(rerun, report)`.
-/// `carried` is the replacement the recovery gate held as the pass started,
-/// and `now` the one it holds as the pass ended
-/// ([`crate::RecoveryGate::replaced`]).
+/// What a first pass's pool replacement asks of the pull
+/// ([`pass_replacement`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassReplacement {
+    /// No step replaced the pool.
+    None,
+    /// The replacement ended the pass: the rest runs once more against the
+    /// new pool, and the caller is told of it.
+    Rerun(PoolReplaced),
+    /// A step replaced the pool, but something else ended the pass: nothing
+    /// runs again, since the pull ends, and the caller is told of it.
+    ReportOnly(PoolReplaced),
+}
+
+impl PassReplacement {
+    /// The replacement the rest runs again against.
+    const fn rerun(self) -> Option<PoolReplaced> {
+        match self {
+            Self::Rerun(replaced) => Some(replaced),
+            Self::None | Self::ReportOnly(_) => None,
+        }
+    }
+
+    /// The replacement the caller is told of.
+    const fn reported(self) -> Option<PoolReplaced> {
+        match self {
+            Self::Rerun(replaced) | Self::ReportOnly(replaced) => Some(replaced),
+            Self::None => None,
+        }
+    }
+}
+
+/// The pool replacement of `run`, a first pass, given `now`, the one the
+/// recovery gate holds as the pass ended ([`crate::RecoveryGate::replaced`]).
 ///
-/// `rerun` is the replacement that ended the pass ([`replaced_pool`]): the
-/// rest runs once more against it. `report` is the replacement the caller is
-/// told of: `rerun`, or else a new one the gate holds. A sibling entry's
+/// The replacement that ended the pass ([`replaced_pool`]) runs the rest
+/// again. Any other one the gate holds is only reported: a sibling entry's
 /// recovery step can replace the pool while another entry's fault ends the
-/// pass, and an untracked escrow can end the pass over the
-/// [`PoolReplaced`] that ended it. Neither runs again, since the pull ends,
-/// but the closed pool may still hold a balance to reclaim.
-fn pass_replacement(
-    run: &PullRun,
-    carried: Option<PoolReplaced>,
-    now: Option<PoolReplaced>,
-) -> (Option<PoolReplaced>, Option<PoolReplaced>) {
-    let rerun = replaced_pool(run);
-    (rerun, rerun.or(now.filter(|now| Some(*now) != carried)))
+/// pass, and an untracked escrow can end the pass over the [`PoolReplaced`]
+/// that ended it. The closed pool may still hold a balance to reclaim.
+fn pass_replacement(run: &PullRun, now: Option<PoolReplaced>) -> PassReplacement {
+    match (replaced_pool(run), now) {
+        (Some(replaced), _) => PassReplacement::Rerun(replaced),
+        (None, Some(replaced)) => PassReplacement::ReportOnly(replaced),
+        (None, None) => PassReplacement::None,
+    }
 }
 
 /// How a pull that ended with `stopped` ends, once every pass ran.
@@ -1194,20 +1222,6 @@ fn merge_passes(first: PullRun, second: PullRun) -> PullRun {
     }
 }
 
-/// Mark each group of `groups` that never settled as not run, one
-/// [`EntryOutcome::NotRun`] for each of its `sizes` entries: a group the pull
-/// dropped at [`GROUP_DRAIN`], one a cancel dropped, or one that never
-/// started. A group that settled holds one outcome per entry already.
-fn fill_not_run(groups: &mut [SettledGroup], sizes: &[usize]) {
-    for (group, &size) in groups.iter_mut().zip(sizes) {
-        if group.outcomes.is_empty() {
-            group.outcomes = std::iter::repeat_with(|| EntryOutcome::NotRun)
-                .take(size)
-                .collect();
-        }
-    }
-}
-
 /// Record one group's run in [`PullCtx::pull_plain`]: forward its recordable
 /// files to the skip-cache flush, put its outcomes in slot `i`, and return the
 /// fault that ends the whole pull, if its fetch failed with one.
@@ -1250,12 +1264,25 @@ fn settle_group_run(
 /// A hash-group's result, kept for the run summary: its per-entry outcomes
 /// and the content bytes its landed fetch paid for and resumed (see
 /// [`GroupRun::bytes`]).
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct SettledGroup {
     outcomes: Vec<EntryOutcome>,
     /// The group's size warnings ([`size_warnings`]).
     warnings: Vec<String>,
     bytes: Option<EntryBytes>,
+}
+
+impl SettledGroup {
+    /// The result of a group of `entries` entries the pull never settled:
+    /// each entry not run.
+    fn not_run(entries: usize) -> Self {
+        Self {
+            outcomes: std::iter::repeat_with(|| EntryOutcome::NotRun)
+                .take(entries)
+                .collect(),
+            ..Self::default()
+        }
+    }
 }
 
 /// Run `items` through `run` once, at most `jobs` at a time. A bundle pull
@@ -1855,14 +1882,19 @@ impl<P: Provider + Clone> PullCtx<P> {
         // dropped mid-pass.
         self.stop = self.stop.next_pass();
         // A replacement the gate holds from before this pull (a manifest
-        // fetch's, or an earlier pull's second pass) is not this pull's.
-        let carried = self.recovery.replaced();
+        // fetch's, or an earlier pull's that ran nothing again) was reported
+        // then, and its pool is the one this pull's lanes reuse. Left on the
+        // gate, it would answer this pull's first recovery step with no step.
+        if self.recovery.replaced().is_some() {
+            self.recovery.start_next_pass();
+        }
         let mut run = self
             .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
             .await;
         self.stop = self.stop.next_pass();
         let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
-        let (rerun, replaced) = pass_replacement(&run, carried, self.recovery.replaced());
+        let replacement = pass_replacement(&run, self.recovery.replaced());
+        let rerun = replacement.rerun();
         if let Some(new) = rerun {
             if let Some(observer) = &self.observer {
                 observer.pool_replaced(&new);
@@ -1903,7 +1935,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         BundleOutcome {
             report,
             end,
-            replaced,
+            replaced: replacement.reported(),
         }
     }
 
@@ -2043,7 +2075,6 @@ impl<P: Provider + Clone> PullCtx<P> {
     ) -> PullRun {
         let groups_by_hash = order_groups_smallest_first(group_by_hash(entries));
         let group_count = groups_by_hash.len().max(1);
-        let sizes: Vec<usize> = groups_by_hash.iter().map(|g| g.entries.len()).collect();
         // Completed groups' skip-cache records flow to the flush task over this
         // channel. Unbounded so a `send` from the fetch-driving side never blocks
         // (the flush write must never stall a fetch); the messages are one small
@@ -2059,7 +2090,12 @@ impl<P: Provider + Clone> PullCtx<P> {
         // waits for a slot starts a fetch (one that links from an on-disk
         // donor still does), and each running fetch stops and drains its lane
         // builds ([`run_groups`]).
-        let mut groups: Vec<SettledGroup> = vec![SettledGroup::default(); groups_by_hash.len()];
+        // A group the pull never settles (dropped at `GROUP_DRAIN`, by a
+        // cancel, or never started) keeps its entries not run.
+        let mut groups: Vec<SettledGroup> = groups_by_hash
+            .iter()
+            .map(|g| SettledGroup::not_run(g.entries.len()))
+            .collect();
         let mut stopped: Option<anyhow::Error> = None;
         let drive = async {
             let run = |group: HashGroup<'e>| {
@@ -2119,7 +2155,6 @@ impl<P: Provider + Clone> PullCtx<P> {
         let flush = flush_task(out_root, saved, flush_rx);
 
         let interrupted = drive_until_interrupted(drive, flush, cancel).await;
-        fill_not_run(&mut groups, &sizes);
         // Byte tally is per-group (a blob pulled once, materialized to N paths),
         // so sum it before flattening away the group boundaries.
         let transfer = groups

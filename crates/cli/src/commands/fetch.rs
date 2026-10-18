@@ -509,7 +509,7 @@ pub(crate) fn manifest_cap_mb(max_blob_mb: u64) -> u64 {
 ///
 /// [`Interrupted`] on Ctrl-C, [`decdn_client::GaveUp`] once the stop policy's
 /// no-progress limit passes, or the fault that ended the fetch. A fetch that
-/// ends with an `openPool` or `topUp` whose receipt it did not read, or with
+/// ends with an `openPool` or `topUp` that no local record credits yet, or with
 /// one that escrowed with no local record crediting it, carries
 /// [`super::interrupt::UnreconciledEscrows`], as context on any of those or as the
 /// error of a fetch that otherwise succeeded. A pending transaction the error
@@ -529,7 +529,7 @@ pub(crate) async fn fetch(
     // A Ctrl-C drops the fetch mid-transfer: each drive's drop guard queues
     // what it paid for recording, and the `.partial` is the next run's resume
     // prefix. The handle outlives the fetch, so an `openPool` or `topUp` that a
-    // Ctrl-C or a fault dropped before its receipt was read is still named.
+    // Ctrl-C or a fault dropped before its record committed is still named.
     let mut interrupt = Interrupt::watch(host.escrows.clone());
     let result = tokio::select! {
         result = fetch_target(&host, &payer, args, output, uri, &timings) => result,
@@ -732,7 +732,7 @@ pub(crate) struct FetchHost {
     connections: Connections,
     health: Arc<PeerHealth>,
     writes: OrderedWrites,
-    /// Each `openPool` and `topUp` whose receipt is unread, and each that
+    /// Each `openPool` and `topUp` no local record credits yet, and each that
     /// escrowed with no local record crediting it, across every fetch.
     pub(crate) escrows: UnconfirmedEscrows,
     /// The pool's settlement token, `PaymentPool.usdc()`, read once.

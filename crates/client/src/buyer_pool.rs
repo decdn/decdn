@@ -616,7 +616,7 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// earlier tx may still mine and a second open would escrow a second deposit.
 /// A held `topUp` does not refuse an open.
 /// A caller that serializes its opens sees this only after an earlier open
-/// ended without a receipt.
+/// ended without a receipt, or left its [`UnrecordedEscrow`] unresolved.
 ///
 /// # The nonce is explicit
 ///
@@ -712,9 +712,16 @@ pub async fn open_pool<P: Provider + Clone>(
     };
     match opened_from_receipt(&receipt, tx, deployment, token, owner, deposit) {
         Ok(opened) => Ok((opened, unrecorded)),
-        // A revert escrowed nothing, and an open with no `PoolOpened` event
-        // is held untracked before its entry is released.
-        Err(err) => Err(unrecorded.untracked(err)),
+        // An open with no `PoolOpened` event is held untracked before its
+        // entry is released.
+        Err(err) if err.downcast_ref::<EscrowUntracked>().is_some() => {
+            Err(unrecorded.untracked(err))
+        }
+        // A revert escrowed nothing.
+        Err(err) => {
+            unrecorded.release();
+            Err(err)
+        }
     }
 }
 
@@ -809,9 +816,10 @@ pub const SELF_CAPABILITY_CAP: u64 = u64::MAX;
 /// Typed marker on an [`open_pool`] error raised when the `openPool` may have
 /// been broadcast but is not known to have mined: its submit failed in
 /// transport, or it was broadcast and its receipt was not read (a failed read,
-/// or none within the caller's bound). An [`UnconfirmedEscrows`] entry has the
-/// same meaning. The transaction may still mine and escrow the deposit, so a
-/// caller must resolve it before it sends another `openPool`. Recover it with
+/// or none within the caller's bound). An [`UnconfirmedEscrows`] entry also
+/// stands for one that mined while its record has not committed. The
+/// transaction may still mine and escrow the deposit, so a caller must
+/// resolve it before it sends another `openPool`. Recover it with
 /// `err.downcast_ref::<OpenUnconfirmed>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenUnconfirmed {
@@ -829,8 +837,8 @@ impl std::fmt::Display for OpenUnconfirmed {
         match self.tx {
             Some(tx) => write!(
                 f,
-                "openPool tx {tx} (nonce {n}) was broadcast but its receipt was not read, so it \
-                 may have mined and escrowed the deposit. An open sent before the tx confirms \
+                "openPool tx {tx} (nonce {n}) was broadcast and no local record credits it, so \
+                 it may have mined and escrowed the deposit. An open sent before the tx confirms \
                  or the account's nonce passes {n} escrows a second deposit; once it mines, \
                  `decdn pool list --all` shows its pool on chain",
                 n = self.nonce
@@ -849,8 +857,10 @@ impl std::fmt::Display for OpenUnconfirmed {
 
 impl std::error::Error for OpenUnconfirmed {}
 
-/// An `openPool` or `topUp` a command submitted whose receipt it has not read:
-/// one entry of [`UnconfirmedEscrows`]. Either may still mine and escrow USDC.
+/// An `openPool` or `topUp` a command submitted that no local record credits
+/// yet: its receipt was not read, or it mined and its record has not
+/// resolved ([`UnrecordedEscrow`]). One entry of [`UnconfirmedEscrows`].
+/// Either may still mine and escrow USDC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscrowUnconfirmed {
     /// An `openPool`, which may escrow a new pool's deposit.
@@ -891,8 +901,9 @@ impl std::fmt::Display for EscrowUnconfirmed {
     }
 }
 
-/// The `openPool` and `topUp` transactions a command submitted whose receipt
-/// it has not read, and those that mined with no local record crediting them.
+/// The `openPool` and `topUp` transactions a command submitted that no local
+/// record credits yet, and those that mined with no local record crediting
+/// them.
 ///
 /// [`open_pool`] and [`top_up`] add an entry before their submit. A submit
 /// rejected without a broadcast or a reverted receipt removes it. A mined one
@@ -905,10 +916,10 @@ impl std::fmt::Display for EscrowUnconfirmed {
 /// The handle also holds every `openPool` and `topUp` that mined with no local
 /// record crediting it ([`UnconfirmedEscrows::untracked`]): a record that
 /// failed ([`UnrecordedEscrow::untracked`]), or an `openPool` whose receipt
-/// holds no `PoolOpened` event. Their receipts were read, so they are not
-/// pending, but a command that ends while the handle holds one names it too: a
-/// re-run reads the uncredited row and escrows again. Each is held before its
-/// entry is released, so the handle names the transaction at every moment.
+/// holds no `PoolOpened` event. Each is held before its pending entry is
+/// released, so the handle names the transaction at every moment, and a
+/// command that ends while the handle holds one names it too: a re-run reads
+/// the uncredited row and escrows again.
 ///
 /// A clone shares the same lists, so one handle can outlive the per-pass state
 /// that the transactions run under.
@@ -960,9 +971,10 @@ impl UntrackedEscrow {
 ///
 /// A command that ends during the write, such as a process exit on a second
 /// Ctrl-C, still finds the transaction on the handle and names it. One that is
-/// dropped unresolved leaves the transaction pending: the command names it,
-/// and the handle refuses a later `openPool` or `topUp`, which is the safe
-/// side of a lost record.
+/// dropped unresolved leaves the transaction pending, which is the safe side
+/// of a lost record: the command names it, a later [`open_pool`] on the handle
+/// refuses while it holds an `openPool`, and a run's later `topUp`
+/// ([`crate::funding::RunFunding`]) refuses while it holds a `topUp`.
 #[derive(Debug)]
 #[must_use = "the escrow stays pending until its record is resolved"]
 pub struct UnrecordedEscrow {
@@ -974,17 +986,26 @@ impl UnrecordedEscrow {
     /// The record or credit committed: release the transaction from the
     /// handle.
     pub fn recorded(self) {
-        self.escrows.remove(self.entry);
+        self.release();
     }
 
-    /// The record or credit failed with `err`: hold `err` as untracked when it
-    /// is an [`EscrowUntracked`], then release the transaction, and return
-    /// `err`. The handle names the transaction at every moment between the
-    /// two, so a command that ends there still names it.
+    /// The record or credit failed with `err`: hold `err` as untracked, then
+    /// release the transaction, and return `err`. The handle names the
+    /// transaction at every moment between the two, so a command that ends
+    /// there still names it. An `err` that is not an [`EscrowUntracked`]
+    /// ([`escrowed_but_untracked`]) names no tx the handle can hold, so the
+    /// transaction stays pending instead.
     pub fn untracked(self, err: anyhow::Error) -> anyhow::Error {
-        self.escrows.hold_untracked(&err);
-        self.escrows.remove(self.entry);
+        if self.escrows.hold_untracked(&err) {
+            self.release();
+        }
         err
+    }
+
+    /// Release the transaction from the handle: its record committed, or its
+    /// receipt shows a revert that escrowed nothing.
+    fn release(self) {
+        self.escrows.remove(self.entry);
     }
 }
 
@@ -1001,10 +1022,11 @@ impl UnconfirmedEscrows {
     }
 
     /// Hold `err` when it is an untracked escrow ([`EscrowUntracked`]) whose
-    /// tx the handle does not hold yet.
-    pub(crate) fn hold_untracked(&self, err: &anyhow::Error) {
+    /// tx the handle does not hold yet. Returns whether the handle holds
+    /// `err`'s escrow now.
+    pub(crate) fn hold_untracked(&self, err: &anyhow::Error) -> bool {
         let Some(escrow) = err.downcast_ref::<EscrowUntracked>() else {
-            return;
+            return false;
         };
         let mut held = self
             .0
@@ -1017,6 +1039,7 @@ impl UnconfirmedEscrows {
                 text: decdn_common::redact::sanitize_err_chain(err),
             });
         }
+        true
     }
 
     /// Hold `err` as a run on the handle holds it when it is an untracked
@@ -1027,7 +1050,9 @@ impl UnconfirmedEscrows {
         self.hold_untracked(err);
     }
 
-    /// The transactions whose receipt was not read, oldest first.
+    /// The transactions no local record credits yet, oldest first: each
+    /// receipt that was not read, and each mined one whose record has not
+    /// resolved ([`UnrecordedEscrow`]).
     #[must_use]
     pub fn pending(&self) -> Vec<EscrowUnconfirmed> {
         self.0
@@ -1037,7 +1062,7 @@ impl UnconfirmedEscrows {
             .clone()
     }
 
-    /// The `openPool` transactions whose receipt was not read, oldest first.
+    /// The pending `openPool` transactions ([`Self::pending`]), oldest first.
     #[must_use]
     pub(crate) fn opens(&self) -> Vec<OpenUnconfirmed> {
         self.pending()
@@ -1049,7 +1074,7 @@ impl UnconfirmedEscrows {
             .collect()
     }
 
-    /// The `topUp` transactions whose receipt was not read, oldest first.
+    /// The pending `topUp` transactions ([`Self::pending`]), oldest first.
     #[must_use]
     pub(crate) fn top_ups(&self) -> Vec<TopUpUnconfirmed> {
         self.pending()
@@ -1070,7 +1095,8 @@ impl UnconfirmedEscrows {
             .push(escrow.into());
     }
 
-    /// Release `escrow` once its receipt is read, or its submit was rejected.
+    /// Release `escrow` once its record resolves, its receipt shows a revert,
+    /// or its submit was rejected.
     /// Releases one entry: two calls that hold equal entries each release
     /// their own.
     fn remove(&self, escrow: impl Into<EscrowUnconfirmed>) {
@@ -1188,7 +1214,7 @@ impl std::fmt::Display for TopUpUnconfirmed {
         match self.tx {
             Some(tx) => write!(
                 f,
-                "topUp tx {tx} (nonce {}) was broadcast but its receipt was not read, so it \
+                "topUp tx {tx} (nonce {}) was broadcast and no local record credits it, so it \
                  may have mined; reconcile against the tx before retrying, because a retry \
                  escrows again",
                 self.nonce
@@ -1486,7 +1512,7 @@ pub async fn top_up<P: Provider + Clone>(
         Ok(topped_up) => Ok((topped_up, unrecorded)),
         // A revert escrowed nothing.
         Err(err) => {
-            unrecorded.recorded();
+            unrecorded.release();
             Err(err)
         }
     }

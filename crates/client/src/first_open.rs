@@ -107,7 +107,8 @@ where
     )
     .await;
     // A build still in flight here serves an open that ended on a stop or an
-    // error: it sends no `openPool` or `topUp` from now on.
+    // error: one that reaches its `openPool` or `topUp` from now on sends
+    // none.
     ended.cancel();
     if opened.is_ok() {
         stop.clock.tick();

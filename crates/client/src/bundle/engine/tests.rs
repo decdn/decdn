@@ -832,8 +832,10 @@ fn replacement(closed: u8, opened: u8) -> PoolReplaced {
 fn a_replacement_that_ends_the_pass_runs_again() {
     let new = replacement(0x01, 0x02);
     let run = ended_on(Some(anyhow::Error::new(new)), false);
+    let replacement = pass_replacement(&run, Some(new));
+    assert_eq!(replacement, PassReplacement::Rerun(new));
     assert_eq!(
-        pass_replacement(&run, None, Some(new)),
+        (replacement.rerun(), replacement.reported()),
         (Some(new), Some(new))
     );
 }
@@ -846,7 +848,12 @@ fn a_replacement_that_ends_the_pass_runs_again() {
 fn a_give_up_beside_a_siblings_replacement_reports_it_without_a_rerun() {
     let new = replacement(0x01, 0x02);
     let run = ended_on(Some(give_up()), false);
-    assert_eq!(pass_replacement(&run, None, Some(new)), (None, Some(new)));
+    let replacement = pass_replacement(&run, Some(new));
+    assert_eq!(replacement, PassReplacement::ReportOnly(new));
+    assert_eq!(
+        (replacement.rerun(), replacement.reported()),
+        (None, Some(new))
+    );
 }
 
 /// #2517: a late escrow folded over the `PoolReplaced` that ended the pass
@@ -861,33 +868,39 @@ fn a_replacement_under_a_late_escrow_is_reported_without_a_rerun() {
     )
     .err();
     let run = ended_on(stopped, false);
-    assert_eq!(pass_replacement(&run, None, Some(new)), (None, Some(new)));
+    assert_eq!(
+        pass_replacement(&run, Some(new)),
+        PassReplacement::ReportOnly(new)
+    );
 }
 
-/// #2517: a replacement the gate held before the pull started is not this
-/// pull's, and an interrupted pass runs nothing again but reports its own.
+/// #2517: an interrupted pass runs nothing again, but reports its
+/// replacement, and a pass with no replacement reports none.
 #[test]
-fn a_carried_replacement_is_not_reported_and_an_interrupt_does_not_rerun() {
-    let old = replacement(0x01, 0x02);
-    let run = ended_on(None, false);
-    assert_eq!(pass_replacement(&run, Some(old), Some(old)), (None, None));
+fn an_interrupted_replacement_is_reported_without_a_rerun() {
     let new = replacement(0x02, 0x03);
     let run = ended_on(Some(anyhow::Error::new(new)), true);
-    assert_eq!(pass_replacement(&run, None, Some(new)), (None, Some(new)));
+    assert_eq!(
+        pass_replacement(&run, Some(new)),
+        PassReplacement::ReportOnly(new)
+    );
+    assert_eq!(
+        pass_replacement(&ended_on(None, false), None),
+        PassReplacement::None
+    );
 }
 
-/// #2517: every group the pull never settled counts its entries as not run,
-/// and a group that settled keeps its outcomes.
+/// #2517: a group the pull never settled counts each of its entries as not
+/// run, so the counts add up to the entry count.
 #[test]
 fn a_group_that_never_settled_is_not_run() {
-    let mut groups = vec![
+    let groups = [
         SettledGroup {
             outcomes: vec![EntryOutcome::Fetched(5)],
             ..SettledGroup::default()
         },
-        SettledGroup::default(),
+        SettledGroup::not_run(2),
     ];
-    fill_not_run(&mut groups, &[1, 2]);
     let outcomes: Vec<_> = groups.into_iter().flat_map(|g| g.outcomes).collect();
     assert_matches!(
         outcomes.as_slice(),

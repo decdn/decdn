@@ -600,7 +600,7 @@ struct PullReport {
     /// Entries the filter or `--select` dropped.
     excluded: u64,
     failed: u64,
-    /// Entries the pull ended before it ran.
+    /// Entries the pull ended before their fetch ended.
     not_run: u64,
     downloaded: u64,
     /// Wire bytes this run's vouchers and hash-chain reveals paid for, over
@@ -759,7 +759,7 @@ async fn pull_over(
 
     let observer = Arc::new(PullObserver::new(args.json, run_label(out)));
     // Outlives the puller's passes, so an `openPool` or `topUp` that a Ctrl-C
-    // or a fault dropped before its receipt was read is still named, and so is
+    // or a fault dropped before its record committed is still named, and so is
     // one that escrowed untracked in an entry the pull dropped.
     let escrows = UnconfirmedEscrows::default();
     let mut puller = BundlePuller::builder(
@@ -800,7 +800,7 @@ async fn pull_over(
     )
     .await;
     // Every exit of the manifest or the pull can drop an `openPool` or a
-    // `topUp` before its receipt is read, and the transaction may still escrow,
+    // `topUp` before its record commits, and the transaction may still escrow,
     // or leave an untracked escrow on the handle that no returned error names.
     let result = name_held_escrows(result, &escrows);
     // On every exit, a Ctrl-C's included: what the entries queued is durable

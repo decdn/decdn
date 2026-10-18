@@ -44,6 +44,21 @@ pub struct ScriptedRpc {
     block: Option<u64>,
     calls: Arc<Mutex<VecDeque<Bytes>>>,
     sent_nonces: Arc<Mutex<Vec<u64>>>,
+    after_calls: AfterCalls,
+}
+
+/// What runs once a [`ScriptedRpc`] hands out its last scripted `eth_call`
+/// answer ([`ScriptedRpc::after_calls`]).
+#[derive(Clone, Default)]
+struct AfterCalls(Arc<Mutex<Option<Hook>>>);
+
+/// A one-shot callback of a [`ScriptedRpc`].
+type Hook = Box<dyn FnOnce() + Send>;
+
+impl std::fmt::Debug for AfterCalls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AfterCalls")
+    }
 }
 
 impl ScriptedRpc {
@@ -58,6 +73,7 @@ impl ScriptedRpc {
             block: None,
             calls: Arc::default(),
             sent_nonces: Arc::default(),
+            after_calls: AfterCalls::default(),
         }
     }
 
@@ -120,6 +136,18 @@ impl ScriptedRpc {
         }
     }
 
+    /// Run `hook` once, as this transport hands out its last scripted
+    /// `eth_call` answer: a state change between that read and the caller's
+    /// next step, which an always-ready transport gives no other task the
+    /// chance to make.
+    #[must_use]
+    pub fn after_calls(self, hook: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            after_calls: AfterCalls(Arc::new(Mutex::new(Some(Box::new(hook))))),
+            ..self
+        }
+    }
+
     /// Whether every scripted `eth_call` answer was read.
     #[must_use]
     pub fn calls_drained(&self) -> bool {
@@ -151,12 +179,25 @@ impl ScriptedRpc {
         }
     }
 
-    /// The next scripted `eth_call` answer, if any is left.
+    /// The next scripted `eth_call` answer, if any is left. Handing out the
+    /// last one runs the [`Self::after_calls`] hook.
     fn next_call(&self) -> Option<Bytes> {
-        self.calls
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
+        let (answer, drained) = {
+            let mut calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
+            (calls.pop_front(), calls.is_empty())
+        };
+        if answer.is_some() && drained {
+            let hook = self
+                .after_calls
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        answer
     }
 }
 

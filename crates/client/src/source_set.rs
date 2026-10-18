@@ -130,10 +130,10 @@ pub trait SourceProvider: Send + Sync {
     /// Build the paid lane to `holder`. An error here is chain-side: the set
     /// retries it later and never blames the holder.
     ///
-    /// `ended` fires once the fetch the build serves has ended. A build sends
-    /// no `openPool` or `topUp` after it fires: the lane would never run. A
-    /// build already past its send runs to its end, so its receipt is read
-    /// and its escrow recorded.
+    /// `ended` fires once the fetch the build serves has ended: the lane
+    /// would never run. A build that reaches its `openPool` or `topUp` after
+    /// it fires sends none. One already inside the call (its nonce read, its
+    /// submit) or past it runs to its receipt.
     fn connect<'a>(
         &'a self,
         holder: &'a Holder,

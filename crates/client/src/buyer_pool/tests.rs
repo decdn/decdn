@@ -535,6 +535,32 @@ async fn a_failed_record_holds_the_escrow_untracked() {
     assert_eq!(held, [SCRIPTED_TX]);
 }
 
+/// An error that names no escrow the handle can hold leaves the transaction
+/// pending: releasing it would leave the tx named nowhere.
+#[tokio::test(start_paused = true)]
+async fn an_unheld_record_error_keeps_the_escrow_pending() {
+    let pool = Address::repeat_byte(0x01);
+    let receipt = top_up_receipt(
+        vec![topped_up_log(pool, B256::repeat_byte(0x33), 1_000)],
+        true,
+    );
+    let escrows = UnconfirmedEscrows::default();
+    let (_, unrecorded) = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        top_up_tracked(ScriptedRpc::mined(receipt), &escrows),
+    )
+    .await
+    .expect("the receipt is answered")
+    .unwrap();
+    let _ = unrecorded.untracked(anyhow::anyhow!("disk full"));
+    let held = TopUpUnconfirmed {
+        tx: Some(SCRIPTED_TX),
+        nonce: SCRIPTED_NONCE,
+    };
+    assert_eq!(escrows.top_ups(), vec![held]);
+    assert_eq!(escrows.untracked(), vec![]);
+}
+
 /// #2515: a mined `openPool` whose receipt holds no `PoolOpened` event
 /// escrowed a deposit no record can name. `open_pool` holds it untracked on
 /// the handle before it releases the pending entry, so the handle names it

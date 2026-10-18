@@ -209,7 +209,7 @@ impl RunFunding {
     }
 
     /// The handle that holds the run's `openPool` and `topUp` transactions
-    /// whose receipt was not read ([`UnconfirmedEscrows::pending`]), and those
+    /// that no local record credits yet ([`UnconfirmedEscrows::pending`]), and those
     /// that escrowed with no local record crediting them
     /// ([`UnconfirmedEscrows::untracked`]).
     pub const fn escrows(&self) -> &UnconfirmedEscrows {
@@ -1191,13 +1191,17 @@ fn escrow_held(err: &anyhow::Error) -> bool {
 /// [`RefusedAfterUntracked`]. Both refusals read the handle, so a later pass
 /// on the same handle refuses the same way. A lane build's call refuses with
 /// [`FetchEnded`] once `ended` fires, checked before the allowance leg and
-/// again before the `topUp` leg; a call past its `topUp` send runs to its
-/// receipt.
+/// again before the `topUp` leg; a call already in its `topUp` leg runs to
+/// its receipt.
+///
+/// Returns the [`ToppedUpPool`] with the [`UnrecordedEscrow`] the caller
+/// resolves once its credit commits or fails.
 ///
 /// # Errors
 ///
-/// The run's handle holds an unconfirmed `topUp` or an untracked escrow, or
-/// the allowance or `topUp` leg fails.
+/// The run's handle holds an unconfirmed `topUp` or an untracked escrow,
+/// `ended` fired before the `topUp` was sent ([`FetchEnded`]), or the
+/// allowance or `topUp` leg fails.
 #[allow(clippy::too_many_arguments)]
 async fn escrow_top_up<P>(
     funding: &RunFunding,

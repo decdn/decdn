@@ -2380,6 +2380,69 @@ async fn a_fresh_open_after_the_fetch_ended_sends_nothing() {
     assert!(store.get_by_owner(signer.address()).unwrap().is_none());
 }
 
+/// #2513: a refill whose fetch ends during its allowance leg sends no `topUp`
+/// after it: the check after that leg refuses it, with no wallet read and no
+/// shortfall.
+#[tokio::test(start_paused = true)]
+async fn a_refill_that_ends_during_its_allowance_leg_sends_no_top_up() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store, &signer);
+    let funding = RunFunding::default();
+    let ended = CancellationToken::new();
+    // The fetch ends as the refill reads its allowance, which is none, so
+    // the refill approves first and the `approve` mines.
+    let rpc = ScriptedRpc::mined(mined_top_up())
+        .answering_calls([
+            still_open(signer.address()),
+            Bytes::from(U256::ZERO.abi_encode()),
+        ])
+        .after_calls({
+            let ended = ended.clone();
+            move || ended.cancel()
+        });
+    let err = run_scripted(&store, &signer, &rpc, &funding, &ended)
+        .await
+        .expect_err("the topUp is refused");
+    ended_before_send(&err);
+    assert!(rpc.calls_drained(), "the refill read its allowance");
+    assert!(rpc.sent_nonces().is_empty(), "no topUp was sent");
+    assert!(funding.shortfall().is_none(), "no wallet read explains it");
+    assert!(funding.escrows().pending().is_empty());
+}
+
+/// #2513: a lane build whose fetch ends during its open's allowance leg
+/// opens no pool.
+#[tokio::test(start_paused = true)]
+async fn an_open_that_ends_during_its_allowance_leg_sends_nothing() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let funding = RunFunding::default();
+    let ended = CancellationToken::new();
+    let rpc = ScriptedRpc::mined(mined_open(signer.address(), B256::repeat_byte(0xEE)))
+        .answering_calls([
+            Bytes::from(TOKEN.abi_encode()),
+            Bytes::from(U256::MAX.abi_encode()),
+        ])
+        .after_calls({
+            let ended = ended.clone();
+            move || ended.cancel()
+        });
+    let err = run_scripted(&store, &signer, &rpc, &funding, &ended)
+        .await
+        .expect_err("the open is refused");
+    ended_before_send(&err);
+    assert!(rpc.calls_drained(), "the open read its allowance");
+    assert!(rpc.sent_nonces().is_empty(), "no openPool was sent");
+    assert!(store.get_by_owner(signer.address()).unwrap().is_none());
+}
+
 /// #2513: a refill already past its `topUp` send when the fetch ends runs to
 /// its receipt: the end refuses a send, never a receipt read. Here the
 /// `topUp` never mines, so the build lapses with it held.
@@ -2645,6 +2708,7 @@ async fn a_credited_row_that_vanishes_holds_the_escrow() {
         &run_until_err(&store, &signer, &rpc, &funding).await,
         "the credited row vanished",
     );
+    assert!(funding.escrows().pending().is_empty(), "held, not pending");
     refused_after_untracked(
         &funding
             .refuse_after_untracked()
@@ -2680,6 +2744,7 @@ async fn an_open_after_an_unrecorded_open_is_refused() {
         1,
         "the first build sent its openPool"
     );
+    assert!(funding.escrows().pending().is_empty(), "held, not pending");
 
     let rpc = ScriptedRpc::mined(mined_open(signer.address(), B256::repeat_byte(0xEF)))
         .answering_calls([Bytes::from(TOKEN.abi_encode())]);
