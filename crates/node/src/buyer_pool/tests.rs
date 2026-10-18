@@ -3082,8 +3082,10 @@ async fn a_full_closing_pool_is_replaced() {
     assert!(asserter.read_q().is_empty(), "the estimate ran");
 }
 
-/// A sweep `reclaim` whose receipt cannot be read may still mine, so the
-/// warning names its tx hash and the failure is metered (#2413).
+/// A sweep `reclaim` whose receipt read errors may still mine, so the
+/// warning names its tx hash and the failure is metered (#2413). The receipt
+/// read that never answers is covered by
+/// [`a_sweep_reclaim_that_never_mines_lapses_and_keeps_the_row`].
 #[tokio::test]
 async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()> {
     use alloy::providers::ProviderBuilder;
@@ -3144,6 +3146,73 @@ async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()>
             .lines()
             .any(|l| l == "decdn_buyer_reclaim_failures_total 1"),
         "{exported}"
+    );
+    // The reclaim may still mine, so the row stays for the next sweep.
+    assert!(store.get_by_owner(owner)?.is_some(), "the row survives");
+    Ok(())
+}
+
+/// A sweep `reclaim` whose receipt never arrives lapses at [`RECEIPT_TIMEOUT`]:
+/// the sweep returns, warns with the tx hash, meters the failure, and keeps the
+/// row for the next sweep. Without the bound one dropped `reclaim` stalls the
+/// hourly sweep (#2495).
+#[tokio::test(start_paused = true)]
+async fn a_sweep_reclaim_that_never_mines_lapses_and_keeps_the_row() -> anyhow::Result<()> {
+    use alloy::sol_types::SolValue;
+    use decdn_incentive::test_rpc::{SCRIPTED_TX, ScriptedRpc};
+
+    let owner = Address::repeat_byte(1);
+    let pool_id = PoolId::from([0xAA; 32]);
+    let store = store_tracking(owner, pool_id);
+
+    // `getPool` reads a `Closing` pool whose dispute deadline (1) is behind the
+    // scripted chain head (2), so the sweep sends the `reclaim`; its receipt
+    // read then never answers.
+    let mut closing = onchain_pool(owner, PaymentPool::Status::Closing, 10_000_000);
+    closing.disputeDeadline = 1;
+    let rpc = ScriptedRpc::parked_receipt()
+        .answering_calls([closing.abi_encode().into()])
+        .at_head(2);
+    let svc = mocked_service_on(
+        PaymentPool::new(DEPLOYMENT.payment_pool, rpc.provider()),
+        Arc::clone(&store),
+        signer(),
+        owner,
+    );
+
+    let log = CapturedLog::default();
+    let sink = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    let started = tokio::time::Instant::now();
+    {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tokio::time::timeout(RECEIPT_TIMEOUT * 2, svc.sweep_reclaimable_once())
+            .await
+            .expect("the sweep must return when the receipt wait lapses");
+    }
+    let waited = started.elapsed();
+    assert!(
+        waited >= RECEIPT_TIMEOUT,
+        "the sweep waits out the receipt bound, returned after {waited:?}"
+    );
+
+    let text = String::from_utf8(
+        log.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    )?;
+    assert!(text.contains("reclaim receipt not read"), "{text}");
+    assert!(text.contains(&format!("{SCRIPTED_TX:#x}")), "{text}");
+    // The bound lapsed; the read did not error.
+    assert!(text.contains("no receipt within"), "{text}");
+    assert_eq!(
+        counter(&svc.metrics, "decdn_buyer_reclaim_failures_total"),
+        1
     );
     // The reclaim may still mine, so the row stays for the next sweep.
     assert!(store.get_by_owner(owner)?.is_some(), "the row survives");
