@@ -1108,12 +1108,35 @@ since project inception and will roll into the first tagged release.
   one, so nothing refused it. A failed record after a mined `openPool` could
   let the next build open a second pool the same way. Now a run that holds an
   untracked `topUp` or `openPool` refuses every later `topUp` and `openPool`
-  of that run before its allowance read or send, from a lane build or a
+  of that command, across passes, before its allowance read or send, from a lane build or a
   funding recovery step. The refusal names the held escrow and ends the
   command. It is not reported as a second escrow. An `openPool` that mined
   with no `PoolOpened` event for the owner also fails as escrowed and
   untracked (`EscrowUntracked`), not as a plain error: the acquire loop
   retried that lane build, and the retry opened a second pool.
+- **Client, CLI: every end of a command names its untracked escrows (#2511).**
+  The hold on a run's untracked `topUp` or `openPool` lived in the run's
+  per-pass state, and no end of the command read it. A Ctrl-C during the 30 s
+  drain of late lane builds dropped the fetch, and `decdn get` printed
+  "interrupted; run the same command again to resume": the receipt read had
+  already cleared the tx from the pending-escrow handle, and a re-run read the
+  uncredited row and escrowed again. A bundle pull whose entry with the escrow
+  was dropped could give up with exit 75 the same way. The hold also kept
+  only the first such escrow, so a second one in a dropped entry was named
+  nowhere. Now the command's `UnconfirmedEscrows` handle holds every
+  untracked escrow (`UnconfirmedEscrows::untracked`, a new `UntrackedEscrow`
+  with the tx; `EscrowUntracked::tx` reads it from the error). The hold
+  outlives a dropped fetch, a dropped bundle entry and a pass, and every
+  later pass on the handle refuses to escrow. `decdn get`, for a blob or a
+  bundle, names each one on every end that does not already name its tx: a
+  Ctrl-C says `interrupted: <escrow>` and still exits 130, a give-up exits 1,
+  not 75, and a success exits 1. A second Ctrl-C names them too. `decdn pool
+  open` and `decdn pool top-up` hold none: their own error names the tx. A
+  `BundlePuller` pull that is not interrupted ends `BundleEnd::Stopped` while
+  its handle holds one, with the escrow as its error and the pull's own stop
+  as text, so a give-up, a pool replacement or "funding needed" cannot invite
+  a rerun. An interrupted pull stays `Interrupted`, and its caller names what
+  the handle holds through the new `BundlePuller::unconfirmed_escrows`.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

@@ -534,6 +534,11 @@ pub enum BundleEnd {
     /// ([`BundleReport::failures`]); a rerun retries them.
     Complete,
     /// The cancel token fired. What landed is recorded, and a rerun resumes.
+    /// The caller names what the puller's handle
+    /// ([`BundlePuller::unconfirmed_escrows`]) still holds: each pending
+    /// `openPool` and `topUp` ([`UnconfirmedEscrows::pending`]) and each
+    /// untracked escrow ([`UnconfirmedEscrows::untracked`]). A rerun before
+    /// those resolve escrows again.
     Interrupted,
     /// The pool cannot pay for the rest: the capability is spent, expired or
     /// revoked, or the delegated pool is unfunded. `error` is the whole
@@ -545,7 +550,10 @@ pub enum BundleEnd {
         error: anyhow::Error,
     },
     /// A fault only the user can fix ended the pull, or it gave up after
-    /// making no progress for its whole limit ([`crate::GaveUp`]).
+    /// making no progress for its whole limit ([`crate::GaveUp`]). A pull that
+    /// is not interrupted ends here while its handle holds an untracked escrow
+    /// ([`UnconfirmedEscrows::untracked`]), with an error that names each tx.
+    /// This includes every later pull on the same handle.
     Stopped(anyhow::Error),
 }
 
@@ -733,6 +741,15 @@ impl BundlePuller {
         self.ctx.funding.shortfall()
     }
 
+    /// The handle that holds each `openPool` and `topUp` of the puller whose
+    /// receipt was not read, and each that escrowed with no local record
+    /// crediting it: the one passed to
+    /// [`BundlePullerBuilder::unconfirmed_escrows`], or the puller's own.
+    #[must_use]
+    pub const fn unconfirmed_escrows(&self) -> &UnconfirmedEscrows {
+        self.ctx.funding.escrows()
+    }
+
     /// Wait for every queued peer-record and watermark write to land. Call it
     /// before the process exits, after a cancelled pull too, so the next run
     /// resumes each lane from what it paid.
@@ -802,7 +819,13 @@ impl BundlePullerBuilder {
     /// drop a receipt wait, and the transaction may still escrow, so the
     /// caller keeps a clone and names what is left when the pull ends. A
     /// `topUp` the handle holds also refuses every later `topUp` of the pull,
-    /// across passes. A private handle by default.
+    /// across passes. The handle also holds each `openPool` and `topUp` that
+    /// escrowed with no local record crediting it
+    /// ([`UnconfirmedEscrows::untracked`]). It refuses every later `openPool`
+    /// and `topUp`, ends every later pull on the handle
+    /// [`BundleEnd::Stopped`], and is the caller's to name on
+    /// [`BundleEnd::Interrupted`]. A private handle by default
+    /// ([`BundlePuller::unconfirmed_escrows`]).
     pub fn unconfirmed_escrows(mut self, escrows: UnconfirmedEscrows) -> Self {
         self.escrows = escrows;
         self

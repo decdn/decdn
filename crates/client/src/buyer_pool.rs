@@ -122,23 +122,40 @@ pub fn escrowed_but_untracked(
     tx: TxHash,
     cause: impl std::fmt::Display,
 ) -> anyhow::Error {
-    anyhow::Error::new(EscrowUntracked(format!(
-        "{effect} on-chain (tx {tx}) but the local record did not survive; the deposit is \
-         escrowed but untracked — reconcile against the tx before retrying, because a retry \
-         escrows again: {cause}"
-    )))
+    anyhow::Error::new(EscrowUntracked {
+        tx,
+        text: format!(
+            "{effect} on-chain (tx {tx}) but the local record did not survive; the deposit is \
+             escrowed but untracked — reconcile against the tx before retrying, because a retry \
+             escrows again: {cause}"
+        ),
+    })
 }
 
-/// The error [`escrowed_but_untracked`] builds: USDC moved on-chain and the
-/// local record does not account for it. A retry escrows again, so the acquire
+/// The error [`escrowed_but_untracked`] builds, or an [`UnconfirmedEscrows`]
+/// rebuilds from the escrow it holds: USDC moved on-chain and the local record
+/// does not account for it. A retry escrows again, so the acquire
 /// loop classifies it as fatal to the command ([`crate::Fault::Fatal`]) instead
 /// of retrying the lane build.
 #[derive(Debug)]
-pub struct EscrowUntracked(pub(crate) String);
+pub struct EscrowUntracked {
+    /// The `openPool` or `topUp` transaction that escrowed.
+    tx: TxHash,
+    /// What landed, the tx, and the local failure.
+    text: String,
+}
+
+impl EscrowUntracked {
+    /// The `openPool` or `topUp` transaction that escrowed.
+    #[must_use]
+    pub const fn tx(&self) -> TxHash {
+        self.tx
+    }
+}
 
 impl std::fmt::Display for EscrowUntracked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.text)
     }
 }
 
@@ -852,7 +869,7 @@ impl std::fmt::Display for EscrowUnconfirmed {
 }
 
 /// The `openPool` and `topUp` transactions a command submitted whose receipt
-/// it has not read.
+/// it has not read, and those that mined with no local record crediting them.
 ///
 /// [`open_pool`] and [`top_up`] add an entry before their submit and remove it
 /// once they read the receipt, or once a submit is rejected without a
@@ -861,16 +878,99 @@ impl std::fmt::Display for EscrowUnconfirmed {
 /// it, because the transaction may escrow after the command exits and a
 /// re-run before it confirms escrows again.
 ///
-/// A clone shares the same list, so one handle can outlive the per-pass state
+/// The handle also holds every `openPool` and `topUp` that a run on it
+/// ([`crate::funding::RunFunding`]) saw mine with no local record crediting it
+/// ([`UnconfirmedEscrows::untracked`]). Their receipts were read, so they are
+/// not pending, but a command that ends while the handle holds one names it
+/// too: a re-run reads the uncredited row and escrows again. [`open_pool`] and
+/// [`top_up`] alone hold none: their caller returns the error that names the
+/// escrow.
+///
+/// A clone shares the same lists, so one handle can outlive the per-pass state
 /// that the transactions run under.
 #[derive(Debug, Default, Clone)]
-pub struct UnconfirmedEscrows(Arc<Mutex<Vec<EscrowUnconfirmed>>>);
+pub struct UnconfirmedEscrows(Arc<Shared>);
+
+/// What every clone of one [`UnconfirmedEscrows`] shares.
+#[derive(Debug, Default)]
+struct Shared {
+    pending: Mutex<Vec<EscrowUnconfirmed>>,
+    /// Oldest first, one per tx. An entry is never removed.
+    untracked: Mutex<Vec<UntrackedEscrow>>,
+}
+
+/// An `openPool` or `topUp` that mined and escrowed USDC that no local record
+/// credits ([`EscrowUntracked`]), as an [`UnconfirmedEscrows`] holds it for
+/// its command to name when it ends. Displays its error chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UntrackedEscrow {
+    /// The transaction that escrowed.
+    pub tx: TxHash,
+    /// The sanitized error chain that reported it, which names the tx.
+    pub text: String,
+}
+
+impl std::fmt::Display for UntrackedEscrow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl UntrackedEscrow {
+    /// The held escrow as the error that reported it ([`EscrowUntracked`]).
+    pub(crate) fn into_error(self) -> anyhow::Error {
+        anyhow::Error::new(EscrowUntracked {
+            tx: self.tx,
+            text: self.text,
+        })
+    }
+}
 
 impl UnconfirmedEscrows {
+    /// The `openPool` and `topUp` transactions that escrowed USDC no local
+    /// record credits, oldest first.
+    #[must_use]
+    pub fn untracked(&self) -> Vec<UntrackedEscrow> {
+        self.0
+            .untracked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Hold `err` when it is an untracked escrow ([`EscrowUntracked`]) whose
+    /// tx the handle does not hold yet.
+    pub(crate) fn hold_untracked(&self, err: &anyhow::Error) {
+        let Some(escrow) = err.downcast_ref::<EscrowUntracked>() else {
+            return;
+        };
+        let mut held = self
+            .0
+            .untracked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !held.iter().any(|known| known.tx == escrow.tx) {
+            held.push(UntrackedEscrow {
+                tx: escrow.tx,
+                text: decdn_common::redact::sanitize_err_chain(err),
+            });
+        }
+    }
+
+    /// Hold `err` as a run on the handle holds it when it is an untracked
+    /// escrow, for a test that builds the error with
+    /// [`escrowed_but_untracked`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn hold_untracked_for_test(&self, err: &anyhow::Error) {
+        self.hold_untracked(err);
+    }
+
     /// The transactions whose receipt was not read, oldest first.
     #[must_use]
     pub fn pending(&self) -> Vec<EscrowUnconfirmed> {
         self.0
+            .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -903,6 +1003,7 @@ impl UnconfirmedEscrows {
     /// Hold `escrow` from its submit.
     fn insert(&self, escrow: impl Into<EscrowUnconfirmed>) {
         self.0
+            .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(escrow.into());
@@ -913,7 +1014,11 @@ impl UnconfirmedEscrows {
     /// their own.
     fn remove(&self, escrow: impl Into<EscrowUnconfirmed>) {
         let escrow = escrow.into();
-        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self
+            .0
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(at) = held.iter().position(|entry| *entry == escrow) {
             held.remove(at);
         }
@@ -928,7 +1033,11 @@ impl UnconfirmedEscrows {
         broadcast: impl Into<EscrowUnconfirmed>,
     ) {
         let (submitted, broadcast) = (submitted.into(), broadcast.into());
-        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self
+            .0
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         match held.iter_mut().find(|entry| **entry == submitted) {
             Some(entry) => *entry = broadcast,
             None => held.push(broadcast),

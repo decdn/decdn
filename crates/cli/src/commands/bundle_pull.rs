@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use super::buyer_store::open_client_store_for_buy;
 use super::fetch;
 use super::get::Destination;
-use super::interrupt::{Interrupt, Interrupted, name_unconfirmed_escrows};
+use super::interrupt::{Interrupt, Interrupted, name_held_escrows};
 use super::manifest::build_glob_set;
 use super::pull_progress::{self, PullProgress};
 
@@ -755,7 +755,8 @@ async fn pull_over(
 
     let observer = Arc::new(PullObserver::new(args.json, run_label(out)));
     // Outlives the puller's passes, so an `openPool` or `topUp` that a Ctrl-C
-    // or a fault dropped before its receipt was read is still named.
+    // or a fault dropped before its receipt was read is still named, and so is
+    // one that escrowed untracked in an entry the pull dropped.
     let escrows = UnconfirmedEscrows::default();
     let mut puller = BundlePuller::builder(
         chain.config.clone(),
@@ -795,8 +796,9 @@ async fn pull_over(
     )
     .await;
     // Every exit of the manifest or the pull can drop an `openPool` or a
-    // `topUp` before its receipt is read, and the transaction may still escrow.
-    let result = name_unconfirmed_escrows(result, &escrows.pending());
+    // `topUp` before its receipt is read, and the transaction may still escrow,
+    // or leave an untracked escrow on the handle that no returned error names.
+    let result = name_held_escrows(result, &escrows);
     // On every exit, a Ctrl-C's included: what the entries queued is durable
     // before the command returns.
     puller.finish().await;

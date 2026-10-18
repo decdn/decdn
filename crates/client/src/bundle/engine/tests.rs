@@ -175,6 +175,225 @@ fn a_give_up_ends_the_whole_pull() {
     assert!(!ends_the_pull(&anyhow!("stream reset")));
 }
 
+/// The untracked escrow a handle holds once a `topUp` with tx `byte`s mined
+/// and its credit failed.
+fn held_escrow(byte: u8) -> UntrackedEscrow {
+    let escrows = crate::buyer_pool::UnconfirmedEscrows::default();
+    escrows.hold_untracked(&crate::buyer_pool::escrowed_but_untracked(
+        "pool 0x01 topped up by 5 µUSDC",
+        alloy::primitives::TxHash::repeat_byte(byte),
+        "deposit credit lost",
+    ));
+    escrows.untracked().into_iter().next().unwrap()
+}
+
+fn give_up() -> anyhow::Error {
+    anyhow::Error::new(crate::GaveUp {
+        idle: std::time::Duration::from_secs(1),
+    })
+}
+
+fn funding_needed() -> anyhow::Error {
+    anyhow!("nodes refuse the funding").context(crate::FundingNeeded::PublisherPool {
+        pool: alloy::primitives::B256::repeat_byte(0x01),
+    })
+}
+
+/// The error a pull that is not interrupted ends with, or `None` for one
+/// that completed.
+fn end_error(end: BundleEnd) -> Option<anyhow::Error> {
+    match end {
+        BundleEnd::Complete => None,
+        BundleEnd::Stopped(error) | BundleEnd::FundingNeeded { error, .. } => Some(error),
+        BundleEnd::Interrupted => panic!("the pull ended interrupted"),
+    }
+}
+
+/// Assert `end` stopped on an untracked escrow that names each of `held`.
+fn stopped_on(end: BundleEnd, held: &[&UntrackedEscrow]) -> anyhow::Error {
+    let BundleEnd::Stopped(err) = end else {
+        panic!("the pull did not end Stopped: {end:?}");
+    };
+    assert!(
+        err.downcast_ref::<crate::buyer_pool::EscrowUntracked>()
+            .is_some(),
+        "{err:#}"
+    );
+    for escrow in held {
+        assert!(
+            format!("{err:#}").contains(&escrow.tx.to_string()),
+            "{err:#}"
+        );
+    }
+    err
+}
+
+/// A give-up while the puller's handle holds an untracked escrow ends
+/// `Stopped` on the escrow, with the give-up kept as text: a caller that
+/// reruns a give-up would escrow again (#2511).
+#[test]
+fn a_give_up_with_an_untracked_escrow_stops_on_the_escrow() {
+    let held = held_escrow(0xab);
+    let err = stopped_on(
+        pull_end(false, Some(give_up()), None, vec![held.clone()]),
+        &[&held],
+    );
+    assert!(err.downcast_ref::<crate::GaveUp>().is_none(), "{err:#}");
+    assert!(format!("{err:#}").contains("no progress"), "{err:#}");
+}
+
+/// A pull that completed while its handle holds an untracked escrow stops on
+/// it.
+#[test]
+fn a_complete_pull_with_an_untracked_escrow_stops() {
+    let held = held_escrow(0xab);
+    stopped_on(pull_end(false, None, None, vec![held.clone()]), &[&held]);
+}
+
+/// A "funding needed" stop while the handle holds an untracked escrow ends
+/// `Stopped`, not `FundingNeeded`: a caller that funds the pool and reruns
+/// would escrow again.
+#[test]
+fn funding_needed_with_an_untracked_escrow_stops_on_the_escrow() {
+    let held = held_escrow(0xab);
+    let err = stopped_on(
+        pull_end(false, Some(funding_needed()), None, vec![held.clone()]),
+        &[&held],
+    );
+    assert!(
+        err.downcast_ref::<crate::FundingNeeded>().is_none(),
+        "{err:#}"
+    );
+}
+
+/// A give-up whose text already names the escrow's tx still stops on the
+/// escrow: the text does not stop the caller from rerunning a give-up.
+#[test]
+fn a_give_up_that_names_the_escrow_still_stops_on_it() {
+    let held = held_escrow(0xab);
+    let named = give_up().context(format!("a late lane build: {held}"));
+    let err = stopped_on(
+        pull_end(false, Some(named), None, vec![held.clone()]),
+        &[&held],
+    );
+    assert!(err.downcast_ref::<crate::GaveUp>().is_none(), "{err:#}");
+}
+
+/// A stop that already names the escrow's tx, and does not invite a rerun,
+/// is kept as it is.
+#[test]
+fn a_stop_that_names_the_escrow_is_kept() {
+    let held = held_escrow(0xab);
+    let named = anyhow!("building the payment lane failed: {held}");
+    let err = end_error(pull_end(false, Some(named), None, vec![held.clone()])).unwrap();
+    assert_eq!(
+        format!("{err:#}"),
+        format!("building the payment lane failed: {held}")
+    );
+}
+
+/// Every untracked escrow the handle holds is named, the oldest as the root.
+/// A pull that completed is not said to have stopped.
+#[test]
+fn every_untracked_escrow_is_named() {
+    let (first, second) = (held_escrow(0xab), held_escrow(0xcd));
+    let both = || vec![first.clone(), second.clone()];
+    let err = stopped_on(
+        pull_end(false, Some(give_up()), None, both()),
+        &[&first, &second],
+    );
+    assert!(format!("{err:#}").contains("no progress"), "{err:#}");
+
+    let err = stopped_on(pull_end(false, None, None, both()), &[&first, &second]);
+    let root = err
+        .downcast_ref::<crate::buyer_pool::EscrowUntracked>()
+        .unwrap();
+    assert_eq!(root.tx(), first.tx);
+    assert!(!format!("{err:#}").contains("the pull stopped"), "{err:#}");
+}
+
+/// A "funding needed" or pool-replaced stop whose text names the escrow's tx
+/// still stops on the escrow: a caller that funds the pool, or runs the next
+/// pass, would escrow again.
+#[test]
+fn a_funding_stop_that_names_the_escrow_still_stops_on_it() {
+    let held = held_escrow(0xab);
+    let named = funding_needed().context(format!("a late lane build: {held}"));
+    let err = stopped_on(
+        pull_end(false, Some(named), None, vec![held.clone()]),
+        &[&held],
+    );
+    assert!(
+        err.downcast_ref::<crate::FundingNeeded>().is_none(),
+        "{err:#}"
+    );
+
+    let replaced = PoolReplaced {
+        closed: alloy::primitives::B256::repeat_byte(0x02),
+        opened: alloy::primitives::B256::repeat_byte(0x03),
+    };
+    let named = anyhow::Error::new(replaced).context(format!("a late lane build: {held}"));
+    let err = stopped_on(
+        pull_end(false, Some(named), None, vec![held.clone()]),
+        &[&held],
+    );
+    assert!(err.downcast_ref::<PoolReplaced>().is_none(), "{err:#}");
+}
+
+/// An interrupted pull ends `Interrupted` whatever the handle holds: its
+/// caller names the hold.
+#[test]
+fn an_interrupted_pull_stays_interrupted() {
+    let end = pull_end(true, None, None, vec![held_escrow(0xab)]);
+    assert_matches!(end, BundleEnd::Interrupted);
+}
+
+/// With no untracked escrow, each end keeps its own type.
+#[test]
+fn a_pull_with_no_untracked_escrow_ends_as_it_stopped() {
+    assert_matches!(pull_end(false, None, None, Vec::new()), BundleEnd::Complete);
+    let err = end_error(pull_end(false, Some(give_up()), None, Vec::new())).unwrap();
+    assert!(err.downcast_ref::<crate::GaveUp>().is_some());
+    assert_matches!(
+        pull_end(false, Some(funding_needed()), None, Vec::new()),
+        BundleEnd::FundingNeeded { .. }
+    );
+}
+
+/// A second replacement in one run ends the pull "funding needed" and asks
+/// for a rerun, unless the handle holds an untracked escrow: then the pull
+/// stops on the escrow, and asks for no rerun.
+#[test]
+fn a_second_replacement_asks_for_a_rerun_only_with_no_untracked_escrow() {
+    let replaced = PoolReplaced {
+        closed: alloy::primitives::B256::repeat_byte(0x02),
+        opened: alloy::primitives::B256::repeat_byte(0x03),
+    };
+    let err = end_error(pull_end(
+        false,
+        Some(anyhow::Error::new(replaced)),
+        Some(replaced),
+        Vec::new(),
+    ))
+    .unwrap();
+    assert!(format!("{err:#}").contains("run the pull again"), "{err:#}");
+
+    let held = held_escrow(0xab);
+    let err = stopped_on(
+        pull_end(
+            false,
+            Some(anyhow::Error::new(replaced)),
+            Some(replaced),
+            vec![held.clone()],
+        ),
+        &[&held],
+    );
+    assert!(
+        !format!("{err:#}").contains("run the pull again"),
+        "{err:#}"
+    );
+}
+
 /// A command-wide fault stops the pull: no group after it starts, and the
 /// fault is what the pull ends with.
 #[tokio::test]

@@ -6,7 +6,7 @@
 //! The run's funding facts ([`RunFunding`]) are shared by every lane build and
 //! funding recovery step: the pool's spend outside the run's lanes, the pool
 //! the run pays from, a wallet too short of USDC to top it up, and the handle
-//! that holds the run's unconfirmed `openPool`s and `topUp`s
+//! that holds the command's unconfirmed and untracked `openPool`s and `topUp`s
 //! ([`UnconfirmedEscrows`]).
 
 use std::collections::HashMap;
@@ -23,10 +23,9 @@ use decdn_incentive::{CapabilityGrant, Deployment, LaneKey, PoolId, bind_node_id
 use iroh::Endpoint;
 
 use crate::buyer_pool::{
-    EscrowUntracked, LOW_WATER_DIVISOR, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool,
-    UnconfirmedEscrows, WalletShortfall, ensure_allowance, escrowed_but_untracked,
-    grade_deposit_credit, open_pool, pool_accepts_funds, refill_amount, self_owned_lane_ctx,
-    top_up, topped_up_effect,
+    LOW_WATER_DIVISOR, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool, UnconfirmedEscrows,
+    WalletShortfall, ensure_allowance, escrowed_but_untracked, grade_deposit_credit, open_pool,
+    pool_accepts_funds, refill_amount, self_owned_lane_ctx, top_up, topped_up_effect,
 };
 use crate::lanes::LaneDeps;
 use crate::session::{ChainAdoption, ChainConfig, DepositPolicy};
@@ -87,49 +86,51 @@ pub fn cached_pool_token(
 /// broadcast but is not known to have mined ([`TopUpUnconfirmed`]), every later
 /// `topUp` sent through the same handle is refused with it: in this run, or in
 /// a later pass or fetch that shares the handle. Once an `openPool` or `topUp`
-/// of the run mines and its local record fails ([`EscrowUntracked`]), the run
-/// holds that escrow: every later `openPool` or `topUp` of the run is refused,
-/// fatally, before its allowance read or send. A sibling lane build still in
-/// flight reads a row that does not credit the escrow, and would escrow
-/// again. The hold is this `RunFunding`'s, not the handle's: an untracked
-/// escrow is fatal to the command, which then runs no later pass.
+/// of the run mines and its local record fails
+/// ([`EscrowUntracked`](crate::buyer_pool::EscrowUntracked)), the handle holds
+/// that escrow ([`UnconfirmedEscrows::untracked`]): every later `openPool` or
+/// `topUp` of a run on the same handle is refused, fatally, before its
+/// allowance read or send. A sibling lane build still in flight reads a row
+/// that does not credit the escrow, and would escrow again. The hold lives on
+/// the handle, so it outlives a dropped fetch, a dropped bundle entry and a
+/// pass. A caller that keeps a clone of the handle names it when the command
+/// ends.
 #[derive(Debug, Default)]
 pub struct RunFunding {
     spend: Mutex<RunSpend>,
     shortfall: Mutex<Option<String>>,
-    /// The sanitized error chain of the run's first `openPool` or `topUp`
-    /// that mined with no local record crediting it ([`EscrowUntracked`]).
-    /// Set once, and never cleared.
-    untracked: OnceLock<String>,
     pool_id: OnceLock<PoolId>,
     escrows: UnconfirmedEscrows,
     /// Held across each `topUp` of the run, from its refusal checks (an
-    /// unconfirmed `topUp` in `escrows`, an untracked escrow) to the `topUp`'s
+    /// unconfirmed `topUp` or an untracked escrow in `escrows`) to the `topUp`'s
     /// outcome, so the checks and the send they allow are one step within this
     /// run. A handle shared with another live
     /// `RunFunding` is not serialized by it.
     top_up_serial: tokio::sync::Mutex<()>,
 }
 
-/// The refusal of an `openPool` or `topUp` in a run that already escrowed USDC
-/// no local record credits ([`EscrowUntracked`]). The refused call escrows
-/// nothing, so it is not itself an untracked escrow. The acquire loop
-/// classifies it as fatal to the command ([`crate::Fault::Fatal`]): the run
-/// cannot fund a lane without escrowing again.
+/// The refusal of an `openPool` or `topUp` once the run's handle holds an
+/// escrow no local record credits
+/// ([`EscrowUntracked`](crate::buyer_pool::EscrowUntracked)), from this run or
+/// an earlier one on the handle. It holds the text of each held escrow. The
+/// refused call escrows nothing, so it is not itself an untracked escrow. The
+/// acquire loop classifies it as fatal to the command
+/// ([`crate::Fault::Fatal`]): the run cannot fund a lane without escrowing
+/// again.
 #[derive(Debug)]
-pub(crate) struct UntrackedEscrowHeld(String);
+pub(crate) struct RefusedAfterUntracked(String);
 
-impl std::fmt::Display for UntrackedEscrowHeld {
+impl std::fmt::Display for RefusedAfterUntracked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "refusing an openPool or topUp: an earlier escrow of this run is untracked: {}",
+            "refusing an openPool or topUp: an earlier escrow of this command is untracked: {}",
             self.0
         )
     }
 }
 
-impl std::error::Error for UntrackedEscrowHeld {}
+impl std::error::Error for RefusedAfterUntracked {}
 
 /// What a lane build learned about the pool's spend, for
 /// [`RunFunding::join_lane`].
@@ -167,7 +168,9 @@ impl RunFunding {
     /// A run whose `openPool` and `topUp` transactions are held in `escrows`,
     /// a handle the caller keeps after the run's state is dropped. A caller
     /// that builds a `RunFunding` per pass passes the same handle to each, so
-    /// a `topUp` one pass left unconfirmed refuses the next pass's.
+    /// a `topUp` one pass left unconfirmed refuses the next pass's, and an
+    /// untracked escrow ([`UnconfirmedEscrows::untracked`]) refuses every later
+    /// `openPool` and `topUp`.
     #[must_use]
     pub fn reporting_escrows_to(escrows: UnconfirmedEscrows) -> Self {
         Self {
@@ -177,7 +180,9 @@ impl RunFunding {
     }
 
     /// The handle that holds the run's `openPool` and `topUp` transactions
-    /// whose receipt was not read ([`UnconfirmedEscrows::pending`]).
+    /// whose receipt was not read ([`UnconfirmedEscrows::pending`]), and those
+    /// that escrowed with no local record crediting them
+    /// ([`UnconfirmedEscrows::untracked`]).
     pub const fn escrows(&self) -> &UnconfirmedEscrows {
         &self.escrows
     }
@@ -236,8 +241,10 @@ impl RunFunding {
         }))
     }
 
-    /// Hold `err` as the run's untracked escrow when it is one
-    /// ([`EscrowUntracked`]) and the run holds none yet, and return it.
+    /// Hold `err` on the run's handle ([`UnconfirmedEscrows::untracked`]) when
+    /// it is an untracked escrow
+    /// ([`EscrowUntracked`](crate::buyer_pool::EscrowUntracked)). Return `err`
+    /// unchanged.
     ///
     /// Each call site notes the error with no `.await` after the record fails,
     /// and the run's lane builds and recovery steps share one task. So a call
@@ -245,27 +252,27 @@ impl RunFunding {
     /// after the failure sees the note. A `topUp` checks under `top_up_serial`,
     /// which an earlier `topUp` holds until its outcome, so it always sees that
     /// `topUp`'s note. An `openPool` that passed its check before another
-    /// call's escrow went untracked still sends.
+    /// call's escrow went untracked still sends. When it also goes untracked,
+    /// the handle holds both.
     pub(crate) fn note_untracked(&self, err: anyhow::Error) -> anyhow::Error {
-        if err.downcast_ref::<EscrowUntracked>().is_some() && self.untracked.get().is_none() {
-            let _ = self
-                .untracked
-                .set(decdn_common::redact::sanitize_err_chain(&err));
-        }
+        self.escrows.hold_untracked(&err);
         err
     }
 
-    /// Refuse an `openPool` or `topUp` once the run holds an untracked escrow
-    /// ([`RunFunding::note_untracked`]).
+    /// Refuse an `openPool` or `topUp` once the run's handle holds an
+    /// untracked escrow ([`RunFunding::note_untracked`]), from this run or an
+    /// earlier one on the same handle.
     ///
     /// # Errors
     ///
-    /// [`UntrackedEscrowHeld`], naming the held escrow.
+    /// [`RefusedAfterUntracked`], naming each held escrow.
     pub(crate) fn refuse_after_untracked(&self) -> anyhow::Result<()> {
-        match self.untracked.get() {
-            Some(held) => Err(anyhow::Error::new(UntrackedEscrowHeld(held.clone()))),
-            None => Ok(()),
+        let held = self.escrows.untracked();
+        if held.is_empty() {
+            return Ok(());
         }
+        let held: Vec<String> = held.into_iter().map(|escrow| escrow.text).collect();
+        Err(anyhow::Error::new(RefusedAfterUntracked(held.join("; "))))
     }
 
     /// The warning for a wallet seen to hold too little USDC for a top-up in
@@ -351,7 +358,7 @@ impl RunFunding {
 /// deposit through the same allowance → `topUp` → `add_deposit` path as the
 /// proactive low-water refill (`escrow_top_up`, then `add_deposit`). Once a
 /// `topUp` of the run is unconfirmed, the step sends none and fails with it,
-/// and once an escrow of the run is untracked, it sends no `topUp` or
+/// and once the run's handle holds an untracked escrow, it sends no `topUp` or
 /// `openPool`. A pool that is `Closing` or `Closed` reverts that `topUp` with
 /// `PoolNotOpen`; the owner
 /// then opens a new pool at the working deposit and records it as the current
@@ -573,8 +580,8 @@ where
     ///
     /// # Errors
     ///
-    /// An escrow of the run is untracked ([`UntrackedEscrowHeld`]: nothing
-    /// sent), the allowance or `openPool` fails (nothing escrowed), or the
+    /// The run's handle holds an untracked escrow ([`RefusedAfterUntracked`]:
+    /// nothing sent), the allowance or `openPool` fails (nothing escrowed), or the
     /// `openPool` mined but the pool it opened cannot be named or recorded
     /// (escrowed and untracked: fatal).
     async fn open_replacement(&self) -> anyhow::Result<PoolId> {
@@ -1112,11 +1119,11 @@ fn cannot_pay(state: &BuyerPoolState, shortfall: &str) -> anyhow::Error {
 
 /// Whether an [`escrow_top_up`] error is about an escrow the run holds: a
 /// `topUp` that may still mine ([`TopUpUnconfirmed`]), or a refusal after an
-/// untracked escrow ([`UntrackedEscrowHeld`]). Either is fatal as it is, and no
+/// untracked escrow ([`RefusedAfterUntracked`]). Either is fatal as it is, and no
 /// wallet balance explains it.
 fn escrow_held(err: &anyhow::Error) -> bool {
     err.downcast_ref::<TopUpUnconfirmed>().is_some()
-        || err.downcast_ref::<UntrackedEscrowHeld>().is_some()
+        || err.downcast_ref::<RefusedAfterUntracked>().is_some()
 }
 
 /// Top `pool_id` up by `additional` from `owner`: ensure the pool's standing
@@ -1134,14 +1141,15 @@ fn escrow_held(err: &anyhow::Error) -> bool {
 /// either) may still mine, so the run's [`UnconfirmedEscrows`] keeps it. Every
 /// later call through the same handle refuses with it instead of escrowing a
 /// second deposit, and the acquire loop classifies that as fatal to the
-/// command ([`crate::Fault::Fatal`]). A `funding` that holds an untracked
-/// escrow ([`RunFunding::note_untracked`]) refuses too, with
-/// [`UntrackedEscrowHeld`]. That hold is the `RunFunding`'s, not the handle's.
+/// command ([`crate::Fault::Fatal`]). A `funding` whose handle holds an
+/// untracked escrow ([`UnconfirmedEscrows::untracked`]) refuses too, with
+/// [`RefusedAfterUntracked`]. Both refusals read the handle, so a later pass
+/// on the same handle refuses the same way.
 ///
 /// # Errors
 ///
-/// The run holds an unconfirmed `topUp` or an untracked escrow, or the
-/// allowance or `topUp` leg fails.
+/// The run's handle holds an unconfirmed `topUp` or an untracked escrow, or
+/// the allowance or `topUp` leg fails.
 async fn escrow_top_up<P>(
     funding: &RunFunding,
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -1195,11 +1203,11 @@ where
 /// receipt the escrow has moved, so a credit that fails, or a re-read that
 /// finds the row gone ([`escrowed_but_untracked`]), is fatal: the acquire loop
 /// ends the command instead of retrying, because a retry escrows again. The
-/// run holds that escrow ([`RunFunding::note_untracked`]). A refill after an
-/// earlier `topUp` of the run went unconfirmed sends nothing and fails with
-/// that held [`TopUpUnconfirmed`] ([`escrow_top_up`]), and one after an
-/// untracked escrow of the run fails with [`UntrackedEscrowHeld`], each fatal
-/// the same way.
+/// run's handle holds that escrow ([`RunFunding::note_untracked`]). A refill
+/// after an earlier `topUp` on the handle went unconfirmed sends nothing and
+/// fails with that held [`TopUpUnconfirmed`] ([`escrow_top_up`]), and one
+/// after an untracked escrow on the handle fails with
+/// [`RefusedAfterUntracked`], each fatal the same way.
 #[allow(clippy::too_many_arguments)]
 async fn refill_if_low<P>(
     store: &dyn BuyerPoolStore,
@@ -1327,8 +1335,8 @@ where
 ///
 /// A chain read, allowance, `openPool` or `topUp` fails, the buyer store
 /// cannot record a pool the chain escrowed (fatal: the escrow is untracked),
-/// or an earlier escrow of the run is untracked, so no `openPool` or `topUp`
-/// is sent ([`UntrackedEscrowHeld`], fatal).
+/// or the run's handle holds an untracked escrow, so no `openPool` or `topUp`
+/// is sent ([`RefusedAfterUntracked`], fatal).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_or_reuse_pool<P>(
     store: &dyn BuyerPoolStore,

@@ -3,7 +3,7 @@ use alloy::primitives::{B256, Bytes};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 
 use crate::Cumulative;
-use crate::buyer_pool::OpenUnconfirmed;
+use crate::buyer_pool::{EscrowUntracked, OpenUnconfirmed};
 use alloy::providers::ProviderBuilder;
 use alloy::providers::mock::Asserter;
 use alloy::sol_types::SolValue;
@@ -2168,7 +2168,7 @@ impl BuyerPoolStore for StoreFaults {
 /// whose text names `held`.
 fn refused_after_untracked(err: &anyhow::Error, held: &str) {
     assert!(
-        err.downcast_ref::<UntrackedEscrowHeld>().is_some(),
+        err.downcast_ref::<RefusedAfterUntracked>().is_some(),
         "{err:#}"
     );
     assert!(
@@ -2242,6 +2242,45 @@ async fn a_top_up_after_an_untracked_refill_is_refused() {
     assert!(
         !rpc.calls_drained(),
         "the refusal makes no call past the pool read"
+    );
+    assert!(rpc.sent_nonces().is_empty(), "the refusal sends nothing");
+}
+
+/// The handle holds a run's untracked escrow after the run's state is
+/// dropped, so the command can name it at its end, and a later pass's
+/// `RunFunding` on the same handle refuses its refill (#2511).
+#[tokio::test(start_paused = true)]
+async fn an_untracked_escrow_outlives_its_run_on_the_handle() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = StoreFaults::new(client_store(&dir), StoreFault::Credit);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let pool_id = a_spent_pool(&store.inner, &signer);
+    let escrows = UnconfirmedEscrows::default();
+    let first = RunFunding::reporting_escrows_to(escrows.clone());
+    let rpc = ScriptedRpc::mined(mined_top_up()).answering_calls(refill_reads(signer.address()));
+    untracked(
+        &run_until_err(&store, &signer, &rpc, &first).await,
+        "deposit credit lost",
+    );
+    drop(first);
+
+    let held = escrows.untracked();
+    assert_eq!(held.len(), 1, "the handle holds the escrow: {held:?}");
+    let held = held.into_iter().next().unwrap();
+    assert_eq!(held.tx, mined_top_up().transaction_hash);
+    assert!(held.text.contains("deposit credit lost"), "{held}");
+    assert!(escrows.pending().is_empty(), "the topUp mined");
+
+    // The next pass's run on the same handle, which reuses the run's pool.
+    let next = RunFunding::reporting_escrows_to(escrows.clone());
+    next.note_pool(pool_id);
+    let rpc =
+        ScriptedRpc::mined(mined_top_up()).answering_calls([Bytes::from(U256::MAX.abi_encode())]);
+    refused_after_untracked(
+        &run_until_err(&store, &signer, &rpc, &next).await,
+        "deposit credit lost",
     );
     assert!(rpc.sent_nonces().is_empty(), "the refusal sends nothing");
 }

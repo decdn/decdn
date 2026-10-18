@@ -87,7 +87,7 @@ use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
     FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, manifest_cache, parse_hash,
 };
-use crate::buyer_pool::OwnedPayer;
+use crate::buyer_pool::{OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
 use crate::funding::RunFunding;
 use crate::lane_sources::LaneSources;
@@ -1027,6 +1027,86 @@ fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
         .copied()
 }
 
+/// How a pull that ended with `stopped` ends, once every pass ran.
+/// `replaced` is the pool replacement a pass made, and `untracked` the escrows
+/// the puller's handle holds with no local record crediting them
+/// ([`crate::buyer_pool::UnconfirmedEscrows::untracked`]).
+///
+/// An interrupted pull ends [`BundleEnd::Interrupted`], which carries no
+/// error: its caller names what the handle holds. Otherwise each untracked
+/// escrow that `stopped` does not already name is folded into it, the oldest
+/// as the error's root ([`crate::buyer_pool::EscrowUntracked`]). An entry
+/// dropped before it reported its escrow, or an earlier pull on the handle,
+/// leaves that escrow named nowhere else. The escrow wins over any outcome,
+/// as a late lane build's does for one fetch: a pull that completed stops,
+/// and the stop survives only as text, so a [`crate::GaveUp`], a
+/// [`PoolReplaced`] or a [`FundingNeeded`] cannot send the caller into a rerun
+/// that escrows again. A second replacement in one run ends the pull "funding
+/// needed".
+fn pull_end(
+    interrupted: bool,
+    stopped: Option<anyhow::Error>,
+    replaced: Option<PoolReplaced>,
+    untracked: Vec<UntrackedEscrow>,
+) -> BundleEnd {
+    if interrupted {
+        return BundleEnd::Interrupted;
+    }
+    // An error that invites a rerun never names an escrow: its text does not
+    // stop the caller from rerunning.
+    let named = stopped
+        .as_ref()
+        .filter(|err| !invites_rerun(err))
+        .map(|err| format!("{err:#}"));
+    let unnamed = untracked.into_iter().filter(|held| {
+        named
+            .as_ref()
+            .is_none_or(|named| !named.contains(&held.tx.to_string()))
+    });
+    // The oldest escrow is the root, and each later one is context on it.
+    let escrows = unnamed.fold(None, |escrows: Option<anyhow::Error>, held| {
+        Some(match escrows {
+            None => held.into_error(),
+            Some(err) => err.context(format!(
+                "another openPool or topUp of this command also escrowed USDC no record \
+                 credits: {held}"
+            )),
+        })
+    });
+    let stopped = match (stopped, escrows) {
+        (stopped, None) => stopped,
+        (None, Some(escrows)) => Some(escrows),
+        (Some(err), Some(escrows)) => Some(escrows.context(format!(
+            "the pull stopped ({}), and an openPool or topUp of this command escrowed USDC no \
+             record credits",
+            sanitize_err_chain(&err)
+        ))),
+    };
+    let stopped = stopped.map(|err| match (replaced, err.downcast_ref::<PoolReplaced>()) {
+        (Some(_), Some(_)) => err.context(
+            "funding needed: the pool this pull opened accepts no more funds either; run the \
+             pull again",
+        ),
+        _ => err,
+    });
+    match stopped {
+        None => BundleEnd::Complete,
+        Some(error) => match error.downcast_ref::<FundingNeeded>().copied() {
+            Some(needed) => BundleEnd::FundingNeeded { needed, error },
+            None => BundleEnd::Stopped(error),
+        },
+    }
+}
+
+/// Whether `err` tells its caller to rerun the pull, or to fund the pool and
+/// rerun it: a rerun escrows again while an untracked escrow is held, so such
+/// an error never stands for one, even when its text names the escrow's tx.
+fn invites_rerun(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::GaveUp>().is_some()
+        || err.downcast_ref::<PoolReplaced>().is_some()
+        || err.downcast_ref::<FundingNeeded>().is_some()
+}
+
 /// One run's result from its `first` pass, which a pool replacement ended,
 /// and its `second` pass against the new pool. Both passes walk the same
 /// entries in the same order, so an entry the first pass landed and the
@@ -1645,30 +1725,17 @@ impl<P: Provider + Clone> PullCtx<P> {
             interrupted,
             stopped,
         } = run;
-        // A second replacement in one run ends it "funding needed".
-        let stopped = stopped.map(|err| match (replaced, err.downcast_ref::<PoolReplaced>()) {
-            (Some(_), Some(_)) => err.context(
-                "funding needed: the pool this pull opened accepts no more funds either; run the \
-                 pull again",
-            ),
-            _ => err,
-        });
         warnings.extend(self.funding.shortfall());
         // Every entry has joined, so the shared dedup counters are now stable.
         let dedup = self.dedup_stats.take();
         let mut report = bundle_report(&outcomes, transfer, dedup, warnings);
         report.paid_bytes = u64::try_from(paid).unwrap_or(u64::MAX);
-        let end = if interrupted {
-            BundleEnd::Interrupted
-        } else {
-            match stopped {
-                None => BundleEnd::Complete,
-                Some(error) => match error.downcast_ref::<FundingNeeded>().copied() {
-                    Some(needed) => BundleEnd::FundingNeeded { needed, error },
-                    None => BundleEnd::Stopped(error),
-                },
-            }
-        };
+        let end = pull_end(
+            interrupted,
+            stopped,
+            replaced,
+            self.funding.escrows().untracked(),
+        );
         BundleOutcome {
             report,
             end,
