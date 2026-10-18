@@ -554,28 +554,52 @@ impl LookupState {
         // Seed from the local routing table. Take more than α so the
         // first round has alternates if the closest few don't answer.
         // The cooling snapshot comes from the same lock, so the seed and
-        // the skip list describe one table state.
+        // the skip list describe one table state. The seed is the nearest
+        // `seed_count` peers that are NOT cooling: the table is read past the
+        // seed count by the number of cooling peers, so cooling peers near the
+        // target cannot crowd a live peer out of the seed.
         let seed_count = cfg.alpha.get().saturating_mul(4);
         let now = Instant::now();
-        let (seed, cooling) = match routing_table.lock() {
-            Ok(mut t) => (
-                t.closest(target.as_bytes(), seed_count),
-                t.cooling_peers(now),
-            ),
+        let (seed, cooling, skipped) = match routing_table.lock() {
+            Ok(mut t) => Self::seed_from(&mut t, target, seed_count, now),
             Err(poisoned) => {
                 warn!("dht lookup: routing table mutex poisoned; recovering inner state");
-                let mut t = poisoned.into_inner();
-                (
-                    t.closest(target.as_bytes(), seed_count),
-                    t.cooling_peers(now),
-                )
+                Self::seed_from(&mut poisoned.into_inner(), target, seed_count, now)
             }
         };
         state.cooling = cooling;
+        state.cooling_skipped = skipped;
         for peer in seed {
             state.add_candidate(peer);
         }
         state
+    }
+
+    /// The nearest `seed_count` peers to `target` that are not cooling at
+    /// `now`, the cooling snapshot itself, and how many cooling peers the
+    /// seed passed over on its way to that count.
+    fn seed_from(
+        table: &mut RoutingTable,
+        target: &Hash,
+        seed_count: usize,
+        now: Instant,
+    ) -> (Vec<NodeId>, HashSet<NodeId>, u32) {
+        let cooling = table.cooling_peers(now);
+        let reach = seed_count.saturating_add(cooling.len());
+        let nearest = table.closest_unbounded(target.as_bytes(), reach);
+        let mut seed = Vec::with_capacity(seed_count);
+        let mut skipped: u32 = 0;
+        for peer in nearest {
+            if seed.len() == seed_count {
+                break;
+            }
+            if cooling.contains(&peer) {
+                skipped = skipped.saturating_add(1);
+            } else {
+                seed.push(peer);
+            }
+        }
+        (seed, cooling, skipped)
     }
 
     /// Insert `peer` into the candidate set if not already present

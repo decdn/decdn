@@ -1101,8 +1101,10 @@ since project inception and will roll into the first tagged release.
   bounds the connect and handshake separately at `DHT_DIAL_TIMEOUT` (2 s)
   and fails them as a typed `DialTimeout`; the lookup marks that peer in the
   routing table (`RoutingTable::mark_unreachable`), and this node's lookups
-  skip it for `DIAL_FAILURE_COOLDOWN` (5 min) from the seed and from
-  `closer_nodes` answers alike. The peer stays in the table and in the
+  skip it for `DIAL_FAILURE_COOLDOWN` (5 min): the seed is the nearest peers
+  that are not skipped, a `closer_nodes` referral to a skipped peer is not
+  followed, and a dead peer reached only through a referral is marked too.
+  The peer stays in the table and in the
   answers this node gives; an inbound request from it ends the skip. The
   `dht_lookup` span records the `cooling` peers skipped, and
   `decdn_dht_lookup_dial_timeouts_total` counts the dials that timed out
