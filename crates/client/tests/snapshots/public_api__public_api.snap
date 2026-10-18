@@ -41,6 +41,7 @@ pub async fn decdn_client::bundle::BundlePuller::fetch_manifest(&self, [u8; 32],
 pub async fn decdn_client::bundle::BundlePuller::finish(self)
 pub fn decdn_client::bundle::BundlePuller::funding_shortfall(&self) -> core::option::Option<alloc::string::String>
 pub async fn decdn_client::bundle::BundlePuller::pull(&mut self, &decdn_client::bundle::BundleManifest, &std::path::Path, bool, &tokio_util::sync::cancellation_token::CancellationToken) -> decdn_client::bundle::BundleOutcome
+pub const fn decdn_client::bundle::BundlePuller::unconfirmed_escrows(&self) -> &decdn_client::buyer_pool::UnconfirmedEscrows
 impl core::fmt::Debug for decdn_client::bundle::BundlePuller
 pub fn decdn_client::bundle::BundlePuller::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::bundle::BundlePullerBuilder
@@ -150,6 +151,8 @@ impl core::error::Error for decdn_client::buyer_pool::AllowanceShortfall
 impl core::fmt::Display for decdn_client::buyer_pool::AllowanceShortfall
 pub fn decdn_client::buyer_pool::AllowanceShortfall::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::buyer_pool::EscrowUntracked
+impl decdn_client::buyer_pool::EscrowUntracked
+pub const fn decdn_client::buyer_pool::EscrowUntracked::tx(&self) -> alloy_primitives::aliases::TxHash
 impl core::error::Error for decdn_client::buyer_pool::EscrowUntracked
 impl core::fmt::Display for decdn_client::buyer_pool::EscrowUntracked
 pub fn decdn_client::buyer_pool::EscrowUntracked::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -190,8 +193,8 @@ pub decdn_client::buyer_pool::ToppedUpPool::tx: alloy_primitives::aliases::TxHas
 pub struct decdn_client::buyer_pool::UnconfirmedEscrows(_)
 impl decdn_client::buyer_pool::UnconfirmedEscrows
 pub fn decdn_client::buyer_pool::UnconfirmedEscrows::pending(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::EscrowUnconfirmed>
-pub fn decdn_client::buyer_pool::UnconfirmedEscrows::untracked(&self) -> core::option::Option<decdn_client::buyer_pool::UntrackedEscrow>
-pub struct decdn_client::buyer_pool::UntrackedEscrow
+pub fn decdn_client::buyer_pool::UnconfirmedEscrows::untracked(&self) -> alloc::vec::Vec<decdn_client::buyer_pool::UntrackedEscrow>
+#[non_exhaustive] pub struct decdn_client::buyer_pool::UntrackedEscrow
 pub decdn_client::buyer_pool::UntrackedEscrow::text: alloc::string::String
 pub decdn_client::buyer_pool::UntrackedEscrow::tx: alloy_primitives::aliases::TxHash
 impl core::fmt::Display for decdn_client::buyer_pool::UntrackedEscrow

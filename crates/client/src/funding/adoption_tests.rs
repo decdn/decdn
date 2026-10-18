@@ -2168,7 +2168,7 @@ impl BuyerPoolStore for StoreFaults {
 /// whose text names `held`.
 fn refused_after_untracked(err: &anyhow::Error, held: &str) {
     assert!(
-        err.downcast_ref::<UntrackedEscrowHeld>().is_some(),
+        err.downcast_ref::<RefusedAfterUntracked>().is_some(),
         "{err:#}"
     );
     assert!(
@@ -2266,7 +2266,9 @@ async fn an_untracked_escrow_outlives_its_run_on_the_handle() {
     );
     drop(first);
 
-    let held = escrows.untracked().expect("the handle holds the escrow");
+    let held = escrows.untracked();
+    assert_eq!(held.len(), 1, "the handle holds the escrow: {held:?}");
+    let held = held.into_iter().next().unwrap();
     assert_eq!(held.tx, mined_top_up().transaction_hash);
     assert!(held.text.contains("deposit credit lost"), "{held}");
     assert!(escrows.pending().is_empty(), "the topUp mined");

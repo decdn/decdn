@@ -1063,6 +1063,46 @@ fn escrowed_but_untracked_names_the_tx_and_the_action() {
     assert!(msg.contains("disk full"), "the cause must survive: {msg}");
 }
 
+/// A handle holds every untracked escrow once, oldest first, and nothing
+/// else: a second `openPool` that passed its check before the first escrow
+/// went untracked can go untracked too, and the command names both (#2511).
+#[test]
+fn a_handle_holds_each_untracked_escrow_once() {
+    let escrows = UnconfirmedEscrows::default();
+    let (first, second) = (B256::repeat_byte(0x01), B256::repeat_byte(0x02));
+    escrows.hold_untracked(&escrowed_but_untracked(
+        "buyer pool opened",
+        first,
+        "disk full",
+    ));
+    escrows.hold_untracked(&anyhow::anyhow!("a transient fault"));
+    let late = escrowed_but_untracked("buyer pool opened", second, "disk full");
+    escrows.hold_untracked(&late.context("building the payment lane failed"));
+    escrows.hold_untracked(&escrowed_but_untracked(
+        "buyer pool opened",
+        first,
+        "a later cause",
+    ));
+
+    let held = escrows.untracked();
+    let txs: Vec<B256> = held.iter().map(|escrow| escrow.tx).collect();
+    assert_eq!(txs, [first, second]);
+    let texts: Vec<&str> = held.iter().map(|escrow| escrow.text.as_str()).collect();
+    assert!(
+        texts[0].contains("disk full") && !texts[0].contains("a later cause"),
+        "{texts:?}"
+    );
+    assert!(
+        texts[1].contains("building the payment lane failed"),
+        "{texts:?}"
+    );
+    assert_eq!(
+        escrows.clone().untracked(),
+        held,
+        "a clone shares the held escrows"
+    );
+}
+
 #[test]
 fn a_credited_deposit_grades_to_the_new_total() {
     let new_deposit = grade_deposit_credit(

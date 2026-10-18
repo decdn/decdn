@@ -13,7 +13,7 @@
 //! caller does directly: a one-shot CLI fetch needs neither the node service's
 //! per-owner concurrency guard nor its background reclaim/reconcile machinery.
 
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -132,16 +132,25 @@ pub fn escrowed_but_untracked(
     })
 }
 
-/// The error [`escrowed_but_untracked`] builds: USDC moved on-chain and the
-/// local record does not account for it. A retry escrows again, so the acquire
+/// The error [`escrowed_but_untracked`] builds, or an [`UnconfirmedEscrows`]
+/// rebuilds from the escrow it holds: USDC moved on-chain and the local record
+/// does not account for it. A retry escrows again, so the acquire
 /// loop classifies it as fatal to the command ([`crate::Fault::Fatal`]) instead
 /// of retrying the lane build.
 #[derive(Debug)]
 pub struct EscrowUntracked {
     /// The `openPool` or `topUp` transaction that escrowed.
-    pub(crate) tx: TxHash,
+    tx: TxHash,
     /// What landed, the tx, and the local failure.
     text: String,
+}
+
+impl EscrowUntracked {
+    /// The `openPool` or `topUp` transaction that escrowed.
+    #[must_use]
+    pub const fn tx(&self) -> TxHash {
+        self.tx
+    }
 }
 
 impl std::fmt::Display for EscrowUntracked {
@@ -860,7 +869,7 @@ impl std::fmt::Display for EscrowUnconfirmed {
 }
 
 /// The `openPool` and `topUp` transactions a command submitted whose receipt
-/// it has not read.
+/// it has not read, and those that mined with no local record crediting them.
 ///
 /// [`open_pool`] and [`top_up`] add an entry before their submit and remove it
 /// once they read the receipt, or once a submit is rejected without a
@@ -869,29 +878,32 @@ impl std::fmt::Display for EscrowUnconfirmed {
 /// it, because the transaction may escrow after the command exits and a
 /// re-run before it confirms escrows again.
 ///
-/// The handle also holds the command's first `openPool` or `topUp` that mined
-/// with no local record crediting it ([`UnconfirmedEscrows::untracked`]). Its
-/// receipt was read, so it is no longer pending, but a command that ends while
-/// the handle holds it names it too: a re-run reads the uncredited row and
-/// escrows again.
+/// The handle also holds every `openPool` and `topUp` that a run on it
+/// ([`crate::funding::RunFunding`]) saw mine with no local record crediting it
+/// ([`UnconfirmedEscrows::untracked`]). Their receipts were read, so they are
+/// not pending, but a command that ends while the handle holds one names it
+/// too: a re-run reads the uncredited row and escrows again. [`open_pool`] and
+/// [`top_up`] alone hold none: their caller returns the error that names the
+/// escrow.
 ///
-/// A clone shares the same list and hold, so one handle can outlive the
-/// per-pass state that the transactions run under.
+/// A clone shares the same lists, so one handle can outlive the per-pass state
+/// that the transactions run under.
 #[derive(Debug, Default, Clone)]
-pub struct UnconfirmedEscrows(Arc<HeldEscrows>);
+pub struct UnconfirmedEscrows(Arc<Shared>);
 
 /// What every clone of one [`UnconfirmedEscrows`] shares.
 #[derive(Debug, Default)]
-struct HeldEscrows {
+struct Shared {
     pending: Mutex<Vec<EscrowUnconfirmed>>,
-    /// Set once, and never cleared.
-    untracked: OnceLock<UntrackedEscrow>,
+    /// Oldest first, one per tx. An entry is never removed.
+    untracked: Mutex<Vec<UntrackedEscrow>>,
 }
 
 /// An `openPool` or `topUp` that mined and escrowed USDC that no local record
-/// credits ([`EscrowUntracked`]): the one a command holds in its
-/// [`UnconfirmedEscrows`] and names when it ends. Displays its error chain.
+/// credits ([`EscrowUntracked`]), as an [`UnconfirmedEscrows`] holds it for
+/// its command to name when it ends. Displays its error chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
 pub struct UntrackedEscrow {
     /// The transaction that escrowed.
     pub tx: TxHash,
@@ -916,24 +928,42 @@ impl UntrackedEscrow {
 }
 
 impl UnconfirmedEscrows {
-    /// The command's first `openPool` or `topUp` that escrowed USDC no local
-    /// record credits, if one did.
+    /// The `openPool` and `topUp` transactions that escrowed USDC no local
+    /// record credits, oldest first.
     #[must_use]
-    pub fn untracked(&self) -> Option<UntrackedEscrow> {
-        self.0.untracked.get().cloned()
+    pub fn untracked(&self) -> Vec<UntrackedEscrow> {
+        self.0
+            .untracked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
-    /// Hold `err` as the command's untracked escrow when it is one
-    /// ([`EscrowUntracked`]) and the handle holds none yet.
+    /// Hold `err` when it is an untracked escrow ([`EscrowUntracked`]) whose
+    /// tx the handle does not hold yet.
     pub(crate) fn hold_untracked(&self, err: &anyhow::Error) {
-        if let Some(escrow) = err.downcast_ref::<EscrowUntracked>()
-            && self.0.untracked.get().is_none()
-        {
-            let _ = self.0.untracked.set(UntrackedEscrow {
+        let Some(escrow) = err.downcast_ref::<EscrowUntracked>() else {
+            return;
+        };
+        let mut held = self
+            .0
+            .untracked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !held.iter().any(|known| known.tx == escrow.tx) {
+            held.push(UntrackedEscrow {
                 tx: escrow.tx,
                 text: decdn_common::redact::sanitize_err_chain(err),
             });
         }
+    }
+
+    /// Hold `err` as a run on the handle holds it when it is an untracked
+    /// escrow, for a test that builds the error with
+    /// [`escrowed_but_untracked`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn hold_untracked_for_test(&self, err: &anyhow::Error) {
+        self.hold_untracked(err);
     }
 
     /// The transactions whose receipt was not read, oldest first.
