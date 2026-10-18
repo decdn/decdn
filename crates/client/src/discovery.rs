@@ -701,14 +701,16 @@ pub struct Probed {
     /// Which discovery blocks this holder answered `has_blob:true` for
     /// (`decdn_protocol::coverage`), taken from the probe's `ProbeResponseExt`.
     /// Unsigned and outside `slash_sig`: a hint for the scheduler's segment
-    /// assignment, never a commitment. `has_blob:true` means
-    /// "will serve at least one block", so this may be a proper subset of the
-    /// blob rather than the whole thing — a **partial holder** is admitted here
+    /// assignment, never a commitment. `has_blob:true` means "will serve at
+    /// least one block" (for every blob with a block), so this may be a
+    /// proper subset of the blob rather than the whole thing — a **partial
+    /// holder** is admitted here
     /// exactly like a full one; nothing in this module treats the two
     /// differently. The requester-side `has_blob`/`coverage.is_empty()`
     /// consistency check (ADR 013 §Tier 1, `ProbeResponseExt::consistent_with`)
     /// runs before a `Probed` is ever constructed, so a malformed pairing never
-    /// reaches this field.
+    /// reaches this field. Empty here only for the empty root, which spans no
+    /// block (#2471).
     pub coverage: Coverage,
 }
 
