@@ -4,7 +4,7 @@ use decdn_common::cli::{Cli, Command, GetArgs};
 
 use std::path::PathBuf;
 
-use super::{Destination, parse_and_check, streams_one_blob};
+use super::{Destination, parse_and_check, resume_dir, streams_one_blob};
 
 const HEX: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
 
@@ -192,4 +192,16 @@ fn an_explicit_output_is_kept_as_given() {
             entry_name: None,
         }
     );
+}
+
+/// Without `-o` the `.partial` state sits in the current directory, which the
+/// interrupt line names; with `-o` the command line already says where it is.
+#[test]
+fn resume_dir_is_the_current_directory_only_without_output() {
+    let uri = format!("decdn:{HEX}");
+    assert_eq!(
+        resume_dir(&get_args(&[&uri])),
+        Some(std::env::current_dir().unwrap())
+    );
+    assert_eq!(resume_dir(&get_args(&[&uri, "-o", "out.bin"])), None);
 }

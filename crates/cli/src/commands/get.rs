@@ -17,7 +17,8 @@
 //! `.` for a bundle, and `./<name>` for an entry, where `<name>` is the last
 //! segment of the entry's path. The command then writes the absolute
 //! destination to stderr before the pull starts, except under `--json` or
-//! `--dry-run`. A bundle or entry pull into a default destination refuses a
+//! `--dry-run`. A default destination sits in the current directory, so an
+//! interrupted run names that directory to run the command again from. A bundle or entry pull into a default destination refuses a
 //! path that holds a file no earlier pull of the same entry left there
 //! unchanged, unless `--overwrite`.
 
@@ -41,11 +42,29 @@ pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<(
         let shown = std::path::absolute(&shown).unwrap_or(shown);
         eprintln!("Downloading to {}", shown.display());
     }
-    if streams_one_blob(args, &uri) {
+    let result = if streams_one_blob(args, &uri) {
         super::fetch::fetch(args, &dest.path, &uri, config_path).await
     } else {
         super::bundle_pull::bundle_pull(args, &dest, &uri, config_path).await
+    };
+    // Without `-o` the command line does not say where the `.partial` state
+    // lives: the current directory, which a re-run must start from.
+    match resume_dir(args) {
+        Some(dir) => super::interrupt::name_resume_dir(result, &dir),
+        None => result,
     }
+}
+
+/// The directory an interrupted run must run again from, when the command
+/// line does not name it: the absolute current directory, for a run without
+/// `-o`. `None` with `-o`, or when the current directory cannot be read.
+fn resume_dir(args: &GetArgs) -> Option<PathBuf> {
+    if args.output.is_some() {
+        return None;
+    }
+    std::env::current_dir()
+        .ok()
+        .or_else(|| std::path::absolute(".").ok())
 }
 
 /// Where a `decdn get` run writes: `-o`, or the default for the URI's target.

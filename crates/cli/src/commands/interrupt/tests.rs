@@ -89,6 +89,54 @@ fn a_command_with_no_dropped_open_ends_as_it_did() {
     assert_eq!(stop_exit(&err), Some(GAVE_UP_EXIT));
 }
 
+/// A `decdn get` run without `-o` names the directory its `.partial` state
+/// sits in, so a re-run from elsewhere does not start over and pay again.
+#[test]
+fn an_interrupt_names_the_resume_directory() {
+    let dir = Path::new("/abs/dir");
+    let err = name_resume_dir::<()>(Err(Interrupted.into()), dir).unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<ResumeFrom>(),
+        Some(&ResumeFrom(dir.to_path_buf()))
+    );
+    assert_eq!(
+        stop_message(&err).unwrap(),
+        "interrupted; run the same command again from /abs/dir to resume"
+    );
+    assert_eq!(stop_exit(&err), Some(INTERRUPTED_EXIT));
+}
+
+/// Only an interrupt takes a resume directory: a give-up keeps its own line,
+/// an error to fix passes through, and a success stays a success.
+#[test]
+fn name_resume_dir_leaves_anything_but_an_interrupt_alone() {
+    let dir = Path::new("/abs/dir");
+    assert_eq!(name_resume_dir(Ok(7), dir).unwrap(), 7);
+    let err = name_resume_dir::<()>(Err(gave_up()), dir).unwrap_err();
+    assert!(err.downcast_ref::<ResumeFrom>().is_none());
+    assert_eq!(
+        stop_message(&err).unwrap(),
+        "no progress for 10m; rerun to resume"
+    );
+    assert_eq!(stop_exit(&err), Some(GAVE_UP_EXIT));
+    let err = name_resume_dir::<()>(Err(anyhow::anyhow!("pool empty")), dir).unwrap_err();
+    assert!(err.downcast_ref::<ResumeFrom>().is_none());
+    assert_eq!(stop_message(&err), None);
+}
+
+/// An `openPool` still in flight replaces the re-run advice even when the run
+/// names a resume directory: a re-run before it confirms escrows again.
+#[test]
+fn an_escrow_in_flight_wins_over_the_resume_directory() {
+    let err = name::<()>(Err(Interrupted.into()), &[open(0xef, 5)]);
+    let err = name_resume_dir(err, Path::new("/abs/dir")).unwrap_err();
+    let line = stop_message(&err).unwrap();
+    assert!(line.starts_with("interrupted: "), "{line}");
+    assert!(line.contains("nonce 5"), "{line}");
+    assert!(!line.contains("/abs/dir"), "{line}");
+    assert_eq!(stop_exit(&err), Some(INTERRUPTED_EXIT));
+}
+
 /// A command that succeeded beside a dropped open still exits non-zero, naming
 /// the tx: the deposit may escrow with no local record.
 #[test]

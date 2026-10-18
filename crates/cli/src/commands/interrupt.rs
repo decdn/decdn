@@ -7,13 +7,17 @@
 //! exits at once with the same status.
 //!
 //! Stopping mid-transfer loses nothing already paid for: every fetch resumes
-//! from its on-disk `.partial` on the next run. Stopping an `openPool` or a
+//! from its on-disk `.partial` on the next run. A `decdn get` run without `-o`
+//! keeps that state in the current directory, so its stop line names the
+//! directory to run the command again from ([`ResumeFrom`]). Stopping an `openPool` or a
 //! `topUp` before its record commits does not cancel the transaction, so the
 //! command names it (`name_held_escrows`, and the immediate exit)
 //! instead of telling the user to run it again: a re-run before it confirms
 //! escrows a second time. An escrow that mined with no local record crediting
 //! it is named the same way: a re-run reads the uncredited row and escrows
 //! again.
+
+use std::path::{Path, PathBuf};
 
 use decdn_client::GaveUp;
 use decdn_client::buyer_pool::{
@@ -33,6 +37,34 @@ impl std::fmt::Display for Interrupted {
 }
 
 impl std::error::Error for Interrupted {}
+
+/// The directory an interrupted command must run again from to resume: the
+/// one that holds its `.partial` state when no `-o` named it. Attached to an
+/// [`Interrupted`] from a `decdn get` run without `-o`, so [`stop_message`]
+/// names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeFrom(pub PathBuf);
+
+impl std::fmt::Display for ResumeFrom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "resume from {}", self.0.display())
+    }
+}
+
+impl std::error::Error for ResumeFrom {}
+
+/// Attach `dir` as the [`ResumeFrom`] directory to an [`Interrupted`] result.
+/// Any other result passes through: a give-up names no directory, and an
+/// error to fix is not resumed. The error keeps its own type underneath, so
+/// the interrupt still exits 130.
+pub(crate) fn name_resume_dir<T>(result: anyhow::Result<T>, dir: &Path) -> anyhow::Result<T> {
+    match result {
+        Err(err) if err.downcast_ref::<Interrupted>().is_some() => {
+            Err(err.context(ResumeFrom(dir.to_path_buf())))
+        }
+        other => other,
+    }
+}
 
 /// The `openPool` and `topUp` transactions a command ended with that someone
 /// must reconcile against the chain: those it did not see confirm, which may
@@ -164,16 +196,21 @@ fn in_flight(err: &anyhow::Error) -> Option<String> {
 
 /// The line `main` prints for a command that stopped rather than failed: a
 /// Ctrl-C, or a give-up after the no-progress limit. `None` for any other
-/// error. An `openPool` or `topUp` in flight or untracked replaces the advice
-/// to run the command again, because a re-run before it is reconciled escrows
-/// again.
+/// error. The advice to run the command again names the [`ResumeFrom`]
+/// directory when the error carries one. An `openPool` or `topUp` in flight or
+/// untracked replaces that advice, because a re-run before it is reconciled
+/// escrows again.
 #[must_use]
 pub fn stop_message(err: &anyhow::Error) -> Option<String> {
     let in_flight = in_flight(err);
     if err.downcast_ref::<Interrupted>().is_some() {
-        return Some(match in_flight {
-            Some(escrows) => format!("interrupted: {escrows}"),
-            None => "interrupted; run the same command again to resume".to_owned(),
+        return Some(match (in_flight, err.downcast_ref::<ResumeFrom>()) {
+            (Some(escrows), _) => format!("interrupted: {escrows}"),
+            (None, Some(ResumeFrom(dir))) => format!(
+                "interrupted; run the same command again from {} to resume",
+                dir.display()
+            ),
+            (None, None) => "interrupted; run the same command again to resume".to_owned(),
         });
     }
     let gave_up = err.downcast_ref::<GaveUp>()?;
