@@ -106,22 +106,40 @@ fn an_interrupt_names_the_resume_directory() {
     assert_eq!(stop_exit(&err), Some(INTERRUPTED_EXIT));
 }
 
-/// Only an interrupt takes a resume directory: a give-up keeps its own line,
-/// an error to fix passes through, and a success stays a success.
+/// A give-up advises a re-run too, so it names the directory the same way and
+/// keeps its exit status.
 #[test]
-fn name_resume_dir_leaves_anything_but_an_interrupt_alone() {
-    let dir = Path::new("/abs/dir");
-    assert_eq!(name_resume_dir(Ok(7), dir).unwrap(), 7);
-    let err = name_resume_dir::<()>(Err(gave_up()), dir).unwrap_err();
-    assert!(err.downcast_ref::<ResumeFrom>().is_none());
+fn a_give_up_names_the_resume_directory() {
+    let err = name_resume_dir::<()>(Err(gave_up()), Path::new("/abs/dir")).unwrap_err();
     assert_eq!(
         stop_message(&err).unwrap(),
-        "no progress for 10m; rerun to resume"
+        "no progress for 10m; rerun from /abs/dir to resume"
     );
     assert_eq!(stop_exit(&err), Some(GAVE_UP_EXIT));
+}
+
+/// An error to fix is not resumed, and a success stays a success: neither
+/// takes a resume directory.
+#[test]
+fn name_resume_dir_leaves_anything_but_a_stop_alone() {
+    let dir = Path::new("/abs/dir");
+    assert_eq!(name_resume_dir(Ok(7), dir).unwrap(), 7);
     let err = name_resume_dir::<()>(Err(anyhow::anyhow!("pool empty")), dir).unwrap_err();
     assert!(err.downcast_ref::<ResumeFrom>().is_none());
     assert_eq!(stop_message(&err), None);
+}
+
+/// A give-up with an `openPool` in flight names the tx, not the directory, and
+/// does not tell a wrapper that a re-run is safe.
+#[test]
+fn an_escrow_in_flight_wins_over_the_resume_directory_on_a_give_up() {
+    let err = name::<()>(Err(gave_up()), &[open(0xef, 5)]);
+    let err = name_resume_dir(err, Path::new("/abs/dir")).unwrap_err();
+    let line = stop_message(&err).unwrap();
+    assert!(line.starts_with("no progress for 600s: "), "{line}");
+    assert!(line.contains("nonce 5"), "{line}");
+    assert!(!line.contains("/abs/dir"), "{line}");
+    assert_eq!(stop_exit(&err), None);
 }
 
 /// An `openPool` still in flight replaces the re-run advice even when the run

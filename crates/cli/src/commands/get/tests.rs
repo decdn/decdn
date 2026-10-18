@@ -4,7 +4,9 @@ use decdn_common::cli::{Cli, Command, GetArgs};
 
 use std::path::PathBuf;
 
-use super::{Destination, parse_and_check, resume_dir, streams_one_blob};
+use crate::commands::interrupt::{Interrupted, stop_message};
+
+use super::{Destination, parse_and_check, streams_one_blob, with_resume_hint};
 
 const HEX: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
 
@@ -194,14 +196,40 @@ fn an_explicit_output_is_kept_as_given() {
     );
 }
 
-/// Without `-o` the `.partial` state sits in the current directory, which the
-/// interrupt line names; with `-o` the command line already says where it is.
+/// The line `main` prints for an interrupt that `get` returns for `argv`.
+fn interrupt_line(argv: &[&str]) -> String {
+    let err = with_resume_hint::<()>(&get_args(argv), Err(Interrupted.into())).unwrap_err();
+    stop_message(&err).unwrap()
+}
+
+/// A default destination and a relative `-o` resolve against the current
+/// directory, so an interrupt names it on the blob and the bundle route alike.
 #[test]
-fn resume_dir_is_the_current_directory_only_without_output() {
-    let uri = format!("decdn:{HEX}");
-    assert_eq!(
-        resume_dir(&get_args(&[&uri])),
-        Some(std::env::current_dir().unwrap())
+fn an_interrupt_names_the_current_directory_for_a_relative_destination() {
+    let named = format!(
+        "interrupted; run the same command again from {} to resume",
+        std::env::current_dir().unwrap().display()
     );
-    assert_eq!(resume_dir(&get_args(&[&uri, "-o", "out.bin"])), None);
+    let blob = format!("decdn:{HEX}");
+    let bundle = format!("decdn:{HEX}/");
+    assert_eq!(interrupt_line(&[&blob]), named);
+    assert_eq!(interrupt_line(&[&bundle]), named);
+    assert_eq!(interrupt_line(&[&blob, "-o", "out.bin"]), named);
+    assert_eq!(interrupt_line(&[&bundle, "-o", "sub/dir"]), named);
+}
+
+/// An absolute `-o` holds its resume state wherever a re-run starts, and `-o -`
+/// keeps none: neither names a directory.
+#[test]
+fn an_interrupt_names_no_directory_for_an_absolute_or_stdout_destination() {
+    let plain = "interrupted; run the same command again to resume";
+    let absolute = std::env::temp_dir().join("out.bin");
+    let absolute = absolute.to_str().unwrap();
+    let blob = format!("decdn:{HEX}");
+    assert_eq!(interrupt_line(&[&blob, "-o", absolute]), plain);
+    assert_eq!(interrupt_line(&[&blob, "-o", "-"]), plain);
+    assert_eq!(
+        interrupt_line(&[&format!("decdn:{HEX}/model.bin"), "-o", "-"]),
+        plain
+    );
 }
