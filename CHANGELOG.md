@@ -1137,6 +1137,25 @@ since project inception and will roll into the first tagged release.
   as text, so a give-up, a pool replacement or "funding needed" cannot invite
   a rerun. An interrupted pull stays `Interrupted`, and its caller names what
   the handle holds through the new `BundlePuller::unconfirmed_escrows`.
+- **Client: a bundle pull lets sibling entries finish their lane builds
+  (#2509).** When one entry ended the pull (a give-up, a pool replacement, a
+  fault that stops every entry), every other entry was dropped where it
+  stood. An entry in the middle of a `topUp` or `openPool` lane build lost it
+  before the receipt read and the local record, which left a tx for the
+  operator to reconcile by hand. Now the pull halts the other entries. Each
+  stops at its next wait or loop pass, starts no new lane build or funding
+  recovery step, and waits up to 30 s for the builds in flight, as one fetch
+  does when it ends. A recovery step already in progress runs to its outcome
+  first. The pull waits up to 40 s for them all, then drops any entry still
+  running, as before: the command names an `openPool` or `topUp` it left
+  unconfirmed. A build that may have escrowed USDC no record credits wins
+  over the stop: the pull ends on the escrow, with the stop kept as text, so a
+  give-up does not exit 75. A halted entry is not counted in the summary, as a
+  dropped one was not, and a pass that keeps an entry's earlier landing does
+  so for a halted one too. The first open of a blob (its size from a header)
+  waits for its lane build the same way on a give-up. A funding recovery step
+  there runs to its outcome, so a give-up can land after the limit while the
+  step finishes.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

@@ -3333,6 +3333,8 @@ where
 ///   here survives on it only as text;
 /// - [`crate::GaveUp`] once the stop policy's limit passes without a verified
 ///   byte;
+/// - a halt, once a sibling bundle entry ends the pull: the acquire returns
+///   it after its drain, and the pull ends with the sibling's error instead;
 /// - [`crate::NoAffordableSource`] or [`crate::NoSourceHasBlob`] on a
 ///   unanimous verdict of the sources, the former once no recovery step can
 ///   raise the deposit;
@@ -3663,6 +3665,9 @@ where
                 }
                 continue;
             }
+            // A sibling entry ended the pull: start nothing more. A build
+            // that starts after the halt only lengthens the drain below.
+            env.stop.ensure_running()?;
             let total_bytes = bound;
             let now = Instant::now();
             let deposit = pool_deposit(&deposit_rx, &started.0);
@@ -3924,6 +3929,9 @@ where
                             }
                         }
                     }
+                    // The awaits since the loop top let a sibling end the
+                    // pull: a halted fetch sends no `topUp` or `openPool`.
+                    env.stop.ensure_running()?;
                     // A sibling entry may have priced a shared source out
                     // at a deposit above this loop's view of it.
                     let seen = sources.priced_out_at(deposit);
@@ -4165,6 +4173,9 @@ where
                 gave_up = env.stop.expired() => {
                     return Err(anyhow::Error::new(gave_up));
                 }
+                halted = env.stop.halted() => {
+                    return Err(anyhow::Error::new(halted));
+                }
             }
         }
     }
@@ -4189,8 +4200,9 @@ where
     fold_late_escrow(result, late)
 }
 
-/// How long [`acquire`] waits, as it returns, for lane builds still in flight.
-const BUILD_DRAIN: Duration = Duration::from_secs(30);
+/// How long [`drain_builds`] waits for lane builds still in flight as
+/// [`acquire`] or [`crate::first_open()`] returns.
+pub(crate) const BUILD_DRAIN: Duration = Duration::from_secs(30);
 
 /// Await every lane build still in `connecting`, for at most [`BUILD_DRAIN`].
 /// A build can be in the middle of an on-chain top-up; dropping it there
@@ -4203,7 +4215,7 @@ const BUILD_DRAIN: Duration = Duration::from_secs(30);
 /// [`LaneBuildFault`], with each later one added to it as text context, so
 /// every such build is reported. `None` when no build ended so. Any other
 /// build error is logged at `debug`: the fetch no longer needs the lane.
-async fn drain_builds<S>(
+pub(crate) async fn drain_builds<S>(
     connecting: &mut FuturesUnordered<Connecting<'_, S>>,
 ) -> Option<anyhow::Error> {
     if connecting.is_empty() {
@@ -4246,10 +4258,13 @@ async fn drain_builds<S>(
 /// fails, and a failed fetch's error survives only as text, so a retryable
 /// [`crate::GaveUp`] or a [`crate::PoolReplaced`] cannot send the caller into a
 /// retry that escrows again.
-fn fold_late_escrow(result: anyhow::Result<()>, late: Option<anyhow::Error>) -> anyhow::Result<()> {
+pub(crate) fn fold_late_escrow<T>(
+    result: anyhow::Result<T>,
+    late: Option<anyhow::Error>,
+) -> anyhow::Result<T> {
     match (result, late) {
         (result, None) => result,
-        (Ok(()), Some(late)) => Err(late),
+        (Ok(_), Some(late)) => Err(late),
         (Err(err), Some(late)) => Err(late.context(format!(
             "the fetch failed ({}), and a lane build that ended after it may have escrowed \
              USDC no record credits",

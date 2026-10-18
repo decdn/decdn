@@ -4357,6 +4357,19 @@ async fn acquire_with_late_builds(
     late: Vec<LateBuild>,
     give_up_after: Duration,
 ) -> anyhow::Result<(anyhow::Result<()>, Vec<bool>)> {
+    let stop = StopPolicy::new(false, Some(give_up_after), Arc::default());
+    acquire_with_late_builds_halted(a, la, late, &stop, None).await
+}
+
+/// [`acquire_with_late_builds`] on `stop`, which a sibling entry halts
+/// `halt_after` into the acquire, when given.
+async fn acquire_with_late_builds_halted(
+    a: ScriptedSource,
+    la: Arc<PoolLedger>,
+    late: Vec<LateBuild>,
+    stop: &StopPolicy,
+    halt_after: Option<Duration>,
+) -> anyhow::Result<(anyhow::Result<()>, Vec<bool>)> {
     let (root, total) = (a.root(), a.total_bytes());
     let mut lanes = vec![candidate(a, la, 0xA1, None)];
     for build in &late {
@@ -4371,31 +4384,35 @@ async fn acquire_with_late_builds(
         late,
     };
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
-    let stop = StopPolicy::new(false, Some(give_up_after), Arc::default());
     let gate = recovery_gate();
-    let result = acquire(
-        AcquireTarget {
-            store: &store,
-            hash: root,
-            total_bytes: total,
-            ranges: &[(0, total)],
-        },
-        &mut set,
-        &AcquireEnv {
-            pacer: &BudgetPacer::new(),
-            funder: &no_funding(),
-            recovery: &gate,
-            credentials: None,
-            max_lanes,
-            stop: &stop,
-            on_progress: None,
-            ledgers: None,
-            pacing: None,
-            max_blob_bytes: 0,
-            run: None,
-        },
-    )
-    .await;
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
+    let halt = async {
+        if let Some(after) = halt_after {
+            tokio::time::sleep(after).await;
+            stop.halt();
+        }
+    };
+    let ranges = [(0, total)];
+    let env = AcquireEnv {
+        pacer: &pacer,
+        funder: &funder,
+        recovery: &gate,
+        credentials: None,
+        max_lanes,
+        stop,
+        on_progress: None,
+        ledgers: None,
+        pacing: None,
+        max_blob_bytes: 0,
+        run: None,
+    };
+    let target = AcquireTarget {
+        store: &store,
+        hash: root,
+        total_bytes: total,
+        ranges: &ranges,
+    };
+    let (result, ()) = tokio::join!(acquire(target, &mut set, &env), halt);
     let ended = provider
         .late
         .iter()
@@ -4552,6 +4569,55 @@ async fn a_late_escrow_survives_a_sibling_build_past_the_drain_bound() -> anyhow
     assert!(
         !text.contains(&dropped),
         "a dropped build reports nothing: {text}"
+    );
+    Ok(())
+}
+
+/// #2509: a sibling entry ends the pull while a lane build is in flight. The
+/// acquire stops, awaits the build, and its escrow wins over the halt.
+#[tokio::test(start_paused = true)]
+async fn a_halt_awaits_the_build_in_flight_and_its_escrow_wins() -> anyhow::Result<()> {
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    // A lane that never delivers, so the acquire is still running.
+    let (_open, gate) = tokio::sync::watch::channel(false);
+    let a = ScriptedSource::new(blob(1024 * 1024))?
+        .paying(Arc::clone(&la))
+        .gated_on(gate);
+    let late = vec![late_build(0xB2, Duration::from_secs(5), || {
+        late_escrow(0xab)
+    })];
+    let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+    let (result, ended) =
+        acquire_with_late_builds_halted(a, la, late, &stop, Some(Duration::from_secs(1))).await?;
+    assert_eq!(ended, [true], "the build ran to its end in the drain");
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a halted acquire must fail"))?;
+    assert!(crate::fault::carries_untracked_escrow(&err), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains(&late_escrow_tx(0xab)), "{text}");
+    assert!(text.contains("another entry ended the pull"), "{text}");
+    Ok(())
+}
+
+/// #2509: an acquire whose pull a sibling already ended starts no lane build,
+/// so its drain cannot meet a `topUp` that started after the halt.
+#[tokio::test(start_paused = true)]
+async fn a_halted_acquire_starts_no_lane_build() -> anyhow::Result<()> {
+    let (a, la) = delivering_lane()?;
+    let late = vec![late_build(0xB2, Duration::from_secs(5), || {
+        late_escrow(0xab)
+    })];
+    let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+    stop.halt();
+    let (result, ended) = acquire_with_late_builds_halted(a, la, late, &stop, None).await?;
+    assert_eq!(ended, [false], "the build never started");
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a halted acquire must fail"))?;
+    assert!(
+        err.downcast_ref::<crate::stop::Halted>().is_some(),
+        "{err:#}"
     );
     Ok(())
 }

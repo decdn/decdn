@@ -9,7 +9,9 @@
 //! lacks the blob is marked absent ([`crate::Holder::probed_holder`]), and
 //! discovery runs when nothing can start. The open ends on a
 //! header, a fatal fault, a unanimous verdict of the sources, or the stop
-//! policy. The lane it builds stays cached in the [`SourceSet`].
+//! policy. A lane build still in flight when the open ends is awaited for a
+//! bounded time, as [`crate::acquire`] awaits its own. The lane it builds stays cached in the
+//! [`SourceSet`].
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -17,12 +19,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use alloy::primitives::{Address, U256};
+use futures_util::stream::FuturesUnordered;
 use tokio::time::Instant;
 
 use crate::credential::{CredentialSlot, CredentialView, FundingNeeded, QuoteMax, unix_now};
 use crate::fault::{Fault, classify};
 use crate::recovery::{RecoveryGate, SwapStep, after_step};
-use crate::scheduler::{Connecting, connect_future, key_spend, sleep_until_opt};
+use crate::scheduler::{
+    Connecting, connect_future, drain_builds, fold_late_escrow, key_spend, sleep_until_opt,
+};
 use crate::source::{Funder, SourceFuture};
 use crate::source_set::{BUILD_RETRY_BASE, Holder, NoAffordableSource, SourceProvider, SourceSet};
 use crate::stop::StopPolicy;
@@ -54,17 +59,27 @@ use crate::streamer::StreamCandidate;
 /// wait for a swapped credential, and the open ends with a typed
 /// [`crate::FundingNeeded`], as [`crate::acquire`] does.
 ///
+/// The stop never interrupts a recovery step: a give-up or a halt takes
+/// effect once the step returns. A lane build still in flight when the stop
+/// fires is awaited for at most 30 s, so the stop does not drop it in the
+/// middle of an on-chain `topUp` or `openPool` unless it outlasts that bound.
+/// A caller that drops the open skips this wait.
+///
 /// # Errors
 ///
 /// - a fatal fault ([`crate::Fault::Fatal`]) `open` returned, verbatim;
 /// - a fatal lane build, wrapped in [`crate::LaneBuildFault`]: one that may
-///   have escrowed USDC no record credits, which a retry would escrow again;
+///   have escrowed USDC no record credits, which a retry would escrow again.
+///   A build that ends so after the stop overrides the stop, which survives
+///   on it only as text;
 /// - [`crate::NoAffordableSource`] or [`crate::NoSourceHasBlob`] on a
 ///   unanimous verdict of the sources, or [`crate::PoolReplaced`] when the
 ///   recovery step opened a new pool;
-/// - [`crate::GaveUp`] once the stop policy's limit passes without an answer.
-pub async fn first_open<P, F, T, O, Fut>(
-    sources: &mut SourceSet<'_, P>,
+/// - [`crate::GaveUp`] once the stop policy's limit passes without an answer;
+/// - a halt once a sibling bundle entry ends the pull: the pull ends with the
+///   sibling's error instead.
+pub async fn first_open<'p, P, F, T, O, Fut>(
+    sources: &mut SourceSet<'p, P>,
     stop: &StopPolicy,
     funder: &F,
     gate: &RecoveryGate,
@@ -77,17 +92,25 @@ where
     O: Fn(Arc<StreamCandidate<P::Source>>) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
-    let opened = open_loop(sources, funder, gate, credentials, &open);
-    tokio::select! {
-        biased;
-        opened = opened => {
-            if opened.is_ok() {
-                stop.clock.tick();
-            }
-            opened
-        }
-        gave_up = stop.expired() => Err(anyhow::Error::new(gave_up)),
+    let mut connecting: Option<Connecting<'p, P::Source>> = None;
+    let opened = open_loop(
+        sources,
+        stop,
+        funder,
+        gate,
+        credentials,
+        &open,
+        &mut connecting,
+    )
+    .await;
+    if opened.is_ok() {
+        stop.clock.tick();
     }
+    // A lane build in flight as the open ends may be in the middle of an
+    // on-chain top-up: await it before returning.
+    let mut connecting: FuturesUnordered<_> = connecting.into_iter().collect();
+    let late = drain_builds(&mut connecting).await;
+    fold_late_escrow(opened, late)
 }
 
 /// Await `fut`, or never resolve without one. The future stays in its slot, so
@@ -99,17 +122,21 @@ async fn poll_some<F: Future + Unpin>(fut: Option<&mut F>) -> F::Output {
     }
 }
 
-/// The body of [`first_open`], without the stop.
+/// The body of [`first_open`].
 ///
 /// One attempt runs at a time: a lane build, then the `open` on that lane.
 /// Discovery runs beside it in the same `select!`, so a slow discovery never
-/// holds back a source whose cooldown ended.
+/// holds back a source whose cooldown ended. The stop is a branch of the same
+/// `select!`: it leaves the loop with the lane build in flight still in
+/// `connecting`, for [`first_open`] to drain ([`drain_builds`]).
 async fn open_loop<'p, P, F, T, O, Fut>(
     sources: &mut SourceSet<'p, P>,
+    stop: &StopPolicy,
     funder: &F,
     gate: &RecoveryGate,
     credentials: Option<&CredentialSlot>,
     open: &O,
+    connecting: &mut Option<Connecting<'p, P::Source>>,
 ) -> anyhow::Result<(Address, T)>
 where
     P: SourceProvider,
@@ -125,10 +152,11 @@ where
     let mut delegate = Delegate::new(credentials);
     // Sources a transient `open` error holds off, until the instant given.
     let mut held_off: HashMap<Address, Instant> = HashMap::new();
-    let mut connecting: Option<Connecting<'p, P::Source>> = None;
     let mut opening: Option<(Address, Pin<Box<Fut>>)> = None;
     let mut discovering: Option<SourceFuture<'p, Vec<Holder>>> = None;
     loop {
+        // A halt starts nothing more, so no lane build starts after it.
+        stop.ensure_running()?;
         let now = Instant::now();
         held_off.retain(|_, until| *until > now);
         if connecting.is_none() && opening.is_none() {
@@ -139,7 +167,7 @@ where
                         deposit = deposit.max(lane_deposit(&lane));
                         opening = Some((holder.provider, Box::pin(open(lane))));
                     }
-                    None => connecting = Some(connect_future(sources.provider(), holder)),
+                    None => *connecting = Some(connect_future(sources.provider(), holder)),
                 }
             }
         }
@@ -174,7 +202,7 @@ where
         tokio::select! {
             biased;
             (provider, built) = poll_some(connecting.as_mut()), if connecting.is_some() => {
-                connecting = None;
+                *connecting = None;
                 match sources.lane_built(provider, built, Instant::now()) {
                     Ok(lane) => {
                         deposit = deposit.max(lane_deposit(&lane));
@@ -221,6 +249,8 @@ where
                 sources.discovery_done(found, Instant::now(), deposit);
             }
             () = sleep_until_opt(wake) => {}
+            gave_up = stop.expired() => return Err(anyhow::Error::new(gave_up)),
+            halted = stop.halted() => return Err(anyhow::Error::new(halted)),
         }
     }
 }

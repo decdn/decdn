@@ -489,3 +489,238 @@ async fn a_delegated_first_open_ends_with_a_typed_funding_needed() -> anyhow::Re
     }
     Ok(())
 }
+
+/// Static lanes whose builds each take `delay`, then end with `fail` when it
+/// is set: a build still in flight when the open stops.
+struct SlowBuilds {
+    lanes: StaticSources<ScriptedSource>,
+    delay: Duration,
+    fail: Option<fn() -> anyhow::Error>,
+    connects: AtomicU32,
+}
+
+impl crate::SourceProvider for SlowBuilds {
+    type Source = ScriptedSource;
+
+    fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+        self.lanes.discover(hash)
+    }
+
+    fn connect<'a>(
+        &'a self,
+        holder: &'a crate::Holder,
+    ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+        self.connects.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            match self.fail {
+                Some(fail) => Err(fail()),
+                None => self.lanes.connect(holder).await,
+            }
+        })
+    }
+}
+
+fn slow_builds(fail: Option<fn() -> anyhow::Error>) -> anyhow::Result<SlowBuilds> {
+    Ok(SlowBuilds {
+        lanes: StaticSources::new(vec![lane(0xA1)])?,
+        delay: Duration::from_secs(20),
+        fail,
+        connects: AtomicU32::new(0),
+    })
+}
+
+/// A lane build's escrow that no record credits: tx `0xab…`.
+fn escrow() -> anyhow::Error {
+    crate::buyer_pool::escrowed_but_untracked(
+        "pool 0x01 topped up by 5 µUSDC",
+        alloy::primitives::TxHash::repeat_byte(0xab),
+        "disk full",
+    )
+}
+
+/// #2509: the give-up does not drop a lane build in flight: the open awaits
+/// it, then gives up.
+#[tokio::test(start_paused = true)]
+async fn a_give_up_awaits_the_lane_build_in_flight() -> anyhow::Result<()> {
+    let provider = slow_builds(None)?;
+    let mut set = SourceSet::new(&provider, [0; 32], Arc::default(), provider.lanes.holders());
+    let start = tokio::time::Instant::now();
+    let err = open_first(
+        &mut set,
+        &policy(Some(Duration::from_secs(5))),
+        |_lane| async { anyhow::Ok(()) },
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("the open must give up"))?;
+    assert!(err.downcast_ref::<GaveUp>().is_some(), "{err:#}");
+    assert_eq!(tokio::time::Instant::now() - start, provider.delay);
+    Ok(())
+}
+
+/// #2509: a lane build that escrows USDC no record credits after the give-up
+/// wins over it, so the caller does not rerun into a second escrow.
+#[tokio::test(start_paused = true)]
+async fn a_late_builds_escrow_wins_over_the_give_up() -> anyhow::Result<()> {
+    let provider = slow_builds(Some(escrow))?;
+    let mut set = SourceSet::new(&provider, [0; 32], Arc::default(), provider.lanes.holders());
+    let err = open_first(
+        &mut set,
+        &policy(Some(Duration::from_secs(5))),
+        |_lane| async { anyhow::Ok(()) },
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("the open must fail"))?;
+    assert!(err.downcast_ref::<GaveUp>().is_none(), "{err:#}");
+    assert!(crate::fault::carries_untracked_escrow(&err), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains(&alloy::primitives::TxHash::repeat_byte(0xab).to_string()),
+        "{text}"
+    );
+    assert!(text.contains("no progress"), "{text}");
+    Ok(())
+}
+
+/// #2509: an open whose pull a sibling already ended builds no lane.
+#[tokio::test(start_paused = true)]
+async fn a_halted_open_builds_no_lane() -> anyhow::Result<()> {
+    let provider = slow_builds(None)?;
+    let mut set = SourceSet::new(&provider, [0; 32], Arc::default(), provider.lanes.holders());
+    let stop = policy(None);
+    stop.halt();
+    let err = open_first(&mut set, &stop, |_lane| async { anyhow::Ok(()) })
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a halted open must fail"))?;
+    assert!(
+        err.downcast_ref::<crate::stop::Halted>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(provider.connects.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+/// A funder whose step takes `delay`, then ends with `outcome`, and records
+/// that it ended.
+struct SlowFunder {
+    delay: Duration,
+    outcome: Recovery,
+    done: std::sync::atomic::AtomicBool,
+}
+
+impl crate::Funder for SlowFunder {
+    fn recover(&self, _remaining: U256) -> crate::SourceFuture<'_, Recovery> {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            self.done.store(true, Ordering::SeqCst);
+            Ok(self.outcome)
+        })
+    }
+
+    fn pool_spent(&self) -> Option<U256> {
+        None
+    }
+}
+
+fn slow_top_up() -> SlowFunder {
+    SlowFunder {
+        delay: Duration::from_secs(20),
+        outcome: Recovery::ToppedUp(U256::from(2_000u32)),
+        done: std::sync::atomic::AtomicBool::new(false),
+    }
+}
+
+/// Open the sole lane, which refuses `Unfunded` below a 2 000 deposit, through
+/// `funder` on `stop`, which a sibling halts `halt_after` into the open.
+async fn open_unfunded(
+    funder: &SlowFunder,
+    stop: &StopPolicy,
+    halt_after: Option<Duration>,
+) -> anyhow::Result<(Address, ())> {
+    let sources = StaticSources::new(vec![lane(0xA1)])?;
+    let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+    let gate = RecoveryGate::new();
+    let halt = async {
+        if let Some(after) = halt_after {
+            tokio::time::sleep(after).await;
+            stop.halt();
+        }
+    };
+    let open = |lane: Arc<StreamCandidate<ScriptedSource>>| async move {
+        if lane.ctx.lock().unwrap().deposit < U256::from(2_000u32) {
+            return Err(unfunded());
+        }
+        Ok(())
+    };
+    let (opened, ()) = tokio::join!(first_open(&mut set, stop, funder, &gate, None, open), halt);
+    opened
+}
+
+/// #2509: a give-up during a funding recovery step lets the step run to its
+/// outcome, and the open answers at the raised deposit.
+#[tokio::test(start_paused = true)]
+async fn a_give_up_lets_the_recovery_step_in_flight_finish() -> anyhow::Result<()> {
+    let funder = slow_top_up();
+    let start = tokio::time::Instant::now();
+    let (provider, ()) =
+        open_unfunded(&funder, &policy(Some(Duration::from_secs(5))), None).await?;
+    assert!(
+        funder.done.load(Ordering::SeqCst),
+        "the step ran to its end"
+    );
+    assert_eq!(provider, A);
+    assert_eq!(tokio::time::Instant::now() - start, funder.delay);
+    Ok(())
+}
+
+/// #2509: a halt during a funding recovery step lets the step run to its
+/// outcome, then ends the open.
+#[tokio::test(start_paused = true)]
+async fn a_halt_lets_the_recovery_step_in_flight_finish() -> anyhow::Result<()> {
+    let funder = slow_top_up();
+    let start = tokio::time::Instant::now();
+    let err = open_unfunded(&funder, &policy(None), Some(Duration::from_secs(1)))
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a halted open must fail"))?;
+    assert!(
+        err.downcast_ref::<crate::stop::Halted>().is_some(),
+        "{err:#}"
+    );
+    assert!(
+        funder.done.load(Ordering::SeqCst),
+        "the step ran to its end"
+    );
+    assert_eq!(tokio::time::Instant::now() - start, funder.delay);
+    Ok(())
+}
+
+/// #2509: a halt ends an open that waits on a header that never comes.
+#[tokio::test(start_paused = true)]
+async fn a_halt_ends_an_open_parked_on_its_header() -> anyhow::Result<()> {
+    let sources = StaticSources::new(vec![lane(0xA1)])?;
+    let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), sources.holders());
+    let stop = policy(None);
+    let start = tokio::time::Instant::now();
+    let halt = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        stop.halt();
+    };
+    let opened = open_first(&mut set, &stop, |_lane| {
+        std::future::pending::<anyhow::Result<()>>()
+    });
+    let (opened, ()) =
+        tokio::time::timeout(Duration::from_mins(1), async { tokio::join!(opened, halt) }).await?;
+    let err = opened
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a halted open must fail"))?;
+    assert!(
+        err.downcast_ref::<crate::stop::Halted>().is_some(),
+        "{err:#}"
+    );
+    assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(1));
+    Ok(())
+}
