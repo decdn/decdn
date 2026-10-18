@@ -108,6 +108,16 @@ pub(crate) fn escrow_untracked(err: &anyhow::Error) -> bool {
         || err.downcast_ref::<OpenUnconfirmed>().is_some()
 }
 
+/// Whether `err` reports a `topUp` or `openPool` that may have escrowed USDC
+/// no local record credits ([`escrow_untracked`]), directly or as the error a
+/// [`LaneBuildFault`] holds: that wrapper hides it from a downcast.
+pub(crate) fn carries_untracked_escrow(err: &anyhow::Error) -> bool {
+    escrow_untracked(err)
+        || err
+            .downcast_ref::<LaneBuildFault>()
+            .is_some_and(|LaneBuildFault(inner)| escrow_untracked(inner))
+}
+
 /// Whether a mid-stream voucher rejection for `reason` acts as `Unfunded`
 /// from its source: the pool's deposit or the signer's capability no longer
 /// covers the stream (ADR 005 §`VoucherRejected` semantics).

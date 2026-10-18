@@ -89,11 +89,14 @@ use super::{
 };
 use crate::buyer_pool::{OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
+use crate::fault::carries_untracked_escrow;
 use crate::funding::RunFunding;
 use crate::lane_sources::LaneSources;
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
+use crate::scheduler::{BUILD_DRAIN, fold_late_escrow};
 use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PullSite};
+use crate::stop::Halted;
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
     ProbeOpts, ProbeRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
@@ -696,7 +699,7 @@ enum Slot<'a> {
 /// destination materialized from an already-fetched sibling (hard link or copy),
 /// kept distinct from `Fetched` (a paid network pull) so the summary never
 /// implies a blob was paid for twice — the whole point of #1306.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum EntryOutcome {
     Fetched(u64),
     Linked,
@@ -710,6 +713,10 @@ enum EntryOutcome {
         path: String,
         err: String,
     },
+    /// A destination a sibling's halt left unwritten ([`Halted`]): the pull
+    /// ended before its fetch finished. The run summary does not count it,
+    /// and the skip-cache does not record it.
+    NotRun,
 }
 
 /// One hash-group's result.
@@ -745,8 +752,14 @@ impl GroupRun {
     }
 
     /// The group's blob fetch failed with `err`: every writable slot fails,
-    /// and `err` ends the whole pull when [`ends_the_pull`] says so.
+    /// and `err` ends the whole pull when [`ends_the_pull`] says so. A sibling
+    /// that ended the pull before this fetch finished halts it ([`Halted`]):
+    /// every writable slot is then [`EntryOutcome::NotRun`], and the halt ends
+    /// nothing.
     fn fetch_failed(slots: Vec<Slot<'_>>, err: anyhow::Error) -> Self {
+        if err.downcast_ref::<Halted>().is_some() {
+            return Self::done(not_run_all(slots));
+        }
         Self {
             outcomes: fail_all(slots, &err),
             bytes: None,
@@ -1110,8 +1123,8 @@ fn invites_rerun(err: &anyhow::Error) -> bool {
 /// One run's result from its `first` pass, which a pool replacement ended,
 /// and its `second` pass against the new pool. Both passes walk the same
 /// entries in the same order, so an entry the first pass landed and the
-/// second found present keeps the first pass's outcome; every other entry
-/// takes the second's. The two transfers add up.
+/// second found present keeps the first pass's outcome, and so does any
+/// entry the second did not run; every other entry takes the second's. The two transfers add up.
 fn merge_passes(first: PullRun, second: PullRun) -> PullRun {
     let outcomes = if first.outcomes.len() == second.outcomes.len() {
         first
@@ -1122,7 +1135,8 @@ fn merge_passes(first: PullRun, second: PullRun) -> PullRun {
                 (
                     EntryOutcome::Fetched(_) | EntryOutcome::Linked | EntryOutcome::Deduped(_),
                     EntryOutcome::Skipped,
-                ) => was,
+                )
+                | (_, EntryOutcome::NotRun) => was,
                 _ => now,
             })
             .collect()
@@ -1196,31 +1210,109 @@ struct SettledGroup {
 ///
 /// `settle` sees every result as it lands, with the item's index in `items`,
 /// and returns the fault that ends the whole run, if the result carries one.
-/// That fault starts no further item, drops the items in flight, and is what
-/// this returns. `None` means every item ran and settled.
+///
+/// Once `settle` returns that fault, no further item starts, and this calls
+/// `halt` once: every item still in flight stops at its next wait or loop
+/// pass ([`crate::StopPolicy`]). An item can be in the middle of an on-chain
+/// `topUp` or `openPool` lane build, so this waits for the items, for at most
+/// [`GROUP_DRAIN`], and `settle` sees each one that lands. Each later fault
+/// `settle` returns that may have escrowed USDC no record credits
+/// ([`carries_untracked_escrow`]) is folded into the first fault the way one
+/// fetch folds a late lane build's ([`fold_late_escrow`]): the escrow wins, so
+/// a [`crate::GaveUp`] cannot send the caller into a rerun that escrows
+/// again. Every other later fault is logged and dropped: the run already
+/// ends. An item still running at the bound is dropped where it stands.
+///
+/// Returns the first fault, or the late escrow with the first fault folded
+/// into it as text. `None` means every item ran and settled.
 async fn run_groups<G, R, Fut>(
     items: Vec<G>,
     jobs: usize,
     run: impl Fn(G) -> Fut,
     mut settle: impl FnMut(usize, R) -> Option<anyhow::Error>,
+    halt: impl FnOnce(),
 ) -> Option<anyhow::Error>
 where
     Fut: std::future::Future<Output = R>,
 {
     let width = jobs.min(items.len()).max(1);
+    // Set once the run ends: no item starts after it.
+    let ended = std::cell::Cell::new(false);
+    // Items started and items settled, for the count a lapsed drain drops.
+    let (started, settled) = (std::cell::Cell::new(0usize), std::cell::Cell::new(0usize));
     let mut stream = futures_util::stream::iter(items.into_iter().enumerate())
+        .take_while(|_| std::future::ready(!ended.get()))
         .map(|(i, item)| {
+            started.set(started.get() + 1);
             let fut = run(item);
             async move { (i, fut.await) }
         })
         .buffer_unordered(width);
-    while let Some((i, result)) = stream.next().await {
+    let stop = loop {
+        let (i, result) = stream.next().await?;
+        settled.set(settled.get() + 1);
         if let Some(err) = settle(i, result) {
-            return Some(err);
+            break err;
         }
+    };
+    ended.set(true);
+    halt();
+    let mut late: Option<anyhow::Error> = None;
+    let drained = tokio::time::timeout(GROUP_DRAIN, async {
+        while let Some((i, result)) = stream.next().await {
+            settled.set(settled.get() + 1);
+            let Some(err) = settle(i, result) else {
+                continue;
+            };
+            if !carries_untracked_escrow(&err) {
+                tracing::warn!(
+                    item = i,
+                    error = %sanitize_err_chain(&err),
+                    "a fault that ends the pull, after another one ended it, is dropped"
+                );
+                continue;
+            }
+            late = Some(match late.take() {
+                None => err,
+                Some(first) => first.context(format!(
+                    "another entry may also have escrowed USDC no record credits as the pull \
+                     ended: {}",
+                    sanitize_err_chain(&err)
+                )),
+            });
+        }
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            entries = started.get().saturating_sub(settled.get()),
+            "bundle entries still running {GROUP_DRAIN:?} after the pull ended are dropped; \
+             an openPool or topUp one of them sent is named as unconfirmed"
+        );
     }
-    None
+    fold_late_escrow(Err::<(), _>(stop), late).err()
 }
+
+/// The fault a pass of [`PullCtx::pull_plain`] ends with: `stopped`, the one
+/// [`run_groups`] returned. A pass that `halted` with no fault ran on a halt
+/// left over from before it, so its halted entries never ran: it fails
+/// rather than end complete with nothing pulled.
+fn pass_stop(stopped: Option<anyhow::Error>, halted: bool) -> Option<anyhow::Error> {
+    match stopped {
+        None if halted => Some(anyhow!(
+            "the pull ran on a halt no entry of it set, so its halted entries never ran; run \
+             the pull again"
+        )),
+        stopped => stopped,
+    }
+}
+
+/// How long [`run_groups`] waits for the items still in flight once one ends
+/// the run: one lane-build drain ([`BUILD_DRAIN`]) plus 10 s for an item to
+/// reach it. A recovery step in progress when the halt lands runs first, and
+/// can outlast the bound.
+const GROUP_DRAIN: std::time::Duration =
+    BUILD_DRAIN.saturating_add(std::time::Duration::from_secs(10));
 
 /// The run's jobs cap ([`PullCtx::gate`]): its permits, and the admission
 /// queue a new group's first permit waits in.
@@ -1566,8 +1658,9 @@ impl<P: Provider + Clone> PullCtx<P> {
             &self.recovery,
         );
         let holders = sources.holders_from(targets);
-        // A fetch dropped by a cancel, or by a sibling's command-wide fault,
-        // queues every lane's vouchers for recording too.
+        // A fetch dropped by a cancel, or still running [`GROUP_DRAIN`] after
+        // a sibling's command-wide fault ([`run_groups`]), queues every lane's
+        // vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
             // The manifest's size is the entry's first claim; without one, the
@@ -1697,9 +1790,15 @@ impl<P: Provider + Clone> PullCtx<P> {
         // this puller drew on them), so this pull's payment is what the
         // lanes' paid bytes grew by while it ran.
         let paid_before = self.ledgers.paid_bytes();
+        // A halt lasts one pass ([`run_groups`]). Clear it as each pass starts
+        // and ends, so it halts neither the next pass, nor a later manifest
+        // fetch or pull of this puller, nor a pull after one its caller
+        // dropped mid-pass.
+        self.stop = self.stop.next_pass();
         let mut run = self
             .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
             .await;
+        self.stop = self.stop.next_pass();
         let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
         let replaced = replaced_pool(&run);
         if let Some(new) = replaced {
@@ -1715,6 +1814,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             let second = self
                 .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
                 .await;
+            self.stop = self.stop.next_pass();
             run = merge_passes(run, second);
             paid = paid.saturating_add(self.ledgers.paid_bytes());
         }
@@ -1887,8 +1987,10 @@ impl<P: Provider + Clone> PullCtx<P> {
         // each run completes, forward its recordable files (built here while
         // the group's entries are in scope) to the flush task and keep its
         // outcomes for the run summary. A fault that ends the whole pull
-        // ([`ends_the_pull`]) drops every group still in flight, so none that
-        // waits for a slot starts.
+        // ([`ends_the_pull`]) halts every group still in flight: none that
+        // waits for a slot starts a fetch (one that links from an on-disk
+        // donor still does), and each running fetch stops and drains its lane
+        // builds ([`run_groups`]).
         let mut groups: Vec<SettledGroup> = vec![SettledGroup::default(); groups_by_hash.len()];
         let mut stopped: Option<anyhow::Error> = None;
         let drive = async {
@@ -1934,8 +2036,10 @@ impl<P: Provider + Clone> PullCtx<P> {
                 |i, (run, updates, warnings)| {
                     settle_group_run(&mut groups, &flush_tx, i, run, updates, warnings)
                 },
+                || self.stop.halt(),
             )
             .await;
+            stopped = pass_stop(stopped.take(), self.stop.is_halted());
             // Closing the channel tells the flush task to do its final write.
             drop(flush_tx);
         };
@@ -1970,7 +2074,9 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// Run [`Self::pull_entry_untimed`] and, when the entry lands, report it
     /// with its size and the time the whole entry took
     /// ([`BundleObserver::entry_landed`], #2120, #2189). Returns the entry's
-    /// [`EntryBytes`] (see [`Self::pull_entry_untimed`]).
+    /// [`EntryBytes`] (see [`Self::pull_entry_untimed`]), or an error carrying
+    /// [`Halted`] once a sibling ends the pull: before this entry starts, or
+    /// mid-fetch (see [`crate::acquire`]).
     #[allow(clippy::too_many_arguments)]
     async fn pull_entry(
         &self,
@@ -1983,6 +2089,8 @@ impl<P: Provider + Clone> PullCtx<P> {
         file: Option<&FileBar>,
         slot: &FetchSlot<'_>,
     ) -> anyhow::Result<EntryBytes> {
+        // A sibling ended the pull while this entry waited for its slot.
+        self.stop.ensure_running()?;
         let started = std::time::Instant::now();
         self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file, slot)
             .await
@@ -3905,6 +4013,19 @@ fn fail_all(slots: Vec<Slot<'_>>, e: &anyhow::Error) -> Vec<EntryOutcome> {
         .collect()
 }
 
+/// Mark every `Write` slot [`EntryOutcome::NotRun`], preserving
+/// `Failed`/`Skip` classification, for a fetch a sibling halted.
+fn not_run_all(slots: Vec<Slot<'_>>) -> Vec<EntryOutcome> {
+    slots
+        .into_iter()
+        .map(|s| match s {
+            Slot::Failed(o) => o,
+            Slot::Skip => EntryOutcome::Skipped,
+            Slot::Write { .. } => EntryOutcome::NotRun,
+        })
+        .collect()
+}
+
 impl EntryOutcome {
     fn failed(path: &str, err: &anyhow::Error) -> Self {
         Self::Failed {
@@ -4183,6 +4304,7 @@ fn bundle_report(
                     error: err.clone(),
                 });
             }
+            EntryOutcome::NotRun => {}
         }
     }
     report
