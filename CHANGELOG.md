@@ -1156,6 +1156,17 @@ since project inception and will roll into the first tagged release.
   waits for its lane build the same way on a give-up. A funding recovery step
   there runs to its outcome, so a give-up can land after the limit while the
   step finishes.
+- **Client: a fatal lane build names every escrow in its batch (#2508).** The
+  acquire loop takes every lane build that is ready as one batch. When one
+  build in the batch was fatal, the loop returned at once and dropped the rest
+  of the batch. Those builds were already out of the set the drain of late
+  builds awaits, so a second build in the batch that may have escrowed USDC no
+  record credits was named nowhere. A full disk that failed a lane's record
+  write beside a mined `topUp` whose credit failed reported only the disk
+  fault, and a re-run after the operator freed space escrowed again. Now each
+  such escrow in the batch is folded into the error the fetch ends with, as
+  the drain folds a late build's: the escrow is the error a caller downcasts,
+  and the fault that ended the fetch survives as text.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

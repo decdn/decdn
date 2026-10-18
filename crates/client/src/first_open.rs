@@ -109,7 +109,7 @@ where
     // A lane build in flight as the open ends may be in the middle of an
     // on-chain top-up: await it before returning.
     let mut connecting: FuturesUnordered<_> = connecting.into_iter().collect();
-    let late = drain_builds(&mut connecting).await;
+    let late = drain_builds(&mut connecting, None).await;
     fold_late_escrow(opened, late)
 }
 

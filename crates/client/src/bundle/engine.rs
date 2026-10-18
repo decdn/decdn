@@ -89,7 +89,7 @@ use super::{
 };
 use crate::buyer_pool::{OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
-use crate::fault::carries_untracked_escrow;
+use crate::fault::{carries_untracked_escrow, fold_escrow};
 use crate::funding::RunFunding;
 use crate::lane_sources::LaneSources;
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
@@ -1272,14 +1272,11 @@ where
                 );
                 continue;
             }
-            late = Some(match late.take() {
-                None => err,
-                Some(first) => first.context(format!(
-                    "another entry may also have escrowed USDC no record credits as the pull \
-                     ended: {}",
-                    sanitize_err_chain(&err)
-                )),
-            });
+            late = Some(fold_escrow(
+                late.take(),
+                err,
+                "another entry may also have escrowed USDC no record credits as the pull ended",
+            ));
         }
     })
     .await;

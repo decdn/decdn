@@ -4600,6 +4600,78 @@ async fn a_halt_awaits_the_build_in_flight_and_its_escrow_wins() -> anyhow::Resu
     Ok(())
 }
 
+/// The lane builds that end together while `a` never delivers, so they land
+/// in one batch inside the acquire loop: the acquire's result.
+async fn acquire_with_one_batch(late: Vec<LateBuild>) -> anyhow::Result<anyhow::Result<()>> {
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    let (_open, gate) = tokio::sync::watch::channel(false);
+    let a = ScriptedSource::new(blob(1024 * 1024))?
+        .paying(Arc::clone(&la))
+        .gated_on(gate);
+    let builds = late.len();
+    let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
+    let (result, ended) = acquire_with_late_builds_halted(a, la, late, &stop, None).await?;
+    assert_eq!(ended, vec![true; builds], "every build ended in the loop");
+    Ok(result)
+}
+
+/// #2508: two lane builds that end in one batch, each with a possible
+/// untracked escrow, give one error that names both txs. The first escrow
+/// ends the fetch; the second one is in the same batch, so the drain of late
+/// builds never sees it.
+#[tokio::test(start_paused = true)]
+async fn every_escrow_in_one_batch_of_lane_builds_is_named() -> anyhow::Result<()> {
+    let result = acquire_with_one_batch(vec![
+        late_build(0xB2, Duration::from_secs(5), || late_escrow(0xab)),
+        late_build(0xC3, Duration::from_secs(5), || late_escrow(0xcd)),
+    ])
+    .await?;
+    let err = result
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("the escrows must fail the acquire"))?;
+    assert_eq!(classify(&err), Fault::Fatal(FatalScope::Command), "{err:#}");
+    let text = format!("{err:#}");
+    for tx in [0xab, 0xcd] {
+        let tx = late_escrow_tx(tx);
+        assert!(text.contains(&tx), "{tx} is named: {text}");
+    }
+    Ok(())
+}
+
+/// #2508: a fatal lane build that is not an escrow still names a possible
+/// untracked escrow in its batch, and the escrow is the error the caller
+/// downcasts: a disk fault alone tells the operator to free space and re-run,
+/// and that re-run escrows again.
+#[tokio::test(start_paused = true)]
+async fn a_fatal_build_names_an_escrow_in_its_batch() -> anyhow::Result<()> {
+    let disk_full = || {
+        anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+            .context("seed the lane's record")
+    };
+    // Either build may come first in the batch.
+    for builds in [
+        [
+            (0xB2, disk_full as fn() -> anyhow::Error),
+            (0xC3, || late_escrow(0xcd)),
+        ],
+        [(0xB2, || late_escrow(0xcd)), (0xC3, disk_full)],
+    ] {
+        let late = builds
+            .into_iter()
+            .map(|(byte, fail)| late_build(byte, Duration::from_secs(5), fail))
+            .collect();
+        let err = acquire_with_one_batch(late)
+            .await?
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("the batch must fail the acquire"))?;
+        assert_eq!(classify(&err), Fault::Fatal(FatalScope::Command), "{err:#}");
+        assert!(crate::fault::carries_untracked_escrow(&err), "{err:#}");
+        let text = format!("{err:#}");
+        assert!(text.contains(&late_escrow_tx(0xcd)), "{text}");
+    }
+    Ok(())
+}
+
 /// #2509: an acquire whose pull a sibling already ended starts no lane build,
 /// so its drain cannot meet a `topUp` that started after the halt.
 #[tokio::test(start_paused = true)]
