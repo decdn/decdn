@@ -1742,3 +1742,250 @@ fn batch_result_names_every_cause() {
         "{msg}"
     );
 }
+
+// ---- the escrow stays named during the record write (#2515, #2521) -----
+
+/// An in-memory store that notes, at each pool record and deposit credit,
+/// whether `escrows` names [`SCRIPTED_TX`](decdn_incentive::test_rpc::SCRIPTED_TX)
+/// as the write runs.
+struct WatchingStore {
+    inner: decdn_incentive::MemoryBuyerPoolStore,
+    escrows: UnconfirmedEscrows,
+    writes: std::sync::Mutex<Vec<bool>>,
+}
+
+impl WatchingStore {
+    fn new(inner: decdn_incentive::MemoryBuyerPoolStore, escrows: UnconfirmedEscrows) -> Self {
+        Self {
+            inner,
+            escrows,
+            writes: std::sync::Mutex::default(),
+        }
+    }
+
+    /// Note whether the handle names the scripted tx now.
+    fn note_write(&self) {
+        use decdn_client::buyer_pool::EscrowUnconfirmed;
+        use decdn_incentive::test_rpc::SCRIPTED_TX;
+
+        let pending = self.escrows.pending().iter().any(|escrow| match escrow {
+            EscrowUnconfirmed::Open(open) => open.tx == Some(SCRIPTED_TX),
+            EscrowUnconfirmed::TopUp(top_up) => top_up.tx == Some(SCRIPTED_TX),
+        });
+        let untracked = self
+            .escrows
+            .untracked()
+            .iter()
+            .any(|held| held.tx == SCRIPTED_TX);
+        self.writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pending || untracked);
+    }
+
+    /// For each pool record and deposit credit, whether the handle named the
+    /// scripted tx as the write ran.
+    fn named_writes(&self) -> Vec<bool> {
+        self.writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl BuyerPoolStore for WatchingStore {
+    fn load_all(&self) -> Result<BuyerLoad, decdn_incentive::StoreError> {
+        self.inner.load_all()
+    }
+    fn record(&self, state: &BuyerPoolState) -> Result<(), decdn_incentive::StoreError> {
+        self.note_write();
+        self.inner.record(state)
+    }
+    fn forget(&self, owner: Address) -> Result<(), decdn_incentive::StoreError> {
+        self.inner.forget(owner)
+    }
+    fn get_by_pool_id(
+        &self,
+        pool_id: PoolId,
+    ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
+        self.inner.get_by_pool_id(pool_id)
+    }
+    fn forget_if_pool(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+    ) -> Result<bool, decdn_incentive::StoreError> {
+        self.inner.forget_if_pool(owner, pool_id)
+    }
+    fn get_by_owner(
+        &self,
+        owner: Address,
+    ) -> Result<Option<BuyerPoolState>, decdn_incentive::StoreError> {
+        self.inner.get_by_owner(owner)
+    }
+    fn advance_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: decdn_incentive::LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.inner
+            .advance_progress(owner, pool_id, lane, bytes, amount)
+    }
+    fn rebase_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: decdn_incentive::LaneKey,
+        anchor: decdn_incentive::BuyerLaneProgress,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.inner
+            .rebase_progress(owner, pool_id, lane, anchor, totals)
+    }
+    fn seed_progress(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        lane: decdn_incentive::LaneKey,
+        bytes: U256,
+        amount: U256,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.inner
+            .seed_progress(owner, pool_id, lane, bytes, amount)
+    }
+    fn add_deposit(
+        &self,
+        owner: Address,
+        pool_id: PoolId,
+        additional: U256,
+    ) -> Result<decdn_incentive::DepositOutcome, decdn_incentive::StoreError> {
+        self.note_write();
+        self.inner.add_deposit(owner, pool_id, additional)
+    }
+    fn delegate_lanes(
+        &self,
+        deployment: Deployment,
+        pool_id: PoolId,
+        signer: Address,
+    ) -> Result<Vec<(Address, decdn_incentive::BuyerLaneProgress)>, decdn_incentive::StoreError>
+    {
+        self.inner.delegate_lanes(deployment, pool_id, signer)
+    }
+    fn advance_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: decdn_incentive::LaneKey,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.inner
+            .advance_delegate_progress(deployment, lane, totals)
+    }
+    fn rebase_delegate_progress(
+        &self,
+        deployment: Deployment,
+        lane: decdn_incentive::LaneKey,
+        anchor: decdn_incentive::BuyerLaneProgress,
+        totals: decdn_incentive::BuyerLaneProgress,
+    ) -> Result<decdn_incentive::AdvanceOutcome, decdn_incentive::StoreError> {
+        self.inner
+            .rebase_delegate_progress(deployment, lane, anchor, totals)
+    }
+    fn lane_salt(
+        &self,
+    ) -> Result<decdn_incentive::lane_signer::LaneSalt, decdn_incentive::StoreError> {
+        self.inner.lane_salt()
+    }
+}
+
+/// A `PaymentPool` at [`DEPLOYMENT`] whose every transaction mines with
+/// `receipt`.
+fn pool_that_mines(
+    receipt: alloy::rpc::types::TransactionReceipt,
+) -> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone> {
+    PaymentPool::new(
+        DEPLOYMENT.payment_pool,
+        decdn_incentive::test_rpc::ScriptedRpc::mined(receipt).provider(),
+    )
+}
+
+/// #2521: `pool open` keeps its mined `openPool` named on the handle while
+/// the pool record is written, so a second Ctrl-C during the write still
+/// names it, and releases it once the record commits.
+#[tokio::test(start_paused = true)]
+async fn pool_open_names_the_open_while_its_record_is_written() {
+    use alloy::sol_types::SolEvent;
+
+    let owner = Address::repeat_byte(0x22);
+    let pool_id = B256::repeat_byte(0x33);
+    let deposit = U256::from(1_000_000_u64);
+    let opened = PaymentPool::PoolOpened {
+        poolId: pool_id,
+        owner,
+        deposit,
+    };
+    let receipt = decdn_incentive::test_rpc::mined_receipt(
+        DEPLOYMENT.payment_pool,
+        vec![alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: DEPLOYMENT.payment_pool,
+                data: opened.encode_log_data(),
+            },
+            ..Default::default()
+        }],
+    );
+    let escrows = UnconfirmedEscrows::default();
+    let store = WatchingStore::new(store_with(&[]), escrows.clone());
+    let opened = open_and_record(
+        &pool_that_mines(receipt),
+        &store,
+        DEPLOYMENT,
+        Address::repeat_byte(0xcd),
+        owner,
+        deposit,
+        &escrows,
+    )
+    .await
+    .expect("the open is recorded");
+    assert_eq!(opened, pool_id);
+    assert_eq!(
+        store.named_writes(),
+        [true],
+        "the record write names the open"
+    );
+    assert_eq!(tracked(&store, owner), Some(pool_id));
+    assert!(escrows.pending().is_empty(), "the record released the open");
+    assert!(escrows.untracked().is_empty());
+}
+
+/// #2521: `pool top-up` keeps its mined `topUp` named on the handle while
+/// the deposit credit is written, and releases it once the credit commits.
+#[tokio::test(start_paused = true)]
+async fn pool_top_up_names_the_top_up_while_its_credit_is_written() {
+    let owner = Address::repeat_byte(0x22);
+    let pool_id = B256::repeat_byte(0x33);
+    let escrows = UnconfirmedEscrows::default();
+    let store = WatchingStore::new(store_with(&[row(0x33, owner)]), escrows.clone());
+    // No `PoolToppedUp` log, so the credit is the amount asked for.
+    let receipt = decdn_incentive::test_rpc::mined_receipt(DEPLOYMENT.payment_pool, Vec::new());
+    let (credited, deposit) = top_up_and_credit(
+        &pool_that_mines(receipt),
+        &store,
+        owner,
+        pool_id,
+        U256::from(5_000_u64),
+        &escrows,
+    )
+    .await
+    .expect("the topUp is credited");
+    assert_eq!(credited, U256::from(5_000_u64));
+    assert_eq!(deposit, U256::from(1_005_000_u64));
+    assert_eq!(store.named_writes(), [true], "the credit names the topUp");
+    assert!(
+        escrows.pending().is_empty(),
+        "the credit released the topUp"
+    );
+    assert!(escrows.untracked().is_empty());
+}

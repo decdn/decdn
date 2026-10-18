@@ -1985,30 +1985,10 @@ async fn a_top_up_left_unconfirmed_by_one_pass_refuses_the_next() {
     assert_eq!(escrows.top_ups(), vec![HELD]);
 }
 
-/// A receipt for [`SCRIPTED_TX`](decdn_incentive::test_rpc::SCRIPTED_TX)
-/// that mined with `logs`.
+/// A receipt for [`SCRIPTED_TX`](decdn_incentive::test_rpc::SCRIPTED_TX),
+/// sent to [`PP`], that mined with `logs`.
 fn mined_with(logs: Vec<alloy::rpc::types::Log>) -> alloy::rpc::types::TransactionReceipt {
-    alloy::rpc::types::TransactionReceipt {
-        inner: alloy::consensus::ReceiptEnvelope::Eip1559(alloy::consensus::ReceiptWithBloom {
-            receipt: alloy::consensus::Receipt {
-                status: alloy::consensus::Eip658Value::Eip658(true),
-                cumulative_gas_used: 0,
-                logs,
-            },
-            logs_bloom: alloy::primitives::Bloom::ZERO,
-        }),
-        transaction_hash: decdn_incentive::test_rpc::SCRIPTED_TX,
-        transaction_index: Some(0),
-        block_hash: Some(B256::repeat_byte(0x01)),
-        block_number: Some(1),
-        gas_used: 0,
-        effective_gas_price: 0,
-        blob_gas_used: None,
-        blob_gas_price: None,
-        from: Address::repeat_byte(0x22),
-        to: Some(PP),
-        contract_address: None,
-    }
+    decdn_incentive::test_rpc::mined_receipt(PP, logs)
 }
 
 /// A `topUp` receipt that mined with no `PoolToppedUp` log, so the top-up
