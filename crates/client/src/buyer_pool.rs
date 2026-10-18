@@ -871,6 +871,17 @@ impl From<TopUpUnconfirmed> for EscrowUnconfirmed {
     }
 }
 
+impl EscrowUnconfirmed {
+    /// The pending escrow as the error that reports it ([`OpenUnconfirmed`]
+    /// or [`TopUpUnconfirmed`]).
+    pub(crate) fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Open(open) => anyhow::Error::new(open),
+            Self::TopUp(top_up) => anyhow::Error::new(top_up),
+        }
+    }
+}
+
 impl std::fmt::Display for EscrowUnconfirmed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

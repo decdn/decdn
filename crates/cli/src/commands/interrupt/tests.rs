@@ -228,6 +228,24 @@ fn a_top_up_the_error_carries_is_not_named_twice() {
     assert!(message.contains("topUp tx 0xcdcd"), "{message}");
 }
 
+/// #2517: a bundle pull folds every pending escrow but the first into its
+/// error as text. Each one the text names is not named twice.
+#[test]
+fn pending_escrows_the_error_names_as_text_are_not_named_twice() {
+    let (first, second) = (top_up(0xab, 7), top_up(0xcd, 8));
+    let folded = anyhow::Error::new(top_up_tx(0xab, 7)).context(format!(
+        "another openPool or topUp of this command may still escrow USDC: {second}"
+    ));
+    let err = name::<()>(Err(folded), &[first, second]).unwrap_err();
+    assert!(
+        err.downcast_ref::<UnreconciledEscrows>().is_none(),
+        "{err:#}"
+    );
+    let text = format!("{err:#}");
+    assert_eq!(text.matches("0xabab").count(), 1, "{text}");
+    assert_eq!(text.matches("0xcdcd").count(), 1, "{text}");
+}
+
 /// A `topUp` dropped while its submit was in flight holds no hash. Its line
 /// names the nonce and claims no transport failure, because nothing failed.
 #[test]

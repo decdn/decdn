@@ -1161,9 +1161,9 @@ since project inception and will roll into the first tagged release.
   running, as before: the command names an `openPool` or `topUp` it left
   unconfirmed. A build that may have escrowed USDC no record credits wins
   over the stop: the pull ends on the escrow, with the stop kept as text, so a
-  give-up does not exit 75. A halted entry is not counted in the summary, as a
-  dropped one was not, and a pass that keeps an entry's earlier landing does
-  so for a halted one too. The first open of a blob (its size from a header)
+  give-up does not exit 75. A halted entry, like a dropped one, counts as not
+  run in the summary (#2517), and a pass that keeps an entry's earlier landing
+  does so for a halted one too. The first open of a blob (its size from a header)
   waits for its lane build the same way on a give-up. A funding recovery step
   there runs to its outcome, so a give-up can land after the limit while the
   step finishes.
@@ -1200,6 +1200,24 @@ since project inception and will roll into the first tagged release.
   record holds it as untracked before it releases the pending entry. Every
   `decdn get`, `decdn bundle pull`, `decdn pool open` and `decdn pool top-up`
   names it on every exit during the write.
+- **Client, CLI: a halted bundle pull reports its replacement, the entries it
+  did not run, and its pending escrows (#2517).** Three gaps remained at the
+  end of a pull that one entry ended. First, the pull took its pool
+  replacement only from the fault that ended it. A sibling entry's recovery
+  step that replaced the pool during the drain, or a replacement that a late
+  escrow folded over, went unreported, and `decdn bundle pull` printed no
+  "reclaim it with: decdn pool reclaim" note for the closed pool. The pull now
+  reads the replacement from the recovery gate, and reports it in
+  `BundleOutcome::replaced`. Only a replacement that ended the first pass runs
+  the rest again. Second, entries the pull did not run were in no count, so
+  the summary did not add up to the entry count. The new
+  `BundleReport::not_run` counts them, the summary line adds `N not run` when
+  there are some, and `--json` carries `not_run`. Third, a `BundlePuller` pull
+  that dropped an entry while its `topUp` or `openPool` receipt read was
+  pending ended with only its own stop. Only `decdn bundle pull` named the tx,
+  from the handle. A pull that is not interrupted now ends
+  `BundleEnd::Stopped` on each pending escrow, as it does on an untracked one.
+  `decdn get` names each one once.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

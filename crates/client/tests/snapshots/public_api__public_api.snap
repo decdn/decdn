@@ -65,6 +65,7 @@ pub decdn_client::bundle::BundleReport::failures: alloc::vec::Vec<decdn_client::
 pub decdn_client::bundle::BundleReport::fetched: u64
 pub decdn_client::bundle::BundleReport::hints_ignored: u64
 pub decdn_client::bundle::BundleReport::linked: u64
+pub decdn_client::bundle::BundleReport::not_run: u64
 pub decdn_client::bundle::BundleReport::paid_bytes: u64
 pub decdn_client::bundle::BundleReport::reconstructed: u64
 pub decdn_client::bundle::BundleReport::resumed_bytes: u64

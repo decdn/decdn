@@ -87,7 +87,7 @@ use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
     FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, manifest_cache, parse_hash,
 };
-use crate::buyer_pool::{OwnedPayer, UntrackedEscrow};
+use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
 use crate::fault::{carries_untracked_escrow, fold_escrow};
 use crate::funding::RunFunding;
@@ -713,9 +713,9 @@ enum EntryOutcome {
         path: String,
         err: String,
     },
-    /// A destination a sibling's halt left unwritten ([`Halted`]): the pull
-    /// ended before its fetch finished. The run summary does not count it,
-    /// and the skip-cache does not record it.
+    /// A destination the pull did not run: a sibling's halt left it unwritten
+    /// ([`Halted`]), or its group never settled ([`fill_not_run`]). The run
+    /// summary counts it as not run, and the skip-cache does not record it.
     NotRun,
 }
 
@@ -1013,10 +1013,10 @@ async fn warn_when_unpolled() -> std::convert::Infallible {
     }
 }
 
-/// What [`PullCtx::pull_all`] hands back: every settled entry's outcome, the
-/// run's byte tally, whether a cancel stopped it, and the fault that ended it
-/// early. A run that stopped early leaves out the entries that had not
-/// settled.
+/// What [`PullCtx::pull_all`] hands back: every entry's outcome, the run's
+/// byte tally, whether a cancel stopped it, and the fault that ended it
+/// early. An entry that a run that stopped early did not settle is
+/// [`EntryOutcome::NotRun`].
 struct PullRun {
     outcomes: Vec<EntryOutcome>,
     /// One line per landed entry whose blob differs in size from its
@@ -1029,7 +1029,8 @@ struct PullRun {
 }
 
 /// The pool replacement that ended `run`, when a funding recovery step opened
-/// a new pool and the pass was not interrupted.
+/// a new pool and the pass was not interrupted: the one the rest runs again
+/// against.
 fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
     if run.interrupted {
         return None;
@@ -1040,26 +1041,52 @@ fn replaced_pool(run: &PullRun) -> Option<PoolReplaced> {
         .copied()
 }
 
+/// The pool replacements of `run`, a first pass, as `(rerun, report)`.
+/// `carried` is the replacement the recovery gate held as the pass started,
+/// and `now` the one it holds as the pass ended
+/// ([`crate::RecoveryGate::replaced`]).
+///
+/// `rerun` is the replacement that ended the pass ([`replaced_pool`]): the
+/// rest runs once more against it. `report` is the replacement the caller is
+/// told of: `rerun`, or else a new one the gate holds. A sibling entry's
+/// recovery step can replace the pool while another entry's fault ends the
+/// pass, and an untracked escrow can end the pass over the
+/// [`PoolReplaced`] that ended it. Neither runs again, since the pull ends,
+/// but the closed pool may still hold a balance to reclaim.
+fn pass_replacement(
+    run: &PullRun,
+    carried: Option<PoolReplaced>,
+    now: Option<PoolReplaced>,
+) -> (Option<PoolReplaced>, Option<PoolReplaced>) {
+    let rerun = replaced_pool(run);
+    (rerun, rerun.or(now.filter(|now| Some(*now) != carried)))
+}
+
 /// How a pull that ended with `stopped` ends, once every pass ran.
-/// `replaced` is the pool replacement a pass made, and `untracked` the escrows
-/// the puller's handle holds with no local record crediting them
+/// `rerun` is the pool replacement a second pass ran against, `pending` the
+/// `openPool` and `topUp` transactions the puller's handle holds with no
+/// receipt read ([`crate::buyer_pool::UnconfirmedEscrows::pending`]), and
+/// `untracked` the escrows it holds with no local record crediting them
 /// ([`crate::buyer_pool::UnconfirmedEscrows::untracked`]).
 ///
 /// An interrupted pull ends [`BundleEnd::Interrupted`], which carries no
-/// error: its caller names what the handle holds. Otherwise each untracked
-/// escrow that `stopped` does not already name is folded into it, the oldest
-/// as the error's root ([`crate::buyer_pool::EscrowUntracked`]). An entry
-/// dropped before it reported its escrow, or an earlier pull on the handle,
-/// leaves that escrow named nowhere else. The escrow wins over any outcome,
-/// as a late lane build's does for one fetch: a pull that completed stops,
-/// and the stop survives only as text, so a [`crate::GaveUp`], a
-/// [`PoolReplaced`] or a [`FundingNeeded`] cannot send the caller into a rerun
-/// that escrows again. A second replacement in one run ends the pull "funding
-/// needed".
+/// error: its caller names what the handle holds. Otherwise each escrow that
+/// `stopped` does not already name is folded into it: the untracked ones,
+/// then the pending ones, the first as the error's root
+/// ([`crate::buyer_pool::EscrowUntracked`], [`crate::buyer_pool::OpenUnconfirmed`]
+/// or [`crate::buyer_pool::TopUpUnconfirmed`]). An entry dropped before it
+/// reported its escrow, an entry dropped while its receipt read was pending,
+/// or an earlier pull on the handle, leaves that escrow named nowhere else.
+/// The escrow wins over any outcome, as a late lane build's does for one
+/// fetch: a pull that completed stops, and the stop survives only as text, so
+/// a [`crate::GaveUp`], a [`PoolReplaced`] or a [`FundingNeeded`] cannot send
+/// the caller into a rerun that escrows again. A second replacement in one
+/// run ends the pull "funding needed".
 fn pull_end(
     interrupted: bool,
     stopped: Option<anyhow::Error>,
-    replaced: Option<PoolReplaced>,
+    rerun: Option<PoolReplaced>,
+    pending: Vec<EscrowUnconfirmed>,
     untracked: Vec<UntrackedEscrow>,
 ) -> BundleEnd {
     if interrupted {
@@ -1086,16 +1113,29 @@ fn pull_end(
             )),
         })
     });
+    let unnamed = pending.into_iter().filter(|escrow| {
+        named
+            .as_ref()
+            .is_none_or(|named| !named.contains(&escrow.to_string()))
+    });
+    let escrows = unnamed.fold(escrows, |escrows, escrow| {
+        Some(match escrows {
+            None => escrow.into_error(),
+            Some(err) => err.context(format!(
+                "another openPool or topUp of this command may still escrow USDC: {escrow}"
+            )),
+        })
+    });
     let stopped = match (stopped, escrows) {
         (stopped, None) => stopped,
         (None, Some(escrows)) => Some(escrows),
         (Some(err), Some(escrows)) => Some(escrows.context(format!(
-            "the pull stopped ({}), and an openPool or topUp of this command escrowed USDC no \
-             record credits",
+            "the pull stopped ({}), and an openPool or topUp of this command may have escrowed \
+             USDC no record credits",
             sanitize_err_chain(&err)
         ))),
     };
-    let stopped = stopped.map(|err| match (replaced, err.downcast_ref::<PoolReplaced>()) {
+    let stopped = stopped.map(|err| match (rerun, err.downcast_ref::<PoolReplaced>()) {
         (Some(_), Some(_)) => err.context(
             "funding needed: the pool this pull opened accepts no more funds either; run the \
              pull again",
@@ -1151,6 +1191,20 @@ fn merge_passes(first: PullRun, second: PullRun) -> PullRun {
         transfer: first.transfer.add(second.transfer),
         interrupted: second.interrupted,
         stopped: second.stopped,
+    }
+}
+
+/// Mark each group of `groups` that never settled as not run, one
+/// [`EntryOutcome::NotRun`] for each of its `sizes` entries: a group the pull
+/// dropped at [`GROUP_DRAIN`], one a cancel dropped, or one that never
+/// started. A group that settled holds one outcome per entry already.
+fn fill_not_run(groups: &mut [SettledGroup], sizes: &[usize]) {
+    for (group, &size) in groups.iter_mut().zip(sizes) {
+        if group.outcomes.is_empty() {
+            group.outcomes = std::iter::repeat_with(|| EntryOutcome::NotRun)
+                .take(size)
+                .collect();
+        }
     }
 }
 
@@ -1763,7 +1817,9 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// remaining entries run once more against the new pool: lanes key on the
     /// pool, so the pass starts with fresh ledgers and funding facts, and each
     /// entry resumes the partial data it holds (ADR 003 § Funding recovery). A
-    /// second replacement ends the pull "funding needed".
+    /// second replacement ends the pull "funding needed". A replacement that
+    /// did not end the pass runs nothing again, and the outcome still reports
+    /// it ([`pass_replacement`]).
     pub(super) async fn run(
         &mut self,
         manifest: &super::BundleManifest,
@@ -1798,13 +1854,16 @@ impl<P: Provider + Clone> PullCtx<P> {
         // fetch or pull of this puller, nor a pull after one its caller
         // dropped mid-pass.
         self.stop = self.stop.next_pass();
+        // A replacement the gate holds from before this pull (a manifest
+        // fetch's, or an earlier pull's second pass) is not this pull's.
+        let carried = self.recovery.replaced();
         let mut run = self
             .pull_all(entries, bundle, out_root, overwrite, saved, cancel)
             .await;
         self.stop = self.stop.next_pass();
         let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
-        let replaced = replaced_pool(&run);
-        if let Some(new) = replaced {
+        let (rerun, replaced) = pass_replacement(&run, carried, self.recovery.replaced());
+        if let Some(new) = rerun {
             if let Some(observer) = &self.observer {
                 observer.pool_replaced(&new);
             }
@@ -1833,11 +1892,13 @@ impl<P: Provider + Clone> PullCtx<P> {
         let dedup = self.dedup_stats.take();
         let mut report = bundle_report(&outcomes, transfer, dedup, warnings);
         report.paid_bytes = u64::try_from(paid).unwrap_or(u64::MAX);
+        let escrows = self.funding.escrows();
         let end = pull_end(
             interrupted,
             stopped,
-            replaced,
-            self.funding.escrows().untracked(),
+            rerun,
+            escrows.pending(),
+            escrows.untracked(),
         );
         BundleOutcome {
             report,
@@ -1982,6 +2043,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     ) -> PullRun {
         let groups_by_hash = order_groups_smallest_first(group_by_hash(entries));
         let group_count = groups_by_hash.len().max(1);
+        let sizes: Vec<usize> = groups_by_hash.iter().map(|g| g.entries.len()).collect();
         // Completed groups' skip-cache records flow to the flush task over this
         // channel. Unbounded so a `send` from the fetch-driving side never blocks
         // (the flush write must never stall a fetch); the messages are one small
@@ -2057,6 +2119,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         let flush = flush_task(out_root, saved, flush_rx);
 
         let interrupted = drive_until_interrupted(drive, flush, cancel).await;
+        fill_not_run(&mut groups, &sizes);
         // Byte tally is per-group (a blob pulled once, materialized to N paths),
         // so sum it before flattening away the group boundaries.
         let transfer = groups
@@ -4311,7 +4374,7 @@ fn bundle_report(
                     error: err.clone(),
                 });
             }
-            EntryOutcome::NotRun => {}
+            EntryOutcome::NotRun => report.not_run += 1,
         }
     }
     report
