@@ -10,7 +10,7 @@
 #
 # The toolchain tag is the workspace's pinned toolchain (rust-toolchain.toml);
 # check_toolchain_pin.py holds it to the same version.
-FROM rust:1.99.0-trixie AS build
+FROM rust:1.99.1-trixie AS build
 ARG BIN
 WORKDIR /src
 COPY . .
