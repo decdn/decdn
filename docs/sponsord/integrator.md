@@ -14,7 +14,7 @@ something, you have three options, from least to most code:
 ## 1. The daemon API
 
 Every `/v1` route needs `Authorization: Bearer <SPONSORD_API_TOKEN>`. The
-OpenAPI document is [`docs/openapi/sponsord.json`](openapi/sponsord.json).
+OpenAPI document is [`crates/sponsord-api/openapi/sponsord.json`](../../crates/sponsord-api/openapi/sponsord.json).
 
 | Route | Request | Success |
 |---|---|---|
@@ -107,7 +107,7 @@ Webhook ([#22](https://github.com/decdn/sponsord/issues/22)), signed-JWT
 built-ins.
 
 The onramp's own API (what the installers and the gate page call) is in
-[`docs/openapi/sponsord-onramp.json`](openapi/sponsord-onramp.json).
+[`crates/sponsord-api/openapi/sponsord-onramp.json`](../../crates/sponsord-api/openapi/sponsord-onramp.json).
 
 ## 3. Embed `sponsord-core`
 

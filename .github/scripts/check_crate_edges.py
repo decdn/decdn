@@ -52,8 +52,8 @@ import subprocess
 import sys
 from collections import deque
 
-# Member -> members it may depend on (normal dependencies only). `e2e` may
-# depend on anything but a sink, so its row is the sentinel ANY.
+# Member -> members it may depend on (normal dependencies only). The two e2e
+# crates may depend on anything but a sink, so their row is the sentinel ANY.
 ANY = frozenset({"*"})
 ALLOWED: dict[str, frozenset[str]] = {
     "decdn-protocol": frozenset(),
@@ -88,16 +88,27 @@ ALLOWED: dict[str, frozenset[str]] = {
         }
     ),
     "decdn-e2e": ANY,
+    # sponsord: the wire types are a leaf; the core builds on the client SDK;
+    # the daemon is a sink; the onramp is an embeddable library over the wire
+    # types alone (its gate is pluggable), so it is not a sink.
+    "sponsord-api": frozenset(),
+    "sponsord-core": frozenset(
+        {"decdn-client", "decdn-common", "decdn-incentive", "sponsord-api"}
+    ),
+    "sponsord": frozenset({"decdn-common", "decdn-incentive", "sponsord-api", "sponsord-core"}),
+    "sponsord-onramp": frozenset({"sponsord-api"}),
+    "sponsord-e2e": ANY,
 }
 # Nothing may depend on these, dev-deps aside.
-SINKS = frozenset({"decdn-cli", "decdn-e2e"})
+SINKS = frozenset({"decdn-cli", "decdn-e2e", "sponsord", "sponsord-e2e"})
 # The publisher CLI and the client SDK are iroh-blobs-free and AWS-free (#578,
 # #1150): neither links a blob store or an S3 SDK, so `cargo install decdn-cli`
 # builds no such thing and a crate built on `decdn-client` inherits none. They
 # also link one TLS backend, ring, and no JSON-RPC server (#2454): aws-lc is a
 # second crypto library and a C build on every client target, and only the
-# daemon serves the admin RPC.
-FOOTPRINT_GUARDED = ("decdn-cli", "decdn-client")
+# daemon serves the admin RPC. The sponsord daemon and onramp are built on
+# the client SDK and the wire types, and ship the same way.
+FOOTPRINT_GUARDED = ("decdn-cli", "decdn-client", "sponsord", "sponsord-onramp")
 MUST_NOT_LINK = frozenset(
     {
         "iroh-blobs",

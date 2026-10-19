@@ -1,4 +1,4 @@
-//! The committed `OpenAPI` documents under `docs/openapi/` match the types.
+//! The committed `OpenAPI` documents under `openapi/` match the types.
 //! `UPDATE_OPENAPI=1 cargo test -p sponsord-api --test openapi` rewrites them.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 fn check(name: &str, doc: &utoipa::openapi::OpenApi) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/openapi")
+        .join("openapi")
         .join(format!("{name}.json"));
     let fresh = format!("{}\n", doc.to_pretty_json().unwrap());
     if std::env::var_os("UPDATE_OPENAPI").is_some() {

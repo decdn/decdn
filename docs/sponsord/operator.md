@@ -100,28 +100,29 @@ Once the widget passes, the page must `POST /v1/fund` with
 `{"client": "{{CLIENT}}", "proof": "<turnstile token>"}`. A `200` means the
 person can return to their terminal; `409` means the key has expired and the
 download must be started again. The built-in page is
-[`crates/sponsord-onramp/assets/turnstile.html`](../crates/sponsord-onramp/assets/turnstile.html).
+[`crates/sponsord-onramp/assets/turnstile.html`](../../crates/sponsord-onramp/assets/turnstile.html).
 For a different kind of check, see [integrator.md](integrator.md).
 
 ## 4. Deploy
 
-- **Docker:** [`deploy/compose.yaml`](../deploy/compose.yaml) runs the
+- **Docker:** [`deploy/sponsord/compose.yaml`](../../deploy/sponsord/compose.yaml) runs the
   released images, `ghcr.io/decdn/sponsord` and
   `ghcr.io/decdn/sponsord-onramp` (also on Docker Hub as `decdn/…`; amd64 and
   arm64; uid 1000), and passes secrets as files. Only the onramp is published,
   on localhost, for your proxy. The daemon refuses a keystore anyone but its
   owner can read, so the secret files must be mode `0600` and owned by uid
   1000. Pull by the signed digest to pin exact bytes
-  ([SECURITY.md](../SECURITY.md#verify-a-container-image)), or build from
+  ([SECURITY.md](../../SECURITY.md#verify-the-container-images)), or build from
   source with `docker compose build`
-  ([`deploy/Dockerfile`](../deploy/Dockerfile)).
-- **systemd:** [`deploy/systemd/`](../deploy/systemd) has a unit for each,
+  ([`deploy/sponsord/Dockerfile`](../../deploy/sponsord/Dockerfile)).
+- **systemd:** [`deploy/sponsord/systemd/`](../../deploy/sponsord/systemd) has a unit for each,
   with secrets as `LoadCredential=` credentials (systemd 252 or later). Some
   systemd versions load credentials at mode `0440`, which the daemon refuses
   for a keystore. So the daemon's unit copies the keystore to a `0600` file
   under `/run/sponsord` before start.
-- **Release binaries:** each `vX.Y.Z` GitHub Release has both binaries for
-  Linux x86_64 and aarch64, with a signed `SHA256SUMS`.
+- **Release binaries:** each `vX.Y.Z` [deCDN release](https://github.com/decdn/decdn/releases)
+  has both binaries for Linux x86_64 and aarch64, beside `decdn` and
+  `decdn-node`, with one signed `SHA256SUMS`.
 
 ## 5. Monitor
 

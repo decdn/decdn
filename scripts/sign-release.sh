@@ -28,7 +28,9 @@
 #   DECDN_SKIP_DOCKERHUB  set to 1 to tag on GHCR only, skipping the Docker Hub
 #                         mirror and overview (implied by DECDN_SKIP_IMAGE_TAGS)
 #   DECDN_DOCKERHUB_REPO  the Docker Hub counterpart of DECDN_REPO (default:
-#                         DECDN_REPO). The images are <it>-node and <it>.
+#                         DECDN_REPO). The decdn images are <it>-node and <it>;
+#                         the sponsord images are <its owner>/sponsord and
+#                         <its owner>/sponsord-onramp.
 #   DECDN_DOCKERHUB_USERNAME, DECDN_DOCKERHUB_TOKEN
 #                         a Docker Hub personal access token for the overview
 #                         push, when the `docker login` credential is not one
@@ -47,23 +49,33 @@ REPO="${DECDN_REPO:-decdn/decdn}"
 # pushing `latest` to the PRODUCTION Docker Hub repositories — which the
 # maintainer is logged in to, so it would succeed silently.
 DOCKERHUB_REPO="${DECDN_DOCKERHUB_REPO:-${REPO}}"
+# The organisation (or user) each repository lives under: the sponsord images
+# are named under it, not under the repository.
+OWNER="${REPO%%/*}"
+DOCKERHUB_OWNER="${DOCKERHUB_REPO%%/*}"
 SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
 
 # The images, keyed by Dockerfile stage. The stage name is also the prefix of
 # the image's release assets: <stage>-image-digest.txt and
 # <stage>-<version>-sbom.spdx.json. `decdn-node` (daemon + CLI) carries a
 # `-node` suffix; `decdn` (CLI only) takes the repository's own name, as the
-# binary does. IMAGES and GHCR_IMAGE must match the `target:` / `image:` pairs
-# of release.yml's docker matrix, which is what wrote the digest files;
-# .github/scripts/check-image-name.sh enforces that.
-IMAGES=( "decdn-node" "decdn" )
+# binary does; `sponsord` and `sponsord-onramp` take their binaries' names
+# under the owner, so operators pull `ghcr.io/decdn/sponsord` whichever
+# repository builds it. IMAGES and GHCR_IMAGE must match the `target:` /
+# `image:` pairs of release.yml's docker matrix, which is what wrote the
+# digest files; .github/scripts/check-image-name.sh enforces that.
+IMAGES=( "decdn-node" "decdn" "sponsord" "sponsord-onramp" )
 declare -A GHCR_IMAGE=(
   [decdn-node]="ghcr.io/${REPO}-node"
   [decdn]="ghcr.io/${REPO}"
+  [sponsord]="ghcr.io/${OWNER}/sponsord"
+  [sponsord-onramp]="ghcr.io/${OWNER}/sponsord-onramp"
 )
 declare -A DOCKERHUB_IMAGE=(
   [decdn-node]="docker.io/${DOCKERHUB_REPO}-node"
   [decdn]="docker.io/${DOCKERHUB_REPO}"
+  [sponsord]="docker.io/${DOCKERHUB_OWNER}/sponsord"
+  [sponsord-onramp]="docker.io/${DOCKERHUB_OWNER}/sponsord-onramp"
 )
 
 # The files a signature covers. SHA256SUMS transitively covers every archive,

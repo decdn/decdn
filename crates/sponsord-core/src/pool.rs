@@ -101,6 +101,9 @@ fn treasury_provider<S>(url: alloy::transports::http::reqwest::Url, signer: S) -
 where
     S: TxSigner<Signature> + Send + Sync + 'static,
 {
+    // reqwest is built with `rustls-no-provider` workspace-wide, and alloy's
+    // HTTP transport builds a `reqwest::Client` here whatever the URL scheme.
+    decdn_common::tls::install_crypto_provider();
     ProviderBuilder::default()
         .with_gas_estimation()
         .with_simple_nonce_management()

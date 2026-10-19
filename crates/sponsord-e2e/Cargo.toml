@@ -22,15 +22,10 @@ sponsord-api = { workspace = true, features = ["client"] }
 sponsord-core = { workspace = true, features = ["test-support"] }
 sponsord-onramp = { workspace = true, features = ["test-support"] }
 alloy.workspace = true
-axum = "0.8"
+axum.workspace = true
 decdn-incentive.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 tokio.workspace = true
-tower = { version = "0.5", features = ["util"] }
-# `tests/no_inline_test_modules.rs` parses every source file under `crates/`
-# and matches them against the CodeQL `paths-ignore` globs.
-globset = "0.4"
-syn = { version = "3", default-features = false, features = ["full", "parsing", "visit"] }
-walkdir = "2"
+tower = { workspace = true, features = ["util"] }

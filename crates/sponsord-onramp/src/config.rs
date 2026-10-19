@@ -228,7 +228,7 @@ pub enum GateKind {
     /// A Cloudflare Turnstile captcha.
     Turnstile,
     /// A gate the program supplies itself, for programs that embed
-    /// `sponsord-onramp` with their own `Gate` (docs/integrator.md). The
+    /// `sponsord-onramp` with their own `Gate` (docs/sponsord/integrator.md). The
     /// stock `sponsord-onramp` binary refuses it.
     Custom,
 }

@@ -9,7 +9,7 @@
 //! - [`error`]: the `{"error": "<code>"}` body both servers answer with.
 //!
 //! The `openapi` feature adds the `OpenAPI` documents (`openapi::daemon()`,
-//! `openapi::onramp()`), committed under `docs/openapi/`.
+//! `openapi::onramp()`), committed under this crate's `openapi/`.
 
 pub mod daemon;
 pub mod error;

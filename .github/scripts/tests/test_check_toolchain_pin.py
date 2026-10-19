@@ -53,6 +53,22 @@ def build_repo(
     return tmp_path
 
 
+def test_source_build_dockerfile_rust_tag_is_a_site(tmp_path):
+    """`FROM rust:<version>-…` in the source-build Dockerfile moves with the pin."""
+    repo = build_repo(tmp_path)
+    dockerfile = repo / ctp.SOURCE_BUILD_DOCKERFILE
+    dockerfile.parent.mkdir(parents=True)
+    dockerfile.write_text("# FROM rust:1.0.0-trixie is a comment\nFROM rust:1.95.0-trixie AS build\n")
+    assert ctp.check(repo) == []
+    dockerfile.write_text("FROM rust:1.96.0-trixie AS build\n")
+    errors = ctp.check(repo)
+    assert any(f"{ctp.SOURCE_BUILD_DOCKERFILE}:1" in e and "1.96.0" in e for e in errors), errors
+    # A two-part tag floats to the newest patch, like a `stable` channel.
+    dockerfile.write_text("FROM rust:1.95-trixie AS build\n")
+    errors = ctp.check(repo)
+    assert any(ctp.SOURCE_BUILD_DOCKERFILE in e for e in errors), errors
+
+
 def test_agreeing_sites_pass(tmp_path):
     assert ctp.check(build_repo(tmp_path)) == []
 

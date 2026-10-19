@@ -85,12 +85,14 @@ minisign -Vm SHA256SUMS -p crates/cli/minisign-<maintainer>.pub
 
 ### Verify the container images
 
-Each release publishes two images:
+Each release publishes four images:
 
 | Image | Default command | Contents | Digest file |
 |-------|-----------------|----------|-------------|
 | `decdn/decdn-node` | `decdn-node run` | the daemon, plus the `decdn` CLI for `docker exec` admin | `decdn-node-image-digest.txt` |
 | `decdn/decdn` | `decdn --help` | the CLI only | `decdn-image-digest.txt` |
+| `decdn/sponsord` | `sponsord` | the sponsorship daemon ([docs/sponsord/](docs/sponsord/README.md)) | `sponsord-image-digest.txt` |
+| `decdn/sponsord-onramp` | `sponsord-onramp` | the public onramp in front of it | `sponsord-onramp-image-digest.txt` |
 
 GPG has no native OCI-image signature, so the release publishes each pinned
 image digest and a detached signature over it. Confirm the signature, then pull
@@ -101,7 +103,7 @@ gpg --verify decdn-node-image-digest.txt.asc decdn-node-image-digest.txt
 docker pull "$(cat decdn-node-image-digest.txt)"
 ```
 
-The CLI image is the same with `decdn-image-digest.txt`.
+The other images are the same with their own digest files.
 
 Each image is published to two registries, `ghcr.io/decdn/<image>` and
 `decdn/<image>` on Docker Hub. The digest file records the GHCR reference, but

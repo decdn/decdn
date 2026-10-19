@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let cfg = OnrampConfig::load()?;
+    sponsord_onramp::tls::install_crypto_provider();
     let http_client = reqwest::Client::builder()
         .timeout(OUTBOUND_TIMEOUT)
         .build()?;
@@ -49,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         }
         GateKind::Custom => anyhow::bail!(
             "ONRAMP_GATE=custom is for programs that embed sponsord-onramp with their own \
-             Gate (docs/integrator.md); this binary has only the turnstile gate"
+             Gate (docs/sponsord/integrator.md); this binary has only the turnstile gate"
         ),
     };
     let state = state::build(&cfg, daemon, gate).await?;

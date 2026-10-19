@@ -1,22 +1,27 @@
 //! Every unit-test module in `crates/` lives in its own file (#2352).
 //!
-//! A `#[cfg(test)]` or `#[cfg(all(test, …))]` module is declared with
-//! `mod <name>;` and its body sits in the child file `foo/<name>.rs` (for
-//! `foo.rs`) or `<name>.rs` beside a `lib.rs`, `main.rs` or `mod.rs`. The tests
-//! stay child modules, so they keep private access. They do not move to
-//! `crates/*/tests/`: an integration test reaches only `pub` items.
+//! A test module is declared with `mod <name>;` and its body sits in the
+//! child file `foo/<name>.rs` (for `foo.rs`) or `<name>.rs` beside a `lib.rs`,
+//! `main.rs` or `mod.rs`. The tests stay child modules, so they keep private
+//! access. They do not move to `crates/*/tests/`: an integration test reaches
+//! only `pub` items.
+//!
+//! A test module is one whose `cfg` holds only in test code: `test`,
+//! `feature = "test-support"`, an `all(…)` with one of those, or an `any(…)`
+//! made only of them. The feature covers the fakes in the sponsord crates'
+//! `test_support.rs`, which dependents' tests enable and no release build
+//! does. Any other `cfg(any(test, …))` also compiles outside tests, so that
+//! module is not test code and stays inline.
 //!
 //! No rustc or clippy lint expresses this rule, so this test holds it. It
 //! parses every `.rs` file under `crates/` with `syn` and fails on any
-//! test-only module with an inline body, at any nesting depth. A module gated
-//! on `cfg(any(test, …))` also compiles outside tests, so it is not a test
-//! module and stays inline.
+//! test-only module with an inline body, at any nesting depth.
 //!
 //! Because every test module has its own file, `CodeQL` skips them by file name
 //! (`.github/codeql/codeql-config.yml`). A second test holds that skip list to
 //! test code: every file under `src/` that a `paths-ignore` pattern matches
-//! must be declared as a `#[cfg(test)]` module, so a production file never
-//! drops out of the analysis because of its name.
+//! must be declared as a test module, so a production file never drops out of
+//! the analysis because of its name.
 //!
 //! The tests live in `decdn-e2e` because that crate is `publish = false`: they
 //! read the whole workspace tree, which a packaged crate does not ship.
@@ -30,20 +35,34 @@ use globset::{GlobBuilder, GlobSetBuilder};
 
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::{Attribute, ItemMod, Meta, Token};
+use syn::{Attribute, Expr, ExprLit, ItemMod, Lit, Meta, MetaList, Token};
 
-/// Whether `meta` (the argument of a `cfg`) holds only under `cfg(test)`.
+/// Whether `meta` (the argument of a `cfg`) holds only under `cfg(test)` or
+/// the `test-support` feature.
 fn cfg_requires_test(meta: &Meta) -> bool {
+    let args =
+        |list: &MetaList| list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated);
     match meta {
         Meta::Path(path) => path.is_ident("test"),
-        Meta::List(list) if list.path.is_ident("all") => list
-            .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
-            .is_ok_and(|args| args.iter().any(cfg_requires_test)),
-        _ => false,
+        Meta::NameValue(nv) => {
+            nv.path.is_ident("feature")
+                && matches!(
+                    &nv.value,
+                    Expr::Lit(ExprLit { lit: Lit::Str(s), .. })
+                        if s.value() == "test-support"
+                )
+        }
+        Meta::List(list) if list.path.is_ident("all") => {
+            args(list).is_ok_and(|args| args.iter().any(cfg_requires_test))
+        }
+        Meta::List(list) if list.path.is_ident("any") => {
+            args(list).is_ok_and(|args| !args.is_empty() && args.iter().all(cfg_requires_test))
+        }
+        Meta::List(_) => false,
     }
 }
 
-/// Whether `attrs` gate the item on `cfg(test)`.
+/// Whether `attrs` gate the item on test code only.
 fn is_test_only(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| {
         attr.path().is_ident("cfg")
@@ -227,7 +246,7 @@ fn codeql_skips_only_test_modules() {
         .collect();
     assert!(
         production.is_empty(),
-        "CodeQL skips these files by name, but they are not `#[cfg(test)]` modules; \
+        "CodeQL skips these files by name, but they are not test modules; \
          rename them or narrow the pattern in .github/codeql/codeql-config.yml:\n{}",
         production.join("\n"),
     );
@@ -320,6 +339,29 @@ fn ignores_modules_that_also_compile_outside_tests() {
     assert!(check("#[cfg(not(test))]\nmod real {}\n").is_empty());
     assert!(check("#[cfg(feature = \"x\")]\nmod gated {}\n").is_empty());
     assert!(check("mod plain {}\n").is_empty());
+}
+
+#[test]
+fn flags_a_module_gated_on_test_or_the_test_support_feature() {
+    let found = check("#[cfg(any(test, feature = \"test-support\"))]\npub mod test_support {}\n");
+    assert_eq!(
+        found,
+        [
+            "crates/x/src/foo.rs: module `test_support` has an inline body; \
+          move it to crates/x/src/foo/test_support.rs"
+        ],
+    );
+    assert_eq!(
+        check("#[cfg(feature = \"test-support\")]\nmod fakes {}\n").len(),
+        1
+    );
+}
+
+#[test]
+fn ignores_a_module_that_any_other_feature_compiles() {
+    assert!(check("#[cfg(any(test, feature = \"other\"))]\nmod doubles {}\n").is_empty());
+    assert!(check("#[cfg(any(feature = \"test-support\", unix))]\nmod doubles {}\n").is_empty());
+    assert!(check("#[cfg(any())]\nmod never {}\n").is_empty());
 }
 
 #[test]

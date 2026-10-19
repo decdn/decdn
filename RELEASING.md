@@ -90,14 +90,14 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
 
 8. **Before the *first* release only — clear the new-crate rate limit.**
    crates.io limits crate *creation* far harder than updates: `PublishNew`
-   allows a burst of 5, then roughly one per 10 minutes. The first release
-   creates **ten** crates at once, so a single run would be rate-limited
+   allows a burst of 5, then roughly one per 10 minutes. A first release
+   creates every crate at once (**fourteen** today), so a single run would be rate-limited
    partway through — and since a published version is immutable, that leaves
    some crates uploaded, the version spent, and no clean retry.
 
    `publish-crates.sh` refuses to start in that situation, but clearing it is a
    manual step. Either ask the crates.io team to raise this repo's publish-new
-   limit (the documented route, and the tidier one), or publish the ten
+   limit (the documented route, and the tidier one), or publish the new
    crates by hand ahead of the tag, in dependency order, spacing them out. Once
    the names exist, every later release is `PublishUpdate` and unconstrained.
    Set `DECDN_ALLOW_RATE_LIMIT=1` to proceed once the limit has been raised.
@@ -156,7 +156,7 @@ than build another commit. The workflow:
 2. imports `KEYS` **from `origin/main`** and refuses the tag if it is not signed
    by a key published there, or if it no longer points at the commit that
    triggered the run;
-3. checks all eleven crate versions match the tag;
+3. checks all sixteen crate versions match the tag;
 4. re-runs `cargo fmt`, `clippy` and the test suite; then
    `cargo publish --workspace --dry-run`, which packages and verify-builds
    every crate. That runs here, before the draft exists, because a packaging
@@ -165,14 +165,16 @@ than build another commit. The workflow:
    for minor bumps while the major is `0`, and for the first release (no prior
    tag to diff against);
 5. creates the GitHub Release as a **draft**;
-6. builds eleven archives (`decdn-node` on five targets, `decdn` on six: the
-   same five plus Windows ARM64) with `--locked`, one job per target, failing
-   a Linux target whose binaries need glibc newer than the 2.31 floor
+6. builds fifteen archives (`decdn-node` on five targets, `decdn` on six: the
+   same five plus Windows ARM64; `sponsord` and `sponsord-onramp` on the two
+   Linux targets) with `--locked`, one job per target, failing a Linux target
+   whose binaries need glibc newer than the 2.31 floor
    ([ADR 000](adr/000-language.md)). Once verification passes it uploads them
-   with a `SHA256SUMS` manifest, asserting all eleven are present;
-7. once the archives are uploaded, assembles two multi-arch images from the
+   with a `SHA256SUMS` manifest, asserting all fifteen are present;
+7. once the archives are uploaded, assembles four multi-arch images from the
    same Linux archives — `decdn-node` (the daemon, with the `decdn` CLI beside
-   it) and `decdn` (the CLI only). It does not compile from source, so every
+   it), `decdn` (the CLI only), `sponsord` and `sponsord-onramp` (one server
+   each). It does not compile from source, so every
    binary in an image is byte-identical to the archived one. It pushes each
    manifest **untagged** and attaches each image's SBOM
    (`<stage>-<version>-sbom.spdx.json`) and digest
@@ -331,9 +333,10 @@ leak into the upload. `cargo publish --workspace` resolves the order itself and
 waits for each crate to reach the index before publishing its dependents. After
 a dry run it prints the crate list and asks you to type the version to confirm.
 
-Ten crates are published; `decdn-e2e` is `publish = false` (test fixtures)
-and cargo skips it. The workspace has eleven members, and the CI version check
-covers all eleven — only the upload is ten.
+Fourteen crates are published; `decdn-e2e` (test fixtures) and `sponsord-e2e`
+(the sponsord stack tests) are `publish = false` and cargo skips them. The
+workspace has sixteen members, and the CI version check covers all sixteen —
+only the upload is fourteen.
 
 **This step is not re-runnable.** A published version is immutable — yanking
 hides it from new resolutions but never frees the version. If it fails partway,
@@ -346,40 +349,31 @@ signatures and the container images are all already published and stand on
 their own; crates.io is an additional distribution channel, so the recovery is
 to finish the remaining crates, not to re-cut the version.
 
-Last, the script opens the PRs that pin the two downstream repositories to
-this release. For each, it clones the repository into a temporary directory
-and runs its bump script with the tag:
+Last, the script opens the PR that pins the downstream repository to this
+release. It clones [decdn/devops](https://github.com/decdn/devops) into a
+temporary directory and runs its `scripts/open-decdn-bump.sh <tag>`, which
+moves the Ansible role, Helm chart, Compose and onramp pins. It takes the
+`SHA256SUMS` and `decdn-node` image digests from the release's assets once
+their signatures verify against its vendored `KEYS`, regenerates its mirrors
+from the tag, and lists in the PR body what a reviewer still has to do. It
+needs Python 3.9+, gpg and `sha256sum`, and opens nothing for a pre-release.
 
-- [decdn/devops](https://github.com/decdn/devops):
-  `scripts/open-decdn-bump.sh <tag>` moves the Ansible role, Helm chart,
-  Compose and onramp pins. It takes the `SHA256SUMS` and `decdn-node` image
-  digests from the release's assets once their signatures verify against its
-  vendored `KEYS`, regenerates its mirrors from the tag, and lists in the PR
-  body what a reviewer still has to do. It needs Python 3.9+, gpg and
-  `sha256sum`, and opens nothing for a pre-release.
-- [decdn/sponsord](https://github.com/decdn/sponsord):
-  `scripts/open-decdn-bump.sh <tag>` moves the crate pins. It waits up
-  to about ten minutes for crates.io to serve the release, and needs Python
-  3.11+; it uses your cargo, so rustup selects sponsord's pinned toolchain.
+It commits as your git identity, pushes with your git credentials for
+github.com, and opens the PR with your `gh` login. It needs push access to
+devops and, over https, a git credential helper such as `gh auth setup-git`.
 
-Both commit as your git identity, push with your git credentials for
-github.com, and open the PR with your `gh` login. They need push access to
-their repository and, over https, a git credential helper such as
-`gh auth setup-git`.
-
-When one fails, or you press Ctrl-C while it runs, the script prints the
-command to run later from a checkout of that repository; it never fails the
-publish. It runs each repository's `main` as you, without the cargo registry
-tokens in the environment. Both rulesets require a reviewed PR for a change to
-`main`, but org admins can bypass them. To run a bump script and its helpers
-from a checkout you have reviewed instead, set `DECDN_SKIP_DEVOPS_BUMP=1` or
-`DECDN_SKIP_SPONSORD_BUMP=1`.
+When it fails, or you press Ctrl-C while it runs, the script prints the
+command to run later from a devops checkout; it never fails the publish. It
+runs devops's `main` as you, without the cargo registry tokens in the
+environment. The devops ruleset requires a reviewed PR for a change to `main`,
+but org admins can bypass it. To run the bump script and its helpers from a
+checkout you have reviewed instead, set `DECDN_SKIP_DEVOPS_BUMP=1`.
 
 ### Crate ownership
 
 crates.io gives a new crate to whoever publishes the name first, and
 `publish-crates.sh` does nothing about ownership. The first release therefore
-leaves all ten crates owned by one person — whoever ran it. Hand them to the
+leaves every new crate owned by one person — whoever ran it. Hand them to the
 org straight afterwards, in the same sitting.
 
 The new owner has to be a GitHub team: crates.io has no organisation account,
@@ -390,7 +384,8 @@ under the `decdn` org is that owner. Confirm you are in it, then:
 TEAM=github:decdn:crates-io
 for crate in decdn-protocol decdn-config-types decdn-bao-range decdn-common \
              decdn-cache decdn-incentive decdn-reputation decdn-client \
-             decdn-node decdn-cli; do
+             decdn-node decdn-cli \
+             sponsord-api sponsord-core sponsord sponsord-onramp; do
   cargo owner --add "$TEAM" "$crate"
 done
 ```

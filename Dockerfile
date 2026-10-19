@@ -1,11 +1,15 @@
 # The images are assembled from the release binaries, not compiled from source.
 #
-# Two of this file's stages are the published images:
+# Four of this file's stages are the published images:
 #   * `decdn-node` (the default, last stage): the daemon, plus the `decdn` CLI so
 #     an operator can run `docker exec <container> decdn node status` against the
 #     daemon's local admin RPC.
 #   * `decdn`: the CLI only, for publishers and clients (`decdn get`,
 #     `decdn publish …`).
+#   * `sponsord`: the sponsorship daemon, which signs capabilities against a
+#     publisher's PaymentPool and keeps it topped up.
+#   * `sponsord-onramp`: the public onramp in front of it, which serves the
+#     `decdn.sh` / `decdn.ps1` installers behind a gate.
 #
 # `.github/workflows/release.yml` builds every target once in `build-binaries`,
 # then the `docker` job unpacks the Linux release archives into dist/<arch>/ and
@@ -16,10 +20,14 @@
 #
 # Build them yourself the same way:
 #   mkdir -p dist/amd64
-#   cargo build --release -p decdn-node -p decdn-cli
-#   cp target/release/decdn-node target/release/decdn dist/amd64/
+#   cargo build --release -p decdn-node -p decdn-cli -p sponsord -p sponsord-onramp
+#   cp target/release/{decdn-node,decdn,sponsord,sponsord-onramp} dist/amd64/
 #   docker build -t decdn-node .
 #   docker build --target decdn -t decdn .
+#   docker build --target sponsord -t sponsord .
+#
+# To build the sponsord images from source instead (a fork, an unreleased
+# commit), use deploy/sponsord/Dockerfile.
 # Pinned by digest, not just by tag. `trixie-slim` is a moving target, so two
 # builds of the same release tag could ship different base layers — which sits
 # badly with a release whose whole story is that a maintainer signs exact bytes.
@@ -67,6 +75,40 @@ VOLUME ["/home/decdn/.decdn"]
 # (`docker run <image> get decdn:<hash> -o <path>`).
 ENTRYPOINT ["decdn"]
 CMD ["--help"]
+
+# The sponsord daemon. Stateless: its configuration is `SPONSORD_*`
+# environment variables (docs/sponsord/operator.md), its secrets mounted files
+# named by SPONSORD_API_TOKEN_FILE, SPONSORD_TREASURY_PASSWORD_FILE and
+# SPONSORD_TREASURY_KEYSTORE. No volume: it keeps nothing on disk.
+FROM base AS sponsord
+
+ARG TARGETARCH
+COPY --chmod=0755 dist/${TARGETARCH}/sponsord /usr/local/bin/sponsord
+
+USER decdn
+WORKDIR /home/decdn
+
+# The binary defaults to loopback; inside a container that is unreachable.
+ENV SPONSORD_BIND=0.0.0.0:8090
+# HTTP API (/v1/capabilities, /v1/info, /healthz, /metrics). Keep this comment
+# on its own line: a trailing comment after EXPOSE is a parse error.
+EXPOSE 8090
+ENTRYPOINT ["sponsord"]
+
+# The public onramp. Stateless too: it holds capabilities in memory only for
+# the browser-to-installer hand-off, so it needs no volume either.
+FROM base AS sponsord-onramp
+
+ARG TARGETARCH
+COPY --chmod=0755 dist/${TARGETARCH}/sponsord-onramp /usr/local/bin/sponsord-onramp
+
+USER decdn
+WORKDIR /home/decdn
+
+ENV ONRAMP_BIND=0.0.0.0:8080
+# /healthz, /decdn.sh, /decdn.ps1, /fund, /v1/fund, /v1/capability.
+EXPOSE 8080
+ENTRYPOINT ["sponsord-onramp"]
 
 # The node image: the CLI image plus the daemon, with the daemon as entrypoint.
 FROM decdn AS decdn-node

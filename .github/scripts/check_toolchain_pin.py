@@ -32,8 +32,11 @@ ref as that site's value; an expression there (`${{ … }}`) cannot be read and
 is refused rather than skipped. Out of scope: a `RUSTUP_TOOLCHAIN` env var,
 which no workflow here sets.
 
-There is no Dockerfile site. The image is a single Debian stage that copies
-prebuilt release binaries, so no `rust:` tag ever names a version.
+The release images copy prebuilt binaries, so the root Dockerfile names no
+`rust:` tag. `deploy/sponsord/Dockerfile` builds from source and does: its
+`FROM rust:<version>-…` tag is a site too, read as the full `X.Y.Z` so that a
+`1.99` tag, which floats to the newest patch, is refused like a floating
+channel.
 
 Run: .github/scripts/check-toolchain-pin.sh
 """
@@ -102,6 +105,23 @@ def action_sites(path: Path, label: str) -> list[tuple[str, str]]:
     return sites
 
 
+# The one Dockerfile that compiles Rust. `FROM rust:<tag>`, where the tag's
+# version prefix is the toolchain the image carries.
+SOURCE_BUILD_DOCKERFILE = "deploy/sponsord/Dockerfile"
+RUST_IMAGE = re.compile(r"^\s*FROM\s+rust:([^\s-]+)")
+
+
+def dockerfile_sites(path: Path, label: str) -> list[tuple[str, str]]:
+    """Every `FROM rust:<version>…` line in one Dockerfile, as (label:line, version)."""
+    sites: list[tuple[str, str]] = []
+    for n, raw in enumerate(path.read_text().splitlines(), start=1):
+        line = COMMENT.sub("", raw)
+        m = RUST_IMAGE.match(line)
+        if m:
+            sites.append((f"{label}:{n}", m.group(1)))
+    return sites
+
+
 def collect_sites(repo_root: Path) -> tuple[list[tuple[str, str]], list[str]]:
     """Every (label, value) pair, plus the errors met while reading them."""
     sites: list[tuple[str, str]] = []
@@ -141,6 +161,10 @@ def collect_sites(repo_root: Path) -> tuple[list[tuple[str, str]], list[str]]:
             "no dtolnay/rust-toolchain@… step found under .github/workflows or "
             ".github/actions — this check inspected no CI site"
         )
+
+    dockerfile = repo_root / SOURCE_BUILD_DOCKERFILE
+    if dockerfile.exists():
+        sites.extend(dockerfile_sites(dockerfile, SOURCE_BUILD_DOCKERFILE))
 
     return sites, errors
 

@@ -11,7 +11,7 @@ fn gate(server: &MockServer) -> TurnstileGate {
         "KEY".into(),
         "Acme <Models>".into(),
         None,
-        reqwest::Client::new(),
+        crate::tls::install_crypto_provider_and_client(),
     )
     .with_endpoint(format!("{}/siteverify", server.uri()))
 }

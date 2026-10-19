@@ -1,17 +1,12 @@
 # sponsord
 
-[![CI](https://img.shields.io/github/actions/workflow/status/decdn/sponsord/ci.yml?branch=main&label=CI&logo=github)](https://github.com/decdn/sponsord/actions/workflows/ci.yml?query=branch%3Amain)
-[![Security](https://img.shields.io/github/actions/workflow/status/decdn/sponsord/security.yml?branch=main&label=security&logo=github)](https://github.com/decdn/sponsord/actions/workflows/security.yml?query=branch%3Amain)
-[![CodeQL](https://img.shields.io/github/actions/workflow/status/decdn/sponsord/codeql.yml?branch=main&label=CodeQL&logo=github)](https://github.com/decdn/sponsord/actions/workflows/codeql.yml?query=branch%3Amain)
-[![Release](https://img.shields.io/github/v/release/decdn/sponsord?sort=semver&logo=github)](https://github.com/decdn/sponsord/releases/latest)
 [![crates.io](https://img.shields.io/crates/v/sponsord?logo=rust&label=crates.io)](https://crates.io/crates/sponsord)
 [![docs.rs](https://img.shields.io/docsrs/sponsord-api?logo=docs.rs&label=docs.rs)](https://docs.rs/sponsord-api)
 [![Docker: sponsord](https://img.shields.io/docker/v/decdn/sponsord?sort=semver&logo=docker&label=sponsord)](https://hub.docker.com/r/decdn/sponsord)
 [![Docker: sponsord-onramp](https://img.shields.io/docker/v/decdn/sponsord-onramp?sort=semver&logo=docker&label=sponsord-onramp)](https://hub.docker.com/r/decdn/sponsord-onramp)
-[![MSRV](https://img.shields.io/badge/MSRV-1.99.0-orange?logo=rust)](rust-toolchain.toml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-Sponsored downloads for [deCDN](https://github.com/decdn/decdn): your users
+Sponsored downloads for [deCDN](../../README.md): your users
 download content from deCDN, and you pay for it. They run one command,
 pass a check in the browser (a captcha by default), and download. There's no
 wallet, key, or token for them to manage.
@@ -36,7 +31,7 @@ You run two services next to a `PaymentPool` you fund:
   has no opinion on who deserves one; that's the gate's job.
 - **`sponsord-onramp`** is the public part: the installers, the gate page,
   and the API the installers poll. Turnstile is the built-in gate; you can
-  write your own in Rust (see the [integrator guide](docs/integrator.md)).
+  write your own in Rust (see the [integrator guide](integrator.md)).
 - **The installers** (`decdn.sh`, `decdn.ps1`), served by the onramp, are
   all a user runs. They install `decdn`, give each download a throwaway key,
   get a capability for it through the onramp, and hand the pull to `decdn`,
@@ -54,19 +49,20 @@ default) and tops it up whenever it is below the low-water mark.
 1. Create the treasury wallet (for example with `decdn key-gen`), fund it
    with gas and USDC, and open your pool from it once with `decdn pool open`.
    Note the pool id it prints; you'll set it as `SPONSORD_POOL_ID`. The
-   [operator guide](docs/operator.md) has the details.
+   [operator guide](operator.md) has the details.
 2. Configure and start both services. With Docker:
 
    ```bash
-   cp deploy/sponsord.env.example deploy/sponsord.env                # edit
-   cp deploy/sponsord-onramp.env.example deploy/sponsord-onramp.env  # edit
-   # put the secrets in deploy/secrets/ (see docs/operator.md)
-   docker compose -f deploy/compose.yaml up -d
+   cd deploy/sponsord
+   cp sponsord.env.example sponsord.env                # edit
+   cp sponsord-onramp.env.example sponsord-onramp.env  # edit
+   # put the secrets in secrets/ (see operator.md)
+   docker compose up -d
    ```
 
    That runs the released images (`ghcr.io/decdn/sponsord`,
    `ghcr.io/decdn/sponsord-onramp`). Or run the release binaries under
-   systemd (`deploy/systemd/`).
+   systemd ([`deploy/sponsord/systemd/`](../../deploy/sponsord/systemd)).
 3. Put TLS in front of the onramp (it listens on `127.0.0.1:8080` by
    default), then give users one line per download:
 
@@ -85,52 +81,53 @@ default) and tops it up whenever it is below the low-water mark.
    a node that hasn't cached the bundle fetch it from that namespace's
    origins. Without it, only nodes that already cache the bundle can serve
    it. Any flag after the URI goes straight to `decdn get`
-   ([installer](docs/installer.md)).
+   ([installer](installer.md)).
 
 ## Documentation
 
-- [Architecture](docs/architecture.md): the components, the flow, and the
+- [Architecture](architecture.md): the components, the flow, and the
   trust boundaries.
-- [Operator guide](docs/operator.md): running the daemon and the onramp,
+- [Operator guide](operator.md): running the daemon and the onramp,
   every setting, metrics, releases.
-- [Integrator guide](docs/integrator.md): your own gate, the daemon API, and
+- [Integrator guide](integrator.md): your own gate, the daemon API, and
   embedding the library. OpenAPI documents are in
-  [`docs/openapi/`](docs/openapi).
-- [Security model](docs/security.md): what each key can do, and what bounds
+  [`crates/sponsord-api/openapi/`](../../crates/sponsord-api/openapi).
+- [Security model](security.md): what each key can do, and what bounds
   a loss.
-- [The installer](docs/installer.md): what happens on a user's machine.
+- [The installer](installer.md): what happens on a user's machine.
 
 ## Crates
 
-Every crate shares one version and is released together, from a signed
-`vX.Y.Z` tag:
+The sponsord crates are members of the deCDN workspace. They share its
+version and ship with every deCDN release, from the same signed `vX.Y.Z`
+tag:
 
 | Crate | What it is | Release archives | Image |
 |---|---|---|---|
-| [`sponsord`](crates/sponsord) | The signing and top-up daemon | Linux (x86_64, aarch64) | `ghcr.io/decdn/sponsord` |
-| [`sponsord-onramp`](crates/sponsord-onramp) | The public onramp: gate, installers, hand-off | Linux (x86_64, aarch64) | `ghcr.io/decdn/sponsord-onramp` |
-| [`sponsord-core`](crates/sponsord-core) | The daemon's logic as a library, to embed instead of running the daemon | — | — |
-| [`sponsord-api`](crates/sponsord-api) | Wire types, error codes and typed clients for both servers | — | — |
-| [`sponsord-e2e`](crates/e2e) | Tests that run the daemon, the onramp and an installer together (not released) | — | — |
+| [`sponsord`](../../crates/sponsord) | The signing and top-up daemon | Linux (x86_64, aarch64) | `ghcr.io/decdn/sponsord` |
+| [`sponsord-onramp`](../../crates/sponsord-onramp) | The public onramp: gate, installers, hand-off | Linux (x86_64, aarch64) | `ghcr.io/decdn/sponsord-onramp` |
+| [`sponsord-core`](../../crates/sponsord-core) | The daemon's logic as a library, to embed instead of running the daemon | — | — |
+| [`sponsord-api`](../../crates/sponsord-api) | Wire types, error codes and typed clients for both servers | — | — |
+| [`sponsord-e2e`](../../crates/sponsord-e2e) | Tests that run the daemon, the onramp and an installer together (not released) | — | — |
 
 All but `sponsord-e2e` also go to crates.io. Images are mirrored to Docker
-Hub. Releases are signed by a maintainer: see [RELEASING.md](RELEASING.md),
-and [SECURITY.md](SECURITY.md) for verifying one.
+Hub. Releases are signed by a maintainer: see [RELEASING.md](../../RELEASING.md),
+and [SECURITY.md](../../SECURITY.md) for verifying one.
 
 ## Building
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+cargo build -p sponsord -p sponsord-onramp
+cargo nextest run -p sponsord -p sponsord-core -p sponsord-api -p sponsord-onramp -p sponsord-e2e
 ```
 
-The deCDN crates come from crates.io, at the
-[decdn](https://github.com/decdn/decdn) release `Cargo.lock` holds, so a
-fresh clone builds on its own. [CONTRIBUTING.md](CONTRIBUTING.md)
-covers the toolchain, the checks, the anvil tests, and building against a
-local deCDN checkout.
+The deCDN crates are path dependencies in the same workspace, so a change to
+a shared type is one pull request. [CONTRIBUTING.md](../../CONTRIBUTING.md)
+covers the toolchain and the checks; the anvil-backed tests (`chain_pool`,
+`binary_anvil`) build under `--features sponsord-core/anvil-e2e,sponsord/anvil-e2e`
+and need `anvil` and `forge` on `PATH`.
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+Licensed under either of [Apache License, Version 2.0](../../LICENSE-APACHE) or
+[MIT license](../../LICENSE-MIT) at your option.

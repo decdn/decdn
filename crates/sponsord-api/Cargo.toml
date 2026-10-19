@@ -14,15 +14,13 @@ categories.workspace = true
 [lints]
 workspace = true
 
-# The OpenAPI documents carry this crate's version (`info.version`), and the
-# snapshot test compares them byte for byte, so the release rewrites them with
-# the version it cuts. This list replaces the root release.toml's rather than
-# adding to it, hence the CHANGELOG.md entry repeated from there.
+# The OpenAPI documents in `openapi/` carry this crate's version
+# (`info.version`), and the snapshot test compares them byte for byte, so the
+# release rewrites them with the version it cuts.
 [package.metadata.release]
 pre-release-replacements = [
-  { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
-  { file = "../../docs/openapi/sponsord.json", search = '"version": "[^"]+"', replace = '"version": "{{version}}"', exactly = 1 },
-  { file = "../../docs/openapi/sponsord-onramp.json", search = '"version": "[^"]+"', replace = '"version": "{{version}}"', exactly = 1 },
+  { file = "openapi/sponsord.json", search = '"version": "[^"]+"', replace = '"version": "{{version}}"', exactly = 1 },
+  { file = "openapi/sponsord-onramp.json", search = '"version": "[^"]+"', replace = '"version": "{{version}}"', exactly = 1 },
 ]
 
 [features]
@@ -38,10 +36,10 @@ secret = ["dep:anyhow", "dep:zeroize"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
-zeroize = { version = "1", optional = true }
-alloy-primitives = { version = "1", features = ["serde"] }
+zeroize = { workspace = true, optional = true }
+alloy-primitives.workspace = true
 serde.workspace = true
-thiserror = "2"
+thiserror.workspace = true
 axum = { version = "0.8", optional = true, default-features = false, features = ["json"] }
 reqwest = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -54,4 +52,7 @@ utoipa = { version = "6", optional = true }
 sponsord-api = { path = ".", features = ["client", "axum", "openapi", "secret"] }
 serde_json.workspace = true
 tokio.workspace = true
-wiremock = "0.6"
+wiremock.workspace = true
+# reqwest is `rustls-no-provider` workspace-wide: the client tests install the
+# ring provider before they build a client.
+rustls.workspace = true

@@ -3385,6 +3385,29 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **sponsord joins the workspace.** The sponsorship daemon and its onramp,
+  which were the `decdn/sponsord` repository, are workspace members:
+  `sponsord` (the daemon binary), `sponsord-onramp` (the public onramp
+  binary), `sponsord-core`, `sponsord-api` and the unpublished
+  `sponsord-e2e`, with their history. They depend on `decdn-client`,
+  `decdn-common` and `decdn-incentive` by path, so a change to a shared type
+  is one pull request, and they ship with every release: the `sponsord` and
+  `sponsord-onramp` Linux archives join `SHA256SUMS`, and the
+  `ghcr.io/decdn/sponsord` and `ghcr.io/decdn/sponsord-onramp` images are
+  two more stages of the root Dockerfile, signed, tagged and mirrored to
+  Docker Hub like the others. The crates.io names do not change; their
+  `repository` metadata is this repository. Their guides live under
+  `docs/sponsord/`, the Compose and systemd material under
+  `deploy/sponsord/`, and the OpenAPI snapshots inside `sponsord-api`.
+  `publish-crates.sh` no longer opens a sponsord bump PR, and sponsord's
+  decdn-pin tooling is gone with the pin. The sponsord crates take the
+  workspace's `alloy` and `reqwest` entries, so both servers link ring and
+  no aws-lc-rs, and `check_crate_edges.py` guards their closures like the
+  CLI's; `sponsord-core` installs the rustls provider before it builds a
+  provider, and the onramp before its first `reqwest::Client`.
+  - Why: every decdn release needed a sponsord bump PR against crates.io and
+    a `decdn-e2e` git pin, and sponsord ran its own CI, release pipeline and
+    a mirror of this repository's tooling.
 - **Node: one warm connection per peer for DHT calls and pull legs (#2475).**
   A node keeps one `cdn/dht/v1` connection per peer, shared by bootstrap,
   bucket refresh, republish and lookups, and one `cdn/client/v1` connection
@@ -3461,9 +3484,7 @@ since project inception and will roll into the first tagged release.
 - **Release: `sign-release.sh` and `publish-crates.sh` live in `scripts/`.**
   Run them as `scripts/sign-release.sh <tag>` and
   `scripts/publish-crates.sh <tag>`. `.github/scripts/` keeps only what
-  workflows and hooks run. `publish-crates.sh` runs sponsord's bump from its
-  `scripts/open-decdn-bump.sh`, so a release needs sponsord's matching move on
-  its `main`.
+  workflows and hooks run.
 - **Both container images run on Debian 13 (`trixie-slim`, glibc 2.41)
   (#2409).** The binaries are the same cross-built release archives, so
   nothing changes for an operator who runs the daemon or CLI as shipped. An
@@ -4017,17 +4038,15 @@ since project inception and will roll into the first tagged release.
   `decdn bundle pull` is now a caller of it; its output, `--json` report and
   exit codes do not change. The pull future is not `Send`.
 
-- **Release: `publish-crates.sh` opens devops' and sponsord's decdn bump PRs
-  (#2399, #2421).** After the upload, the script clones decdn/devops and then
-  decdn/sponsord into temporary directories and runs each one's
-  `open-decdn-bump.sh <tag>`, which opens the PR that pins that repository to
-  the new release with the maintainer's `gh` login. devops' PR moves the
-  Ansible role, Helm chart, Compose and onramp pins. A failure prints the
-  command to run later and never fails the publish; a `DECDN_REPO` other than
-  `decdn/decdn` opens nothing, and `DECDN_SKIP_DEVOPS_BUMP=1` or
-  `DECDN_SKIP_SPONSORD_BUMP=1` (or `true`/`yes`) skips one.
-  - Why: devops and sponsord pin decdn at a release tag, and each move was a
-    PR opened by hand after the release.
+- **Release: `publish-crates.sh` opens devops' decdn bump PR (#2399, #2421).**
+  After the upload, the script clones decdn/devops into a temporary directory
+  and runs its `open-decdn-bump.sh <tag>`, which opens the PR that pins devops
+  to the new release with the maintainer's `gh` login: the Ansible role, Helm
+  chart, Compose and onramp pins. A failure prints the command to run later
+  and never fails the publish; a `DECDN_REPO` other than `decdn/decdn` opens
+  nothing, and `DECDN_SKIP_DEVOPS_BUMP=1` (or `true`/`yes`) skips it.
+  - Why: devops pins decdn at a release tag, and the move was a PR opened by
+    hand after the release.
 - **`serve_stream` spans time their serve loop's waits by cause (#2348).** A
   serve loop records `store_wait_ns`, `send_wait_ns` and `proof_wait_ns` as
   it ends, with the QUIC path's state: `path_kind`, `path_rtt_us`,

@@ -80,8 +80,25 @@ CARGO_BUILD_WARNINGS=deny cargo clippy -p decdn-incentive --no-default-features 
 ```
 
 The `--all-features` run is the only one that reaches anything behind an off-by-default feature —
-the `anvil-e2e` targets (journeys and the two `decdn-node` anvil tests), `public-api-test`. Run it
-before pushing a change that touches gated code, or the first thing that tells you is a red CI.
+the `anvil-e2e` targets (journeys, the two `decdn-node` anvil tests, and sponsord's `chain_pool`
+and `binary_anvil`), `public-api-test`, the sponsord `test-support` fakes. Run it before pushing
+a change that touches gated code, or the first thing that tells you is a red CI.
+
+The sponsord crates (`crates/sponsord*`, [`docs/sponsord/`](docs/sponsord/README.md)) have two
+checks of their own. Their anvil-backed tests need `anvil` and `forge` on `PATH`, like the
+journeys:
+
+```bash
+cargo nextest run --features sponsord-core/anvil-e2e,sponsord/anvil-e2e \
+  -p sponsord-core -p sponsord --test chain_pool --test binary_anvil
+```
+
+And `sponsord-api`'s OpenAPI documents are snapshot-tested against its types, so after changing
+one (a doc comment on a wire type is its OpenAPI description) regenerate them:
+
+```bash
+UPDATE_OPENAPI=1 cargo test -p sponsord-api --test openapi
+```
 
 ### Unit test placement
 

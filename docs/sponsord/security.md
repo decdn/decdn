@@ -1,6 +1,6 @@
 # Security model
 
-Report vulnerabilities as described in [SECURITY.md](../SECURITY.md).
+Report vulnerabilities as described in [SECURITY.md](../../SECURITY.md).
 
 ## What holds what
 

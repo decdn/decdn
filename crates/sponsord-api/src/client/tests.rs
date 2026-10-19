@@ -7,8 +7,15 @@ use crate::{IssuedCapability, MicroUsdc};
 
 const SIGNER: Address = Address::repeat_byte(0xaa);
 
+/// A reqwest client. The workspace builds reqwest with `rustls-no-provider`,
+/// so a provider has to be installed before the first client is built.
+fn http() -> reqwest::Client {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::new()
+}
+
 fn daemon(base: &str) -> DaemonClient {
-    DaemonClient::new(base, "tok".into(), reqwest::Client::new())
+    DaemonClient::new(base, "tok".into(), http())
 }
 
 async fn mock_issue(status: u16, body: serde_json::Value) -> MockServer {
@@ -135,6 +142,7 @@ async fn a_hung_daemon_times_out_as_unavailable() {
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
         .mount(&server)
         .await;
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let http = reqwest::Client::builder()
         .timeout(Duration::from_millis(200))
         .build()
@@ -170,7 +178,7 @@ async fn info_parses() {
 }
 
 fn onramp(base: &str) -> OnrampClient {
-    OnrampClient::new(base, reqwest::Client::new())
+    OnrampClient::new(base, http())
 }
 
 #[tokio::test]

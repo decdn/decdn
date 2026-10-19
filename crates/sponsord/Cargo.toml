@@ -32,15 +32,15 @@ alloy.workspace = true
 tracing.workspace = true
 # `env-filter`: `RUST_LOG`, with the RPC URL's span held back (main.rs).
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-axum = "0.8"
+axum.workspace = true
 subtle = "2"
 
 [dev-dependencies]
 decdn-client.workspace = true
 decdn-e2e = { workspace = true, features = ["anvil-e2e"] }
 reqwest.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 sponsord-core = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
 tokio-util.workspace = true
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true, features = ["util"] }

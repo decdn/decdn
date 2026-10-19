@@ -62,7 +62,8 @@ and it resumes. A sponsor pays for the transfer, so you need no wallet, keys, or
 Later, `decdn self-update` moves the installed binary to the latest signed release.
 
 The [catalogue on decdn.org](https://decdn.org/#try) lists more seeded content. To pay for
-your own users' downloads the same way, run [sponsord](https://github.com/decdn/sponsord).
+your own users' downloads the same way, run [sponsord](docs/sponsord/README.md), the
+sponsorship daemon and onramp that ship with every release.
 
 ## ✨ Features
 
@@ -104,11 +105,14 @@ mainnet deployment. Many ADRs are still marked Draft, so the specification can c
 cargo install --locked decdn-cli decdn-node
 docker pull ghcr.io/decdn/decdn-node     # daemon + CLI; mirrored to docker.io/decdn/decdn-node
 docker pull ghcr.io/decdn/decdn          # CLI only; mirrored to docker.io/decdn/decdn
+docker pull ghcr.io/decdn/sponsord       # sponsorship daemon, for publishers who pay for their users' downloads
+docker pull ghcr.io/decdn/sponsord-onramp # its public onramp; both mirrored to docker.io/decdn/…
 ```
 
 Each [GitHub release](https://github.com/decdn/decdn/releases) also carries
 `decdn-${VERSION}-${TARGET}` and `decdn-node-${VERSION}-${TARGET}` archives (`.tar.gz`,
-or `.zip` on Windows). [SECURITY.md](SECURITY.md) explains how to verify each channel.
+or `.zip` on Windows), and `sponsord-…` and `sponsord-onramp-…` archives for Linux.
+[SECURITY.md](SECURITY.md) explains how to verify each channel.
 
 A `decdn` installed from an archive or by the one-liner updates itself:
 `decdn self-update` fetches the latest release, verifies its `SHA256SUMS.minisig`
@@ -383,12 +387,19 @@ crates/
   incentive/    — payment pools, staking, vouchers (alloy for Ethereum)
   reputation/   — local per-peer reputation scoring (ADR 008)
   e2e/          — test-only Rust↔contract fixtures (anvil + the production deploy script)
+  sponsord/     — sponsorship daemon binary `sponsord`: signs download capabilities against a PaymentPool, keeps it topped up
+  sponsord-onramp/ — public onramp binary `sponsord-onramp`: the gate, the `decdn.sh` / `decdn.ps1` installers, the hand-off
+  sponsord-core/ — the daemon's logic as a library, built on `client` and `incentive`
+  sponsord-api/ — sponsord wire types, error codes and typed HTTP clients (leaf crate)
+  sponsord-e2e/ — test-only: the daemon, the onramp and an installer run together
 contracts/      — Solidity contracts + Foundry (excluded from the Cargo workspace)
 ```
 
 The daemon is itself a paying client on its upstream cache-miss leg, so `node` depends on
-`client` like any other consumer. The three leaf crates keep the publisher CLI free of any
-blob store or AWS SDK. `.github/scripts/check_crate_edges.py` enforces that boundary in CI.
+`client` like any other consumer; so does `sponsord-core`, which opens the pool a sponsor
+pays from. The leaf crates keep the publisher CLI, the client SDK and the sponsord servers
+free of any blob store or AWS SDK. `.github/scripts/check_crate_edges.py` enforces that
+boundary in CI.
 
 The contracts cover operator bonding, USDC settlement and the fee split, buyback-and-burn,
 served-bytes governance, slashing and appeals, content takedown, and publisher namespaces.
@@ -425,7 +436,7 @@ how they interact.
 | Operating a node | [Operator runbook](docs/runbook.md), [key rotation](adr/appendix-operator-key-rotation.md), [upgrade path](adr/appendix-operator-upgrade-path.md) |
 | Monitoring | [Dashboards and alert rules](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring) (in `decdn/devops`); [metric surface](adr/appendix-observability.md) |
 | Contracts | [`contracts/README.md`](contracts/README.md) |
-| Sponsored downloads | [decdn/sponsord](https://github.com/decdn/sponsord): the onramp behind `decdn.sh` and `decdn.ps1` |
+| Sponsored downloads | [`docs/sponsord/`](docs/sponsord/README.md): the daemon and onramp behind `decdn.sh` and `decdn.ps1` |
 | Releases | [RELEASING.md](RELEASING.md): cutting, signing, and publishing a release |
 
 ## 🤝 Contributing

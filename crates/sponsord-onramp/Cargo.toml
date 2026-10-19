@@ -20,13 +20,15 @@ clap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
-alloy-primitives = "1"
+alloy-primitives.workspace = true
 reqwest.workspace = true
+# reqwest is `rustls-no-provider` workspace-wide; `main` installs ring.
+rustls.workspace = true
 serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-async-trait = "0.1"
-axum = "0.8"
+async-trait.workspace = true
+axum.workspace = true
 
 [features]
 # `test_support`: fakes for the daemon and the gate, and a ready `AppState`.
@@ -36,5 +38,5 @@ test-support = []
 # This crate's own integration tests use `test_support`.
 sponsord-onramp = { path = ".", features = ["test-support"] }
 serde_json.workspace = true
-wiremock = "0.6"
-tower = { version = "0.5", features = ["util"] }
+wiremock.workspace = true
+tower = { workspace = true, features = ["util"] }

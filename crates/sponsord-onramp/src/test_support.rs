@@ -38,7 +38,11 @@ pub const fn test_info() -> Info {
 }
 
 /// A valid [`OnrampConfig`] with the Turnstile gate and no rate limits.
+///
+/// Also installs the process-wide rustls provider, so a test that builds a
+/// `reqwest::Client` after taking its config needs no call of its own.
 pub fn test_config() -> OnrampConfig {
+    crate::tls::install_crypto_provider();
     OnrampConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         public_url: "https://up.example.org".into(),

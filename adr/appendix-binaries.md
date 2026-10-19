@@ -84,12 +84,17 @@ and would silently miss data on a prefix rename.
 
 ## Distribution
 
-- **Container images.** Two stages of one Dockerfile build the
+- **Container images.** Four stages of one Dockerfile build the
   container images:
   - `decdn-node` runs the daemon. It also contains the `decdn` CLI.
     An operator uses `docker exec <container> decdn node …` to reach
     the loopback admin port.
   - `decdn` runs the CLI only. Publishers and clients use it.
+  - `sponsord` and `sponsord-onramp` run the sponsorship daemon and
+    its public onramp (`crates/sponsord`, `crates/sponsord-onramp`).
+    A publisher who pays for their users' downloads runs them. They
+    are built on `decdn-client` and `decdn-incentive`, and never on
+    the daemon's crates.
 
   Each image copies its binaries out of the Linux release archives.
   It does not compile from source. Each binary in an image is
@@ -98,7 +103,10 @@ and would silently miss data on a prefix rename.
 - **Release archives** ship both binaries as separate tarballs per
   target (Linux x86_64 + aarch64, macOS x86_64 + aarch64, Windows
   x86_64): `decdn-node-${VERSION}-${TARGET}.tar.gz` (operators) and
-  `decdn-${VERSION}-${TARGET}.tar.gz` (publishers).
+  `decdn-${VERSION}-${TARGET}.tar.gz` (publishers). The two sponsord
+  servers ship for the two Linux targets only, as
+  `sponsord-${VERSION}-${TARGET}.tar.gz` and
+  `sponsord-onramp-${VERSION}-${TARGET}.tar.gz`.
 - **Platform floor.** The Linux binaries link glibc dynamically. Both
   Linux targets build with `cross`, which sets the floor at glibc 2.31
   (Debian 11, Ubuntu 20.04, RHEL 8). See

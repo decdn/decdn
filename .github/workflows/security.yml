@@ -58,6 +58,8 @@ jobs:
         image:
           - ghcr.io/${{ github.repository }}-node
           - ghcr.io/${{ github.repository }}
+          - ghcr.io/${{ github.repository_owner }}/sponsord
+          - ghcr.io/${{ github.repository_owner }}/sponsord-onramp
     steps:
       - uses: actions/checkout@v7
 

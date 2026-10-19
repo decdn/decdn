@@ -6,7 +6,7 @@ sponsorship daemon, as a library: signing capped, expiring capabilities
 a treasury. For Rust programs that embed the daemon's behaviour instead of
 calling it over HTTP.
 
-See the [sponsord repository](https://github.com/decdn/sponsord) for the
+See the [sponsord guide](https://github.com/decdn/decdn/blob/main/docs/sponsord/README.md) for the
 architecture, and [decdn](https://github.com/decdn/decdn) for the protocol.
 
 Licensed under either of MIT or Apache-2.0, at your option.

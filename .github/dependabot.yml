@@ -37,7 +37,10 @@ updates:
   # when it can parse a version out of it, and `trixie-slim` gives it nothing,
   # so with a bare tag this ecosystem would open no PRs at all.
   - package-ecosystem: docker
-    directory: /
+    directories:
+      - /
+      # The source-build image behind deploy/sponsord/compose.yaml.
+      - /deploy/sponsord
     schedule:
       interval: weekly
     open-pull-requests-limit: 5

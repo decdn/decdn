@@ -2,8 +2,10 @@
 # Fails if a container image repository is spelled inconsistently, or if an
 # image has no Docker Hub overview file.
 #
-# There are two images: `<repo>-node` (daemon + CLI) and `<repo>` (CLI only).
-# Each name lives in three places that must agree:
+# There are four images: `<repo>-node` (daemon + CLI), `<repo>` (CLI only),
+# and `<owner>/sponsord` and `<owner>/sponsord-onramp` (one server each, named
+# for their binaries under the organisation rather than the repository). Each
+# name lives in three places that must agree:
 #   * release.yml's docker matrix — each `target:` (the Dockerfile stage, which
 #     names <stage>-image-digest.txt) with the `image:` it pushes to
 #   * sign-release.sh's IMAGES list and GHCR_IMAGE table — the list picks which
@@ -34,6 +36,8 @@ cd "$REPO_ROOT"
 # shellcheck disable=SC2016  # not expanding it is the entire point: this is the
 # literal text that must appear in the workflow file.
 GH_REPO='${{ github.repository }}'
+# shellcheck disable=SC2016  # same
+GH_OWNER='${{ github.repository_owner }}'
 
 fail=0
 missing_overview=0
@@ -74,15 +78,22 @@ expect_pair() {
 # The list is checked whole: dropping a stage from it would leave that image's
 # digest unsigned and its tags unpromoted, and the table lines alone would
 # still pass.
-expect scripts/sign-release.sh 'IMAGES=( "decdn-node" "decdn" )'
+expect scripts/sign-release.sh 'IMAGES=( "decdn-node" "decdn" "sponsord" "sponsord-onramp" )'
 
-# Stage name → repository suffix.
-for pair in "decdn-node:-node" "decdn:"; do
-  stage="${pair%%:*}" suffix="${pair#*:}"
-  expect_pair .github/workflows/release.yml "$stage" "${GH_REPO}${suffix}"
-  # shellcheck disable=SC2016  # ${REPO} is literal text in the target file
-  expect scripts/sign-release.sh "[${stage}]="'"ghcr.io/${REPO}'"${suffix}"'"'
-  expect .github/workflows/security.yml  "- ghcr.io/${GH_REPO}${suffix}"
+# Stage name → the image as the workflows spell it → as sign-release.sh spells
+# it. The decdn images hang off the repository (`${REPO}` in the script), the
+# sponsord images off its owner (`${OWNER}`).
+# shellcheck disable=SC2016  # ${REPO} and ${OWNER} are literal text in the target file
+for triple in \
+  "decdn-node|${GH_REPO}-node|"'ghcr.io/${REPO}-node' \
+  "decdn|${GH_REPO}|"'ghcr.io/${REPO}' \
+  "sponsord|${GH_OWNER}/sponsord|"'ghcr.io/${OWNER}/sponsord' \
+  "sponsord-onramp|${GH_OWNER}/sponsord-onramp|"'ghcr.io/${OWNER}/sponsord-onramp'
+do
+  IFS='|' read -r stage image script_image <<<"$triple"
+  expect_pair .github/workflows/release.yml "$stage" "$image"
+  expect scripts/sign-release.sh "[${stage}]=\"${script_image}\""
+  expect .github/workflows/security.yml  "- ghcr.io/${image}"
   [[ -f "docker/README.${stage}.md" ]] || {
     echo "error: stage $stage has no Docker Hub overview: docker/README.${stage}.md" >&2
     missing_overview=1

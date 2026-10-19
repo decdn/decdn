@@ -33,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts/dockerhub-description.py"
 # The fixture's own stages. The committed overviews are found by glob in the
 # last test, so a new image's file is checked without an edit here.
-STAGES = ["decdn-node", "decdn"]
+STAGES = ["decdn-node", "decdn", "sponsord", "sponsord-onramp"]
 USER = "hubuser"
 SECRET = "dckr_pat_secret"
 TOKEN = "access-token-1"
@@ -266,13 +266,10 @@ def test_pushes_both_fields_and_reads_them_back_anonymously(hub_env: Env) -> Non
             "description": f"The {s} image.",
             "full_description": "# Image\n\nOverview text.\n",
         }
-    assert calls(hub_env.hub) == [
-        ("POST", "/v2/auth/token"),
-        ("PATCH", "/v2/repositories/decdn/decdn-node"),
-        ("GET", "/v2/repositories/decdn/decdn-node"),
-        ("PATCH", "/v2/repositories/decdn/decdn"),
-        ("GET", "/v2/repositories/decdn/decdn"),
-    ]
+    expected = [("POST", "/v2/auth/token")]
+    for s in STAGES:
+        expected += [("PATCH", f"/v2/repositories/decdn/{s}"), ("GET", f"/v2/repositories/decdn/{s}")]
+    assert calls(hub_env.hub) == expected
     for method, _, headers, _ in hub_env.hub.requests:
         if method == "GET":
             assert "Authorization" not in headers

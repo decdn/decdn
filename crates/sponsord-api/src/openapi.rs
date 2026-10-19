@@ -1,5 +1,5 @@
 //! `OpenAPI` 3.1 documents for both servers, built from the types in this
-//! crate. The committed copies under `docs/openapi/` are checked against
+//! crate. The committed copies under this crate's `openapi/` are checked against
 //! these by `tests/openapi.rs`; regenerate them with
 //! `UPDATE_OPENAPI=1 cargo test -p sponsord-api --test openapi`.
 //!
