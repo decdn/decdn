@@ -138,7 +138,7 @@ KEYS_FILE="$REPO_ROOT/KEYS"
 MINISIGN_KEY="${DECDN_MINISIGN_KEY:-$HOME/.minisign/minisign.key}"
 [[ -f "$MINISIGN_KEY" ]] || die \
   "minisign secret key not found at $MINISIGN_KEY (set DECDN_MINISIGN_KEY).
-See RELEASING.md § The minisign key."
+See RELEASING.md § The minisign keys."
 MINISIGN_PUBS=( "$REPO_ROOT"/crates/cli/minisign*.pub )
 [[ -f "${MINISIGN_PUBS[0]}" ]] || die \
   "no crates/cli/minisign*.pub in the repository; the binary would trust no release key"
@@ -472,7 +472,7 @@ while IFS= read -r f; do
     die "cannot read $f from the $TAG tree"
   ! grep -qi 'placeholder' "$KEYS_HOME/${f##*/}" || die \
     "$f at $TAG is a placeholder key; the released binary would trust no real key.
-Commit the maintainer minisign public key first (RELEASING.md § The minisign key)."
+Commit your minisign public key first (RELEASING.md § The minisign keys)."
   TAG_PUBS+=( "$f" )
 done < <(git -C "$REPO_ROOT" ls-tree --name-only "$TAG" -- crates/cli/ | grep -E '^crates/cli/minisign[^/]*\.pub$' || true)
 (( ${#TAG_PUBS[@]} > 0 )) || die \
@@ -490,7 +490,7 @@ for f in "${TAG_PUBS[@]}"; do
 done
 [[ -n "$MINISIGN_PUB" ]] || die \
   "SHA256SUMS.minisig is not signed by a key the decdn binary trusts (crates/cli/minisign*.pub at $TAG).
-$MINISIGN_KEY is not the key whose public half that tree carries; see RELEASING.md § The minisign key.
+$MINISIGN_KEY is not the key whose public half that tree carries; see RELEASING.md § The minisign keys.
 minisign said: ${MINISIGN_ERR:-nothing}"
 echo "    signed SHA256SUMS.minisig ($MINISIGN_PUB)"
 

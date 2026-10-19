@@ -1,11 +1,13 @@
 //! Trust decisions for a release: the minisign signature over `SHA256SUMS`
 //! and the archive digest the signed manifest lists.
 //!
-//! The keys in [`TRUSTED_KEYS`] are the `minisign*.pub` files committed in
-//! this crate, embedded at build time. A release whose `SHA256SUMS.minisig`
-//! verifies under no key in that set is refused outright. To rotate the key,
-//! a release signed by the current key ships a binary that embeds both the
-//! current and the next key; releases after it sign with the next key.
+//! The keys in [`TRUSTED_KEYS`] are the `minisign-<maintainer>.pub` files
+//! committed in this crate, one per maintainer, embedded at build time. A
+//! release signed by any of them verifies; one whose `SHA256SUMS.minisig`
+//! verifies under no key in the set is refused outright. A binary trusts a
+//! key from the first release built after the file lands, which is why a
+//! maintainer rotating their key adds the new file in one release and
+//! removes the old one in a later release.
 
 use anyhow::{Context, bail};
 use minisign_verify::{Error as MinisignError, PublicKey, Signature};
@@ -13,8 +15,9 @@ use sha2::{Digest, Sha256};
 
 use super::release::Manifest;
 
-/// The minisign public keys this build trusts, one `minisign*.pub` file each.
-pub(crate) const TRUSTED_KEYS: &[&str] = &[include_str!("../../../minisign.pub")];
+/// The minisign public keys this build trusts: every `crates/cli/minisign*.pub`,
+/// one `include_str!` per file. A unit test keeps this list equal to the files.
+pub(crate) const TRUSTED_KEYS: &[&str] = &[include_str!("../../../minisign-placeholder.pub")];
 
 /// Decode every embedded key.
 pub(crate) fn trusted_keys() -> anyhow::Result<Vec<PublicKey>> {

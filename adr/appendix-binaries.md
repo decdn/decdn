@@ -108,10 +108,11 @@ and would silently miss data on a prefix rename.
 - **Self-update channel.** `decdn self-update` replaces the running
   `decdn` binary with the latest release. The release carries
   `SHA256SUMS.minisig`, a minisign signature over the same manifest
-  the GPG signature covers. The binary embeds the public keys
-  committed as `crates/cli/minisign*.pub` and refuses a release that
-  no embedded key verifies. It then checks the archive against the
-  manifest, unpacks it, and swaps the new binary in for the old one.
+  the GPG signature covers. The binary embeds the maintainers' public
+  keys, committed as `crates/cli/minisign-<maintainer>.pub`, and
+  refuses a release that no embedded key verifies. It then checks the
+  archive against the manifest, unpacks it, and swaps the new binary
+  in for the old one.
   It replaces only a binary the user can write and that
   `cargo install` did not place. It never applies a downgrade or a
   pre-release. Once a day, after a command succeeds on a terminal,

@@ -28,20 +28,25 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    gpg --fingerprint <your-key-id>           # add the fingerprint to SECURITY.md
    ```
 
-2. **A minisign key.** `sign-release.sh` also signs `SHA256SUMS` with
-   minisign, the signature `decdn self-update` checks. The binary trusts only
-   the public keys committed as `crates/cli/minisign*.pub`, so the key you
-   sign with must be one of them. Generate the pair once and keep the secret
-   half out of the repository:
+2. **A minisign key in `crates/cli/`.** `sign-release.sh` also signs
+   `SHA256SUMS` with minisign, the signature `decdn self-update` checks. The
+   binary trusts only the public keys committed as
+   `crates/cli/minisign-<maintainer>.pub`, one file per maintainer, so the key
+   you sign with must be yours among them. Generate the pair once and keep
+   the secret half out of the repository:
 
    ```bash
-   minisign -G -p crates/cli/minisign.pub -s ~/.minisign/minisign.key
+   minisign -G -p crates/cli/minisign-<you>.pub -s ~/.minisign/minisign.key
    ```
 
-   Commit `crates/cli/minisign.pub`; SECURITY.md points readers at that file
-   for the key id. The script reads the secret key from `DECDN_MINISIGN_KEY`,
-   defaulting to `~/.minisign/minisign.key`. See
-   [The minisign key](#the-minisign-key) for rotation.
+   Commit the `.pub`, add its `include_str!` line to `TRUSTED_KEYS` in
+   `crates/cli/src/commands/self_update/verify.rs` (a unit test keeps that
+   list equal to the files), and add the key id beside your fingerprint in
+   SECURITY.md. A binary trusts your key from the first release built after
+   the file lands, so merge it before the tag you sign. The script reads the
+   secret key from `DECDN_MINISIGN_KEY`, defaulting to
+   `~/.minisign/minisign.key`. See [The minisign keys](#the-minisign-keys)
+   for adding, removing and rotating keys.
 
 3. **Git configured to sign.** `cargo release` relies on git's own signing
    config; `release.toml` sets `sign-commit` and `sign-tag`. Set this
@@ -194,8 +199,8 @@ strictly against them **and** that every published archive appears in the
 manifest; signs `SHA256SUMS` and each image's digest file and SBOM; verifies
 each signature against a keyring built only from `KEYS`; signs `SHA256SUMS` a
 second time with minisign and verifies that against the
-`crates/cli/minisign*.pub` in the tag's tree, the keys the released binary
-embeds; uploads the five `.asc` files and `SHA256SUMS.minisig`; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
+`crates/cli/minisign-*.pub` in the tag's tree, the maintainers' keys the
+released binary embeds; uploads the five `.asc` files and `SHA256SUMS.minisig`; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
 signed digest on GHCR; mirrors those same digests to Docker Hub; for a stable
 release, pushes each Docker Hub overview; checks that every promoted repository
 is pullable without credentials; and flips the release out of draft.
@@ -233,7 +238,7 @@ Useful environment overrides:
 | Variable | Effect |
 |----------|--------|
 | `DECDN_SIGNING_KEY` | key to sign with. Unset, the script uses your one secret key with a live `@decdn.org` uid that is in `KEYS`, else your one secret key that is in `KEYS`. Set it when you hold two or more such keys (for example during a key rotation). gpg.conf's `default-key` is not read |
-| `DECDN_MINISIGN_KEY` | the minisign secret key that signs `SHA256SUMS` for `decdn self-update` (default `~/.minisign/minisign.key`). Its public half must be one of `crates/cli/minisign*.pub` |
+| `DECDN_MINISIGN_KEY` | your minisign secret key, which signs `SHA256SUMS` for `decdn self-update` (default `~/.minisign/minisign.key`). Its public half must be one of the `crates/cli/minisign-*.pub` maintainer keys |
 | `DECDN_SKIP_IMAGE_TAGS` | set to `1` to publish with **no** pullable image tag at all — the release then ships only the signed digests |
 | `DECDN_SKIP_DOCKERHUB` | set to `1` to tag on GHCR only, with no Docker Hub mirror or overview (implied by `DECDN_SKIP_IMAGE_TAGS`) |
 | `DECDN_DOCKERHUB_REPO` | the Docker Hub counterpart of `DECDN_REPO` (defaults to it); the images are `<it>-node` and `<it>` |
@@ -263,33 +268,33 @@ release means deleting and re-cutting it.
 On failure the script keeps its download directory and prints the path, so you
 can inspect the bytes rather than re-downloading several hundred megabytes.
 
-## The minisign key
+## The minisign keys
 
 `decdn self-update` trusts a release only when `SHA256SUMS.minisig` verifies
-against a key the running binary embeds: the `crates/cli/minisign*.pub` files,
-included at build time. GPG stays the channel people verify by hand
-([SECURITY.md](SECURITY.md#verify-a-binary-archive)); minisign is the one the
-binary carries, because a full OpenPGP implementation has no place in the
-client crate graph.
+against a key the running binary embeds: the `crates/cli/minisign-*.pub`
+files, one per maintainer, included at build time. A release signed by any
+of them is accepted, the rule `KEYS` sets for GPG. GPG stays the channel
+people verify by hand ([SECURITY.md](SECURITY.md#verify-a-binary-archive));
+minisign is the one the binary carries, because a full OpenPGP implementation
+has no place in the client crate graph.
 
-A binary can only ever accept a key it already embeds, so a rotation runs
-across two releases:
+A binary can only ever accept a key it already embeds, so every change to the
+set reaches users through a release:
 
-1. Generate the new pair. Rename the current `crates/cli/minisign.pub` to
-   `crates/cli/minisign-prev.pub`, commit the new public key as
-   `crates/cli/minisign.pub`, and add the second `include_str!` to
-   `TRUSTED_KEYS` in `crates/cli/src/commands/self_update/verify.rs` (a unit
-   test keeps that list equal to the files).
-2. Cut release N and sign it with the **old** key (`DECDN_MINISIGN_KEY` names
-   it). Every installed binary verifies it, and the binary it ships trusts
-   both keys.
-3. From release N+1 on, sign with the new key. A binary older than N refuses
-   those releases ("not signed by a key this decdn build trusts"); say in the
-   release notes of N that older binaries must reinstall by hand.
-4. Once no supported binary predates N, delete `minisign-prev.pub` and its
-   `TRUSTED_KEYS` entry.
+- **Adding a maintainer** is the one-time setup step above. Their key signs
+  releases from the first one built after the file lands.
+- **Removing a maintainer** deletes their file and its `TRUSTED_KEYS` entry.
+  Binaries that never update keep trusting the removed key, as they keep an
+  old `KEYS`; the release that drops it is the one to call out in its notes.
+- **Rotating your own key** is an add followed by a remove: commit the new
+  file, cut and sign a release with the **old** key so every installed binary
+  accepts it and the binary it ships trusts both, sign the releases after it
+  with the new key, and delete the old file once no supported binary predates
+  that release. A binary older than it refuses the newer releases ("not
+  signed by a key this decdn build trusts"); say in the release notes that
+  such binaries must reinstall by hand.
 
-The script verifies the signature against the `minisign*.pub` files in the
+The script verifies the signature against the `minisign-*.pub` files in the
 tag's tree, which are exactly the keys the binary being released embeds, so a
 release signed with a key that binary does not carry stops before anything is
 uploaded.

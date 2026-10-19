@@ -14,13 +14,16 @@ is committed to this repository as [`KEYS`](KEYS):
 ```
 Ant Somers <ant@decdn.org>
 Fingerprint: DA75 1570 6F18 73D2 74D8  A369 9E11 A9FF D62D AADB
+minisign key: crates/cli/minisign-ant.pub (key id listed here once committed)
 
 Alper Gundogdu <alper@decdn.org>
 Fingerprint: E27B 9A2D 2519 1E8E C90B  F8AE 57E2 823C 16CC D376
+minisign key: crates/cli/minisign-alper.pub (key id listed here once committed)
 ```
 
 A good signature from **any** key listed above is authentic. Adding or removing
-a maintainer is a change to `KEYS`, visible in this repository's history.
+a maintainer is a change to `KEYS` and to the `crates/cli/minisign-*.pub` files,
+visible in this repository's history.
 
 **Pin the fingerprint, not the file.** The signature is what protects you, and
 it protects you because you check it against a fingerprint you already trust —
@@ -37,14 +40,14 @@ own — verify them through the signed manifest.
 
 `SHA256SUMS` carries one more signature, `SHA256SUMS.minisig`, made with
 [minisign](https://jedisct1.github.io/minisign/). It exists for
-`decdn self-update`: the `decdn` binary embeds the minisign public key committed
-as [`crates/cli/minisign.pub`](crates/cli/minisign.pub) and refuses a release
-whose manifest signature verifies under no embedded key, before it reads a
-byte of the archive. The key id is encoded in the key itself and repeated in
-the file's comment line as `minisign -G` writes it; record it out of band the
-first time you verify a release, as you do the GPG fingerprints. A rotation
-ships the next key inside a release signed by the current one (RELEASING.md
-§ The minisign key).
+`decdn self-update`: the `decdn` binary embeds each maintainer's minisign public
+key, committed as [`crates/cli/minisign-<maintainer>.pub`](crates/cli/), and
+refuses a release whose manifest signature verifies under no embedded key,
+before it reads a byte of the archive. A key id is encoded in the key itself
+and repeated in the file's comment line as `minisign -G` writes it; record the
+ids out of band the first time you verify a release, as you do the GPG
+fingerprints. A new or rotated key reaches installed binaries inside a release
+signed by a key they already trust (RELEASING.md § The minisign keys).
 
 ### Verify a release tag
 
@@ -72,12 +75,12 @@ gpg --verify SHA256SUMS.asc SHA256SUMS
 sha256sum --ignore-missing --check SHA256SUMS
 ```
 
-The minisign signature verifies the same manifest with the key from
-`crates/cli/minisign.pub`; `decdn self-update` runs this check itself and
-applies no release that fails it:
+The minisign signature verifies the same manifest with any maintainer's key
+from `crates/cli/minisign-<maintainer>.pub`; `decdn self-update` runs this check
+itself and applies no release that fails it:
 
 ```bash
-minisign -Vm SHA256SUMS -p minisign.pub
+minisign -Vm SHA256SUMS -p crates/cli/minisign-<maintainer>.pub
 ```
 
 ### Verify the container images

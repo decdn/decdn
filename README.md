@@ -112,7 +112,7 @@ or `.zip` on Windows). [SECURITY.md](SECURITY.md) explains how to verify each ch
 
 A `decdn` installed from an archive or by the one-liner updates itself:
 `decdn self-update` fetches the latest release, verifies its `SHA256SUMS.minisig`
-against the key the binary embeds, and replaces the binary in place. A binary
+against a maintainer key the binary embeds, and replaces the binary in place. A binary
 `cargo install` placed, or one in a directory you cannot write (the container
 image, a package), is refused with the command to run instead. Once a day, after
 a command succeeds on a terminal, `decdn` prints one line when a newer release
