@@ -20,6 +20,11 @@
 //! `--dry-run`. A bundle or entry pull into a default destination refuses a
 //! path that holds a file no earlier pull of the same entry left there
 //! unchanged, unless `--overwrite`.
+//!
+//! A default destination, like any relative `-o`, resolves against the
+//! current directory, and so does the run's resume state. A run that stops on
+//! Ctrl-C or a give-up names that directory as the one to run the command again
+//! from.
 
 use std::path::{Path, PathBuf};
 
@@ -41,11 +46,33 @@ pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<(
         let shown = std::path::absolute(&shown).unwrap_or(shown);
         eprintln!("Downloading to {}", shown.display());
     }
-    if streams_one_blob(args, &uri) {
+    let result = if streams_one_blob(args, &uri) {
         super::fetch::fetch(args, &dest.path, &uri, config_path).await
     } else {
         super::bundle_pull::bundle_pull(args, &dest, &uri, config_path).await
+    };
+    with_resume_hint(args, result)
+}
+
+/// `result` with the [`resume_dir`] of `args` attached to a stop, so its
+/// re-run advice names the directory to run the command again from.
+fn with_resume_hint<T>(args: &GetArgs, result: anyhow::Result<T>) -> anyhow::Result<T> {
+    match resume_dir(args) {
+        Some(dir) => super::interrupt::name_resume_dir(result, &dir),
+        None => result,
     }
+}
+
+/// The directory a stopped run must run again from to resume: the current
+/// directory, which a default destination or a relative `-o` resolves against.
+/// `None` for an absolute `-o`, whose resume state a re-run from any directory
+/// finds, for `-o -`, which keeps none, and when the current directory cannot
+/// be read.
+fn resume_dir(args: &GetArgs) -> Option<PathBuf> {
+    if args.output.as_deref().is_some_and(Path::is_absolute) || is_stdout(args) {
+        return None;
+    }
+    std::env::current_dir().ok()
 }
 
 /// Where a `decdn get` run writes: `-o`, or the default for the URI's target.
