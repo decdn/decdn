@@ -14,7 +14,6 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::U256;
@@ -82,9 +81,8 @@ async fn daemon_binary_serves_tops_up_and_shuts_down() {
     )
     .await
     .unwrap();
-    let opened = open_pool(
+    let (opened, unrecorded) = open_pool(
         &PaymentPool::new(pool_addr, provider),
-        Arc::new(signer.clone()),
         Deployment {
             chain_id: chain.chain_id(),
             payment_pool: pool_addr,
@@ -93,9 +91,11 @@ async fn daemon_binary_serves_tops_up_and_shuts_down() {
         owner,
         U256::from(OPEN_DEPOSIT),
         None,
+        None,
     )
     .await
     .unwrap();
+    unrecorded.recorded();
     let pool_id = opened.state.pool_id;
 
     let port = {

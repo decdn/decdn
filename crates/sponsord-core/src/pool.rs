@@ -240,9 +240,14 @@ impl PoolChain for ChainPool {
         )
         .await
         .map_err(|e| redacted_top_up("approve the top-up".to_owned(), &e))?;
-        let topped = top_up(&self.contract, self.owner, pool_id, amount)
+        // No escrow handle and no receipt bound: the daemon keeps no local pool
+        // record for decdn to reconcile, and the keeper holds further top-ups
+        // on decdn's own `TopUpUnconfirmed` when the receipt read fails.
+        let (topped, unrecorded) = top_up(&self.contract, self.owner, pool_id, amount, None, None)
             .await
             .map_err(|e| redacted_top_up(format!("top up {pool_id}"), &e))?;
+        // The credit is reported to the keeper, which is this daemon's record.
+        unrecorded.recorded();
         Ok(MicroUsdc(
             u64::try_from(topped.credited).unwrap_or(u64::MAX),
         ))

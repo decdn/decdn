@@ -14,8 +14,6 @@
     clippy::indexing_slicing
 )]
 
-use std::sync::Arc;
-
 use alloy::primitives::{TxHash, U256};
 use alloy::providers::Provider as _;
 use alloy::signers::local::PrivateKeySigner;
@@ -72,17 +70,18 @@ async fn remaining_grows_after_topup() {
         payment_pool: chain.addrs().payment_pool,
     };
     let contract = PaymentPool::new(chain.addrs().payment_pool, open_provider);
-    let opened = open_pool(
+    let (opened, unrecorded) = open_pool(
         &contract,
-        Arc::new(signer.clone()),
         deployment,
         chain.usdc(),
         owner,
         U256::from(OPEN_DEPOSIT_MICRO_USDC),
         None,
+        None,
     )
     .await
     .expect("open pool");
+    unrecorded.recorded();
     let pool_id = opened.state.pool_id;
 
     // 3. Build the sponsor's pool client against the fixture endpoint + pool addr,

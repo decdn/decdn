@@ -15,6 +15,12 @@ release.
 
 ## [Unreleased]
 
+### Changed
+
+- **decdn v0.2.0.** The decdn crates are locked at `0.2.0` from crates.io and
+  require `0.2`, and the anvil fixtures are at decdn's `v0.2.0` release tag
+  (`5c830ea2dae90c99410097192b558b3ac970ccc4`).
+
 ## [0.1.0] - 2026-10-14
 
 ### Changed
