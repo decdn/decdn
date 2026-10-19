@@ -29,6 +29,7 @@ fn default_config_template_parses_with_every_section() {
         receipts,
         content,
         client,
+        self_update,
     } = &parsed;
     // Every uncommented line is a section header with no field values —
     // some nested (`[dht.rate_limit]`, `[probe.rate_limit]`) but each
@@ -48,6 +49,7 @@ fn default_config_template_parses_with_every_section() {
         ("receipts", receipts.is_some()),
         ("content", content.is_some()),
         ("client", client.is_some()),
+        ("self_update", self_update.is_some()),
     ] {
         assert!(
             present,

@@ -886,6 +886,9 @@ const CLIENT_CONFIG: &str = r#"# deCDN client configuration — fetch-only consu
 # usdc_address = ""                  # USDC settlement token deposits spend
 # buyer_working_deposit_micro_usdc = 10000000  # deposit when OPENING a pool and refill target; must be > 0; default 10 USDC
 # buyer_max_approve = false          # exact deposit-sized USDC approvals (client default); true opts into an unlimited standing approval
+
+# [self_update]
+# check = true                       # once a day, print a notice when a newer signed release exists; `decdn self-update` applies it
 "#;
 
 /// Default TOML config file content, written by `decdn config init`.
@@ -1115,6 +1118,12 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # registered nodes are probed/discovered; never ranks them. Absent/empty =>
 # no filter, every registered node is eligible.
 # region_allowlist = ["US", "DE"]
+
+[self_update]
+# Once a day, after a command's own work, `decdn` checks for a newer signed
+# release and prints one line on stderr when it finds one. `false` turns the
+# check off; `DECDN_SELF_UPDATE_CHECK=0` does the same for one shell.
+# check = true
 "#;
 
 #[cfg(test)]

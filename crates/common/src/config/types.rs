@@ -46,6 +46,9 @@ pub struct FileConfig {
     /// Client-scoped discovery settings. Absent => no region filter;
     /// discovery/probing considers every registered node.
     pub client: Option<ClientConfig>,
+    /// `decdn` self-update settings. Absent => the CLI checks once a day for
+    /// a newer signed release. CLI-only: the daemon ignores it.
+    pub self_update: Option<SelfUpdateConfig>,
 }
 
 /// Identity section of the config file.
@@ -73,6 +76,18 @@ pub struct ClientConfig {
     /// which peers are near, so a warm store selects by latency without
     /// consulting this list.
     pub region_allowlist: Option<Vec<String>>,
+}
+
+/// `decdn` self-update section of the config file. The `decdn` CLI reads it
+/// raw from the file on every run; it is not resolved into
+/// [`super::ResolvedConfig`] and `decdn config validate` does not report it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelfUpdateConfig {
+    /// Whether a `decdn` command checks once a day for a newer signed release
+    /// and prints a one-line notice on stderr. `DECDN_SELF_UPDATE_CHECK`
+    /// overrides it. Absent => `true`.
+    pub check: Option<bool>,
 }
 
 /// Network section of the config file.
