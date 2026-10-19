@@ -13,7 +13,9 @@
 //! chunks holds no slot while it waits. A manifest `chunks` entry is never
 //! fetched or stored as its own blob: its hints only let a byte range shared
 //! with another entry be recognized and spliced from disk instead of paid for
-//! again.
+//! again. Every entry lands beneath the output directory's open handle
+//! ([`Landing`]), so a symlink in its path cannot move the write outside the
+//! directory.
 //!
 //! **Shared chunks are fetched once.** When a chunk hint hash appears in two or
 //! more entries, the run assigns that chunk to one entry — its smallest holder,
@@ -82,6 +84,7 @@ use futures_util::StreamExt as _;
 use iroh::{Endpoint, RelayUrl};
 use tokio_util::sync::CancellationToken;
 
+use super::landing::Landing;
 use super::skip_cache::{self, SavedManifest, SavedMtime};
 use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
@@ -165,48 +168,14 @@ where
         .map_err(|e| anyhow!("{what} task: {e}"))?
 }
 
-/// [`link_or_copy_atomic`] on the blocking pool: its copy fallback moves a whole
-/// blob.
-async fn link_off_runtime(src: PathBuf, dest: PathBuf) -> anyhow::Result<()> {
-    off_runtime("link", move || link_or_copy_atomic(&src, &dest)).await
-}
-
-/// Materialize `src`'s content at `dest` without re-reading it over the network:
-/// a hard link where the filesystem allows it, else a full copy (cross-device
-/// `EXDEV`, or a filesystem that can't link). Staged in `dest`'s parent and
-/// renamed into place so `dest` is only ever absent or complete — the same
-/// atomic-replace invariant [`materialize`] upholds, which [`resolve_disk_state`]
-/// and [`plan_slots`] rely on when deciding a path is skip-safe.
-fn link_or_copy_atomic(src: &Path, dest: &Path) -> anyhow::Result<()> {
-    let parent = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    // A duplicate path may live in a subdir the canonical path never created.
-    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    let staged = tempfile::Builder::new()
-        .prefix(".decdn-link-")
-        .make_in(parent, |candidate| {
-            match std::fs::hard_link(src, candidate) {
-                Ok(()) => Ok(()),
-                // A fresh random candidate colliding is make_in's signal to retry.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-                // EXDEV or an unsupported link: fall back to a full byte copy.
-                Err(_) => std::fs::copy(src, candidate).map(|_| ()),
-            }
-        })
-        .with_context(|| {
-            format!(
-                "stage link/copy of {} for {}",
-                src.display(),
-                dest.display()
-            )
-        })?;
-    staged
-        .persist(dest)
-        .map_err(|e| e.error)
-        .with_context(|| format!("write {}", dest.display()))?;
-    Ok(())
+/// [`Landing::link_or_copy_atomic`] on the blocking pool: its copy fallback
+/// moves a whole blob.
+async fn link_off_runtime(
+    landing: Arc<Landing>,
+    src: PathBuf,
+    dest: PathBuf,
+) -> anyhow::Result<()> {
+    off_runtime("link", move || landing.link_or_copy_atomic(&src, &dest)).await
 }
 
 /// A disk-seeded chunk donor: a byte range already on disk whose bytes back a
@@ -261,7 +230,7 @@ struct PlannedWork {
 /// run's outstanding work while it waits for a jobs slot.
 async fn planned_work(
     entries: &[ManifestEntry],
-    out_root: &Path,
+    landing: &Landing,
     overwrite: bool,
     fetch_plan: &FetchPlan,
     disk: &DiskState,
@@ -273,7 +242,7 @@ async fn planned_work(
         let Ok(hash) = parse_hash(group.hash) else {
             continue;
         };
-        let writes = plan_slots(&group.entries, out_root, overwrite, &disk.skip)
+        let writes = plan_slots(&group.entries, landing, overwrite, &disk.skip)
             .iter()
             .any(|slot| matches!(slot, Slot::Write { .. }));
         if !writes || disk.whole_file.contains_key(&hash) {
@@ -283,7 +252,7 @@ async fn planned_work(
         if download == 0 {
             continue;
         }
-        let resumed = match staging_path(out_root, hash) {
+        let resumed = match staging_path(landing.root(), hash) {
             Ok(staging) => span_bytes(&resumed_spans_off_runtime(&staging, hash).await),
             Err(_) => 0,
         };
@@ -481,21 +450,27 @@ pub(super) fn writable_dest(out_root: &Path, path: &str) -> anyhow::Result<PathB
 /// on-disk bytes against the new manifest hash. A path whose content changed
 /// is written, not silently kept. Evaluated **per destination**, so one path
 /// of a duplicated blob can be skipped while another is written. With
-/// `overwrite` set, `skip` is empty and every destination is written.
+/// `overwrite` set, `skip` is empty and every destination is written. A path
+/// to write whose parent chain already cannot take it ([`Landing::check`])
+/// fails here, before its fetch is paid for. A path to skip is not checked:
+/// nothing is written to it.
 fn plan_slots<'a>(
     entries: &[&'a ManifestEntry],
-    out_root: &Path,
+    landing: &Landing,
     overwrite: bool,
     skip: &HashSet<String>,
 ) -> Vec<Slot<'a>> {
     entries
         .iter()
-        .map(|en| match writable_dest(out_root, &en.path) {
+        .map(|en| match writable_dest(landing.root(), &en.path) {
             Err(e) => Slot::Failed(EntryOutcome::failed(&en.path, &e)),
             Ok(_) if !overwrite && skip.contains(en.path.as_str()) => Slot::Skip,
-            Ok(dest) => Slot::Write {
-                label: en.path.as_str(),
-                dest,
+            Ok(dest) => match landing.check(&dest) {
+                Ok(()) => Slot::Write {
+                    label: en.path.as_str(),
+                    dest,
+                },
+                Err(e) => Slot::Failed(EntryOutcome::failed(&en.path, &e)),
             },
         })
         .collect()
@@ -574,6 +549,7 @@ async fn verified_donor_len(donor: &Path, hash: [u8; 32]) -> Option<u64> {
 /// fetch-once/link-rest accounting of #1306. The donor is verified by the
 /// caller (a re-hash against the target hash) before this is called.
 async fn materialize_from_donor(
+    landing: &Arc<Landing>,
     slots: Vec<Slot<'_>>,
     donor: &Path,
     size: u64,
@@ -582,9 +558,10 @@ async fn materialize_from_donor(
         slots,
         |dest| {
             let donor = donor.to_path_buf();
-            async move { link_off_runtime(donor, dest).await.map(|()| size) }
+            let landing = landing.clone();
+            async move { link_off_runtime(landing, donor, dest).await.map(|()| size) }
         },
-        link_off_runtime,
+        |src, dest| link_off_runtime(landing.clone(), src, dest),
     )
     .await
     .into_iter()
@@ -688,6 +665,7 @@ struct HashGroup<'a> {
 /// fetch: a resolve failure, an already-present file to skip, or a path to
 /// write. `label` (the entry's manifest-relative path) is retained only to tag
 /// a later failure.
+#[derive(Debug)]
 enum Slot<'a> {
     Failed(EntryOutcome),
     Skip,
@@ -891,20 +869,54 @@ impl Transfer {
     }
 }
 
-/// The run's candidate list: every active registered node. Each entry draws its
-/// own candidate sample from the whole list ([`entry_candidates`]), so no
-/// registered node is hidden from every entry by one draw.
-///
-/// The peer store's identity-fresh records serve as that list when enough of
-/// them qualify ([`cached_registry`]), and the run issues no
-/// `getRegisteredNodes`. Otherwise the registry is read once. A cached list that
-/// runs out of holders falls back to a live read through the in-run
-/// rediscovery ([`LaneSources`]).
+/// The run's candidate list, every active registered node, and where it came
+/// from. Each entry draws its own sample from the whole list
+/// ([`Registry::entry_candidates`]), so no registered node is hidden from
+/// every entry by one draw.
+#[derive(Debug, Clone)]
+pub(super) struct Registry {
+    /// Every active registered node.
+    pub(super) nodes: Vec<NodeCandidate>,
+    /// The list is the registry-outage fallback
+    /// ([`discovery::Bootstrap::Cached`]), which the region allowlist leaves
+    /// alone: the run is already down to what the store kept. A live registry
+    /// read, or the peer store's identity-fresh records that stand in for
+    /// one, is narrowed.
+    pub(super) outage_fallback: bool,
+}
+
+impl Registry {
+    /// One entry's probe candidates: a fresh sample of the list, same-region
+    /// nodes first, kept to `site.region_allowlist` with the widening rule a
+    /// single fetch applies ([`crate::targets::select_with_widening`]). A
+    /// cached-outage list ignores the allowlist. A sample per entry costs no
+    /// extra probe, because each entry probes its own candidates, and a node
+    /// that one draw leaves out can still reach other entries.
+    pub(super) fn entry_candidates(&self, site: &PullSite) -> Vec<NodeCandidate> {
+        let allow: &[decdn_protocol::Region] = if self.outage_fallback {
+            &[]
+        } else {
+            site.region_allowlist.as_slice()
+        };
+        crate::targets::select_with_widening(
+            self.nodes.clone(),
+            site.region.as_deref(),
+            allow,
+            &crate::StoreConfig::default(),
+        )
+    }
+}
+
+/// The run's [`Registry`]. The peer store's identity-fresh records serve as
+/// the list when enough of them qualify ([`cached_registry`]), and the run
+/// issues no `getRegisteredNodes`. Otherwise the registry is read once. A
+/// cached list that runs out of holders falls back to a live read through the
+/// in-run rediscovery ([`LaneSources`]).
 pub(super) async fn discover_candidates(
     chain: &ChainConfig,
     site: &PullSite,
     discovery: &DiscoveryOptions,
-) -> anyhow::Result<Vec<NodeCandidate>> {
+) -> anyhow::Result<Registry> {
     let capacity_bond = chain.capacity_bond.ok_or_else(|| {
         anyhow!(
             "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
@@ -914,7 +926,10 @@ pub(super) async fn discover_candidates(
     if !discovery.rediscover
         && let Some(cached) = cached_registry(&site.data_dir, now_secs())
     {
-        return Ok(cached);
+        return Ok(Registry {
+            nodes: cached,
+            outage_fallback: false,
+        });
     }
     let bootstrap = crate::discovery::bootstrap_nodes(
         &chain.rpc_url,
@@ -928,11 +943,15 @@ pub(super) async fn discover_candidates(
     if let Some(warning) = bootstrap.warning() {
         tracing::warn!("{warning}");
     }
+    let outage_fallback = matches!(bootstrap, discovery::Bootstrap::Cached { .. });
     let all = bootstrap.into_peers();
     if all.is_empty() {
         bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
-    Ok(all)
+    Ok(Registry {
+        nodes: all,
+        outage_fallback,
+    })
 }
 
 /// The peer store's identity-fresh records under `data_dir`, or `None` when
@@ -946,14 +965,6 @@ fn cached_registry(data_dir: &Path, now_secs: u64) -> Option<Vec<NodeCandidate>>
     let cfg = crate::StoreConfig::default();
     let cached = identity_fresh_candidates(&store, &cfg, now_secs);
     (cached.len() >= cfg.min_fresh_candidates).then_some(cached)
-}
-
-/// One entry's probe candidates: a fresh sample of `registry`, same-region
-/// nodes first ([`discovery::select_candidates`]). A sample per entry costs no
-/// extra probe, because each entry probes its own candidates, and a node that
-/// one draw leaves out can still reach other entries.
-fn entry_candidates(registry: &[NodeCandidate], region: Option<&str>) -> Vec<NodeCandidate> {
-    discovery::select_candidates(registry.to_vec(), region, discovery::SELECT_K)
 }
 
 /// How often the pull's poll watch ([`warn_when_unpolled`]) ticks.
@@ -1027,6 +1038,21 @@ struct PullRun {
     interrupted: bool,
     /// The fault that ended the whole pull ([`ends_the_pull`]), if one did.
     stopped: Option<anyhow::Error>,
+}
+
+impl PullRun {
+    /// A run `fault` stopped before any group started: every entry not run.
+    fn stopped_before_start(entries: usize, fault: anyhow::Error) -> Self {
+        Self {
+            outcomes: std::iter::repeat_with(|| EntryOutcome::NotRun)
+                .take(entries)
+                .collect(),
+            warnings: Vec::new(),
+            transfer: Transfer::default(),
+            interrupted: false,
+            stopped: Some(fault),
+        }
+    }
 }
 
 /// The pool replacement that ended `run`, when a funding recovery step opened
@@ -1795,15 +1821,15 @@ impl<P: Provider + Clone> PullCtx<P> {
         })
     }
 
-    /// This entry's probe candidates: a fresh sample of the run's registry read
-    /// ([`entry_candidates`]).
+    /// This entry's probe candidates: a fresh sample of the run's registry
+    /// list ([`Registry::entry_candidates`]).
     fn entry_candidates(&self) -> anyhow::Result<Vec<NodeCandidate>> {
         let registry = self
             .nodes
             .registry
-            .as_deref()
+            .as_ref()
             .ok_or_else(|| anyhow!("no discovery candidates available"))?;
-        Ok(entry_candidates(registry, self.site.region.as_deref()))
+        Ok(registry.entry_candidates(&self.site))
     }
 
     /// The manifest blob `hash`, read from `out_root`'s manifest cache when
@@ -2000,6 +2026,13 @@ impl<P: Provider + Clone> PullCtx<P> {
         // one blob is assembled, never that it is one paid unit per distinct hash.
         let index = ChunkIndex::default();
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        // The output directory, held open for the pass: every entry lands
+        // beneath its handle. One that cannot be opened is a local fault only
+        // the user can fix, so it ends the pull before any group starts.
+        let landing = match Landing::open(out_root) {
+            Ok(landing) => Arc::new(landing),
+            Err(e) => return PullRun::stopped_before_start(entries.len(), e),
+        };
         // Assign every chunk shared by two or more entries to its smallest holder,
         // so that shared chunk is fetched once (by that holder) and spliced into
         // every other entry — computed once from the whole manifest.
@@ -2014,7 +2047,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         let mut disk = resolve_disk_state(entries, &saved, out_root, overwrite).await;
         // The run's outstanding work starts at what the groups that still
         // fetch plan to pay for.
-        disk.work = planned_work(entries, out_root, overwrite, &fetch_plan, &disk).await;
+        disk.work = planned_work(entries, &landing, overwrite, &fetch_plan, &disk).await;
         let outstanding = disk
             .work
             .values()
@@ -2031,7 +2064,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             .pull_plain(
                 &refs,
                 bundle,
-                out_root,
+                &landing,
                 overwrite,
                 &index,
                 &fetch_plan,
@@ -2068,7 +2101,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         &self,
         entries: &[&'e ManifestEntry],
         bundle: [u8; 32],
-        out_root: &Path,
+        landing: &Arc<Landing>,
         overwrite: bool,
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
@@ -2107,7 +2140,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 let group_entries: Vec<&'e ManifestEntry> = group.entries.clone();
                 async move {
                     let run = self
-                        .fetch_group(group, out_root, overwrite, index, fetch_plan, disk)
+                        .fetch_group(group, landing, overwrite, index, fetch_plan, disk)
                         .await;
                     // Mark this group's blob finished (whatever the outcome) so a
                     // tail-reconcile waiter deferring a chunk assigned to it stops
@@ -2128,8 +2161,12 @@ impl<P: Provider + Clone> PullCtx<P> {
                         run.outcomes.len(),
                         "fetch_group must return one outcome per entry"
                     );
-                    let updates =
-                        build_completed_updates(&group_entries, &run.outcomes, bundle, out_root);
+                    let updates = build_completed_updates(
+                        &group_entries,
+                        &run.outcomes,
+                        bundle,
+                        landing.root(),
+                    );
                     let warnings = size_warnings(&group_entries, &updates);
                     (run, updates, warnings)
                 }
@@ -2155,7 +2192,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // Running here (joined, not awaited inside `drive`) keeps the blocking
         // write off the fetch-driving path — `join!` keeps polling `drive` while
         // this side awaits its write.
-        let flush = flush_task(out_root, saved, flush_rx);
+        let flush = flush_task(landing.root(), saved, flush_rx);
 
         let interrupted = drive_until_interrupted(drive, flush, cancel).await;
         // Byte tally is per-group (a blob pulled once, materialized to N paths),
@@ -2435,7 +2472,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     async fn fetch_group(
         &self,
         group: HashGroup<'_>,
-        out_root: &Path,
+        landing: &Arc<Landing>,
         overwrite: bool,
         index: &ChunkIndex,
         fetch_plan: &FetchPlan,
@@ -2488,7 +2525,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // `pull_all` removes it once every recipient has had its chance.
         let is_donor = hints.as_ref().is_some_and(|h| !h.is_empty());
 
-        let slots = plan_slots(&group.entries, out_root, overwrite, &disk.skip);
+        let slots = plan_slots(&group.entries, landing, overwrite, &disk.skip);
 
         // Every destination already present (or failed to resolve) → no fetch, no
         // payment. This is the whole point of the group: a duplicate path that is
@@ -2520,7 +2557,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         {
             // A whole-file link downloads nothing, so it adds nothing to the
             // total bar's download meter.
-            return GroupRun::done(materialize_from_donor(slots, donor, len).await);
+            return GroupRun::done(materialize_from_donor(landing, slots, donor, len).await);
         }
 
         // Staged once per group: the entry's fetch finalizes to
@@ -2529,7 +2566,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // large entry top up mid-fetch. The staging path derived from `out_root`
         // is only created once a group actually has something to write, never for
         // an all-skipped group.
-        let staging = match staging_path(out_root, hash) {
+        let staging = match staging_path(landing.root(), hash) {
             Ok(p) => p,
             Err(e) => return GroupRun::done(fail_all(slots, &e)),
         };
@@ -2577,12 +2614,12 @@ impl<P: Provider + Clone> PullCtx<P> {
         let outcomes = materialize_group(
             slots,
             |dest| {
-                let staging = staging.clone();
+                let (staging, landing) = (staging.clone(), landing.clone());
                 off_runtime("materialize", move || {
-                    first_write(&staging, &dest, is_donor)
+                    landing.first_write(&staging, &dest, is_donor)
                 })
             },
-            link_off_runtime,
+            |src, dest| link_off_runtime(landing.clone(), src, dest),
         )
         .await;
 
@@ -3266,65 +3303,6 @@ async fn sweep_donor_sources(index: &ChunkIndex) {
     .await
     {
         tracing::warn!("donor staging sweep task: {e}");
-    }
-}
-
-/// Copy the already-fetched, already-verified blob at `staging` to `dest`,
-/// returning the byte count. `staging` is read-only here (not consumed) — a
-/// retry after a failed first write calls this again for the next writable
-/// path — so the copy goes through a unique temp file beside `dest` and an
-/// atomic rename, the same source-must-survive shape [`link_or_copy_atomic`]
-/// uses for every later duplicate — built from [`temp_in_parent`], the
-/// staging primitive the bundle cache and manifest writers share.
-fn materialize(staging: &Path, dest: &Path) -> anyhow::Result<u64> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let mut tmp = temp_in_parent(dest).with_context(|| format!("stage {}", dest.display()))?;
-    let mut src =
-        std::fs::File::open(staging).with_context(|| format!("open {}", staging.display()))?;
-    let written = std::io::copy(&mut src, tmp.as_file_mut())
-        .with_context(|| format!("copy {} -> {}", staging.display(), dest.display()))?;
-    tmp.as_file()
-        .sync_all()
-        .with_context(|| format!("sync staged copy for {}", dest.display()))?;
-    tmp.persist(dest)
-        .map_err(|e| e.error)
-        .with_context(|| format!("write {}", dest.display()))?;
-    Ok(written)
-}
-
-/// Land a group's finalized `staging` blob at its first destination, returning
-/// its byte count: a non-donor moves ([`move_into_place`]); a donor — a splice
-/// source the run-end sweep still owns — is hard-linked (a copy only across
-/// filesystems), so its staging name survives for later recipients.
-fn first_write(staging: &Path, dest: &Path, is_donor: bool) -> anyhow::Result<u64> {
-    if !is_donor {
-        return move_into_place(staging, dest);
-    }
-    let len = std::fs::metadata(staging)
-        .with_context(|| format!("stat {}", staging.display()))?
-        .len();
-    link_or_copy_atomic(staging, dest).map(|()| len)
-}
-
-/// Move the finalized `staging` blob to `dest`, returning its byte count. A
-/// non-donor blob has no reader after its first destination lands, so a rename
-/// replaces the full copy [`materialize`] makes — no second write of the blob and
-/// no second copy on disk. `staging` is already durable: the ranged store's
-/// finalize, and the dedup splice before promotion, sync it. A rename that fails
-/// (a destination on another filesystem, `EXDEV`) falls back to [`materialize`],
-/// which leaves `staging` in place for the next writable path.
-fn move_into_place(staging: &Path, dest: &Path) -> anyhow::Result<u64> {
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let len = std::fs::metadata(staging)
-        .with_context(|| format!("stat {}", staging.display()))?
-        .len();
-    match std::fs::rename(staging, dest) {
-        Ok(()) => Ok(len),
-        Err(_) => materialize(staging, dest),
     }
 }
 
@@ -4176,7 +4154,7 @@ pub(super) fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
 /// nothing safe to record for it. A record is produced only when a regular file
 /// is present at the entry's path with a usable mtime — the gates that keep a
 /// symlink, a non-regular file, a missing file, or an unreadable mtime out of
-/// the later fast-skip path. `materialize` renames new content into place only
+/// the later fast-skip path. [`Landing`] renames new content into place only
 /// on success, so a present regular file at the path is this run's landed
 /// bytes; pairing the entry's hash with them is sound.
 fn record_one(

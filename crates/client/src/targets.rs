@@ -995,9 +995,10 @@ pub fn identity_fresh_candidates(
 /// Region-filter a candidate set to at most [`discovery::SELECT_K`], then
 /// progressively widen: a too-thin region allowlist must never starve the fetch,
 /// so re-run unfiltered over the same set when the filtered pool falls below the
-/// store's freshness floor. Shared by the live registry path and the
-/// registry-read-skip path so both rank identically.
-fn select_with_widening(
+/// store's freshness floor. Shared by the live registry path, the
+/// registry-read-skip path and a bundle pull's per-entry sample
+/// ([`crate::bundle`]), so all three rank identically.
+pub(crate) fn select_with_widening(
     candidates: Vec<NodeCandidate>,
     region: Option<&str>,
     allow: &[decdn_protocol::Region],

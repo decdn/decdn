@@ -231,7 +231,8 @@ in current schema terms:
   `slash_judge_address` (and `capacity_bond_address` for auto-discovery) a client needs to pay for
   and verify delivery. The RPC URL and keystore live here, **not** under `[network]`/`[keys]`.
 - `[client]` — an optional `region_allowlist` list of regions. When set, it restricts discovery and
-  probing to nodes whose `region_hint` matches; empty or absent means no filter.
+  probing to nodes whose `region_hint` matches; empty or absent means no filter. A bundle pull
+  applies it to each entry's candidate sample, with the same widening rule as a single fetch.
 
 The voucher byte-accounting granularity is a fixed protocol constant that every client and node
 reads directly ([ADR 003 § Key parameters](003-payments.md#adr-003-payment-model)), so a client has

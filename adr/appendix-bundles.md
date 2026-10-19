@@ -325,7 +325,10 @@ The rules below apply to every pull:
   every entry is pulled from that one node; otherwise each distinct blob
   independently discovers a holder among the region-nearest active nodes
   (`CapacityBond`, read once), so different blobs may come from different
-  nodes.
+  nodes. The `[client] region_allowlist` narrows each blob's candidate
+  sample. The sample widens to every region when fewer than three
+  candidates remain. A list the peer store supplied during a registry
+  outage is not narrowed.
 - **Duplicate blobs are fetched once.** A bundle may hold one file's
   content at two paths (nothing dedupes `entries[]` by `hash`). Entries
   sharing a `hash` are grouped and the blob is fetched — and **paid for**
@@ -392,7 +395,15 @@ The rules below apply to every pull:
   keeps its `.partial`, so a rerun pays for no byte twice.
 - **Output** files are written under the output directory at each entry's
   relative path, resolved with the § Path-safety rules above (`..`,
-  absolute, and escaping paths rejected). Writes are atomic
+  absolute, and escaping paths rejected). The pull holds the output
+  directory open and resolves each entry's path beneath that handle. A
+  symlink in the entry's parent directories that leads out of the output
+  directory fails that entry. A relative symlink that stays inside the
+  output directory is followed. A symlink with an absolute target is an
+  escape, even when it points back inside. The output directory itself may
+  be a symlink. The pull reads its staging directory (`.decdn-partial/`) by
+  its own path. A staging directory that is a symlink the handle refuses
+  still lands entries, by a copy. Writes are atomic
   (temp-then-rename after the BLAKE3 check the fetch path already
   performs), so a present file is verified-good: pull **skips existing
   files** by default (re-runs resume), and `--overwrite` forces a re-fetch.

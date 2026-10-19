@@ -57,6 +57,11 @@ version = 2
 allow = [
     "MIT",
     "Apache-2.0",
+    # `winx`, the Windows backend of `cap-std` (bundle landing, #2439), carries
+    # only this form. The exception relaxes the Apache §4 notice terms for
+    # object-form redistribution and adds a GPLv2-compatibility waiver; it
+    # adds no obligation.
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",

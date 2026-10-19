@@ -8,18 +8,103 @@ use std::assert_matches;
 /// draw leaves out still reaches other entries.
 #[test]
 fn entry_candidates_resample_the_registry_for_each_entry() {
-    let registry: Vec<NodeCandidate> = (1u8..=7).map(|b| stripe_candidate(b, b)).collect();
+    let registry = Registry {
+        nodes: (1u8..=7).map(|b| stripe_candidate(b, b)).collect(),
+        outage_fallback: false,
+    };
+    let site = site_allowing(&[]);
     let mut seen = HashSet::new();
     let mut draws = HashSet::new();
     for _ in 0..200 {
-        let sample = entry_candidates(&registry, None);
+        let sample = registry.entry_candidates(&site);
         assert_eq!(sample.len(), discovery::SELECT_K);
         let ids: std::collections::BTreeSet<PublicKey> = sample.iter().map(|c| c.node_id).collect();
         seen.extend(ids.iter().copied());
         draws.insert(ids);
     }
-    assert_eq!(seen.len(), registry.len(), "every node reaches some entry");
+    assert_eq!(
+        seen.len(),
+        registry.nodes.len(),
+        "every node reaches some entry"
+    );
     assert!(draws.len() > 1, "entries draw different samples");
+}
+
+/// A candidate on node `node` in `region`.
+fn regional_candidate(node: u8, region: &str) -> NodeCandidate {
+    NodeCandidate {
+        region_hint: decdn_protocol::Region::parse(region),
+        ..stripe_candidate(node, node)
+    }
+}
+
+/// A site with no region of its own, whose allowlist is `regions`.
+fn site_allowing(regions: &[&str]) -> PullSite {
+    PullSite {
+        data_dir: PathBuf::new(),
+        region: None,
+        region_allowlist: regions
+            .iter()
+            .filter_map(|r| decdn_protocol::Region::parse(r))
+            .collect(),
+    }
+}
+
+/// `de` DE nodes then `us` US nodes, as a registry list that is the outage
+/// fallback when `outage_fallback`.
+fn two_region_registry(de: u8, us: u8, outage_fallback: bool) -> Registry {
+    let nodes = (1..=de)
+        .map(|b| regional_candidate(b, "DE"))
+        .chain((de + 1..=de + us).map(|b| regional_candidate(b, "US")))
+        .collect();
+    Registry {
+        nodes,
+        outage_fallback,
+    }
+}
+
+/// The allowlist narrows every entry's sample to the allowed regions when
+/// enough nodes stay: the fetch path's rule, applied to the bundle.
+#[test]
+fn entry_candidates_keep_to_the_region_allowlist() {
+    let registry = two_region_registry(4, 3, false);
+    let site = site_allowing(&["US"]);
+    let us = decdn_protocol::Region::parse("US");
+    for _ in 0..50 {
+        let sample = registry.entry_candidates(&site);
+        assert_eq!(sample.len(), 3, "the three US nodes, and no DE node");
+        assert!(sample.iter().all(|c| c.region_hint == us));
+    }
+}
+
+/// An allowlist that leaves fewer nodes than the store's freshness floor
+/// widens back to every region, so a thin allowlist never starves an entry.
+#[test]
+fn entry_candidates_widen_when_the_allowlist_starves() {
+    let registry = two_region_registry(5, 2, false);
+    let site = site_allowing(&["US"]);
+    let de = decdn_protocol::Region::parse("DE");
+    let sample = registry.entry_candidates(&site);
+    assert_eq!(sample.len(), discovery::SELECT_K);
+    assert!(
+        sample.iter().any(|c| c.region_hint == de),
+        "widened past the allowlist"
+    );
+}
+
+/// The list the peer store supplies during a registry outage is not
+/// narrowed: the run is already down to what the store kept.
+#[test]
+fn a_cached_outage_list_ignores_the_allowlist() {
+    let registry = two_region_registry(4, 3, true);
+    let site = site_allowing(&["US"]);
+    let de = decdn_protocol::Region::parse("DE");
+    let sample = registry.entry_candidates(&site);
+    assert_eq!(sample.len(), discovery::SELECT_K);
+    assert!(
+        sample.iter().any(|c| c.region_hint == de),
+        "a DE node stays in the sample"
+    );
 }
 
 /// A peer store holding `n` identities confirmed at `now`.
@@ -99,7 +184,11 @@ async fn discover_candidates_skips_the_registry_read_on_fresh_identities() -> an
 
     let (chain, site, discovery) = chain_against(&rpc, dir.path(), false)?;
     let found = discover_candidates(&chain, &site, &discovery).await?;
-    assert_eq!(found.len(), usize::from(min));
+    assert_eq!(found.nodes.len(), usize::from(min));
+    assert!(
+        !found.outage_fallback,
+        "identity-fresh records stand in for a live read"
+    );
     assert_matches!(
         rpc.accept(),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock,
@@ -108,9 +197,14 @@ async fn discover_candidates_skips_the_registry_read_on_fresh_identities() -> an
 
     let (chain, site, discovery) = chain_against(&rpc, dir.path(), true)?;
     // The listener never answers, so the read times out and falls back to
-    // the same store. Only the connection attempt matters here.
-    drop(discover_candidates(&chain, &site, &discovery).await);
+    // the same store: the outage fallback, which the allowlist leaves alone.
+    let found = discover_candidates(&chain, &site, &discovery).await?;
     assert!(rpc.accept().is_ok(), "--rediscover reads the registry");
+    assert!(
+        found.outage_fallback,
+        "a timed-out read falls back to the store"
+    );
+    assert_eq!(found.nodes.len(), usize::from(min));
     Ok(())
 }
 
@@ -3427,37 +3521,6 @@ fn group_by_hash_keeps_distinct_hashes_separate() {
     assert!(groups.iter().all(|group| group.entries.len() == 1));
 }
 
-/// A duplicate destination is materialized from the canonical file (no second
-/// paid fetch), lands with identical bytes, creates any missing parent dir,
-/// and leaves the source in place (it is a link/copy, not a move).
-#[test]
-fn link_or_copy_atomic_materializes_identical_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("src.bin");
-    let dest = dir.path().join("nested/dest.bin");
-    std::fs::write(&src, b"the-canonical-bytes").unwrap();
-
-    link_or_copy_atomic(&src, &dest).unwrap();
-
-    assert_eq!(std::fs::read(&dest).unwrap(), b"the-canonical-bytes");
-    assert!(src.exists());
-}
-
-/// Materialization atomically *replaces* an existing destination, upholding the
-/// "a present final file is verified-good" invariant skip-existing relies on.
-#[test]
-fn link_or_copy_atomic_replaces_existing_dest() {
-    let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("src.bin");
-    let dest = dir.path().join("dest.bin");
-    std::fs::write(&src, b"new").unwrap();
-    std::fs::write(&dest, b"stale-and-longer").unwrap();
-
-    link_or_copy_atomic(&src, &dest).unwrap();
-
-    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
-}
-
 /// Skip-existing / `--overwrite` are decided **per destination** from the
 /// [`resolve_disk_state`] pre-pass's skip set (not a raw existence check): one
 /// path of a duplicated blob can be in the skip set (Skip) while its twin is
@@ -3471,11 +3534,12 @@ fn plan_slots_classifies_each_destination_independently() {
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let skip = HashSet::from(["present.txt".to_string()]);
 
-    let slots = plan_slots(&refs, out, false, &skip);
+    let landing = Landing::open(out).unwrap();
+    let slots = plan_slots(&refs, &landing, false, &skip);
     assert!(matches!(slots[0], Slot::Skip));
     assert!(matches!(slots[1], Slot::Write { .. }));
 
-    let slots = plan_slots(&refs, out, true, &skip);
+    let slots = plan_slots(&refs, &landing, true, &skip);
     assert!(matches!(slots[0], Slot::Write { .. }));
     assert!(matches!(slots[1], Slot::Write { .. }));
 }
@@ -3486,7 +3550,12 @@ fn plan_slots_marks_unsafe_paths_failed() {
     let dir = tempfile::tempdir().unwrap();
     let entries = [entry("../escape", "b3:h")];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
-    let slots = plan_slots(&refs, dir.path(), false, &HashSet::new());
+    let slots = plan_slots(
+        &refs,
+        &Landing::open(dir.path()).unwrap(),
+        false,
+        &HashSet::new(),
+    );
     assert!(matches!(slots[0], Slot::Failed(_)));
 }
 
@@ -3498,7 +3567,12 @@ fn plan_slots_rejects_the_reserved_staging_dir() {
     let dir = tempfile::tempdir().unwrap();
     let entries = [entry(&format!("{STAGING_DIR}/deadbeef.partial"), "b3:h")];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
-    let slots = plan_slots(&refs, dir.path(), false, &HashSet::new());
+    let slots = plan_slots(
+        &refs,
+        &Landing::open(dir.path()).unwrap(),
+        false,
+        &HashSet::new(),
+    );
     assert!(matches!(slots[0], Slot::Failed(_)));
 }
 
@@ -3513,10 +3587,129 @@ fn plan_slots_rejects_the_pull_state_paths() {
         entry("plain.bin", "b3:h"),
     ];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
-    let slots = plan_slots(&refs, dir.path(), false, &HashSet::new());
+    let slots = plan_slots(
+        &refs,
+        &Landing::open(dir.path()).unwrap(),
+        false,
+        &HashSet::new(),
+    );
     assert!(matches!(slots[0], Slot::Failed(_)));
     assert!(matches!(slots[1], Slot::Failed(_)));
     assert!(matches!(slots[2], Slot::Write { .. }));
+}
+
+/// An entry whose parent chain leads out of the root fails before its fetch
+/// is paid for; its sibling is still written.
+#[cfg(unix)]
+#[test]
+fn plan_slots_fails_an_entry_whose_parent_leads_out_of_the_root() {
+    let out = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), out.path().join("link")).unwrap();
+    let landing = Landing::open(out.path()).unwrap();
+    let entries = [entry("link/escape.bin", "b3:h"), entry("safe.bin", "b3:h")];
+    let refs: Vec<&ManifestEntry> = entries.iter().collect();
+
+    let slots = plan_slots(&refs, &landing, false, &HashSet::new());
+
+    assert!(
+        matches!(&slots[0], Slot::Failed(EntryOutcome::Failed { path, err })
+            if path == "link/escape.bin" && err.contains("outside the output directory")),
+        "{:?}",
+        slots[0]
+    );
+    assert!(matches!(slots[1], Slot::Write { .. }));
+}
+
+/// An entry already present behind a link the handle refuses is skipped,
+/// not failed: nothing is written to it. With `--overwrite` it is written,
+/// so the check applies and fails it before the fetch.
+#[cfg(unix)]
+#[test]
+fn plan_slots_skips_a_present_entry_before_it_checks_its_parent_chain() {
+    let out = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), out.path().join("link")).unwrap();
+    let landing = Landing::open(out.path()).unwrap();
+    let entries = [entry("link/file", "b3:h")];
+    let refs: Vec<&ManifestEntry> = entries.iter().collect();
+    let skip = HashSet::from(["link/file".to_string()]);
+
+    let slots = plan_slots(&refs, &landing, false, &skip);
+    assert!(matches!(slots[0], Slot::Skip), "{:?}", slots[0]);
+
+    let slots = plan_slots(&refs, &landing, true, &HashSet::new());
+    assert!(matches!(slots[0], Slot::Failed(_)), "{:?}", slots[0]);
+}
+
+/// A run stopped before any group started has one `NotRun` outcome per
+/// entry, so the summary and the pass merge see every entry.
+#[test]
+fn a_run_stopped_before_start_has_one_not_run_outcome_per_entry() {
+    let run = PullRun::stopped_before_start(3, anyhow!("the output directory cannot be opened"));
+    assert_eq!(run.outcomes.len(), 3);
+    assert!(
+        run.outcomes
+            .iter()
+            .all(|o| matches!(o, EntryOutcome::NotRun))
+    );
+    assert!(!run.interrupted);
+    assert!(run.stopped.is_some());
+}
+
+/// The landing gate holds for a slot the plan let through: the escaping
+/// destination fails, the next path of the group lands from the same staging
+/// blob, and nothing reaches the directory the link points at.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_group_whose_path_crosses_a_symlink_out_of_the_root_fails_that_entry_only() {
+    let out = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), out.path().join("link")).unwrap();
+    let landing = Arc::new(Landing::open(out.path()).unwrap());
+    let staging = out.path().join(STAGING_DIR).join("blob");
+    std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+    std::fs::write(&staging, b"bytes").unwrap();
+    let slots = vec![
+        Slot::Write {
+            label: "link/escape.bin",
+            dest: out.path().join("link/escape.bin"),
+        },
+        Slot::Write {
+            label: "safe.bin",
+            dest: out.path().join("safe.bin"),
+        },
+    ];
+
+    let outcomes = materialize_group(
+        slots,
+        |dest| {
+            let landing = landing.clone();
+            let staging = staging.clone();
+            off_runtime("materialize", move || {
+                landing.first_write(&staging, &dest, false)
+            })
+        },
+        |src, dest| link_off_runtime(landing.clone(), src, dest),
+    )
+    .await;
+
+    assert!(
+        matches!(&outcomes[0], EntryOutcome::Failed { path, err }
+            if path == "link/escape.bin" && err.contains("outside the output directory")),
+        "{:?}",
+        outcomes[0]
+    );
+    assert!(
+        matches!(outcomes[1], EntryOutcome::Fetched(5)),
+        "{:?}",
+        outcomes[1]
+    );
+    assert_eq!(
+        std::fs::read(out.path().join("safe.bin")).unwrap(),
+        b"bytes"
+    );
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
 }
 
 /// Record `entries` as landed under `out` from the bundle `bundle`, as a pull
@@ -4114,66 +4307,6 @@ async fn resolve_disk_state_seeds_old_chunks_of_a_changed_file() {
     }
 }
 
-/// `materialize` (the paid-path writer) atomically replaces an existing
-/// destination from the staging file, and leaves the staging file intact so a
-/// retry for the next duplicate path can read it again.
-#[test]
-fn materialize_replaces_dest_and_keeps_staging() {
-    let dir = tempfile::tempdir().unwrap();
-    let staging = dir.path().join("blob.partial");
-    std::fs::write(&staging, b"new-content").unwrap();
-    let dest = dir.path().join("out.bin");
-    std::fs::write(&dest, b"stale-old").unwrap();
-
-    let n = materialize(&staging, &dest).unwrap();
-
-    assert_eq!(n, b"new-content".len() as u64);
-    assert_eq!(std::fs::read(&dest).unwrap(), b"new-content");
-    assert!(staging.exists(), "staging must survive for retries");
-    assert_eq!(std::fs::read(&staging).unwrap(), b"new-content");
-}
-
-/// A non-donor blob's first write moves staging into place — no second copy
-/// of the blob — and replaces a stale destination atomically.
-#[test]
-fn first_write_moves_a_non_donor_blob_into_place() {
-    let dir = tempfile::tempdir().unwrap();
-    let staging = dir.path().join("blob");
-    std::fs::write(&staging, b"new-content").unwrap();
-    let dest = dir.path().join("sub").join("out.bin");
-    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-    std::fs::write(&dest, b"stale-old").unwrap();
-
-    let n = first_write(&staging, &dest, false).unwrap();
-
-    assert_eq!(n, b"new-content".len() as u64);
-    assert_eq!(std::fs::read(&dest).unwrap(), b"new-content");
-    assert!(!staging.exists(), "the blob moved, it was not copied");
-}
-
-/// A donor blob's first write keeps its staging name — later recipients
-/// still splice from it — and shares its storage with the destination.
-#[cfg(unix)]
-#[test]
-fn first_write_links_a_donor_blob_and_keeps_staging() {
-    use std::os::unix::fs::MetadataExt;
-    let dir = tempfile::tempdir().unwrap();
-    let staging = dir.path().join("blob");
-    std::fs::write(&staging, b"donor-bytes").unwrap();
-    let dest = dir.path().join("out.bin");
-
-    let n = first_write(&staging, &dest, true).unwrap();
-
-    assert_eq!(n, b"donor-bytes".len() as u64);
-    assert_eq!(std::fs::read(&dest).unwrap(), b"donor-bytes");
-    assert!(staging.exists(), "a donor's staging name survives");
-    assert_eq!(
-        std::fs::metadata(&staging).unwrap().ino(),
-        std::fs::metadata(&dest).unwrap().ino(),
-        "the first destination is a hard link, not a copy"
-    );
-}
-
 /// The headline #1306 invariant, testable without a live endpoint: two
 /// destinations for one blob → the paid `materialize` runs **once**, the second
 /// is a free `link`, and outcomes are `[Fetched, Linked]` (never `Fetched`
@@ -4285,7 +4418,8 @@ async fn materialize_from_donor_links_every_destination() {
         label: "game2/lib/dup.dll",
         dest: dest.clone(),
     }];
-    let outcomes = materialize_from_donor(slots, &donor, 2048).await;
+    let landing = Arc::new(Landing::open(tmp.path()).unwrap());
+    let outcomes = materialize_from_donor(&landing, slots, &donor, 2048).await;
     assert!(matches!(outcomes.as_slice(), [EntryOutcome::Deduped(2048)]));
     assert_eq!(std::fs::read(&dest).expect("read"), body);
 }
@@ -4309,7 +4443,8 @@ async fn materialize_from_donor_links_second_destination_as_linked() {
             dest: dest_b.clone(),
         },
     ];
-    let outcomes = materialize_from_donor(slots, &donor, 10).await;
+    let landing = Arc::new(Landing::open(tmp.path()).unwrap());
+    let outcomes = materialize_from_donor(&landing, slots, &donor, 10).await;
     assert!(matches!(outcomes[0], EntryOutcome::Deduped(10)));
     assert!(matches!(outcomes[1], EntryOutcome::Linked));
     assert_eq!(std::fs::read(&dest_a).expect("read a"), b"same-bytes");
@@ -4331,7 +4466,8 @@ async fn materialize_from_donor_preserves_failed_slot() {
             dest: dest.clone(),
         },
     ];
-    let outcomes = materialize_from_donor(slots, &donor, 5).await;
+    let landing = Arc::new(Landing::open(tmp.path()).unwrap());
+    let outcomes = materialize_from_donor(&landing, slots, &donor, 5).await;
     assert!(matches!(outcomes[0], EntryOutcome::Failed { .. }));
     assert!(matches!(outcomes[1], EntryOutcome::Deduped(5)));
 }
@@ -4734,7 +4870,14 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
     disk.whole_file
         .insert([3; 32], tmp.path().join("elsewhere.bin"));
     let plan = build_fetch_plan(&entries);
-    let work = planned_work(&entries, tmp.path(), false, &plan, &disk).await;
+    let work = planned_work(
+        &entries,
+        &Landing::open(tmp.path()).unwrap(),
+        false,
+        &plan,
+        &disk,
+    )
+    .await;
     assert_eq!(
         work.get(&[1; 32]),
         Some(&PlannedWork {
@@ -4744,6 +4887,13 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
     );
     assert_eq!(work.len(), 1, "{work:?}");
 
-    let all = planned_work(&entries, tmp.path(), true, &plan, &DiskState::default()).await;
+    let all = planned_work(
+        &entries,
+        &Landing::open(tmp.path()).unwrap(),
+        true,
+        &plan,
+        &DiskState::default(),
+    )
+    .await;
     assert_eq!(all.len(), 3, "an overwriting pull fetches every group");
 }
