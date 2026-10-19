@@ -15,7 +15,10 @@ categories.workspace = true
 workspace = true
 
 [features]
-anvil-e2e = []
+# The anvil-backed pool test (`tests/chain_pool.rs`); needs `anvil` and
+# `forge` on PATH. See `crates/sponsord/Cargo.toml` for why this enables the
+# buyer store itself rather than `decdn-e2e/anvil-e2e`.
+anvil-e2e = ["decdn-incentive/redb"]
 test-support = ["dep:tracing-subscriber"]
 
 [dependencies]
@@ -34,5 +37,5 @@ tokio-util.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
-decdn-e2e = { workspace = true, features = ["anvil-e2e"] }
+decdn-e2e.workspace = true
 tracing-subscriber.workspace = true

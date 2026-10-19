@@ -16,8 +16,12 @@ workspace = true
 
 [features]
 # The anvil-backed test of the binary (`tests/binary_anvil.rs`); needs
-# `anvil` and `forge` on PATH.
-anvil-e2e = []
+# `anvil` and `forge` on PATH. It enables the buyer store the fixtures use,
+# as `decdn-e2e`'s own `anvil-e2e` does, instead of asking for that feature on
+# the `decdn-e2e` dev-dependency: a feature named on a dev-dependency is
+# unified into every `cargo nextest run --workspace`, which would make the
+# plain test run spawn anvil for all of `decdn-e2e`'s gated targets.
+anvil-e2e = ["decdn-incentive/redb"]
 
 [dependencies]
 sponsord-api = { workspace = true, features = ["axum", "secret"] }
@@ -37,7 +41,7 @@ subtle = "2"
 
 [dev-dependencies]
 decdn-client.workspace = true
-decdn-e2e = { workspace = true, features = ["anvil-e2e"] }
+decdn-e2e.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
 sponsord-core = { workspace = true, features = ["test-support"] }
