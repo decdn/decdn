@@ -118,6 +118,24 @@ base64 = "0.23"
 # Cryptography
 ed25519-dalek = { version = "3", features = ["serde"] }
 chacha20poly1305 = "0.11"
+# `decdn self-update` (#2537) trusts a release only once `SHA256SUMS.minisig`
+# verifies against the minisign public key embedded in the binary. Pure Rust,
+# no dependencies of its own.
+minisign-verify = "0.3"
+# `decdn self-update` checks each downloaded archive against the signed
+# `SHA256SUMS` manifest. Already in the tree through iroh-base.
+sha2 = "0.11"
+
+# Self-update plumbing (#2537): compare the running version with the release
+# tag, unpack the release archive, and swap the running executable in place
+# (rename-then-replace on Windows, where a running `.exe` cannot be
+# overwritten). `tar` without `xattr`; `zip` with the flate2 deflate backend
+# only, so no C code enters the client graph and the glibc floor holds.
+semver = "1"
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+self-replace = "1"
 
 # Blockchain / EVM
 # `default-features = false` drops alloy's `reqwest-rustls-tls`, which turns on
