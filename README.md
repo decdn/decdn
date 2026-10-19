@@ -42,8 +42,7 @@
 
 ## ⚡ Try it in one line
 
-Download Mistral 7B Instruct v0.3 (about 29 GB) from the testnet. Run it in an empty
-directory: the download replaces any file of the same name there. On macOS or Linux:
+Download Mistral 7B Instruct v0.3 (about 29 GB) from the testnet. On macOS or Linux:
 
 ```bash
 curl -fsSL https://up.decdn.org/decdn.sh | sh -s -- get 'decdn:9194000d7b356650e6924a7746ec4afb0b705838b65913c0e46cba6b15af69e5/?ns=1'
@@ -57,8 +56,9 @@ On Windows, in PowerShell:
 
 The line installs `decdn` and asks you to pass one check in the browser (it opens the
 link, or prints it). Then it downloads into the current directory and verifies every byte
-on the way in. Run it again after an interruption
-and it resumes. A sponsor pays for the transfer, so you need no wallet, keys, or account.
+on the way in. It refuses to overwrite a file it did not write itself; add `--overwrite`
+after the URI to replace one. Run it again after an interruption and it resumes. A sponsor
+pays for the transfer, so you need no wallet, keys, or account.
 Later, `decdn self-update` moves the installed binary to the latest signed release.
 
 The [catalogue on decdn.org](https://decdn.org/#try) lists more seeded content. To pay for
