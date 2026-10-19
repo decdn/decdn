@@ -17,7 +17,7 @@ use super::release::Manifest;
 
 /// The minisign public keys this build trusts: every `crates/cli/minisign*.pub`,
 /// one `include_str!` per file. A unit test keeps this list equal to the files.
-pub(crate) const TRUSTED_KEYS: &[&str] = &[include_str!("../../../minisign-placeholder.pub")];
+pub(crate) const TRUSTED_KEYS: &[&str] = &[include_str!("../../../minisign-thiras.pub")];
 
 /// Decode every embedded key.
 pub(crate) fn trusted_keys() -> anyhow::Result<Vec<PublicKey>> {

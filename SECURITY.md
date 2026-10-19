@@ -14,7 +14,7 @@ is committed to this repository as [`KEYS`](KEYS):
 ```
 Ant Somers <ant@decdn.org>
 Fingerprint: DA75 1570 6F18 73D2 74D8  A369 9E11 A9FF D62D AADB
-minisign key: crates/cli/minisign-ant.pub (key id listed here once committed)
+minisign key: crates/cli/minisign-thiras.pub, key id 111497640DE76A05
 
 Alper Gundogdu <alper@decdn.org>
 Fingerprint: E27B 9A2D 2519 1E8E C90B  F8AE 57E2 823C 16CC D376
