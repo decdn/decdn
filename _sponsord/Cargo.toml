@@ -1,0 +1,139 @@
+[workspace]
+# Resolver 3, the MSRV-aware resolver: with `rust-version` below, a future
+# `cargo update` prefers dependency versions that still build on the pinned
+# toolchain instead of silently pulling one that raised its MSRV past it.
+resolver = "3"
+members = [
+    "crates/e2e",
+    "crates/sponsord",
+    "crates/sponsord-api",
+    "crates/sponsord-core",
+    "crates/sponsord-onramp",
+]
+
+[workspace.package]
+# One version for every crate: the workspace is released as a whole, from one
+# signed `v<version>` tag (`cargo release <level>`; see RELEASING.md). Every
+# member inherits it, and each internal alias below carries it too;
+# check_workspace_manifests.py requires both.
+version = "0.2.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+# Three parts, not two: this string, `rust-toolchain.toml`'s channel and the
+# version of every `dtolnay/rust-toolchain` step under .github/ (its
+# `toolchain:` input, or its `@ref` without one) are compared byte-for-byte by
+# check_toolchain_pin.py, so they move together. A step's SHA pin is not checked.
+rust-version = "1.99.0"
+repository = "https://github.com/decdn/sponsord"
+homepage = "https://decdn.org"
+keywords = ["decdn", "cdn", "p2p", "sponsorship"]
+categories = ["network-programming"]
+# `readme` and `description` are per crate: each is its own crates.io landing
+# page. check_workspace_manifests.py requires both on every publishable member.
+
+# decdn's lint set (decdn's root Cargo.toml, `[workspace.lints]`). Keep the two
+# in step: a lint added there belongs here too, unless sponsord has no code it
+# could fire on.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+elided_lifetimes_in_paths = "warn"
+# A `pub` item inside a private module is not part of any crate's API.
+unreachable_pub = "warn"
+# Every public item carries a doc comment. On the sponsord-api wire types the
+# comments are also the OpenAPI descriptions.
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Anti-panic: the daemon and the onramp are long-running servers.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+# Numeric safety (USDC amounts, expiries). `deny`, not `warn`, so a bare local
+# `cargo clippy` agrees with CI's `-D warnings`. Widening casts stay legal.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_precision_loss = "deny"
+
+# No stray output or scaffolding. The print lints keep stdio out of the
+# libraries and the servers.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+# Code quality
+cognitive_complexity = "warn"
+needless_pass_by_value = "warn"
+missing_const_for_fn = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+trivially_copy_pass_by_ref = "warn"
+unused_self = "warn"
+
+# Pedantic relaxations
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[workspace.dependencies]
+# Internal crates. The `version` is what makes them publishable: a published
+# manifest has no path to follow, so cargo rejects a path dependency without
+# one. Locally the `path` wins. It equals the workspace version above;
+# `cargo release` rewrites it (`dependent-version = "upgrade"`).
+sponsord = { path = "crates/sponsord", version = "0.2.0" }
+sponsord-api = { path = "crates/sponsord-api", version = "0.2.0" }
+sponsord-core = { path = "crates/sponsord-core", version = "0.2.0" }
+sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.2.0" }
+
+# deCDN, from crates.io. A caret requirement takes every compatible decdn
+# release; `Cargo.lock` decides which one builds, and open-decdn-bump.sh moves
+# it (RELEASING.md § Pinning decdn).
+decdn-client = "0.2"
+decdn-common = "0.2"
+decdn-incentive = "0.2"
+# Dev-only: the anvil fixtures. decdn does not publish decdn-e2e, and it needs
+# decdn's whole checkout (it builds the contracts), so it is a git dependency at
+# the release tag of the decdn version Cargo.lock holds, whose contracts match
+# the crates.io ABI. A dev-dependency without a `version` is stripped from the
+# published manifest. check_decdn_pin.py checks all of this.
+decdn-e2e = { git = "https://github.com/decdn/decdn", tag = "v0.2.0" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+alloy = { version = "2", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+reqwest = { version = "0.13", features = ["json", "query", "form"] }
+
+# decdn-e2e's own decdn dependencies, taken from crates.io like the ones above,
+# so each decdn crate is built once: a git copy beside the crates.io one would
+# be a different crate, with types that do not match. One entry per decdn crate
+# both sides use; the requirements equal the ones above.
+[patch."https://github.com/decdn/decdn"]
+decdn-bao-range = "0.2"
+decdn-client = "0.2"
+decdn-common = "0.2"
+decdn-config-types = "0.2"
+decdn-incentive = "0.2"
+decdn-protocol = "0.2"
+
+[profile.release]
+# Fat LTO + one codegen unit: smaller, faster release binaries at the cost of
+# build time, which lands only on the release workflow (CI never builds
+# --release). Unwinding is kept (no `panic = "abort"`) and the symbol table
+# stays (`strip = "debuginfo"`) so an operator's backtrace names functions.
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"

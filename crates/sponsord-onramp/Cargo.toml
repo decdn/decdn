@@ -1,0 +1,40 @@
+[package]
+name = "sponsord-onramp"
+description = "The public onramp in front of sponsord: a pluggable gate, and the installers that download through it"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sponsord-api = { workspace = true, features = ["axum", "client", "secret"] }
+clap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+anyhow.workspace = true
+alloy-primitives = "1"
+reqwest.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait = "0.1"
+axum = "0.8"
+
+[features]
+# `test_support`: fakes for the daemon and the gate, and a ready `AppState`.
+test-support = []
+
+[dev-dependencies]
+# This crate's own integration tests use `test_support`.
+sponsord-onramp = { path = ".", features = ["test-support"] }
+serde_json.workspace = true
+wiremock = "0.6"
+tower = { version = "0.5", features = ["util"] }

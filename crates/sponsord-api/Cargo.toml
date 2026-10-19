@@ -1,0 +1,57 @@
+[package]
+name = "sponsord-api"
+description = "Wire types, error codes and HTTP clients for the sponsord daemon and onramp"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+# The OpenAPI documents carry this crate's version (`info.version`), and the
+# snapshot test compares them byte for byte, so the release rewrites them with
+# the version it cuts. This list replaces the root release.toml's rather than
+# adding to it, hence the CHANGELOG.md entry repeated from there.
+[package.metadata.release]
+pre-release-replacements = [
+  { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+  { file = "../../docs/openapi/sponsord.json", search = '"version": "[^"]+"', replace = '"version": "{{version}}"', exactly = 1 },
+  { file = "../../docs/openapi/sponsord-onramp.json", search = '"version": "[^"]+"', replace = '"version": "{{version}}"', exactly = 1 },
+]
+
+[features]
+# Typed HTTP clients: `DaemonClient` (for gates in front of the daemon) and
+# `OnrampClient` (for programs that run a download through an onramp).
+client = ["dep:reqwest", "dep:tokio", "secret"]
+# `IntoResponse` for `ErrorBody`, for servers built on axum.
+axum = ["dep:axum"]
+# `utoipa` schemas and the OpenAPI documents in `openapi`.
+openapi = ["dep:utoipa", "dep:serde_json"]
+# `secret::Secret`, for server configuration.
+secret = ["dep:anyhow", "dep:zeroize"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+zeroize = { version = "1", optional = true }
+alloy-primitives = { version = "1", features = ["serde"] }
+serde.workspace = true
+thiserror = "2"
+axum = { version = "0.8", optional = true, default-features = false, features = ["json"] }
+reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { version = "1", optional = true, features = ["time"] }
+utoipa = { version = "6", optional = true }
+
+[dev-dependencies]
+# Builds this crate's own tests with every feature, so `cargo test` covers
+# the clients and checks the committed OpenAPI documents.
+sponsord-api = { path = ".", features = ["client", "axum", "openapi", "secret"] }
+serde_json.workspace = true
+tokio.workspace = true
+wiremock = "0.6"

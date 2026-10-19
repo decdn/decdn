@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{BRAND_NAME}}: start your download</title>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 4rem auto; padding: 0 1rem; }
+  #done { display: none; }
+  #expired { display: none; }
+  #error { display: none; color: #b00020; }
+</style>
+</head>
+<body>
+<h1>{{BRAND_NAME}}</h1>
+<p>Verify you are not a robot to receive a sponsored allowance for your download.</p>
+
+<div class="cf-turnstile" data-sitekey="{{SITEKEY}}" data-callback="onTurnstileToken"></div>
+
+<p id="done">You can return to your terminal.</p>
+<p id="expired">This key's allowance has expired and cannot be renewed. Start the download again with a fresh key.</p>
+<p id="error">Something went wrong. Please refresh and try again.</p>
+
+<script>
+  const CLIENT = "{{CLIENT}}";
+
+  function onTurnstileToken(token) {
+    fetch("/v1/fund", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client: CLIENT, proof: token }),
+    })
+      .then((resp) => {
+        if (resp.ok) {
+          document.getElementById("done").style.display = "block";
+        } else if (resp.status === 409) {
+          document.getElementById("expired").style.display = "block";
+        } else {
+          document.getElementById("error").style.display = "block";
+        }
+      })
+      .catch(() => {
+        document.getElementById("error").style.display = "block";
+      });
+  }
+</script>
+</body>
+</html>
