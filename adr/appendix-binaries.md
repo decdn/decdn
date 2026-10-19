@@ -111,7 +111,7 @@ and would silently miss data on a prefix rename.
   the GPG signature covers. The binary embeds the public keys
   committed as `crates/cli/minisign*.pub` and refuses a release that
   no embedded key verifies. It then checks the archive against the
-  manifest, unpacks it, and renames the new binary over the old one.
+  manifest, unpacks it, and swaps the new binary in for the old one.
   It replaces only a binary the user can write and that
   `cargo install` did not place. It never applies a downgrade or a
   pre-release. Once a day, after a command succeeds on a terminal,

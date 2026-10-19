@@ -3,8 +3,8 @@
 //!
 //! The keys in [`TRUSTED_KEYS`] are the `minisign*.pub` files committed in
 //! this crate, embedded at build time. A release whose `SHA256SUMS.minisig`
-//! no key in that set verifies is refused outright. To rotate the key, a
-//! release signed by the current key ships a binary that embeds both the
+//! verifies under no key in that set is refused outright. To rotate the key,
+//! a release signed by the current key ships a binary that embeds both the
 //! current and the next key; releases after it sign with the next key.
 
 use anyhow::{Context, bail};
@@ -25,24 +25,33 @@ pub(crate) fn trusted_keys() -> anyhow::Result<Vec<PublicKey>> {
 }
 
 /// Check that `minisig` is a valid minisign signature over `sums` by one of
-/// `keys`. A signature from a key outside the set is refused by that fact
-/// alone; a signature that names a trusted key but does not verify is a
-/// tampered manifest or signature.
+/// `keys`, and parse the manifest those bytes hold. A signature from a key
+/// outside the set is refused by that fact alone; a signature that names a
+/// trusted key but does not verify is a tampered manifest or signature. The
+/// parse runs only after the signature holds, so a [`Manifest`] value is
+/// always one a trusted key signed.
 pub(crate) fn verify_manifest_with(
     keys: &[PublicKey],
     sums: &[u8],
     minisig: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Manifest> {
     let signature = Signature::decode(minisig)
         .map_err(|e| anyhow::anyhow!("SHA256SUMS.minisig is not a minisign signature: {e}"))?;
+    let mut verified = false;
     for key in keys {
         match key.verify(sums, &signature, false) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                verified = true;
+                break;
+            }
             Err(MinisignError::UnexpectedKeyId) => {}
             Err(e) => bail!("SHA256SUMS does not verify against SHA256SUMS.minisig: {e}"),
         }
     }
-    bail!("SHA256SUMS.minisig is not signed by a key this decdn build trusts")
+    if !verified {
+        bail!("SHA256SUMS.minisig is not signed by a key this decdn build trusts");
+    }
+    Manifest::parse(std::str::from_utf8(sums).context("SHA256SUMS is not UTF-8")?)
 }
 
 /// Lowercase hex SHA-256 of `bytes`, as `sha256sum` prints it.

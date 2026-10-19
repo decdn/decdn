@@ -324,8 +324,8 @@ jobs:
             gh release edit "$TAG" --notes-file /tmp/release-notes.md
           else
             # A pre-release suffix marks the draft as a pre-release, so it
-            # never becomes the "latest" release that `decdn self-update`
-            # and the devops release resolver read.
+            # never becomes the "latest" release `decdn self-update` resolves
+            # and the devops release-line resolver skips it.
             prerelease=()
             [[ "$TAG" == *-* ]] && prerelease=(--prerelease)
             gh release create "$TAG" \

@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::super::release::ArchiveKind;
@@ -21,7 +20,7 @@ fn classify_refuses_a_cargo_install() {
     let exe = cargo.join("decdn");
     assert_eq!(
         classify(&exe, std::slice::from_ref(&cargo), writable),
-        Ownership::CargoBin(exe)
+        Ownership::CargoBin
     );
 }
 
@@ -32,8 +31,7 @@ fn classify_refuses_a_cargo_install() {
 fn classify_refuses_an_unwritable_directory() {
     let exe = PathBuf::from("/usr/local/bin/decdn");
     match classify(&exe, &[PathBuf::from("/home/u/.cargo/bin")], read_only) {
-        Ownership::NotWritable { path, reason } => {
-            assert_eq!(path, exe);
+        Ownership::NotWritable(reason) => {
             assert!(reason.to_lowercase().contains("permission"), "{reason}");
         }
         other => panic!("expected NotWritable, got {other:?}"),
@@ -49,34 +47,80 @@ fn classify_accepts_a_writable_install() {
     );
 }
 
-/// `~/.cargo/bin` always counts; `$CARGO_HOME/bin` too when set.
+/// `~/.cargo/bin` always counts; `$CARGO_HOME/bin` and `$CARGO_INSTALL_ROOT/bin`
+/// too when set. A directory that exists is canonicalised, so a symlinked
+/// cargo home still matches the canonical path of the running binary.
 #[test]
-fn cargo_bin_dirs_cover_home_and_cargo_home() {
+fn cargo_bin_dirs_cover_home_cargo_home_and_install_root() {
     let home = Path::new("/home/u");
     assert_eq!(
-        cargo_bin_dirs(home, None),
+        cargo_bin_dirs(home, None, None),
         vec![PathBuf::from("/home/u/.cargo/bin")]
     );
     assert_eq!(
-        cargo_bin_dirs(home, Some(Path::new("/opt/cargo"))),
+        cargo_bin_dirs(
+            home,
+            Some(Path::new("/opt/cargo")),
+            Some(Path::new("/opt/tools"))
+        ),
         vec![
             PathBuf::from("/home/u/.cargo/bin"),
-            PathBuf::from("/opt/cargo/bin")
+            PathBuf::from("/opt/cargo/bin"),
+            PathBuf::from("/opt/tools/bin"),
         ]
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn cargo_bin_dirs_canonicalise_a_symlinked_cargo_home() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("disk").join("cargo");
+    std::fs::create_dir_all(real.join("bin")).unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(&real, home.join(".cargo")).unwrap();
+    let dirs = cargo_bin_dirs(&home, None, None);
+    assert_eq!(dirs, vec![real.canonicalize().unwrap().join("bin")]);
+    let exe = real.canonicalize().unwrap().join("bin").join("decdn");
+    assert_eq!(classify(&exe, &dirs, writable), Ownership::CargoBin);
+}
+
 fn tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    tar_gz_typed(
+        &entries
+            .iter()
+            .map(|(n, d)| (*n, *d, tar::EntryType::Regular))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn tar_gz_typed(entries: &[(&str, &[u8], tar::EntryType)]) -> Vec<u8> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     let mut tar = tar::Builder::new(gz);
-    for (name, data) in entries {
+    for (name, data, kind) in entries {
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
         header.set_mode(0o755);
+        header.set_entry_type(*kind);
+        if *kind == tar::EntryType::Symlink {
+            header.set_link_name("elsewhere").unwrap();
+        }
         header.set_cksum();
         tar.append_data(&mut header, name, *data).unwrap();
     }
     tar.into_inner().unwrap().finish().unwrap()
+}
+
+fn zip_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, data) in entries {
+        zip.start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(data).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
 }
 
 #[test]
@@ -114,6 +158,87 @@ fn extract_binary_caps_the_entry_size() {
 #[test]
 fn extract_binary_rejects_garbage() {
     assert!(extract_binary(b"not an archive", ArchiveKind::TarGz, 1024).is_err());
+    assert!(extract_binary(b"not an archive", ArchiveKind::Zip, 1024).is_err());
+}
+
+/// A `decdn` entry that is not a regular file (a symlink, a directory) reads
+/// as zero bytes; installing that would leave no binary at all.
+#[test]
+fn extract_binary_rejects_a_symlink_entry() {
+    let archive = tar_gz_typed(&[("decdn", b"", tar::EntryType::Symlink)]);
+    let err = extract_binary(&archive, ArchiveKind::TarGz, 1024).unwrap_err();
+    assert!(err.to_string().contains("not a regular file"), "{err}");
+}
+
+#[test]
+fn extract_binary_rejects_an_empty_binary() {
+    let archive = tar_gz(&[("decdn", b"")]);
+    let err = extract_binary(&archive, ArchiveKind::TarGz, 1024).unwrap_err();
+    assert!(err.to_string().contains("is empty"), "{err}");
+    let archive = zip_archive(&[("decdn.exe", b"")]);
+    let err = extract_binary(&archive, ArchiveKind::Zip, 1024).unwrap_err();
+    assert!(err.to_string().contains("is empty"), "{err}");
+}
+
+/// A Windows release archive is a zip holding `decdn.exe` at its root.
+#[test]
+fn extract_binary_reads_decdn_exe_from_a_zip() {
+    let archive = zip_archive(&[("decdn.exe", b"new exe")]);
+    assert_eq!(
+        extract_binary(&archive, ArchiveKind::Zip, 1024).unwrap(),
+        b"new exe"
+    );
+}
+
+#[test]
+fn extract_binary_rejects_a_nested_zip_entry() {
+    let archive = zip_archive(&[("bin/decdn.exe", b"nested"), ("decdn", b"wrong name")]);
+    let err = extract_binary(&archive, ArchiveKind::Zip, 1024).unwrap_err();
+    assert!(err.to_string().contains("no `decdn.exe` entry"), "{err}");
+}
+
+#[test]
+fn extract_binary_caps_a_zip_entry() {
+    let archive = zip_archive(&[("decdn.exe", &[0u8; 2048])]);
+    let err = extract_binary(&archive, ArchiveKind::Zip, 1024).unwrap_err();
+    assert!(err.to_string().contains("larger than"), "{err}");
+}
+
+/// On Unix the swap is one rename of the staged sibling over the binary:
+/// atomic, mode kept, and the staged name gone afterwards.
+#[cfg(unix)]
+#[test]
+fn swap_renames_the_staged_file_over_the_binary() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let exe = dir.path().join("decdn");
+    std::fs::write(&exe, b"old").unwrap();
+    let staged = stage(dir.path(), b"new binary").unwrap();
+    let staged_path = staged.path().to_path_buf();
+    swap(staged, &exe).unwrap();
+    assert_eq!(std::fs::read(&exe).unwrap(), b"new binary");
+    assert!(!staged_path.exists());
+    let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755, "mode {mode:o}");
+}
+
+/// A swap that fails keeps the verified download and names it, so nothing
+/// the user paid to fetch and verify is thrown away.
+#[cfg(unix)]
+#[test]
+fn a_failed_swap_keeps_the_staged_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let staged = stage(dir.path(), b"new binary").unwrap();
+    let staged_path = staged.path().to_path_buf();
+    // Renaming over a non-empty directory fails.
+    let target = dir.path().join("occupied");
+    std::fs::create_dir_all(target.join("child")).unwrap();
+    let err = swap(staged, &target).unwrap_err();
+    assert!(
+        err.to_string().contains(staged_path.to_str().unwrap()),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(&staged_path).unwrap(), b"new binary");
 }
 
 /// The staged file is a sibling of the executable (same filesystem, so the
@@ -133,42 +258,6 @@ fn stage_writes_an_executable_sibling() {
             .mode();
         assert_eq!(mode & 0o111, 0o111, "mode {mode:o}");
     }
-}
-
-/// The marker line is what the sponsored installer writes: the manifest
-/// digest, a space, the target triple, a newline.
-#[test]
-fn marker_line_matches_the_installer_format() {
-    let line = marker_line(&"c".repeat(64), "x86_64-unknown-linux-gnu");
-    assert_eq!(
-        line,
-        format!("{} x86_64-unknown-linux-gnu\n", "c".repeat(64))
-    );
-}
-
-/// Only an existing marker is rewritten: an install the sponsored installer
-/// did not make gets no marker.
-#[test]
-fn rewrite_marker_only_when_present() {
-    let dir = tempfile::tempdir().unwrap();
-    let marker = dir.path().join("installer").join("decdn");
-    assert!(!rewrite_marker_if_present(&marker, "new\n").unwrap());
-    assert!(!marker.exists());
-    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-    std::fs::File::create(&marker)
-        .unwrap()
-        .write_all(b"old x\n")
-        .unwrap();
-    assert!(rewrite_marker_if_present(&marker, "new\n").unwrap());
-    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "new\n");
-}
-
-#[test]
-fn installer_marker_lives_under_the_data_dir() {
-    assert_eq!(
-        installer_marker_path(Path::new("/home/u/.decdn")),
-        PathBuf::from("/home/u/.decdn/installer/decdn")
-    );
 }
 
 /// The probe names the OS reason, not the temporary file it tried to make:

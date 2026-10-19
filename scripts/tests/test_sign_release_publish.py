@@ -9,7 +9,6 @@ skipped, so no docker is needed.
 
 from __future__ import annotations
 
-import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -55,16 +54,19 @@ case "$1 $2" in
 esac
 """
 
-# `minisign -S` writes the signature file named by -x; `minisign -V` succeeds
-# unless $MINISIGN_FAIL_VERIFY is set. Logs argv to $MINISIGN_LOG.
+# `minisign -S` writes the signature file named by -x unless
+# $MINISIGN_FAIL_SIGN is set; `minisign -V` succeeds unless
+# $MINISIGN_FAIL_VERIFY is set. Logs argv to $MINISIGN_LOG.
 MINISIGN_SHIM = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$MINISIGN_LOG"
 mode="$1"; shift
 out=""
 while [ $# -gt 0 ]; do [ "$1" = "-x" ] && out="$2"; shift; done
 case "$mode" in
-  -S) echo "untrusted comment: shim" > "$out"; exit 0 ;;
-  -V) [ -n "${MINISIGN_FAIL_VERIFY:-}" ] && exit 1; exit 0 ;;
+  -S) [ -n "${MINISIGN_FAIL_SIGN:-}" ] && { echo "shim: bad password" >&2; exit 1; }
+      echo "untrusted comment: shim" > "$out"; exit 0 ;;
+  -V) [ -n "${MINISIGN_FAIL_VERIFY:-}" ] && { echo "shim: signature mismatch" >&2; exit 1; }
+      exit 0 ;;
   *) exit 9 ;;
 esac
 """
@@ -91,7 +93,8 @@ class Release(Keyring):
         run = lambda *a: subprocess.run(  # noqa: E731
             [*git, *a], cwd=self.repo, env=self.env(), check=True, capture_output=True
         )
-        run("commit", "--allow-empty", "-q", "-m", "release")
+        run("add", "-A")
+        run("commit", "-q", "-m", "release")
         run("-c", f"user.signingkey={fpr}", "tag", "-s", name, "-m", name)
         origin = self.root / "origin.git"
         subprocess.run(
@@ -157,7 +160,12 @@ def test_a_stable_release_is_minisigned_uploaded_and_published(release):
     assert result.returncode == 0, output(result)
     signs = release.calls(release.minisign_log, "-S")
     assert len(signs) == 1 and "-m SHA256SUMS" in signs[0] and "-x SHA256SUMS.minisig" in signs[0]
-    assert release.calls(release.minisign_log, "-V"), "the signature was not verified"
+    verifies = release.calls(release.minisign_log, "-V")
+    assert len(verifies) == 1, verifies
+    # Verified against the public key read out of the tag's tree, not the
+    # secret key's own public half.
+    assert "-p " in verifies[0] and "/minisign.pub" in verifies[0], verifies
+    assert "signed SHA256SUMS.minisig (crates/cli/minisign.pub)" in result.stdout
     uploads = release.calls(release.gh_log, "release upload")
     assert len(uploads) == 1 and "SHA256SUMS.minisig" in uploads[0], uploads
     assert "SHA256SUMS.asc" in uploads[0]
@@ -185,8 +193,34 @@ def test_a_manifest_signature_no_committed_key_verifies_is_refused(release):
 
     assert result.returncode != 0
     assert "not signed by a key the decdn binary trusts" in result.stderr, output(result)
+    assert "minisign said: shim: signature mismatch" in result.stderr, output(result)
     assert not release.calls(release.gh_log, "release upload")
     assert not release.calls(release.gh_log, "release edit")
+
+
+def test_a_failed_minisign_stops_before_any_upload(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", MINISIGN_FAIL_SIGN="1")
+
+    assert result.returncode != 0
+    assert "failed to minisign SHA256SUMS" in result.stderr, output(result)
+    assert not release.calls(release.gh_log, "release upload")
+
+
+def test_the_keys_come_from_the_tag_tree_not_the_working_tree(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+    # A second key added after the tag is not one the released binary embeds.
+    extra = release.repo / "crates" / "cli" / "minisign-next.pub"
+    extra.write_text("untrusted comment: next\nRWQBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n")
+
+    result = release.publish("v0.0.0")
+
+    assert result.returncode == 0, output(result)
+    verifies = release.calls(release.minisign_log, "-V")
+    assert all("minisign-next.pub" not in line for line in verifies), verifies
 
 
 def test_a_missing_minisign_key_is_refused_before_signing(release):
@@ -209,10 +243,3 @@ def test_no_committed_public_key_is_refused_before_signing(release):
     assert result.returncode != 0
     assert "crates/cli/minisign*.pub" in result.stderr, output(result)
     assert "==> Signing as" not in result.stdout
-
-
-def test_sha256_of_the_shim_manifest_is_stable():
-    # Guards the shim's manifest shape: GNU text format the script checks
-    # with `sha256sum --strict --check`.
-    digest = hashlib.sha256(b"bytes").hexdigest()
-    assert len(digest) == 64

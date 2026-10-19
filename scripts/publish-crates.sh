@@ -221,7 +221,9 @@ esac
 # SHA256SUMS.asc and SHA256SUMS.minisig are the two sign-release.sh always
 # uploads; the second is what `decdn self-update` checks, so a release
 # without it strands every installed CLI on the previous version.
-ASSETS=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null)
+if ! ASSETS=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>&1); then
+  die "cannot list the assets of release $TAG: $ASSETS"
+fi
 for sig in SHA256SUMS.asc SHA256SUMS.minisig; do
   grep -qx "$sig" <<<"$ASSETS" || die \
     "release $TAG carries no $sig — it is published but was never signed.

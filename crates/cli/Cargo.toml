@@ -156,8 +156,11 @@ jsonrpsee = { workspace = true, features = ["server"] }
 # does not re-export.
 alloy-json-rpc = { workspace = true }
 # The self-update tests stand in for github.com: a redirect to the release
-# tag, the signed manifest, and the archive, all served from loopback.
+# tag, the signed manifest, and the archive, all served from loopback. `zip`
+# is a dev-dependency on every platform so the Windows archive reader is
+# tested on Linux CI.
 wiremock = { workspace = true }
+zip = { workspace = true }
 
 # `tests/key_gen_prompt_pty.rs` drives the real `decdn` binary through the
 # interactive keystore-password prompt, which `rpassword` reads from

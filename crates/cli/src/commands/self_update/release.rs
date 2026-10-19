@@ -11,17 +11,22 @@ use anyhow::{Context, bail};
 use bytes::{Bytes, BytesMut};
 use semver::Version;
 
-/// The release page every asset is fetched from.
+/// The repository whose releases every asset is fetched from.
 pub(crate) const REPO_BASE: &str = "https://github.com/decdn/decdn";
 
 /// Where the releases live: `DECDN_RELEASES_BASE` when set, else the project
 /// repository. The override points a test or a smoke run at a local server;
 /// it changes where the client looks, never what it trusts.
 pub(crate) fn releases_base() -> String {
-    std::env::var("DECDN_RELEASES_BASE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| REPO_BASE.to_string())
+    base_from(std::env::var("DECDN_RELEASES_BASE").ok().as_deref())
+}
+
+/// `raw` without its trailing slash, or [`REPO_BASE`] when it is blank.
+pub(crate) fn base_from(raw: Option<&str>) -> String {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(base) => base.trim_end_matches('/').to_string(),
+        None => REPO_BASE.to_string(),
+    }
 }
 
 /// How a release archive for a target is packed.
@@ -33,77 +38,102 @@ pub(crate) enum ArchiveKind {
     Zip,
 }
 
-/// A target the release pipeline builds an archive for.
+impl ArchiveKind {
+    /// The file name the archive holds at its root.
+    pub(crate) const fn binary_name(self) -> &'static str {
+        match self {
+            Self::TarGz => "decdn",
+            Self::Zip => "decdn.exe",
+        }
+    }
+}
+
+/// A target the release pipeline builds an archive for: the six triples of
+/// the release matrix, and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Target {
-    triple: &'static str,
-    kind: ArchiveKind,
+pub(crate) enum Target {
+    /// `x86_64-unknown-linux-gnu`
+    X86_64LinuxGnu,
+    /// `aarch64-unknown-linux-gnu`
+    Aarch64LinuxGnu,
+    /// `x86_64-apple-darwin`
+    X86_64Darwin,
+    /// `aarch64-apple-darwin`
+    Aarch64Darwin,
+    /// `x86_64-pc-windows-msvc`
+    X86_64WindowsMsvc,
+    /// `aarch64-pc-windows-msvc`
+    Aarch64WindowsMsvc,
 }
 
 impl Target {
-    #[cfg(test)]
-    pub(crate) const fn new(triple: &'static str, kind: ArchiveKind) -> Self {
-        Self { triple, kind }
-    }
-
     /// The target this binary was built for, when the release pipeline
     /// ships an archive for it. `None` on every other platform (a musl or
     /// BSD build, say), which must install from source instead.
     pub(crate) const fn current() -> Option<Self> {
-        let triple = if cfg!(all(
+        if cfg!(all(
             target_arch = "x86_64",
             target_os = "linux",
             target_env = "gnu"
         )) {
-            "x86_64-unknown-linux-gnu"
+            Some(Self::X86_64LinuxGnu)
         } else if cfg!(all(
             target_arch = "aarch64",
             target_os = "linux",
             target_env = "gnu"
         )) {
-            "aarch64-unknown-linux-gnu"
+            Some(Self::Aarch64LinuxGnu)
         } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
-            "x86_64-apple-darwin"
+            Some(Self::X86_64Darwin)
         } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
-            "aarch64-apple-darwin"
+            Some(Self::Aarch64Darwin)
         } else if cfg!(all(
             target_arch = "x86_64",
             target_os = "windows",
             target_env = "msvc"
         )) {
-            "x86_64-pc-windows-msvc"
+            Some(Self::X86_64WindowsMsvc)
         } else if cfg!(all(
             target_arch = "aarch64",
             target_os = "windows",
             target_env = "msvc"
         )) {
-            "aarch64-pc-windows-msvc"
+            Some(Self::Aarch64WindowsMsvc)
         } else {
-            return None;
-        };
-        let kind = if cfg!(windows) {
-            ArchiveKind::Zip
-        } else {
-            ArchiveKind::TarGz
-        };
-        Some(Self { triple, kind })
+            None
+        }
     }
 
+    /// The target triple, as the release asset names spell it.
     pub(crate) const fn triple(self) -> &'static str {
-        self.triple
+        match self {
+            Self::X86_64LinuxGnu => "x86_64-unknown-linux-gnu",
+            Self::Aarch64LinuxGnu => "aarch64-unknown-linux-gnu",
+            Self::X86_64Darwin => "x86_64-apple-darwin",
+            Self::Aarch64Darwin => "aarch64-apple-darwin",
+            Self::X86_64WindowsMsvc => "x86_64-pc-windows-msvc",
+            Self::Aarch64WindowsMsvc => "aarch64-pc-windows-msvc",
+        }
     }
 
+    /// How this target's archive is packed: Windows ships zips, the rest tarballs.
     pub(crate) const fn kind(self) -> ArchiveKind {
-        self.kind
+        match self {
+            Self::X86_64WindowsMsvc | Self::Aarch64WindowsMsvc => ArchiveKind::Zip,
+            Self::X86_64LinuxGnu
+            | Self::Aarch64LinuxGnu
+            | Self::X86_64Darwin
+            | Self::Aarch64Darwin => ArchiveKind::TarGz,
+        }
     }
 
     /// The release asset name for this target at `version`.
     pub(crate) fn archive_name(self, version: &Version) -> String {
-        let ext = match self.kind {
+        let ext = match self.kind() {
             ArchiveKind::TarGz => "tar.gz",
             ArchiveKind::Zip => "zip",
         };
-        format!("decdn-{version}-{}.{ext}", self.triple)
+        format!("decdn-{version}-{}.{ext}", self.triple())
     }
 }
 
@@ -114,9 +144,10 @@ pub(crate) struct Manifest {
 }
 
 impl Manifest {
-    /// Parse GNU `sha256sum` text output: 64 lowercase hex digits, two
-    /// spaces, the file name. A leading `*` on the name (binary mode) is
-    /// dropped and a CRLF line end is tolerated. Any other line is an error.
+    /// Parse GNU `sha256sum` output: 64 lowercase hex digits, then either
+    /// two spaces and the file name (text mode) or one space, `*` and the
+    /// file name (binary mode). A CRLF line end is tolerated. Any other line
+    /// is an error.
     pub(crate) fn parse(text: &str) -> anyhow::Result<Self> {
         let mut entries = Vec::new();
         for (idx, raw) in text.lines().enumerate() {
@@ -124,8 +155,8 @@ impl Manifest {
             if line.is_empty() {
                 continue;
             }
-            let (digest, name) = line
-                .split_once("  ")
+            let (digest, rest) = line
+                .split_once(' ')
                 .with_context(|| format!("SHA256SUMS line {}: not `<sha256>  <name>`", idx + 1))?;
             if digest.len() != 64
                 || !digest
@@ -137,7 +168,10 @@ impl Manifest {
                     idx + 1
                 );
             }
-            let name = name.strip_prefix('*').unwrap_or(name);
+            let name = rest
+                .strip_prefix(' ')
+                .or_else(|| rest.strip_prefix('*'))
+                .with_context(|| format!("SHA256SUMS line {}: not `<sha256>  <name>`", idx + 1))?;
             if name.is_empty() {
                 bail!("SHA256SUMS line {}: empty file name", idx + 1);
             }
@@ -194,7 +228,7 @@ pub(crate) enum Upgrade {
     Newer,
     /// The running binary is the latest release.
     UpToDate,
-    /// The latest release is older than the running binary; refused.
+    /// The latest release is older than the running binary; nothing is applied.
     Downgrade,
     /// The latest release is a pre-release; never offered.
     PreRelease,
@@ -291,7 +325,7 @@ pub(crate) async fn fetch_asset(
     if let Some(len) = resp.content_length()
         && usize::try_from(len).is_ok_and(|len| len > max_bytes)
     {
-        bail!("GET {url}: {len} bytes is larger than the {max_bytes}-byte limit");
+        bail!("GET {url}: declares {len} bytes, larger than the {max_bytes}-byte limit");
     }
     let mut body = BytesMut::new();
     while let Some(chunk) = resp

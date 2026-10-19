@@ -38,10 +38,10 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    minisign -G -p crates/cli/minisign.pub -s ~/.minisign/minisign.key
    ```
 
-   Commit `crates/cli/minisign.pub` and list its key id in SECURITY.md. The
-   script reads the secret key from `DECDN_MINISIGN_KEY`, defaulting to
-   `~/.minisign/minisign.key`. See [The minisign key](#the-minisign-key) for
-   rotation.
+   Commit `crates/cli/minisign.pub`; SECURITY.md points readers at that file
+   for the key id. The script reads the secret key from `DECDN_MINISIGN_KEY`,
+   defaulting to `~/.minisign/minisign.key`. See
+   [The minisign key](#the-minisign-key) for rotation.
 
 3. **Git configured to sign.** `cargo release` relies on git's own signing
    config; `release.toml` sets `sign-commit` and `sign-tag`. Set this
@@ -193,9 +193,9 @@ verifies the tag signature; downloads the draft's assets; checks `SHA256SUMS`
 strictly against them **and** that every published archive appears in the
 manifest; signs `SHA256SUMS` and each image's digest file and SBOM; verifies
 each signature against a keyring built only from `KEYS`; signs `SHA256SUMS` a
-second time with minisign and verifies that against the committed
-`crates/cli/minisign*.pub`; uploads the five `.asc` files and
-`SHA256SUMS.minisig`; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
+second time with minisign and verifies that against the
+`crates/cli/minisign*.pub` in the tag's tree, the keys the released binary
+embeds; uploads the five `.asc` files and `SHA256SUMS.minisig`; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
 signed digest on GHCR; mirrors those same digests to Docker Hub; for a stable
 release, pushes each Docker Hub overview; checks that every promoted repository
 is pullable without credentials; and flips the release out of draft.
@@ -251,8 +251,9 @@ For a stable version the promoted tags are `latest`, `<version>` and
 `<major>.<minor>`. A prerelease (`v1.2.0-rc1`) gets only its exact version tag:
 moving `latest` to a candidate would hand it to every unpinned pull, and
 `<major>.<minor>` would clobber the stable minor tag. It is also published with
-`--prerelease`, so GitHub's "latest" release, which `decdn self-update` and
-the devops release resolver read, never names a candidate.
+`--prerelease`, so it is never GitHub's "latest" release (what
+`decdn self-update` resolves) and the devops release-line resolver, which drops
+any release flagged pre-release, skips it.
 
 Re-running is safe at any point before the release is published — signatures
 are re-uploaded with `--clobber` and the tag promotion is idempotent. Once the
@@ -283,14 +284,15 @@ across two releases:
    it). Every installed binary verifies it, and the binary it ships trusts
    both keys.
 3. From release N+1 on, sign with the new key. A binary older than N refuses
-   those releases and tells its user to reinstall; say so in the release
-   notes of N.
+   those releases ("not signed by a key this decdn build trusts"); say in the
+   release notes of N that older binaries must reinstall by hand.
 4. Once no supported binary predates N, delete `minisign-prev.pub` and its
    `TRUSTED_KEYS` entry.
 
-The script accepts whichever committed key verifies the signature, so a
-release signed with a key whose public half is not committed stops before
-anything is uploaded.
+The script verifies the signature against the `minisign*.pub` files in the
+tag's tree, which are exactly the keys the binary being released embeds, so a
+release signed with a key that binary does not carry stops before anything is
+uploaded.
 
 ## Publishing to crates.io
 

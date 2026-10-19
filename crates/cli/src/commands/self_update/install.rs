@@ -9,9 +9,6 @@ use tempfile::NamedTempFile;
 
 use super::release::ArchiveKind;
 
-/// The file name the release archive holds at its root.
-const BIN_NAME: &str = if cfg!(windows) { "decdn.exe" } else { "decdn" };
-
 /// Whether `decdn self-update` may replace the running binary.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Ownership {
@@ -19,44 +16,52 @@ pub(crate) enum Ownership {
     /// owns it: replace it in place.
     Replaceable,
     /// `cargo install` placed the binary; the user re-runs that instead.
-    CargoBin(PathBuf),
+    CargoBin,
     /// The binary's directory cannot be written by this user (the
     /// container image, an operator-managed fleet path, a distro package).
-    NotWritable {
-        /// The running binary.
-        path: PathBuf,
-        /// The OS reason the directory refused a write.
-        reason: String,
-    },
+    /// Carries the OS reason.
+    NotWritable(String),
 }
 
-/// Decide [`Ownership`] for the running binary at `exe`. `cargo_bins` are
-/// the cargo bin directories to refuse; `probe_writable` tries a write in a
-/// directory and reports the OS error when it fails.
+/// Decide [`Ownership`] for the running binary at `exe`, which must be
+/// canonical. `cargo_bins` are the canonical cargo bin directories to
+/// refuse; `probe_writable` tries a write in a directory and reports the OS
+/// reason when it fails.
 pub(crate) fn classify(
     exe: &Path,
     cargo_bins: &[PathBuf],
     probe_writable: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Ownership {
     if cargo_bins.iter().any(|dir| exe.starts_with(dir)) {
-        return Ownership::CargoBin(exe.to_path_buf());
+        return Ownership::CargoBin;
     }
     let dir = exe.parent().unwrap_or(exe);
     match probe_writable(dir) {
         Ok(()) => Ownership::Replaceable,
-        Err(e) => Ownership::NotWritable {
-            path: exe.to_path_buf(),
-            reason: e.to_string(),
-        },
+        Err(e) => Ownership::NotWritable(e.to_string()),
     }
 }
 
-/// The directories `cargo install` writes binaries to: `~/.cargo/bin` and,
-/// when set, `$CARGO_HOME/bin`.
-pub(crate) fn cargo_bin_dirs(home: &Path, cargo_home: Option<&Path>) -> Vec<PathBuf> {
-    let mut dirs = vec![home.join(".cargo").join("bin")];
-    if let Some(cargo_home) = cargo_home {
-        let dir = cargo_home.join("bin");
+/// The directories `cargo install` writes binaries to: `~/.cargo/bin`, and
+/// `$CARGO_HOME/bin` and `$CARGO_INSTALL_ROOT/bin` when set. Each one that
+/// exists is canonicalised, so it compares with the canonical path of the
+/// running binary even through a symlinked cargo home.
+pub(crate) fn cargo_bin_dirs(
+    home: &Path,
+    cargo_home: Option<&Path>,
+    install_root: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for root in [
+        Some(home.join(".cargo")),
+        cargo_home.map(Path::to_path_buf),
+        install_root.map(Path::to_path_buf),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let dir = root.join("bin");
+        let dir = dir.canonicalize().unwrap_or(dir);
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
@@ -91,27 +96,33 @@ pub(crate) fn extract_binary(
     kind: ArchiveKind,
     max_bytes: u64,
 ) -> anyhow::Result<Vec<u8>> {
-    match kind {
-        ArchiveKind::TarGz => extract_tar_gz(archive, max_bytes),
-        ArchiveKind::Zip => extract_zip(archive, max_bytes),
+    let bytes = match kind {
+        ArchiveKind::TarGz => extract_tar_gz(archive, max_bytes)?,
+        ArchiveKind::Zip => extract_zip(archive, max_bytes)?,
+    };
+    if bytes.is_empty() {
+        bail!("`{}` in the archive is empty", kind.binary_name());
     }
+    Ok(bytes)
 }
 
 fn extract_tar_gz(archive: &[u8], max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+    let bin = ArchiveKind::TarGz.binary_name();
     let gz = flate2::read::GzDecoder::new(archive);
     let mut tar = tar::Archive::new(gz);
     for entry in tar.entries().context("read the release archive")? {
         let mut entry = entry.context("read the release archive")?;
         let path = entry.path().context("read an archive entry name")?;
         let name = path.to_string_lossy();
-        if name.strip_prefix("./").unwrap_or(&name) != BIN_NAME {
+        if name.strip_prefix("./").unwrap_or(&name) != bin {
             continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            bail!("`{bin}` in the archive is not a regular file");
         }
         let size = entry.size();
         if size > max_bytes {
-            bail!(
-                "{BIN_NAME} in the archive is {size} bytes, larger than the {max_bytes}-byte limit"
-            );
+            bail!("`{bin}` in the archive is {size} bytes, larger than the {max_bytes}-byte limit");
         }
         let mut bytes = Vec::new();
         entry
@@ -119,23 +130,27 @@ fn extract_tar_gz(archive: &[u8], max_bytes: u64) -> anyhow::Result<Vec<u8>> {
             .context("read the binary out of the archive")?;
         return Ok(bytes);
     }
-    bail!("the release archive holds no `{BIN_NAME}` entry at its root")
+    bail!("the release archive holds no `{bin}` entry at its root")
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn extract_zip(archive: &[u8], max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+    let bin = ArchiveKind::Zip.binary_name();
     let mut zip =
         zip::ZipArchive::new(std::io::Cursor::new(archive)).context("read the release archive")?;
-    let mut entry = match zip.by_name(BIN_NAME) {
+    let mut entry = match zip.by_name(bin) {
         Ok(entry) => entry,
         Err(zip::result::ZipError::FileNotFound) => {
-            bail!("the release archive holds no `{BIN_NAME}` entry at its root")
+            bail!("the release archive holds no `{bin}` entry at its root")
         }
         Err(e) => return Err(e).context("read the release archive"),
     };
+    if !entry.is_file() {
+        bail!("`{bin}` in the archive is not a regular file");
+    }
     let size = entry.size();
     if size > max_bytes {
-        bail!("{BIN_NAME} in the archive is {size} bytes, larger than the {max_bytes}-byte limit");
+        bail!("`{bin}` in the archive is {size} bytes, larger than the {max_bytes}-byte limit");
     }
     let mut bytes = Vec::new();
     entry
@@ -144,7 +159,7 @@ fn extract_zip(archive: &[u8], max_bytes: u64) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, test)))]
 fn extract_zip(_archive: &[u8], _max_bytes: u64) -> anyhow::Result<Vec<u8>> {
     bail!("zip release archives are for Windows builds only")
 }
@@ -169,37 +184,43 @@ pub(crate) fn stage(dir: &Path, bytes: &[u8]) -> anyhow::Result<NamedTempFile> {
     Ok(staged)
 }
 
-/// Replace the running executable with the staged file. On Unix this is a
-/// rename over the running path; on Windows the running `.exe` is moved
-/// aside first, because it cannot be overwritten while it runs.
-pub(crate) fn swap(staged: &Path) -> anyhow::Result<()> {
-    self_replace::self_replace(staged)
-        .with_context(|| format!("replace the running binary with {}", staged.display()))
-}
-
-/// The sponsored installer's marker for the `decdn` binary under `data_dir`.
-pub(crate) fn installer_marker_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("installer").join("decdn")
-}
-
-/// The marker line the sponsored installer writes: the SHA-256 of the
-/// release's `SHA256SUMS`, a space, the target triple. The installer skips
-/// a release whose marker matches, so a self-updated binary stays.
-pub(crate) fn marker_line(sums_sha256: &str, triple: &str) -> String {
-    format!("{sums_sha256} {triple}\n")
-}
-
-/// Rewrite `marker` atomically when it exists. Returns whether it did.
-pub(crate) fn rewrite_marker_if_present(marker: &Path, line: &str) -> std::io::Result<bool> {
-    if !marker.is_file() {
-        return Ok(false);
+/// Replace the binary at `exe` with the staged file. On Unix this is one
+/// rename of the staged sibling over `exe`, so the path always holds either
+/// the old or the new binary. On Windows the running `.exe` cannot be
+/// overwritten: it is moved aside and deleted once this process exits. A
+/// swap that fails keeps the staged file and names it in the error, so the
+/// verified download is not lost.
+pub(crate) fn swap(staged: NamedTempFile, exe: &Path) -> anyhow::Result<()> {
+    let staged_path = staged.path().to_path_buf();
+    let result = swap_inner(&staged, exe);
+    match result {
+        Ok(()) => {
+            // The staged file is already gone on Unix; on Windows it was
+            // copied, and dropping the handle removes it.
+            drop(staged);
+            Ok(())
+        }
+        Err(e) => {
+            let kept = staged.keep().map_or(staged_path, |(_, path)| path);
+            Err(e.context(format!(
+                "the verified new binary is kept at {}; move it over {} by hand",
+                kept.display(),
+                exe.display()
+            )))
+        }
     }
-    let dir = marker.parent().unwrap_or(marker);
-    let mut tmp = NamedTempFile::new_in(dir)?;
-    tmp.write_all(line.as_bytes())?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(marker).map_err(|e| e.error)?;
-    Ok(true)
+}
+
+#[cfg(unix)]
+fn swap_inner(staged: &NamedTempFile, exe: &Path) -> anyhow::Result<()> {
+    std::fs::rename(staged.path(), exe)
+        .with_context(|| format!("rename {} over {}", staged.path().display(), exe.display()))
+}
+
+#[cfg(windows)]
+fn swap_inner(staged: &NamedTempFile, exe: &Path) -> anyhow::Result<()> {
+    self_replace::self_replace(staged.path())
+        .with_context(|| format!("replace {} with {}", exe.display(), staged.path().display()))
 }
 
 #[cfg(test)]

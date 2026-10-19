@@ -11,9 +11,26 @@ fn test_keys() -> Vec<PublicKey> {
     vec![PublicKey::decode(TEST_PUB).unwrap()]
 }
 
+/// A good signature yields the parsed manifest: a `Manifest` value only
+/// ever comes from bytes a trusted key signed.
 #[test]
 fn manifest_signature_verifies_with_the_signing_key() {
-    verify_manifest_with(&test_keys(), SUMS, SUMS_SIG).unwrap();
+    let manifest = verify_manifest_with(&test_keys(), SUMS, SUMS_SIG).unwrap();
+    assert!(
+        manifest
+            .digest_for("decdn-99.0.0-x86_64-unknown-linux-gnu.tar.gz")
+            .is_some()
+    );
+}
+
+/// During a rotation a build embeds two keys; a release signed by either
+/// verifies, whichever order the keys are listed in.
+#[test]
+fn signature_verifies_against_either_of_two_trusted_keys() {
+    let other = PublicKey::decode(TRUSTED_KEYS.first().copied().unwrap()).unwrap();
+    let test = PublicKey::decode(TEST_PUB).unwrap();
+    verify_manifest_with(&[other.clone(), test.clone()], SUMS, SUMS_SIG).unwrap();
+    verify_manifest_with(&[test, other], SUMS, SUMS_SIG).unwrap();
 }
 
 /// One flipped byte in the manifest and the signature no longer covers it.

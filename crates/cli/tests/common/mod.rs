@@ -50,5 +50,9 @@ pub(crate) fn decdn_command(home: &Path) -> Command {
         }
     }
     cmd.env("HOME", home);
+    // A command that succeeds on a pty would otherwise ask github.com for the
+    // latest release once per isolated HOME; the test that covers the notice
+    // turns it back on and points it at a local server.
+    cmd.env("DECDN_SELF_UPDATE_CHECK", "0");
     cmd
 }

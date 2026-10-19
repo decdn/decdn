@@ -39,10 +39,12 @@ own — verify them through the signed manifest.
 [minisign](https://jedisct1.github.io/minisign/). It exists for
 `decdn self-update`: the `decdn` binary embeds the minisign public key committed
 as [`crates/cli/minisign.pub`](crates/cli/minisign.pub) and refuses a release
-whose manifest signature no embedded key verifies, before it reads a byte of
-the archive. The key's id is in that file's first line; pin it as you pin the
-GPG fingerprints. A rotation ships the next key inside a release signed by
-the current one (RELEASING.md § The minisign key).
+whose manifest signature verifies under no embedded key, before it reads a
+byte of the archive. The key id is encoded in the key itself and repeated in
+the file's comment line as `minisign -G` writes it; record it out of band the
+first time you verify a release, as you do the GPG fingerprints. A rotation
+ships the next key inside a release signed by the current one (RELEASING.md
+§ The minisign key).
 
 ### Verify a release tag
 

@@ -3909,19 +3909,18 @@ since project inception and will roll into the first tagged release.
   `cargo install` placed is refused with `cargo install --locked decdn-cli`;
   one in a directory the user cannot write (the container image, a managed
   fleet path) is refused by path. A downgrade or a pre-release is never
-  applied. When the sponsored installer's marker `~/.decdn/installer/decdn`
-  exists it is rewritten for the new release. After any other command
-  succeeds on a terminal, at most once a day (stamp
+  applied. After any other command succeeds, at most once a day (stamp
   `~/.decdn/self-update-check`), the CLI prints one stderr line naming the
-  newer version and `decdn self-update`; never with `--json` or piped
-  output. New config section `[self_update]` with
+  newer version and `decdn self-update`; never for `--json` output and never
+  when stderr is not a terminal. New config section `[self_update]` with
   `check` (default `true`), overridden by `DECDN_SELF_UPDATE_CHECK`.
   `DECDN_RELEASES_BASE` points a test at another release page.
 - **Release tooling: `SHA256SUMS.minisig` and pre-release marking (#2537).**
   `scripts/sign-release.sh` signs `SHA256SUMS` with the minisign key
   `DECDN_MINISIGN_KEY` names (default `~/.minisign/minisign.key`), verifies
-  it against the committed `crates/cli/minisign*.pub`, and uploads it beside
-  the `.asc` files; `scripts/publish-crates.sh` requires it. A version with a
+  it against the `crates/cli/minisign*.pub` in the tag's tree (the keys the
+  released binary embeds), and uploads it beside the `.asc` files;
+  `scripts/publish-crates.sh` requires it. A version with a
   pre-release suffix is created and published with `--prerelease`, so it never
   becomes GitHub's "latest" release.
 - **Node: `decdn_buyer_topup_unresolved` gauge (#2493).** It reads 1 while

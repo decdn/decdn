@@ -2,8 +2,8 @@
 //!
 //! After a command's own work succeeds, and at most once per day, the CLI
 //! asks GitHub for the latest release tag and prints one line on stderr when
-//! it is newer than this build. The check never runs for machine-read
-//! (`--json`) or non-terminal output, is bounded by a short timeout, and is
+//! it is newer than this build. The check never runs for `--json` output or
+//! when stderr is not a terminal, is bounded by a short timeout, and is
 //! silent on every failure. `[self_update] check = false` in the config file
 //! or `DECDN_SELF_UPDATE_CHECK=0` turns it off.
 
@@ -20,17 +20,17 @@ use super::release::{
 /// How long after one check the next one is due.
 const INTERVAL: Duration = Duration::from_hours(24);
 
-/// The whole-request bound on the lookup, so no command waits on it.
+/// The whole-request bound on the lookup, so a command never waits longer
+/// than this on it.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The environment variable that overrides `[self_update] check`.
 pub(crate) const ENV_CHECK: &str = "DECDN_SELF_UPDATE_CHECK";
 
-/// What the finished command tells the notice about its output.
+/// What the finished command tells the notice about itself. Either field
+/// true suppresses the notice.
 #[derive(Clone, Copy, Debug)]
 pub struct NudgePolicy {
-    /// stderr is a terminal.
-    pub tty: bool,
     /// The command rendered JSON for a program to read.
     pub json: bool,
     /// The command is `self-update` itself.
@@ -62,7 +62,7 @@ pub(crate) fn env_flag(raw: Option<&str>) -> Option<bool> {
 }
 
 /// Resolve the knob: the env var wins, then `[self_update] check`, then on.
-/// A config file that fails to parse (`Err`) turns the check off.
+/// A config file that cannot be read or parsed (`Err`) turns the check off.
 pub(crate) fn check_enabled(env: Option<bool>, file_check: Result<Option<bool>, ()>) -> bool {
     match (env, file_check) {
         (Some(v), _) => v,
@@ -97,18 +97,35 @@ pub(crate) async fn notice(
     }
 }
 
+/// Write the stamp. Its directory is `~/.decdn`, which the identity code
+/// requires to be private (mode 0700), so a missing directory is created
+/// private rather than with the umask's bits.
 fn write_stamp(stamp: &Path, now_secs: u64) -> std::io::Result<()> {
     if let Some(dir) = stamp.parent() {
-        std::fs::create_dir_all(dir)?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(dir)?;
     }
-    let mut file = std::fs::File::create(stamp)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(stamp)?;
     writeln!(file, "{now_secs}")
 }
 
 /// Run the daily check for a command that just succeeded, printing the
 /// notice on stderr when a newer release exists. Silent otherwise.
 pub async fn maybe_nudge(policy: NudgePolicy, config_path: Option<&Path>) {
-    if policy.excluded || policy.json || !policy.tty || !std::io::stderr().is_terminal() {
+    if policy.excluded || policy.json || !std::io::stderr().is_terminal() {
         return;
     }
     let env = env_flag(std::env::var(ENV_CHECK).ok().as_deref());

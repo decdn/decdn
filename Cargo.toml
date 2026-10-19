@@ -123,7 +123,8 @@ chacha20poly1305 = "0.11"
 # no dependencies of its own.
 minisign-verify = "0.3"
 # `decdn self-update` checks each downloaded archive against the signed
-# `SHA256SUMS` manifest. Already in the tree through iroh-base.
+# `SHA256SUMS` manifest. Already in every crate's tree through ed25519-dalek
+# and k256.
 sha2 = "0.11"
 
 # Self-update plumbing (#2537): compare the running version with the release

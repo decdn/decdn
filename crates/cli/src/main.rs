@@ -9,8 +9,6 @@
 //! Its one direct write is the top-level error boundary in `main`; everything
 //! else prints from [`decdn_cli::commands`].
 
-use std::io::IsTerminal;
-
 use clap::{CommandFactory, FromArgMatches};
 
 use decdn_cli::commands;
@@ -70,7 +68,6 @@ async fn run() -> anyhow::Result<()> {
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let nudge = commands::self_update::NudgePolicy {
-        tty: std::io::stderr().is_terminal(),
         json: cli::json_requested(&matches),
         excluded: matches!(cli.command, Command::SelfUpdate(_)),
     };

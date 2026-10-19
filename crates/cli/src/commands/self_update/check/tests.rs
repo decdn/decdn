@@ -34,8 +34,8 @@ fn env_flag_reads_booleans_and_ignores_the_rest() {
 }
 
 /// The env var wins; then `[self_update] check`; absent means on. A config
-/// file that does not parse turns the notice off rather than adding noise to
-/// a command that already reported the parse error.
+/// file that cannot be read or parsed turns the notice off: silence is the
+/// safe side for a best-effort notice.
 #[test]
 fn check_enabled_applies_env_then_file_then_default() {
     assert!(check_enabled(None, Ok(None)));
@@ -127,6 +127,24 @@ async fn notice_skips_the_lookup_when_the_stamp_cannot_be_written() {
     let line = notice(&stamp, &server.uri(), Duration::from_secs(5), 1).await;
     assert_eq!(line, None);
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// The stamp's directory is `~/.decdn`; when the notice is what creates it,
+/// it is private, as every other writer of that directory requires.
+#[cfg(unix)]
+#[tokio::test]
+async fn notice_creates_the_data_dir_private() {
+    use std::os::unix::fs::PermissionsExt;
+    decdn_common::tls::install_crypto_provider();
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join(".decdn");
+    let stamp = stamp_path(&data_dir);
+    notice(&stamp, &server.uri(), Duration::from_secs(5), 1).await;
+    let dir_mode = std::fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700, "dir mode {dir_mode:o}");
+    let file_mode = std::fs::metadata(&stamp).unwrap().permissions().mode() & 0o777;
+    assert_eq!(file_mode, 0o600, "stamp mode {file_mode:o}");
 }
 
 #[test]

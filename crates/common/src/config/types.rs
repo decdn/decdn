@@ -79,8 +79,9 @@ pub struct ClientConfig {
 }
 
 /// `decdn` self-update section of the config file. The `decdn` CLI reads it
-/// raw from the file on every run; it is not resolved into
-/// [`super::ResolvedConfig`] and `decdn config validate` does not report it.
+/// raw from the file on every run that may print the update notice; it is
+/// not resolved into [`super::ResolvedConfig`] and `decdn config validate`
+/// does not report it.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelfUpdateConfig {
