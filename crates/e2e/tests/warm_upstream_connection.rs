@@ -6,12 +6,17 @@
 //! main runtime, and every pull leg and DHT call opens a stream on them. So:
 //!
 //!   1. After a warm-up miss has opened the server's connections to the
-//!      provider, two more misses within the idle window open at most one new
-//!      connection on the provider each (the one-shot `cdn/probe/v1` probe).
-//!      The pull legs, the header handshakes, the DHT lookups and the
-//!      republish stores all ride the warm connections. The count is the
-//!      provider's `decdn_iroh_socket_num_conns_opened_total`, which counts
-//!      inbound connections too; the warm-up miss proves it moves.
+//!      provider, two more misses within the idle window open no connection
+//!      on the provider beyond their probes. Each miss probes the provider
+//!      once on a one-shot `cdn/probe/v1` connection (the positive probe
+//!      cache is keyed by hash, and each miss is a new hash); the pull legs,
+//!      the header handshakes, the DHT lookups and the republish stores all
+//!      ride the warm connections. The count is the provider's
+//!      `decdn_iroh_socket_num_conns_opened_total`, which counts inbound and
+//!      outbound connections, less its inbound `decdn_probe_requests_total`;
+//!      the warm-up miss proves the connection count moves. A single
+//!      un-pooled ALPN costs one dial per miss on top of the probes and fails
+//!      the check.
 //!   2. With those warm connections open, the server stops promptly on SIGTERM
 //!      and its router close finishes on its own: every pooled connection's
 //!      driver runs on the main runtime, never on a pull leg's throwaway one
@@ -59,11 +64,6 @@ const SERVER_BUYER_USDC: u64 = 1_000_000_000;
 /// bound catches it; this one leaves room for the final redeem sweep against
 /// anvil and the store flushes on a loaded runner.
 const SERVER_STOP_BUDGET: Duration = Duration::from_secs(30);
-
-/// The most new connections the provider may see across the two warm misses:
-/// one `cdn/probe/v1` probe per miss. Without pooling each miss adds at least
-/// a DHT lookup, a header handshake and a pull leg on fresh connections.
-const MAX_NEW_CONNS_FOR_TWO_WARM_MISSES: u64 = 2;
 
 /// Deterministic pseudo-random blob, distinct per `seed`.
 fn make_blob(len: usize, seed: u32) -> Vec<u8> {
@@ -141,6 +141,7 @@ async fn run() -> anyhow::Result<()> {
     let pulls_before = server
         .scrape_metric("decdn_node_pull_success_total")
         .await?;
+    let probes_before = provider.scrape_metric("decdn_probe_requests_total").await?;
 
     // (1) Two more misses in a row, inside the idle window.
     for (hash, blob) in [(hash_a, &blob_a), (hash_b, &blob_b)] {
@@ -160,12 +161,17 @@ async fn run() -> anyhow::Result<()> {
     let conns_after_misses = provider
         .scrape_metric("decdn_iroh_socket_num_conns_opened_total")
         .await?;
+    let probes_after = provider.scrape_metric("decdn_probe_requests_total").await?;
     let new_conns = conns_after_misses.saturating_sub(conns_after_warm_up);
+    let probes = probes_after.saturating_sub(probes_before);
     anyhow::ensure!(
-        new_conns <= MAX_NEW_CONNS_FOR_TWO_WARM_MISSES,
-        "two misses on warm connections must open at most \
-         {MAX_NEW_CONNS_FOR_TWO_WARM_MISSES} new connections on the provider (its \
-         probes), got {new_conns}"
+        probes <= 2,
+        "each miss probes the provider at most once, got {probes} probes"
+    );
+    anyhow::ensure!(
+        new_conns <= probes,
+        "two misses on warm connections must open no connection on the provider \
+         beyond their one-shot probes: {new_conns} new connections for {probes} probes"
     );
 
     // (2) Shutdown with the warm connections still open stays prompt.

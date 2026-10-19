@@ -29,7 +29,7 @@ use decdn_protocol::ALPN_CLIENT;
 
 use crate::{LocalPullFault, PullTimeout, rate_limited};
 
-/// Dial `target` on `alpn`.
+/// Dial `target` on `alpn`, as a task on `runtime` under `span`.
 ///
 /// The dial spawns the connection's QUIC driver on whichever runtime runs the
 /// `connect`, and the connection makes progress — I/O, timers, its close — only
@@ -38,12 +38,16 @@ use crate::{LocalPullFault, PullTimeout, rate_limited};
 /// runtime it later drops passes a long-lived one here: a driver dropped with its
 /// runtime before the connection reaches QUIC's draining state leaves the
 /// connection in the endpoint's active set for good, and the endpoint's close then
-/// waits for it forever. With `None`, the dial and the driver run inline on the
-/// caller's runtime.
+/// waits for it forever. With `None`, the dial and the driver run as a task on
+/// the caller's runtime.
 ///
-/// The spawned dial carries the caller's current span, so its connect events and
-/// the driver's stay in the caller's trace. Dropping the returned future mid-dial
-/// aborts the spawned dial.
+/// The driver inherits the span current inside the dial task, which is `span`
+/// when the subscriber enables it and no span when it does not: a spawned task
+/// starts outside every span of the caller's. A caller whose trace should carry
+/// the connection's events passes `Span::current()`; a pooled dial passes a root
+/// span of the connection's own, so a connection that outlives its first caller
+/// never holds that caller's span open, at any log level. Dropping the returned
+/// future mid-dial aborts the spawned dial.
 ///
 /// # Errors
 ///
@@ -56,17 +60,17 @@ pub(crate) async fn dial(
     target: EndpointAddr,
     alpn: &'static [u8],
     runtime: Option<&Handle>,
+    span: tracing::Span,
     stage: &'static str,
 ) -> anyhow::Result<Connection> {
-    let Some(runtime) = runtime else {
-        return endpoint
-            .connect(target, alpn)
-            .await
-            .map_err(|e| rate_limited::transport_error(stage, e));
+    let runtime = match runtime {
+        Some(runtime) => runtime.clone(),
+        None => Handle::try_current().map_err(|e| {
+            anyhow::anyhow!("{stage}: no runtime to dial on: {e}").context(LocalPullFault)
+        })?,
     };
     let endpoint = endpoint.clone();
-    let connect =
-        async move { endpoint.connect(target, alpn).await }.instrument(tracing::Span::current());
+    let connect = async move { endpoint.connect(target, alpn).await }.instrument(span);
     AbortOnDropHandle::new(runtime.spawn(connect))
         .await
         .map_err(|e| {
@@ -80,13 +84,14 @@ pub(crate) async fn dial(
         .map_err(|e| rate_limited::transport_error(stage, e))
 }
 
-/// A dialed `cdn/client/v1` connection reused across many hash fetches.
+/// A dialled connection reused across many requests on one ALPN: `cdn/client/v1`
+/// hash fetches, or `cdn/dht/v1` calls.
 ///
-/// Each fetch opens a new bi-stream on the SAME connection (one stream = one
-/// hash, no multiplexing), amortizing the dial over every hash. The connection is
-/// closed exactly once, on this handle's own [`Drop`]; a per-hash pull that
-/// borrows the connection (`open_progressive_pull_on`) tears down only
-/// its own stream and leaves the connection open for the next hash.
+/// Each request opens a new bi-stream on the SAME connection (one stream = one
+/// request, no multiplexing), amortizing the dial over every request. The
+/// connection is closed exactly once, on this handle's own [`Drop`]; a request
+/// that borrows the connection (`open_progressive_pull_on`, a DHT call) tears
+/// down only its own stream and leaves the connection open for the next one.
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct WarmConnection {
@@ -121,6 +126,7 @@ impl WarmConnection {
                 target,
                 ALPN_CLIENT,
                 dial_runtime,
+                tracing::Span::current(),
                 "warm connect failed",
             ),
         )
@@ -178,6 +184,39 @@ pub struct Connections {
 /// A node's connection slot. The async lock makes concurrent callers for one
 /// node wait on one dial.
 type Slot = Arc<tokio::sync::Mutex<Option<Arc<WarmConnection>>>>;
+
+/// How a caller came by a map's connection ([`Connections::get_or_dial`]).
+///
+/// The variant carries the retry rule. A caller that meets a closed connection
+/// redials once only when the connection was [`Pinned`](Self::Pinned) before
+/// the call: the peer closed it between calls (an idle reap, a spent budget),
+/// so a fresh dial is the first real attempt. A connection the call
+/// [`Dialled`](Self::Dialled) itself that fails is the peer's failure, and is
+/// not retried.
+#[derive(Debug)]
+#[doc(hidden)]
+pub enum Lease {
+    /// This call dialled the connection.
+    Dialled(Arc<WarmConnection>),
+    /// The connection was pinned before this call.
+    Pinned(Arc<WarmConnection>),
+}
+
+impl Lease {
+    /// The connection, however it was come by.
+    #[must_use]
+    pub fn into_warm(self) -> Arc<WarmConnection> {
+        match self {
+            Self::Dialled(warm) | Self::Pinned(warm) => warm,
+        }
+    }
+
+    /// Whether the connection was pinned before this call.
+    #[must_use]
+    pub const fn is_pinned(&self) -> bool {
+        matches!(self, Self::Pinned(_))
+    }
+}
 
 #[derive(Debug)]
 struct ConnectionsInner {
@@ -241,22 +280,18 @@ impl Connections {
     /// `connect failed: {err}` (a rate-limit shed keeps its typed sentinel).
     #[doc(hidden)]
     pub async fn get(&self, target: &EndpointAddr) -> anyhow::Result<Arc<WarmConnection>> {
-        self.get_or_dial(target).await.map(|(warm, _)| warm)
+        self.get_or_dial(target).await.map(Lease::into_warm)
     }
 
-    /// [`get`](Self::get), also saying whether this call dialled the
-    /// connection (`true`) or took one already pinned (`false`). A caller
-    /// that retries on a closed connection retries only a pinned one: a
-    /// connection it just dialled that fails is the peer's failure.
+    /// [`get`](Self::get), also saying how the call came by the connection
+    /// ([`Lease`]): dialled by this call, or pinned before it. A caller that
+    /// retries on a closed connection retries only a pinned one.
     ///
     /// # Errors
     ///
     /// The same faults as [`get`](Self::get).
     #[doc(hidden)]
-    pub async fn get_or_dial(
-        &self,
-        target: &EndpointAddr,
-    ) -> anyhow::Result<(Arc<WarmConnection>, bool)> {
+    pub async fn get_or_dial(&self, target: &EndpointAddr) -> anyhow::Result<Lease> {
         let slot = Arc::clone(
             self.inner
                 .slots
@@ -267,7 +302,7 @@ impl Connections {
         );
         let mut held = slot.lock().await;
         if let Some(warm) = held.as_ref().filter(|warm| !warm.is_closed()) {
-            return Ok((Arc::clone(warm), false));
+            return Ok(Lease::Pinned(Arc::clone(warm)));
         }
         #[cfg(any(test, feature = "test-util"))]
         self.inner
@@ -275,8 +310,11 @@ impl Connections {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // The connection outlives this caller, and its driver keeps the span
         // it was dialled under open for the connection's life. So the dial
-        // runs under a root span of the connection's own, linked to the
-        // caller's, and the caller's span closes when the caller ends.
+        // task runs under a root span of the connection's own, linked to the
+        // caller's: `dial` hands the span to the task rather than entering it
+        // here, because entering a span the subscriber has disabled (a debug
+        // span at the node's INFO level) changes nothing, and the task would
+        // then see the caller's span as current and hand it to the driver.
         let span = tracing::debug_span!(
             parent: None,
             "pooled_connection",
@@ -289,13 +327,13 @@ impl Connections {
             target.clone(),
             self.inner.alpn,
             self.inner.dial_runtime.as_ref(),
+            span,
             "connect failed",
         )
-        .instrument(span)
         .await?;
         let warm = Arc::new(WarmConnection { conn });
         *held = Some(Arc::clone(&warm));
-        Ok((warm, true))
+        Ok(Lease::Dialled(warm))
     }
 
     /// Unpin `conn` from `node`'s slot, so the next [`get`](Self::get) dials

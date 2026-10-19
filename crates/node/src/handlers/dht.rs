@@ -241,9 +241,10 @@ impl DhtHandler {
         // here would be redundant; we run it inside the per-stream loop
         // because a single connection may carry multiple requests.
 
-        // Iroh-side connection cap: DHT is short-lived request/response,
-        // but a peer may bundle multiple requests on one connection. Accept
-        // streams in a loop until the peer closes (or we time out waiting).
+        // Each DHT request is one stream, and a requester keeps one
+        // connection per peer and sends every request on it. Accept streams
+        // in a loop until the peer closes, the accept window elapses, or the
+        // per-connection budget is spent.
         //
         // Permit hygiene (#845): the dispatch permit above is held for the
         // whole `serve` call, so an unbounded accept loop lets a peer staying
@@ -278,17 +279,36 @@ impl DhtHandler {
                 );
                 break;
             }
-            // Peer closed the connection (`Ok(Err)`) or the accept window
-            // elapsed (`Err`): done serving this connection. The window is
-            // short before the first stream and the client idle window
-            // after it (`accept_timeout`), so a requester's pooled
-            // connection stays warm between requests while an idle one
-            // still releases its permit within `APP_IDLE_TIMEOUT`.
-            let Ok(Ok((send, recv))) =
-                tokio::time::timeout(accept_timeout(served), conn.accept_bi()).await
-            else {
-                break;
-            };
+            // The accept window is short before the first stream and the
+            // client idle window after it (`accept_timeout`), so a
+            // requester's pooled connection stays warm between requests
+            // while an idle one still releases its permit within
+            // `handlers::client::APP_IDLE_TIMEOUT`. The requester keeps the
+            // connection open on its side, so an elapsed window closes it
+            // here: the requester's next call then meets a closed pin and
+            // redials at once, rather than opening a stream nobody accepts
+            // and reading until the close lands.
+            let (send, recv) =
+                match tokio::time::timeout(accept_timeout(served), conn.accept_bi()).await {
+                    Ok(Ok(streams)) => streams,
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            served,
+                            error = %e,
+                            "dht connection ended by the peer or the transport"
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            served,
+                            window_secs = accept_timeout(served).as_secs(),
+                            "dht connection idle past its accept window; closing"
+                        );
+                        conn.close(0u32.into(), b"dht-idle");
+                        break;
+                    }
+                };
             served = served.saturating_add(1);
             // Rate-limit per request (ADR 022 §DHT Rate Limiting). Re-read
             // `peer_ip` here so a relay→direct path switch over the

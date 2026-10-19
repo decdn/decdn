@@ -412,7 +412,15 @@ where
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
     while let Ok((send, recv)) = conn.accept_bi().await {
-        tokio::spawn(serve(send, recv));
+        let served = serve(send, recv);
+        tokio::spawn(async move {
+            // A stream the fixture fails to serve surfaces to the node as a
+            // leg that never answers; name it in the captured log so a fixture
+            // fault on a later stream is not misread as a node-side stall.
+            if let Err(e) = served.await {
+                tracing::warn!(error = %e, "fixture: a stream on a pooled connection failed");
+            }
+        });
     }
 }
 
@@ -1878,8 +1886,8 @@ async fn serve_gated_correct_bytes(
     // (single SPEND) holds either way.
     loop {
         // No further stream on this connection (the buyer finished on the handshake
-        // alone, or opened the real pull on a fresh connection handled by another
-        // invocation) surfaces as an `accept_bi` error — nothing left to serve here.
+        // alone, or the pooled connection closed) surfaces as an `accept_bi` error —
+        // nothing left to serve here.
         let Ok((mut send, mut recv)) = conn.accept_bi().await else {
             return Ok(());
         };
@@ -4313,8 +4321,8 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     //
     // The persist happens on the PULL THREAD, not on the dropped `fetch` future:
     // dropping the future cancels the token, and the pull thread then stops `drive`,
-    // waits for the abandoned upstream connection to reach drained, and only then drops
-    // its `SettleOnDrop` guard. So the watermark lands a beat AFTER the cancellation,
+    // finishes the abandoned upstream stream's teardown (the pooled connection stays
+    // open for the next leg), and only then drops its `SettleOnDrop` guard. So the watermark lands a beat AFTER the cancellation,
     // not synchronously with it — poll for it rather than reading once. (Were the
     // settle still on the outer future, or missing, this poll would time out: that is
     // the wedge this test guards.)
@@ -12824,9 +12832,9 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         matches!(second, OriginFetch::NotFound),
         "fetch #2 must refuse: H lacks hash1 and A cannot be paid"
     );
-    // One logical pull to A opens ONE connection: `pull_from_candidate`'s
+    // One logical pull to A opens ONE stream: `pull_from_candidate`'s
     // whole-blob header handshake is also the drive's first and only leg, which
-    // adopts it (#2063). One connection here means "A WAS pulled once (the hash1
+    // adopts it (#2063). One stream here means "A WAS pulled once (the hash1
     // wedge)".
     anyhow::ensure!(
         streams_a.load(Ordering::SeqCst) == 1,

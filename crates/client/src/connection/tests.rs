@@ -40,7 +40,8 @@ enum Via {
 
 /// Dial a peer that holds its side open, from a throwaway current-thread
 /// runtime on its own thread, then drop that runtime — the shape of a
-/// `decdn-node` pull leg. `dial_runtime` is passed through to the dial.
+/// `Connections` map dial requested from a `decdn-node` pull leg's throwaway
+/// runtime. `dial_runtime` is passed through to the dial.
 /// Returns the dialling endpoint, the dialled handle (still held, so the
 /// connection is still open), and the peer endpoint, which must outlive the
 /// test's close.
@@ -72,6 +73,7 @@ async fn dial_from_a_dropped_runtime(
                     peer_addr,
                     ALPN_CLIENT,
                     dial_runtime.as_ref(),
+                    tracing::Span::current(),
                     "connect failed",
                 ))
                 .expect("dial the peer"),
@@ -130,7 +132,14 @@ async fn a_dial_on_a_shut_down_runtime_is_a_local_fault() {
 
     let err = tokio::time::timeout(
         Duration::from_secs(10),
-        super::dial(&ep, peer_addr, ALPN_CLIENT, Some(&handle), "connect failed"),
+        super::dial(
+            &ep,
+            peer_addr,
+            ALPN_CLIENT,
+            Some(&handle),
+            tracing::Span::current(),
+            "connect failed",
+        ),
     )
     .await
     .expect("a dial on a shut-down runtime must fail, not hang")
@@ -452,4 +461,170 @@ async fn a_dial_on_a_dropped_runtime_blocks_the_endpoint_close() {
             .is_err(),
         "a connection whose driver was dropped must keep the close waiting"
     );
+}
+
+/// A layer that records the name of every span it sees close.
+struct ClosedSpans(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+impl<S> tracing_subscriber::Layer<S> for ClosedSpans
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if let Some(span) = ctx.span(&id) {
+            self.0.lock().expect("closed spans").push(span.name());
+        }
+    }
+}
+
+/// At the node's INFO level the pooled dial's debug root span is disabled.
+/// The caller's INFO span must still close when the caller ends while the
+/// pooled connection stays open: the connection's driver inherits no span
+/// of the caller's. A current-thread runtime, so the thread-local subscriber
+/// sees the dial task and the driver too.
+#[tokio::test(flavor = "current_thread")]
+async fn a_pooled_dial_holds_no_caller_span_open_at_info() {
+    use tracing::Instrument as _;
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let closed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(
+        ClosedSpans(std::sync::Arc::clone(&closed))
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (_peer, peer_addr, _accepted) = holding_peer().await;
+    let (ep, _) = loopback_endpoint(Vec::new()).await;
+    let connections = super::Connections::new(ep.clone());
+
+    let caller = tracing::info_span!("caller");
+    let warm = connections
+        .get(&peer_addr)
+        .instrument(caller.clone())
+        .await
+        .expect("get under the caller's span");
+    drop(caller);
+    assert!(!warm.is_closed(), "the pooled connection is still open");
+    assert!(
+        closed.lock().expect("closed spans").contains(&"caller"),
+        "the caller's span must close once the caller ends, not once the \
+         connection does: {:?}",
+        closed.lock().expect("closed spans")
+    );
+}
+
+/// A peer that closes each of its first `closes` connections when that
+/// connection's first stream arrives, the way an upstream's idle reaper or
+/// stream budget closes a pooled connection under a leg, and holds every later
+/// connection open without answering a stream.
+async fn closing_peer(closes: usize) -> (Endpoint, EndpointAddr) {
+    let (peer, peer_addr) = loopback_endpoint(vec![ALPN_CLIENT.to_vec()]).await;
+    let accept_peer = peer.clone();
+    tokio::spawn(async move {
+        let mut accepted = 0usize;
+        while let Some(incoming) = accept_peer.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            accepted += 1;
+            let close = accepted <= closes;
+            tokio::spawn(async move {
+                if close && conn.accept_bi().await.is_ok() {
+                    conn.close(0u32.into(), b"idle");
+                }
+                conn.closed().await;
+            });
+        }
+    });
+    (peer, peer_addr)
+}
+
+/// A `PeerSource` on `connections` with a 500 ms open deadline.
+fn pooled_source<'a>(
+    ep: &'a Endpoint,
+    peer_addr: &EndpointAddr,
+    slash: &'a alloy::dyn_abi::Eip712Domain,
+    connections: &super::Connections,
+) -> crate::PeerSource<'a> {
+    use alloy::primitives::{Address, U256};
+
+    let ctx = crate::source::ctx_with(0xB0, U256::from(1_000_000u64));
+    let ledger = std::sync::Arc::new(ctx.new_ledger());
+    crate::PeerSource::new(
+        ep,
+        peer_addr.clone(),
+        std::sync::Arc::new(std::sync::Mutex::new(ctx)),
+        ledger,
+        slash,
+        Address::repeat_byte(0xB0),
+        [0u8; 32],
+        0,
+        0,
+        crate::PullDeadlines::new(Duration::from_millis(500), Duration::from_secs(5), 0)
+            .expect("deadlines"),
+        Some(connections.clone()),
+    )
+}
+
+/// A leg whose pinned connection the peer closes under the open redials
+/// once and opens again on the fresh connection: the peer holds that one
+/// without answering, so the leg ends in the open deadline, after two dials,
+/// and the failure names the redial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leg_on_a_pinned_connection_closed_under_the_open_redials_once() {
+    use alloy::primitives::Address;
+    use decdn_bao_range::align_range;
+
+    use crate::source::BlobSource as _;
+
+    let (_peer, peer_addr) = closing_peer(1).await;
+    let (ep, _) = loopback_endpoint(Vec::new()).await;
+    let connections = super::Connections::new(ep.clone());
+    let slash = decdn_incentive::slash_judge_domain(1, Address::ZERO);
+    let source = pooled_source(&ep, &peer_addr, &slash, &connections);
+
+    let pinned = connections.get(&peer_addr).await.expect("pin a connection");
+    let err = source
+        .open([7u8; 32], align_range(0, 0, 1024).expect("range"))
+        .await
+        .expect_err("the fresh connection never answers");
+    assert!(pinned.is_closed(), "the peer closed the pinned connection");
+    assert!(
+        err.downcast_ref::<crate::PullTimeout>().is_some(),
+        "the leg ends in the open deadline on the fresh connection: {err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("after a redial"),
+        "the failure names the redial: {err:#}"
+    );
+    assert_eq!(connections.dials(), 2, "one redial after the pinned close");
+}
+
+/// A leg whose own fresh dial the peer closes under the open does not redial:
+/// that failure is the peer's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_leg_on_a_fresh_connection_that_fails_is_not_retried() {
+    use alloy::primitives::Address;
+    use decdn_bao_range::align_range;
+
+    use crate::source::BlobSource as _;
+
+    let (_peer, peer_addr) = closing_peer(1).await;
+    let (ep, _) = loopback_endpoint(Vec::new()).await;
+    let connections = super::Connections::new(ep.clone());
+    let slash = decdn_incentive::slash_judge_domain(1, Address::ZERO);
+    let source = pooled_source(&ep, &peer_addr, &slash, &connections);
+
+    let err = source
+        .open([7u8; 32], align_range(0, 0, 1024).expect("range"))
+        .await
+        .expect_err("the peer closes the fresh connection");
+    assert!(
+        !format!("{err:#}").contains("after a redial"),
+        "a fresh dial's failure is not retried: {err:#}"
+    );
+    assert_eq!(connections.dials(), 1);
 }

@@ -31,6 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
+use anyhow::Context as _;
 use decdn_bao_range::AlignedRange;
 use decdn_incentive::PoolId;
 use iroh::{Endpoint, EndpointAddr};
@@ -537,6 +538,12 @@ impl<'a> PeerSource<'a> {
     /// this connection from the map, so the next open dials again. Any other
     /// failure (a refusal, a bad response, a hash mismatch) leaves the
     /// connection pinned for the next open.
+    ///
+    /// A connection that was pinned before this open and is closed under it
+    /// is a stale pin: the target reaped it idle between legs, or its budget
+    /// ran out. The open then redials once and opens again. No byte is paid
+    /// before the header, so the retry costs nothing. A connection this open
+    /// dialled itself that fails is the target's failure, and is not retried.
     async fn open_shared(
         &self,
         connections: &Connections,
@@ -545,10 +552,56 @@ impl<'a> PeerSource<'a> {
         byte_offset: u64,
         byte_len: u64,
     ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-        let open = self.deadlines.open;
-        let warm = tokio::time::timeout(open, connections.get(&self.target))
+        debug_assert_eq!(
+            connections.alpn(),
+            decdn_protocol::ALPN_CLIENT,
+            "a pull opens on a cdn/client/v1 map"
+        );
+        let lease = self.lease(connections).await?;
+        let pinned = lease.is_pinned();
+        let warm = lease.into_warm();
+        let err = match self
+            .open_on(connections, warm.clone(), ctx, hash, byte_offset, byte_len)
             .await
-            .map_err(|_| anyhow::Error::new(crate::PullTimeout { after: open }))??;
+        {
+            Ok(opened) => return Ok(opened),
+            Err(err) => err,
+        };
+        if !(pinned && warm.is_closed()) {
+            return Err(err);
+        }
+        tracing::debug!(
+            peer = %self.target.id,
+            close = ?warm.connection().close_reason(),
+            error = %err,
+            "pooled connection closed under the open; redialling once"
+        );
+        let fresh = self.lease(connections).await?.into_warm();
+        self.open_on(connections, fresh, ctx, hash, byte_offset, byte_len)
+            .await
+            .with_context(|| format!("after a redial; the pinned connection failed: {err:#}"))
+    }
+
+    /// The target's connection in `connections`, dialled when it has none,
+    /// under `deadlines.open`.
+    async fn lease(&self, connections: &Connections) -> anyhow::Result<crate::connection::Lease> {
+        let open = self.deadlines.open;
+        tokio::time::timeout(open, connections.get_or_dial(&self.target))
+            .await
+            .map_err(|_| anyhow::Error::new(crate::PullTimeout { after: open }))?
+    }
+
+    /// Open the pull as a stream on `warm`, which the pull holds and unpins
+    /// from `connections` on a transport fault.
+    async fn open_on(
+        &self,
+        connections: &Connections,
+        warm: Arc<crate::WarmConnection>,
+        ctx: &PoolContext,
+        hash: [u8; 32],
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
         let conn = warm.connection().clone();
         crate::open_progressive_pull_on(
             &conn,

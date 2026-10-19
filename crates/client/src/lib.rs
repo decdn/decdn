@@ -164,11 +164,12 @@ pub mod buyer_pool;
 /// ([`config::PullConfig`], #1848): every knob defaults, so a caller overrides
 /// only what it must, and construction needs no network or chain access.
 pub mod config;
-/// A caller-owned QUIC connection kept warm across many hash fetches
-/// ([`connection::WarmConnection`]): one dial amortized over every hash, one
-/// bi-stream per hash (no wire change), closed once on the handle's own `Drop`;
-/// and the command-wide map of one such connection per node
-/// ([`connection::Connections`]).
+/// A QUIC connection kept warm across many requests on one ALPN
+/// ([`connection::WarmConnection`]): one dial amortized over every request, one
+/// bi-stream per request (no wire change), closed once on the handle's own
+/// `Drop`; and the map of one such connection per node on one ALPN
+/// ([`connection::Connections`]), shared by a CLI command or by a node's
+/// outbound pull legs and DHT calls.
 pub mod connection;
 /// Range-keyed discovery coverage-map primitive plus the two
 /// objective-specific planners over it (#1506): [`coverage_plan::plan_covered_runs`]
@@ -305,7 +306,7 @@ pub use streamer::{LiveReader, StreamCandidate, StreamDrive, Streamer, VerifiedR
 // public so those crates can reach them, hidden from the docs and the
 // public-API snapshot, and carry no stability promise.
 #[doc(hidden)]
-pub use connection::WarmConnection;
+pub use connection::{Lease, WarmConnection};
 #[doc(hidden)]
 pub use coverage_plan::{CoveredRun, SourceCoverage, plan_covered_runs};
 #[doc(hidden)]
@@ -1992,6 +1993,7 @@ async fn open_stream(
                     target,
                     decdn_protocol::ALPN_CLIENT,
                     None,
+                    tracing::Span::current(),
                     "connect failed",
                 )
                 .await?

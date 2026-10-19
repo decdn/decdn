@@ -18,9 +18,13 @@
 //! 5. Leaves the connection open for the next call to the same peer. The
 //!    server closes it once it idles past its window or spends its budget.
 //!
-//! A call whose pinned connection turns out closed (the server closed it
-//! between calls) redials once and retries. A call that fails on a
+//! A call whose pinned connection turns out closed (closed by the server
+//! between calls, or lost) redials once and retries. A call that fails on a
 //! connection it dialled itself does not retry: that is the peer's failure.
+//! A call that times out, or that its caller aborts mid-flight (a lookup
+//! round deadline), unpins the connection it used, so the next call to the
+//! peer dials afresh rather than queueing on a connection that stopped
+//! answering.
 //!
 //! The signatures mirror the server-side message types: callers
 //! provide the request fields, get back the response struct. Error
@@ -34,16 +38,16 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use anyhow::Context;
-use decdn_client::{Connections, WarmConnection};
+use decdn_client::{Connections, Lease, WarmConnection};
 use decdn_protocol::{
     ALPN_DHT, ContentHash, Coverage, NodeId, decode_message, dht as wire, encode_message,
     encode_store_request, read_frame, write_frame,
 };
-use iroh::EndpointAddr;
 use iroh::endpoint::Connection;
+use iroh::{EndpointAddr, PublicKey};
 
-/// Per-request hard timeout for outbound DHT exchanges: the dial, the request
-/// and the response together. Shorter than the sum of the server-side
+/// Per-request hard timeout for outbound DHT exchanges: the dial (and a redial
+/// of a stale pin), the request and the response together. Shorter than the sum of the server-side
 /// first-stream timeout (5s) and read timeout (5s) in [`crate::handlers::dht`]
 /// so a hung peer doesn't wedge a republish sweep. The dial inside it has its
 /// own, shorter budget, [`DHT_DIAL_TIMEOUT`].
@@ -219,14 +223,16 @@ async fn exchange(
 ///
 /// Wraps the whole call, retry included, in one [`DHT_CLIENT_TIMEOUT`]
 /// so a hung peer can't block the caller's scheduler indefinitely, and
-/// each dial inside it in [`DHT_DIAL_TIMEOUT`]. A call that times out
-/// unpins the connection it used, so the next call to the peer dials
-/// afresh rather than queueing on a connection that stopped answering.
+/// each dial inside it in [`DHT_DIAL_TIMEOUT`]. A call that times out, or
+/// that its caller aborts mid-flight, unpins the connection it used
+/// ([`UnpinOnDrop`]), so the next call to the peer dials afresh rather than
+/// queueing on a connection that stopped answering.
 ///
 /// # Errors
 ///
 /// A dial that [`DHT_DIAL_TIMEOUT`] cuts off is a bare [`DialTimeout`]; every
-/// other failure carries its stage as context.
+/// other failure carries its stage as context. A failure after a redial
+/// carries the pinned connection's failure as context too.
 async fn exchange_payload(
     conns: &Connections,
     target: EndpointAddr,
@@ -239,10 +245,12 @@ async fn exchange_payload(
     );
     let node = target.id;
     let peer = NodeId::from_bytes(*node.as_bytes());
-    let mut used: Option<Arc<WarmConnection>> = None;
+    let mut unpin = UnpinOnDrop::new(conns.clone(), node);
     let outcome = tokio::time::timeout(DHT_CLIENT_TIMEOUT, async {
-        let (warm, dialled) = pooled(conns, &target, peer).await?;
-        used = Some(Arc::clone(&warm));
+        let lease = pooled(conns, &target, peer).await?;
+        let pinned = lease.is_pinned();
+        let warm = lease.into_warm();
+        unpin.arm(&warm);
         let err = match exchange_on(warm.connection(), payload).await {
             Ok(resp) => return Ok(resp),
             Err(err) => err,
@@ -251,41 +259,102 @@ async fn exchange_payload(
             return Err(err);
         }
         conns.invalidate(node, &warm).await;
-        if dialled {
+        if !pinned {
             return Err(err);
         }
         // The pinned connection closed under this call (the server spent
         // its budget or idled it out between calls): redial once.
-        let (fresh, _) = pooled(conns, &target, peer).await?;
-        used = Some(Arc::clone(&fresh));
-        exchange_on(fresh.connection(), payload).await
+        tracing::debug!(
+            peer = %node,
+            close = ?warm.connection().close_reason(),
+            error = %err,
+            "dht client: pooled connection closed under the call; redialling once"
+        );
+        let fresh = pooled(conns, &target, peer).await?.into_warm();
+        unpin.arm(&fresh);
+        exchange_on(fresh.connection(), payload)
+            .await
+            .with_context(|| format!("after a redial; the pinned connection failed: {err:#}"))
     })
     .await;
     let Ok(result) = outcome else {
-        if let Some(warm) = used {
-            conns.invalidate(node, &warm).await;
-        }
+        unpin.unpin().await;
         anyhow::bail!(
             "dht client: request timed out after {} ms",
             DHT_CLIENT_TIMEOUT.as_millis()
         );
     };
+    unpin.disarm();
     result
 }
 
-/// `target`'s pooled connection, dialled when it has none, and whether this
-/// call dialled it. The dial (or the wait on another caller's dial) is bounded
-/// by [`DHT_DIAL_TIMEOUT`]; a pinned live connection returns at once.
+/// Unpins the connection a call uses when the call does not finish on its
+/// own: a timeout ([`unpin`](Self::unpin)), or a drop mid-flight, which is how
+/// a lookup round deadline aborts its in-flight RPCs
+/// ([`crate::dht::lookup`]). The drop path spawns the unpin on the current
+/// runtime, because the map's slot lock is async. A call that finishes
+/// disarms the guard first, so a connection that answered, or that failed
+/// while still live (a stream reset), stays pinned.
+struct UnpinOnDrop {
+    conns: Connections,
+    node: PublicKey,
+    warm: Option<Arc<WarmConnection>>,
+}
+
+impl UnpinOnDrop {
+    const fn new(conns: Connections, node: PublicKey) -> Self {
+        Self {
+            conns,
+            node,
+            warm: None,
+        }
+    }
+
+    /// Guard `warm`, replacing any connection guarded before.
+    fn arm(&mut self, warm: &Arc<WarmConnection>) {
+        self.warm = Some(Arc::clone(warm));
+    }
+
+    /// Forget the guarded connection: the call finished on its own.
+    fn disarm(&mut self) {
+        self.warm = None;
+    }
+
+    /// Unpin the guarded connection now, and disarm.
+    async fn unpin(&mut self) {
+        if let Some(warm) = self.warm.take() {
+            self.conns.invalidate(self.node, &warm).await;
+        }
+    }
+}
+
+impl Drop for UnpinOnDrop {
+    fn drop(&mut self) {
+        let Some(warm) = self.warm.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let conns = self.conns.clone();
+        let node = self.node;
+        tracing::debug!(
+            peer = %node,
+            "dht client: call dropped mid-flight; unpinning its connection"
+        );
+        runtime.spawn(async move { conns.invalidate(node, &warm).await });
+    }
+}
+
+/// `target`'s pooled connection, dialled when it has none, and how the call
+/// came by it ([`Lease`]). The dial (or the wait on another caller's dial) is
+/// bounded by [`DHT_DIAL_TIMEOUT`]; a pinned live connection returns at once.
 ///
 /// # Errors
 ///
 /// A bare [`DialTimeout`] naming `peer` when the dial runs past its budget;
 /// a connect or handshake fault as `dht client: connect failed: {err}`.
-async fn pooled(
-    conns: &Connections,
-    target: &EndpointAddr,
-    peer: NodeId,
-) -> anyhow::Result<(Arc<WarmConnection>, bool)> {
+async fn pooled(conns: &Connections, target: &EndpointAddr, peer: NodeId) -> anyhow::Result<Lease> {
     tokio::time::timeout(DHT_DIAL_TIMEOUT, conns.get_or_dial(target))
         .await
         .map_err(|_| anyhow::Error::new(DialTimeout { peer }))?

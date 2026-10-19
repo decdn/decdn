@@ -24,7 +24,7 @@ The DHT defined here is a separate content DHT scoped to the registered node set
 
 #### ALPN and Transport
 
-All DHT messages use the ALPN `cdn/dht/v1` over iroh QUIC. Connections are short-lived and request/response oriented — no persistent streams. The same iroh endpoint serving `cdn/probe/v1` and `cdn/client/v1` handles DHT connections.
+All DHT messages use the ALPN `cdn/dht/v1` over iroh QUIC. Each request is one bidirectional stream: the requester opens a stream, writes one request, and reads one response. A requester keeps one connection per peer and opens each request as a new stream on it. A receiver closes a connection that carries no stream for 5 seconds before its first request, or for 30 seconds after a request. A receiver also closes a connection that reaches 256 requests or 5 minutes of age. A requester whose kept connection is closed when it calls dials the peer once more and retries that call. The same iroh endpoint serving `cdn/probe/v1` and `cdn/client/v1` handles DHT connections.
 
 #### Message Types
 
@@ -159,7 +159,7 @@ When a node verifies its first 64 MiB block of blob H — on any verified partia
 
 **Drain cycle.** The re-publish scheduler ticks once per second. A tick with no due record sends nothing. A tick with at least one due record starts a drain cycle. The cycle takes every due record. The 32-hash cap below does not apply to these records. Then the cycle looks ahead. It takes the records due within the next 5 minutes, in due order. It takes a record only if the record has a receiver and each receiver's set in the cycle stays at or below 32 hashes. The cycle stops at the first record that fails this test. That record and every later record stay scheduled. A cycle that starts less than 2 seconds after the previous drain cycle does not look ahead.
 
-The look-ahead is necessary. Per-record jitter spreads due times thinly. A one-second tick alone holds about one hash per receiver. Without the look-ahead, each batch carries one hash and pays a full connection setup.
+The look-ahead is necessary. Per-record jitter spreads due times thinly. A one-second tick alone holds about one hash per receiver. Without the look-ahead, each batch carries one hash, and each hash costs its own stream, frame and ack.
 
 An early re-publish only shortens the refresh gap of a record. The refresh gap is the time between two STOREs of one record to one receiver. The step 3 draw keeps the gap at or below 50 minutes, inside the 1-hour TTL. The 5-minute look-ahead keeps the gap at or above 25 minutes. The step 3 draw starts at the drain cycle that takes the record. The next window is thus `uniform(30 min, 50 min)` from that cycle, less at most 5 minutes.
 

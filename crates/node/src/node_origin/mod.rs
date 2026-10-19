@@ -584,8 +584,9 @@ pub struct NodeOriginDeps {
     /// close. A pull leg runs on its own current-thread runtime, which drops
     /// when the leg returns. A connection dialled there would lose its QUIC
     /// driver with that runtime, never reach QUIC's draining state, and hang
-    /// `Endpoint::close` at shutdown. Every upstream dial goes through this map,
-    /// so every driver lives on the main runtime.
+    /// `Endpoint::close` at shutdown. Every upstream pull dial goes through this
+    /// map, so every driver lives on the main runtime. Probes dial one-shot on
+    /// `endpoint`, on the serve task.
     pub connections: Connections,
     /// The node's pooled `cdn/dht/v1` connections (one per peer, dialled on
     /// the main runtime), shared with the DHT background tasks.
@@ -2479,8 +2480,8 @@ async fn pull_from_candidate_in_span(
     // window/leech pacer (this tier has no downstream paid frontier to pace against, so
     // it pulls the whole blob under a plain [`BudgetPacer`]).
     //
-    // Cancellation, settle and the dial runtime mirror `run_pull_leg`, and each is
-    // load-bearing:
+    // Cancellation, settle and the shared connection map mirror `run_pull_leg`, and
+    // each is load-bearing:
     //
     // - CANCELLATION. `spawn_blocking` tasks are never aborted when their `JoinHandle`
     //   is dropped, so a bare thread would keep pulling and PAYING vouchers for a blob
