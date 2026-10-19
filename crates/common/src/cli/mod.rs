@@ -20,6 +20,7 @@ pub mod pool;
 pub mod probe;
 pub mod publish;
 pub mod run;
+pub mod self_update;
 pub mod setup;
 pub mod whoami;
 
@@ -51,6 +52,7 @@ pub use publish::{
     PublishChainArgs, PublishCommand, RevokeArgs,
 };
 pub use run::RunArgs;
+pub use self_update::SelfUpdateArgs;
 pub use setup::SetupArgs;
 pub use whoami::WhoamiArgs;
 
@@ -144,6 +146,21 @@ pub enum Command {
     Publish(PublishArgs),
     /// File a slash appeal, posting the appeal bond (ADR 028).
     Appeal(AppealArgs),
+    /// Replace this binary with the latest signed release. The release's
+    /// `SHA256SUMS.minisig` must verify against a minisign key this build
+    /// embeds; a binary `cargo install` placed, or one in a directory this
+    /// user cannot write, is refused with the command to run instead.
+    SelfUpdate(SelfUpdateArgs),
+}
+
+/// Whether the parsed command asked for JSON output, at whatever depth its
+/// `--json` flag sits. A command with no `--json` flag never asks.
+#[must_use]
+pub fn json_requested(matches: &clap::ArgMatches) -> bool {
+    matches!(matches.try_get_one::<bool>("json"), Ok(Some(true)))
+        || matches
+            .subcommand()
+            .is_some_and(|(_, sub)| json_requested(sub))
 }
 
 #[cfg(test)]

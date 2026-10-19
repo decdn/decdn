@@ -218,12 +218,18 @@ esac
 # signature. A release can leave draft by other routes — `gh release edit
 # --draft=false` by hand, or an aborted sign-release.sh finished manually — so
 # check for the signature itself rather than inferring it from publication.
-# SHA256SUMS.asc is the one sign-release.sh always uploads.
-gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null |
-  grep -qx 'SHA256SUMS.asc' || die \
-  "release $TAG carries no SHA256SUMS.asc — it is published but was never signed.
+# SHA256SUMS.asc and SHA256SUMS.minisig are the two sign-release.sh always
+# uploads; the second is what `decdn self-update` checks, so a release
+# without it strands every installed CLI on the previous version.
+if ! ASSETS=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>&1); then
+  die "cannot list the assets of release $TAG: $ASSETS"
+fi
+for sig in SHA256SUMS.asc SHA256SUMS.minisig; do
+  grep -qx "$sig" <<<"$ASSETS" || die \
+    "release $TAG carries no $sig — it is published but was never signed.
 Nothing goes to crates.io that no maintainer signature vouches for.
 Run scripts/sign-release.sh $TAG."
+done
 
 # ---- publish from the tagged tree ----------------------------------------
 

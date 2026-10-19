@@ -54,12 +54,16 @@ expect() {
 # The `image:` that follows `- target: <stage>` in release.yml's matrix, before
 # the next entry starts. A plain line check would pass with the two `image:`
 # lines swapped between entries, which pushes each image to the other's name.
+# awk reads to the end of the file rather than exiting at the match: an early
+# exit while sed still has output buffered kills sed with SIGPIPE once the
+# file outgrows the pipe buffer, and pipefail turns that into a failed check.
 expect_pair() {
   local file="$1" stage="$2" image="$3" got
   got=$(sed 's/^[[:space:]]*//' "$file" | awk -v t="- target: ${stage}" '
+    found { next }
     $0 == t { on = 1; next }
-    on && /^- / { exit }
-    on && /^image: / { print substr($0, 8); exit }
+    on && /^- / { on = 0; found = 1; next }
+    on && /^image: / { print substr($0, 8); found = 1 }
   ')
   [[ "$got" == "$image" ]] || {
     echo "error: $file: target $stage pushes to '${got}', expected: $image" >&2

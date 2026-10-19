@@ -118,9 +118,26 @@ http-body-util = { workspace = true }
 bytes = { workspace = true }
 mime_guess = { workspace = true }
 psl = { workspace = true }
+# `decdn self-update` (#2537): resolves the latest GitHub release, verifies
+# `SHA256SUMS.minisig` against the embedded `minisign.pub`, checks the archive
+# against the manifest, unpacks it, and replaces the running binary. `semver`
+# orders the running version against the release tag so a downgrade or a
+# pre-release is refused. None of these link iroh-blobs or the AWS SDK.
+minisign-verify = { workspace = true }
+sha2 = { workspace = true }
+semver = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+self-replace = { workspace = true }
+
 # `decdn whoami` holds the resolved keystore password in a `Zeroizing<String>`
 # (the type `eth_identity::read_password` returns) so it is scrubbed on drop.
 zeroize = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Windows release archives are `.zip`.
+zip = { workspace = true }
+
 [dev-dependencies]
 decdn-incentive = { workspace = true, features = ["redb", "test-util"] }
 # `ScriptedSource` and `StaticSources` drive the acquire loop in unit tests.
@@ -138,6 +155,12 @@ jsonrpsee = { workspace = true, features = ["server"] }
 # A mocked chain answers a revert with a JSON-RPC `ErrorPayload`, which `alloy`
 # does not re-export.
 alloy-json-rpc = { workspace = true }
+# The self-update tests stand in for github.com: a redirect to the release
+# tag, the signed manifest, and the archive, all served from loopback. `zip`
+# is a dev-dependency on every platform so the Windows archive reader is
+# tested on Linux CI.
+wiremock = { workspace = true }
+zip = { workspace = true }
 
 # `tests/key_gen_prompt_pty.rs` drives the real `decdn` binary through the
 # interactive keystore-password prompt, which `rpassword` reads from

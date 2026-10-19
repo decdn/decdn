@@ -3901,6 +3901,34 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: `decdn self-update` and a daily update notice (#2537).**
+  `decdn self-update` resolves the latest GitHub release, verifies its
+  `SHA256SUMS.minisig` against a maintainer's minisign public key embedded
+  from `crates/cli/minisign-<maintainer>.pub`, checks the archive against the
+  signed manifest,
+  and replaces the running binary in place (`--check` only reports). A binary
+  `cargo install` placed is refused with `cargo install --locked decdn-cli`;
+  one in a directory the user cannot write (the container image, a managed
+  fleet path) is refused by path. A downgrade or a pre-release is never
+  applied. At most once a day (stamp `~/.decdn/self-update-check`) the CLI
+  looks the latest release up alongside the command and, once the command
+  succeeds, prints one stderr line naming the newer version and
+  `decdn self-update`; the command waits at most one second for the lookup,
+  and a `get` outlasts it. Never for `--json` output and never when stdout or stderr is not a
+  terminal. New config section `[self_update]` with
+  `check` (default `true`), overridden by `DECDN_SELF_UPDATE_CHECK`.
+  `DECDN_RELEASES_BASE` points a test at another release page.
+- **Release tooling: `SHA256SUMS.minisig` and pre-release marking (#2537).**
+  `scripts/sign-release.sh` signs `SHA256SUMS` with the minisign key
+  `DECDN_MINISIGN_KEY` names (default `~/.minisign/minisign.key`), verifies
+  it against the `crates/cli/minisign-*.pub` maintainer keys in the tag's tree
+  (the keys the released binary embeds), and uploads it beside the `.asc`
+  files;
+  It also verifies the signature against the keys in the previous tag's
+  tree, the keys installed binaries embed, so a key new in a release cannot
+  sign that release. `scripts/publish-crates.sh` requires it. A version with a
+  pre-release suffix is created and published with `--prerelease`, so it never
+  becomes GitHub's "latest" release.
 - **Node: `decdn_buyer_topup_unresolved` gauge (#2493).** It reads 1 while
   the node holds its top-up slot for a `topUp` whose outcome the chain has not
   resolved, and 0 again once the settle ends, including when its task is

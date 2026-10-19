@@ -18,6 +18,10 @@
 #                         in KEYS; two or more candidates stop the script.
 #                         gpg.conf's default-key is not read. Whatever it
 #                         resolves to must be published in KEYS.
+#   DECDN_MINISIGN_KEY    the minisign secret key that signs SHA256SUMS for
+#                         `decdn self-update` (default: ~/.minisign/minisign.key).
+#                         Its public half must be one of crates/cli/minisign*.pub,
+#                         the keys the released binary embeds.
 #   DECDN_SKIP_IMAGE_TAGS set to 1 to publish without creating ANY pullable
 #                         image tag — the release then ships with only the
 #                         signed digests in the *-image-digest.txt files
@@ -117,7 +121,7 @@ fi
 
 # ---- preconditions -------------------------------------------------------
 
-for tool in gh gpg git sha256sum; do
+for tool in gh gpg git sha256sum minisign; do
   command -v "$tool" >/dev/null || die "$tool not found on PATH"
 done
 
@@ -126,6 +130,21 @@ gh auth status >/dev/null 2>&1 || die "gh is not authenticated; run \`gh auth lo
 REPO_ROOT=$(git rev-parse --show-toplevel) || die "not inside a git repository"
 KEYS_FILE="$REPO_ROOT/KEYS"
 [[ -f "$KEYS_FILE" ]] || die "KEYS not found at $KEYS_FILE"
+
+# The second signature on SHA256SUMS: minisign, for `decdn self-update`. The
+# binary trusts only the public keys committed as crates/cli/minisign*.pub, so
+# the secret key used here must be one of theirs, and the check below runs
+# against those files rather than the key's own public half.
+MINISIGN_KEY="${DECDN_MINISIGN_KEY:-$HOME/.minisign/minisign.key}"
+[[ -f "$MINISIGN_KEY" ]] || die \
+  "minisign secret key not found at $MINISIGN_KEY (set DECDN_MINISIGN_KEY).
+See RELEASING.md § The minisign keys."
+# Absolute before the download step changes directory, or a relative path
+# that just passed the check above fails to open when it is used.
+[[ "$MINISIGN_KEY" == /* ]] || MINISIGN_KEY="$PWD/$MINISIGN_KEY"
+MINISIGN_PUBS=( "$REPO_ROOT"/crates/cli/minisign*.pub )
+[[ -f "${MINISIGN_PUBS[0]}" ]] || die \
+  "no crates/cli/minisign*.pub in the repository; the binary would trust no release key"
 
 # Registry auth is the likeliest runtime failure (PATs expire) and the tag
 # promotion is the last step, so check it up front rather than after signing.
@@ -443,18 +462,83 @@ for f in "${SIGN_TARGETS[@]}"; do
   echo "    signed $f"
 done
 
+# SHA256SUMS.minisig: the signature `decdn self-update` checks. Verified
+# against the public keys committed in the TAG's tree, which are the keys the
+# binary being released embeds, not the working tree's, so a secret key whose
+# public half that binary does not carry stops here instead of shipping a
+# release no client accepts. A placeholder key (one whose comment line says
+# so) means the real key never landed; nothing is signed with it.
+TAG_PUBS=()
+while IFS= read -r f; do
+  [[ -n "$f" ]] || continue
+  git -C "$REPO_ROOT" show "${TAG}:${f}" > "$KEYS_HOME/${f##*/}" ||
+    die "cannot read $f from the $TAG tree"
+  ! grep -qi 'placeholder' "$KEYS_HOME/${f##*/}" || die \
+    "$f at $TAG is a placeholder key; the released binary would trust no real key.
+Commit your minisign public key first (RELEASING.md § The minisign keys)."
+  TAG_PUBS+=( "$f" )
+done < <(git -C "$REPO_ROOT" ls-tree --name-only "$TAG" -- crates/cli/ | grep -E '^crates/cli/minisign[^/]*\.pub$' || true)
+(( ${#TAG_PUBS[@]} > 0 )) || die \
+  "the $TAG tree holds no crates/cli/minisign*.pub; the released binary would trust no key"
+rm -f SHA256SUMS.minisig
+minisign -S -s "$MINISIGN_KEY" -m SHA256SUMS -x SHA256SUMS.minisig ||
+  die "failed to minisign SHA256SUMS (password problem?); nothing has been published"
+MINISIGN_PUB=""
+MINISIGN_ERR=""
+for f in "${TAG_PUBS[@]}"; do
+  if MINISIGN_ERR=$(minisign -V -q -p "$KEYS_HOME/${f##*/}" -m SHA256SUMS -x SHA256SUMS.minisig 2>&1); then
+    MINISIGN_PUB="$f"
+    break
+  fi
+done
+[[ -n "$MINISIGN_PUB" ]] || die \
+  "SHA256SUMS.minisig is not signed by a key the decdn binary trusts (crates/cli/minisign*.pub at $TAG).
+$MINISIGN_KEY is not the key whose public half that tree carries; see RELEASING.md § The minisign keys.
+minisign said: ${MINISIGN_ERR:-nothing}"
+
+# A binary in the field trusts only the keys of the release it was built from,
+# so this release must also verify under a key the previous tag's tree
+# carries, or every installed binary refuses it. A key new in this release
+# signs from the next one. The first tag that carries keys has no previous
+# key set and skips the check.
+mapfile -t PREV_TAGS < <(git -C "$REPO_ROOT" tag --list 'v*' --sort=-v:refname | grep -vx -- "$TAG" || true)
+PREV_TAG="${PREV_TAGS[0]:-}"
+PREV_PUBS=()
+if [[ -n "$PREV_TAG" ]]; then
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    git -C "$REPO_ROOT" show "${PREV_TAG}:${f}" > "$KEYS_HOME/prev-${f##*/}" ||
+      die "cannot read $f from the $PREV_TAG tree"
+    PREV_PUBS+=( "$f" )
+  done < <(git -C "$REPO_ROOT" ls-tree --name-only "$PREV_TAG" -- crates/cli/ | grep -E '^crates/cli/minisign[^/]*\.pub$' || true)
+fi
+if (( ${#PREV_PUBS[@]} > 0 )); then
+  PREV_OK=""
+  for f in "${PREV_PUBS[@]}"; do
+    if minisign -V -q -p "$KEYS_HOME/prev-${f##*/}" -m SHA256SUMS -x SHA256SUMS.minisig >/dev/null 2>&1; then
+      PREV_OK="$f"
+      break
+    fi
+  done
+  [[ -n "$PREV_OK" ]] || die \
+    "SHA256SUMS.minisig is signed by a key not trusted by the binaries in the field: it is not among the
+crates/cli/minisign*.pub at $PREV_TAG, the release they were built from. Sign $TAG with a key
+committed at $PREV_TAG; a key new in $TAG signs from the next release (RELEASING.md § The minisign keys)."
+fi
+echo "    signed SHA256SUMS.minisig ($MINISIGN_PUB)"
+
 # ---- publish -------------------------------------------------------------
 
 # Only the signatures just produced. `gh release download` fetched every asset,
 # so a bare ./*.asc glob would also re-upload any stray signature left on the
 # draft by an earlier or abandoned run, unverified.
 echo "==> Uploading signatures"
-gh release upload "$TAG" --repo "$REPO" --clobber "${SIGN_TARGETS[@]/%/.asc}" ||
+gh release upload "$TAG" --repo "$REPO" --clobber "${SIGN_TARGETS[@]/%/.asc}" SHA256SUMS.minisig ||
   die "failed to upload signatures; the release is still a draft. Re-run this script."
 
-for stray in ./*.asc; do
+for stray in ./*.asc ./*.minisig; do
   [[ -e "$stray" ]] || continue
-  case " ${SIGN_TARGETS[*]/%/.asc} " in
+  case " ${SIGN_TARGETS[*]/%/.asc} SHA256SUMS.minisig " in
     *" ${stray#./} "*) ;;
     *) echo "warning: draft carries an unrecognised signature: ${stray#./}" >&2 ;;
   esac
@@ -586,16 +670,25 @@ Make each one public (GHCR: the package's settings page, Change visibility),
 then re-run this script. Their tags ALREADY serve an unpublished release."
 fi
 
+# GitHub's "latest" release, which `decdn self-update` resolves, excludes a
+# release marked pre-release, and the devops release-line resolver drops any
+# release flagged pre-release. A version with a pre-release suffix is
+# published as one so neither ever picks a candidate.
+PRERELEASE_FLAG=()
+if [[ "$VERSION" == *-* ]]; then
+  PRERELEASE_FLAG=( --prerelease )
+fi
+
 echo "==> Publishing $TAG"
 if [[ -n "$SKIP_IMAGE_TAGS" ]]; then
   PROMOTED_NOTE="no image tag was promoted"
 else
   PROMOTED_NOTE="the image tags on $(printf '%s ' "${PROMOTED[@]}")already serve it"
 fi
-gh release edit "$TAG" --repo "$REPO" --draft=false || die \
+gh release edit "$TAG" --repo "$REPO" --draft=false ${PRERELEASE_FLAG[@]+"${PRERELEASE_FLAG[@]}"} || die \
   "signatures are uploaded, but the release is STILL A DRAFT; ${PROMOTED_NOTE}.
 Re-run this script, or publish manually:
-gh release edit $TAG --repo $REPO --draft=false"
+gh release edit $TAG --repo $REPO --draft=false ${PRERELEASE_FLAG[*]+"${PRERELEASE_FLAG[*]}"}"
 
 echo
 echo "Published: https://github.com/${REPO}/releases/tag/${TAG}"
