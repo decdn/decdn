@@ -15,6 +15,8 @@ release.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-19
+
 ### Added
 
 - **`decdn.sh` and `decdn.ps1` download a blob URI.** The one-liner takes
