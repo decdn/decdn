@@ -79,7 +79,7 @@ repos:
         name: crate embeds stay inside their package
         entry: .github/scripts/check-package-embeds.sh
         language: system
-        files: '^crates/.*\.(rs|toml)$'
+        files: '^crates/.*\.(rs|toml|sh|ps1|html|json)$'
         pass_filenames: false
 
       # The CLI embeds a deployment manifest, but `include_str!` cannot escape
@@ -102,7 +102,7 @@ repos:
         name: rust version agrees across toolchain, manifest and workflows
         entry: .github/scripts/check-toolchain-pin.sh
         language: system
-        files: '^(rust-toolchain\.toml|Cargo\.toml|\.github/(workflows|actions)/.*\.ya?ml|\.github/scripts/check[-_]toolchain[-_]pin\.(py|sh))$'
+        files: '^(rust-toolchain\.toml|Cargo\.toml|deploy/sponsord/Dockerfile|\.github/(workflows|actions)/.*\.ya?ml|\.github/scripts/check[-_]toolchain[-_]pin\.(py|sh))$'
         pass_filenames: false
 
       # A member that restates `version` ships its own number; one without
@@ -136,8 +136,9 @@ repos:
         pass_filenames: false
 
       # Cargo enforces acyclicity only. The dependency flow in CLAUDE.md
-      # § Crate Structure (three leaves, cli/e2e as sinks, an iroh-blobs-free
-      # CLI and client SDK) is held by the table in check_crate_edges.py. Needs cargo. The
+      # § Crate Structure (four leaves, cli/e2e/sponsord/sponsord-e2e as sinks,
+      # an iroh-blobs-free CLI, client SDK and sponsord servers) is held by the
+      # table in check_crate_edges.py. Needs cargo. The
       # `packaging` CI job is authoritative.
       - id: crate-edges
         name: crate dependency direction matches CLAUDE.md

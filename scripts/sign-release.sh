@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Signs and publishes a release draft staged by .github/workflows/release.yml.
 #
-# The workflow builds the archives, the two container images and their SBOMs,
+# The workflow builds the archives, the four container images and their SBOMs,
 # but signs nothing and publishes nothing — the GitHub Release is left as a
-# draft and both image manifests are pushed untagged. This script is the human
+# draft and every image manifest is pushed untagged. This script is the human
 # step: a maintainer verifies what CI produced, signs it with their own GPG key,
 # promotes the image tags, and publishes. There is no signing key in Actions
 # secrets.
@@ -28,7 +28,9 @@
 #   DECDN_SKIP_DOCKERHUB  set to 1 to tag on GHCR only, skipping the Docker Hub
 #                         mirror and overview (implied by DECDN_SKIP_IMAGE_TAGS)
 #   DECDN_DOCKERHUB_REPO  the Docker Hub counterpart of DECDN_REPO (default:
-#                         DECDN_REPO). The images are <it>-node and <it>.
+#                         DECDN_REPO). The decdn images are <it>-node and <it>;
+#                         the sponsord images are <its owner>/sponsord and
+#                         <its owner>/sponsord-onramp.
 #   DECDN_DOCKERHUB_USERNAME, DECDN_DOCKERHUB_TOKEN
 #                         a Docker Hub personal access token for the overview
 #                         push, when the `docker login` credential is not one
@@ -49,21 +51,48 @@ REPO="${DECDN_REPO:-decdn/decdn}"
 DOCKERHUB_REPO="${DECDN_DOCKERHUB_REPO:-${REPO}}"
 SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
 
+die() { echo "error: $*" >&2; exit 1; }
+
+# Both are `<owner>/<name>`. A bare namespace (`DECDN_DOCKERHUB_REPO=hubuser`)
+# would pass every check below and fail only at the Docker Hub mirror, after
+# the GHCR tags are promoted.
+[[ "$REPO" == */* ]] || die "DECDN_REPO must be <owner>/<repo>, got '$REPO'"
+[[ "$DOCKERHUB_REPO" == */* ]] ||
+  die "DECDN_DOCKERHUB_REPO must be <namespace>/<repo> (e.g. decdn/decdn), got '$DOCKERHUB_REPO'"
+# The organisation (or user) each repository lives under: the sponsord images
+# are named under it, not under the repository. That is why a rehearsal must
+# run from a fork under ANOTHER owner: a DECDN_REPO under `decdn` would promote
+# the production `ghcr.io/decdn/sponsord*` tags while the decdn images went to
+# the rehearsal names.
+OWNER="${REPO%%/*}"
+DOCKERHUB_OWNER="${DOCKERHUB_REPO%%/*}"
+if [[ "$REPO" != "decdn/decdn" && "$OWNER" == "decdn" ]]; then
+  die "DECDN_REPO=$REPO is under the decdn organisation but is not decdn/decdn: the
+sponsord images are named per owner, so this run would promote the production
+ghcr.io/decdn/sponsord tags. Rehearse from a fork under another owner."
+fi
+
 # The images, keyed by Dockerfile stage. The stage name is also the prefix of
 # the image's release assets: <stage>-image-digest.txt and
 # <stage>-<version>-sbom.spdx.json. `decdn-node` (daemon + CLI) carries a
 # `-node` suffix; `decdn` (CLI only) takes the repository's own name, as the
-# binary does. IMAGES and GHCR_IMAGE must match the `target:` / `image:` pairs
-# of release.yml's docker matrix, which is what wrote the digest files;
-# .github/scripts/check-image-name.sh enforces that.
-IMAGES=( "decdn-node" "decdn" )
+# binary does; `sponsord` and `sponsord-onramp` take their binaries' names
+# under the owner, so operators pull `ghcr.io/decdn/sponsord` whichever
+# repository builds it. IMAGES and GHCR_IMAGE must match the `target:` /
+# `image:` pairs of release.yml's docker matrix, which is what wrote the
+# digest files; .github/scripts/check-image-name.sh enforces that.
+IMAGES=( "decdn-node" "decdn" "sponsord" "sponsord-onramp" )
 declare -A GHCR_IMAGE=(
   [decdn-node]="ghcr.io/${REPO}-node"
   [decdn]="ghcr.io/${REPO}"
+  [sponsord]="ghcr.io/${OWNER}/sponsord"
+  [sponsord-onramp]="ghcr.io/${OWNER}/sponsord-onramp"
 )
 declare -A DOCKERHUB_IMAGE=(
   [decdn-node]="docker.io/${DOCKERHUB_REPO}-node"
   [decdn]="docker.io/${DOCKERHUB_REPO}"
+  [sponsord]="docker.io/${DOCKERHUB_OWNER}/sponsord"
+  [sponsord-onramp]="docker.io/${DOCKERHUB_OWNER}/sponsord-onramp"
 )
 
 # The files a signature covers. SHA256SUMS transitively covers every archive,
@@ -72,8 +101,6 @@ SIGN_TARGETS=( "SHA256SUMS" )
 for img in "${IMAGES[@]}"; do
   SIGN_TARGETS+=( "${img}-image-digest.txt" "${img}-${VERSION}-sbom.spdx.json" )
 done
-
-die() { echo "error: $*" >&2; exit 1; }
 
 # DECDN_DOCKERHUB_REPO names the base repository, and the node image appends
 # `-node` to it. A value that already ends in `-node` would mirror the node

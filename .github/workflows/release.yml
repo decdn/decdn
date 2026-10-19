@@ -138,7 +138,7 @@ jobs:
       # The version bump happens locally and is unpoliced by CI, so confirm the
       # tag matches the manifests it claims to describe. Catches a hand-typed
       # tag or a tag pushed without `cargo release`. Checks every crate, not
-      # just one: `shared-version` is supposed to move all eleven in lockstep,
+      # just one: `shared-version` is supposed to move all sixteen in lockstep,
       # and a partially-applied bump is exactly what this is here to catch.
       # `shell: bash` is deliberate: the default shell for a `run:` block is
       # `bash -e` with NO pipefail, so a `cargo metadata` failure here would be
@@ -154,7 +154,7 @@ jobs:
               '.packages[] | select(.version != $v) | "\(.name)=\(.version)"')
           if [ -n "$MISMATCHED" ]; then
             echo "::error::tag says $VERSION but these crates disagree: $MISMATCHED"
-            echo "Cut releases with \`cargo release\` so all eleven stay in step."
+            echo "Cut releases with \`cargo release\` so all sixteen stay in step."
             exit 1
           fi
           echo "All crates are at $VERSION."
@@ -344,14 +344,16 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      # Two binaries: the `decdn-node` daemon and the `decdn` user CLI. Each
-      # ships as its own archive so users grab only what they need. The
-      # container images reuse the Linux archives: `decdn` carries the CLI,
-      # `decdn-node` the daemon plus the CLI.
+      # Four binaries: the `decdn-node` daemon, the `decdn` user CLI, and the
+      # `sponsord` daemon with its `sponsord-onramp`, which are servers and
+      # ship for Linux only. Each ships as its own archive so users grab only
+      # what they need. The container images reuse the Linux archives: `decdn`
+      # carries the CLI, `decdn-node` the daemon plus the CLI, `sponsord` and
+      # `sponsord-onramp` one server each.
       #
-      # One job per target, not per binary: the two packages share most of
-      # their dependency graph, and building both in one `target/` compiles
-      # the shared part once. `builds` lists `package:binary` pairs; each binary
+      # One job per target, not per binary: the packages share most of their
+      # dependency graph, and building them in one `target/` compiles the
+      # shared part once. `builds` lists `package:binary` pairs; each binary
       # ships as `<binary>-<version>-<target>.<archive>`.
       matrix:
         include:
@@ -365,12 +367,12 @@ jobs:
           # ubuntu-latest points at next.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            builds: decdn-node:decdn-node decdn-cli:decdn
+            builds: decdn-node:decdn-node decdn-cli:decdn sponsord:sponsord sponsord-onramp:sponsord-onramp
             archive: tar.gz
             cross: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            builds: decdn-node:decdn-node decdn-cli:decdn
+            builds: decdn-node:decdn-node decdn-cli:decdn sponsord:sponsord sponsord-onramp:sponsord-onramp
             archive: tar.gz
             cross: true
           - target: x86_64-apple-darwin
@@ -451,7 +453,7 @@ jobs:
       # runner's) and fails at exec on any older distribution with
       # "version `GLIBC_2.3x' not found". Checked here, before the archive
       # exists, so a binary above the floor never reaches upload-assets or
-      # either image.
+      # any image.
       - name: Check glibc floor
         if: contains(matrix.target, '-linux-gnu')
         shell: bash
@@ -566,7 +568,7 @@ jobs:
         working-directory: artifacts
         shell: bash
         env:
-          EXPECTED_ARCHIVES: "11"
+          EXPECTED_ARCHIVES: "15"
         run: |
           archives=( ./*.tar.gz ./*.zip )
           for a in "${archives[@]}"; do
@@ -597,7 +599,7 @@ jobs:
     # signed SHA256SUMS covers. Needs verify: that job creates the draft this
     # one uploads to, and no image is pushed, not even untagged, for a release
     # that failed verification. Needs upload-assets: no image is pushed and
-    # nothing is attached to the draft unless all eleven archives and
+    # nothing is attached to the draft unless all fifteen archives and
     # SHA256SUMS reached it first, so a failed run never leaves a draft holding
     # an SBOM and digest for archives it does not have.
     needs: [tag, verify, build-binaries, upload-assets]
@@ -611,7 +613,7 @@ jobs:
     strategy:
       # One leg per image, each a stage of the one Dockerfile. A failed leg
       # does not cancel the other; sign-release.sh refuses a draft that lacks
-      # either image's digest, so a half-built release cannot be signed.
+      # any image's digest, so a half-built release cannot be signed.
       # Each image has the same repository path on Docker Hub, which
       # sign-release.sh mirrors its signed digest to.
       fail-fast: false
@@ -626,6 +628,15 @@ jobs:
           - target: decdn
             binaries: decdn
             image: ${{ github.repository }}
+          # The sponsord images take their binaries' names under the
+          # organisation, not the repository's: operators pull
+          # `ghcr.io/decdn/sponsord`, whichever repository builds it.
+          - target: sponsord
+            binaries: sponsord
+            image: ${{ github.repository_owner }}/sponsord
+          - target: sponsord-onramp
+            binaries: sponsord-onramp
+            image: ${{ github.repository_owner }}/sponsord-onramp
     steps:
       # `github.sha`, not the tag name — see build-binaries.
       - uses: actions/checkout@v7
@@ -641,7 +652,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # Each Linux artifact carries both archives; the unpack step below names
+      # Each Linux artifact carries all four archives; the unpack step below names
       # the ones this image needs and ignores the rest.
       - name: Download Linux archives
         uses: actions/download-artifact@v8

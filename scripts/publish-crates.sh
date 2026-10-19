@@ -21,7 +21,6 @@
 #                          decdn bump PR after the upload (0/false/no or unset
 #                          opens it; any other value stops the script before
 #                          the upload)
-#   DECDN_SKIP_SPONSORD_BUMP the same, for decdn/sponsord's decdn bump PR
 #
 # Unlike sign-release.sh this is NOT freely re-runnable: a crates.io version is
 # immutable and can never be replaced or re-uploaded (only yanked, which does not
@@ -39,7 +38,7 @@ die() { echo "error: $*" >&2; exit 1; }
 
 # `1`/`true`/`yes` enable, `0`/`false`/`no`/empty do not, anything else is a
 # typo and stops the script — the same rule as sign-release.sh. A bare
-# `[[ -n ]]` test would make DECDN_SKIP_SPONSORD_BUMP=0 mean "skip".
+# `[[ -n ]]` test would make DECDN_SKIP_DEVOPS_BUMP=0 mean "skip".
 enabled() {
   local name="$1" value="${2:-}"
   case "${value,,}" in
@@ -54,10 +53,6 @@ enabled() {
 SKIP_DEVOPS_BUMP=""
 if enabled DECDN_SKIP_DEVOPS_BUMP "${DECDN_SKIP_DEVOPS_BUMP:-}"; then
   SKIP_DEVOPS_BUMP=1
-fi
-SKIP_SPONSORD_BUMP=""
-if enabled DECDN_SKIP_SPONSORD_BUMP "${DECDN_SKIP_SPONSORD_BUMP:-}"; then
-  SKIP_SPONSORD_BUMP=1
 fi
 
 # ---- preconditions -------------------------------------------------------
@@ -433,28 +428,22 @@ fi
 
 # ---- downstream ------------------------------------------------------------
 
-# Two repositories pin decdn at a release tag, and each carries the script that
-# opens the PR moving its pin to this release: decdn/devops (the role, chart,
-# Compose and onramp pins; the digests come from the release's signed assets)
-# and decdn/sponsord (the crate pins; it checks crates.io up to 10 times, a
-# minute apart, and exits 3 if the release is still not served, so it runs even
-# when a crate above is not served yet). devops goes first, so sponsord's wait
-# does not hold it up. devops pins vX.Y.Z releases only, so a pre-release opens
-# no devops PR.
-# Each script runs from a fresh clone of its repo's main: it commits as your git
+# decdn/devops pins decdn at a release tag (the role, chart, Compose and onramp
+# pins; the digests come from the release's signed assets) and carries the
+# script that opens the PR moving its pin to this release. It pins vX.Y.Z
+# releases only, so a pre-release opens no devops PR.
+# The script runs from a fresh clone of devops's main: it commits as your git
 # identity, pushes with your git credentials for github.com and opens the PR
-# with your gh login. sponsord's uses your cargo, so rustup selects the
-# toolchain sponsord's rust-toolchain.toml names. A run with DECDN_REPO set to
-# anything but decdn/decdn, such as a fork or a test run, opens nothing.
+# with your gh login. A run with DECDN_REPO set to anything but decdn/decdn,
+# such as a fork or a test run, opens nothing.
 #
-# This runs each repo's main as you, so it trusts that branch the way running
-# the script by hand would. Both repos' rulesets require a PR with one approving
-# review for a change to main, though org admins can bypass them. The registry
-# tokens cargo reads from the environment (CARGO_REGISTRY_TOKEN,
-# CARGO_REGISTRIES_<NAME>_TOKEN) are unset first. Every other variable stays
-# set, and every file you can read, such as ~/.cargo/credentials.toml, stays
-# readable to it. Skip a step with DECDN_SKIP_DEVOPS_BUMP=1 or
-# DECDN_SKIP_SPONSORD_BUMP=1 to run that script and its helpers from a checkout
+# This runs devops's main as you, so it trusts that branch the way running the
+# script by hand would. Its ruleset requires a PR with one approving review for
+# a change to main, though org admins can bypass it. The registry tokens cargo
+# reads from the environment (CARGO_REGISTRY_TOKEN, CARGO_REGISTRIES_<NAME>_TOKEN)
+# are unset first. Every other variable stays set, and every file you can read,
+# such as ~/.cargo/credentials.toml, stays readable to it. Skip it with
+# DECDN_SKIP_DEVOPS_BUMP=1 to run the script and its helpers from a checkout
 # you have reviewed.
 #
 # Every failure here is a warning with the command to run later; none of them
@@ -506,12 +495,6 @@ open_bump() {
   trap - INT
   case "$rc" in
     0) ;;
-    3)
-      # sponsord's: the crates.io wait ran out.
-      echo "warning: crates.io does not serve $TAG yet, so ${name}'s bump PR is not open." >&2
-      echo "Open it later with:" >&2
-      echo "  $hint" >&2
-      ;;
     130)
       echo "warning: ${name}'s bump was interrupted; no PR is open unless its output" >&2
       echo "above ends with \"==> Opened <url>\". Open it later with:" >&2
@@ -533,7 +516,6 @@ else
   echo
   echo "==> Skipping devops's decdn bump ($TAG is a pre-release)"
 fi
-open_bump sponsord decdn/sponsord scripts/open-decdn-bump.sh "$SKIP_SPONSORD_BUMP"
 
 echo
 echo "Published ${#CRATES[@]} crates at $VERSION."

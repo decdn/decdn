@@ -19,6 +19,11 @@ members = [
     "crates/client",
     "crates/cli",
     "crates/e2e",
+    "crates/sponsord-api",
+    "crates/sponsord-core",
+    "crates/sponsord",
+    "crates/sponsord-onramp",
+    "crates/sponsord-e2e",
 ]
 exclude = ["contracts"]
 
@@ -49,14 +54,15 @@ categories = ["network-programming", "web-programming"]
 # inheritance would break packaging (cargo copies a workspace-root readme into
 # the .crate quite happily) but because these are public crates.io landing
 # pages and each one needs to describe its own crate. Inheriting would put the
-# same text on all eleven. check_workspace_manifests.py requires both per
+# same text on all sixteen. check_workspace_manifests.py requires both per
 # publishable crate.
 
 [workspace.dependencies]
 # Internal crates. The `version` is what makes these publishable — cargo rejects
-# a path dependency with no version specifier, because a published crate has no
-# path to follow. Locally the `path` still wins; the version only applies to the
-# manifest cargo uploads.
+# a normal or build path dependency with no version specifier, because a
+# published crate has no path to follow. Locally the `path` still wins; the
+# version only applies to the manifest cargo uploads. A dev-dependency is the
+# exception, see `decdn-e2e` below.
 decdn-protocol = { path = "crates/protocol", version = "0.2.0" }
 decdn-config-types = { path = "crates/config-types", version = "0.2.0" }
 decdn-bao-range = { path = "crates/bao-range", version = "0.2.0" }
@@ -66,6 +72,18 @@ decdn-reputation = { path = "crates/reputation", version = "0.2.0" }
 decdn-common = { path = "crates/common", version = "0.2.0" }
 decdn-client = { path = "crates/client", version = "0.2.0" }
 decdn-node = { path = "crates/node", version = "0.2.0" }
+# `decdn-e2e` is `publish = false`; the alias exists because the sponsord crates
+# dev-depend on its anvil fixtures. No `version`, on purpose: cargo strips a
+# dev-dependency from the published manifest only when it has no version
+# requirement, and with one `cargo publish` would look for `decdn-e2e` on
+# crates.io, where it never is.
+decdn-e2e = { path = "crates/e2e" }
+# sponsord: the sponsorship daemon, its library core, the wire types and the
+# public onramp. `sponsord-e2e` has no alias: nothing depends on it.
+sponsord = { path = "crates/sponsord", version = "0.2.0" }
+sponsord-api = { path = "crates/sponsord-api", version = "0.2.0" }
+sponsord-core = { path = "crates/sponsord-core", version = "0.2.0" }
+sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.2.0" }
 # No `decdn-cli` entry: it is a bin crate and a workspace *member*, but nothing
 # in the workspace depends on it, so it needs no `[workspace.dependencies]`
 # alias. Add one back only alongside a real dependant.
@@ -228,6 +246,11 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider",
     "stream",
     "json",
+    # `form` and `query` are serde_urlencoded only, no TLS impact: the onramp
+    # posts Turnstile siteverify forms, `sponsord-api`'s clients send query
+    # strings.
+    "form",
+    "query",
 ] }
 # TLS for the reqwest clients above: ring, the provider iroh's QUIC stack
 # already links. `default-features = false`, because rustls's default is
@@ -317,6 +340,11 @@ rexpect = "0.7"
 # already depends on tower 0.5; this pins the same major so those `Service`
 # impls satisfy alloy's `Transport` blanket bound.
 tower = "0.5"
+# The HTTP servers: the sponsord daemon and the onramp. `sponsord-api` narrows
+# its own optional entry to `json`, which a workspace entry cannot express.
+axum = "0.8"
+# Addresses and U256 in the sponsord wire types, without the rest of alloy.
+alloy-primitives = { version = "1", features = ["serde"] }
 # The packet types those `Service` impls are generic over. Taken directly
 # rather than by enabling alloy's `json-rpc` feature: the feature is
 # workspace-wide (it would widen `decdn-cli`'s surface too, cf. #578). alloy

@@ -1,0 +1,16 @@
+# sponsord-onramp
+
+The public onramp in front of [`sponsord`](https://crates.io/crates/sponsord):
+a gate page (Turnstile built in, or your own `Gate`), the `decdn.sh` and
+`decdn.ps1` installers that install `decdn` and download through it, and the
+API they poll. Every
+setting is a flag or an `ONRAMP_*` environment variable
+(`sponsord-onramp --help`).
+
+Prebuilt Linux binaries, signed, are on the
+[GitHub Releases](https://github.com/decdn/decdn/releases), and a container
+image is published as `ghcr.io/decdn/sponsord-onramp`. See the
+[operator guide](https://github.com/decdn/decdn/blob/main/docs/sponsord/operator.md)
+for configuration.
+
+Licensed under either of MIT or Apache-2.0, at your option.

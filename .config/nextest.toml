@@ -31,6 +31,16 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # `2 x ci_scaled(60s)` ladder has lost a scheduling race, not found a defect.
 retries = 2
 
+# The sponsord pool client (`chain_pool`) and daemon binary (`binary_anvil`)
+# boot anvil and deploy the protocol with `forge` the same way; they build only
+# under `--features anvil-e2e` and the job that runs them uses this default
+# profile, so they need their own row.
+[[profile.default.overrides]]
+filter = '(package(sponsord-core) & binary(chain_pool)) | (package(sponsord) & binary(binary_anvil))'
+slow-timeout = { period = "120s", terminate-after = 5 }
+# Same anvil + `forge` contention as the journeys above.
+retries = 2
+
 # The two anvil-backed `decdn-node` targets boot anvil, shell out to `forge`, and
 # drive real node code against a live chain, so they are legitimately slower than
 # the rest of that package and are excluded from its tighter cap below. They build

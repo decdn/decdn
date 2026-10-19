@@ -37,7 +37,14 @@ updates:
   # when it can parse a version out of it, and `trixie-slim` gives it nothing,
   # so with a bare tag this ecosystem would open no PRs at all.
   - package-ecosystem: docker
-    directory: /
+    directories:
+      - /
+      # The source-build image behind deploy/sponsord/compose.yaml. Its
+      # `rust:X.Y.Z-trixie` tag has a parseable version, so Dependabot opens
+      # a PR for each new Rust; check_toolchain_pin.py holds that PR red until
+      # rust-toolchain.toml, `rust-version` and the action refs move with it.
+      # Its undigested `debian:trixie-slim` line gets no PRs, as above.
+      - /deploy/sponsord
     schedule:
       interval: weekly
     open-pull-requests-limit: 5

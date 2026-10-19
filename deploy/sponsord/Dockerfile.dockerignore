@@ -1,0 +1,15 @@
+# deploy/sponsord/Dockerfile builds from source with the repository root as
+# its context, so the workspace manifests and crates are in. Everything the
+# build does not read stays out. The release Dockerfile at the root uses the
+# root .dockerignore instead.
+target/
+dist/
+.git/
+.github/
+adr/
+contracts/
+docs/
+docker/
+deploy/sponsord/secrets/
+**/*.env
+**/*.md

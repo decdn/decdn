@@ -80,8 +80,25 @@ CARGO_BUILD_WARNINGS=deny cargo clippy -p decdn-incentive --no-default-features 
 ```
 
 The `--all-features` run is the only one that reaches anything behind an off-by-default feature —
-the `anvil-e2e` targets (journeys and the two `decdn-node` anvil tests), `public-api-test`. Run it
-before pushing a change that touches gated code, or the first thing that tells you is a red CI.
+the `anvil-e2e` targets (journeys, the two `decdn-node` anvil tests, and sponsord's `chain_pool`
+and `binary_anvil`), `public-api-test`, the sponsord `test-support` fakes. Run it before pushing
+a change that touches gated code, or the first thing that tells you is a red CI.
+
+The sponsord crates (`crates/sponsord*`, [`docs/sponsord/`](docs/sponsord/README.md)) have two
+checks of their own. Their anvil-backed tests need `anvil` and `forge` on `PATH`, like the
+journeys:
+
+```bash
+cargo nextest run --features sponsord-core/anvil-e2e,sponsord/anvil-e2e \
+  -p sponsord-core -p sponsord --test chain_pool --test binary_anvil
+```
+
+And `sponsord-api`'s OpenAPI documents are snapshot-tested against its types, so after changing
+one (a doc comment on a wire type is its OpenAPI description) regenerate them:
+
+```bash
+UPDATE_OPENAPI=1 cargo test -p sponsord-api --test openapi
+```
 
 ### Unit test placement
 
@@ -94,8 +111,11 @@ child file — `foo/tests.rs` for `foo.rs`, or `tests.rs` beside a `lib.rs`, `ma
 mod tests;
 ```
 
-The rule has no size threshold, and it covers every `#[cfg(test)]` or `#[cfg(all(test, …))]`
-module, whatever its name (`tests`, `prop_tests`, `test_support`, …). The tests stay child modules,
+The rule has no size threshold, and it covers every module gated on test code only:
+`#[cfg(test)]`, `#[cfg(all(test, …))]`, `#[cfg(feature = "test-support")]` and
+`#[cfg(any(test, feature = "test-support"))]`, whatever its name (`tests`, `prop_tests`,
+`test_support`, …). `test-support` is the workspace's name for a test-only feature; the same
+test fails if a crate turns it on by default or through a normal dependency. The tests stay child modules,
 so they keep access to private items. Do not move them to `crates/*/tests/`: an integration test
 reaches only `pub` items. `crates/e2e/tests/no_inline_test_modules.rs` parses every source file
 under `crates/` and fails on any test module with an inline body. It runs in the default
@@ -104,7 +124,7 @@ under `crates/` and fails on any test module with an inline body. It runs in the
 CodeQL skips these files by name (`.github/codeql/codeql-config.yml`): `tests.rs`, `*_tests.rs`,
 `proptests.rs`, `test_support.rs` and `tests_support.rs` under `src/`. Name a new test module to
 match, or its fixture secrets raise alerts. The same test fails if a file with one of those names
-is not a `#[cfg(test)]` module, so a production file never drops out of the analysis.
+is not a test module, so a production file never drops out of the analysis.
 
 ### Public API snapshot
 
@@ -265,7 +285,7 @@ Notes and common snags:
 
 `rust-toolchain.toml` pins an exact stable release (currently `1.99.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.99.0` so pre-commit's `cargo clippy` runs the identical lint *rules* as CI. Identical rules, not identical coverage: the hook runs one invocation over the default-feature workspace, while the `clippy` job runs four (see [Build and Test](#build-and-test)). Under a rustup-managed `cargo`, the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.99.0` manually.
 
-Dependabot auto-bumps the GitHub Actions refs only — it does **not** touch `rust-toolchain.toml` or `Cargo.toml`'s `rust-version`. A toolchain bump therefore touches three kinds of site: `.github/scripts/check-toolchain-pin.sh` (the `toolchain-pin` hook and the `packaging` CI job) refuses them to differ, so a Dependabot bump stays red until `rust-toolchain.toml` and `Cargo.toml` move in the same PR. All carry the same `X.Y.Z`; a two-part `rust-version` is refused for that reason, and a `with: toolchain:` input on a `dtolnay/rust-toolchain` step counts as that step's version.
+Dependabot bumps the GitHub Actions refs and the `rust:` tag in `deploy/sponsord/Dockerfile` on its own — it does **not** touch `rust-toolchain.toml` or `Cargo.toml`'s `rust-version`. A toolchain bump therefore touches four kinds of site: `.github/scripts/check-toolchain-pin.sh` (the `toolchain-pin` hook and the `packaging` CI job) refuses them to differ, so a Dependabot bump stays red until `rust-toolchain.toml`, `Cargo.toml` and the other sites move in the same PR. All carry the same `X.Y.Z`; a two-part `rust-version` is refused for that reason, and a `with: toolchain:` input on a `dtolnay/rust-toolchain` step counts as that step's version.
 
 MSRV (`rust-version.workspace = true` → 1.99.0) is the lower bound the workspace must compile under. It equals the stable lint pin, so there is no separate MSRV job: every Rust job compiles on that toolchain, and the pin check keeps the two from drifting apart. If MSRV is ever lowered below the pinned toolchain, add a dedicated `cargo check` job on the older floor and relax the pin check to a floor comparison.
 

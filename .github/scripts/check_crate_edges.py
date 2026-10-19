@@ -2,9 +2,10 @@
 """Fail if a crate depends on one the design says it must not.
 
 Cargo enforces acyclicity and nothing more. The direction the workspace's
-crates depend on each other is a design decision — three leaves that pull in
-no sibling, `cli` and `e2e` as sinks nothing depends on, a publisher CLI that
-links no blob store or AWS SDK — and CLAUDE.md § Crate Structure states it.
+crates depend on each other is a design decision — four leaves that pull in
+no sibling, `cli`, `e2e`, `sponsord` and `sponsord-e2e` as sinks nothing
+depends on, a publisher CLI and two sponsord servers that link no blob store
+or AWS SDK — and CLAUDE.md § Crate Structure states it.
 Without this check nothing enforces it: an edge added the wrong way compiles
 green, and the first thing to notice is a `decdn` binary that has grown an S3
 client.
@@ -19,7 +20,8 @@ Two passes:
   (`cli` tests the daemon it is shipped beside). A member with no row fails,
   and a row for a member that does not exist fails too.
 * **Closure**, over one `cargo tree -p <crate>` per FOOTPRINT_GUARDED crate —
-  the `decdn-cli` binary and the `decdn-client` SDK it builds on. Their
+  the `decdn-cli` binary, the `decdn-client` SDK it builds on, and the
+  `sponsord` and `sponsord-onramp` servers. Their
   transitive normal and build dependencies must not include the blob store,
   the AWS SDK, the aws-lc crypto library or the JSON-RPC server
   (MUST_NOT_LINK). The direct table cannot see this: `client → common` is
@@ -52,8 +54,8 @@ import subprocess
 import sys
 from collections import deque
 
-# Member -> members it may depend on (normal dependencies only). `e2e` may
-# depend on anything but a sink, so its row is the sentinel ANY.
+# Member -> members it may depend on (normal dependencies only). The two e2e
+# crates may depend on anything but a sink, so their row is the sentinel ANY.
 ANY = frozenset({"*"})
 ALLOWED: dict[str, frozenset[str]] = {
     "decdn-protocol": frozenset(),
@@ -88,16 +90,27 @@ ALLOWED: dict[str, frozenset[str]] = {
         }
     ),
     "decdn-e2e": ANY,
+    # sponsord: the wire types are a leaf; the core builds on the client SDK;
+    # the daemon is a sink; the onramp is an embeddable library over the wire
+    # types alone (its gate is pluggable), so it is not a sink.
+    "sponsord-api": frozenset(),
+    "sponsord-core": frozenset(
+        {"decdn-client", "decdn-common", "decdn-incentive", "sponsord-api"}
+    ),
+    "sponsord": frozenset({"decdn-common", "decdn-incentive", "sponsord-api", "sponsord-core"}),
+    "sponsord-onramp": frozenset({"sponsord-api"}),
+    "sponsord-e2e": ANY,
 }
 # Nothing may depend on these, dev-deps aside.
-SINKS = frozenset({"decdn-cli", "decdn-e2e"})
+SINKS = frozenset({"decdn-cli", "decdn-e2e", "sponsord", "sponsord-e2e"})
 # The publisher CLI and the client SDK are iroh-blobs-free and AWS-free (#578,
 # #1150): neither links a blob store or an S3 SDK, so `cargo install decdn-cli`
 # builds no such thing and a crate built on `decdn-client` inherits none. They
 # also link one TLS backend, ring, and no JSON-RPC server (#2454): aws-lc is a
 # second crypto library and a C build on every client target, and only the
-# daemon serves the admin RPC.
-FOOTPRINT_GUARDED = ("decdn-cli", "decdn-client")
+# daemon serves the admin RPC. The sponsord daemon and onramp are built on
+# the client SDK and the wire types, and ship the same way.
+FOOTPRINT_GUARDED = ("decdn-cli", "decdn-client", "sponsord", "sponsord-onramp")
 MUST_NOT_LINK = frozenset(
     {
         "iroh-blobs",
@@ -215,8 +228,14 @@ def check(metadata: dict, trees: dict[str, str]) -> list[str]:
 
     # --- footprint closures -------------------------------------------------
     for root in FOOTPRINT_GUARDED:
-        if root in members:
-            errors.extend(check_closure(root, trees.get(root, "")))
+        if root not in members:
+            errors.append(
+                f"FOOTPRINT_GUARDED in check_crate_edges.py lists {root}, which is not a "
+                "workspace member — a misspelt root would otherwise drop its closure from "
+                "the check"
+            )
+            continue
+        errors.extend(check_closure(root, trees.get(root, "")))
 
     return errors
 

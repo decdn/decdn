@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail if the sites that hold the Rust version disagree.
 
-The version is written in three kinds of place, each read by a different tool
+The version is written in four kinds of place, each read by a different tool
 and none derivable from another:
 
     rust-toolchain.toml   [toolchain] channel        what rustup installs locally
@@ -10,6 +10,8 @@ and none derivable from another:
     .github/workflows/*   dtolnay/rust-toolchain@X   what CI actually compiles on
     .github/actions/*/    (or its `with: toolchain:`
       action.y*ml         input, which overrides the @ref)
+    deploy/sponsord/      FROM rust:X.Y.Z-…          what a source build of the
+      Dockerfile                                     sponsord images compiles on
 
 Without this check nothing compares them. Dependabot's github-actions
 ecosystem bumps every action ref on its own and touches neither TOML file, so
@@ -32,8 +34,13 @@ ref as that site's value; an expression there (`${{ … }}`) cannot be read and
 is refused rather than skipped. Out of scope: a `RUSTUP_TOOLCHAIN` env var,
 which no workflow here sets.
 
-There is no Dockerfile site. The image is a single Debian stage that copies
-prebuilt release binaries, so no `rust:` tag ever names a version.
+The release images copy prebuilt binaries, so the root Dockerfile names no
+`rust:` tag. `deploy/sponsord/Dockerfile` builds from source and does: its
+`FROM rust:<version>-…` tag is a site too, read as the full `X.Y.Z` so that a
+`1.99` tag, which floats to the newest patch, is refused like a floating
+channel. A `--platform` flag or a `docker.io/library/` prefix on that line is
+read through; a missing file, or one with no `FROM rust:` line, is an error
+rather than one site fewer, so moving the file moves the constant with it.
 
 Run: .github/scripts/check-toolchain-pin.sh
 """
@@ -102,6 +109,27 @@ def action_sites(path: Path, label: str) -> list[tuple[str, str]]:
     return sites
 
 
+# The one Dockerfile that compiles Rust. `FROM rust:<tag>`, where the tag's
+# version prefix is the toolchain the image carries.
+SOURCE_BUILD_DOCKERFILE = "deploy/sponsord/Dockerfile"
+# `FROM [--flag…] [docker.io/library/]rust:<tag>`; the tag stops at `-` (the
+# Debian suffix) or `@` (a digest). Case-insensitive, as Dockerfile keywords are.
+RUST_IMAGE = re.compile(
+    r"^\s*FROM(?:\s+--\S+)*\s+(?:docker\.io/library/)?rust:([^\s@-]+)", re.IGNORECASE
+)
+
+
+def dockerfile_sites(path: Path, label: str) -> list[tuple[str, str]]:
+    """Every `FROM rust:<version>…` line in one Dockerfile, as (label:line, version)."""
+    sites: list[tuple[str, str]] = []
+    for n, raw in enumerate(path.read_text().splitlines(), start=1):
+        line = COMMENT.sub("", raw)
+        m = RUST_IMAGE.match(line)
+        if m:
+            sites.append((f"{label}:{n}", m.group(1)))
+    return sites
+
+
 def collect_sites(repo_root: Path) -> tuple[list[tuple[str, str]], list[str]]:
     """Every (label, value) pair, plus the errors met while reading them."""
     sites: list[tuple[str, str]] = []
@@ -141,6 +169,21 @@ def collect_sites(repo_root: Path) -> tuple[list[tuple[str, str]], list[str]]:
             "no dtolnay/rust-toolchain@… step found under .github/workflows or "
             ".github/actions — this check inspected no CI site"
         )
+
+    dockerfile = repo_root / SOURCE_BUILD_DOCKERFILE
+    if not dockerfile.is_file():
+        errors.append(
+            f"{SOURCE_BUILD_DOCKERFILE}: not found — SOURCE_BUILD_DOCKERFILE in "
+            "check_toolchain_pin.py names the source-build Dockerfile; move it with the file"
+        )
+    else:
+        found = dockerfile_sites(dockerfile, SOURCE_BUILD_DOCKERFILE)
+        if not found:
+            errors.append(
+                f"{SOURCE_BUILD_DOCKERFILE}: no `FROM rust:<version>` line — this check "
+                "inspected no Dockerfile site"
+            )
+        sites.extend(found)
 
     return sites, errors
 

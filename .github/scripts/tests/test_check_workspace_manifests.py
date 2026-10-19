@@ -333,6 +333,38 @@ def test_alias_without_a_version_is_an_error(tmp_path):
     assert "demo-core" in errors[0] and "version" in errors[0]
 
 
+def test_alias_to_an_unpublished_member_carries_no_version(tmp_path):
+    """A versioned dev-dependency survives packaging and then resolves on crates.io."""
+    repo = build_repo(tmp_path)
+    write_member(repo, "crates/fixtures", PRIVATE, name="demo-fixtures")
+    write_member(
+        repo,
+        "crates/cli",
+        PUBLISHABLE,
+        name="demo-cli",
+        deps='demo-core = { workspace = true }\n',
+        dev_deps='demo-fixtures = { workspace = true }\n',
+    )
+    root = repo / "Cargo.toml"
+    write_root(
+        repo,
+        version="0.0.0",
+        members=["crates/core", "crates/cli", "crates/fixtures"],
+        internal={"demo-core": ("crates/core", "0.0.0"), "demo-fixtures": ("crates/fixtures", "0.0.0")},
+    )
+    errors = cwm.check(repo)
+    assert len(errors) == 1, errors
+    assert "demo-fixtures" in errors[0] and "publish = false" in errors[0], errors[0]
+
+    root.write_text(
+        root.read_text().replace(
+            'demo-fixtures = { path = "crates/fixtures", version = "0.0.0" }',
+            'demo-fixtures = { path = "crates/fixtures" }',
+        )
+    )
+    assert cwm.check(repo) == []
+
+
 def test_alias_path_that_is_not_a_member_is_an_error(tmp_path):
     repo = build_repo(tmp_path)
     root = repo / "Cargo.toml"

@@ -69,11 +69,19 @@ GRAPH: dict[str, list[str]] = {
         "decdn-node",
         "decdn-protocol",
     ],
+    "sponsord-api": [],
+    "sponsord-core": ["decdn-client", "decdn-common", "decdn-incentive", "sponsord-api"],
+    "sponsord": ["decdn-common", "decdn-incentive", "sponsord-api", "sponsord-core"],
+    "sponsord-onramp": ["sponsord-api"],
+    "sponsord-e2e": [],
 }
 
 DEV: dict[str, list[str]] = {
     "decdn-cli": ["decdn-cache", "decdn-incentive", "decdn-node"],
     "decdn-node": ["decdn-client", "decdn-incentive"],
+    "sponsord": ["decdn-client", "decdn-e2e", "sponsord-core"],
+    "sponsord-core": ["decdn-e2e"],
+    "sponsord-e2e": ["sponsord", "sponsord-api", "sponsord-core", "sponsord-onramp", "decdn-incentive"],
 }
 
 # External crates and what they pull, enough to exercise the closure walk.
@@ -175,12 +183,57 @@ def test_leaf_gaining_an_external_looking_internal_edge_is_an_error():
     assert "decdn-bao-range" in errors[0]
 
 
-def test_nothing_may_depend_on_a_sink():
+@pytest.mark.parametrize(
+    ("dependant", "sink"),
+    [
+        ("decdn-node", "decdn-cli"),
+        ("decdn-node", "decdn-e2e"),
+        ("sponsord-onramp", "sponsord"),
+        ("sponsord-core", "sponsord-e2e"),
+    ],
+)
+def test_nothing_may_depend_on_a_sink(dependant, sink):
+    assert sink in cce.SINKS
     graph = {k: list(v) for k, v in GRAPH.items()}
-    graph["decdn-node"].append("decdn-cli")
+    graph[dependant].append(sink)
     errors = run(graph=graph)
     assert len(errors) == 1, errors
-    assert "decdn-cli" in errors[0]
+    assert sink in errors[0] and "sink" in errors[0], errors[0]
+
+
+def test_the_onramp_is_not_a_sink():
+    """The onramp is an embeddable library; an edge into it is an ordinary table miss."""
+    assert "sponsord-onramp" not in cce.SINKS
+    graph = {k: list(v) for k, v in GRAPH.items()}
+    graph["sponsord"].append("sponsord-onramp")
+    errors = run(graph=graph)
+    assert len(errors) == 1, errors
+    assert "sink" not in errors[0], errors[0]
+
+
+def test_sponsord_e2e_may_depend_on_anything_but_a_sink():
+    graph = {k: list(v) for k, v in GRAPH.items()}
+    graph["sponsord-e2e"].append("decdn-reputation")
+    assert run(graph=graph) == []
+    graph["sponsord-e2e"].append("sponsord")
+    errors = run(graph=graph)
+    assert len(errors) == 1, errors
+
+
+def test_leak_under_the_wire_types_reaches_only_the_sponsord_crates():
+    """`sponsord-api` is under both sponsord servers and under nothing else guarded."""
+    ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
+    ext["sponsord-api"] = ["iroh-blobs"]
+    errors = run(external_edges=ext)
+    assert [e.split()[0] for e in errors] == ["sponsord", "sponsord-onramp"], errors
+    assert all("← sponsord-api ←" in e for e in errors), errors
+
+
+def test_a_guarded_root_that_is_not_a_member_is_an_error(monkeypatch):
+    monkeypatch.setattr(cce, "FOOTPRINT_GUARDED", (*cce.FOOTPRINT_GUARDED, "sponsord-typo"))
+    errors = run()
+    assert len(errors) == 1, errors
+    assert "sponsord-typo" in errors[0] and "not a workspace member" in errors[0], errors[0]
 
 
 def test_e2e_may_depend_on_anything_but_cli():
@@ -200,12 +253,16 @@ def test_dev_dependencies_are_not_edges():
 
 
 def test_closure_must_not_reach_the_blob_store():
-    """A leak below the SDK reaches both guarded crates; each gets its own error."""
+    """A leak below the SDK reaches every guarded crate built on it; each gets its own error.
+
+    The onramp sits on the wire types alone, so it is the one guarded crate
+    the leak misses.
+    """
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-common"].append("iroh-blobs")
     errors = run(external_edges=ext)
-    assert len(errors) == 2, errors
-    assert [e.split()[0] for e in errors] == ["decdn-cli", "decdn-client"], errors
+    assert len(errors) == 3, errors
+    assert [e.split()[0] for e in errors] == ["decdn-cli", "decdn-client", "sponsord"], errors
     for e in errors:
         assert "iroh-blobs" in e
         assert "decdn-common" in e, "the path should name the crate that introduced it"
@@ -227,8 +284,11 @@ def test_client_sdk_is_guarded_without_the_cli():
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-client"] = ["aws-sdk-s3"]
     errors = [e for e in run(graph=graph, external_edges=ext) if " links " in e]
-    assert len(errors) == 1, errors
+    # The SDK's own error, and the sponsord daemon's, which links the SDK
+    # through sponsord-core.
+    assert len(errors) == 2, errors
     assert errors[0].startswith("decdn-client links aws-sdk-s3"), errors[0]
+    assert errors[1].startswith("sponsord links aws-sdk-s3"), errors[1]
 
 
 def test_cli_only_leak_does_not_blame_the_sdk():
@@ -263,9 +323,10 @@ def test_cli_closure_leak_two_hops_through_an_external_crate(forbidden):
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-incentive"] = ["origin-sdk"]
     errors = run(external_edges=ext, external=external)
-    assert len(errors) == 2, errors
+    assert len(errors) == 3, errors
     assert f"{forbidden} ← origin-sdk ← decdn-incentive ← decdn-cli" in errors[0], errors[0]
     assert f"{forbidden} ← origin-sdk ← decdn-incentive ← decdn-client" in errors[1], errors[1]
+    assert f"{forbidden} ← origin-sdk ← decdn-incentive ← sponsord" in errors[2], errors[2]
 
 
 def test_aws_lc_reached_through_rustls_is_an_error():
@@ -274,7 +335,8 @@ def test_aws_lc_reached_through_rustls_is_an_error():
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-common"].append("rustls")
     errors = run(external_edges=ext, external=external)
-    assert len(errors) == 4, errors
+    # aws-lc-rs and aws-lc-sys, for each of the CLI, the SDK and the daemon.
+    assert len(errors) == 6, errors
     assert "aws-lc-sys ← aws-lc-rs ← rustls ← decdn-common ← decdn-client" in "\n".join(errors)
 
 
@@ -322,14 +384,14 @@ def test_unparseable_tree_line_is_an_error_not_a_skip():
 
 def test_empty_tree_is_a_failure_not_a_pass():
     errors = cce.check(metadata(), {r: "" for r in cce.FOOTPRINT_GUARDED})
-    assert len(errors) == 2, errors
+    assert len(errors) == len(cce.FOOTPRINT_GUARDED), errors
     assert all("inspected nothing" in e for e in errors), errors
 
 
 def test_tree_for_the_wrong_root_is_an_error():
     trees = {r: tree("decdn-protocol") for r in cce.FOOTPRINT_GUARDED}
     errors = cce.check(metadata(), trees)
-    assert len(errors) == 2, errors
+    assert len(errors) == len(cce.FOOTPRINT_GUARDED), errors
     assert all("rooted at decdn-protocol" in e for e in errors), errors
 
 

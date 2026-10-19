@@ -9,6 +9,12 @@
 # Claude Code harness runtime artifacts
 .claude/scheduled_tasks.lock
 
+# deploy/sponsord/compose.yaml secrets and filled-in env files
+/deploy/sponsord/secrets/
+/deploy/sponsord/*.env
+# Release binaries staged for a local `docker build` (see Dockerfile)
+/dist/
+
 # Rust / Cargo
 /target/
 # `cargo llvm-cov nextest --cobertura` output (the CI `test` job's command)

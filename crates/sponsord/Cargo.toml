@@ -1,0 +1,50 @@
+[package]
+name = "sponsord"
+description = "deCDN sponsorship daemon: signs capped, expiring capabilities against a PaymentPool and keeps it topped up"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The anvil-backed test of the binary (`tests/binary_anvil.rs`); needs
+# `anvil` and `forge` on PATH. It enables the buyer store the fixtures use,
+# as `decdn-e2e`'s own `anvil-e2e` does, instead of asking for that feature on
+# the `decdn-e2e` dev-dependency: a feature named on a dev-dependency is
+# unified into every `cargo nextest run --workspace`, which would make the
+# plain test run spawn anvil for all of `decdn-e2e`'s gated targets.
+anvil-e2e = ["decdn-incentive/redb"]
+
+[dependencies]
+sponsord-api = { workspace = true, features = ["axum", "secret"] }
+clap.workspace = true
+sponsord-core.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+decdn-common.workspace = true
+decdn-incentive.workspace = true
+anyhow.workspace = true
+alloy.workspace = true
+tracing.workspace = true
+# `env-filter`: `RUST_LOG`, with the RPC URL's span held back (main.rs).
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+axum.workspace = true
+subtle = "2"
+
+[dev-dependencies]
+decdn-client.workspace = true
+decdn-e2e.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+sponsord-core = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+tokio-util.workspace = true
+tower = { workspace = true, features = ["util"] }

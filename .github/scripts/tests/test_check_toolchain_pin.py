@@ -10,6 +10,8 @@ agree while CI compiles on a different compiler from every developer.
 from __future__ import annotations
 
 import importlib.util
+
+import pytest
 import sys
 from pathlib import Path
 
@@ -29,6 +31,7 @@ def build_repo(
     channel: str = "1.95.0",
     rust_version: str = "1.95.0",
     refs: dict[str, list[str]] | None = None,
+    dockerfile: str | None = "FROM rust:1.95.0-trixie AS build\n",
 ) -> Path:
     """A repo with the three kinds of site.
 
@@ -50,7 +53,54 @@ def build_repo(
         for v in versions:
             body += f"      - uses: dtolnay/rust-toolchain@{v}\n"
         (workflows / name).write_text(body)
+    if dockerfile is not None:
+        path = tmp_path / ctp.SOURCE_BUILD_DOCKERFILE
+        path.parent.mkdir(parents=True)
+        path.write_text(dockerfile)
     return tmp_path
+
+
+def test_source_build_dockerfile_rust_tag_is_a_site(tmp_path):
+    """`FROM rust:<version>-…` in the source-build Dockerfile moves with the pin."""
+    repo = build_repo(tmp_path)
+    dockerfile = repo / ctp.SOURCE_BUILD_DOCKERFILE
+    dockerfile.write_text("# FROM rust:1.0.0-trixie is a comment\nFROM rust:1.95.0-trixie AS build\n")
+    assert ctp.check(repo) == []
+    dockerfile.write_text("FROM rust:1.96.0-trixie AS build\n")
+    errors = ctp.check(repo)
+    assert any(f"{ctp.SOURCE_BUILD_DOCKERFILE}:1" in e and "1.96.0" in e for e in errors), errors
+    # A two-part tag floats to the newest patch, like a `stable` channel.
+    dockerfile.write_text("FROM rust:1.95-trixie AS build\n")
+    errors = ctp.check(repo)
+    assert any(ctp.SOURCE_BUILD_DOCKERFILE in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "FROM --platform=$BUILDPLATFORM rust:1.95.0-trixie AS build",
+        "FROM docker.io/library/rust:1.95.0-trixie AS build",
+        "from rust:1.95.0-trixie as build",
+        "FROM rust:1.95.0-trixie@sha256:0123 AS build",
+    ],
+)
+def test_dockerfile_from_variants_are_read_through(tmp_path, line):
+    repo = build_repo(tmp_path, dockerfile=f"{line}\n")
+    assert ctp.check(repo) == []
+    (repo / ctp.SOURCE_BUILD_DOCKERFILE).write_text(line.replace("1.95.0", "1.96.0") + "\n")
+    assert any("1.96.0" in e for e in ctp.check(repo))
+
+
+def test_missing_dockerfile_is_a_failure_not_one_site_fewer(tmp_path):
+    repo = build_repo(tmp_path, dockerfile=None)
+    errors = ctp.check(repo)
+    assert any(ctp.SOURCE_BUILD_DOCKERFILE in e and "not found" in e for e in errors), errors
+
+
+def test_dockerfile_without_a_rust_image_is_a_failure(tmp_path):
+    repo = build_repo(tmp_path, dockerfile="FROM debian:trixie-slim\n")
+    errors = ctp.check(repo)
+    assert any("inspected no Dockerfile site" in e for e in errors), errors
 
 
 def test_agreeing_sites_pass(tmp_path):
@@ -196,11 +246,15 @@ def test_composite_action_is_a_site(tmp_path):
 
 def test_majority_tie_reports_every_site(tmp_path):
     repo = build_repo(
-        tmp_path, channel="1.96.0", rust_version="1.95.0", refs={"ci.yml": ["1.96.0", "1.95.0"]}
+        tmp_path,
+        channel="1.96.0",
+        rust_version="1.95.0",
+        refs={"ci.yml": ["1.96.0", "1.95.0", "1.95.0"]},
+        dockerfile="FROM rust:1.96.0-trixie AS build\n",
     )
     errors = ctp.check(repo)
     assert len(errors) == 1, errors
-    for site in ("rust-toolchain.toml", "Cargo.toml", "ci.yml:4", "ci.yml:5"):
+    for site in ("rust-toolchain.toml", "Cargo.toml", "ci.yml:4", "ci.yml:5", "Dockerfile:1"):
         assert site in errors[0], (site, errors[0])
 
 

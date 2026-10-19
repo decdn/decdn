@@ -17,7 +17,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts/publish-crates.sh"
-SWITCHES = ["DECDN_SKIP_DEVOPS_BUMP", "DECDN_SKIP_SPONSORD_BUMP"]
+SWITCHES = ["DECDN_SKIP_DEVOPS_BUMP"]
 FIRST_TOOL_CHECK = "cargo not found on PATH"
 # Resolved before the tests empty PATH.
 BASH = shutil.which("bash") or "/bin/bash"

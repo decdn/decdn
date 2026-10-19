@@ -28,7 +28,11 @@ Across the workspace:
 
 * Every internal `[workspace.dependencies]` alias (a `path` into a member)
   resolves to a member and carries `version` equal to `[workspace.package]
-  version`. `cargo release` keeps them in step (`dependent-version =
+  version` — except an alias to a `publish = false` member, which carries no
+  `version` at all: cargo strips a dev-dependency from the published manifest
+  only when it has no version requirement, and with one `cargo publish` would
+  look for the unpublished crate on crates.io. `cargo release` keeps the
+  versioned ones in step (`dependent-version =
   "upgrade"`); a hand edit does not.
 * A member some other member depends on has an alias; a member nothing depends
   on has none — an unread alias is one more version to forget on release.
@@ -90,6 +94,7 @@ def check(repo_root: Path) -> list[str]:
     # --- per-member shape --------------------------------------------------
     name_by_dir: dict[Path, str] = {}
     depended_upon: set[str] = set()
+    unpublished: set[str] = set()
     internal_deps: list[tuple[Path, str, object]] = []
     for crate_root in members:
         rel = crate_root.relative_to(repo_root) / "Cargo.toml"
@@ -101,6 +106,10 @@ def check(repo_root: Path) -> list[str]:
         package = manifest.get("package", {})
         name = package.get("name", str(rel))
         name_by_dir[crate_root.resolve()] = name
+        # `publish = false` and `publish = []` both mean "never published";
+        # cargo metadata renders both as `[]`, which publish-crates.sh reads.
+        if package.get("publish") is False or package.get("publish") == []:
+            unpublished.add(name)
 
         for key in INHERITED_ALWAYS:
             if not inherits(package, key):
@@ -113,7 +122,7 @@ def check(repo_root: Path) -> list[str]:
                 f"{rel}: missing `[lints] workspace = true` — the workspace lint table "
                 "(anti-panic, cast safety, print lints) does not reach this crate"
             )
-        if package.get("publish") is not False:
+        if name not in unpublished:
             for key in INHERITED_IF_PUBLISHABLE:
                 if not inherits(package, key):
                     errors.append(f"{rel}: publishable crate must set `{key}.workspace = true`")
@@ -124,21 +133,40 @@ def check(repo_root: Path) -> list[str]:
                         "crates.io landing page is per crate, never inherited"
                     )
 
-        dep_tables = [manifest.get(table, {}) for table in DEP_TABLES]
+        dep_tables = [(table, manifest.get(table, {})) for table in DEP_TABLES]
         for target in manifest.get("target", {}).values():
-            dep_tables.extend(target.get(table, {}) for table in DEP_TABLES)
-        for deps in dep_tables:
+            dep_tables.extend((table, target.get(table, {})) for table in DEP_TABLES)
+        for table, deps in dep_tables:
             depended_upon.update(deps.keys())
-            internal_deps.extend((rel, dep, spec) for dep, spec in deps.items() if dep != name)
+            internal_deps.extend(
+                (rel, dep, spec, table) for dep, spec in deps.items() if dep != name
+            )
 
     member_names = set(name_by_dir.values())
-    for rel, dep, spec in internal_deps:
+    unpublished_rels = {
+        d.relative_to(repo_root.resolve()) / "Cargo.toml"
+        for d, n in name_by_dir.items()
+        if n in unpublished
+    }
+
+    def rel_is_publishable(rel: Path) -> bool:
+        return rel not in unpublished_rels
+
+    for rel, dep, spec, table in internal_deps:
         if dep in member_names and not (isinstance(spec, dict) and spec.get("workspace") is True):
             errors.append(
                 f"{rel}: internal dependency {dep} must be `{{ workspace = true }}` — the "
                 "[workspace.dependencies] alias carries the version; a path + version "
                 "written here packages fine and then requires a sibling version that was "
                 "never released"
+            )
+        if dep in unpublished and table != "dev-dependencies" and rel_is_publishable(rel):
+            # Only a dev-dependency is stripped from the published manifest; any
+            # other edge into an unpublished member makes `cargo publish` fail on
+            # the release machine, after the tag exists.
+            errors.append(
+                f"{rel}: [{table}] names {dep}, which is `publish = false` — only a "
+                "dev-dependency may reach an unpublished member"
             )
 
     # --- internal aliases --------------------------------------------------
@@ -156,7 +184,15 @@ def check(repo_root: Path) -> list[str]:
 
     for name, spec in sorted(aliases.items()):
         version = spec.get("version")
-        if version != ws_version:
+        if name in unpublished:
+            if version is not None:
+                errors.append(
+                    f"Cargo.toml: [workspace.dependencies] {name} is `publish = false` but "
+                    f"its alias says version = {version!r} — a dev-dependency with a version "
+                    "stays in the published manifest and `cargo publish` then looks for "
+                    f"{name} on crates.io; drop the `version`"
+                )
+        elif version != ws_version:
             errors.append(
                 f"Cargo.toml: [workspace.dependencies] {name} says version = {version!r} "
                 f"but [workspace.package] version is {ws_version!r} — cargo release "
@@ -172,8 +208,8 @@ def check(repo_root: Path) -> list[str]:
         if name not in aliases:
             errors.append(
                 f"Cargo.toml: {name} is depended on by another member but has no "
-                "[workspace.dependencies] alias — add one with `path` and `version` so the "
-                "published manifest resolves"
+                "[workspace.dependencies] alias — add one with `path` and `version` (no "
+                "`version` for a `publish = false` member) so the published manifest resolves"
             )
 
     # --- directories not in members ----------------------------------------

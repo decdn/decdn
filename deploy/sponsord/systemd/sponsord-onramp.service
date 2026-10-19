@@ -1,0 +1,29 @@
+# sponsord-onramp as a systemd service, next to sponsord.service. The daemon
+# token is the daemon's own api-token file.
+#
+#   install -m 0600 turnstile-secret /etc/sponsord/
+#   install -m 0644 sponsord-onramp.env /etc/sponsord/sponsord-onramp.env
+#   systemctl enable --now sponsord-onramp
+[Unit]
+Description=sponsord-onramp: the public onramp in front of sponsord
+After=network-online.target sponsord.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sponsord-onramp
+EnvironmentFile=/etc/sponsord/sponsord-onramp.env
+LoadCredential=api-token:/etc/sponsord/api-token
+LoadCredential=turnstile-secret:/etc/sponsord/turnstile-secret
+Environment=ONRAMP_DAEMON_TOKEN_FILE=%d/api-token
+Environment=ONRAMP_TURNSTILE_SECRET_FILE=%d/turnstile-secret
+DynamicUser=yes
+# It exits at startup while the daemon is unreachable; retry until it is up.
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

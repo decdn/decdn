@@ -107,27 +107,7 @@ pub fn num_blocks(total_bytes: u64) -> u32 {
 
 /// The overridable discovery-block size, compiled only under `test-support`.
 #[cfg(feature = "test-support")]
-mod test_block_size {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use super::DISCOVERY_BLOCK_BYTES;
-
-    /// The active block size. Starts at [`DISCOVERY_BLOCK_BYTES`], so an
-    /// un-overridden `test-support` build behaves exactly like production.
-    static BLOCK_BYTES: AtomicU64 = AtomicU64::new(DISCOVERY_BLOCK_BYTES);
-
-    pub(super) fn current() -> u64 {
-        BLOCK_BYTES.load(Ordering::Relaxed)
-    }
-
-    pub(super) fn set(bytes: u64) {
-        BLOCK_BYTES.store(bytes, Ordering::Relaxed);
-    }
-
-    pub(super) fn reset() {
-        BLOCK_BYTES.store(DISCOVERY_BLOCK_BYTES, Ordering::Relaxed);
-    }
-}
+mod test_block_size;
 
 /// A live override of the discovery-block size for the duration of the returned
 /// guard (test-support only).

@@ -47,8 +47,11 @@ case "$1 $2" in
     zeros=$(printf '0%.0s' $(seq 64))
     echo "ghcr.io/decdn/decdn-node@sha256:$zeros" > "$dir/decdn-node-image-digest.txt"
     echo "ghcr.io/decdn/decdn@sha256:$zeros" > "$dir/decdn-image-digest.txt"
-    echo '{}' > "$dir/decdn-node-$version-sbom.spdx.json"
-    echo '{}' > "$dir/decdn-$version-sbom.spdx.json" ;;
+    echo "ghcr.io/decdn/sponsord@sha256:$zeros" > "$dir/sponsord-image-digest.txt"
+    echo "ghcr.io/decdn/sponsord-onramp@sha256:$zeros" > "$dir/sponsord-onramp-image-digest.txt"
+    for img in decdn-node decdn sponsord sponsord-onramp; do
+      echo '{}' > "$dir/$img-$version-sbom.spdx.json"
+    done ;;
   "release upload"|"release edit") exit 0 ;;
   *) echo "gh shim: unexpected call: $*" >&2; exit 9 ;;
 esac

@@ -1,0 +1,41 @@
+[package]
+name = "sponsord-core"
+description = "Library core of sponsord, deCDN's sponsored on-ramp: capability signing and pool top-ups, for embedding"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The anvil-backed pool test (`tests/chain_pool.rs`); needs `anvil` and
+# `forge` on PATH. See `crates/sponsord/Cargo.toml` for why this enables the
+# buyer store itself rather than `decdn-e2e/anvil-e2e`.
+anvil-e2e = ["decdn-incentive/redb"]
+test-support = ["dep:tracing-subscriber"]
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+alloy.workspace = true
+decdn-client.workspace = true
+decdn-common.workspace = true
+decdn-incentive.workspace = true
+sponsord-api.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+# The log capture in `test_support`.
+tracing-subscriber = { workspace = true, optional = true }
+
+[dev-dependencies]
+decdn-e2e.workspace = true
+tracing-subscriber.workspace = true
