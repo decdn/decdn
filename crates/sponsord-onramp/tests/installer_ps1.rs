@@ -188,16 +188,16 @@ impl Fixture {
         }
     }
 
-    /// Run `get decdn:<HASH>/?ns=1 --jobs 8` and pass the gate for whatever
-    /// key the script prints a gate link for. Returns (success, stdout,
-    /// stderr).
-    async fn get(&self, stub_exit: &str) -> (bool, String, String) {
+    /// Run `get <args>` (PowerShell syntax, URI first) and pass the gate for
+    /// whatever key the script prints a gate link for. Returns (success,
+    /// stdout, stderr).
+    async fn get(&self, args: &str, stub_exit: &str) -> (bool, String, String) {
         let home = self.root.join("home");
         let local = self.root.join("local");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&local).unwrap();
         let command = format!(
-            "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '{}'))) get 'decdn:{HASH}/?ns=1' --jobs 8",
+            "& ([scriptblock]::Create((Get-Content -Raw -LiteralPath '{}'))) get {args}",
             self.script.display()
         );
         let mut child = tokio::process::Command::new("powershell")
@@ -260,8 +260,9 @@ async fn get_passes_the_gate_and_resumes_a_failed_download_without_it() {
         return;
     }
     let fx = Fixture::new("get").await;
+    let args = format!("'decdn:{HASH}/?ns=1' --jobs 8");
 
-    let (ok, stdout, stderr) = fx.get("3").await;
+    let (ok, stdout, stderr) = fx.get(&args, "3").await;
     let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(!ok, "a failed decdn fails the run\n{both}");
     assert!(stdout.contains("Installing decdn v0.1.0"), "{both}");
@@ -274,7 +275,7 @@ async fn get_passes_the_gate_and_resumes_a_failed_download_without_it() {
         "{both}"
     );
 
-    let (ok, stdout, stderr) = fx.get("0").await;
+    let (ok, stdout, stderr) = fx.get(&args, "0").await;
     let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(ok, "{both}");
     assert!(
@@ -306,5 +307,34 @@ async fn get_passes_the_gate_and_resumes_a_failed_download_without_it() {
     assert_eq!(
         fs::read_to_string(fx.stub.join("keys")).unwrap().trim(),
         "1"
+    );
+}
+
+#[tokio::test]
+async fn a_blob_uri_needs_an_output_file() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    let fx = Fixture::new("blob").await;
+
+    let (ok, stdout, stderr) = fx.get(&format!("'decdn:{HASH}?ns=1'"), "0").await;
+    let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!ok, "a blob URI without -o is refused\n{both}");
+    assert!(both.contains("a blob URI needs -o <file>"), "{both}");
+    assert!(fx.calls().is_empty(), "{both}");
+
+    let (ok, stdout, stderr) = fx
+        .get(&format!("'decdn:{HASH}?ns=1' -o file.iso"), "0")
+        .await;
+    let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(ok, "{both}");
+    let calls = fx.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        calls[0].starts_with(&format!(
+            "get decdn:{HASH}?ns=1 -o file.iso --capability dcap1:FAKE1 "
+        )),
+        "{}",
+        calls[0]
     );
 }

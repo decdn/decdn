@@ -15,6 +15,15 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- **`decdn.sh` and `decdn.ps1` download a blob URI.** The one-liner takes
+  `get 'decdn:<hash>[?ns=<id>]' -o <file>` alongside bundle and entry URIs,
+  and `decdn get` writes the blob to that file without fetching a manifest.
+  A blob URI needs `-o <file>`; without it, the script stops before
+  installing anything. Bundle and entry URIs work as before, with `-o .`
+  added when no output directory is given.
+
 ## [0.1.0] - 2026-10-14
 
 ### Changed (BREAKING)

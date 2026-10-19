@@ -334,12 +334,16 @@ async fn every_argument_after_the_uri_reaches_decdn_as_given() {
     fx.run_ok(&args, &[]).await;
     // Without one, the bundle lands in the current directory.
     fx.run_ok(&[GET[0], GET[1], "--jobs", "8"], &[]).await;
+    // A blob URI names its file with -o.
+    let blob = format!("decdn:{HASH}?ns=1");
+    fx.run_ok(&[GET[0], &blob, "-o", "file.iso"], &[]).await;
 
     let calls = fx.calls();
-    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls.len(), 3, "{calls:?}");
     let expected = [
         format!("get {BUNDLE} --jobs 8 --output=out --include *.txt --capability "),
         format!("get {BUNDLE} -o . --jobs 8 --capability "),
+        format!("get {blob} -o file.iso --capability "),
     ];
     for (call, start) in calls.iter().zip(&expected) {
         assert!(call.starts_with(start), "{call}");
@@ -458,7 +462,7 @@ async fn bad_arguments_are_refused_before_installing() {
         &["get"],
         &["pull", BUNDLE],
         &["get", "-o", "out", BUNDLE],
-        // The installer downloads bundles: a blob URI has no trailing `/`.
+        // A blob URI is written to a file, so it needs -o to name one.
         &["get", &blob],
         &["get", &blob_ns],
         &["get", &b3],

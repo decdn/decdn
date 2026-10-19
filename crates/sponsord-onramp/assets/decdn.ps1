@@ -5,13 +5,14 @@
 #
 # Install decdn:
 #   irm <onramp>/decdn.ps1 | iex
-# Install, then download a bundle, or one file of a bundle, paid for by this
-# onramp's sponsor:
+# Install, then download a bundle, one file of a bundle, or a blob, paid for
+# by this onramp's sponsor:
 #   & ([scriptblock]::Create((irm <onramp>/decdn.ps1))) get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]
+#   & ([scriptblock]::Create((irm <onramp>/decdn.ps1))) get decdn:<hash>[?ns=<id>] -o <file> [<decdn get flags>]
 #
 # The `decdn:` URI comes first. It and every argument after it go to
-# `decdn get` as given, with `-o .` added when none of them sets the output
-# directory.
+# `decdn get` as given. For a bundle URI, `-o .` is added when none of them
+# sets the output directory; a blob URI needs `-o <file>`.
 #
 # Each download gets a throwaway key under ~\.decdn\sponsored\downloads\<hash>\
 # and a capability for it, issued once the person passes the gate in the
@@ -63,7 +64,7 @@
     # needs an hour on top.
     $ExpiryMarginSecs = 4020
 
-    $Usage = 'usage: decdn.ps1 [get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]]'
+    $Usage = 'usage: decdn.ps1 [get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>] | get decdn:<hash>[?ns=<id>] -o <file> [<decdn get flags>]]'
 
     # Parse the arguments before downloading anything.
     $Hash = $null
@@ -71,16 +72,21 @@
     $PassArgs = New-Object System.Collections.Generic.List[string]
     if ($args.Count -gt 0) {
       if ($args[0] -ne 'get' -or $args.Count -lt 2) { throw $Usage }
-      # A bundle URI (`decdn:<hash>/...`). Its hash, as 64 lowercase hex
-      # characters, keys this download's state; decdn get checks the rest.
+      # A bundle URI (`decdn:<hash>/...`) or a blob URI (`decdn:<hash>` or
+      # `decdn:<hash>?...`). Its hash, as 64 lowercase hex characters, keys
+      # this download's state; decdn get checks the rest.
       $Uri = [string]$args[1]
-      if (-not ($Uri -cmatch '^decdn:([0-9a-fA-F]{64})/')) {
-        throw "decdn: not a bundle URI (expected decdn:<64 hex characters>/, with an optional file path after the /): $Uri"
+      if (-not ($Uri -cmatch '^decdn:([0-9a-fA-F]{64})(/|\?|$)')) {
+        throw "decdn: not a decdn: URI (expected decdn:<64 hex characters>, then / for a bundle): $Uri"
       }
       $Hash = $Matches[1].ToLowerInvariant()
+      $IsBundle = $Matches[2] -eq '/'
       # The rest go to decdn get, which checks them.
       foreach ($Arg in ($args | Select-Object -Skip 2)) { $PassArgs.Add([string]$Arg) }
       if (-not ($PassArgs | Where-Object { $_ -cmatch '^(-o|--output(=|$))' })) {
+        if (-not $IsBundle) {
+          throw "decdn: a blob URI needs -o <file> to name the file it is written to: $Uri"
+        }
         $PassArgs.InsertRange(0, [string[]]@('-o', '.'))
       }
     }
@@ -209,8 +215,9 @@
 
     if (-not $Hash) {
       Write-Host ''
-      Write-Host 'decdn is ready. Download a bundle with:'
+      Write-Host 'decdn is ready. Download a bundle or a blob with:'
       Write-Host "  & ([scriptblock]::Create((irm $OnrampUrl/decdn.ps1))) get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]"
+      Write-Host "  & ([scriptblock]::Create((irm $OnrampUrl/decdn.ps1))) get decdn:<hash>[?ns=<id>] -o <file> [<decdn get flags>]"
       return
     }
 

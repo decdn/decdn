@@ -5,13 +5,14 @@
 # environment variable to run. The Windows twin is assets/decdn.ps1; the two
 # keep the same state.
 #
-# It installs decdn and, given `get`, downloads a bundle, or one file of a
-# bundle, paid for by this onramp's sponsor:
+# It installs decdn and, given `get`, downloads a bundle, one file of a
+# bundle, or a blob, paid for by this onramp's sponsor:
 #   curl -fsSL <onramp>/decdn.sh | sh -s -- get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]
+#   curl -fsSL <onramp>/decdn.sh | sh -s -- get decdn:<hash>[?ns=<id>] -o <file> [<decdn get flags>]
 #
 # The `decdn:` URI comes first. It and every argument after it go to
-# `decdn get` as given, with `-o .` added when none of them sets the output
-# directory.
+# `decdn get` as given. For a bundle URI, `-o .` is added when none of them
+# sets the output directory; a blob URI needs `-o <file>`.
 #
 # Without arguments, it only installs decdn into ~/.local/bin and checks that
 # the directory is on PATH, printing how to add it when it is not:
@@ -70,6 +71,7 @@ die() {
 
 usage() {
   echo "usage: sh decdn.sh [get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]]" >&2
+  echo "       sh decdn.sh get decdn:<hash>[?ns=<id>] -o <file> [<decdn get flags>]" >&2
   exit 2
 }
 
@@ -96,15 +98,16 @@ lock() {
   LOCKS="${LOCKS} $1"
 }
 
-# bundle_hash <uri>: the hash of a bundle URI (`decdn:<hash>/...`) as 64
-# lowercase hex characters, which keys this download's state. Fails on a URI
-# that does not start with `decdn:<hash>/`; decdn get checks the rest.
-bundle_hash() {
+# uri_hash <uri>: the hash of a bundle URI (`decdn:<hash>/...`) or a blob URI
+# (`decdn:<hash>` or `decdn:<hash>?...`) as 64 lowercase hex characters, which
+# keys this download's state. Fails on a URI that does not start with
+# `decdn:<hash>` followed by `/`, `?` or its end; decdn get checks the rest.
+uri_hash() {
   rest="${1#decdn:}"
   [ "$rest" != "$1" ] || return 1
   h="${rest%%[/?]*}"
   case "${rest#"$h"}" in
-    /*) ;;
+    '' | /* | \?*) ;;
     *) return 1 ;;
   esac
   h="$(printf '%s' "$h" | tr 'A-F' 'a-f')"
@@ -349,8 +352,8 @@ main() {
   if [ "$#" -gt 0 ]; then
     [ "$1" = get ] && [ "$#" -ge 2 ] || usage
     uri="$2"
-    hash="$(bundle_hash "$uri")" ||
-      die "not a bundle URI (expected decdn:<64 hex characters>/, with an optional file path after the /): $uri"
+    hash="$(uri_hash "$uri")" ||
+      die "not a decdn: URI (expected decdn:<64 hex characters>, then / for a bundle): $uri"
     shift 2
     # The rest go to decdn get, which checks them.
     has_output=""
@@ -359,7 +362,14 @@ main() {
         -o* | --output | --output=*) has_output=1 ;;
       esac
     done
-    [ -n "$has_output" ] || set -- -o . "$@"
+    if [ -z "$has_output" ]; then
+      # uri_hash admits only `/`, `?` or the end after the hash, so a `/`
+      # before the query marks a bundle URI.
+      case "${uri%%\?*}" in
+        */*) set -- -o . "$@" ;;
+        *) die "a blob URI needs -o <file> to name the file it is written to: $uri" ;;
+      esac
+    fi
   fi
 
   detect_target
@@ -375,8 +385,9 @@ main() {
     return 0
   fi
   echo ""
-  echo "decdn is installed at ${DECDN}. Download a bundle with:"
+  echo "decdn is installed at ${DECDN}. Download a bundle or a blob with:"
   echo "  curl -fsSL ${ONRAMP_URL}/decdn.sh | sh -s -- get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>] [<decdn get flags>]"
+  echo "  curl -fsSL ${ONRAMP_URL}/decdn.sh | sh -s -- get decdn:<hash>[?ns=<id>] -o <file> [<decdn get flags>]"
   path_hint
 }
 

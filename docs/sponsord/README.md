@@ -79,7 +79,8 @@ default) and tops it up whenever it is below the low-water mark.
    ```
 
    The `decdn:` URI names the bundle by its manifest hash; a path after the
-   `/` downloads one file of it. `?ns=<id>` is optional. It takes the numeric
+   `/` downloads one file of it. A URI without the `/` names a single blob,
+   written to the file `-o <file>` names. `?ns=<id>` is optional. It takes the numeric
    deCDN namespace the bundle is published under, not your pool id, and lets
    a node that hasn't cached the bundle fetch it from that namespace's
    origins. Without it, only nodes that already cache the bundle can serve
