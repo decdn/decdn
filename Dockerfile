@@ -13,7 +13,7 @@
 #
 # `.github/workflows/release.yml` builds every target once in `build-binaries`,
 # then the `docker` job unpacks the Linux release archives into dist/<arch>/ and
-# builds each stage. That means every binary in either image is byte-identical
+# builds each stage. That means every binary in any image is byte-identical
 # to the one in its `<binary>-<version>-<target>.tar.gz`, which the signed
 # SHA256SUMS covers — compiling here instead would produce second, unrelated
 # binaries that the release signature says nothing about.
@@ -25,6 +25,7 @@
 #   docker build -t decdn-node .
 #   docker build --target decdn -t decdn .
 #   docker build --target sponsord -t sponsord .
+#   docker build --target sponsord-onramp -t sponsord-onramp .
 #
 # To build the sponsord images from source instead (a fork, an unreleased
 # commit), use deploy/sponsord/Dockerfile.

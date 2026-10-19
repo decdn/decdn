@@ -11,8 +11,9 @@ publish = false
 [lints]
 workspace = true
 
-# Never released: it carries the workspace version only because every member
-# does, and has no changelog for the release to update.
+# Never released: `publish = false`, and `release = false` keeps cargo-release
+# from treating it as a package to tag or publish. It carries the workspace
+# version only because every member does.
 [package.metadata.release]
 release = false
 

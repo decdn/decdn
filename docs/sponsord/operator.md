@@ -59,7 +59,7 @@ on another host needs it.
 | `ONRAMP_SPENDING_CAP_MICRO_USDC` | daemon maximum | Cap requested per capability |
 | `ONRAMP_TTL_SECS` | daemon maximum | TTL requested per capability |
 | `ONRAMP_SLASH_JUDGE_ADDR` | none | `SlashJudge` contract, handed to `decdn` |
-| `ONRAMP_GATE` | `turnstile` | The gate; `custom` only for programs that embed the onramp with their own (docs/integrator.md) |
+| `ONRAMP_GATE` | `turnstile` | The gate; `custom` only for programs that embed the onramp with their own ([integrator.md](integrator.md)) |
 | `ONRAMP_BRAND_NAME` | `deCDN` | Name on the gate page |
 | `ONRAMP_GATE_TEMPLATE` | built-in | Your own gate page (below) |
 | `ONRAMP_CLIENT_IP_HEADER` | TCP peer | Header your reverse proxy puts the client address in |

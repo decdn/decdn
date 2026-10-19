@@ -106,7 +106,9 @@ def check(repo_root: Path) -> list[str]:
         package = manifest.get("package", {})
         name = package.get("name", str(rel))
         name_by_dir[crate_root.resolve()] = name
-        if package.get("publish") is False:
+        # `publish = false` and `publish = []` both mean "never published";
+        # cargo metadata renders both as `[]`, which publish-crates.sh reads.
+        if package.get("publish") is False or package.get("publish") == []:
             unpublished.add(name)
 
         for key in INHERITED_ALWAYS:
@@ -120,7 +122,7 @@ def check(repo_root: Path) -> list[str]:
                 f"{rel}: missing `[lints] workspace = true` — the workspace lint table "
                 "(anti-panic, cast safety, print lints) does not reach this crate"
             )
-        if package.get("publish") is not False:
+        if name not in unpublished:
             for key in INHERITED_IF_PUBLISHABLE:
                 if not inherits(package, key):
                     errors.append(f"{rel}: publishable crate must set `{key}.workspace = true`")
@@ -131,21 +133,40 @@ def check(repo_root: Path) -> list[str]:
                         "crates.io landing page is per crate, never inherited"
                     )
 
-        dep_tables = [manifest.get(table, {}) for table in DEP_TABLES]
+        dep_tables = [(table, manifest.get(table, {})) for table in DEP_TABLES]
         for target in manifest.get("target", {}).values():
-            dep_tables.extend(target.get(table, {}) for table in DEP_TABLES)
-        for deps in dep_tables:
+            dep_tables.extend((table, target.get(table, {})) for table in DEP_TABLES)
+        for table, deps in dep_tables:
             depended_upon.update(deps.keys())
-            internal_deps.extend((rel, dep, spec) for dep, spec in deps.items() if dep != name)
+            internal_deps.extend(
+                (rel, dep, spec, table) for dep, spec in deps.items() if dep != name
+            )
 
     member_names = set(name_by_dir.values())
-    for rel, dep, spec in internal_deps:
+    unpublished_rels = {
+        d.relative_to(repo_root.resolve()) / "Cargo.toml"
+        for d, n in name_by_dir.items()
+        if n in unpublished
+    }
+
+    def rel_is_publishable(rel: Path) -> bool:
+        return rel not in unpublished_rels
+
+    for rel, dep, spec, table in internal_deps:
         if dep in member_names and not (isinstance(spec, dict) and spec.get("workspace") is True):
             errors.append(
                 f"{rel}: internal dependency {dep} must be `{{ workspace = true }}` — the "
                 "[workspace.dependencies] alias carries the version; a path + version "
                 "written here packages fine and then requires a sibling version that was "
                 "never released"
+            )
+        if dep in unpublished and table != "dev-dependencies" and rel_is_publishable(rel):
+            # Only a dev-dependency is stripped from the published manifest; any
+            # other edge into an unpublished member makes `cargo publish` fail on
+            # the release machine, after the tag exists.
+            errors.append(
+                f"{rel}: [{table}] names {dep}, which is `publish = false` — only a "
+                "dev-dependency may reach an unpublished member"
             )
 
     # --- internal aliases --------------------------------------------------

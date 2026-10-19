@@ -46,6 +46,7 @@ missing_overview=0
 # unnoticed.
 expect() {
   local file="$1" needle="$2"
+  [[ -f "$file" ]] || { echo "error: $file not found" >&2; fail=1; return; }
   # -F: the needles contain ${{ }} and ${}, none of it meant as a regex. No -q:
   # grep would exit at the first match, and sed's SIGPIPE fails the pipeline
   # under pipefail.
@@ -63,6 +64,7 @@ expect() {
 # file outgrows the pipe buffer, and pipefail turns that into a failed check.
 expect_pair() {
   local file="$1" stage="$2" image="$3" got
+  [[ -f "$file" ]] || { echo "error: $file not found" >&2; fail=1; return; }
   got=$(sed 's/^[[:space:]]*//' "$file" | awk -v t="- target: ${stage}" '
     found { next }
     $0 == t { on = 1; next }

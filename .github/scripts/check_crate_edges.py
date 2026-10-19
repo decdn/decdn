@@ -2,9 +2,10 @@
 """Fail if a crate depends on one the design says it must not.
 
 Cargo enforces acyclicity and nothing more. The direction the workspace's
-crates depend on each other is a design decision — three leaves that pull in
-no sibling, `cli` and `e2e` as sinks nothing depends on, a publisher CLI that
-links no blob store or AWS SDK — and CLAUDE.md § Crate Structure states it.
+crates depend on each other is a design decision — four leaves that pull in
+no sibling, `cli`, `e2e`, `sponsord` and `sponsord-e2e` as sinks nothing
+depends on, a publisher CLI and two sponsord servers that link no blob store
+or AWS SDK — and CLAUDE.md § Crate Structure states it.
 Without this check nothing enforces it: an edge added the wrong way compiles
 green, and the first thing to notice is a `decdn` binary that has grown an S3
 client.
@@ -19,7 +20,8 @@ Two passes:
   (`cli` tests the daemon it is shipped beside). A member with no row fails,
   and a row for a member that does not exist fails too.
 * **Closure**, over one `cargo tree -p <crate>` per FOOTPRINT_GUARDED crate —
-  the `decdn-cli` binary and the `decdn-client` SDK it builds on. Their
+  the `decdn-cli` binary, the `decdn-client` SDK it builds on, and the
+  `sponsord` and `sponsord-onramp` servers. Their
   transitive normal and build dependencies must not include the blob store,
   the AWS SDK, the aws-lc crypto library or the JSON-RPC server
   (MUST_NOT_LINK). The direct table cannot see this: `client → common` is
@@ -226,8 +228,14 @@ def check(metadata: dict, trees: dict[str, str]) -> list[str]:
 
     # --- footprint closures -------------------------------------------------
     for root in FOOTPRINT_GUARDED:
-        if root in members:
-            errors.extend(check_closure(root, trees.get(root, "")))
+        if root not in members:
+            errors.append(
+                f"FOOTPRINT_GUARDED in check_crate_edges.py lists {root}, which is not a "
+                "workspace member — a misspelt root would otherwise drop its closure from "
+                "the check"
+            )
+            continue
+        errors.extend(check_closure(root, trees.get(root, "")))
 
     return errors
 

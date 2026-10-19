@@ -92,17 +92,19 @@ and would silently miss data on a prefix rename.
   - `decdn` runs the CLI only. Publishers and clients use it.
   - `sponsord` and `sponsord-onramp` run the sponsorship daemon and
     its public onramp (`crates/sponsord`, `crates/sponsord-onramp`).
-    A publisher who pays for their users' downloads runs them. They
-    are built on `decdn-client` and `decdn-incentive`, and never on
-    the daemon's crates.
+    A publisher who pays for their users' downloads runs them. The
+    daemon is built on `decdn-client` and `decdn-incentive` through
+    `sponsord-core`; the onramp on the `sponsord-api` wire types
+    alone. Neither depends on the node daemon's crates.
 
   Each image copies its binaries out of the Linux release archives.
   It does not compile from source. Each binary in an image is
   identical to the archived binary. The signed `SHA256SUMS` covers
   the archive. It therefore also covers the binary in the image.
-- **Release archives** ship both binaries as separate tarballs per
+- **Release archives** ship the node binaries as separate tarballs per
   target (Linux x86_64 + aarch64, macOS x86_64 + aarch64, Windows
-  x86_64): `decdn-node-${VERSION}-${TARGET}.tar.gz` (operators) and
+  x86_64; `decdn` also on Windows aarch64):
+  `decdn-node-${VERSION}-${TARGET}.tar.gz` (operators) and
   `decdn-${VERSION}-${TARGET}.tar.gz` (publishers). The two sponsord
   servers ship for the two Linux targets only, as
   `sponsord-${VERSION}-${TARGET}.tar.gz` and

@@ -41,7 +41,7 @@ the deCDN release the onramp shipped with.
 
 This image is built for linux/amd64 and linux/arm64. It is also on GitHub Container
 Registry as
-[`ghcr.io/decdn/sponsord-onramp`](https://github.com/decdn/decdn/pkgs/container/sponsord-onramp),
+[`ghcr.io/decdn/sponsord-onramp`](https://github.com/orgs/decdn/packages/container/package/sponsord-onramp),
 with the same digest.
 
 ## Verify the image

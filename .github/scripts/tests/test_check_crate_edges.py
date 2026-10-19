@@ -183,12 +183,57 @@ def test_leaf_gaining_an_external_looking_internal_edge_is_an_error():
     assert "decdn-bao-range" in errors[0]
 
 
-def test_nothing_may_depend_on_a_sink():
+@pytest.mark.parametrize(
+    ("dependant", "sink"),
+    [
+        ("decdn-node", "decdn-cli"),
+        ("decdn-node", "decdn-e2e"),
+        ("sponsord-onramp", "sponsord"),
+        ("sponsord-core", "sponsord-e2e"),
+    ],
+)
+def test_nothing_may_depend_on_a_sink(dependant, sink):
+    assert sink in cce.SINKS
     graph = {k: list(v) for k, v in GRAPH.items()}
-    graph["decdn-node"].append("decdn-cli")
+    graph[dependant].append(sink)
     errors = run(graph=graph)
     assert len(errors) == 1, errors
-    assert "decdn-cli" in errors[0]
+    assert sink in errors[0] and "sink" in errors[0], errors[0]
+
+
+def test_the_onramp_is_not_a_sink():
+    """The onramp is an embeddable library; an edge into it is an ordinary table miss."""
+    assert "sponsord-onramp" not in cce.SINKS
+    graph = {k: list(v) for k, v in GRAPH.items()}
+    graph["sponsord"].append("sponsord-onramp")
+    errors = run(graph=graph)
+    assert len(errors) == 1, errors
+    assert "sink" not in errors[0], errors[0]
+
+
+def test_sponsord_e2e_may_depend_on_anything_but_a_sink():
+    graph = {k: list(v) for k, v in GRAPH.items()}
+    graph["sponsord-e2e"].append("decdn-reputation")
+    assert run(graph=graph) == []
+    graph["sponsord-e2e"].append("sponsord")
+    errors = run(graph=graph)
+    assert len(errors) == 1, errors
+
+
+def test_leak_under_the_wire_types_reaches_only_the_sponsord_crates():
+    """`sponsord-api` is under both sponsord servers and under nothing else guarded."""
+    ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
+    ext["sponsord-api"] = ["iroh-blobs"]
+    errors = run(external_edges=ext)
+    assert [e.split()[0] for e in errors] == ["sponsord", "sponsord-onramp"], errors
+    assert all("← sponsord-api ←" in e for e in errors), errors
+
+
+def test_a_guarded_root_that_is_not_a_member_is_an_error(monkeypatch):
+    monkeypatch.setattr(cce, "FOOTPRINT_GUARDED", (*cce.FOOTPRINT_GUARDED, "sponsord-typo"))
+    errors = run()
+    assert len(errors) == 1, errors
+    assert "sponsord-typo" in errors[0] and "not a workspace member" in errors[0], errors[0]
 
 
 def test_e2e_may_depend_on_anything_but_cli():

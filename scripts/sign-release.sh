@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Signs and publishes a release draft staged by .github/workflows/release.yml.
 #
-# The workflow builds the archives, the two container images and their SBOMs,
+# The workflow builds the archives, the four container images and their SBOMs,
 # but signs nothing and publishes nothing — the GitHub Release is left as a
-# draft and both image manifests are pushed untagged. This script is the human
+# draft and every image manifest is pushed untagged. This script is the human
 # step: a maintainer verifies what CI produced, signs it with their own GPG key,
 # promotes the image tags, and publishes. There is no signing key in Actions
 # secrets.
@@ -49,11 +49,28 @@ REPO="${DECDN_REPO:-decdn/decdn}"
 # pushing `latest` to the PRODUCTION Docker Hub repositories — which the
 # maintainer is logged in to, so it would succeed silently.
 DOCKERHUB_REPO="${DECDN_DOCKERHUB_REPO:-${REPO}}"
+SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Both are `<owner>/<name>`. A bare namespace (`DECDN_DOCKERHUB_REPO=hubuser`)
+# would pass every check below and fail only at the Docker Hub mirror, after
+# the GHCR tags are promoted.
+[[ "$REPO" == */* ]] || die "DECDN_REPO must be <owner>/<repo>, got '$REPO'"
+[[ "$DOCKERHUB_REPO" == */* ]] ||
+  die "DECDN_DOCKERHUB_REPO must be <namespace>/<repo> (e.g. decdn/decdn), got '$DOCKERHUB_REPO'"
 # The organisation (or user) each repository lives under: the sponsord images
-# are named under it, not under the repository.
+# are named under it, not under the repository. That is why a rehearsal must
+# run from a fork under ANOTHER owner: a DECDN_REPO under `decdn` would promote
+# the production `ghcr.io/decdn/sponsord*` tags while the decdn images went to
+# the rehearsal names.
 OWNER="${REPO%%/*}"
 DOCKERHUB_OWNER="${DOCKERHUB_REPO%%/*}"
-SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
+if [[ "$REPO" != "decdn/decdn" && "$OWNER" == "decdn" ]]; then
+  die "DECDN_REPO=$REPO is under the decdn organisation but is not decdn/decdn: the
+sponsord images are named per owner, so this run would promote the production
+ghcr.io/decdn/sponsord tags. Rehearse from a fork under another owner."
+fi
 
 # The images, keyed by Dockerfile stage. The stage name is also the prefix of
 # the image's release assets: <stage>-image-digest.txt and
@@ -84,8 +101,6 @@ SIGN_TARGETS=( "SHA256SUMS" )
 for img in "${IMAGES[@]}"; do
   SIGN_TARGETS+=( "${img}-image-digest.txt" "${img}-${VERSION}-sbom.spdx.json" )
 done
-
-die() { echo "error: $*" >&2; exit 1; }
 
 # DECDN_DOCKERHUB_REPO names the base repository, and the node image appends
 # `-node` to it. A value that already ends in `-node` would mirror the node

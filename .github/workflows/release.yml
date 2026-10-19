@@ -453,7 +453,7 @@ jobs:
       # runner's) and fails at exec on any older distribution with
       # "version `GLIBC_2.3x' not found". Checked here, before the archive
       # exists, so a binary above the floor never reaches upload-assets or
-      # either image.
+      # any image.
       - name: Check glibc floor
         if: contains(matrix.target, '-linux-gnu')
         shell: bash
@@ -613,7 +613,7 @@ jobs:
     strategy:
       # One leg per image, each a stage of the one Dockerfile. A failed leg
       # does not cancel the other; sign-release.sh refuses a draft that lacks
-      # either image's digest, so a half-built release cannot be signed.
+      # any image's digest, so a half-built release cannot be signed.
       # Each image has the same repository path on Docker Hub, which
       # sign-release.sh mirrors its signed digest to.
       fail-fast: false
@@ -652,7 +652,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # Each Linux artifact carries both archives; the unpack step below names
+      # Each Linux artifact carries all four archives; the unpack step below names
       # the ones this image needs and ignores the rest.
       - name: Download Linux archives
         uses: actions/download-artifact@v8

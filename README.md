@@ -325,9 +325,10 @@ cargo nextest run -p decdn-e2e --features anvil-e2e
 
 ## 🧰 Commands
 
-deCDN ships two binaries, split like `dockerd` and `docker`
+The node stack ships as two binaries, split like `dockerd` and `docker`
 ([appendix](adr/appendix-binaries.md)): **`decdn-node`** is the daemon, with one
-subcommand, `run`; **`decdn`** is every command a human types. Run
+subcommand, `run`; **`decdn`** is every command a human types. The sponsorship
+daemon and its onramp are two more ([`docs/sponsord/`](docs/sponsord/README.md)). Run
 `decdn <command> --help` for flags.
 
 <details>

@@ -33,8 +33,8 @@ depth: it lives in the repository it is checking. Record the fingerprint above
 out of band the first time you verify a release, and compare against your copy
 afterwards.
 
-Each release carries seven GPG signatures: the tag, the version-bump commit, the
-`SHA256SUMS` manifest covering every archive, and for each of the two container
+Each release carries eleven GPG signatures: the tag, the version-bump commit, the
+`SHA256SUMS` manifest covering every archive, and for each of the four container
 images its digest file and its SBOM. Individual archives carry no `.asc` of their
 own — verify them through the signed manifest.
 
@@ -162,8 +162,9 @@ The `decdn` binary in `ghcr.io/decdn/decdn:<version>` is the same file.
 
 ### Crates published to crates.io
 
-The library crates and both binaries are also published to crates.io
-(`decdn-node`, `decdn-cli` and the crates they depend on). **Those artifacts
+The library crates and all four binaries are also published to crates.io
+(`decdn-node`, `decdn-cli`, `sponsord`, `sponsord-onramp` and the crates they
+depend on). **Those artifacts
 carry no maintainer signature** — crates.io has no detached-signature mechanism,
 and the `.crate` files are built and uploaded from a maintainer's machine after
 the GitHub Release is signed, not from the signed archives.

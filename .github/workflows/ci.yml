@@ -269,6 +269,11 @@ jobs:
               # *.snap would have rust=false and skip the `public-api` job that
               # validates it — letting a stale/incorrect baseline merge.
               - '**/*.snap'
+              # The onramp builds its installers and gate page in with
+              # `include_str!`, and sponsord-api's snapshot test reads the
+              # committed OpenAPI documents; neither is a .rs file.
+              - 'crates/**/assets/**'
+              - 'crates/sponsord-api/openapi/**'
               - '.github/workflows/ci.yml'
             adr:
               - 'adr/**/*.md'
@@ -1348,7 +1353,7 @@ jobs:
   # Nothing validated the Dockerfile until a release tag was cut, which is how
   # `EXPOSE 4433 9090  # comment` — a hard parse error, since Dockerfile `#`
   # only starts a comment at the beginning of a line — survived in the tree.
-  # The release workflow assembles both images from prebuilt archives; here
+  # The release workflow assembles all four images from prebuilt archives; here
   # placeholders stand in for the binaries so the build stays cheap.
   docker-build:
     name: docker build

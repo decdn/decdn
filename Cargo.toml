@@ -59,9 +59,10 @@ categories = ["network-programming", "web-programming"]
 
 [workspace.dependencies]
 # Internal crates. The `version` is what makes these publishable — cargo rejects
-# a path dependency with no version specifier, because a published crate has no
-# path to follow. Locally the `path` still wins; the version only applies to the
-# manifest cargo uploads.
+# a normal or build path dependency with no version specifier, because a
+# published crate has no path to follow. Locally the `path` still wins; the
+# version only applies to the manifest cargo uploads. A dev-dependency is the
+# exception, see `decdn-e2e` below.
 decdn-protocol = { path = "crates/protocol", version = "0.2.0" }
 decdn-config-types = { path = "crates/config-types", version = "0.2.0" }
 decdn-bao-range = { path = "crates/bao-range", version = "0.2.0" }

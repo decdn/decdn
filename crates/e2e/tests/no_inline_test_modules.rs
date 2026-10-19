@@ -8,10 +8,13 @@
 //!
 //! A test module is one whose `cfg` holds only in test code: `test`,
 //! `feature = "test-support"`, an `all(…)` with one of those, or an `any(…)`
-//! made only of them. The feature covers the fakes in the sponsord crates'
-//! `test_support.rs`, which dependents' tests enable and no release build
-//! does. Any other `cfg(any(test, …))` also compiles outside tests, so that
-//! module is not test code and stays inline.
+//! made only of them. `test-support` is the workspace's name for a test-only
+//! feature: `decdn-protocol`'s overridable discovery-block size (and
+//! `decdn-node`'s pass-through to it) and the fakes in the sponsord crates'
+//! `test_support.rs`. Only tests and dev-dependencies enable it; no release
+//! build does, and a third test below holds that. Any other
+//! `cfg(any(test, …))` also compiles outside tests, so that module is not
+//! test code and stays inline.
 //!
 //! No rustc or clippy lint expresses this rule, so this test holds it. It
 //! parses every `.rs` file under `crates/` with `syn` and fails on any
@@ -252,6 +255,128 @@ fn codeql_skips_only_test_modules() {
     );
 }
 
+/// The ways a `Cargo.toml` could turn `test-support` on outside tests: as a
+/// default feature, through a normal or build dependency's feature list, or
+/// from a feature with another name. Only tests and dev-dependencies may
+/// enable it, or the classifier above would treat shipped code as test code
+/// and `CodeQL` would skip it by name.
+fn test_support_leaks(manifest: &toml::Table) -> Vec<String> {
+    let mut leaks = Vec::new();
+    let enables_test_support = |value: &toml::Value| {
+        value.as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|s| s == "test-support" || s.ends_with("/test-support"))
+            })
+        })
+    };
+    if let Some(features) = manifest.get("features").and_then(toml::Value::as_table) {
+        for (name, value) in features {
+            if name != "test-support" && enables_test_support(value) {
+                leaks.push(format!("feature `{name}` enables test-support"));
+            }
+        }
+    }
+    let mut dep_tables: Vec<(&str, &toml::Table)> = Vec::new();
+    for table in ["dependencies", "build-dependencies"] {
+        if let Some(deps) = manifest.get(table).and_then(toml::Value::as_table) {
+            dep_tables.push((table, deps));
+        }
+        if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+            for target in targets.values() {
+                if let Some(deps) = target.get(table).and_then(toml::Value::as_table) {
+                    dep_tables.push((table, deps));
+                }
+            }
+        }
+    }
+    for (table, deps) in dep_tables {
+        for (dep, spec) in deps {
+            if spec.get("features").is_some_and(enables_test_support) {
+                leaks.push(format!("[{table}] {dep} enables its test-support feature"));
+            }
+        }
+    }
+    leaks
+}
+
+#[test]
+fn the_test_support_feature_is_never_on_outside_tests() {
+    let crates = workspace().join("crates");
+    let mut checked = 0;
+    let mut leaks = Vec::new();
+    for entry in std::fs::read_dir(&crates).expect("read crates/") {
+        let manifest_path = entry.expect("crate dir").path().join("Cargo.toml");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&manifest_path).expect("read Cargo.toml");
+        let manifest: toml::Table = toml::from_str(&text).expect("parse Cargo.toml");
+        checked += 1;
+        let name = manifest_path
+            .strip_prefix(workspace())
+            .unwrap_or(&manifest_path)
+            .display()
+            .to_string();
+        leaks.extend(
+            test_support_leaks(&manifest)
+                .into_iter()
+                .map(|l| format!("{name}: {l}")),
+        );
+    }
+    assert!(checked > 0, "no Cargo.toml under {}", crates.display());
+    assert!(
+        leaks.is_empty(),
+        "`test-support` is a test-only feature; a module gated on it is a test module the \
+         CodeQL skip list may ignore by name, so nothing but tests and dev-dependencies may \
+         enable it:\n{}",
+        leaks.join("\n"),
+    );
+}
+
+#[test]
+fn test_support_leak_shapes_are_detected() {
+    let parse = |s: &str| toml::from_str::<toml::Table>(s).unwrap();
+    assert!(test_support_leaks(&parse("[features]\ndefault = []\ntest-support = []\n")).is_empty());
+    assert!(
+        test_support_leaks(&parse(
+            "[features]\ntest-support = [\"decdn-protocol/test-support\"]\n"
+        ))
+        .is_empty()
+    );
+    assert!(
+        test_support_leaks(&parse(
+            "[dev-dependencies]\nx = { path = \".\", features = [\"test-support\"] }\n"
+        ))
+        .is_empty()
+    );
+    assert_eq!(
+        test_support_leaks(&parse("[features]\ndefault = [\"test-support\"]\n")).len(),
+        1
+    );
+    assert_eq!(
+        test_support_leaks(&parse(
+            "[features]\nfakes = [\"decdn-protocol/test-support\"]\n"
+        ))
+        .len(),
+        1
+    );
+    assert_eq!(
+        test_support_leaks(&parse(
+            "[dependencies]\nx = { path = \"../x\", features = [\"test-support\"] }\n"
+        ))
+        .len(),
+        1
+    );
+    assert_eq!(
+        test_support_leaks(&parse(
+            "[target.'cfg(unix)'.build-dependencies]\nx = { version = \"1\", features = [\"test-support\"] }\n"
+        ))
+        .len(),
+        1
+    );
+}
+
 /// Runs the checker on `source` as if it were `crates/x/src/foo.rs`.
 fn check(source: &str) -> Vec<String> {
     test_modules(Path::new("crates/x/src/foo.rs"), source)
@@ -354,6 +479,17 @@ fn flags_a_module_gated_on_test_or_the_test_support_feature() {
     assert_eq!(
         check("#[cfg(feature = \"test-support\")]\nmod fakes {}\n").len(),
         1
+    );
+}
+
+#[test]
+fn nested_cfg_combinations_follow_the_same_rule() {
+    assert_eq!(
+        check("#[cfg(any(all(test, unix), feature = \"test-support\"))]\nmod doubles {}\n").len(),
+        1
+    );
+    assert!(
+        check("#[cfg(all(any(test, feature = \"other\"), unix))]\nmod doubles {}\n").is_empty()
     );
 }
 

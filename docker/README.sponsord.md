@@ -39,7 +39,7 @@ A prerelease (for example `0.3.0-rc1`) gets only its exact version tag. The vers
 the deCDN release the daemon shipped with.
 
 This image is built for linux/amd64 and linux/arm64. It is also on GitHub Container
-Registry as [`ghcr.io/decdn/sponsord`](https://github.com/decdn/decdn/pkgs/container/sponsord),
+Registry as [`ghcr.io/decdn/sponsord`](https://github.com/orgs/decdn/packages/container/package/sponsord),
 with the same digest.
 
 ## Verify the image

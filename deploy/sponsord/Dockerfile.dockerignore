@@ -11,5 +11,5 @@ contracts/
 docs/
 docker/
 deploy/sponsord/secrets/
-*.env
-*.md
+**/*.env
+**/*.md

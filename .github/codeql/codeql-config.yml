@@ -4,14 +4,16 @@ name: decdn CodeQL config
 # alert it raises is noise. Rust runs with `build-mode: none`, which honours
 # `paths-ignore`. The list skips integration-test targets, the `decdn-e2e`
 # fixture crate and the `sponsord-e2e` test crate, and the unit-test modules,
-# which each live in their own file under `src/` (#2352). `test_support.rs` is
-# the fakes behind the sponsord crates' `test-support` feature, which no
-# release build enables.
+# which each live in their own file under `src/` (#2352). `test_support.rs` and
+# `tests_support.rs` are `#[cfg(test)]` helper modules in the decdn crates
+# and, in the sponsord crates, the fakes behind their `test-support` feature,
+# which only tests and dev-dependencies enable.
 #
 # The `src/` patterns match by file name, so
 # `crates/e2e/tests/no_inline_test_modules.rs` fails the test run on any file
-# they match that is not declared as a `#[cfg(test)]` module. A production
-# file never drops out of the analysis because of its name.
+# they match that is not declared as a test module (`cfg(test)` or the
+# `test-support` feature). A production file never drops out of the analysis
+# because of its name.
 paths-ignore:
   - crates/*/tests/**
   - crates/e2e/**

@@ -65,9 +65,9 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    `python3` for the Docker Hub overview push.
 
 5. **Registry logins.** `docker login ghcr.io` with a token carrying
-   `write:packages`, and `docker login docker.io` — both images go to both
-   registries. The Docker Hub repositories `decdn/decdn-node` and
-   `decdn/decdn` must exist first. The same Docker Hub login writes each
+   `write:packages`, and `docker login docker.io` — all four images go to both
+   registries. The Docker Hub repositories `decdn/decdn-node`, `decdn/decdn`,
+   `decdn/sponsord` and `decdn/sponsord-onramp` must exist first. The same Docker Hub login writes each
    repository's overview, through the Hub API. That API accepts a password or
    a personal access token with the *Read, Write, Delete* scope. If your
    `docker login` stored something else (a browser-based login can), set
@@ -81,6 +81,14 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    to public (package settings, *Change visibility*). `sign-release.sh`
    checks every promoted repository without credentials and refuses to
    publish while one is private.
+
+   The `sponsord` and `sponsord-onramp` packages are named under the
+   organisation, and a workflow may push to an org package only from a
+   repository the package grants access to. Before the first release that
+   ships them, an org admin adds `decdn/decdn` with the **Write** role under
+   each package's *Manage Actions access* (package settings); otherwise the
+   `docker` job fails with `permission_denied: write_package` and
+   `sign-release.sh` refuses the draft for its missing digests.
 
 7. **A crates.io token.** `cargo login`, with a token scoped to
    publish-update (and publish-new for the first release). Membership of the
