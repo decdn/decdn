@@ -28,7 +28,11 @@ Across the workspace:
 
 * Every internal `[workspace.dependencies]` alias (a `path` into a member)
   resolves to a member and carries `version` equal to `[workspace.package]
-  version`. `cargo release` keeps them in step (`dependent-version =
+  version` — except an alias to a `publish = false` member, which carries no
+  `version` at all: cargo strips a dev-dependency from the published manifest
+  only when it has no version requirement, and with one `cargo publish` would
+  look for the unpublished crate on crates.io. `cargo release` keeps the
+  versioned ones in step (`dependent-version =
   "upgrade"`); a hand edit does not.
 * A member some other member depends on has an alias; a member nothing depends
   on has none — an unread alias is one more version to forget on release.
@@ -90,6 +94,7 @@ def check(repo_root: Path) -> list[str]:
     # --- per-member shape --------------------------------------------------
     name_by_dir: dict[Path, str] = {}
     depended_upon: set[str] = set()
+    unpublished: set[str] = set()
     internal_deps: list[tuple[Path, str, object]] = []
     for crate_root in members:
         rel = crate_root.relative_to(repo_root) / "Cargo.toml"
@@ -101,6 +106,8 @@ def check(repo_root: Path) -> list[str]:
         package = manifest.get("package", {})
         name = package.get("name", str(rel))
         name_by_dir[crate_root.resolve()] = name
+        if package.get("publish") is False:
+            unpublished.add(name)
 
         for key in INHERITED_ALWAYS:
             if not inherits(package, key):
@@ -156,7 +163,15 @@ def check(repo_root: Path) -> list[str]:
 
     for name, spec in sorted(aliases.items()):
         version = spec.get("version")
-        if version != ws_version:
+        if name in unpublished:
+            if version is not None:
+                errors.append(
+                    f"Cargo.toml: [workspace.dependencies] {name} is `publish = false` but "
+                    f"its alias says version = {version!r} — a dev-dependency with a version "
+                    "stays in the published manifest and `cargo publish` then looks for "
+                    f"{name} on crates.io; drop the `version`"
+                )
+        elif version != ws_version:
             errors.append(
                 f"Cargo.toml: [workspace.dependencies] {name} says version = {version!r} "
                 f"but [workspace.package] version is {ws_version!r} — cargo release "
@@ -172,8 +187,8 @@ def check(repo_root: Path) -> list[str]:
         if name not in aliases:
             errors.append(
                 f"Cargo.toml: {name} is depended on by another member but has no "
-                "[workspace.dependencies] alias — add one with `path` and `version` so the "
-                "published manifest resolves"
+                "[workspace.dependencies] alias — add one with `path` and `version` (no "
+                "`version` for a `publish = false` member) so the published manifest resolves"
             )
 
     # --- directories not in members ----------------------------------------

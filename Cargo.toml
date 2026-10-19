@@ -72,9 +72,11 @@ decdn-common = { path = "crates/common", version = "0.2.0" }
 decdn-client = { path = "crates/client", version = "0.2.0" }
 decdn-node = { path = "crates/node", version = "0.2.0" }
 # `decdn-e2e` is `publish = false`; the alias exists because the sponsord crates
-# dev-depend on its anvil fixtures. A dev-dependency is stripped from the
-# published manifest, so the version here never reaches crates.io.
-decdn-e2e = { path = "crates/e2e", version = "0.2.0" }
+# dev-depend on its anvil fixtures. No `version`, on purpose: cargo strips a
+# dev-dependency from the published manifest only when it has no version
+# requirement, and with one `cargo publish` would look for `decdn-e2e` on
+# crates.io, where it never is.
+decdn-e2e = { path = "crates/e2e" }
 # sponsord: the sponsorship daemon, its library core, the wire types and the
 # public onramp. `sponsord-e2e` has no alias: nothing depends on it.
 sponsord = { path = "crates/sponsord", version = "0.2.0" }
