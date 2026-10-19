@@ -30,6 +30,7 @@ pub mod publish;
 pub mod pull_progress;
 pub mod register;
 pub mod rotate_key;
+pub mod self_update;
 pub mod setup;
 pub(crate) mod tab_progress;
 pub mod terms;

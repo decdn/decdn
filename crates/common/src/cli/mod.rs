@@ -146,6 +146,11 @@ pub enum Command {
     Publish(PublishArgs),
     /// File a slash appeal, posting the appeal bond (ADR 028).
     Appeal(AppealArgs),
+    /// Replace this binary with the latest signed release. The release's
+    /// `SHA256SUMS.minisig` must verify against a minisign key this build
+    /// embeds; a binary `cargo install` placed, or one in a directory this
+    /// user cannot write, is refused with the command to run instead.
+    SelfUpdate(SelfUpdateArgs),
 }
 
 /// Whether the parsed command asked for JSON output, at whatever depth its

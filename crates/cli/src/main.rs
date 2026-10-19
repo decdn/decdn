@@ -9,7 +9,9 @@
 //! Its one direct write is the top-level error boundary in `main`; everything
 //! else prints from [`decdn_cli::commands`].
 
-use clap::Parser;
+use std::io::IsTerminal;
+
+use clap::{CommandFactory, FromArgMatches};
 
 use decdn_cli::commands;
 use decdn_common::cli::{self, Cli, Command, ConfigCommand};
@@ -63,7 +65,15 @@ fn exit_code_for(err: &anyhow::Error) -> std::process::ExitCode {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    // Parsed through `ArgMatches` so the post-run update notice can learn
+    // whether `--json` was given at any depth without a per-command list.
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let nudge = commands::self_update::NudgePolicy {
+        tty: std::io::stderr().is_terminal(),
+        json: cli::json_requested(&matches),
+        excluded: matches!(cli.command, Command::SelfUpdate(_)),
+    };
 
     // Opt-in only: with no `-v`, `--log-level` or `RUST_LOG` this is a no-op and
     // the CLI stays a clean terminal UI. Installed before dispatch so it covers
@@ -75,7 +85,7 @@ async fn run() -> anyhow::Result<()> {
 
     let config_path = cli.config.map(|p| cli::common::expand_tilde(&p));
 
-    match cli.command {
+    let result = match cli.command {
         Command::KeyGen(args) => commands::key_gen::key_gen(&args),
         Command::Whoami(args) => commands::whoami::whoami(&args, config_path.as_deref()),
         Command::Config(args) => match args.command {
@@ -101,7 +111,14 @@ async fn run() -> anyhow::Result<()> {
                 commands::appeal::run(&slash, config_path.as_deref()).await
             }
         },
+        Command::SelfUpdate(args) => commands::self_update::self_update(&args).await,
+    };
+    // After the command's own work, and only when it succeeded: a command
+    // that failed has the terminal's attention already.
+    if result.is_ok() {
+        commands::self_update::maybe_nudge(nudge, config_path.as_deref()).await;
     }
+    result
 }
 
 #[cfg(test)]
