@@ -31,6 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
+use anyhow::Context as _;
 use decdn_bao_range::AlignedRange;
 use decdn_incentive::PoolId;
 use iroh::{Endpoint, EndpointAddr};
@@ -385,11 +386,6 @@ pub struct PeerSource<'a> {
     max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
-    /// The runtime every dial of this source runs on, so each connection's QUIC
-    /// driver lives there rather than on the runtime the pull runs on. `None`
-    /// dials on the caller's runtime. See
-    /// [`with_dial_runtime`](Self::with_dial_runtime).
-    dial_runtime: Option<tokio::runtime::Handle>,
     /// The command's shared connection per node, or `None` to dial per open.
     connections: Option<Connections>,
 }
@@ -421,9 +417,10 @@ impl<'a> PeerSource<'a> {
     ///
     /// `connections` is the command's map of one connection per node: with
     /// `Some`, every open takes a new stream on `target`'s shared connection
-    /// and dials only when `target` has no live one. With `None`, every open
-    /// dials its own connection. Pass `Some` only from a single long-lived
-    /// runtime (see [`Connections`]).
+    /// and dials only when `target` has no live one, on the map's dial
+    /// runtime (see [`Connections`]). With `None`, every open dials its own
+    /// connection on the caller's runtime, so the caller's runtime must
+    /// outlive the endpoint's close.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
@@ -450,29 +447,25 @@ impl<'a> PeerSource<'a> {
             max_blob_size_bytes,
             max_rate_per_mb,
             deadlines,
-            dial_runtime: None,
             connections,
         }
     }
 
-    /// Run every dial of this source on `runtime`.
+    /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end)
+    /// as a raw pull, unaligned, for a caller that reads only the signed
+    /// header and then aborts the pull.
     ///
-    /// A dial spawns the connection's QUIC driver on the runtime that runs it, and
-    /// the driver is what carries the connection through its close to QUIC's
-    /// draining state. A caller that runs a pull on a runtime it drops afterwards
-    /// (`decdn-node`'s per-serve pull legs) passes a runtime that outlives its
-    /// endpoint here. Otherwise a connection the pull dialled that has not reached
-    /// draining when the pull's runtime drops loses its driver, stays in the
-    /// endpoint's active set, and `Endpoint::close` waits for it forever.
-    /// The dial and the connection's driver move to `runtime`; the pull still
-    /// opens and polls its streams from the caller's runtime. A source with a
-    /// [`Connections`] map dials through the map instead, on the caller's
-    /// runtime.
-    #[must_use]
+    /// # Errors
+    ///
+    /// The same faults as [`BlobSource::open`].
     #[doc(hidden)]
-    pub fn with_dial_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
-        self.dial_runtime = Some(runtime);
-        self
+    pub fn open_span(
+        &self,
+        hash: [u8; 32],
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> SourceFuture<'_, (UpstreamPullHeader, UpstreamPull)> {
+        Box::pin(self.open_pull(hash, byte_offset, byte_len))
     }
 
     /// Open the whole blob (`byte_len == 0`, "to end") from offset 0.
@@ -530,7 +523,6 @@ impl<'a> PeerSource<'a> {
                 self.max_rate_per_mb,
                 self.deadlines,
                 byte_len,
-                self.dial_runtime.as_ref(),
             )
             .await
         }
@@ -546,6 +538,12 @@ impl<'a> PeerSource<'a> {
     /// this connection from the map, so the next open dials again. Any other
     /// failure (a refusal, a bad response, a hash mismatch) leaves the
     /// connection pinned for the next open.
+    ///
+    /// A connection that was pinned before this open and is closed under it
+    /// is a stale pin: the target reaped it idle between legs, or its budget
+    /// ran out. The open then redials once and opens again. No byte is paid
+    /// before the header, so the retry costs nothing. A connection this open
+    /// dialled itself that fails is the target's failure, and is not retried.
     async fn open_shared(
         &self,
         connections: &Connections,
@@ -554,10 +552,56 @@ impl<'a> PeerSource<'a> {
         byte_offset: u64,
         byte_len: u64,
     ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-        let open = self.deadlines.open;
-        let warm = tokio::time::timeout(open, connections.get(&self.target))
+        debug_assert_eq!(
+            connections.alpn(),
+            decdn_protocol::ALPN_CLIENT,
+            "a pull opens on a cdn/client/v1 map"
+        );
+        let lease = self.lease(connections).await?;
+        let pinned = lease.is_pinned();
+        let warm = lease.into_warm();
+        let err = match self
+            .open_on(connections, warm.clone(), ctx, hash, byte_offset, byte_len)
             .await
-            .map_err(|_| anyhow::Error::new(crate::PullTimeout { after: open }))??;
+        {
+            Ok(opened) => return Ok(opened),
+            Err(err) => err,
+        };
+        if !(pinned && warm.is_closed()) {
+            return Err(err);
+        }
+        tracing::debug!(
+            peer = %self.target.id,
+            close = ?warm.connection().close_reason(),
+            error = %err,
+            "pooled connection closed under the open; redialling once"
+        );
+        let fresh = self.lease(connections).await?.into_warm();
+        self.open_on(connections, fresh, ctx, hash, byte_offset, byte_len)
+            .await
+            .with_context(|| format!("after a redial; the pinned connection failed: {err:#}"))
+    }
+
+    /// The target's connection in `connections`, dialled when it has none,
+    /// under `deadlines.open`.
+    async fn lease(&self, connections: &Connections) -> anyhow::Result<crate::connection::Lease> {
+        let open = self.deadlines.open;
+        tokio::time::timeout(open, connections.get_or_dial(&self.target))
+            .await
+            .map_err(|_| anyhow::Error::new(crate::PullTimeout { after: open }))?
+    }
+
+    /// Open the pull as a stream on `warm`, which the pull holds and unpins
+    /// from `connections` on a transport fault.
+    async fn open_on(
+        &self,
+        connections: &Connections,
+        warm: Arc<crate::WarmConnection>,
+        ctx: &PoolContext,
+        hash: [u8; 32],
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
         let conn = warm.connection().clone();
         crate::open_progressive_pull_on(
             &conn,

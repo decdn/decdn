@@ -46,7 +46,15 @@ use crate::dht::{
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::metrics::Metrics;
 
-const ACCEPT_BI_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a fresh connection may sit before its first stream. A peer that
+/// dials and sends nothing frees its dispatch permit quickly.
+const FIRST_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a connection that has served a request stays open for the next
+/// one. The requester pools one `cdn/dht/v1` connection per peer, so bursty
+/// lookups and republish drains reuse it instead of redialling. It equals the
+/// `cdn/client/v1` idle reaper (`handlers::client::APP_IDLE_TIMEOUT`), so a
+/// parked DHT peer holds its dispatch permit no longer than an idle client.
+const IDLE_BETWEEN_STREAMS: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -71,6 +79,17 @@ const MAX_DHT_CONN_AGE: Duration = Duration::from_mins(5);
 /// than a re-implementation of it.
 fn accept_budget_reached(served: u32, conn_age: Duration) -> bool {
     served >= MAX_DHT_REQUESTS_PER_CONN || conn_age >= MAX_DHT_CONN_AGE
+}
+
+/// How long the accept loop waits for the next stream after serving
+/// `served` of them: [`FIRST_STREAM_TIMEOUT`] for the first,
+/// [`IDLE_BETWEEN_STREAMS`] for every later one.
+const fn accept_timeout(served: u32) -> Duration {
+    if served == 0 {
+        FIRST_STREAM_TIMEOUT
+    } else {
+        IDLE_BETWEEN_STREAMS
+    }
 }
 
 // ADR 013 application error codes (also defined in `handlers::probe`; the
@@ -222,9 +241,10 @@ impl DhtHandler {
         // here would be redundant; we run it inside the per-stream loop
         // because a single connection may carry multiple requests.
 
-        // Iroh-side connection cap: DHT is short-lived request/response,
-        // but a peer may bundle multiple requests on one connection. Accept
-        // streams in a loop until the peer closes (or we time out waiting).
+        // Each DHT request is one stream, and a requester keeps one
+        // connection per peer and sends every request on it. Accept streams
+        // in a loop until the peer closes, the accept window elapses, or the
+        // per-connection budget is spent.
         //
         // Permit hygiene (#845): the dispatch permit above is held for the
         // whole `serve` call, so an unbounded accept loop lets a peer staying
@@ -259,14 +279,36 @@ impl DhtHandler {
                 );
                 break;
             }
-            // Peer closed the connection (`Ok(Err)`) or we hit the idle
-            // accept timeout (`Err`) — both mean we're done serving this
-            // connection; break the per-stream loop.
-            let Ok(Ok((send, recv))) =
-                tokio::time::timeout(ACCEPT_BI_TIMEOUT, conn.accept_bi()).await
-            else {
-                break;
-            };
+            // The accept window is short before the first stream and the
+            // client idle window after it (`accept_timeout`), so a
+            // requester's pooled connection stays warm between requests
+            // while an idle one still releases its permit within
+            // `handlers::client::APP_IDLE_TIMEOUT`. The requester keeps the
+            // connection open on its side, so an elapsed window closes it
+            // here: the requester's next call then meets a closed pin and
+            // redials at once, rather than opening a stream nobody accepts
+            // and reading until the close lands.
+            let (send, recv) =
+                match tokio::time::timeout(accept_timeout(served), conn.accept_bi()).await {
+                    Ok(Ok(streams)) => streams,
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            served,
+                            error = %e,
+                            "dht connection ended by the peer or the transport"
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            served,
+                            window_secs = accept_timeout(served).as_secs(),
+                            "dht connection idle past its accept window; closing"
+                        );
+                        conn.close(0u32.into(), b"dht-idle");
+                        break;
+                    }
+                };
             served = served.saturating_add(1);
             // Rate-limit per request (ADR 022 §DHT Rate Limiting). Re-read
             // `peer_ip` here so a relay→direct path switch over the

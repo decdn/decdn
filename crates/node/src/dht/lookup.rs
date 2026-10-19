@@ -42,9 +42,10 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use decdn_client::Connections;
 use decdn_protocol::Coverage;
 use indexmap::IndexMap;
-use iroh::{Endpoint, EndpointAddr, PublicKey};
+use iroh::{EndpointAddr, PublicKey};
 use rand::seq::SliceRandom;
 use tokio::task::JoinSet;
 use tracing::{Instrument as _, debug, warn};
@@ -164,7 +165,7 @@ impl Default for LookupConfig {
     )
 )]
 pub async fn find_providers(
-    endpoint: &Endpoint,
+    conns: &Connections,
     routing_table: &Arc<Mutex<RoutingTable>>,
     staker_set: &Arc<dyn StakerSet>,
     negative_cache: &NegativeProbeCache,
@@ -177,7 +178,7 @@ pub async fn find_providers(
         metrics.dht_findvalue_query();
     }
     let ctx = LookupCtx {
-        endpoint,
+        conns,
         routing_table,
         staker_set: staker_set.as_ref(),
         negative_cache,
@@ -257,7 +258,8 @@ enum RoundRpcError {
 
 /// Shared inputs to a lookup round.
 struct LookupCtx<'a> {
-    endpoint: &'a Endpoint,
+    /// The node's `cdn/dht/v1` connection map.
+    conns: &'a Connections,
     routing_table: &'a Arc<Mutex<RoutingTable>>,
     staker_set: &'a dyn StakerSet,
     negative_cache: &'a NegativeProbeCache,
@@ -279,7 +281,7 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
     );
     let mut tasks: JoinSet<RoundResult> = JoinSet::new();
     for &peer in batch {
-        let endpoint = ctx.endpoint.clone();
+        let conns = ctx.conns.clone();
         let requester_id = ctx.requester_id;
         let target = ctx.target;
         tasks.spawn(
@@ -288,7 +290,7 @@ async fn run_round(ctx: &LookupCtx<'_>, batch: &[NodeId], state: &mut LookupStat
                     return (peer, Err(RoundRpcError::InvalidPubKey));
                 };
                 let addr = EndpointAddr::new(pk);
-                let result = client::find_value(&endpoint, addr, target, requester_id)
+                let result = client::find_value(&conns, addr, target, requester_id)
                     .await
                     .map_err(RoundRpcError::Transport);
                 (peer, result)

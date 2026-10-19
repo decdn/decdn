@@ -59,3 +59,24 @@ fn budget_bounds_are_sane() {
         "a zero age deadline would close every connection immediately"
     );
 }
+
+/// The first stream gets the short accept window; every later stream gets
+/// the idle window that keeps a caller's pooled connection warm.
+#[test]
+fn accept_timeout_is_short_for_first_stream_and_idle_window_after() {
+    assert_eq!(accept_timeout(0), Duration::from_secs(5));
+    assert_eq!(accept_timeout(1), Duration::from_secs(30));
+    assert_eq!(
+        accept_timeout(MAX_DHT_REQUESTS_PER_CONN - 1),
+        Duration::from_secs(30)
+    );
+}
+
+/// A warm DHT connection never idles longer than a `cdn/client/v1`
+/// connection does, so a parked DHT peer holds its dispatch permit no
+/// longer than an idle client.
+#[test]
+fn idle_window_never_exceeds_client_reaper() {
+    assert!(IDLE_BETWEEN_STREAMS <= crate::handlers::client::APP_IDLE_TIMEOUT);
+    assert!(FIRST_STREAM_TIMEOUT <= IDLE_BETWEEN_STREAMS);
+}

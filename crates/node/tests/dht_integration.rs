@@ -249,7 +249,7 @@ async fn prime_iroh_cache(
 ) -> anyhow::Result<()> {
     let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
     let _ = client::find_node(
-        client_ep,
+        &support::dht_conns(client_ep),
         target,
         NodeId::from_bytes(*server.id.as_bytes()),
         NodeId::from_bytes(*client_id),
@@ -460,7 +460,7 @@ async fn find_providers_converges_after_peer_departs() -> anyhow::Result<()> {
     let neg = NegativeProbeCache::new();
 
     let providers = find_providers(
-        &client_ep,
+        &support::dht_conns(&client_ep),
         &routing,
         &staker_set,
         &neg,
@@ -560,7 +560,7 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
     let providers = tokio::time::timeout(
         UNREACHABLE_HANG_GUARD,
         find_providers(
-            &client_ep,
+            &support::dht_conns(&client_ep),
             &routing,
             &staker_set,
             &neg,
@@ -614,7 +614,7 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
     let providers = tokio::time::timeout(
         UNREACHABLE_HANG_GUARD,
         find_providers(
-            &client_ep,
+            &support::dht_conns(&client_ep),
             &routing,
             &staker_set,
             &neg,
@@ -693,7 +693,7 @@ async fn find_providers_converges_via_closer_nodes_second_round() -> anyhow::Res
     let neg = NegativeProbeCache::new();
 
     let providers = find_providers(
-        &client_ep,
+        &support::dht_conns(&client_ep),
         &routing,
         &staker_set,
         &neg,
@@ -762,7 +762,7 @@ async fn find_providers_skips_a_dead_referral_on_the_next_lookup() -> anyhow::Re
     let providers = tokio::time::timeout(
         UNREACHABLE_HANG_GUARD,
         find_providers(
-            &client_ep,
+            &support::dht_conns(&client_ep),
             &routing,
             &staker_set,
             &neg,
@@ -799,7 +799,7 @@ async fn find_providers_skips_a_dead_referral_on_the_next_lookup() -> anyhow::Re
     let providers = tokio::time::timeout(
         UNREACHABLE_HANG_GUARD,
         find_providers(
-            &client_ep,
+            &support::dht_conns(&client_ep),
             &routing,
             &staker_set,
             &neg,
@@ -875,7 +875,7 @@ async fn find_providers_stops_suppressing_once_the_negative_entry_expires() -> a
 
     // First lookup: the pre-recorded failure suppresses the provider.
     let suppressed = find_providers(
-        &client_ep,
+        &support::dht_conns(&client_ep),
         &routing,
         &staker_set,
         &neg,
@@ -905,7 +905,7 @@ async fn find_providers_stops_suppressing_once_the_negative_entry_expires() -> a
     // Second lookup with the SAME cache: the entry has expired, so the
     // provider is no longer suppressed.
     let recovered = find_providers(
-        &client_ep,
+        &support::dht_conns(&client_ep),
         &routing,
         &staker_set,
         &neg,

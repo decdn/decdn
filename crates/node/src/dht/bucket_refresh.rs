@@ -27,7 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointAddr, PublicKey};
+use decdn_client::Connections;
+use iroh::{EndpointAddr, PublicKey};
 use rand::RngExt;
 use tokio::sync::oneshot;
 
@@ -61,7 +62,7 @@ pub const BUCKET_REFRESH_TICK: Duration = Duration::from_hours(1);
 /// `decdn_dht_bucket_refresh_failures_total` and publishes the table's size
 /// as `decdn_dht_routing_table_size`.
 pub async fn run_bucket_refresh(
-    endpoint: Endpoint,
+    conns: Connections,
     self_id: PublicKey,
     routing: Arc<Mutex<RoutingTable>>,
     mut stop_rx: oneshot::Receiver<()>,
@@ -83,7 +84,7 @@ pub async fn run_bucket_refresh(
             }
             _ = ticker.tick() => {
                 let failures =
-                    refresh_all_non_empty_buckets(&endpoint, self_node_id, &routing).await;
+                    refresh_all_non_empty_buckets(&conns, self_node_id, &routing).await;
                 for _ in 0..failures {
                     metrics.dht_bucket_refresh_failure();
                 }
@@ -131,7 +132,7 @@ fn now_us() -> u64 {
 /// routing-table peer that is not a valid public key, or a panicked refresh
 /// task.
 async fn refresh_all_non_empty_buckets(
-    endpoint: &Endpoint,
+    conns: &Connections,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
 ) -> usize {
@@ -143,10 +144,10 @@ async fn refresh_all_non_empty_buckets(
     }
     let mut handles = Vec::with_capacity(picks.len());
     for pick in picks {
-        let endpoint_cloned = endpoint.clone();
+        let conns = conns.clone();
         let routing_cloned = Arc::clone(routing);
         handles.push(tokio::spawn(async move {
-            refresh_one_bucket(&endpoint_cloned, self_node_id, &routing_cloned, pick).await
+            refresh_one_bucket(&conns, self_node_id, &routing_cloned, pick).await
         }));
     }
     let mut failures = 0;
@@ -182,7 +183,7 @@ fn all_non_empty_picks(table: &RoutingTable) -> Vec<BucketPick> {
 /// [`all_non_empty_picks`] so the routing-table lock is held only
 /// briefly under the snapshot.
 async fn refresh_one_bucket(
-    endpoint: &Endpoint,
+    conns: &Connections,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
     pick: BucketPick,
@@ -204,7 +205,7 @@ async fn refresh_one_bucket(
         }
     };
     let addr = EndpointAddr::new(target_pk);
-    match client::find_node(endpoint, addr, target, self_node_id).await {
+    match client::find_node(conns, addr, target, self_node_id).await {
         Ok(resp) => {
             // Insert any new peers from the response into the routing
             // table. The bucket's freshness is updated by virtue of

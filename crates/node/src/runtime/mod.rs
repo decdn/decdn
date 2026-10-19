@@ -21,6 +21,7 @@ use anyhow::Context;
 use decdn_cache::{
     CacheEngine, FilesystemOrigin, HttpOrigin, Origin, S3Credentials, S3Origin, S3OriginConfig,
 };
+use decdn_client::Connections;
 use decdn_common::config::{ResolvedDiscovery, ResolvedOrigin, ResolvedS3Credentials};
 use iroh::address_lookup::{DnsAddressLookup, MemoryLookup, PkarrPublisher};
 use iroh::endpoint::{BindOpts, IdleTimeout, QuicTransportConfig, VarInt, presets};
@@ -432,6 +433,10 @@ struct Infra {
     /// ([`spawn_background_tasks`]) as the ADR 041 `margin` policy's heat input.
     frequency_estimator: Option<Arc<dyn decdn_cache::FrequencyEstimator>>,
     ep: Endpoint,
+    /// One pooled `cdn/dht/v1` connection per peer, shared by every outbound
+    /// DHT call (bootstrap, bucket refresh, republish, lookups). Every dial
+    /// and connection driver runs on the main runtime.
+    dht_conns: Connections,
     limiter: Arc<ConnectionLimiter>,
 }
 
@@ -692,6 +697,11 @@ async fn build_infra(
     node_metrics
         .register_iroh_endpoint(&ep)
         .context("failed to register iroh metrics")?;
+    let dht_conns = Connections::with_options(
+        ep.clone(),
+        decdn_protocol::ALPN_DHT,
+        Some(tokio::runtime::Handle::current()),
+    );
 
     let limiter = Arc::new(ConnectionLimiter::new(
         &cfg.security,
@@ -721,6 +731,7 @@ async fn build_infra(
         eviction_policy,
         frequency_estimator: estimator,
         ep,
+        dht_conns,
         limiter,
     })
 }
@@ -1557,7 +1568,7 @@ async fn build_chain_and_handlers(
     // fan-out of seeds. Best-effort — failures here log but don't
     // abort startup.
     let bootstrap_outcome = crate::dht::bootstrap::bootstrap(
-        &infra.ep,
+        &infra.dht_conns,
         infra.secret_key.public(),
         &dht_routing,
         &staker_set,
@@ -1932,7 +1943,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         "republish scheduler seeded from existing cache + origin-held index (ADR 022 §Bootstrap cold-start, #1130)"
     );
     tasks.spawn(crate::dht::publish::run_republish(
-        infra.ep.clone(),
+        infra.dht_conns.clone(),
         infra.secret_key.public(),
         Arc::clone(&ch.dht_routing),
         Arc::clone(&republish_scheduler),
@@ -2004,7 +2015,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // reads it for the routing-table health view (issue #741).
     let bucket_refresh_clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
     tasks.spawn(crate::dht::bucket_refresh::run_bucket_refresh(
-        infra.ep.clone(),
+        infra.dht_conns.clone(),
         infra.secret_key.public(),
         Arc::clone(&ch.dht_routing),
         bucket_refresh_stop_rx,
@@ -2150,6 +2161,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let resolver_opt = ch.node_address_resolver.clone();
     let node_origin_opt = infra.node_origin.clone();
     let dht_routing_c = Arc::clone(&ch.dht_routing);
+    let dht_conns_c = infra.dht_conns.clone();
     let staker_set_c = Arc::clone(&ch.staker_set);
     let origin_directory_c = Arc::clone(&ch.origin_directory);
     let local_reputation_c = Arc::clone(&local_reputation);
@@ -2207,7 +2219,12 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             if let Some(resolver) = resolver_opt.as_ref() {
                 origin.provision(crate::node_origin::NodeOriginDeps {
                     endpoint: ep_for_buyer.clone(),
-                    dial_runtime: tokio::runtime::Handle::current(),
+                    connections: Connections::with_options(
+                        ep_for_buyer.clone(),
+                        decdn_protocol::ALPN_CLIENT,
+                        Some(tokio::runtime::Handle::current()),
+                    ),
+                    dht_connections: dht_conns_c,
                     routing_table: dht_routing_c,
                     staker_set: staker_set_c,
                     // FIND_VALUE directory reads: the last-resort fallback when

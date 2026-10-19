@@ -61,7 +61,8 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointAddr, PublicKey};
+use decdn_client::Connections;
+use iroh::{EndpointAddr, PublicKey};
 use rand::RngExt;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -893,7 +894,7 @@ async fn run_sweep_worker(
 // is a flat dispatcher.
 #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 pub async fn run_republish(
-    endpoint: Endpoint,
+    conns: Connections,
     self_id: PublicKey,
     routing: Arc<Mutex<RoutingTable>>,
     scheduler: Arc<RepublishScheduler>,
@@ -944,7 +945,7 @@ pub async fn run_republish(
                         scheduler.schedule_steady_if_absent(hash_bytes);
                         if !scheduler.is_announced(&hash_bytes) {
                             let accepted =
-                                publish_hash(&endpoint, self_node_id, &routing, &cache, hash_bytes)
+                                publish_hash(&conns, self_node_id, &routing, &cache, hash_bytes)
                                     .await;
                             metrics.dht_store_published(accepted);
                             if accepted > 0 {
@@ -1046,13 +1047,13 @@ pub async fn run_republish(
                     // routing peers yet, or every receiver refused — stays
                     // eligible for the eager publish on its next cache event.
                     let groups = budget.into_groups(&held.into_iter().collect());
-                    let ep = endpoint.clone();
+                    let conns = conns.clone();
                     let cache_cloned = cache.clone();
                     let metrics = Arc::clone(&metrics);
                     let scheduler = Arc::clone(&scheduler);
                     tokio::spawn(async move {
                         let outcome =
-                            publish_batch(&ep, self_node_id, &cache_cloned, groups).await;
+                            publish_batch(&conns, self_node_id, &cache_cloned, groups).await;
                         metrics.dht_store_published(outcome.accepted);
                         for hash in outcome.announced {
                             scheduler.mark_announced(hash);
@@ -1170,7 +1171,7 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
 ///
 /// Returns how many peers accepted the record.
 async fn publish_hash(
-    endpoint: &Endpoint,
+    conns: &Connections,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
     cache: &decdn_cache::CacheEngine,
@@ -1197,7 +1198,7 @@ async fn publish_hash(
     }
     let mut handles = Vec::with_capacity(targets.len());
     for peer in targets {
-        let endpoint_cloned = endpoint.clone();
+        let conns = conns.clone();
         let coverage_cloned = coverage.clone();
         handles.push(tokio::spawn(async move {
             let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
@@ -1212,7 +1213,7 @@ async fn publish_hash(
                 }
             };
             let addr = EndpointAddr::new(target_pk);
-            match client::store(&endpoint_cloned, addr, hash, self_node_id, coverage_cloned).await {
+            match client::store(&conns, addr, hash, self_node_id, coverage_cloned).await {
                 Ok(ack) if ack.accepted => 1,
                 Ok(_) => {
                     tracing::debug!(
@@ -1324,7 +1325,7 @@ impl ReceiverBudget {
 /// Returns how many `(peer, hash)` records the peers accepted, and which
 /// hashes at least one peer accepted with non-empty coverage.
 async fn publish_batch(
-    endpoint: &Endpoint,
+    conns: &Connections,
     self_node_id: NodeId,
     cache: &decdn_cache::CacheEngine,
     groups: HashMap<NodeId, Vec<ContentHash>>,
@@ -1346,7 +1347,7 @@ async fn publish_batch(
     let coverage_by_hash = Arc::new(coverage_by_hash);
     let mut handles = Vec::with_capacity(groups.len());
     for (peer, peer_hashes) in groups {
-        let endpoint_cloned = endpoint.clone();
+        let conns = conns.clone();
         let coverage_by_hash = Arc::clone(&coverage_by_hash);
         handles.push(tokio::spawn(async move {
             let target_pk = match PublicKey::from_bytes(peer.as_bytes()) {
@@ -1372,7 +1373,7 @@ async fn publish_batch(
                     })
                     .collect();
                 match client::batch_store(
-                    &endpoint_cloned,
+                    &conns,
                     addr.clone(),
                     entries.clone(),
                     self_node_id,

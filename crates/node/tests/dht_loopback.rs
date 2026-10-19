@@ -534,7 +534,7 @@ mod adr_013_error_codes {
 
         let started = std::time::Instant::now();
         let result = decdn_node::dht::client::find_value(
-            &client_ep,
+            &support::dht_conns(&client_ep),
             target,
             ContentHash::from_bytes([0x11; 32]),
             NodeId::from_bytes(*client_ep.id().as_bytes()),
@@ -573,7 +573,7 @@ mod adr_013_error_codes {
 
         let started = std::time::Instant::now();
         let result = decdn_node::dht::client::find_value(
-            &client_ep,
+            &support::dht_conns(&client_ep),
             target,
             ContentHash::from_bytes([0x11; 32]),
             NodeId::from_bytes(*client_ep.id().as_bytes()),
@@ -1628,6 +1628,7 @@ mod batch_store_admission {
 // handler over loopback (ADR 022 §STORE Flow Batched STORE).
 mod batch_store_client {
     use super::*;
+    use decdn_client::Connections;
     use decdn_node::dht::client;
 
     /// Spin up a staked-publisher DHT server whose accept loop serves an
@@ -1635,7 +1636,7 @@ mod batch_store_client {
     /// endpoint, its connect target, the publisher's key, the shared
     /// metrics handle, and the accept-loop join handle.
     #[allow(clippy::type_complexity)]
-    async fn spin_up_looping_staked_server(
+    pub(super) async fn spin_up_looping_staked_server(
         client_id: [u8; 32],
     ) -> anyhow::Result<(
         Endpoint,
@@ -1695,9 +1696,10 @@ mod batch_store_client {
         let (server_ep, target, _sid, _metrics, accept_task) =
             spin_up_looping_staked_server(holder).await?;
         let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
         let hashes: Vec<[u8; 32]> = (1u8..=4).map(|i| [i; 32]).collect();
         let ack = client::batch_store(
-            &client_ep,
+            &conns,
             target,
             hashes
                 .iter()
@@ -1709,6 +1711,363 @@ mod batch_store_client {
         .await?;
         assert_eq!(ack.results, vec![true; 4]);
         shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+}
+
+/// The outbound DHT primitives reuse one pooled connection per peer, redial
+/// once when a pooled connection turns out closed, and never retry a fresh
+/// dial that fails.
+mod pooled_client {
+    use super::*;
+    use decdn_client::Connections;
+    use decdn_node::dht::client;
+
+    /// Three `FindNode` calls to one peer through one map dial once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sequential_rpcs_to_one_peer_dial_once() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (server_ep, target, _sid, _metrics, accept_task) =
+            super::batch_store_client::spin_up_looping_staked_server(*client_id.as_bytes()).await?;
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+        for i in 1u8..=3 {
+            client::find_node(
+                &conns,
+                target.clone(),
+                NodeId::from_bytes([i; 32]),
+                client_id,
+            )
+            .await?;
+        }
+        assert_eq!(conns.dials(), 1, "three RPCs ride one connection");
+        drop(conns);
+        shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
+    /// Two calls more than the server's first-stream window (5 s) apart, but
+    /// inside its idle window (30 s), ride one connection: the server keeps a
+    /// connection that has served a request open for the next one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpcs_past_the_first_stream_window_ride_one_connection() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (server_ep, target, _sid, _metrics, accept_task) =
+            super::batch_store_client::spin_up_looping_staked_server(*client_id.as_bytes()).await?;
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+        find_node_via(&conns, &target, client_id, 1).await?;
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        find_node_via(&conns, &target, client_id, 2).await?;
+        assert_eq!(
+            conns.dials(),
+            1,
+            "a connection that has served a request stays open past 5 s"
+        );
+        drop(conns);
+        shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
+    /// What a scripted server does with one inbound connection.
+    #[derive(Clone, Copy)]
+    enum ConnPlan {
+        /// Answer this many `FindNode` streams with an empty response, then
+        /// close the connection when the next stream arrives, the way a
+        /// server closes at its per-connection budget.
+        Answer(usize),
+        /// Take the first stream, read its request, and never answer: the
+        /// connection and the stream stay open.
+        Stall,
+    }
+
+    /// Answer one `FindNode` stream with an empty `FindNodeResponse`.
+    async fn answer_find_node(
+        send: &mut iroh::endpoint::SendStream,
+        recv: &mut iroh::endpoint::RecvStream,
+    ) {
+        if let Ok(frame) = read_frame(recv, decdn_protocol::MAX_DHT_FRAME).await
+            && let Ok((wire::DhtMessage::FindNode(req), _)) =
+                decode_message::<wire::DhtMessage>(&frame)
+        {
+            let resp = wire::DhtMessage::FindNodeResponse(wire::FindNodeResponse {
+                target: req.target,
+                closer_nodes: wire::CloserNodes::default(),
+            });
+            if let Ok(bytes) = encode_message(&resp) {
+                let _ = write_frame(send, &bytes).await;
+                let _ = send.finish();
+            }
+        }
+    }
+
+    /// A server that follows `script` connection by connection, in accept
+    /// order, and `rest` for every connection past the script's end.
+    async fn scripted_server(
+        script: Vec<ConnPlan>,
+        rest: ConnPlan,
+    ) -> anyhow::Result<(Endpoint, EndpointAddr, tokio::task::JoinHandle<()>)> {
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
+        let accept_ep = server_ep.clone();
+        let task = tokio::spawn(async move {
+            let mut script = script.into_iter();
+            while let Some(incoming) = accept_ep.accept().await {
+                let plan = script.next().unwrap_or(rest);
+                tokio::spawn(async move {
+                    let Ok(connecting) = incoming.accept() else {
+                        return;
+                    };
+                    let Ok(conn) = connecting.await else {
+                        return;
+                    };
+                    match plan {
+                        ConnPlan::Stall => {
+                            let Ok((_send, mut recv)) = conn.accept_bi().await else {
+                                return;
+                            };
+                            let _ = read_frame(&mut recv, decdn_protocol::MAX_DHT_FRAME).await;
+                            conn.closed().await;
+                        }
+                        ConnPlan::Answer(n) => {
+                            for _ in 0..n {
+                                let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                                    return;
+                                };
+                                answer_find_node(&mut send, &mut recv).await;
+                            }
+                            if conn.accept_bi().await.is_ok() {
+                                conn.close(0u32.into(), b"budget-spent");
+                            }
+                            conn.closed().await;
+                        }
+                    }
+                });
+            }
+        });
+        let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+        Ok((server_ep, target, task))
+    }
+
+    /// A server that answers the first stream on each connection and closes
+    /// the connection when a second stream arrives.
+    async fn closing_server()
+    -> anyhow::Result<(Endpoint, EndpointAddr, tokio::task::JoinHandle<()>)> {
+        scripted_server(Vec::new(), ConnPlan::Answer(1)).await
+    }
+
+    /// One `FindNode` to `target` through `conns`.
+    async fn find_node_via(
+        conns: &Connections,
+        target: &EndpointAddr,
+        client_id: NodeId,
+        probe: u8,
+    ) -> anyhow::Result<wire::FindNodeResponse> {
+        client::find_node(
+            conns,
+            target.clone(),
+            NodeId::from_bytes([probe; 32]),
+            client_id,
+        )
+        .await
+    }
+
+    /// A connection this call dialled itself that fails is not redialled:
+    /// a server that closes every connection on its first stream costs the
+    /// call one dial.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_dial_that_fails_is_not_retried() -> anyhow::Result<()> {
+        let (server_ep, target, accept_task) =
+            scripted_server(Vec::new(), ConnPlan::Answer(0)).await?;
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+
+        let err = find_node_via(&conns, &target, client_id, 1)
+            .await
+            .expect_err("a connection closed on its first stream fails the call");
+        assert!(
+            !format!("{err:#}").contains("after a redial"),
+            "a fresh dial's failure is the peer's, not a redial's: {err:#}"
+        );
+        assert_eq!(conns.dials(), 1, "the failed fresh dial is not retried");
+        drop(conns);
+        shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
+    /// A redial that fails is not retried again: the second call to a peer
+    /// whose pinned connection closed under it redials once, fails on the
+    /// fresh connection, and stops at two dials. The next call dials again,
+    /// because the failed fresh connection is closed, and succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_redial_is_not_retried() -> anyhow::Result<()> {
+        let (server_ep, target, accept_task) = scripted_server(
+            vec![ConnPlan::Answer(1), ConnPlan::Answer(0)],
+            ConnPlan::Answer(usize::MAX),
+        )
+        .await?;
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+
+        find_node_via(&conns, &target, client_id, 1).await?;
+        assert_eq!(conns.dials(), 1);
+        let err = find_node_via(&conns, &target, client_id, 2)
+            .await
+            .expect_err("the redialled connection closes on its first stream");
+        assert!(
+            format!("{err:#}").contains("after a redial"),
+            "the failure names the redial and the pinned failure: {err:#}"
+        );
+        assert_eq!(conns.dials(), 2, "one redial, and no third dial");
+        find_node_via(&conns, &target, client_id, 3).await?;
+        assert_eq!(
+            conns.dials(),
+            3,
+            "the next call dials past the closed redial"
+        );
+        drop(conns);
+        shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
+    /// A call that times out on a connection that stays open unpins it: the
+    /// next call dials afresh instead of queueing on the stalled connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_that_times_out_unpins_its_connection() -> anyhow::Result<()> {
+        let (server_ep, target, accept_task) =
+            scripted_server(vec![ConnPlan::Stall], ConnPlan::Answer(usize::MAX)).await?;
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+
+        let err = find_node_via(&conns, &target, client_id, 1)
+            .await
+            .expect_err("a stream nobody answers times out");
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "the failure is the client timeout: {err:#}"
+        );
+        assert_eq!(conns.dials(), 1);
+        find_node_via(&conns, &target, client_id, 2).await?;
+        assert_eq!(
+            conns.dials(),
+            2,
+            "the stalled connection is unpinned, so the next call dials"
+        );
+        drop(conns);
+        shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
+    /// A call its caller aborts mid-flight (a lookup round deadline) unpins
+    /// the connection it used, so the next call dials afresh.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_aborted_call_unpins_its_connection() -> anyhow::Result<()> {
+        let (server_ep, target, accept_task) =
+            scripted_server(vec![ConnPlan::Stall], ConnPlan::Answer(usize::MAX)).await?;
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+
+        let in_flight = tokio::spawn({
+            let conns = conns.clone();
+            let target = target.clone();
+            async move { find_node_via(&conns, &target, client_id, 1).await }
+        });
+        // Let the call dial and park on its read, then abort it the way a
+        // lookup round deadline does.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while conns.dials() < 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        in_flight.abort();
+        assert!(in_flight.await.is_err_and(|e| e.is_cancelled()));
+
+        find_node_via(&conns, &target, client_id, 2).await?;
+        assert_eq!(
+            conns.dials(),
+            2,
+            "the aborted call's connection is unpinned, so the next call dials"
+        );
+        drop(conns);
+        shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
+    /// A pooled connection the server closes under the next call is redialled
+    /// once, and the call succeeds on the fresh connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pooled_call_redials_after_server_closed_connection() -> anyhow::Result<()> {
+        let (server_ep, target, accept_task) = closing_server().await?;
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+
+        let first = client::find_node(
+            &conns,
+            target.clone(),
+            NodeId::from_bytes([1; 32]),
+            client_id,
+        )
+        .await?;
+        assert_eq!(first.target, NodeId::from_bytes([1; 32]));
+        assert_eq!(conns.dials(), 1);
+        let second = client::find_node(
+            &conns,
+            target.clone(),
+            NodeId::from_bytes([2; 32]),
+            client_id,
+        )
+        .await?;
+        assert_eq!(second.target, NodeId::from_bytes([2; 32]));
+        assert_eq!(
+            conns.dials(),
+            2,
+            "the closed pooled connection redials once"
+        );
+        drop(conns);
+        shutdown([accept_task], [&client_ep, &server_ep]).await?;
+        Ok(())
+    }
+
+    /// A peer nobody runs fails within the client timeout, on one dial.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dead_peer_fails_within_client_timeout_without_retry() -> anyhow::Result<()> {
+        let client_sk = fresh_key();
+        let client_id = NodeId::from_bytes(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let conns = Connections::with_options(client_ep.clone(), ALPN_DHT, None);
+        // A bound-then-dropped socket: nothing answers on it.
+        let dead_addr = std::net::UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
+        let target = EndpointAddr::new(fresh_key().public()).with_ip_addr(dead_addr);
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            client::DHT_CLIENT_TIMEOUT + std::time::Duration::from_secs(2),
+            client::find_node(&conns, target, NodeId::from_bytes([1; 32]), client_id),
+        )
+        .await
+        .expect("the call must end within the client timeout");
+        assert!(result.is_err(), "a dead peer must fail");
+        assert!(
+            started.elapsed() <= client::DHT_CLIENT_TIMEOUT + std::time::Duration::from_secs(1)
+        );
+        assert_eq!(conns.dials(), 1, "a fresh dial that fails is not retried");
+        drop(conns);
+        shutdown([], [&client_ep]).await?;
         Ok(())
     }
 }

@@ -28,6 +28,18 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **`decdn-client` pools connections per node on one ALPN, on a map-chosen
+  runtime (#2475).** `Connections::with_options(endpoint, alpn, dial_runtime)`
+  builds a map whose every dial and connection driver runs on `dial_runtime`
+  (`None` dials on the caller's runtime), `Connections::alpn` names its ALPN,
+  and `Connections::get_or_dial` returns a `Lease` that says whether the call
+  dialled the connection or took one already pinned. A pull on a map's
+  connection that was pinned before the open and is closed under it redials
+  once; a fresh dial that fails is not retried. `PeerSource::open_span` opens
+  one range of a hash on the source's connection. `PeerSource::with_dial_runtime`
+  and the `dial_runtime` argument of `open_progressive_pull` do not exist: a
+  caller that pulls on a runtime it drops afterwards opens its pulls through a
+  map with a dial runtime, and a map-less open dials on the caller's runtime.
 - **`decdn-protocol`: `ProbeResponseExt::consistent_with` takes the signed
   `&ProbeResponseBody`, not `has_blob` alone (#2471).** The rule keys on
   `body.hash`: for `EMPTY_ROOT` (new constant, the BLAKE3 hash of zero bytes)
@@ -285,13 +297,13 @@ since project inception and will roll into the first tagged release.
   and `SourceLane` gains `lease: Option<&LaneLease>`; the scheduler drops the
   lease when that lane's worker stops. A caller that builds these structs
   sets the new field (`None`, or `LaneLease::default()`).
-- **`decdn-client` dials on a caller-chosen runtime (#2185).**
-  `PeerSource::with_dial_runtime(Handle)` replaces `with_dial_observer`, and
-  `DialObserver` is removed. `open_progressive_pull` and
-  `WarmConnection::connect` each take a new `dial_runtime: Option<&Handle>`
-  argument; `None` dials on the caller's runtime as before. A caller that pulls
-  on a runtime it drops afterwards passes a long-lived runtime, so every
-  connection's QUIC driver outlives the pull.
+- **`decdn-client` dials on a caller-chosen runtime (#2185, #2475).**
+  `WarmConnection::connect` takes a `dial_runtime: Option<&Handle>` argument,
+  and a `Connections` map built with `with_options` dials every connection on
+  its own dial runtime; `None` dials on the caller's runtime. A caller that
+  pulls on a runtime it drops afterwards opens its pulls through a map with a
+  long-lived dial runtime, so every connection's QUIC driver outlives the pull.
+  `DialObserver` and `PeerSource::with_dial_observer` do not exist.
 - **An underpaying voucher gets an `Underpaid` rejection carrying the node's
   watermark, and a diverged payer lane heals itself.** Wire-breaking:
   `VoucherRejectReason::Underpaid` is appended as discriminant 14 and is
@@ -3373,6 +3385,19 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Node: one warm connection per peer for DHT calls and pull legs (#2475).**
+  A node keeps one `cdn/dht/v1` connection per peer, shared by bootstrap,
+  bucket refresh, republish and lookups, and one `cdn/client/v1` connection
+  per upstream, shared by every pull leg and header handshake. Both maps dial
+  on the main runtime, so no pull leg's throwaway runtime owns a connection
+  driver. A DHT call whose pinned connection is closed under it redials once
+  and never retries a connection it dialled itself; a call that times out, or
+  that a lookup round deadline aborts, unpins its connection. The DHT server
+  waits 5 s for a connection's first stream and 30 s between streams, the
+  `cdn/client/v1` idle window, then closes an idle connection with reason
+  `dht-idle`; the 256-request and 5-minute caps are unchanged. A warm
+  connection holds one dispatch permit while it idles; `decdn_dispatch_in_flight`
+  shows the headroom under `max_concurrent_handlers`.
 - **`decdn gateway` runs pulls at once on one long-lived worker (#2458).**
   The endpoint, the buyer-pool store and the connections to nodes are built
   once per gateway run instead of once per request, and up to 16 pulls stream

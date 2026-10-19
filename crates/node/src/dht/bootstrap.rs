@@ -23,7 +23,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use iroh::{Endpoint, EndpointAddr, PublicKey};
+use decdn_client::Connections;
+use iroh::{EndpointAddr, PublicKey};
 use rand::seq::SliceRandom;
 
 use crate::dht::chain_projection::with_lock;
@@ -69,7 +70,7 @@ pub struct BootstrapOutcome {
 // ordering that the seed table is populated BEFORE we go to network.
 #[allow(clippy::cognitive_complexity)]
 pub async fn bootstrap(
-    endpoint: &Endpoint,
+    conns: &Connections,
     self_id: PublicKey,
     routing: &Arc<Mutex<RoutingTable>>,
     staker_set: &Arc<dyn StakerSet>,
@@ -120,7 +121,7 @@ pub async fn bootstrap(
     let fanout: Vec<NodeId> = seeds_shuffled.into_iter().take(BOOTSTRAP_FANOUT).collect();
     let mut handles = Vec::with_capacity(fanout.len());
     for peer in fanout {
-        let endpoint_cloned = endpoint.clone();
+        let conns = conns.clone();
         let target_id = peer;
         handles.push(tokio::spawn(async move {
             let target_pk = match PublicKey::from_bytes(target_id.as_bytes()) {
@@ -138,8 +139,7 @@ pub async fn bootstrap(
                 }
             };
             let addr = EndpointAddr::new(target_pk);
-            let result =
-                client::find_node(&endpoint_cloned, addr, self_node_id, self_node_id).await;
+            let result = client::find_node(&conns, addr, self_node_id, self_node_id).await;
             (target_id, result)
         }));
     }
