@@ -59,6 +59,7 @@ The line installs `decdn` and asks you to pass one check in the browser (it open
 link, or prints it). Then it downloads into the current directory and verifies every byte
 on the way in. Run it again after an interruption
 and it resumes. A sponsor pays for the transfer, so you need no wallet, keys, or account.
+Later, `decdn self-update` moves the installed binary to the latest signed release.
 
 The [catalogue on decdn.org](https://decdn.org/#try) lists more seeded content. To pay for
 your own users' downloads the same way, run [sponsord](https://github.com/decdn/sponsord).
@@ -108,6 +109,15 @@ docker pull ghcr.io/decdn/decdn          # CLI only; mirrored to docker.io/decdn
 Each [GitHub release](https://github.com/decdn/decdn/releases) also carries
 `decdn-${VERSION}-${TARGET}` and `decdn-node-${VERSION}-${TARGET}` archives (`.tar.gz`,
 or `.zip` on Windows). [SECURITY.md](SECURITY.md) explains how to verify each channel.
+
+A `decdn` installed from an archive or by the one-liner updates itself:
+`decdn self-update` fetches the latest release, verifies its `SHA256SUMS.minisig`
+against the key the binary embeds, and replaces the binary in place. A binary
+`cargo install` placed, or one in a directory you cannot write (the container
+image, a package), is refused with the command to run instead. Once a day, after
+a command succeeds on a terminal, `decdn` prints one line when a newer release
+exists; `[self_update] check = false` in `node.toml` or
+`DECDN_SELF_UPDATE_CHECK=0` turns that off. `decdn-node` never updates itself.
 
 <details>
 <summary><b>Running the container images</b></summary>
@@ -331,6 +341,7 @@ subcommand, `run`; **`decdn`** is every command a human types. Run
 | `publish {…}` | Publisher control plane: `namespace create`; seat and unseat authorized origins with `assign` and `revoke` |
 | `origin {import}` | Write local content into a local filesystem origin store, offline and config-free |
 | `appeal {slash}` | File a slash appeal and post the appeal bond ([ADR 028](adr/028-slashing-appeals.md)) |
+| `self-update` | Replace this binary with the latest release whose `SHA256SUMS.minisig` the embedded key verifies; `--check` only reports |
 
 The global `--config <path>` selects the config file, and every `decdn-node run` flag also
 reads a `DECDN_*` environment variable (`decdn-node run --help`). Every chain endpoint and

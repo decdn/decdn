@@ -4,8 +4,11 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 
 > **Status: early implementation.** deCDN runs a public testnet on Arbitrum Sepolia and is pre-mainnet. Wire formats, APIs and on-chain interfaces change without compatibility shims until mainnet.
 
-The user-facing `decdn` binary: `probe`, `node` administration, `key-gen`, `config` and
-`bundle` subcommands.
+The user-facing `decdn` binary: `get`, `probe`, `node` administration, `key-gen`,
+`config`, `pool`, `publish`, `origin`, `appeal`, `gateway` and `self-update`
+subcommands. `self-update` replaces the binary with the latest release whose
+`SHA256SUMS.minisig` verifies against the minisign key embedded from
+[`minisign.pub`](https://github.com/decdn/decdn/blob/main/crates/cli/minisign.pub).
 
 ```sh
 cargo install decdn-cli

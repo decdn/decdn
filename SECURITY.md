@@ -30,10 +30,19 @@ depth: it lives in the repository it is checking. Record the fingerprint above
 out of band the first time you verify a release, and compare against your copy
 afterwards.
 
-Each release carries seven signatures: the tag, the version-bump commit, the
+Each release carries seven GPG signatures: the tag, the version-bump commit, the
 `SHA256SUMS` manifest covering every archive, and for each of the two container
 images its digest file and its SBOM. Individual archives carry no `.asc` of their
 own — verify them through the signed manifest.
+
+`SHA256SUMS` carries one more signature, `SHA256SUMS.minisig`, made with
+[minisign](https://jedisct1.github.io/minisign/). It exists for
+`decdn self-update`: the `decdn` binary embeds the minisign public key committed
+as [`crates/cli/minisign.pub`](crates/cli/minisign.pub) and refuses a release
+whose manifest signature no embedded key verifies, before it reads a byte of
+the archive. The key's id is in that file's first line; pin it as you pin the
+GPG fingerprints. A rotation ships the next key inside a release signed by
+the current one (RELEASING.md § The minisign key).
 
 ### Verify a release tag
 
@@ -59,6 +68,14 @@ Verify the signed checksum manifest, then check your archive against it:
 ```bash
 gpg --verify SHA256SUMS.asc SHA256SUMS
 sha256sum --ignore-missing --check SHA256SUMS
+```
+
+The minisign signature verifies the same manifest with the key from
+`crates/cli/minisign.pub`; `decdn self-update` runs this check itself and
+applies no release that fails it:
+
+```bash
+minisign -Vm SHA256SUMS -p minisign.pub
 ```
 
 ### Verify the container images
@@ -104,7 +121,8 @@ fetchable by digest in that window; what the tags guarantee is that a pull *by
 name* never reaches unsigned bytes.
 
 A prerelease (`v1.2.0-rc1`) is published only as its exact version tag —
-`latest` and `<major>.<minor>` are never moved to a release candidate.
+`latest` and `<major>.<minor>` are never moved to a release candidate — and is
+marked pre-release on GitHub, so `decdn self-update` never offers it.
 
 Each image's SBOM (`decdn-node-<version>-sbom.spdx.json` and
 `decdn-<version>-sbom.spdx.json`) ships with a matching `.asc`.

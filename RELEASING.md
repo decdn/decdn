@@ -28,7 +28,22 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    gpg --fingerprint <your-key-id>           # add the fingerprint to SECURITY.md
    ```
 
-2. **Git configured to sign.** `cargo release` relies on git's own signing
+2. **A minisign key.** `sign-release.sh` also signs `SHA256SUMS` with
+   minisign, the signature `decdn self-update` checks. The binary trusts only
+   the public keys committed as `crates/cli/minisign*.pub`, so the key you
+   sign with must be one of them. Generate the pair once and keep the secret
+   half out of the repository:
+
+   ```bash
+   minisign -G -p crates/cli/minisign.pub -s ~/.minisign/minisign.key
+   ```
+
+   Commit `crates/cli/minisign.pub` and list its key id in SECURITY.md. The
+   script reads the secret key from `DECDN_MINISIGN_KEY`, defaulting to
+   `~/.minisign/minisign.key`. See [The minisign key](#the-minisign-key) for
+   rotation.
+
+3. **Git configured to sign.** `cargo release` relies on git's own signing
    config; `release.toml` sets `sign-commit` and `sign-tag`. Set this
    explicitly — git otherwise selects a key by matching `user.email`, which may
    not be the key you published.
@@ -37,10 +52,11 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    git config user.signingkey <your-fingerprint>
    ```
 
-3. **Tools.** `cargo install cargo-release git-cliff`, plus `gh auth login`.
+4. **Tools.** `cargo install cargo-release git-cliff`, `minisign` (a package
+   on every platform), plus `gh auth login`.
    `python3` for the Docker Hub overview push.
 
-4. **Registry logins.** `docker login ghcr.io` with a token carrying
+5. **Registry logins.** `docker login ghcr.io` with a token carrying
    `write:packages`, and `docker login docker.io` — both images go to both
    registries. The Docker Hub repositories `decdn/decdn-node` and
    `decdn/decdn` must exist first. The same Docker Hub login writes each
@@ -51,20 +67,20 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    Skip the Docker Hub login with `DECDN_SKIP_DOCKERHUB=1` if you only need
    GHCR.
 
-5. **Public GHCR packages.** The first push of an image creates its GHCR
+6. **Public GHCR packages.** The first push of an image creates its GHCR
    package as **private**, and a private package denies every anonymous
    `docker pull`. After the first release run, set `decdn-node` and `decdn`
    to public (package settings, *Change visibility*). `sign-release.sh`
    checks every promoted repository without credentials and refuses to
    publish while one is private.
 
-6. **A crates.io token.** `cargo login`, with a token scoped to
+7. **A crates.io token.** `cargo login`, with a token scoped to
    publish-update (and publish-new for the first release). Membership of the
    `decdn` crates.io owner set is what makes it work; the token itself is
    personal and never leaves your machine. That owner set does not exist until
    the first publish creates it — see [Crate ownership](#crate-ownership).
 
-7. **Before the *first* release only — clear the new-crate rate limit.**
+8. **Before the *first* release only — clear the new-crate rate limit.**
    crates.io limits crate *creation* far harder than updates: `PublishNew`
    allows a burst of 5, then roughly one per 10 minutes. The first release
    creates **ten** crates at once, so a single run would be rate-limited
@@ -176,8 +192,10 @@ mark it revoked or expired; force-fetches tags and checks your local tag matches
 verifies the tag signature; downloads the draft's assets; checks `SHA256SUMS`
 strictly against them **and** that every published archive appears in the
 manifest; signs `SHA256SUMS` and each image's digest file and SBOM; verifies
-each signature against a keyring built only from `KEYS`; uploads the five
-`.asc` files; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
+each signature against a keyring built only from `KEYS`; signs `SHA256SUMS` a
+second time with minisign and verifies that against the committed
+`crates/cli/minisign*.pub`; uploads the five `.asc` files and
+`SHA256SUMS.minisig`; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
 signed digest on GHCR; mirrors those same digests to Docker Hub; for a stable
 release, pushes each Docker Hub overview; checks that every promoted repository
 is pullable without credentials; and flips the release out of draft.
@@ -215,6 +233,7 @@ Useful environment overrides:
 | Variable | Effect |
 |----------|--------|
 | `DECDN_SIGNING_KEY` | key to sign with. Unset, the script uses your one secret key with a live `@decdn.org` uid that is in `KEYS`, else your one secret key that is in `KEYS`. Set it when you hold two or more such keys (for example during a key rotation). gpg.conf's `default-key` is not read |
+| `DECDN_MINISIGN_KEY` | the minisign secret key that signs `SHA256SUMS` for `decdn self-update` (default `~/.minisign/minisign.key`). Its public half must be one of `crates/cli/minisign*.pub` |
 | `DECDN_SKIP_IMAGE_TAGS` | set to `1` to publish with **no** pullable image tag at all — the release then ships only the signed digests |
 | `DECDN_SKIP_DOCKERHUB` | set to `1` to tag on GHCR only, with no Docker Hub mirror or overview (implied by `DECDN_SKIP_IMAGE_TAGS`) |
 | `DECDN_DOCKERHUB_REPO` | the Docker Hub counterpart of `DECDN_REPO` (defaults to it); the images are `<it>-node` and `<it>` |
@@ -231,7 +250,9 @@ Docker Hub namespace genuinely differs from the GitHub one.
 For a stable version the promoted tags are `latest`, `<version>` and
 `<major>.<minor>`. A prerelease (`v1.2.0-rc1`) gets only its exact version tag:
 moving `latest` to a candidate would hand it to every unpinned pull, and
-`<major>.<minor>` would clobber the stable minor tag.
+`<major>.<minor>` would clobber the stable minor tag. It is also published with
+`--prerelease`, so GitHub's "latest" release, which `decdn self-update` and
+the devops release resolver read, never names a candidate.
 
 Re-running is safe at any point before the release is published — signatures
 are re-uploaded with `--clobber` and the tag promotion is idempotent. Once the
@@ -240,6 +261,36 @@ release means deleting and re-cutting it.
 
 On failure the script keeps its download directory and prints the path, so you
 can inspect the bytes rather than re-downloading several hundred megabytes.
+
+## The minisign key
+
+`decdn self-update` trusts a release only when `SHA256SUMS.minisig` verifies
+against a key the running binary embeds: the `crates/cli/minisign*.pub` files,
+included at build time. GPG stays the channel people verify by hand
+([SECURITY.md](SECURITY.md#verify-a-binary-archive)); minisign is the one the
+binary carries, because a full OpenPGP implementation has no place in the
+client crate graph.
+
+A binary can only ever accept a key it already embeds, so a rotation runs
+across two releases:
+
+1. Generate the new pair. Rename the current `crates/cli/minisign.pub` to
+   `crates/cli/minisign-prev.pub`, commit the new public key as
+   `crates/cli/minisign.pub`, and add the second `include_str!` to
+   `TRUSTED_KEYS` in `crates/cli/src/commands/self_update/verify.rs` (a unit
+   test keeps that list equal to the files).
+2. Cut release N and sign it with the **old** key (`DECDN_MINISIGN_KEY` names
+   it). Every installed binary verifies it, and the binary it ships trusts
+   both keys.
+3. From release N+1 on, sign with the new key. A binary older than N refuses
+   those releases and tells its user to reinstall; say so in the release
+   notes of N.
+4. Once no supported binary predates N, delete `minisign-prev.pub` and its
+   `TRUSTED_KEYS` entry.
+
+The script accepts whichever committed key verifies the signature, so a
+release signed with a key whose public half is not committed stops before
+anything is uploaded.
 
 ## Publishing to crates.io
 
@@ -252,7 +303,7 @@ scripts/publish-crates.sh v0.1.2
 It verifies the tag against `KEYS` and against `origin` the way
 `sign-release.sh` does, and adds two checks of its own. It **requires the
 release to be published, not a draft**, and — because leaving draft does not by
-itself prove anything was signed — it **requires `SHA256SUMS.asc` to be
+itself prove anything was signed — it **requires `SHA256SUMS.asc` and `SHA256SUMS.minisig` to be
 attached**. A crates.io version can never be replaced, so nothing reaches the
 registry that no maintainer signature vouches for.
 
