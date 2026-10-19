@@ -835,13 +835,8 @@ async fn pull_manifest(
     // (already glob-filtered) list in their editor. Everything deselected ends
     // the run (reported) like an empty filter.
     let selected = async {
-        let obtained = tokio::select! {
-            obtained = obtain_manifest(puller, (args, out), uri, filter, filters_given) => {
-                obtained?
-            }
-            () = interrupt.wait() => return Err(Interrupted.into()),
-        };
-        let Some(kept) = obtained else {
+        let fetch = obtain_manifest(puller, (args, out), uri, filter, filters_given);
+        let Some(kept) = until_interrupted(fetch, interrupt).await? else {
             return Ok(None);
         };
         let kept = maybe_select(args, out, uri, kept)?;
@@ -883,6 +878,19 @@ async fn pull_manifest(
         BundleEnd::Interrupted => Err(Interrupted.into()),
         BundleEnd::FundingNeeded { error, .. } | BundleEnd::Stopped(error) => Err(error),
         _ => reported,
+    }
+}
+
+/// `fetch`'s result, or [`Interrupted`] when the first Ctrl-C arrives first.
+/// The Ctrl-C drops `fetch` where it is, which queues the watermark writes of
+/// the lanes it drew on; the puller's `finish` settles them.
+async fn until_interrupted<T>(
+    fetch: impl std::future::Future<Output = anyhow::Result<T>>,
+    interrupt: &mut Interrupt,
+) -> anyhow::Result<T> {
+    tokio::select! {
+        got = fetch => got,
+        () = interrupt.wait() => Err(Interrupted.into()),
     }
 }
 

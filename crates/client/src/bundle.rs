@@ -40,7 +40,6 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
-use crate::discovery::NodeCandidate;
 use crate::funding::RunFunding;
 use crate::ordered_writes::OrderedWrites;
 use crate::session::{
@@ -54,6 +53,7 @@ use crate::{
 };
 
 mod engine;
+mod landing;
 mod manifest_cache;
 mod skip_cache;
 
@@ -373,8 +373,9 @@ pub enum Funding {
 pub struct NodeSelection {
     /// The node every entry pulls from, when one is pinned.
     pinned: Option<PinnedNode>,
-    /// Every active registered node, when none is pinned.
-    registry: Option<Vec<NodeCandidate>>,
+    /// Every active registered node, and whether the list is a live read,
+    /// when none is pinned.
+    registry: Option<engine::Registry>,
 }
 
 /// Resolve where a pull's entries find their holders, once for the run.

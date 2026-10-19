@@ -67,9 +67,11 @@ pub struct ClientConfig {
     /// Regions to restrict discovery/probing to; empty/absent = no filter.
     ///
     /// This is a DISCOVERY-TIME filter only: it narrows the pool the client
-    /// probes/rediscovers. It does NOT apply to the probe-less peer-store fast
-    /// path, where measured latency ranking already governs which peers are
-    /// near, so a warm store selects by latency without consulting this list.
+    /// probes/rediscovers, for a single fetch and for every entry's candidate
+    /// sample in a bundle pull alike. It does NOT apply to the probe-less
+    /// peer-store fast path, where measured latency ranking already governs
+    /// which peers are near, so a warm store selects by latency without
+    /// consulting this list.
     pub region_allowlist: Option<Vec<String>>,
 }
 

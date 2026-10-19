@@ -1090,3 +1090,49 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
         .await
         .unwrap();
 }
+
+/// A guard whose drop sets `flag`: it stands in for the fetch's lanes, whose
+/// drop queues their watermark writes.
+struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The first Ctrl-C during the manifest fetch ends the run `Interrupted` and
+/// drops the fetch where it is, which is what settles its lanes.
+#[tokio::test]
+async fn a_ctrl_c_during_the_manifest_fetch_ends_the_run_and_drops_the_fetch() {
+    let (fire, mut interrupt) = Interrupt::manual();
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = DropFlag(dropped.clone());
+    let fetch = async move {
+        let _held = guard;
+        std::future::pending::<anyhow::Result<()>>().await
+    };
+    let run = until_interrupted(fetch, &mut interrupt);
+    tokio::pin!(run);
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(20), &mut run).await;
+    assert!(waited.is_err(), "the run waits with the pending fetch");
+    assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+    fire.send(()).unwrap();
+    let err = run.await.unwrap_err();
+    assert!(err.downcast_ref::<Interrupted>().is_some(), "{err:#}");
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the fetch is dropped"
+    );
+}
+
+/// With no Ctrl-C, the manifest fetch's own result is the run's.
+#[tokio::test]
+async fn the_manifest_fetch_wins_when_nothing_fires() {
+    let (_fire, mut interrupt) = Interrupt::manual();
+    let got = until_interrupted(async { anyhow::Ok(7) }, &mut interrupt)
+        .await
+        .unwrap();
+    assert_eq!(got, 7);
+}

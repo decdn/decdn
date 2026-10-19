@@ -52,6 +52,10 @@ alloy = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+# A bundle pull lands every entry beneath the output directory's handle, so a
+# symlink in an entry's parent chain cannot move the write outside it (#2439).
+cap-std = { workspace = true }
+cap-tempfile = { workspace = true }
 iroh = { workspace = true }
 # `discovery::select_candidates` shuffles the probe sample (#1988).
 rand = { workspace = true }

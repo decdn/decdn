@@ -1090,6 +1090,20 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: a bundle pull lands no entry outside its output directory, and
+  applies `[client] region_allowlist` to every entry (#2439).** A manifest
+  path is checked for `..` and absolute components, but the write followed a
+  symlink in the entry's parent directories: with `out/link -> /elsewhere`
+  and an entry `link/file`, the pull wrote `/elsewhere/file`. The pull now
+  holds the output directory open and resolves each entry beneath that
+  handle (cap-std). Such an entry fails with a message that names the path,
+  before its blob is paid for when the link already exists, the rest of the
+  pull goes on, and a fetched blob stays in `.decdn-partial/` for a rerun. A
+  relative symlink inside the output directory still works; one with an
+  absolute target is treated as an escape. Each entry's candidate sample now
+  keeps to `region_allowlist` with the same widening as a single fetch, and a
+  list the peer store supplied during a registry outage is not narrowed. The
+  Ctrl-C watch that covers the paid manifest fetch has a regression test.
 - **DHT: a bonded peer that is offline costs a lookup one dial budget, once
   per cooldown, not the 8 s round on every lookup that picks it (#2532).**
   The registry seeds every bonded peer into every routing table, and a bond

@@ -162,6 +162,10 @@ fs4 = "1.1"
 
 # Misc
 bytes = "1"
+# Beneath-root landing of bundle entries: `decdn-client` resolves every
+# destination through the output directory's handle (#2439).
+cap-std = "4"
+cap-tempfile = "4"
 indexmap = "2"
 rand = "0.10"
 rpassword = "7"
