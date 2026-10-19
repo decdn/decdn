@@ -22,7 +22,7 @@ use minisign_verify::PublicKey;
 use semver::Version;
 use tempfile::NamedTempFile;
 
-pub use check::{NudgePolicy, maybe_nudge};
+pub use check::{NudgePolicy, Pending, start as start_nudge};
 use install::Ownership;
 use release::{Clients, Target, Upgrade};
 

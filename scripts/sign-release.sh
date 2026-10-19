@@ -139,6 +139,9 @@ MINISIGN_KEY="${DECDN_MINISIGN_KEY:-$HOME/.minisign/minisign.key}"
 [[ -f "$MINISIGN_KEY" ]] || die \
   "minisign secret key not found at $MINISIGN_KEY (set DECDN_MINISIGN_KEY).
 See RELEASING.md § The minisign keys."
+# Absolute before the download step changes directory, or a relative path
+# that just passed the check above fails to open when it is used.
+[[ "$MINISIGN_KEY" == /* ]] || MINISIGN_KEY="$PWD/$MINISIGN_KEY"
 MINISIGN_PUBS=( "$REPO_ROOT"/crates/cli/minisign*.pub )
 [[ -f "${MINISIGN_PUBS[0]}" ]] || die \
   "no crates/cli/minisign*.pub in the repository; the binary would trust no release key"
@@ -492,6 +495,36 @@ done
   "SHA256SUMS.minisig is not signed by a key the decdn binary trusts (crates/cli/minisign*.pub at $TAG).
 $MINISIGN_KEY is not the key whose public half that tree carries; see RELEASING.md § The minisign keys.
 minisign said: ${MINISIGN_ERR:-nothing}"
+
+# A binary in the field trusts only the keys of the release it was built from,
+# so this release must also verify under a key the previous tag's tree
+# carries, or every installed binary refuses it. A key new in this release
+# signs from the next one. The first tag that carries keys has no previous
+# key set and skips the check.
+mapfile -t PREV_TAGS < <(git -C "$REPO_ROOT" tag --list 'v*' --sort=-v:refname | grep -vx -- "$TAG" || true)
+PREV_TAG="${PREV_TAGS[0]:-}"
+PREV_PUBS=()
+if [[ -n "$PREV_TAG" ]]; then
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    git -C "$REPO_ROOT" show "${PREV_TAG}:${f}" > "$KEYS_HOME/prev-${f##*/}" ||
+      die "cannot read $f from the $PREV_TAG tree"
+    PREV_PUBS+=( "$f" )
+  done < <(git -C "$REPO_ROOT" ls-tree --name-only "$PREV_TAG" -- crates/cli/ | grep -E '^crates/cli/minisign[^/]*\.pub$' || true)
+fi
+if (( ${#PREV_PUBS[@]} > 0 )); then
+  PREV_OK=""
+  for f in "${PREV_PUBS[@]}"; do
+    if minisign -V -q -p "$KEYS_HOME/prev-${f##*/}" -m SHA256SUMS -x SHA256SUMS.minisig >/dev/null 2>&1; then
+      PREV_OK="$f"
+      break
+    fi
+  done
+  [[ -n "$PREV_OK" ]] || die \
+    "SHA256SUMS.minisig is signed by a key not trusted by the binaries in the field: it is not among the
+crates/cli/minisign*.pub at $PREV_TAG, the release they were built from. Sign $TAG with a key
+committed at $PREV_TAG; a key new in $TAG signs from the next release (RELEASING.md § The minisign keys)."
+fi
 echo "    signed SHA256SUMS.minisig ($MINISIGN_PUB)"
 
 # ---- publish -------------------------------------------------------------

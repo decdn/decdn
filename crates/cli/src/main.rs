@@ -82,6 +82,10 @@ async fn run() -> anyhow::Result<()> {
 
     let config_path = cli.config.map(|p| cli::common::expand_tilde(&p));
 
+    // The daily update lookup runs alongside the command; its line is
+    // printed only once the command has succeeded.
+    let pending = commands::self_update::start_nudge(nudge, config_path.as_deref());
+
     let result = match cli.command {
         Command::KeyGen(args) => commands::key_gen::key_gen(&args),
         Command::Whoami(args) => commands::whoami::whoami(&args, config_path.as_deref()),
@@ -110,10 +114,12 @@ async fn run() -> anyhow::Result<()> {
         },
         Command::SelfUpdate(args) => commands::self_update::self_update(&args).await,
     };
-    // After the command's own work, and only when it succeeded: a command
-    // that failed has the terminal's attention already.
-    if result.is_ok() {
-        commands::self_update::maybe_nudge(nudge, config_path.as_deref()).await;
+    if let Some(pending) = pending {
+        if result.is_ok() {
+            pending.finish().await;
+        } else {
+            pending.cancel();
+        }
     }
     result
 }

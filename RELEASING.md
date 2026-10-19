@@ -42,11 +42,14 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    Commit the `.pub`, add its `include_str!` line to `TRUSTED_KEYS` in
    `crates/cli/src/commands/self_update/verify.rs` (a unit test keeps that
    list equal to the files), and add the key id beside your fingerprint in
-   SECURITY.md. A binary trusts your key from the first release built after
-   the file lands, so merge it before the tag you sign. The script reads the
-   secret key from `DECDN_MINISIGN_KEY`, defaulting to
-   `~/.minisign/minisign.key`. See [The minisign keys](#the-minisign-keys)
-   for adding, removing and rotating keys.
+   SECURITY.md. Installed binaries trust only the keys of the release they
+   came from, so the release that first carries your key is signed by a
+   maintainer whose key they already trust; yours signs from the release
+   after it. `sign-release.sh` enforces this against the previous tag's
+   keys. The script reads the secret key from `DECDN_MINISIGN_KEY`,
+   defaulting to `~/.minisign/minisign.key`. See
+   [The minisign keys](#the-minisign-keys) for adding, removing and rotating
+   keys.
 
 3. **Git configured to sign.** `cargo release` relies on git's own signing
    config; `release.toml` sets `sign-commit` and `sign-tag`. Set this
@@ -281,8 +284,10 @@ has no place in the client crate graph.
 A binary can only ever accept a key it already embeds, so every change to the
 set reaches users through a release:
 
-- **Adding a maintainer** is the one-time setup step above. Their key signs
-  releases from the first one built after the file lands.
+- **Adding a maintainer** is the one-time setup step above. The release that
+  introduces their key is signed by a key already in the field; theirs signs
+  from the release after it. `sign-release.sh` refuses a signature that no
+  key in the previous tag's tree verifies.
 - **Removing a maintainer** deletes their file and its `TRUSTED_KEYS` entry.
   Binaries that never update keep trusting the removed key, as they keep an
   old `KEYS`; the release that drops it is the one to call out in its notes.
@@ -294,10 +299,11 @@ set reaches users through a release:
   signed by a key this decdn build trusts"); say in the release notes that
   such binaries must reinstall by hand.
 
-The script verifies the signature against the `minisign-*.pub` files in the
-tag's tree, which are exactly the keys the binary being released embeds, so a
-release signed with a key that binary does not carry stops before anything is
-uploaded.
+The script verifies the signature twice: against the `minisign-*.pub` files
+in the tag's tree, which are exactly the keys the binary being released
+embeds, and against those in the previous tag's tree, which are what the
+binaries in the field embed. A release that fails either stops before
+anything is uploaded.
 
 ## Publishing to crates.io
 

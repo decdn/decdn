@@ -54,22 +54,37 @@ case "$1 $2" in
 esac
 """
 
-# `minisign -S` writes the signature file named by -x unless
-# $MINISIGN_FAIL_SIGN is set; `minisign -V` succeeds unless
-# $MINISIGN_FAIL_VERIFY is set. Logs argv to $MINISIGN_LOG.
+# Models key identity with a token: a secret key file holds one token line,
+# a public key file mentions the token of the key it belongs to. `minisign -S`
+# writes `signed-with:<token>` into the file named by -x unless
+# $MINISIGN_FAIL_SIGN is set; `minisign -V` succeeds iff the public key file
+# named by -p mentions the signature's token, unless $MINISIGN_FAIL_VERIFY is
+# set. Logs argv to $MINISIGN_LOG.
 MINISIGN_SHIM = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$MINISIGN_LOG"
 mode="$1"; shift
-out=""
-while [ $# -gt 0 ]; do [ "$1" = "-x" ] && out="$2"; shift; done
+out=""; sec=""; pub=""
+while [ $# -gt 0 ]; do
+  case "$1" in -x) out="$2";; -s) sec="$2";; -p) pub="$2";; esac
+  shift
+done
 case "$mode" in
   -S) [ -n "${MINISIGN_FAIL_SIGN:-}" ] && { echo "shim: bad password" >&2; exit 1; }
-      echo "untrusted comment: shim" > "$out"; exit 0 ;;
+      echo "signed-with:$(head -n1 "$sec")" > "$out"; exit 0 ;;
   -V) [ -n "${MINISIGN_FAIL_VERIFY:-}" ] && { echo "shim: signature mismatch" >&2; exit 1; }
-      exit 0 ;;
+      tok=$(sed -n 's/^signed-with://p' "$out")
+      grep -q -- "$tok" "$pub" && exit 0
+      echo "shim: signature by $tok does not match $pub" >&2; exit 1 ;;
   *) exit 9 ;;
 esac
 """
+
+KEY_A = "keyA"
+KEY_B = "keyB"
+
+
+def pub_for(token: str) -> str:
+    return f"untrusted comment: test key {token}\nRWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
 
 
 class Release(Keyring):
@@ -88,22 +103,32 @@ class Release(Keyring):
         env.update(GH_LOG=str(self.gh_log), MINISIGN_LOG=str(self.minisign_log))
         return env
 
-    def tag(self, name: str, fpr: str) -> None:
-        git = ["git", "-c", "user.name=t", "-c", "user.email=t@decdn.org"]
-        run = lambda *a: subprocess.run(  # noqa: E731
-            [*git, *a], cwd=self.repo, env=self.env(), check=True, capture_output=True
+    def git(self, *args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@decdn.org", *args],
+            cwd=self.repo,
+            env=self.env(),
+            check=True,
+            capture_output=True,
         )
-        run("add", "-A")
-        run("commit", "-q", "-m", "release")
-        run("-c", f"user.signingkey={fpr}", "tag", "-s", name, "-m", name)
+
+    def tag(self, name: str, fpr: str) -> None:
+        """Commit the working tree, tag it, and make the tag reachable from a
+        bare `origin`. The first call creates the origin."""
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", name)
+        self.git("-c", f"user.signingkey={fpr}", "tag", "-s", name, "-m", name)
         origin = self.root / "origin.git"
+        if origin.exists():
+            self.git("push", "-q", "origin", "HEAD", name)
+            return
         subprocess.run(
             ["git", "clone", "-q", "--bare", str(self.repo), str(origin)],
             env=self.env(),
             check=True,
             capture_output=True,
         )
-        run("remote", "add", "origin", str(origin))
+        self.git("remote", "add", "origin", str(origin))
 
     def publish(self, tag: str, **env: str) -> subprocess.CompletedProcess[str]:
         keys = self.gpg("--armor", "--export", *self.published)
@@ -133,12 +158,10 @@ def release() -> Iterator[Release]:
         shim = ring.bin / name
         shim.write_text(body)
         shim.chmod(0o755)
-    (ring.root / "minisign.key").write_text("stub\n")
+    (ring.root / "minisign.key").write_text(f"{KEY_A}\n")
     ring.repo.mkdir()
     (ring.repo / "crates" / "cli").mkdir(parents=True)
-    (ring.repo / "crates" / "cli" / "minisign.pub").write_text(
-        "untrusted comment: test\nRWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
-    )
+    (ring.repo / "crates" / "cli" / "minisign.pub").write_text(pub_for(KEY_A))
     subprocess.run(["git", "init", "-q"], cwd=ring.repo, env=ring.env(), check=True)
     try:
         yield ring
@@ -230,13 +253,50 @@ def test_the_keys_come_from_the_tag_tree_not_the_working_tree(release):
     release.tag("v0.0.0", fpr)
     # A second key added after the tag is not one the released binary embeds.
     extra = release.repo / "crates" / "cli" / "minisign-next.pub"
-    extra.write_text("untrusted comment: next\nRWQBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n")
+    extra.write_text(pub_for(KEY_B))
 
     result = release.publish("v0.0.0")
 
     assert result.returncode == 0, output(result)
     verifies = release.calls(release.minisign_log, "-V")
     assert all("minisign-next.pub" not in line for line in verifies), verifies
+
+
+def test_a_relative_minisign_key_path_is_resolved_before_signing(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+    (release.repo / "my.key").write_text(f"{KEY_A}\n")
+
+    # Relative to the directory the script is run from; the script changes
+    # directory before it signs.
+    result = release.publish("v0.0.0", DECDN_MINISIGN_KEY="my.key")
+
+    assert result.returncode == 0, output(result)
+    signs = release.calls(release.minisign_log, "-S")
+    assert len(signs) == 1 and f"-s {release.repo}/my.key" in signs[0], signs
+
+
+def test_a_key_new_in_this_release_may_not_sign_it(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+    # The next release introduces key B. Installed binaries hold only key A,
+    # so B cannot sign the release that introduces it.
+    (release.repo / "crates" / "cli" / "minisign-b.pub").write_text(pub_for(KEY_B))
+    release.tag("v0.0.1", fpr)
+    key_b = release.root / "b.key"
+    key_b.write_text(f"{KEY_B}\n")
+
+    result = release.publish("v0.0.1", DECDN_MINISIGN_KEY=str(key_b))
+
+    assert result.returncode != 0
+    assert "v0.0.0" in result.stderr and "not trusted by" in result.stderr, output(result)
+    assert not release.calls(release.gh_log, "release upload")
+
+    # Key A, which every installed binary trusts, signs it.
+    result = release.publish("v0.0.1")
+
+    assert result.returncode == 0, output(result)
+    assert "signed SHA256SUMS.minisig (crates/cli/minisign.pub)" in result.stdout
 
 
 def test_a_missing_minisign_key_is_refused_before_signing(release):

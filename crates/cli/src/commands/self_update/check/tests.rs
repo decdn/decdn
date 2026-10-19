@@ -154,3 +154,25 @@ fn stamp_lives_under_the_data_dir() {
         std::path::PathBuf::from("/home/u/.decdn/self-update-check")
     );
 }
+
+/// A lookup that finished during the command yields its line at once.
+#[tokio::test]
+async fn settle_returns_a_line_the_lookup_already_produced() {
+    let handle = tokio::spawn(async { Some("decdn 99.0.0 is available".to_string()) });
+    let line = settle(handle, Duration::from_millis(250)).await;
+    assert_eq!(line.as_deref(), Some("decdn 99.0.0 is available"));
+}
+
+/// A lookup still in flight when the command ends is given the grace period
+/// and no more; the command's exit does not wait on GitHub.
+#[tokio::test]
+async fn settle_drops_a_lookup_that_outlives_the_grace() {
+    let handle = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Some("too late".to_string())
+    });
+    let started = std::time::Instant::now();
+    let line = settle(handle, Duration::from_millis(100)).await;
+    assert_eq!(line, None);
+    assert!(started.elapsed() < Duration::from_secs(1));
+}

@@ -115,8 +115,8 @@ A `decdn` installed from an archive or by the one-liner updates itself:
 against a maintainer key the binary embeds, and replaces the binary in place. A binary
 `cargo install` placed, or one in a directory you cannot write (the container
 image, a package), is refused with the command to run instead. Once a day, after
-a command succeeds on a terminal, `decdn` prints one line when a newer release
-exists; `[self_update] check = false` in `node.toml` or
+a command succeeds with the terminal as its output, `decdn` prints one line when a
+newer release exists; `[self_update] check = false` in `node.toml` or
 `DECDN_SELF_UPDATE_CHECK=0` turns that off. `decdn-node` never updates itself.
 
 <details>

@@ -1,11 +1,13 @@
 //! The once-a-day notice that a newer signed release exists.
 //!
-//! After a command's own work succeeds, and at most once per day, the CLI
-//! asks GitHub for the latest release tag and prints one line on stderr when
-//! it is newer than this build. The check never runs for `--json` output or
-//! when stderr is not a terminal, is bounded by a short timeout, and is
-//! silent on every failure. `[self_update] check = false` in the config file
-//! or `DECDN_SELF_UPDATE_CHECK=0` turns it off.
+//! At most once per day, the CLI asks GitHub for the latest release tag and,
+//! once the command's own work has succeeded, prints one line on stderr when
+//! that tag is newer than this build. The lookup starts alongside the
+//! command and the command waits for it at most `GRACE` after finishing,
+//! so a long command pays nothing and a short one at most a second, once a
+//! day. The check never runs for `--json` output or when stdout or stderr is
+//! not a terminal, and is silent on every failure. `[self_update] check =
+//! false` in the config file or `DECDN_SELF_UPDATE_CHECK=0` turns it off.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -20,9 +22,12 @@ use super::release::{
 /// How long after one check the next one is due.
 const INTERVAL: Duration = Duration::from_hours(24);
 
-/// The whole-request bound on the lookup, so a command never waits longer
-/// than this on it.
+/// The whole-request bound on the lookup, which runs alongside the command.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a finished command waits for a lookup still in flight: enough
+/// for a GitHub round trip after a short command, nothing after a long one.
+const GRACE: Duration = Duration::from_secs(1);
 
 /// The environment variable that overrides `[self_update] check`.
 pub(crate) const ENV_CHECK: &str = "DECDN_SELF_UPDATE_CHECK";
@@ -122,32 +127,72 @@ fn write_stamp(stamp: &Path, now_secs: u64) -> std::io::Result<()> {
     writeln!(file, "{now_secs}")
 }
 
-/// Run the daily check for a command that just succeeded, printing the
-/// notice on stderr when a newer release exists. Silent otherwise.
-pub async fn maybe_nudge(policy: NudgePolicy, config_path: Option<&Path>) {
-    if policy.excluded || policy.json || !std::io::stderr().is_terminal() {
-        return;
+/// A lookup in flight, started before the command ran.
+#[derive(Debug)]
+pub struct Pending {
+    handle: tokio::task::JoinHandle<Option<String>>,
+}
+
+impl Pending {
+    /// The command succeeded: print the notice if the lookup produced one
+    /// within the grace period. A lookup still in flight after that is dropped.
+    pub async fn finish(self) {
+        if let Some(line) = settle(self.handle, GRACE).await {
+            eprintln!("{line}");
+        }
+    }
+
+    /// The command failed: the terminal has its attention already.
+    pub fn cancel(self) {
+        self.handle.abort();
+    }
+}
+
+/// Wait at most `grace` for the lookup's line; abort it otherwise.
+pub(crate) async fn settle(
+    handle: tokio::task::JoinHandle<Option<String>>,
+    grace: Duration,
+) -> Option<String> {
+    let abort = handle.abort_handle();
+    match tokio::time::timeout(grace, handle).await {
+        Ok(Ok(line)) => line,
+        Ok(Err(_)) => None,
+        Err(_elapsed) => {
+            abort.abort();
+            None
+        }
+    }
+}
+
+/// Start the daily check for a command about to run, when one is due and
+/// the command's output is a terminal. Returns the lookup to settle once the
+/// command has finished, or `None` when no check runs.
+pub fn start(policy: NudgePolicy, config_path: Option<&Path>) -> Option<Pending> {
+    if policy.excluded
+        || policy.json
+        || !std::io::stdout().is_terminal()
+        || !std::io::stderr().is_terminal()
+    {
+        return None;
     }
     let env = env_flag(std::env::var(ENV_CHECK).ok().as_deref());
     let file_check = load_file_config(config_path)
         .map(|f| f.self_update.and_then(|s| s.check))
         .map_err(|_| ());
     if !check_enabled(env, file_check) {
-        return;
+        return None;
     }
-    let Some(data_dir) = decdn_common::cli::default_data_dir() else {
-        return;
-    };
+    let data_dir = decdn_common::cli::default_data_dir()?;
     let stamp = stamp_path(&data_dir);
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     if !is_due(std::fs::read_to_string(&stamp).ok().as_deref(), now_secs) {
-        return;
+        return None;
     }
-    if let Some(line) = notice(&stamp, &releases_base(), LOOKUP_TIMEOUT, now_secs).await {
-        eprintln!("{line}");
-    }
+    let base = releases_base();
+    let handle = tokio::spawn(async move { notice(&stamp, &base, LOOKUP_TIMEOUT, now_secs).await });
+    Some(Pending { handle })
 }
 
 #[cfg(test)]
