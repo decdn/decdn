@@ -111,7 +111,7 @@ fn extract_tar_gz(archive: &[u8], max_bytes: u64) -> anyhow::Result<Vec<u8>> {
     let gz = flate2::read::GzDecoder::new(archive);
     let mut tar = tar::Archive::new(gz);
     for entry in tar.entries().context("read the release archive")? {
-        let mut entry = entry.context("read the release archive")?;
+        let entry = entry.context("read the release archive")?;
         let path = entry.path().context("read an archive entry name")?;
         let name = path.to_string_lossy();
         if name.strip_prefix("./").unwrap_or(&name) != bin {
@@ -121,14 +121,7 @@ fn extract_tar_gz(archive: &[u8], max_bytes: u64) -> anyhow::Result<Vec<u8>> {
             bail!("`{bin}` in the archive is not a regular file");
         }
         let size = entry.size();
-        if size > max_bytes {
-            bail!("`{bin}` in the archive is {size} bytes, larger than the {max_bytes}-byte limit");
-        }
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .context("read the binary out of the archive")?;
-        return Ok(bytes);
+        return read_binary(entry, size, bin, max_bytes);
     }
     bail!("the release archive holds no `{bin}` entry at its root")
 }
@@ -138,7 +131,7 @@ fn extract_zip(archive: &[u8], max_bytes: u64) -> anyhow::Result<Vec<u8>> {
     let bin = ArchiveKind::Zip.binary_name();
     let mut zip =
         zip::ZipArchive::new(std::io::Cursor::new(archive)).context("read the release archive")?;
-    let mut entry = match zip.by_name(bin) {
+    let entry = match zip.by_name(bin) {
         Ok(entry) => entry,
         Err(zip::result::ZipError::FileNotFound) => {
             bail!("the release archive holds no `{bin}` entry at its root")
@@ -149,6 +142,17 @@ fn extract_zip(archive: &[u8], max_bytes: u64) -> anyhow::Result<Vec<u8>> {
         bail!("`{bin}` in the archive is not a regular file");
     }
     let size = entry.size();
+    read_binary(entry, size, bin, max_bytes)
+}
+
+/// Read the archive entry `bin`, which declares `size` bytes, refusing it
+/// when that exceeds `max_bytes`.
+fn read_binary(
+    mut entry: impl Read,
+    size: u64,
+    bin: &str,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
     if size > max_bytes {
         bail!("`{bin}` in the archive is {size} bytes, larger than the {max_bytes}-byte limit");
     }
@@ -191,9 +195,7 @@ pub(crate) fn stage(dir: &Path, bytes: &[u8]) -> anyhow::Result<NamedTempFile> {
 /// swap that fails keeps the staged file and names it in the error, so the
 /// verified download is not lost.
 pub(crate) fn swap(staged: NamedTempFile, exe: &Path) -> anyhow::Result<()> {
-    let staged_path = staged.path().to_path_buf();
-    let result = swap_inner(&staged, exe);
-    match result {
+    match swap_inner(&staged, exe) {
         Ok(()) => {
             // The staged file is already gone on Unix; on Windows it was
             // copied, and dropping the handle removes it.
@@ -201,6 +203,7 @@ pub(crate) fn swap(staged: NamedTempFile, exe: &Path) -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => {
+            let staged_path = staged.path().to_path_buf();
             let kept = staged.keep().map_or(staged_path, |(_, path)| path);
             Err(e.context(format!(
                 "the verified new binary is kept at {}; move it over {} by hand",

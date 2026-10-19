@@ -157,12 +157,7 @@ pub enum Command {
 /// `--json` flag sits. A command with no `--json` flag never asks.
 #[must_use]
 pub fn json_requested(matches: &clap::ArgMatches) -> bool {
-    matches
-        .try_get_one::<bool>("json")
-        .ok()
-        .flatten()
-        .copied()
-        .unwrap_or(false)
+    matches!(matches.try_get_one::<bool>("json"), Ok(Some(true)))
         || matches
             .subcommand()
             .is_some_and(|(_, sub)| json_requested(sub))

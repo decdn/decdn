@@ -37,21 +37,18 @@ pub(crate) fn verify_manifest_with(
 ) -> anyhow::Result<Manifest> {
     let signature = Signature::decode(minisig)
         .map_err(|e| anyhow::anyhow!("SHA256SUMS.minisig is not a minisign signature: {e}"))?;
-    let mut verified = false;
     for key in keys {
         match key.verify(sums, &signature, false) {
             Ok(()) => {
-                verified = true;
-                break;
+                return Manifest::parse(
+                    std::str::from_utf8(sums).context("SHA256SUMS is not UTF-8")?,
+                );
             }
             Err(MinisignError::UnexpectedKeyId) => {}
             Err(e) => bail!("SHA256SUMS does not verify against SHA256SUMS.minisig: {e}"),
         }
     }
-    if !verified {
-        bail!("SHA256SUMS.minisig is not signed by a key this decdn build trusts");
-    }
-    Manifest::parse(std::str::from_utf8(sums).context("SHA256SUMS is not UTF-8")?)
+    bail!("SHA256SUMS.minisig is not signed by a key this decdn build trusts")
 }
 
 /// Lowercase hex SHA-256 of `bytes`, as `sha256sum` prints it.

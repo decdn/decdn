@@ -13,7 +13,7 @@ pub(crate) mod install;
 pub(crate) mod release;
 pub(crate) mod verify;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -48,8 +48,8 @@ pub async fn self_update(args: &SelfUpdateArgs) -> anyhow::Result<()> {
         decdn_common::cli::default_data_dir().context("cannot determine the home directory")?;
     let home = data_dir.parent().unwrap_or(&data_dir).to_path_buf();
     let exe = install::running_exe()?;
-    let cargo_home = std::env::var_os("CARGO_HOME").map(std::path::PathBuf::from);
-    let install_root = std::env::var_os("CARGO_INSTALL_ROOT").map(std::path::PathBuf::from);
+    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
+    let install_root = std::env::var_os("CARGO_INSTALL_ROOT").map(PathBuf::from);
     let cargo_bins = install::cargo_bin_dirs(&home, cargo_home.as_deref(), install_root.as_deref());
     match install::classify(&exe, &cargo_bins, install::probe_writable) {
         Ownership::Replaceable => {}

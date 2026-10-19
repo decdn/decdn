@@ -151,29 +151,26 @@ impl Manifest {
     pub(crate) fn parse(text: &str) -> anyhow::Result<Self> {
         let mut entries = Vec::new();
         for (idx, raw) in text.lines().enumerate() {
+            let line_no = idx + 1;
             let line = raw.trim_end_matches('\r');
             if line.is_empty() {
                 continue;
             }
-            let (digest, rest) = line
-                .split_once(' ')
-                .with_context(|| format!("SHA256SUMS line {}: not `<sha256>  <name>`", idx + 1))?;
+            let malformed = || format!("SHA256SUMS line {line_no}: not `<sha256>  <name>`");
+            let (digest, rest) = line.split_once(' ').with_context(malformed)?;
             if digest.len() != 64
                 || !digest
                     .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
             {
-                bail!(
-                    "SHA256SUMS line {}: not a lowercase sha256 hex digest",
-                    idx + 1
-                );
+                bail!("SHA256SUMS line {line_no}: not a lowercase sha256 hex digest");
             }
             let name = rest
                 .strip_prefix(' ')
                 .or_else(|| rest.strip_prefix('*'))
-                .with_context(|| format!("SHA256SUMS line {}: not `<sha256>  <name>`", idx + 1))?;
+                .with_context(malformed)?;
             if name.is_empty() {
-                bail!("SHA256SUMS line {}: empty file name", idx + 1);
+                bail!("SHA256SUMS line {line_no}: empty file name");
             }
             entries.push((digest.to_string(), name.to_string()));
         }
@@ -191,15 +188,10 @@ impl Manifest {
 
 /// The release tag in a `…/releases/download/<tag>/<asset>` location.
 pub(crate) fn tag_from_location(location: &str) -> Option<String> {
-    let path = url::Url::parse(location)
-        .map(|u| u.path().to_string())
-        .or_else(|_| {
-            url::Url::parse(REPO_BASE)
-                .and_then(|base| base.join(location))
-                .map(|u| u.path().to_string())
-        })
+    let url = url::Url::parse(location)
+        .or_else(|_| url::Url::parse(REPO_BASE)?.join(location))
         .ok()?;
-    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let mut segments = url.path().split('/').filter(|s| !s.is_empty());
     while let Some(seg) = segments.next() {
         if seg == "releases" {
             if segments.next() != Some("download") {
