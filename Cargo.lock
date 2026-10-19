@@ -2759,7 +2759,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "decdn-bao-range"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bao-tree",
  "bytes",
@@ -2769,7 +2769,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-cache"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -2865,7 +2865,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -2896,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-config-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -2930,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-e2e"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2960,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-incentive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -2989,7 +2989,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-node"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -3048,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "insta",
@@ -3064,7 +3064,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-reputation"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "decdn-protocol",
