@@ -209,6 +209,22 @@ def test_a_failed_minisign_stops_before_any_upload(release):
     assert not release.calls(release.gh_log, "release upload")
 
 
+def test_a_placeholder_key_in_the_tag_tree_is_refused(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    (release.repo / "crates" / "cli" / "minisign.pub").write_text(
+        "untrusted comment: PLACEHOLDER decdn self-update key; replace before a release\n"
+        "RWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+    )
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0")
+
+    assert result.returncode != 0
+    assert "placeholder" in result.stderr.lower(), output(result)
+    assert not release.calls(release.minisign_log, "-S")
+    assert not release.calls(release.gh_log, "release upload")
+
+
 def test_the_keys_come_from_the_tag_tree_not_the_working_tree(release):
     fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
     release.tag("v0.0.0", fpr)

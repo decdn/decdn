@@ -463,19 +463,23 @@ done
 # against the public keys committed in the TAG's tree, which are the keys the
 # binary being released embeds, not the working tree's, so a secret key whose
 # public half that binary does not carry stops here instead of shipping a
-# release no client accepts.
-rm -f SHA256SUMS.minisig
-minisign -S -s "$MINISIGN_KEY" -m SHA256SUMS -x SHA256SUMS.minisig ||
-  die "failed to minisign SHA256SUMS (password problem?); nothing has been published"
+# release no client accepts. A placeholder key (one whose comment line says
+# so) means the real key never landed; nothing is signed with it.
 TAG_PUBS=()
 while IFS= read -r f; do
   [[ -n "$f" ]] || continue
   git -C "$REPO_ROOT" show "${TAG}:${f}" > "$KEYS_HOME/${f##*/}" ||
     die "cannot read $f from the $TAG tree"
+  ! grep -qi 'placeholder' "$KEYS_HOME/${f##*/}" || die \
+    "$f at $TAG is a placeholder key; the released binary would trust no real key.
+Commit the maintainer minisign public key first (RELEASING.md § The minisign key)."
   TAG_PUBS+=( "$f" )
 done < <(git -C "$REPO_ROOT" ls-tree --name-only "$TAG" -- crates/cli/ | grep -E '^crates/cli/minisign[^/]*\.pub$' || true)
 (( ${#TAG_PUBS[@]} > 0 )) || die \
   "the $TAG tree holds no crates/cli/minisign*.pub; the released binary would trust no key"
+rm -f SHA256SUMS.minisig
+minisign -S -s "$MINISIGN_KEY" -m SHA256SUMS -x SHA256SUMS.minisig ||
+  die "failed to minisign SHA256SUMS (password problem?); nothing has been published"
 MINISIGN_PUB=""
 MINISIGN_ERR=""
 for f in "${TAG_PUBS[@]}"; do

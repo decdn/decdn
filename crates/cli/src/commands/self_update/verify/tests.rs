@@ -104,15 +104,3 @@ fn embedded_keys_match_the_files_in_the_crate() {
     assert_eq!(embedded, files);
     assert!(!trusted_keys().unwrap().is_empty());
 }
-
-/// The committed `minisign.pub` is a placeholder until the maintainer key
-/// lands; a build that still embeds it must not pass CI.
-#[test]
-fn embedded_key_is_not_the_placeholder() {
-    for key in TRUSTED_KEYS {
-        assert!(
-            !key.contains("PLACEHOLDER"),
-            "crates/cli/minisign.pub is still the placeholder; see RELEASING.md"
-        );
-    }
-}
