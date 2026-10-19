@@ -53,7 +53,7 @@ on another host needs it.
 | `ONRAMP_CAPACITY_BOND_ADDR` | required | `CapacityBond` contract, for node discovery |
 | `ONRAMP_TURNSTILE_SECRET` / `_FILE` | required (Turnstile gate) | Cloudflare Turnstile secret |
 | `ONRAMP_TURNSTILE_SITEKEY` | required (Turnstile gate) | Cloudflare Turnstile sitekey |
-| `ONRAMP_DECDN_RELEASE`, `ONRAMP_DECDN_SUMS_SHA256` | required | `decdn` release the installers install, and the SHA-256 of its `SHA256SUMS` |
+| `ONRAMP_DECDN_RELEASE`, `ONRAMP_DECDN_SUMS_SHA256` | required | `decdn` release the installers install (`v0.2.0` or later; the onramp refuses an older one), and the SHA-256 of its `SHA256SUMS` |
 | `ONRAMP_BIND` | `127.0.0.1:8080` | Listen address |
 | `ONRAMP_DAEMON_URL` | `http://127.0.0.1:8090` | The daemon |
 | `ONRAMP_SPENDING_CAP_MICRO_USDC` | daemon maximum | Cap requested per capability |

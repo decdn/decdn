@@ -63,7 +63,8 @@ Published commands and downloads in progress read these, so a change to any
 of them is called out as contract-breaking in the changelog:
 
 - the installers' arguments (`get decdn:<hash>/[<path>][?ns=<id>] [-o <dir>]
-  [<decdn get flags>]`);
+  [<decdn get flags>]` and `get decdn:<hash>[?ns=<id>] -o <file>
+  [<decdn get flags>]`, passed to `decdn get` as given);
 - the layout under `~/.decdn/sponsored/` (`downloads/<hash>/` with
   `keystore.json`, `password`, `address`, `capability` and `expiry`), which
   an interrupted download resumes from;

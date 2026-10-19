@@ -260,8 +260,8 @@ fn expected(slash_judge: &str) -> [(&'static str, String); 10] {
     [
         ("ONRAMP_URL", "https://up.example.org".into()),
         ("RELEASES", "https://github.com/decdn".into()),
-        ("DECDN_RELEASE", "v0.1.0".into()),
-        ("DECDN_VERSION", "0.1.0".into()),
+        ("DECDN_RELEASE", "v0.2.0".into()),
+        ("DECDN_VERSION", "0.2.0".into()),
         ("DECDN_SUMS_SHA256", "ab".repeat(32)),
         ("CHAIN_ID", "421614".into()),
         ("RPC_URL", "https://rpc.example".into()),

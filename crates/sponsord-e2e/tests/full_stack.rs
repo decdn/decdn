@@ -81,7 +81,7 @@ async fn the_installer_gets_a_capability_through_the_gate_and_runs_decdn() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&stub).unwrap();
     let releases = tmp.path().join("releases");
-    let sums = publish_release(&releases, "decdn", "decdn", "v0.1.0", "0.1.0", STUB_DECDN);
+    let sums = publish_release(&releases, "decdn", "decdn", "v0.2.0", "0.2.0", STUB_DECDN);
 
     let (onramp_listener, onramp_url) = listen().await;
     let mut cfg = test_config();

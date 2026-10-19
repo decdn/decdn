@@ -35,6 +35,12 @@ pub struct ReleasePin {
     pub sums_sha256: String,
 }
 
+/// The oldest decdn release the installers work with. They run `decdn get`
+/// without `-o` so that it picks the destination and keeps its overwrite
+/// guard, and `get -o` became optional in decdn v0.2.0 (decdn#2466,
+/// decdn#2476): v0.1.x's `decdn get` refuses the command.
+pub const MIN_DECDN_RELEASE: (u64, u64, u64) = (0, 2, 0);
+
 impl ReleasePin {
     /// All three values are interpolated into the POSIX and PowerShell
     /// installer scripts, so they are held to a strict shape rather than
@@ -43,7 +49,9 @@ impl ReleasePin {
     /// # Errors
     ///
     /// Returns an error if `tag` is not [`RELEASE_TAG_PREFIX`] followed by a
-    /// semver version, or `sums_sha256` is not 64 lowercase hex characters.
+    /// semver version, if that version is below [`MIN_DECDN_RELEASE`] (a
+    /// pre-release of it counts as below), or if `sums_sha256` is not 64
+    /// lowercase hex characters.
     pub fn new(tag: &str, sums_sha256: &str) -> anyhow::Result<Self> {
         let version = tag
             .strip_prefix(RELEASE_TAG_PREFIX)
@@ -53,6 +61,12 @@ impl ReleasePin {
                     "release tag {tag:?} is not {RELEASE_TAG_PREFIX}MAJOR.MINOR.PATCH[-pre]"
                 )
             })?;
+        let (min_major, min_minor, min_patch) = MIN_DECDN_RELEASE;
+        anyhow::ensure!(
+            at_least(version, MIN_DECDN_RELEASE),
+            "release tag {tag:?} is below {RELEASE_TAG_PREFIX}{min_major}.{min_minor}.{min_patch}, \
+             the oldest decdn whose `get` picks the destination when the installers pass no `-o`"
+        );
         anyhow::ensure!(
             sums_sha256.len() == 64
                 && sums_sha256
@@ -65,6 +79,26 @@ impl ReleasePin {
             version: version.to_owned(),
             sums_sha256: sums_sha256.to_owned(),
         })
+    }
+}
+
+/// Whether the semver `version` (checked by [`is_semver`]) is `min` or later.
+/// A pre-release of `min` sorts before it, as semver orders them.
+fn at_least(version: &str, min: (u64, u64, u64)) -> bool {
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (version, None),
+    };
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+    let (Some(Some(major)), Some(Some(minor)), Some(Some(patch))) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    match (major, minor, patch).cmp(&min) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => pre.is_none(),
+        std::cmp::Ordering::Less => false,
     }
 }
 

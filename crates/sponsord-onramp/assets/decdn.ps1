@@ -11,8 +11,9 @@
 #   & ([scriptblock]::Create((irm <onramp>/decdn.ps1))) get decdn:<hash>[?ns=<id>] -o <file> [<decdn get flags>]
 #
 # The `decdn:` URI comes first. It and every argument after it go to
-# `decdn get` as given. For a bundle URI, `-o .` is added when none of them
-# sets the output directory; a blob URI needs `-o <file>`.
+# `decdn get` as given. A blob URI needs `-o <file>`. Without `-o`, a bundle
+# or entry URI lets `decdn get` pick the destination and refuse to replace a
+# file no earlier pull of the same entry left there.
 #
 # Each download gets a throwaway key under ~\.decdn\sponsored\downloads\<hash>\
 # and a capability for it, issued once the person passes the gate in the
@@ -83,11 +84,10 @@
       $IsBundle = $Matches[2] -eq '/'
       # The rest go to decdn get, which checks them.
       foreach ($Arg in ($args | Select-Object -Skip 2)) { $PassArgs.Add([string]$Arg) }
-      if (-not ($PassArgs | Where-Object { $_ -cmatch '^(-o|--output(=|$))' })) {
-        if (-not $IsBundle) {
-          throw "decdn: a blob URI needs -o <file> to name the file it is written to: $Uri"
-        }
-        $PassArgs.InsertRange(0, [string[]]@('-o', '.'))
+      # A bundle URI goes without `-o`: decdn get picks the destination and
+      # keeps its overwrite guard, which an explicit `-o` would turn off.
+      if ((-not $IsBundle) -and -not ($PassArgs | Where-Object { $_ -cmatch '^(-o|--output(=|$))' })) {
+        throw "decdn: a blob URI needs -o <file> to name the file it is written to: $Uri"
       }
     }
 

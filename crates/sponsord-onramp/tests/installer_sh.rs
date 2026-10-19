@@ -67,7 +67,7 @@ impl Fixture {
         let stub = root.join("stub");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&stub).unwrap();
-        let sums = publish_release(&releases, "decdn", "decdn", "v0.1.0", "0.1.0", STUB_DECDN);
+        let sums = publish_release(&releases, "decdn", "decdn", "v0.2.0", "0.2.0", STUB_DECDN);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let onramp = format!("http://{}", listener.local_addr().unwrap());
@@ -205,7 +205,7 @@ impl Fixture {
 async fn a_second_run_with_the_same_pin_downloads_nothing() {
     let fx = Fixture::new("same_pin").await;
     let first = fx.run_ok(&[], &[]).await;
-    assert!(first.contains("Installing decdn v0.1.0"), "{first}");
+    assert!(first.contains("Installing decdn v0.2.0"), "{first}");
     assert!(first.contains("decdn is installed at"), "{first}");
     assert!(fx.bin("decdn").exists() && fx.marker("decdn").exists());
 
@@ -214,7 +214,7 @@ async fn a_second_run_with_the_same_pin_downloads_nothing() {
     let second = fx.run_ok(&[], &[]).await;
     assert!(!second.contains("Installing"), "{second}");
     assert!(
-        second.contains("decdn v0.1.0 is already installed."),
+        second.contains("decdn v0.2.0 is already installed."),
         "{second}"
     );
 }
@@ -226,11 +226,11 @@ async fn a_missing_marker_or_binary_reinstalls() {
 
     fs::remove_file(fx.marker("decdn")).unwrap();
     let out = fx.run_ok(&[], &[]).await;
-    assert!(out.contains("Installing decdn v0.1.0"), "{out}");
+    assert!(out.contains("Installing decdn v0.2.0"), "{out}");
 
     fs::remove_file(fx.bin("decdn")).unwrap();
     let out = fx.run_ok(&[], &[]).await;
-    assert!(out.contains("Installing decdn v0.1.0"), "{out}");
+    assert!(out.contains("Installing decdn v0.2.0"), "{out}");
     assert!(fx.bin("decdn").exists());
 }
 
@@ -241,7 +241,7 @@ async fn a_changed_pin_reinstalls() {
     // A marker from another release, as after the onramp moves its pin.
     fs::write(fx.marker("decdn"), "00 x86_64-unknown-linux-gnu\n").unwrap();
     let out = fx.run_ok(&[], &[]).await;
-    assert!(out.contains("Installing decdn v0.1.0"), "{out}");
+    assert!(out.contains("Installing decdn v0.2.0"), "{out}");
 }
 
 #[tokio::test]
@@ -321,7 +321,7 @@ async fn get_passes_the_gate_and_runs_decdn_with_the_capability() {
 async fn every_argument_after_the_uri_reaches_decdn_as_given() {
     let fx = Fixture::new("pass_through").await;
 
-    // An output flag in any form replaces `-o .`.
+    // An output flag in any form reaches decdn as given.
     let args = [
         GET[0],
         GET[1],
@@ -332,7 +332,7 @@ async fn every_argument_after_the_uri_reaches_decdn_as_given() {
         "*.txt",
     ];
     fx.run_ok(&args, &[]).await;
-    // Without one, the bundle lands in the current directory.
+    // Without one, the script adds none: decdn get picks the destination.
     fx.run_ok(&[GET[0], GET[1], "--jobs", "8"], &[]).await;
     // A blob URI names its file with -o.
     let blob = format!("decdn:{HASH}?ns=1");
@@ -342,7 +342,7 @@ async fn every_argument_after_the_uri_reaches_decdn_as_given() {
     assert_eq!(calls.len(), 3, "{calls:?}");
     let expected = [
         format!("get {BUNDLE} --jobs 8 --output=out --include *.txt --capability "),
-        format!("get {BUNDLE} -o . --jobs 8 --capability "),
+        format!("get {BUNDLE} --jobs 8 --capability "),
         format!("get {blob} -o file.iso --capability "),
     ];
     for (call, start) in calls.iter().zip(&expected) {
