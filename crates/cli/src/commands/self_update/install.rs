@@ -72,12 +72,17 @@ pub(crate) fn running_exe() -> anyhow::Result<PathBuf> {
         .with_context(|| format!("resolve {}", exe.display()))
 }
 
-/// Try to create a file in `dir`, as the swap will.
+/// Try to create a file in `dir`, as the swap will. The error carries the
+/// OS reason alone; the caller names the directory.
 pub(crate) fn probe_writable(dir: &Path) -> std::io::Result<()> {
     tempfile::Builder::new()
         .prefix(".decdn-update-probe-")
         .tempfile_in(dir)
         .map(drop)
+        .map_err(|e| match e.raw_os_error() {
+            Some(code) => std::io::Error::from_raw_os_error(code),
+            None => std::io::Error::from(e.kind()),
+        })
 }
 
 /// The bare binary a release archive holds at its root, at most `max_bytes`.

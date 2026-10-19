@@ -170,3 +170,21 @@ fn installer_marker_lives_under_the_data_dir() {
         PathBuf::from("/home/u/.decdn/installer/decdn")
     );
 }
+
+/// The probe names the OS reason, not the temporary file it tried to make:
+/// the user is told which directory refused, and why, by the caller.
+#[cfg(unix)]
+#[test]
+fn probe_writable_reports_the_os_reason_without_the_probe_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = probe_writable(dir.path());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let Err(err) = result else {
+        return; // root writes anywhere
+    };
+    let text = err.to_string();
+    assert!(text.to_lowercase().contains("permission denied"), "{text}");
+    assert!(!text.contains(".decdn-update-probe"), "{text}");
+}
