@@ -67,6 +67,7 @@ class Keyring:
             GIT_CONFIG_NOSYSTEM="1",
             PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
             DECDN_SKIP_IMAGE_TAGS="1",
+            DECDN_MINISIGN_KEY=str(self.root / "minisign.key"),
         )
         return env
 
@@ -149,7 +150,17 @@ def keyring() -> Iterator[Keyring]:
     gh = ring.bin / "gh"
     gh.write_text("#!/bin/sh\nexit 0\n")
     gh.chmod(0o755)
+    # The minisign preconditions (tool on PATH, secret key file, a committed
+    # public key) are checked before the key announcement these tests stop at.
+    minisign = ring.bin / "minisign"
+    minisign.write_text("#!/bin/sh\nexit 0\n")
+    minisign.chmod(0o755)
+    (ring.root / "minisign.key").write_text("stub\n")
     ring.repo.mkdir()
+    (ring.repo / "crates" / "cli").mkdir(parents=True)
+    (ring.repo / "crates" / "cli" / "minisign.pub").write_text(
+        "untrusted comment: test\nRWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+    )
     subprocess.run(["git", "init", "-q"], cwd=ring.repo, env=ring.env(), check=True)
     try:
         yield ring
