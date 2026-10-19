@@ -127,14 +127,14 @@ impl Landing {
     /// chain leads out of it, its directory cannot be created, or both the
     /// move and the copy fail.
     pub(super) fn move_into_place(&self, staging: &Path, dest: &Path) -> anyhow::Result<u64> {
-        let len = std::fs::metadata(staging)
-            .with_context(|| format!("stat {}", staging.display()))?
-            .len();
+        let len = file_len(staging)?;
         let rel = self.relative(dest)?;
         let (parent, name) = self.parent_of(rel)?;
-        let moved = self
-            .relative(staging)
-            .and_then(|from| Ok(self.dir.rename(from, &parent, name)?));
+        let moved = self.relative(staging).and_then(|from| {
+            self.dir
+                .rename(from, &parent, name)
+                .map_err(anyhow::Error::from)
+        });
         match moved {
             Ok(()) => Ok(len),
             Err(refused) => {
@@ -171,7 +171,7 @@ impl Landing {
             self.dir.hard_link(src_rel, &parent, candidate)
         });
         let candidate = match linked {
-            Ok(candidate) => candidate,
+            Ok((candidate, ())) => candidate,
             Err(refused) => {
                 tracing::debug!(
                     src = %src.display(),
@@ -206,9 +206,7 @@ impl Landing {
         if !is_donor {
             return self.move_into_place(staging, dest);
         }
-        let len = std::fs::metadata(staging)
-            .with_context(|| format!("stat {}", staging.display()))?
-            .len();
+        let len = file_len(staging)?;
         self.link_or_copy_atomic(staging, dest).map(|()| len)
     }
 
@@ -236,17 +234,16 @@ impl Landing {
             .ok_or_else(|| anyhow!("{} has no file name", rel.display()))?;
         let parent = match rel.parent().filter(|p| !p.as_os_str().is_empty()) {
             Some(p) => {
-                if let Err(e) = self.dir.create_dir_all(p) {
+                self.dir.create_dir_all(p).map_err(|e| {
                     // A symlink that leads out is reported as the name it
                     // occupies, not as the escape behind it: resolve it to
                     // name the cause.
-                    if let Err(probe) = self.dir.metadata(p)
-                        && is_escape(&probe)
-                    {
-                        return Err(self.escape(rel));
-                    }
-                    return Err(self.beneath(rel, "create the directory of", e));
-                }
+                    let cause = match self.dir.metadata(p) {
+                        Err(probe) if is_escape(&probe) => probe,
+                        _ => e,
+                    };
+                    self.beneath(rel, "create the directory of", cause)
+                })?;
                 self.dir
                     .open_dir(p)
                     .map_err(|e| self.beneath(rel, "open the directory of", e))?
@@ -289,32 +286,27 @@ impl Landing {
 /// through the handle, so the copy lands beneath the root like a link does.
 fn copy_into(src: &Path, parent: &Dir, name: &OsStr, dest: &Path) -> anyhow::Result<u64> {
     let mut from = std::fs::File::open(src).with_context(|| format!("open {}", src.display()))?;
-    let mut tmp = None;
-    let staged = fresh_name(".decdn-tmp-", |candidate| {
-        tmp = Some(parent.open_with(candidate, OpenOptions::new().write(true).create_new(true))?);
-        Ok(())
+    let (staged, mut file) = fresh_name(".decdn-tmp-", |candidate| {
+        parent.open_with(candidate, OpenOptions::new().write(true).create_new(true))
     })
     .with_context(|| format!("stage {}", dest.display()))?;
-    let Some(mut file) = tmp else {
-        return Err(anyhow!("stage {}: no temp file was opened", dest.display()));
-    };
-    let copied = std::io::copy(&mut from, &mut file)
+    std::io::copy(&mut from, &mut file)
         .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))
         .and_then(|written| {
             file.sync_all()
                 .with_context(|| format!("sync staged copy for {}", dest.display()))?;
-            Ok(written)
-        })
-        .and_then(|written| {
             parent
                 .rename(&staged, parent, name)
                 .with_context(|| format!("write {}", dest.display()))?;
             Ok(written)
-        });
-    if copied.is_err() {
-        remove_staged(parent, &staged);
-    }
-    copied
+        })
+        .inspect_err(|_| remove_staged(parent, &staged))
+}
+
+/// `path`'s length in bytes.
+fn file_len(path: &Path) -> anyhow::Result<u64> {
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok(meta.len())
 }
 
 /// Drop the staged `name` in `parent` after its landing failed, so no
@@ -325,12 +317,12 @@ fn remove_staged(parent: &Dir, name: &str) {
     }
 }
 
-/// A `<prefix><rand>` name under which `create` succeeded. A name that
-/// already exists draws another, up to [`NAME_TRIES`] times; any other error,
-/// or a spent budget, is returned.
-fn fresh_name<F>(prefix: &str, mut create: F) -> std::io::Result<String>
+/// A `<prefix><rand>` name under which `create` succeeded, with what `create`
+/// returned. A name that already exists draws another, up to [`NAME_TRIES`]
+/// times; any other error, or a spent budget, is returned.
+fn fresh_name<T, F>(prefix: &str, mut create: F) -> std::io::Result<(String, T)>
 where
-    F: FnMut(&str) -> std::io::Result<()>,
+    F: FnMut(&str) -> std::io::Result<T>,
 {
     let mut last = None;
     for _ in 0..NAME_TRIES {
@@ -339,7 +331,7 @@ where
             rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8)
         );
         match create(&candidate) {
-            Ok(()) => return Ok(candidate),
+            Ok(created) => return Ok((candidate, created)),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => last = Some(e),
             Err(e) => return Err(e),
         }
