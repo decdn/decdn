@@ -10,7 +10,7 @@ use std::assert_matches;
 fn entry_candidates_resample_the_registry_for_each_entry() {
     let registry = Registry {
         nodes: (1u8..=7).map(|b| stripe_candidate(b, b)).collect(),
-        live: true,
+        outage_fallback: false,
     };
     let site = site_allowing(&[]);
     let mut seen = HashSet::new();
@@ -50,20 +50,24 @@ fn site_allowing(regions: &[&str]) -> PullSite {
     }
 }
 
-/// `de` DE nodes then `us` US nodes, as a registry list that is `live`.
-fn two_region_registry(de: u8, us: u8, live: bool) -> Registry {
+/// `de` DE nodes then `us` US nodes, as a registry list that is the outage
+/// fallback when `outage_fallback`.
+fn two_region_registry(de: u8, us: u8, outage_fallback: bool) -> Registry {
     let nodes = (1..=de)
         .map(|b| regional_candidate(b, "DE"))
         .chain((de + 1..=de + us).map(|b| regional_candidate(b, "US")))
         .collect();
-    Registry { nodes, live }
+    Registry {
+        nodes,
+        outage_fallback,
+    }
 }
 
 /// The allowlist narrows every entry's sample to the allowed regions when
 /// enough nodes stay: the fetch path's rule, applied to the bundle.
 #[test]
 fn entry_candidates_keep_to_the_region_allowlist() {
-    let registry = two_region_registry(4, 3, true);
+    let registry = two_region_registry(4, 3, false);
     let site = site_allowing(&["US"]);
     let us = decdn_protocol::Region::parse("US");
     for _ in 0..50 {
@@ -77,7 +81,7 @@ fn entry_candidates_keep_to_the_region_allowlist() {
 /// widens back to every region, so a thin allowlist never starves an entry.
 #[test]
 fn entry_candidates_widen_when_the_allowlist_starves() {
-    let registry = two_region_registry(5, 2, true);
+    let registry = two_region_registry(5, 2, false);
     let site = site_allowing(&["US"]);
     let de = decdn_protocol::Region::parse("DE");
     let sample = registry.entry_candidates(&site);
@@ -92,7 +96,7 @@ fn entry_candidates_widen_when_the_allowlist_starves() {
 /// narrowed: the run is already down to what the store kept.
 #[test]
 fn a_cached_outage_list_ignores_the_allowlist() {
-    let registry = two_region_registry(4, 3, false);
+    let registry = two_region_registry(4, 3, true);
     let site = site_allowing(&["US"]);
     let de = decdn_protocol::Region::parse("DE");
     let sample = registry.entry_candidates(&site);
@@ -182,7 +186,7 @@ async fn discover_candidates_skips_the_registry_read_on_fresh_identities() -> an
     let found = discover_candidates(&chain, &site, &discovery).await?;
     assert_eq!(found.nodes.len(), usize::from(min));
     assert!(
-        found.live,
+        !found.outage_fallback,
         "identity-fresh records stand in for a live read"
     );
     assert_matches!(
@@ -193,9 +197,14 @@ async fn discover_candidates_skips_the_registry_read_on_fresh_identities() -> an
 
     let (chain, site, discovery) = chain_against(&rpc, dir.path(), true)?;
     // The listener never answers, so the read times out and falls back to
-    // the same store. Only the connection attempt matters here.
-    drop(discover_candidates(&chain, &site, &discovery).await);
+    // the same store: the outage fallback, which the allowlist leaves alone.
+    let found = discover_candidates(&chain, &site, &discovery).await?;
     assert!(rpc.accept().is_ok(), "--rediscover reads the registry");
+    assert!(
+        found.outage_fallback,
+        "a timed-out read falls back to the store"
+    );
+    assert_eq!(found.nodes.len(), usize::from(min));
     Ok(())
 }
 
@@ -3610,6 +3619,42 @@ fn plan_slots_fails_an_entry_whose_parent_leads_out_of_the_root() {
         slots[0]
     );
     assert!(matches!(slots[1], Slot::Write { .. }));
+}
+
+/// An entry already present behind a link the handle refuses is skipped,
+/// not failed: nothing is written to it. With `--overwrite` it is written,
+/// so the check applies and fails it before the fetch.
+#[cfg(unix)]
+#[test]
+fn plan_slots_skips_a_present_entry_before_it_checks_its_parent_chain() {
+    let out = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), out.path().join("link")).unwrap();
+    let landing = Landing::open(out.path()).unwrap();
+    let entries = [entry("link/file", "b3:h")];
+    let refs: Vec<&ManifestEntry> = entries.iter().collect();
+    let skip = HashSet::from(["link/file".to_string()]);
+
+    let slots = plan_slots(&refs, &landing, false, &skip);
+    assert!(matches!(slots[0], Slot::Skip), "{:?}", slots[0]);
+
+    let slots = plan_slots(&refs, &landing, true, &HashSet::new());
+    assert!(matches!(slots[0], Slot::Failed(_)), "{:?}", slots[0]);
+}
+
+/// A run stopped before any group started has one `NotRun` outcome per
+/// entry, so the summary and the pass merge see every entry.
+#[test]
+fn a_run_stopped_before_start_has_one_not_run_outcome_per_entry() {
+    let run = PullRun::stopped_before_start(3, anyhow!("the output directory cannot be opened"));
+    assert_eq!(run.outcomes.len(), 3);
+    assert!(
+        run.outcomes
+            .iter()
+            .all(|o| matches!(o, EntryOutcome::NotRun))
+    );
+    assert!(!run.interrupted);
+    assert!(run.stopped.is_some());
 }
 
 /// The landing gate holds for a slot the plan let through: the escaping

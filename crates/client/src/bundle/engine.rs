@@ -451,27 +451,26 @@ pub(super) fn writable_dest(out_root: &Path, path: &str) -> anyhow::Result<PathB
 /// is written, not silently kept. Evaluated **per destination**, so one path
 /// of a duplicated blob can be skipped while another is written. With
 /// `overwrite` set, `skip` is empty and every destination is written. A path
-/// whose parent chain already leads out of the root ([`Landing::check`])
-/// fails here, before its fetch is paid for.
+/// to write whose parent chain already cannot take it ([`Landing::check`])
+/// fails here, before its fetch is paid for. A path to skip is not checked:
+/// nothing is written to it.
 fn plan_slots<'a>(
     entries: &[&'a ManifestEntry],
     landing: &Landing,
     overwrite: bool,
     skip: &HashSet<String>,
 ) -> Vec<Slot<'a>> {
-    let resolve = |path: &str| {
-        let dest = writable_dest(landing.root(), path)?;
-        landing.check(&dest)?;
-        anyhow::Ok(dest)
-    };
     entries
         .iter()
-        .map(|en| match resolve(&en.path) {
+        .map(|en| match writable_dest(landing.root(), &en.path) {
             Err(e) => Slot::Failed(EntryOutcome::failed(&en.path, &e)),
             Ok(_) if !overwrite && skip.contains(en.path.as_str()) => Slot::Skip,
-            Ok(dest) => Slot::Write {
-                label: en.path.as_str(),
-                dest,
+            Ok(dest) => match landing.check(&dest) {
+                Ok(()) => Slot::Write {
+                    label: en.path.as_str(),
+                    dest,
+                },
+                Err(e) => Slot::Failed(EntryOutcome::failed(&en.path, &e)),
             },
         })
         .collect()
@@ -878,11 +877,12 @@ impl Transfer {
 pub(super) struct Registry {
     /// Every active registered node.
     pub(super) nodes: Vec<NodeCandidate>,
-    /// The list is a live registry read, or the peer store's identity-fresh
-    /// records that stand in for one. `false` is the registry-outage fallback
+    /// The list is the registry-outage fallback
     /// ([`discovery::Bootstrap::Cached`]), which the region allowlist leaves
-    /// alone: the run is already down to what the store kept.
-    pub(super) live: bool,
+    /// alone: the run is already down to what the store kept. A live registry
+    /// read, or the peer store's identity-fresh records that stand in for
+    /// one, is narrowed.
+    pub(super) outage_fallback: bool,
 }
 
 impl Registry {
@@ -893,10 +893,10 @@ impl Registry {
     /// extra probe, because each entry probes its own candidates, and a node
     /// that one draw leaves out can still reach other entries.
     pub(super) fn entry_candidates(&self, site: &PullSite) -> Vec<NodeCandidate> {
-        let allow: &[decdn_protocol::Region] = if self.live {
-            site.region_allowlist.as_slice()
-        } else {
+        let allow: &[decdn_protocol::Region] = if self.outage_fallback {
             &[]
+        } else {
+            site.region_allowlist.as_slice()
         };
         crate::targets::select_with_widening(
             self.nodes.clone(),
@@ -928,7 +928,7 @@ pub(super) async fn discover_candidates(
     {
         return Ok(Registry {
             nodes: cached,
-            live: true,
+            outage_fallback: false,
         });
     }
     let bootstrap = crate::discovery::bootstrap_nodes(
@@ -943,12 +943,15 @@ pub(super) async fn discover_candidates(
     if let Some(warning) = bootstrap.warning() {
         tracing::warn!("{warning}");
     }
-    let live = matches!(bootstrap, discovery::Bootstrap::Live { .. });
+    let outage_fallback = matches!(bootstrap, discovery::Bootstrap::Cached { .. });
     let all = bootstrap.into_peers();
     if all.is_empty() {
         bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
-    Ok(Registry { nodes: all, live })
+    Ok(Registry {
+        nodes: all,
+        outage_fallback,
+    })
 }
 
 /// The peer store's identity-fresh records under `data_dir`, or `None` when

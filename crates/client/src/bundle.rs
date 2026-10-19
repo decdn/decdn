@@ -373,8 +373,8 @@ pub enum Funding {
 pub struct NodeSelection {
     /// The node every entry pulls from, when one is pinned.
     pinned: Option<PinnedNode>,
-    /// Every active registered node, and whether the list is a live read,
-    /// when none is pinned.
+    /// Every active registered node, and whether the list is the
+    /// registry-outage fallback, when none is pinned.
     registry: Option<engine::Registry>,
 }
 

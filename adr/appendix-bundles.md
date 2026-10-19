@@ -402,8 +402,8 @@ The rules below apply to every pull:
   output directory is followed. A symlink with an absolute target is an
   escape, even when it points back inside. The output directory itself may
   be a symlink. The pull reads its staging directory (`.decdn-partial/`) by
-  its own path, so a staging directory that is a symlink still lands
-  entries, by a copy. Writes are atomic
+  its own path. A staging directory that is a symlink the handle refuses
+  still lands entries, by a copy. Writes are atomic
   (temp-then-rename after the BLAKE3 check the fetch path already
   performs), so a present file is verified-good: pull **skips existing
   files** by default (re-runs resume), and `--overwrite` forces a re-fetch.

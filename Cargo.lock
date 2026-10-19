@@ -2081,20 +2081,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cap-tempfile"
-version = "4.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "038b3f6a5d4b5641b1bb99d638eb7a22013de84f81c528d8930de06d7383fbd5"
-dependencies = [
- "cap-std",
- "rand 0.9.5",
- "rustix",
- "rustix-linux-procfs",
- "uuid 1.28.0",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "cargo-manifest"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2880,7 +2866,6 @@ dependencies = [
  "blake3",
  "bytes",
  "cap-std",
- "cap-tempfile",
  "decdn-bao-range",
  "decdn-common",
  "decdn-incentive",
@@ -8592,7 +8577,6 @@ version = "1.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cc1186384beb7dd8eedea376413fd654937285ea6c9cfbb928dc3043ea4b606"
 dependencies = [
- "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]

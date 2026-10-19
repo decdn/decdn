@@ -307,3 +307,127 @@ fn check_refuses_an_escaping_parent_and_accepts_a_missing_one() {
         "the check creates nothing"
     );
 }
+
+/// An output path that is a regular file cannot be opened as the output
+/// directory, and the error names it as such.
+#[test]
+fn open_refuses_a_path_that_is_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("out");
+    std::fs::write(&file, b"x").unwrap();
+
+    let err = Landing::open(&file).unwrap_err();
+
+    assert!(format!("{err:#}").contains("output directory"), "{err:#}");
+}
+
+/// A parent that is a regular file fails the check, before the fetch.
+#[test]
+fn check_refuses_a_parent_that_is_a_file() {
+    let out = tempfile::tempdir().unwrap();
+    std::fs::write(out.path().join("a"), b"x").unwrap();
+    let landing = Landing::open(out.path()).unwrap();
+
+    let err = landing.check(&out.path().join("a/b")).unwrap_err();
+
+    assert!(format!("{err:#}").contains("is not a directory"), "{err:#}");
+}
+
+/// The handle, not the pre-fetch check, is the gate: a directory the check
+/// accepted that is swapped for a symlink out of the root before the write
+/// is still refused, by every writer.
+#[cfg(unix)]
+#[test]
+fn a_directory_swapped_for_a_symlink_after_the_check_is_still_refused() {
+    let out = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let landing = Landing::open(out.path()).unwrap();
+    let staging = out.path().join(STAGING_DIR).join("blob");
+    std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+    std::fs::write(&staging, b"bytes").unwrap();
+    let src = out.path().join("src.bin");
+    std::fs::write(&src, b"bytes").unwrap();
+    let dest = out.path().join("link/file");
+
+    std::fs::create_dir(out.path().join("link")).unwrap();
+    landing.check(&dest).unwrap();
+    std::fs::remove_dir(out.path().join("link")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), out.path().join("link")).unwrap();
+
+    let moved = landing.move_into_place(&staging, &dest).unwrap_err();
+    assert_refused(&moved, outside.path());
+    let copied = landing.materialize(&staging, &dest).unwrap_err();
+    assert_refused(&copied, outside.path());
+    let linked = landing.link_or_copy_atomic(&src, &dest).unwrap_err();
+    assert_refused(&linked, outside.path());
+    assert!(staging.exists(), "the fetched blob is kept for a rerun");
+}
+
+/// A donor whose staging directory is a symlink the handle refuses still
+/// lands: the hard link is refused, and the copy fallback lands it with no
+/// staged name left beside the entry.
+#[cfg(unix)]
+#[test]
+fn a_donor_under_a_symlinked_staging_dir_lands_through_the_copy_fallback() {
+    let out = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), out.path().join(STAGING_DIR)).unwrap();
+    let landing = Landing::open(out.path()).unwrap();
+    let staging = out.path().join(STAGING_DIR).join("blob");
+    std::fs::write(&staging, b"donor-bytes").unwrap();
+    let dest = out.path().join("sub/file");
+
+    let n = landing.first_write(&staging, &dest, true).unwrap();
+
+    assert_eq!(n, 11);
+    assert_eq!(std::fs::read(&dest).unwrap(), b"donor-bytes");
+    assert!(staging.exists(), "a donor's staging name survives");
+    let names: Vec<String> = std::fs::read_dir(out.path().join("sub"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["file"]);
+}
+
+/// A symlink at the entry's own name is replaced by the landed file, never
+/// followed: nothing reaches the link's target.
+#[cfg(unix)]
+#[test]
+fn a_symlink_at_the_entry_itself_is_replaced_not_followed() {
+    let out = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let landing = Landing::open(out.path()).unwrap();
+    let staging = out.path().join("blob");
+    std::fs::write(&staging, b"bytes").unwrap();
+    for name in ["copied", "moved", "linked"] {
+        std::os::unix::fs::symlink(outside.path().join(name), out.path().join(name)).unwrap();
+    }
+
+    landing
+        .materialize(&staging, &out.path().join("copied"))
+        .unwrap();
+    landing
+        .move_into_place(&staging, &out.path().join("moved"))
+        .unwrap();
+    landing
+        .link_or_copy_atomic(&out.path().join("copied"), &out.path().join("linked"))
+        .unwrap();
+
+    for name in ["copied", "moved", "linked"] {
+        let landed = out.path().join(name);
+        assert!(
+            !std::fs::symlink_metadata(&landed).unwrap().is_symlink(),
+            "{name}"
+        );
+        assert_eq!(std::fs::read(&landed).unwrap(), b"bytes", "{name}");
+    }
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+}
+
+/// An empty output path is the current directory, as it is for every other
+/// path the pull derives from it.
+#[test]
+fn open_treats_an_empty_root_as_the_current_directory() {
+    let landing = Landing::open(Path::new("")).unwrap();
+    assert_eq!(landing.root(), Path::new("."));
+}
