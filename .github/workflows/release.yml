@@ -133,7 +133,7 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
 
       # The version bump happens locally and is unpoliced by CI, so confirm the
       # tag matches the manifests it claims to describe. Catches a hand-typed
@@ -182,7 +182,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
 
@@ -406,7 +406,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: ${{ matrix.target }}
 
