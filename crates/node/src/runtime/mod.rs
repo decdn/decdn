@@ -265,8 +265,12 @@ impl ProviderFactory {
         signer: PrivateKeySigner,
         interval: Duration,
     ) -> impl Provider + Clone + use<> {
+        // The send-leg marker lets the buyer's `openPool` / `topUp` and the
+        // seller's redemptions tell a send request that failed in transport
+        // from a chain read that failed before it.
         with_poll_interval(
             ProviderBuilder::new()
+                .layer(decdn_incentive::tx::SendLegLayer)
                 .with_simple_nonce_management()
                 .wallet(EthereumWallet::from(signer))
                 .connect_client(self.client()),

@@ -3116,7 +3116,9 @@ async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()>
     asserter.push_success(&hash);
     let contract = PaymentPool::new(
         Address::ZERO,
-        ProviderBuilder::default().connect_mocked_client(asserter),
+        ProviderBuilder::default()
+            .layer(decdn_incentive::tx::SendLegLayer)
+            .connect_mocked_client(asserter),
     );
 
     let metrics = metrics();
@@ -3223,13 +3225,16 @@ async fn a_sweep_reclaim_that_never_mines_lapses_and_keeps_the_row() -> anyhow::
 
 /// A filler-free `PaymentPool` at [`DEPLOYMENT`]'s address whose RPC calls
 /// `asserter` answers in order, so an `openPool` send is one
-/// `eth_sendTransaction`.
+/// `eth_sendTransaction`, marked as the send as the runtime's wallet
+/// providers mark it.
 fn bare_pool_contract(
     asserter: alloy::providers::mock::Asserter,
 ) -> PaymentPool::PaymentPoolInstance<impl Provider + Clone + 'static> {
     PaymentPool::new(
         Address::ZERO,
-        alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter),
+        alloy::providers::ProviderBuilder::default()
+            .layer(decdn_incentive::tx::SendLegLayer)
+            .connect_mocked_client(asserter),
     )
 }
 

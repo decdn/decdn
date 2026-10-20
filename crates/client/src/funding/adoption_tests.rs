@@ -1257,7 +1257,8 @@ async fn a_pool_another_data_dir_drained_tops_up() {
 
 /// A full pool that is closing or closed still needs a replacement: its
 /// `topUp` estimate reverts `PoolNotOpen`, and the step goes on to open a new
-/// pool (whose chain calls this mock leaves unanswered).
+/// pool (whose chain calls this mock leaves unanswered, so the open's gas
+/// estimate fails before anything is sent).
 #[tokio::test]
 async fn a_full_closing_pool_is_replaced() {
     let selector = alloy::primitives::keccak256("PoolNotOpen()");
@@ -1285,27 +1286,26 @@ async fn a_full_closing_pool_is_replaced() {
         asserter.read_q().is_empty(),
         "the estimate and the allowance ran"
     );
-    // The submit failed in transport, so it may have broadcast: the run's
-    // handle holds it, which is how the command names it (#2418).
-    assert_eq!(opens, vec![OpenUnconfirmed { tx: None, nonce: 0 }]);
+    // The open's chain reads failed before the send, so nothing was signed
+    // and the run's handle holds no open (#2431).
+    assert!(opens.is_empty(), "{opens:?}");
 }
 
-/// A lane build that opens the run's pool holds the `openPool` in the run's
-/// handle, so a command that drops the build can still name it (#2418).
-#[tokio::test]
-async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_escrows() {
+/// Run a lane build's open on `rpc`, in a run reporting to `opens`: `usdc()`,
+/// then the allowance read finds enough, and the pending-nonce read answers
+/// 3, so the open goes on to submit. Returns the submit's error.
+async fn lane_build_open_on(
+    rpc: impl alloy::providers::Provider + Clone,
+    asserter: &Asserter,
+    opens: &UnconfirmedEscrows,
+) -> anyhow::Error {
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
     let signer = Arc::new(PrivateKeySigner::random());
-    let asserter = Asserter::new();
-    // `usdc()`, then the allowance read finds enough, and the pending-nonce
-    // read answers, so the open goes on to submit, which fails in transport.
     asserter.push_success(&Bytes::from(TOKEN.abi_encode()));
     asserter.push_success(&U256::MAX.abi_encode());
     asserter.push_success(&U256::from(3u64));
-    let rpc = ProviderBuilder::new().connect_mocked_client(asserter.clone());
     let contract = PaymentPool::new(PP, rpc.clone());
-    let opens = UnconfirmedEscrows::default();
     let funding = RunFunding::reporting_escrows_to(opens.clone());
     let err = open_or_reuse_pool(
         &store,
@@ -1323,9 +1323,39 @@ async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_escrows() {
         &CancellationToken::new(),
     )
     .await
-    .expect_err("the open's submit fails in transport");
+    .expect_err("the open's submit fails");
     assert!(format!("{err:#}").contains("submit openPool"), "{err:#}");
+    err
+}
+
+/// A lane build that opens the run's pool holds the `openPool` in the run's
+/// handle, so a command that drops the build can still name it (#2418). The
+/// provider is filler-free and send-leg-marked, so the empty queue fails the
+/// send request itself, which may have broadcast.
+#[tokio::test]
+async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_escrows() {
+    let asserter = Asserter::new();
+    let rpc = ProviderBuilder::default()
+        .layer(decdn_incentive::tx::SendLegLayer)
+        .connect_mocked_client(asserter.clone());
+    let opens = UnconfirmedEscrows::default();
+    lane_build_open_on(rpc, &asserter, &opens).await;
     assert_eq!(opens.opens(), vec![OpenUnconfirmed { tx: None, nonce: 3 }]);
+}
+
+/// A lane build whose open fails on a chain read before the send (here the
+/// gas estimate, on a provider with fillers) signed nothing, so the run's
+/// handle holds no open (#2431).
+#[tokio::test]
+async fn a_lane_build_open_whose_reads_fail_is_not_held() {
+    let asserter = Asserter::new();
+    let rpc = ProviderBuilder::new()
+        .layer(decdn_incentive::tx::SendLegLayer)
+        .connect_mocked_client(asserter.clone());
+    let opens = UnconfirmedEscrows::default();
+    let err = lane_build_open_on(rpc, &asserter, &opens).await;
+    assert!(err.downcast_ref::<OpenUnconfirmed>().is_none(), "{err:#}");
+    assert!(opens.opens().is_empty());
 }
 
 /// A delegated lane resumes from the delegate lanes the store holds for its

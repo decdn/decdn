@@ -134,6 +134,42 @@ fn invalid_rpc_url_is_redacted_from_both_builders() {
     }
 }
 
+/// A fully specified request from `signer`: every filler is finished, so the
+/// first request on the wire is the send itself.
+fn specified_request(signer: &PrivateKeySigner) -> alloy::rpc::types::TransactionRequest {
+    alloy::rpc::types::TransactionRequest {
+        from: Some(signer.address()),
+        to: Some(alloy::primitives::TxKind::Call(
+            alloy::primitives::Address::repeat_byte(0x01),
+        )),
+        nonce: Some(0),
+        gas: Some(21_000),
+        chain_id: Some(1),
+        max_fee_per_gas: Some(1),
+        max_priority_fee_per_gas: Some(1),
+        ..Default::default()
+    }
+}
+
+/// The wallet-filled builder carries the send-leg marker: a send request
+/// that fails in transport (nothing listens on the port) comes back as a
+/// [`decdn_incentive::tx::SendLegFailure`], so the senders can tell it from a
+/// chain read that failed before it (#2431).
+#[tokio::test]
+async fn wallet_builder_marks_a_failed_send_request() {
+    let signer = PrivateKeySigner::random();
+    let provider = build_provider("http://127.0.0.1:1", &signer).unwrap();
+    let err = provider
+        .send_transaction(specified_request(&signer))
+        .await
+        .unwrap_err();
+    let err = alloy::contract::Error::TransportError(err);
+    assert!(
+        decdn_incentive::tx::SendLegFailure::from_error(&err).is_some(),
+        "{err}"
+    );
+}
+
 /// reqwest is built with `rustls-no-provider` and panics in `Client::build`
 /// with no process-wide rustls provider. An SDK host that installs none must
 /// still get a chain client, so each builder installs ring itself. nextest

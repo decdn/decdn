@@ -25,6 +25,10 @@
 //! after the receipt wait is a bug. The `decdn-e2e` fixtures are exempt: a
 //! failed fixture tx fails the test, and no operator reconciles it.
 
+mod send_leg;
+
+pub use send_leg::{SendLegFailure, SendLegLayer, SendLegProvider};
+
 use alloy::contract::{CallBuilder, CallDecoder, Error as ContractError};
 use alloy::network::Ethereum;
 use alloy::primitives::B256;
@@ -76,14 +80,16 @@ pub async fn await_receipt(
 /// The six states are mutually exclusive and cover every path:
 ///
 /// - [`NotSent`](Self::NotSent) — the initial value; also what a dry run leaves.
-/// - [`Rejected`](Self::Rejected) — `send()` failed with a JSON-RPC error
-///   response other than an `already known` answer (a pre-flight gas-estimate
-///   revert, a stale nonce, an under-funded account). The node answered, and
-///   nothing entered the mempool.
-/// - [`MaybeBroadcast`](Self::MaybeBroadcast) — `send()` failed with a
-///   transport-class error, or the node answered that it already holds the
-///   transaction. The request may have reached the node and broadcast the
-///   transaction, but no hash was captured. The outcome is UNKNOWN.
+/// - [`Rejected`](Self::Rejected) — `send()` failed before anything entered
+///   the mempool: a JSON-RPC error response other than an `already known`
+///   answer (a pre-flight gas-estimate revert, a stale nonce, an under-funded
+///   account), or a chain read before the send that failed in transport, so
+///   nothing was signed.
+/// - [`MaybeBroadcast`](Self::MaybeBroadcast) — the send request itself
+///   failed with a transport-class error ([`SendLegFailure`]), or the node
+///   answered that it already holds the transaction. The request may have
+///   reached the node and broadcast the transaction, but no hash was
+///   captured. The outcome is UNKNOWN.
 /// - [`InFlight`](Self::InFlight) — broadcast, but the receipt could not be
 ///   read or did not arrive within [`RECEIPT_TIMEOUT`]. In flight, may still
 ///   confirm. Carries the hash.
@@ -96,14 +102,15 @@ pub enum SendOutcome {
     /// dry run leaves.
     #[default]
     NotSent,
-    /// The node rejected the call before broadcast (a JSON-RPC error response
-    /// other than `already known`). Nothing entered the mempool.
+    /// Nothing entered the mempool: the node rejected the call (a JSON-RPC
+    /// error response other than `already known`), or a chain read before the
+    /// send failed, so nothing was signed.
     Rejected,
-    /// `send()` failed with a transport-class error (timeout, connection reset, a
-    /// 5xx from an RPC load balancer), or the node answered that it already
-    /// holds the transaction (`already known`). The transaction may have been
-    /// broadcast; no hash was captured, so the outcome is genuinely unknown and
-    /// re-sending can double-submit.
+    /// The send request itself failed with a transport-class error (timeout,
+    /// connection reset, a 5xx from an RPC load balancer), or the node answered
+    /// that it already holds the transaction (`already known`). The transaction
+    /// may have been broadcast; no hash was captured, so the outcome is
+    /// genuinely unknown and re-sending can double-submit.
     MaybeBroadcast,
     /// Broadcast; the receipt could not be read or did not arrive within
     /// [`RECEIPT_TIMEOUT`]. May still confirm.
@@ -120,9 +127,9 @@ impl SendOutcome {
     /// [`Reverted`](Self::Reverted), or [`InFlight`](Self::InFlight).
     ///
     /// [`MaybeBroadcast`](Self::MaybeBroadcast) has none by construction: its
-    /// `send()` failed before returning a handle (a transport error, or an
-    /// `already known` answer), so there is no hash to give even though a
-    /// transaction may exist.
+    /// the send request failed before returning a handle (a transport error,
+    /// or an `already known` answer), so there is no hash to give even though
+    /// a transaction may exist.
     #[must_use]
     pub const fn tx(self) -> Option<B256> {
         match self {
@@ -149,54 +156,65 @@ impl SendOutcome {
 /// Whether a `send()` failure leaves the transaction's fate genuinely unknown.
 ///
 /// The question is whether the request could have reached the node and broadcast
-/// the transaction before its response was lost. Two kinds of failure are
-/// definite rejections that broadcast nothing:
+/// the transaction before its response was lost. `send()` does its chain reads
+/// first (the pending nonce, the gas estimate, the fees, the chain id), then
+/// signs, then sends. Only the last step can broadcast, and only a failure of
+/// that step is uncertain. [`SendLegLayer`] tells the two apart by structure:
+/// it sits below the fillers and wraps a failure of the send request in
+/// [`SendLegFailure`], so:
 ///
-/// - a JSON-RPC error *response* — the node processed the request and rejected
-///   it (a pre-flight gas-estimate revert, the modal `createNamespace` /
-///   `addOrigin` failure; a stale nonce; an under-funded account). The one
-///   exception is an `already known` / `known transaction` answer: the node
-///   already holds this signed transaction, because an earlier copy of the same
-///   send (a gateway that retried it on another backend) reached a mempool. That
-///   answer is uncertain, not a rejection;
-/// - a client-side fault raised before the request left the process (an
-///   unsupported feature, a local-usage error, a body that failed to serialize),
-///   or an HTTP 4xx where the gateway refused the request outright (a bad path,
-///   an expired key) without forwarding it to the node.
+/// - a marked failure is the send itself failing without an answer: a timeout,
+///   a connection reset, an HTTP 5xx from an RPC load balancer, a response body
+///   that could not be deserialized. The transaction may already be in the
+///   mempool, and `eth_sendRawTransaction` is not idempotent from the client's
+///   view, so the caller must not report "nothing happened". Two marked shapes
+///   are still definite: an HTTP 4xx, where the gateway refused the request
+///   outright (a bad path, an expired key) without forwarding it, and a
+///   client-side fault raised before the request left the process (an
+///   unsupported feature, a local-usage error, a body that failed to
+///   serialize);
+/// - a JSON-RPC error *response* arrives unmarked whichever step it answers:
+///   the node processed the request and rejected it (a pre-flight gas-estimate
+///   revert, the modal `createNamespace` / `addOrigin` failure; a stale nonce;
+///   an under-funded account). The one exception is an `already known` /
+///   `known transaction` answer: the node already holds this signed
+///   transaction, because an earlier copy of the same send (a gateway that
+///   retried it on another backend) reached a mempool. That answer is
+///   uncertain, not a rejection;
+/// - any other unmarked failure happened before the send: a chain read that
+///   failed in transport, a signing fault, a local fault. Nothing was signed
+///   or sent, so re-running is safe.
 ///
-/// Everything else is genuinely uncertain: a timeout, a connection reset, an HTTP
-/// 5xx from an RPC load balancer, or a response body that could not be
-/// deserialized. There the transaction may already be in the mempool, and
-/// `eth_sendRawTransaction` is not idempotent from the client's view, so the
-/// caller must not report "nothing happened".
-///
-/// The `as_error_resp().is_none()` shorthand is deliberately NOT used: it would
-/// fold the local faults above into the uncertain bucket, warning about a
-/// possibly-broadcast transaction on a bug that never touched the wire.
+/// The sending providers all carry the layer (`decdn_client::provider::build_provider`,
+/// the node's wallet providers, sponsord's treasury provider). A provider
+/// without it reports every transport failure as "nothing sent", so a
+/// provider handed to a sender in this crate or `decdn-client` must install
+/// it.
 #[must_use]
 pub fn send_broadcast_unknown(err: &ContractError) -> bool {
     use alloy::transports::{RpcError, TransportErrorKind};
 
-    let ContractError::TransportError(rpc) = err else {
-        // ABI, pending-transaction, and other contract-level faults are local —
-        // nothing reached the wire.
+    if let Some(failure) = SendLegFailure::from_error(err) {
+        return match failure.inner() {
+            // The client failed before the request left: nothing reached the wire.
+            RpcError::UnsupportedFeature(_)
+            | RpcError::LocalUsageError(_)
+            | RpcError::SerError(_) => false,
+            // An HTTP 4xx is the gateway refusing the request (bad path, bad key)
+            // before it reaches the node; a 5xx may have broadcast before failing.
+            RpcError::Transport(TransportErrorKind::HttpError(h)) => h.status >= 500,
+            // Timeouts, resets, a null response, an undeserializable body: the
+            // request may have been processed before the answer was lost.
+            _ => true,
+        };
+    }
+    // The node already holds this signed tx: an earlier copy of the send
+    // reached a mempool, so the tx may still mine. Every other answer, and
+    // every failure before the send, broadcast nothing.
+    let ContractError::TransportError(RpcError::ErrorResp(resp)) = err else {
         return false;
     };
-    match rpc {
-        // The node already holds this signed tx: an earlier copy of the send
-        // reached a mempool, so the tx may still mine.
-        RpcError::ErrorResp(resp) => is_already_known(&resp.message),
-        // The client failed before sending: nothing reached the wire.
-        RpcError::UnsupportedFeature(_) | RpcError::LocalUsageError(_) | RpcError::SerError(_) => {
-            false
-        }
-        // An HTTP 4xx is the gateway refusing the request (bad path, bad key)
-        // before it reaches the node; a 5xx may have broadcast before failing.
-        RpcError::Transport(TransportErrorKind::HttpError(h)) => h.status >= 500,
-        // Timeouts, resets, a null response, an undeserializable body: the
-        // request may have been processed before the answer was lost.
-        _ => true,
-    }
+    is_already_known(&resp.message)
 }
 
 /// Whether a send failed because another transaction from the same account took
@@ -237,8 +255,8 @@ fn is_already_known(message: &str) -> bool {
 /// and is the reason an out-param exists rather than just a return value:
 ///
 /// - rejected send → `None` (nothing was broadcast)
-/// - a send failure whose broadcast is unknown (a transport-class error, or the
-///   node answers that it already holds the tx) → `None`, but the error text
+/// - a send failure whose broadcast is unknown (the send request failed in
+///   transport, or the node answers that it already holds the tx) → `None`, but the error text
 ///   warns that the tx MAY have been broadcast — the outcome is unknown
 ///   ([`SendOutcome`] carries this as
 ///   [`MaybeBroadcast`](SendOutcome::MaybeBroadcast) for callers that render
@@ -306,11 +324,13 @@ pub async fn send_for_receipt<C: CallDecoder, P: Provider>(
     let pending = match call.send().await {
         Ok(pending) => pending,
         Err(err) => {
-            // A rejected send never reached the mempool. A transport-class
-            // failure may have broadcast the tx before its response was lost,
-            // and an `already known` answer means an earlier copy of it already
+            // A rejected send, and a chain read that failed before the send,
+            // never reached the mempool. The send request failing in transport
+            // may have broadcast the tx before its response was lost, and an
+            // `already known` answer means an earlier copy of it already
             // reached one. Neither may be reported as a clean "nothing
-            // happened", since re-sending is not idempotent (#1577, #2432).
+            // happened", since re-sending is not idempotent (#1577, #2432,
+            // #2431).
             let broadcast_unknown = send_broadcast_unknown(&err);
             *outcome = if broadcast_unknown {
                 SendOutcome::MaybeBroadcast

@@ -813,13 +813,32 @@ async fn an_unreachable_rpc_warns_and_still_issues() {
 }
 
 /// A `PaymentPool` on a filler-free provider whose RPC calls `asserter` answers
-/// in order; a call past the queue fails in transport.
+/// in order; a call past the queue fails in transport. The provider carries
+/// the send-leg marker, as `provider::build_provider` does, so the one request
+/// `send()` makes is read as the send.
 fn pool_on(
     asserter: alloy::providers::mock::Asserter,
 ) -> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone> {
     PaymentPool::new(
         Address::repeat_byte(0x01),
-        alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter),
+        alloy::providers::ProviderBuilder::default()
+            .layer(decdn_incentive::tx::SendLegLayer)
+            .connect_mocked_client(asserter),
+    )
+}
+
+/// [`pool_on`] with the nonce and gas fillers, so `send()` reads the chain
+/// before it sends: an empty queue then fails a read, not the send request.
+fn filled_pool_on(
+    asserter: alloy::providers::mock::Asserter,
+) -> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone> {
+    PaymentPool::new(
+        Address::repeat_byte(0x01),
+        alloy::providers::ProviderBuilder::default()
+            .layer(decdn_incentive::tx::SendLegLayer)
+            .with_simple_nonce_management()
+            .with_gas_estimation()
+            .connect_mocked_client(asserter),
     )
 }
 
@@ -994,6 +1013,49 @@ async fn a_transport_failed_close_send_warns_it_may_have_broadcast() {
     assert!(msg.contains(MAYBE_BROADCAST), "{msg}");
     // The failure is the send itself, not a fill-stage read before it.
     assert!(msg.contains("eth_sendTransaction"), "{msg}");
+}
+
+/// A `closePool` whose chain reads fail before the send signed nothing, so
+/// it carries no [`TxUnconfirmed`] and no broadcast warning (#2431).
+#[tokio::test]
+async fn a_close_whose_reads_fail_before_the_send_is_not_unconfirmed() {
+    let err = close_and_forget(
+        &filled_pool_on(alloy::providers::mock::Asserter::new()),
+        LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+        Address::repeat_byte(0x22),
+        B256::repeat_byte(0x33),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.downcast_ref::<TxUnconfirmed>().is_none(), "{err:#}");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("closePool send failed"), "{msg}");
+    assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
+    assert!(!msg.contains("eth_sendTransaction"), "{msg}");
+}
+
+/// `close --all` counts a pool whose `closePool` reads failed before the send
+/// as failed, not as one that may have broadcast (#2431): every send in the
+/// sweep fails on the first chain read, so no pool is unconfirmed.
+#[tokio::test]
+async fn close_all_counts_a_failed_read_before_the_send_as_failed() {
+    let owner = Address::repeat_byte(0x22);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&owned_pools(2));
+    for _ in 0..2 {
+        asserter.push_success(&pool_in(owner, PaymentPool::Status::Open));
+    }
+
+    let err = close_all(
+        &filled_pool_on(asserter),
+        LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+        owner,
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("2 pool(s) failed to close"), "{msg}");
+    assert!(!msg.contains("may have broadcast"), "{msg}");
 }
 
 /// A `closePool` send the RPC node rejects (other than `already known`)

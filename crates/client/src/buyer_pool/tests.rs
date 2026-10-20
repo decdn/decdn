@@ -10,7 +10,7 @@ use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::test_rpc::{SCRIPTED_NONCE, SCRIPTED_TX, ScriptedRpc};
-use decdn_incentive::tx::RECEIPT_TIMEOUT;
+use decdn_incentive::tx::{RECEIPT_TIMEOUT, SendLegLayer};
 use decdn_incentive::{BuyerPoolState, DepositOutcome, MemoryBuyerPoolStore, StoreError};
 use decdn_incentive::{SignedCapability, voucher_domain};
 use std::sync::Arc;
@@ -42,14 +42,58 @@ fn top_up_signature_takes_pool_id_and_amount() {
 }
 
 /// A `PaymentPool` on a filler-free provider whose RPC calls are answered
-/// in order by `asserter`; a call past the queue fails in transport.
+/// in order by `asserter`; a call past the queue fails in transport. The
+/// provider carries the send-leg marker, as the production builders do, so
+/// the one request `send()` makes is read as the send.
 fn mocked_pool(
     asserter: alloy::providers::mock::Asserter,
 ) -> PaymentPool::PaymentPoolInstance<impl Provider + Clone> {
     PaymentPool::new(
         Address::repeat_byte(0x01),
-        alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter),
+        alloy::providers::ProviderBuilder::default()
+            .layer(SendLegLayer)
+            .connect_mocked_client(asserter),
     )
+}
+
+/// [`mocked_pool`] with a gas filler, so `send()` reads the gas estimate and
+/// the fees before it sends: an empty queue then fails a chain read, not the
+/// send request.
+fn filled_pool(
+    asserter: alloy::providers::mock::Asserter,
+) -> PaymentPool::PaymentPoolInstance<impl Provider + Clone> {
+    PaymentPool::new(
+        Address::repeat_byte(0x01),
+        alloy::providers::ProviderBuilder::default()
+            .layer(SendLegLayer)
+            .with_gas_estimation()
+            .connect_mocked_client(asserter),
+    )
+}
+
+/// A `topUp` whose chain reads fail before the send signed nothing, so it is
+/// not unconfirmed: no [`TopUpUnconfirmed`] in the error, `escrows` releases
+/// the entry, and nothing is re-sent (#2431).
+#[tokio::test]
+async fn a_top_up_whose_reads_fail_before_the_send_is_not_unconfirmed() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    let escrows = UnconfirmedEscrows::default();
+    let err = top_up(
+        &filled_pool(asserter),
+        Address::repeat_byte(0x22),
+        B256::repeat_byte(0x33),
+        U256::from(1_000u64),
+        Some(&escrows),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("submit topUp"), "{msg}");
+    assert!(!msg.contains("eth_sendTransaction"), "{msg}");
+    assert!(escrows.top_ups().is_empty());
 }
 
 /// A `topUp` submit that fails in transport may have been broadcast, so it
@@ -694,6 +738,28 @@ async fn an_unreadable_open_pool_receipt_names_the_tx() {
     );
 }
 
+/// An `openPool` whose chain reads fail before the send signed nothing, so it
+/// is not unconfirmed: no [`OpenUnconfirmed`] in the error and `opens` holds
+/// nothing, while the failure still classifies as an RPC fault (#2431).
+#[tokio::test]
+async fn an_open_pool_whose_reads_fail_before_the_send_is_not_unconfirmed() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    let opens = UnconfirmedEscrows::default();
+    let err = open_tracked(filled_pool(asserter), &opens, None)
+        .await
+        .unwrap_err();
+    assert!(err.downcast_ref::<OpenUnconfirmed>().is_none(), "{err:#}");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("submit openPool"), "{msg}");
+    assert!(!msg.contains("eth_sendTransaction"), "{msg}");
+    assert_eq!(
+        err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
+        Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
+    );
+    assert!(opens.opens().is_empty());
+}
+
 /// An `openPool` submit that fails in transport may have been broadcast, so it
 /// carries [`OpenUnconfirmed`] with no hash and the nonce it was sent with.
 #[tokio::test]
@@ -1019,11 +1085,13 @@ fn regenerated_capability_is_deterministic_for_same_params() -> anyhow::Result<(
 /// The `approve` note that a send whose broadcast is unknown may be pending.
 const APPROVE_MAYBE_BROADCAST: &str = "may already be pending";
 
-/// Run [`ensure_allowance`] on a filler-free mocked provider whose RPC calls
-/// `asserter` answers in order, and return its error.
+/// Run [`ensure_allowance`] on a filler-free, send-leg-marked mocked provider
+/// whose RPC calls `asserter` answers in order, and return its error.
 async fn approve_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error {
     ensure_allowance(
-        &alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter),
+        &alloy::providers::ProviderBuilder::default()
+            .layer(SendLegLayer)
+            .connect_mocked_client(asserter),
         Address::repeat_byte(0x44),
         Address::repeat_byte(0x22),
         Address::repeat_byte(0x01),
@@ -1031,6 +1099,32 @@ async fn approve_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error
     )
     .await
     .unwrap_err()
+}
+
+/// An `approve` whose chain reads fail before the send signed nothing, so
+/// the error does not say it may be pending (#2431).
+#[tokio::test]
+async fn an_approve_whose_reads_fail_before_the_send_is_not_pending() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    // An ABI-encoded zero allowance, so `approve` is sent; the gas estimate
+    // then finds no reply.
+    asserter.push_success(&B256::ZERO);
+    let err = ensure_allowance(
+        &alloy::providers::ProviderBuilder::default()
+            .layer(SendLegLayer)
+            .with_gas_estimation()
+            .connect_mocked_client(asserter),
+        Address::repeat_byte(0x44),
+        Address::repeat_byte(0x22),
+        Address::repeat_byte(0x01),
+        None,
+    )
+    .await
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("submit USDC approve"), "{msg}");
+    assert!(!msg.contains(APPROVE_MAYBE_BROADCAST), "{msg}");
+    assert!(!msg.contains("eth_sendTransaction"), "{msg}");
 }
 
 /// An `approve` submit that fails in transport may have been broadcast with no

@@ -642,8 +642,9 @@ diagnostic.
    its first vouchers. That clears on the provider's next redemption; no action.
 
 **`decdn_buyer_pool_open_unresolved` at 1 means the node holds its pool open for
-an `openPool` it could not confirm.** The submit returned no tx hash (a
-transport failure, or the RPC node already held the transaction), or the receipt
+an `openPool` it could not confirm.** The submit returned no tx hash (the send
+request failed in transport after the RPC node may have accepted it, or the RPC
+node already held the transaction), or the receipt
 read failed, so the transaction may still mine. The node opens no second
 pool until the chain resolves it, and every cache miss that needs a pool is
 refused as a local fault meanwhile. The node re-reads the chain every 5 s: a
