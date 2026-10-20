@@ -3504,7 +3504,7 @@ since project inception and will roll into the first tagged release.
     sorted first, the script picked it and died at the KEYS check, so every
     run needed `DECDN_SIGNING_KEY` set by hand. Keyring order also decided
     between two published keys during a key rotation.
-- **Toolchain: Rust 1.99.0 is the pinned toolchain and the MSRV (#2378).**
+- **Toolchain: Rust 1.99.1 is the pinned toolchain and the MSRV (#2378, #2545).**
   `rust-toolchain.toml`, `rust-version` and every `dtolnay/rust-toolchain`
   step move from 1.95.0 together. Rust 1.97 makes v0 symbol mangling the
   default, so a profiler or debugger that reads `decdn-node` symbols needs a

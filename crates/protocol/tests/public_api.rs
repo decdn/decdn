@@ -20,7 +20,7 @@
 //! `public-api` parses rustdoc's JSON output, which is nominally a nightly-only
 //! feature (`-Z unstable-options --output-format json`). We avoid pulling a
 //! nightly into the project by generating the JSON with the workspace's pinned
-//! **stable** toolchain (`rust-toolchain.toml`, currently 1.99.0) and unlocking
+//! **stable** toolchain (`rust-toolchain.toml`, currently 1.99.1) and unlocking
 //! the unstable flag via `RUSTC_BOOTSTRAP=1` — passed only to the spawned
 //! `cargo rustdoc`, not to anything else. This is deterministic and *more*
 //! stable than tracking `nightly`: the rustdoc-JSON `format_version` is frozen
