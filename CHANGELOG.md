@@ -1102,6 +1102,20 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Payments: a send the RPC node answers with `nonce too low` is reported
+  as possibly broadcast, and an `openPool` or `topUp` that gets it is not sent
+  again (#2562).** A load-balancing RPC gateway that loses one backend's
+  response and retries the same signed bytes on a second backend gets `nonce
+  too low` once the first copy is sequenced. `topUp` read that answer as a
+  foreign nonce collision and re-sent on a fresh nonce, and `openPool` read it
+  as a rejection and released its entry, so either could escrow twice. Both
+  now return `TopUpUnconfirmed` / `OpenUnconfirmed` at the nonce, which the
+  node settles against the chain and the CLI reports instead of retrying.
+  Every other chain write reports the answer as possibly broadcast too, as for
+  `already known` (#2432): `pool close` and `pool reclaim` warn that the tx
+  may still mine, and so do `publish`, key rotation, bond, register, appeal,
+  and the USDC `approve`. A `replacement transaction underpriced` answer is
+  still re-sent on a fresh nonce (#2565).
 - **CLI: `decdn gateway` answers 404, not 502, for a bundle entry whose hash
   does not parse (#2479).** The manifest is content-addressed, so the bad
   `hash` field never changes and nothing upstream failed. The 404 names the

@@ -9,22 +9,22 @@ fn error_resp(code: i64, message: &str) -> ContractError {
     ))
 }
 
-/// A same-account nonce collision is a JSON-RPC rejection with one of the two
-/// collision messages (any case); an unrelated rejection, a revert, or a
-/// transport failure is not.
+/// A same-account nonce collision is a JSON-RPC `replacement transaction
+/// underpriced` rejection (any case). `nonce too low`, an unrelated rejection,
+/// a revert, or a transport failure is not.
 #[test]
-fn only_a_nonce_rejection_is_a_nonce_collision() {
-    assert!(super::is_nonce_collision(&error_resp(
-        -32003,
-        "nonce too low"
-    )));
-    assert!(super::is_nonce_collision(&error_resp(
-        -32000,
-        "Nonce too low: next nonce 7, tx nonce 6"
-    )));
+fn only_an_underpriced_replacement_is_a_nonce_collision() {
     assert!(super::is_nonce_collision(&error_resp(
         -32000,
         "replacement transaction underpriced"
+    )));
+    assert!(super::is_nonce_collision(&error_resp(
+        -32000,
+        "Replacement Transaction Underpriced"
+    )));
+    assert!(!super::is_nonce_collision(&error_resp(
+        -32003,
+        "nonce too low"
     )));
     assert!(!super::is_nonce_collision(&error_resp(
         3,
@@ -35,7 +35,7 @@ fn only_a_nonce_rejection_is_a_nonce_collision() {
         "insufficient funds for gas"
     )));
     assert!(!super::is_nonce_collision(&ContractError::TransportError(
-        alloy::transports::TransportErrorKind::custom_str("nonce too low")
+        alloy::transports::TransportErrorKind::custom_str("replacement transaction underpriced")
     )));
 }
 
@@ -88,10 +88,6 @@ fn a_rejection_is_not_a_broadcast() {
     assert!(!send_broadcast_unknown(&error_resp(
         3,
         "execution reverted"
-    )));
-    assert!(!send_broadcast_unknown(&error_resp(
-        -32000,
-        "nonce too low"
     )));
     // Local faults raised before the request leaves the client — these must
     // NOT be lumped into the uncertain bucket by an `as_error_resp()` shortcut.
@@ -215,7 +211,6 @@ fn an_already_known_rejection_leaves_the_broadcast_unknown() {
         );
     }
     for message in [
-        "nonce too low",
         "insufficient funds for gas * price + value",
         "unknown transaction type",
         "execution reverted",
@@ -225,6 +220,29 @@ fn an_already_known_rejection_leaves_the_broadcast_unknown() {
             "{message}"
         );
     }
+}
+
+/// #2562: a `nonce too low` rejection does not say which transaction spent the
+/// nonce. A gateway that retried the send on a second backend gets it once the
+/// first copy is sequenced, so the tx may have mined. It is not a nonce
+/// collision either, since a re-send on a fresh nonce could double-submit.
+#[test]
+fn a_nonce_too_low_rejection_leaves_the_broadcast_unknown() {
+    for message in ["nonce too low", "Nonce too low: next nonce 7, tx nonce 6"] {
+        assert!(
+            send_broadcast_unknown(&error_resp(-32003, message)),
+            "{message}"
+        );
+        assert!(
+            !is_nonce_collision(&error_resp(-32003, message)),
+            "{message}"
+        );
+    }
+    // An underpriced replacement is a collision, not a spent nonce.
+    assert!(!send_broadcast_unknown(&error_resp(
+        -32000,
+        "replacement transaction underpriced"
+    )));
 }
 
 /// Run [`send_for_receipt`] on a filler-free, send-leg-marked provider whose
@@ -254,6 +272,15 @@ async fn an_already_known_send_is_maybe_broadcast() {
     let msg = format!("{err:#}");
     assert!(msg.contains("may already hold this transaction"), "{msg}");
     assert!(msg.contains("can double-submit"), "{msg}");
+}
+
+/// A send the node answers with `nonce too low` may have mined (#2562): the
+/// outcome is `MaybeBroadcast`, and the error warns against a re-run.
+#[tokio::test]
+async fn a_nonce_too_low_send_is_maybe_broadcast() {
+    let (err, outcome) = send_rejected_with("nonce too low").await;
+    assert_eq!(outcome, SendOutcome::MaybeBroadcast);
+    assert!(format!("{err:#}").contains("can double-submit"), "{err:#}");
 }
 
 /// Any other rejection broadcast nothing: the outcome is `Rejected`, and the
