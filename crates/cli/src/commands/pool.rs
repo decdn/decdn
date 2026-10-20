@@ -1101,7 +1101,9 @@ fn send_reverted(
 /// message sends the operator to this signer's own transactions. A JSON-RPC
 /// rejection that says the node already holds the tx (`already known`, `known
 /// transaction`) also carries [`TxUnconfirmed`]: an earlier copy of the send
-/// reached a mempool (#2432). Any other failure (any other JSON-RPC rejection,
+/// reached a mempool (#2432). So does `nonce too low`: an earlier copy that a
+/// gateway retried on a second backend may have spent the nonce (#2562). Any
+/// other failure (any other JSON-RPC rejection,
 /// an HTTP 4xx, a local fault) broadcast nothing and gets no such note (#1577).
 fn send_failed(err: alloy::contract::Error, label: &'static str) -> anyhow::Error {
     if decdn_incentive::tx::send_broadcast_unknown(&err) {

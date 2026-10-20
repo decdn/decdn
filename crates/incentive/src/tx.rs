@@ -77,13 +77,14 @@ pub async fn await_receipt(
 ///
 /// - [`NotSent`](Self::NotSent) — the initial value; also what a dry run leaves.
 /// - [`Rejected`](Self::Rejected) — `send()` failed with a JSON-RPC error
-///   response other than an `already known` answer (a pre-flight gas-estimate
-///   revert, a stale nonce, an under-funded account). The node answered, and
-///   nothing entered the mempool.
+///   response other than an `already known` or `nonce too low` answer (a
+///   pre-flight gas-estimate revert, an under-funded account). The node
+///   answered, and nothing entered the mempool.
 /// - [`MaybeBroadcast`](Self::MaybeBroadcast) — `send()` failed with a
 ///   transport-class error, or the node answered that it already holds the
-///   transaction. The request may have reached the node and broadcast the
-///   transaction, but no hash was captured. The outcome is UNKNOWN.
+///   transaction or already counts its nonce as spent. The request may have
+///   reached the node and broadcast the transaction, but no hash was captured.
+///   The outcome is UNKNOWN.
 /// - [`InFlight`](Self::InFlight) — broadcast, but the receipt could not be
 ///   read or did not arrive within [`RECEIPT_TIMEOUT`]. In flight, may still
 ///   confirm. Carries the hash.
@@ -97,11 +98,13 @@ pub enum SendOutcome {
     #[default]
     NotSent,
     /// The node rejected the call before broadcast (a JSON-RPC error response
-    /// other than `already known`). Nothing entered the mempool.
+    /// other than `already known` or `nonce too low`). Nothing entered the
+    /// mempool.
     Rejected,
     /// `send()` failed with a transport-class error (timeout, connection reset, a
     /// 5xx from an RPC load balancer), or the node answered that it already
-    /// holds the transaction (`already known`). The transaction may have been
+    /// holds the transaction (`already known`) or already counts its nonce as
+    /// spent (`nonce too low`). The transaction may have been
     /// broadcast; no hash was captured, so the outcome is genuinely unknown and
     /// re-sending can double-submit.
     MaybeBroadcast,
@@ -154,11 +157,16 @@ impl SendOutcome {
 ///
 /// - a JSON-RPC error *response* — the node processed the request and rejected
 ///   it (a pre-flight gas-estimate revert, the modal `createNamespace` /
-///   `addOrigin` failure; a stale nonce; an under-funded account). The one
-///   exception is an `already known` / `known transaction` answer: the node
-///   already holds this signed transaction, because an earlier copy of the same
-///   send (a gateway that retried it on another backend) reached a mempool. That
-///   answer is uncertain, not a rejection;
+///   `addOrigin` failure; an under-funded account). Two answers are exceptions,
+///   because each can be the answer to a gateway that retried the same signed
+///   bytes on a second backend after it lost the first backend's response:
+///   - `already known` / `known transaction`: the node already holds this signed
+///     transaction, because an earlier copy of the send reached a mempool;
+///   - `nonce too low`: the node already counts the nonce as spent, and does not
+///     say which transaction spent it. An earlier copy of the send that was
+///     sequenced first spends it too.
+///
+///   Both answers are uncertain, not rejections;
 /// - a client-side fault raised before the request left the process (an
 ///   unsupported feature, a local-usage error, a body that failed to serialize),
 ///   or an HTTP 4xx where the gateway refused the request outright (a bad path,
@@ -183,9 +191,12 @@ pub fn send_broadcast_unknown(err: &ContractError) -> bool {
         return false;
     };
     match rpc {
-        // The node already holds this signed tx: an earlier copy of the send
-        // reached a mempool, so the tx may still mine.
-        RpcError::ErrorResp(resp) => is_already_known(&resp.message),
+        // The node already holds this signed tx, or counts its nonce as spent:
+        // an earlier copy of the send may have reached a mempool or been
+        // sequenced, so the tx may still mine or may have mined.
+        RpcError::ErrorResp(resp) => {
+            is_already_known(&resp.message) || is_nonce_too_low(&resp.message)
+        }
         // The client failed before sending: nothing reached the wire.
         RpcError::UnsupportedFeature(_) | RpcError::LocalUsageError(_) | RpcError::SerError(_) => {
             false
@@ -200,41 +211,37 @@ pub fn send_broadcast_unknown(err: &ContractError) -> bool {
 }
 
 /// Whether a send failed because a different transaction from the same account
-/// holds its nonce in the node's mempool: a same-nonce `replacement transaction
-/// underpriced`. A retried copy of this send would be answered `already known`
-/// there, so the node broadcast nothing of it, and a provider that reads the
-/// pending nonce on every send picks the next free nonce on a re-send. A node's
-/// seller and buyer services sign with one operator key, so their transactions
-/// can collide this way.
+/// holds its nonce in the answering node's mempool: a same-nonce `replacement
+/// transaction underpriced`. If that node held a copy of this send, it would
+/// answer `already known`, so that node broadcast nothing of it. A provider that
+/// reads the pending nonce on every send picks the next free nonce on a
+/// re-send. A node's seller and buyer services sign with one operator key, so
+/// their transactions can collide this way.
 ///
-/// `nonce too low` is not a collision: see [`is_nonce_spent`].
+/// The answer speaks for one backend only. A gateway that lost another
+/// backend's response to this send and retried it here can get this answer
+/// while the first copy still wins the nonce, so a re-send on a fresh nonce can
+/// then apply the send twice (#2565).
+///
+/// A sequencer chain (Arbitrum, anvil) answers most same-key collisions with
+/// `nonce too low` instead. That answer is not a collision: it counts as
+/// possibly broadcast ([`send_broadcast_unknown`]).
 #[must_use]
 pub fn is_nonce_collision(err: &ContractError) -> bool {
-    rejection_message(err)
-        .is_some_and(|message| message.contains("replacement transaction underpriced"))
-}
-
-/// Whether a send failed because the node already counts its nonce as spent
-/// (`nonce too low`). The answer does not say which transaction spent the
-/// nonce. A load-balancing gateway that loses one backend's response and
-/// retries the same signed bytes on another backend gets this answer once the
-/// first copy is sequenced. So the send itself may hold the nonce and may still
-/// take effect, and re-sending it on a fresh nonce can apply it twice. A caller
-/// that pins the nonce treats the send as possibly broadcast at that nonce.
-#[must_use]
-pub fn is_nonce_spent(err: &ContractError) -> bool {
-    rejection_message(err).is_some_and(|message| message.contains("nonce too low"))
-}
-
-/// The lowercased message of a JSON-RPC error response, or `None` for any
-/// other failure.
-fn rejection_message(err: &ContractError) -> Option<String> {
     use alloy::transports::RpcError;
 
     let ContractError::TransportError(RpcError::ErrorResp(resp)) = err else {
-        return None;
+        return false;
     };
-    Some(resp.message.to_ascii_lowercase())
+    resp.message
+        .to_ascii_lowercase()
+        .contains("replacement transaction underpriced")
+}
+
+/// Whether a JSON-RPC rejection says the node already counts the nonce as
+/// spent: `nonce too low`. The match ignores case.
+fn is_nonce_too_low(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("nonce too low")
 }
 
 /// Whether a JSON-RPC rejection says the node already holds this signed
@@ -329,9 +336,11 @@ pub async fn send_for_receipt<C: CallDecoder, P: Provider>(
         Err(err) => {
             // A rejected send never reached the mempool. A transport-class
             // failure may have broadcast the tx before its response was lost,
-            // and an `already known` answer means an earlier copy of it already
-            // reached one. Neither may be reported as a clean "nothing
-            // happened", since re-sending is not idempotent (#1577, #2432).
+            // an `already known` answer means an earlier copy of it already
+            // reached one, and a `nonce too low` answer may mean an earlier copy
+            // was sequenced. None may be reported as a clean "nothing
+            // happened", since re-sending is not idempotent (#1577, #2432,
+            // #2562).
             let broadcast_unknown = send_broadcast_unknown(&err);
             *outcome = if broadcast_unknown {
                 SendOutcome::MaybeBroadcast
