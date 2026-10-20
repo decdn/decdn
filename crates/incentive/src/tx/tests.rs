@@ -140,6 +140,76 @@ fn a_transport_failure_leaves_the_broadcast_unknown() {
     assert!(send_broadcast_unknown(&http_error(500)));
 }
 
+/// A rejection that says the node already holds this signed tx means an
+/// earlier copy of the send reached a mempool (#2432): the tx may still mine.
+/// It is not a nonce collision either, since a re-send on a fresh nonce could
+/// double-submit.
+#[test]
+fn an_already_known_rejection_leaves_the_broadcast_unknown() {
+    for message in [
+        "already known",
+        "Already Known",
+        "known transaction: 0xabc",
+        "transaction rejected: known transaction: 0xabc",
+    ] {
+        assert!(
+            send_broadcast_unknown(&error_resp(-32000, message)),
+            "{message}"
+        );
+        assert!(
+            !is_nonce_collision(&error_resp(-32000, message)),
+            "{message}"
+        );
+    }
+    for message in [
+        "nonce too low",
+        "insufficient funds for gas * price + value",
+        "unknown transaction type",
+        "execution reverted",
+    ] {
+        assert!(
+            !send_broadcast_unknown(&error_resp(-32000, message)),
+            "{message}"
+        );
+    }
+}
+
+/// Run [`send_for_receipt`] on a filler-free provider whose one RPC call,
+/// the send, the node answers with a JSON-RPC rejection carrying `message`.
+async fn send_rejected_with(message: &'static str) -> (anyhow::Error, SendOutcome) {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg(message);
+    let provider = alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter);
+    let call = CallBuilder::new_raw(&provider, alloy::primitives::Bytes::new())
+        .to(alloy::primitives::Address::repeat_byte(0x01));
+    let mut outcome = SendOutcome::NotSent;
+    let err = send_for_receipt(call, "topUp", None, &mut outcome)
+        .await
+        .unwrap_err();
+    (err, outcome)
+}
+
+/// A send the node answers with `already known` may mine (#2432): the
+/// outcome is `MaybeBroadcast`, and the error warns against a re-run.
+#[tokio::test]
+async fn an_already_known_send_is_maybe_broadcast() {
+    let (err, outcome) = send_rejected_with("already known").await;
+    assert_eq!(outcome, SendOutcome::MaybeBroadcast);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("may already hold this transaction"), "{msg}");
+    assert!(msg.contains("can double-submit"), "{msg}");
+}
+
+/// Any other rejection broadcast nothing: the outcome is `Rejected`, and the
+/// error carries no warning against a re-run.
+#[tokio::test]
+async fn a_rejected_send_is_rejected_with_no_warning() {
+    let (err, outcome) = send_rejected_with("insufficient funds for gas").await;
+    assert_eq!(outcome, SendOutcome::Rejected);
+    let msg = format!("{err:#}");
+    assert!(!msg.contains("double-submit"), "{msg}");
+}
+
 /// A broadcast transaction that never mines ends the wait at
 /// [`RECEIPT_TIMEOUT`]: the error names the hash, and the outcome
 /// stays `InFlight` because the transaction may still mine (#2433).

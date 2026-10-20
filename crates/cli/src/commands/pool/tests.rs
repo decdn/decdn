@@ -950,8 +950,8 @@ async fn a_reclaim_that_never_mines_lapses_unconfirmed() {
     assert!(format!("{err:#}").contains("no receipt within"), "{err:#}");
 }
 
-/// The `send_failed` note that a transport failure may have broadcast the tx.
-const MAYBE_BROADCAST: &str = "may have reached the node and broadcast the transaction";
+/// The `send_failed` note that a send whose broadcast is unknown may still mine.
+const MAYBE_BROADCAST: &str = "may be in a mempool and may still mine";
 
 /// Run [`close_and_forget`] against a pool whose RPC calls `asserter` answers.
 async fn close_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error {
@@ -996,8 +996,8 @@ async fn a_transport_failed_close_send_warns_it_may_have_broadcast() {
     assert!(msg.contains("eth_sendTransaction"), "{msg}");
 }
 
-/// A `closePool` send the RPC node rejects broadcast nothing, so it carries no
-/// broadcast warning.
+/// A `closePool` send the RPC node rejects (other than `already known`)
+/// broadcast nothing, so it carries no broadcast warning.
 #[tokio::test]
 async fn a_rejected_close_send_does_not_warn() {
     let asserter = alloy::providers::mock::Asserter::new();
@@ -1007,6 +1007,26 @@ async fn a_rejected_close_send_does_not_warn() {
     let msg = format!("{err:#}");
     assert!(msg.contains("closePool send failed"), "{msg}");
     assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
+}
+
+/// A `closePool` send the RPC node answers with `already known` may still
+/// mine: an earlier copy of it reached a mempool (#2432). It carries
+/// [`TxUnconfirmed`] with no hash, so `--all` counts it as unconfirmed.
+#[tokio::test]
+async fn an_already_known_close_send_warns_it_may_have_broadcast() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("already known");
+    let err = close_on(asserter).await;
+    assert_eq!(
+        err.downcast_ref::<TxUnconfirmed>(),
+        Some(&TxUnconfirmed {
+            label: "closePool",
+            tx: None
+        })
+    );
+    assert!(format!("{err:#}").contains(MAYBE_BROADCAST), "{err:#}");
+    let mut tally = BatchTally::default();
+    assert_eq!(tally.record_error(&err), ErrorClass::Unconfirmed);
 }
 
 /// A `reclaim` send that fails in transport may have broadcast the tx with no
@@ -1028,8 +1048,8 @@ async fn a_transport_failed_reclaim_send_warns_it_may_have_broadcast() {
     assert!(msg.contains("eth_sendTransaction"), "{msg}");
 }
 
-/// A `reclaim` send the RPC node rejects broadcast nothing, so it carries no
-/// broadcast warning.
+/// A `reclaim` send the RPC node rejects (other than `already known`)
+/// broadcast nothing, so it carries no broadcast warning.
 #[tokio::test]
 async fn a_rejected_reclaim_send_does_not_warn() {
     let asserter = alloy::providers::mock::Asserter::new();

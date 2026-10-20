@@ -748,7 +748,7 @@ enum TopUpProof {
     Receipt(TxHash),
     /// The `topUp`'s nonce was spent with no receipt in hand, and the pool's
     /// deposit at `block` stood above the row's. This happens when the
-    /// `topUp`'s hash was never returned (a submit that failed in transport),
+    /// `topUp`'s hash was never returned (a submit whose broadcast is unknown),
     /// was forgotten past [`MAX_TOPUP_TXS`], or its receipt was not yet
     /// readable on the RPC backend that answered.
     DepositGrowth {

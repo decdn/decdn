@@ -921,6 +921,44 @@ async fn a_rejected_top_up_submit_is_not_unconfirmed() {
     assert_eq!(escrows.pending(), vec![]);
 }
 
+/// An `openPool` submit the RPC node answers with `already known` may mine:
+/// an earlier copy of it reached a mempool (#2432). It carries
+/// [`OpenUnconfirmed`] with no hash, and `opens` keeps the entry, so the next
+/// open is refused.
+#[tokio::test]
+async fn an_already_known_open_pool_submit_stays_unconfirmed() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    asserter.push_failure_msg("already known");
+    let opens = UnconfirmedEscrows::default();
+    let err = open_tracked(mocked_pool(asserter), &opens, None)
+        .await
+        .unwrap_err();
+    let unconfirmed = OpenUnconfirmed { tx: None, nonce: 5 };
+    assert_eq!(err.downcast_ref::<OpenUnconfirmed>(), Some(&unconfirmed));
+    assert_eq!(opens.opens(), vec![unconfirmed]);
+}
+
+/// A `topUp` submit the RPC node answers with `already known` may mine
+/// (#2432). It is not a nonce collision, so `top_up` reads no fresh nonce and
+/// sends nothing more: the error carries [`TopUpUnconfirmed`] at the nonce it
+/// was sent with, and `escrows` keeps that entry.
+#[tokio::test(start_paused = true)]
+async fn an_already_known_top_up_submit_stays_unconfirmed_and_is_not_re_sent() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    asserter.push_failure_msg("already known");
+    let escrows = UnconfirmedEscrows::default();
+    let err = top_up_mocked(asserter.clone(), &escrows).await.unwrap_err();
+    let unconfirmed = TopUpUnconfirmed { tx: None, nonce: 5 };
+    assert_eq!(err.downcast_ref::<TopUpUnconfirmed>(), Some(&unconfirmed));
+    assert_eq!(escrows.top_ups(), vec![unconfirmed]);
+    assert!(
+        asserter.read_q().is_empty(),
+        "every scripted answer was read"
+    );
+}
+
 // ---- self-owned capability (#966 / ADR 003 §Capability delegation) ---
 
 /// A data dir's payer: a random owner key, and the lane key derived from it
@@ -1022,8 +1060,8 @@ fn regenerated_capability_is_deterministic_for_same_params() -> anyhow::Result<(
 
 // ---- allowance decision -------------
 
-/// The `approve` note that a transport failure may have broadcast the tx.
-const APPROVE_MAYBE_BROADCAST: &str = "may have reached the node and broadcast the transaction";
+/// The `approve` note that a send whose broadcast is unknown may be pending.
+const APPROVE_MAYBE_BROADCAST: &str = "may already be pending";
 
 /// Run [`ensure_allowance`] on a filler-free mocked provider whose RPC calls
 /// `asserter` answers in order, and return its error.
@@ -1040,7 +1078,7 @@ async fn approve_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error
 }
 
 /// An `approve` submit that fails in transport may have been broadcast with no
-/// hash returned, so the error warns before the operator re-runs (#2416).
+/// hash returned, so the error says it may be pending (#2416).
 #[tokio::test]
 async fn a_transport_failed_approve_submit_warns_it_may_have_broadcast() {
     let asserter = alloy::providers::mock::Asserter::new();
@@ -1089,6 +1127,18 @@ async fn a_rejected_approve_submit_does_not_warn() {
     let msg = format!("{:#}", approve_on(asserter).await);
     assert!(msg.contains("submit USDC approve"), "{msg}");
     assert!(!msg.contains(APPROVE_MAYBE_BROADCAST), "{msg}");
+}
+
+/// An `approve` submit the RPC node answers with `already known` may mine
+/// (#2432), so the error says it may be pending.
+#[tokio::test]
+async fn an_already_known_approve_submit_says_it_may_be_pending() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&B256::ZERO);
+    asserter.push_failure_msg("already known");
+    let msg = format!("{:#}", approve_on(asserter).await);
+    assert!(msg.contains("submit USDC approve"), "{msg}");
+    assert!(msg.contains(APPROVE_MAYBE_BROADCAST), "{msg}");
 }
 
 #[test]
