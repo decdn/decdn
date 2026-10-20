@@ -1108,7 +1108,12 @@ since project inception and will roll into the first tagged release.
   example after a gateway retried the send on a second backend. `pool close`
   and `pool reclaim` now warn that the tx may still mine, `--all` counts the
   pool as unconfirmed, and `openPool` / `topUp` keep the unconfirmed escrow
-  record. `topUp` does not re-send it on a fresh nonce.
+  record, so `topUp` holds it rather than re-sending on a fresh nonce. Every
+  other chain write reports it as possibly broadcast too: `publish` namespace,
+  seat and revoke statuses, key rotation (which keeps the parked key), bond,
+  register, appeal, and the USDC `approve`. A send with no tx hash now says
+  the transaction may be in a mempool, and the `approve` note says a
+  re-approve to the same value is harmless.
 - **CLI: a bundle pull lands no entry outside its output directory, and
   applies `[client] region_allowlist` to every entry (#2439).** A manifest
   path is checked for `..` and absolute components, but the write followed a

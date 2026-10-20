@@ -801,9 +801,9 @@ impl std::fmt::Display for TxUnconfirmed {
             ),
             None => write!(
                 f,
-                "{label} send failed: the request may have reached the node and broadcast the \
-                 transaction — check this signer's pending and mined transactions before \
-                 re-running"
+                "{label} send failed with no tx hash, but the transaction may be in a mempool \
+                 and may still mine — check this signer's pending and mined transactions \
+                 before re-running"
             ),
         }
     }

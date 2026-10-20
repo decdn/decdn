@@ -119,9 +119,10 @@ impl SendOutcome {
     /// The tx hash for any arm that captured one — [`Confirmed`](Self::Confirmed),
     /// [`Reverted`](Self::Reverted), or [`InFlight`](Self::InFlight).
     ///
-    /// [`MaybeBroadcast`](Self::MaybeBroadcast) has none by construction: a
-    /// transport error surfaces before `send()` returns a handle, so there is no
-    /// hash to give even though a transaction may exist.
+    /// [`MaybeBroadcast`](Self::MaybeBroadcast) has none by construction: its
+    /// `send()` failed before returning a handle (a transport error, or an
+    /// `already known` answer), so there is no hash to give even though a
+    /// transaction may exist.
     #[must_use]
     pub const fn tx(self) -> Option<B256> {
         match self {
@@ -132,8 +133,8 @@ impl SendOutcome {
 
     /// Whether the transaction may have taken effect on-chain.
     ///
-    /// True for a confirmed success, an in-flight broadcast, and a transport
-    /// failure whose broadcast is unknown; false for a definitive rejection and a
+    /// True for a confirmed success, an in-flight broadcast, and a send failure
+    /// whose broadcast is unknown; false for a definitive rejection and a
     /// confirmed revert. Asserting "nothing was transferred" when this is true is
     /// how an operator gets told to re-run a transaction that is still pending.
     #[must_use]
@@ -156,8 +157,8 @@ impl SendOutcome {
 ///   `addOrigin` failure; a stale nonce; an under-funded account). The one
 ///   exception is an `already known` / `known transaction` answer: the node
 ///   already holds this signed transaction, because an earlier copy of the same
-///   send (a gateway retry on another backend, a client retry after a lost
-///   response) reached a mempool. That answer is uncertain, not a rejection;
+///   send (a gateway that retried it on another backend) reached a mempool. That
+///   answer is uncertain, not a rejection;
 /// - a client-side fault raised before the request left the process (an
 ///   unsupported feature, a local-usage error, a body that failed to serialize),
 ///   or an HTTP 4xx where the gateway refused the request outright (a bad path,
@@ -217,8 +218,8 @@ pub fn is_nonce_collision(err: &ContractError) -> bool {
 
 /// Whether a JSON-RPC rejection says the node already holds this signed
 /// transaction: `already known` (geth, reth, Nitro) or `known transaction`
-/// (older geth). The text is case-insensitive. `unknown transaction …` is not
-/// a match, so the `known transaction` hit must not follow a letter.
+/// (older geth). The match ignores case. `unknown transaction …` is not a
+/// match, so the `known transaction` hit must not follow a letter.
 fn is_already_known(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("already known")

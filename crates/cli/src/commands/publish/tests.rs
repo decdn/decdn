@@ -236,7 +236,7 @@ fn namespace_failure_context_only_claims_a_namespace_when_one_exists() {
     // A lost send response may have minted too, but has no hash to point at,
     // so the note routes the operator to this signer's own transactions.
     let maybe = namespace_failure_context(NamespaceStatus::MaybeBroadcast).unwrap();
-    assert!(maybe.contains("may have reached the node"), "{maybe}");
+    assert!(maybe.contains("may be in a mempool"), "{maybe}");
     assert!(maybe.contains("this signer's pending"), "{maybe}");
     assert!(maybe.contains("maxNamespacesPerPublisher"), "{maybe}");
 
@@ -657,7 +657,7 @@ fn revoke_failure_context_only_warns_once_something_was_broadcast() {
     // A lost send response warns too, but points at the signer's own txs
     // since there is no hash to cite.
     let maybe = revoke_failure_context(RevokeStatus::MaybeBroadcast).unwrap();
-    assert!(maybe.contains("may have reached the node"), "{maybe}");
+    assert!(maybe.contains("may be in a mempool"), "{maybe}");
     assert!(maybe.contains("NotAuthorizedOrigin"), "{maybe}");
 
     assert!(

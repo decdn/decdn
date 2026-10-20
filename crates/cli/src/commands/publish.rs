@@ -177,10 +177,11 @@ pub(crate) enum NamespaceStatus {
     /// Nothing was minted: the node rejected the send before broadcast. Distinct
     /// from `Reverted` (which mined) and `MaybeBroadcast` (whose fate is unknown).
     Failed,
-    /// A transport-class send failure (timeout, reset, 5xx). The request may have
-    /// reached the node and minted a namespace, but no hash was captured, so the
-    /// outcome is unknown and a blind retry can burn quota against
-    /// `maxNamespacesPerPublisher` (#1577).
+    /// A send whose broadcast is unknown: a transport-class failure (timeout,
+    /// reset, 5xx), or an `already known` answer. The transaction may have
+    /// minted a namespace, but no hash was captured, so the outcome is unknown
+    /// and a blind retry can burn quota against `maxNamespacesPerPublisher`
+    /// (#1577).
     MaybeBroadcast,
     /// The transaction was broadcast but its receipt was unreadable, so a
     /// namespace may or may not exist. Keeps the hash — the only handle on it.
@@ -246,7 +247,7 @@ impl NamespaceStatus {
 }
 
 /// The `submitted=` token for a single-tx text receipt whose transaction has no
-/// hash: a definite `true`/`false`, or `unknown` for a transport failure whose
+/// hash: a definite `true`/`false`, or `unknown` for a send failure whose
 /// broadcast cannot be determined.
 const fn submitted_token(submitted: Option<bool>) -> &'static str {
     match submitted {
@@ -349,9 +350,10 @@ async fn namespace_create(
                 created = Err(err);
                 // `recorded` already distinguishes the failure shapes: a broadcast
                 // whose receipt was unreadable (`InFlight`, keeps its hash), a
-                // transport failure that may still have minted (`MaybeBroadcast`),
-                // a confirmed revert (`Reverted`, minted nothing but kept its
-                // hash), or a clean rejection (`Rejected` → `Failed`).
+                // send whose broadcast is unknown and may still have minted
+                // (`MaybeBroadcast`), a confirmed revert (`Reverted`, minted
+                // nothing but kept its hash), or a clean rejection (`Rejected` →
+                // `Failed`).
                 match recorded {
                     SendOutcome::InFlight(hash) => NamespaceStatus::InFlight(hash),
                     SendOutcome::Reverted(hash) => NamespaceStatus::Reverted(hash),
@@ -412,11 +414,12 @@ const fn namespace_failure_context(status: NamespaceStatus) -> Option<&'static s
             "the transaction was broadcast — check the tx above before re-running, since a \
              create that landed already counts against maxNamespacesPerPublisher",
         ),
-        // A transport failure may have minted too, but has no hash to point at,
-        // so the note sends the operator to this signer's own transactions.
+        // A send whose broadcast is unknown may have minted too, but has no hash
+        // to point at, so the note sends the operator to this signer's own
+        // transactions.
         NamespaceStatus::MaybeBroadcast => Some(
-            "the request may have reached the node and broadcast the transaction — check this \
-             signer's pending and mined transactions before re-running, since a create that \
+            "the send returned no tx hash, but the transaction may be in a mempool — check \
+             this signer's pending and mined transactions before re-running, since a create that \
              landed already counts against maxNamespacesPerPublisher",
         ),
         // Names a log query rather than the receipt's own log, and deliberately
@@ -558,9 +561,9 @@ pub(crate) enum SeatOutcome {
     /// operator. Keeps its hash as a permanent handle — distinct from `Failed`,
     /// which never broadcast (#1550).
     Reverted(B256),
-    /// The send failed with a transport-class error, so whether it broadcast is
-    /// unknown and no hash was captured. Re-sending can double-submit, so this is
-    /// distinct from `Failed` (#1577).
+    /// The send failed with a transport-class error or an `already known`
+    /// answer, so whether it broadcast is unknown and no hash was captured.
+    /// Re-sending can double-submit, so this is distinct from `Failed` (#1577).
     MaybeBroadcast,
     /// The node rejected the send — nothing was ever broadcast. The usual shape,
     /// since the `addOrigin` guards surface from the pre-flight gas estimate.
@@ -819,9 +822,10 @@ pub(crate) enum RevokeStatus {
     /// Nothing was unseated: the node rejected the send before broadcast.
     /// Distinct from `Reverted` (mined) and `MaybeBroadcast` (fate unknown).
     Failed,
-    /// A transport-class send failure (timeout, reset, 5xx). The request may have
-    /// reached the node and unseated the operator, but no hash was captured, so
-    /// the outcome is unknown and re-running can double-submit (#1577).
+    /// A send whose broadcast is unknown: a transport-class failure (timeout,
+    /// reset, 5xx), or an `already known` answer. The transaction may have
+    /// unseated the operator, but no hash was captured, so the outcome is
+    /// unknown and re-running can double-submit (#1577).
     MaybeBroadcast,
     /// The transaction was broadcast but its receipt was unreadable, so the
     /// operator may or may not still be seated. Keeps the hash — the only handle
@@ -945,8 +949,8 @@ async fn revoke(args: &cli::RevokeArgs, global_config: Option<&Path>) -> anyhow:
             Ok(receipt) => status = RevokeStatus::Revoked(receipt.transaction_hash),
             Err(err) => {
                 // `send` distinguishes a broadcast whose receipt was unreadable
-                // (`InFlight`), a transport failure that may have unseated
-                // (`MaybeBroadcast`), a confirmed revert (`Reverted`, unseated
+                // (`InFlight`), a send whose broadcast is unknown and may have
+                // unseated (`MaybeBroadcast`), a confirmed revert (`Reverted`, unseated
                 // nothing), and a clean rejection (`Rejected` → `Failed`).
                 status = match send {
                     SendOutcome::InFlight(hash) => RevokeStatus::InFlight(hash),
@@ -998,10 +1002,11 @@ const fn revoke_failure_context(status: RevokeStatus) -> Option<&'static str> {
             "the transaction was broadcast — check the tx above before re-running, since a \
              removal that landed makes the retry revert NotAuthorizedOrigin",
         ),
-        // A transport failure may have unseated too, but has no hash to cite.
+        // A send whose broadcast is unknown may have unseated too, but has no
+        // hash to cite.
         RevokeStatus::MaybeBroadcast => Some(
-            "the request may have reached the node and broadcast the transaction — check this \
-             signer's pending and mined transactions before re-running, since a removal that \
+            "the send returned no tx hash, but the transaction may be in a mempool — check \
+             this signer's pending and mined transactions before re-running, since a removal that \
              landed makes the retry revert NotAuthorizedOrigin",
         ),
         // A rejected send or a confirmed revert unseated nothing.
