@@ -20,6 +20,11 @@ Under GitHub Actions (`GITHUB_ACTIONS=true`) each outcome also emits a
 workflow annotation: the summary and each distinct `error[...]` title as a
 warning, or a single error when no check ran.
 
+The `cargo deny check` child runs without git's repo-scoping environment
+variables (see `GIT_REPO_ENV_VARS`), so the git commands cargo-deny runs
+inside `~/.cargo/advisory-dbs/` never act on the repository whose pre-commit
+hook invoked this script.
+
 Run: .github/scripts/cargo-deny-warn.sh
 """
 
@@ -34,6 +39,23 @@ DENY_ARGS = [
     "cargo", "deny", "--color", "never", "--all-features",
     "check", "--hide-inclusion-graph", "-A", "duplicate",
 ]
+
+# Git exports repo-scoping variables to hooks (from a linked worktree, an
+# absolute GIT_DIR and GIT_INDEX_FILE). A cargo-deny older than 0.19.6 lets
+# its advisory-db git commands inherit them, so its `git reset --hard` acts
+# on the committing repository instead of ~/.cargo/advisory-dbs/. The child
+# runs without them; the list is git's own `local_repo_env`.
+GIT_REPO_ENV_VARS = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR", "GIT_GRAFT_FILE", "GIT_SHALLOW_FILE", "GIT_PREFIX",
+    "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+)
+
+
+def deny_env() -> dict[str, str]:
+    """The child environment for `cargo deny`: os.environ minus git's repo-scoping vars."""
+    return {k: v for k, v in os.environ.items() if k not in GIT_REPO_ENV_VARS}
 
 SUMMARY_RE = re.compile(
     r"^advisories (?:ok|FAILED), bans (?:ok|FAILED), "
@@ -94,7 +116,12 @@ def main() -> int:
         return 1
 
     run = subprocess.run(
-        DENY_ARGS, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False
+        DENY_ARGS,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+        env=deny_env(),
     )
     output = run.stdout
     print(output, end="" if output.endswith("\n") or not output else "\n")

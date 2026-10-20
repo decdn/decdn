@@ -92,11 +92,25 @@ def test_annotation_escaping():
     assert cdw.escape_annotation("100%\r\nnext") == "100%25%0D%0Anext"
 
 
+def test_deny_env_drops_gits_repo_scoping_vars(monkeypatch):
+    # Git exports these to pre-commit hooks (absolute paths from a linked
+    # worktree); leaked into cargo-deny < 0.19.6, they point its advisory-db
+    # `git reset --hard` at the committing repository.
+    monkeypatch.setenv("GIT_DIR", "/repo/.git/worktrees/wt")
+    monkeypatch.setenv("GIT_INDEX_FILE", "/repo/.git/worktrees/wt/index")
+    monkeypatch.setenv("GIT_WORK_TREE", "/repo")
+    env = cdw.deny_env()
+    for var in cdw.GIT_REPO_ENV_VARS:
+        assert var not in env
+    assert env["PATH"]
+
+
 def fake_run(version_rc: int, deny_rc: int, deny_out: str):
-    def run(args, **_kwargs):
+    def run(args, **kwargs):
         if args == ["cargo", "deny", "--version"]:
             return subprocess.CompletedProcess(args, version_rc, "cargo-deny 0.20.2\n", "")
         assert args == cdw.DENY_ARGS
+        assert "GIT_DIR" not in kwargs["env"]
         return subprocess.CompletedProcess(args, deny_rc, deny_out, None)
 
     return run
