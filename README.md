@@ -23,6 +23,8 @@
 
 <p align="center">
   <a href="https://github.com/decdn/decdn/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/decdn/decdn/ci.yml?branch=main&label=CI&logo=github" alt="CI"></a>
+  <a href="https://github.com/decdn/decdn/actions/workflows/security.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/decdn/decdn/security.yml?branch=main&label=security&logo=github" alt="Security"></a>
+  <a href="https://github.com/decdn/decdn/actions/workflows/codeql.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/decdn/decdn/codeql.yml?branch=main&label=CodeQL&logo=github" alt="CodeQL"></a>
   <a href="https://github.com/decdn/decdn/releases/latest"><img src="https://img.shields.io/github/v/release/decdn/decdn?sort=semver&logo=github" alt="Release"></a>
   <a href="https://crates.io/crates/decdn-cli"><img src="https://img.shields.io/crates/v/decdn-cli?logo=rust&label=crates.io" alt="crates.io"></a>
   <a href="https://docs.rs/decdn-client"><img src="https://img.shields.io/docsrs/decdn-client?logo=docs.rs&label=docs.rs" alt="docs.rs"></a>
