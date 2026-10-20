@@ -61,7 +61,7 @@ async fn a_rejected_send_passes_through_unmarked() {
     asserter.push_failure_msg("replacement transaction underpriced");
     let err = send_layered(asserter).await;
     assert!(SendLegFailure::from_error(&err).is_none(), "{err}");
-    assert!(crate::tx::is_nonce_collision(&err), "{err}");
+    assert!(crate::tx::send_broadcast_unknown(&err), "{err}");
 }
 
 /// Every other send entry point alloy forwards is marked too.

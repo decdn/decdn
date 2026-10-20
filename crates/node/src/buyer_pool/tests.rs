@@ -4378,6 +4378,37 @@ async fn a_spent_nonce_with_no_deposit_growth_escrowed_nothing() {
     assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
 }
 
+/// #2565: a `topUp` whose nonce a same-key transaction took (a submit answered
+/// `replacement transaction underpriced` or `nonce too low`) has no hash to
+/// poll. The settle waits while that transaction is pending at the nonce,
+/// then, once the nonce is spent with no deposit growth, ends as "escrowed
+/// nothing" without the [`TopUpUnconfirmed`] marker, so the slot is released
+/// and the next refill sends a fresh `topUp`.
+#[tokio::test(start_paused = true)]
+async fn a_hashless_top_up_waits_out_the_colliding_tx_then_escrowed_nothing() {
+    let owner = Address::repeat_byte(1);
+    let err = settle_top_up(
+        vec![
+            // First tick: the colliding transaction is pending at nonce 5.
+            Reply::Block(100),
+            Reply::Nonce(5),
+            Reply::Nonce(6),
+            // Second tick: it mined, and the pool's deposit did not grow.
+            Reply::Block(101),
+            Reply::Nonce(6),
+            deposit_reply(owner, ROW_DEPOSIT),
+        ],
+        TopUpUnconfirmed { tx: None, nonce: 5 },
+        store_tracking(owner, TOPPED),
+        owner,
+    )
+    .await
+    .err()
+    .expect("nothing escrowed");
+    assert!(format!("{err:#}").contains("escrowed nothing"), "{err:#}");
+    assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
+}
+
 /// A spent nonce whose pool the row no longer tracks cannot be compared, so
 /// the settle ends escrowed-but-untracked and no caller funds on top of it.
 #[tokio::test(start_paused = true)]

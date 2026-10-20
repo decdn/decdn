@@ -148,7 +148,9 @@ Also alert on `sponsord_pool_topup_unconfirmed_since_unix` staying non-zero.
 It means the keeper may have broadcast a `topUp` but does not know that it
 mined: it could not read the receipt, or the submission returned no tx hash
 (the send request failed in transport after the RPC node may have accepted it,
-or an `already known` answer because the RPC node already held it). A top-up
+or the RPC node answered `already known`, `nonce too low` or `replacement
+transaction underpriced`, each of which can be the answer to a gateway retry
+of a send another backend accepted). A top-up
 whose chain reads failed before the send is not held: nothing was signed. A
 second top-up could refill the
 pool twice, so the keeper sends none until that transaction has a receipt,

@@ -1211,8 +1211,8 @@ fn escrow_held(err: &anyhow::Error) -> bool {
 /// [`RefusedAfterUntracked`]. Both refusals read the handle, so a later pass
 /// on the same handle refuses the same way. A lane build's call refuses with
 /// [`FetchEnded`] once `ended` fires: while it waits for the run's `topUp`
-/// lock, before the allowance leg, and before each `topUp` send, a re-send
-/// after a nonce collision too. A `topUp` already sent runs to its receipt.
+/// lock, before the allowance leg, and before the `topUp` send. A `topUp`
+/// already sent runs to its receipt.
 ///
 /// Returns the [`ToppedUpPool`] with the [`UnrecordedEscrow`] the caller
 /// resolves once its credit commits or fails.

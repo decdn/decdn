@@ -123,7 +123,7 @@ async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
 }
 
 /// Run [`top_up`] against a mocked pool whose RPC calls `asserter` answers,
-/// holding it in `escrows`, with a paused clock past the nonce backoff.
+/// holding it in `escrows`.
 async fn top_up_mocked(
     asserter: alloy::providers::mock::Asserter,
     escrows: &UnconfirmedEscrows,
@@ -139,111 +139,59 @@ async fn top_up_mocked(
     .await
 }
 
-/// A submit rejected as a nonce collision broadcast nothing, so its entry is
-/// released before the re-send: after one collision at nonce 5 and a
-/// broadcast at nonce 6 whose receipt read fails, only nonce 6 is held.
-#[tokio::test(start_paused = true)]
-async fn a_nonce_collision_releases_its_entry_before_the_re_send() {
-    let hash = B256::repeat_byte(0xab);
+/// #2565: a `topUp` submit answered `replacement transaction underpriced`
+/// lost its nonce on the answering backend only. A gateway that retried the
+/// signed bytes there after another backend accepted them leaves the first
+/// copy able to win the nonce, so the `topUp` is not re-sent on a fresh nonce:
+/// it carries [`TopUpUnconfirmed`] with its nonce, and `escrows` keeps the
+/// entry.
+#[tokio::test]
+async fn a_top_up_submit_answered_underpriced_is_unconfirmed_not_re_sent() {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&U256::from(5u64));
     asserter.push_failure_msg("replacement transaction underpriced");
-    asserter.push_success(&U256::from(6u64));
-    asserter.push_success(&hash);
-    let escrows = UnconfirmedEscrows::default();
-    let err = top_up_mocked(asserter.clone(), &escrows).await.unwrap_err();
-    let unconfirmed = TopUpUnconfirmed {
-        tx: Some(hash),
-        nonce: 6,
-    };
-    assert_eq!(err.downcast_ref::<TopUpUnconfirmed>(), Some(&unconfirmed));
-    assert_eq!(
-        escrows.pending(),
-        vec![EscrowUnconfirmed::TopUp(unconfirmed)]
-    );
-    assert!(
-        asserter.read_q().is_empty(),
-        "every scripted answer was read"
-    );
-}
-
-/// #2562: a re-send after a collision that is answered `nonce too low` is held
-/// at the re-send's nonce. The collided submit at nonce 5 broadcast nothing and
-/// is released; the re-send at nonce 6 may hold its nonce, so it carries
-/// [`TopUpUnconfirmed`] at 6 and no third send is tried.
-#[tokio::test(start_paused = true)]
-async fn a_nonce_too_low_after_a_collision_re_send_is_unconfirmed_at_the_new_nonce() {
-    let asserter = alloy::providers::mock::Asserter::new();
-    asserter.push_success(&U256::from(5u64));
-    asserter.push_failure_msg("replacement transaction underpriced");
-    asserter.push_success(&U256::from(6u64));
-    asserter.push_failure_msg("nonce too low");
-    let escrows = UnconfirmedEscrows::default();
-    let err = top_up_mocked(asserter.clone(), &escrows).await.unwrap_err();
-    let unconfirmed = TopUpUnconfirmed { tx: None, nonce: 6 };
-    assert_eq!(err.downcast_ref::<TopUpUnconfirmed>(), Some(&unconfirmed));
-    assert_eq!(escrows.top_ups(), vec![unconfirmed]);
-    assert!(asserter.read_q().is_empty(), "two sends, no third");
-}
-
-/// A `topUp` whose every send collides runs out of re-sends: nothing was
-/// broadcast, so the error carries no [`TopUpUnconfirmed`] and `escrows`
-/// keeps no entry.
-#[tokio::test(start_paused = true)]
-async fn a_top_up_out_of_nonce_retries_holds_nothing() {
-    let asserter = alloy::providers::mock::Asserter::new();
-    for nonce in 5u64..9 {
-        asserter.push_success(&U256::from(nonce));
-        asserter.push_failure_msg("replacement transaction underpriced");
-    }
-    let escrows = UnconfirmedEscrows::default();
-    let err = top_up_mocked(asserter.clone(), &escrows).await.unwrap_err();
-    assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
-    assert_eq!(escrows.pending(), vec![]);
-    assert!(asserter.read_q().is_empty(), "four sends were tried");
-}
-
-/// #2520: a lane build's `topUp` that lost its nonce sends no re-send once
-/// its fetch ends during the backoff. The collision broadcast nothing, so the
-/// refusal escrows nothing, and the re-send's nonce read never runs.
-#[tokio::test(start_paused = true)]
-async fn a_collided_top_up_sends_no_re_send_after_the_fetch_ends() {
-    let asserter = alloy::providers::mock::Asserter::new();
-    asserter.push_success(&U256::from(5u64));
-    asserter.push_failure_msg("replacement transaction underpriced");
+    // A re-send would read this nonce and broadcast at it.
     asserter.push_success(&U256::from(6u64));
     asserter.push_success(&B256::repeat_byte(0xab));
     let escrows = UnconfirmedEscrows::default();
-    let ended = tokio_util::sync::CancellationToken::new();
-    let end_in_the_backoff = async {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        ended.cancel();
-    };
-    let pool = mocked_pool(asserter.clone());
-    let started = tokio::time::Instant::now();
-    let (result, ()) = tokio::join!(
-        top_up_unless_ended(
-            &pool,
-            Address::repeat_byte(0x22),
-            B256::repeat_byte(0x33),
-            U256::from(1_000u64),
-            Some(&escrows),
-            None,
-            Some(&ended),
-        ),
-        end_in_the_backoff,
+    let err = top_up_mocked(asserter.clone(), &escrows).await.unwrap_err();
+    let unconfirmed = TopUpUnconfirmed { tx: None, nonce: 5 };
+    assert_eq!(err.downcast_ref::<TopUpUnconfirmed>(), Some(&unconfirmed));
+    assert!(
+        format!("{err:#}").contains("replacement transaction underpriced"),
+        "{err:#}"
     );
-    let err = result.unwrap_err();
+    assert_eq!(escrows.top_ups(), vec![unconfirmed]);
+    assert_eq!(asserter.read_q().len(), 2, "no re-send was tried");
+}
+
+/// #2520: a lane build's `topUp` is refused before its send once its fetch
+/// has ended. Nothing reaches the RPC, so nothing escrows.
+#[tokio::test]
+async fn a_top_up_after_the_fetch_ended_is_refused_before_its_send() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    asserter.push_success(&B256::repeat_byte(0xab));
+    let escrows = UnconfirmedEscrows::default();
+    let ended = tokio_util::sync::CancellationToken::new();
+    ended.cancel();
+    let err = top_up_unless_ended(
+        &mocked_pool(asserter.clone()),
+        Address::repeat_byte(0x22),
+        B256::repeat_byte(0x33),
+        U256::from(1_000u64),
+        Some(&escrows),
+        None,
+        Some(&ended),
+    )
+    .await
+    .unwrap_err();
     assert!(
         err.downcast_ref::<crate::funding::FetchEnded>().is_some(),
         "{err:#}"
     );
     assert_eq!(escrows.pending(), vec![]);
-    assert_eq!(asserter.read_q().len(), 2, "the re-send was never tried");
-    assert!(
-        started.elapsed() < super::TOPUP_NONCE_BACKOFF,
-        "the backoff ends with the fetch"
-    );
+    assert_eq!(asserter.read_q().len(), 2, "no nonce read, no send");
 }
 
 /// Two calls that hold equal entries each release their own: releasing one
@@ -969,7 +917,7 @@ async fn an_open_pool_submit_answered_nonce_too_low_stays_unconfirmed() {
 /// copy, sequenced through another backend after a gateway retry. So it is
 /// not re-sent on a fresh nonce: it carries [`TopUpUnconfirmed`] with its
 /// nonce, and `escrows` keeps the entry.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn a_top_up_submit_answered_nonce_too_low_is_unconfirmed_not_re_sent() {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&U256::from(5u64));
@@ -1026,11 +974,34 @@ async fn an_already_known_open_pool_submit_stays_unconfirmed() {
     assert_eq!(opens.opens(), vec![unconfirmed]);
 }
 
+/// #2565: an `openPool` submit answered `replacement transaction underpriced`
+/// lost its nonce on the answering backend only; a gateway retry can leave an
+/// earlier copy able to win it. It carries [`OpenUnconfirmed`] with no hash,
+/// and `opens` keeps the entry, so the next open is refused.
+#[tokio::test]
+async fn an_open_pool_submit_answered_underpriced_stays_unconfirmed() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&U256::from(5u64));
+    asserter.push_failure_msg("replacement transaction underpriced");
+    let opens = UnconfirmedEscrows::default();
+    let err = open_tracked(mocked_pool(asserter.clone()), &opens, None)
+        .await
+        .unwrap_err();
+    let unconfirmed = OpenUnconfirmed { tx: None, nonce: 5 };
+    assert_eq!(err.downcast_ref::<OpenUnconfirmed>(), Some(&unconfirmed));
+    assert_eq!(
+        err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
+        Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
+    );
+    assert_eq!(opens.opens(), vec![unconfirmed]);
+    assert!(asserter.read_q().is_empty(), "one nonce read, one send");
+}
+
 /// A `topUp` submit the RPC node answers with `already known` may mine
-/// (#2432). It is not a nonce collision, so `top_up` reads no fresh nonce and
-/// sends nothing more: the error carries [`TopUpUnconfirmed`] at the nonce it
-/// was sent with, and `escrows` keeps that entry.
-#[tokio::test(start_paused = true)]
+/// (#2432). `top_up` reads no fresh nonce and sends nothing more: the error
+/// carries [`TopUpUnconfirmed`] at the nonce it was sent with, and `escrows`
+/// keeps that entry.
+#[tokio::test]
 async fn an_already_known_top_up_submit_stays_unconfirmed_and_is_not_re_sent() {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&U256::from(5u64));

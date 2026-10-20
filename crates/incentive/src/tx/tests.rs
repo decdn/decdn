@@ -9,34 +9,43 @@ fn error_resp(code: i64, message: &str) -> ContractError {
     ))
 }
 
-/// A same-account nonce collision is a JSON-RPC `replacement transaction
-/// underpriced` rejection (any case). `nonce too low`, an unrelated rejection,
-/// a revert, or a transport failure is not.
+/// #2565: a `replacement transaction underpriced` rejection (any case) says
+/// another same-account transaction holds the nonce on the answering backend
+/// only. A gateway that retried the send there after another backend accepted
+/// it leaves the first copy able to win the nonce, so the broadcast is
+/// unknown. The same text as a transport failure, unmarked, is a read that
+/// failed before the send.
 #[test]
-fn only_an_underpriced_replacement_is_a_nonce_collision() {
-    assert!(super::is_nonce_collision(&error_resp(
-        -32000,
-        "replacement transaction underpriced"
-    )));
-    assert!(super::is_nonce_collision(&error_resp(
-        -32000,
-        "Replacement Transaction Underpriced"
-    )));
-    assert!(!super::is_nonce_collision(&error_resp(
-        -32003,
-        "nonce too low"
-    )));
-    assert!(!super::is_nonce_collision(&error_resp(
-        3,
-        "execution reverted"
-    )));
-    assert!(!super::is_nonce_collision(&error_resp(
-        -32000,
-        "insufficient funds for gas"
-    )));
-    assert!(!super::is_nonce_collision(&ContractError::TransportError(
+fn an_underpriced_replacement_rejection_leaves_the_broadcast_unknown() {
+    for message in [
+        "replacement transaction underpriced",
+        "Replacement Transaction Underpriced",
+    ] {
+        assert!(
+            send_broadcast_unknown(&error_resp(-32000, message)),
+            "{message}"
+        );
+    }
+    assert!(!send_broadcast_unknown(&ContractError::TransportError(
         alloy::transports::TransportErrorKind::custom_str("replacement transaction underpriced")
     )));
+}
+
+/// A fee rejection that is not a replacement (`transaction underpriced`, a
+/// fee below the block base fee) broadcast nothing: the node holds no other
+/// transaction at the nonce, so a re-send is safe and the answer is a
+/// rejection.
+#[test]
+fn a_plain_underpriced_fee_rejection_broadcast_nothing() {
+    for message in [
+        "transaction underpriced",
+        "max fee per gas less than block base fee",
+    ] {
+        assert!(
+            !send_broadcast_unknown(&error_resp(-32000, message)),
+            "{message}"
+        );
+    }
 }
 
 /// The tx hash reaches the receipt on every arm that has one, and only
@@ -191,8 +200,6 @@ fn a_transport_failure_before_the_send_broadcast_nothing() {
 
 /// A rejection that says the node already holds this signed tx means an
 /// earlier copy of the send reached a mempool (#2432): the tx may still mine.
-/// It is not a nonce collision either, since a re-send on a fresh nonce could
-/// double-submit.
 #[test]
 fn an_already_known_rejection_leaves_the_broadcast_unknown() {
     for message in [
@@ -203,10 +210,6 @@ fn an_already_known_rejection_leaves_the_broadcast_unknown() {
     ] {
         assert!(
             send_broadcast_unknown(&error_resp(-32000, message)),
-            "{message}"
-        );
-        assert!(
-            !is_nonce_collision(&error_resp(-32000, message)),
             "{message}"
         );
     }
@@ -224,8 +227,7 @@ fn an_already_known_rejection_leaves_the_broadcast_unknown() {
 
 /// #2562: a `nonce too low` rejection does not say which transaction spent the
 /// nonce. A gateway that retried the send on a second backend gets it once the
-/// first copy is sequenced, so the tx may have mined. It is not a nonce
-/// collision either, since a re-send on a fresh nonce could double-submit.
+/// first copy is sequenced, so the tx may have mined.
 #[test]
 fn a_nonce_too_low_rejection_leaves_the_broadcast_unknown() {
     for message in ["nonce too low", "Nonce too low: next nonce 7, tx nonce 6"] {
@@ -233,16 +235,7 @@ fn a_nonce_too_low_rejection_leaves_the_broadcast_unknown() {
             send_broadcast_unknown(&error_resp(-32003, message)),
             "{message}"
         );
-        assert!(
-            !is_nonce_collision(&error_resp(-32003, message)),
-            "{message}"
-        );
     }
-    // An underpriced replacement is a collision, not a spent nonce.
-    assert!(!send_broadcast_unknown(&error_resp(
-        -32000,
-        "replacement transaction underpriced"
-    )));
 }
 
 /// Run [`send_for_receipt`] on a filler-free, send-leg-marked provider whose
@@ -279,6 +272,16 @@ async fn an_already_known_send_is_maybe_broadcast() {
 #[tokio::test]
 async fn a_nonce_too_low_send_is_maybe_broadcast() {
     let (err, outcome) = send_rejected_with("nonce too low").await;
+    assert_eq!(outcome, SendOutcome::MaybeBroadcast);
+    assert!(format!("{err:#}").contains("can double-submit"), "{err:#}");
+}
+
+/// A send the node answers with `replacement transaction underpriced` may
+/// have mined through another backend (#2565): the outcome is
+/// `MaybeBroadcast`, and the error warns against a re-run.
+#[tokio::test]
+async fn an_underpriced_replacement_send_is_maybe_broadcast() {
+    let (err, outcome) = send_rejected_with("replacement transaction underpriced").await;
     assert_eq!(outcome, SendOutcome::MaybeBroadcast);
     assert!(format!("{err:#}").contains("can double-submit"), "{err:#}");
 }

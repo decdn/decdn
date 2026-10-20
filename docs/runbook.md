@@ -644,8 +644,9 @@ diagnostic.
 **`decdn_buyer_pool_open_unresolved` at 1 means the node holds its pool open for
 an `openPool` it could not confirm.** The submit returned no tx hash (the send
 request failed in transport after the RPC node may have accepted it, or the RPC
-node already held the transaction), or the receipt
-read failed, so the transaction may still mine. The node opens no second
+node already held the transaction, counted its nonce as spent, or held another
+transaction of this key at that nonce), or the receipt read failed, so the
+transaction may still mine. The node opens no second
 pool until the chain resolves it, and every cache miss that needs a pool is
 refused as a local fault meanwhile. The node re-reads the chain every 5 s: a
 receipt, or the account's nonce passing the open's, ends the wait. A nonce that
@@ -662,8 +663,9 @@ deposit the node does not track until the next restart adopts or reports it.
 
 **`decdn_buyer_topup_unresolved` at 1 means the node holds its top-up slot for a
 `topUp` it could not confirm.** The submit returned no tx hash (a transport
-failure, or the RPC node already held the transaction), or the receipt read
-failed, so the transaction may still mine. The node sends no other `topUp`
+failure, or the RPC node already held the transaction, counted its nonce as
+spent, or held another transaction of this key at that nonce), or the receipt
+read failed, so the transaction may still mine. The node sends no other `topUp`
 until the chain resolves it. A low-water refill does nothing. A funding recovery
 step that arrives meanwhile fails at once as a local fault and counts on
 `decdn_node_pull_recovery_step_refused_total`, so a cache miss whose upstreams
