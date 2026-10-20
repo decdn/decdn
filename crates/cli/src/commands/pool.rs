@@ -775,18 +775,18 @@ impl BatchTally {
 }
 
 /// The context on a `closePool` / `reclaim` error whose transaction may have
-/// broadcast and may still mine: its send failed in transport, or it was
-/// broadcast and its receipt was not read (a failed read, or none within
-/// [`RECEIPT_TIMEOUT`]). A re-run may double-submit, so a `--all` sweep counts
-/// it apart from a definite failure. Recover it with
-/// `err.downcast_ref::<TxUnconfirmed>()`.
+/// broadcast and may still mine: its send failed in transport, the node
+/// answered that it already holds the tx, or it was broadcast and its receipt
+/// was not read (a failed read, or none within [`RECEIPT_TIMEOUT`]). A re-run
+/// may double-submit, so a `--all` sweep counts it apart from a definite
+/// failure. Recover it with `err.downcast_ref::<TxUnconfirmed>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TxUnconfirmed {
     /// The contract call, `closePool` or `reclaim`.
     label: &'static str,
-    /// The broadcast transaction. `None` when the send failed in transport:
-    /// the RPC node may have broadcast the transaction without returning its
-    /// hash.
+    /// The broadcast transaction. `None` when the send failed in transport, or
+    /// the node answered that it already holds the transaction: either way no
+    /// hash came back.
     tx: Option<TxHash>,
 }
 
@@ -1098,9 +1098,11 @@ fn send_reverted(
 /// data. When `send_broadcast_unknown` holds (a timeout, a reset, an HTTP 5xx,
 /// an unreadable response), the tx may have broadcast before its response was
 /// lost and no hash came back. The error then carries [`TxUnconfirmed`], whose
-/// message sends the operator to this signer's own transactions. Any other
-/// failure (a JSON-RPC rejection, an HTTP 4xx, a local fault) broadcast nothing
-/// and gets no such note (#1577).
+/// message sends the operator to this signer's own transactions. A JSON-RPC
+/// rejection that says the node already holds the tx (`already known`, `known
+/// transaction`) also carries [`TxUnconfirmed`]: an earlier copy of the send
+/// reached a mempool (#2432). Any other failure (any other JSON-RPC rejection,
+/// an HTTP 4xx, a local fault) broadcast nothing and gets no such note (#1577).
 fn send_failed(err: alloy::contract::Error, label: &'static str) -> anyhow::Error {
     if decdn_incentive::tx::send_broadcast_unknown(&err) {
         anyhow::Error::new(err).context(TxUnconfirmed { label, tx: None })

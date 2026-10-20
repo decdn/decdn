@@ -150,7 +150,11 @@ impl SendOutcome {
 ///
 /// - a JSON-RPC error *response* — the node processed the request and rejected
 ///   it (a pre-flight gas-estimate revert, the modal `createNamespace` /
-///   `addOrigin` failure; a stale nonce; an under-funded account);
+///   `addOrigin` failure; a stale nonce; an under-funded account). The one
+///   exception is an `already known` / `known transaction` answer: the node
+///   already holds this signed transaction, because an earlier copy of the same
+///   send (a gateway retry on another backend, a client retry after a lost
+///   response) reached a mempool. That answer is uncertain, not a rejection;
 /// - a client-side fault raised before the request left the process (an
 ///   unsupported feature, a local-usage error, a body that failed to serialize),
 ///   or an HTTP 4xx where the gateway refused the request outright (a bad path,
@@ -165,11 +169,8 @@ impl SendOutcome {
 /// The `as_error_resp().is_none()` shorthand is deliberately NOT used: it would
 /// fold the local faults above into the uncertain bucket, warning about a
 /// possibly-broadcast transaction on a bug that never touched the wire.
-///
-/// `const` because the workspace `missing_const_for_fn` clippy lint requires it —
-/// the body is a pure classification with no non-const calls.
 #[must_use]
-pub const fn send_broadcast_unknown(err: &ContractError) -> bool {
+pub fn send_broadcast_unknown(err: &ContractError) -> bool {
     use alloy::transports::{RpcError, TransportErrorKind};
 
     let ContractError::TransportError(rpc) = err else {
@@ -178,12 +179,13 @@ pub const fn send_broadcast_unknown(err: &ContractError) -> bool {
         return false;
     };
     match rpc {
-        // The node answered, or the client failed before sending: a definite
-        // rejection that broadcast nothing.
-        RpcError::ErrorResp(_)
-        | RpcError::UnsupportedFeature(_)
-        | RpcError::LocalUsageError(_)
-        | RpcError::SerError(_) => false,
+        // The node already holds this signed tx: an earlier copy of the send
+        // reached a mempool, so the tx may still mine.
+        RpcError::ErrorResp(resp) => is_already_known(&resp.message),
+        // The client failed before sending: nothing reached the wire.
+        RpcError::UnsupportedFeature(_) | RpcError::LocalUsageError(_) | RpcError::SerError(_) => {
+            false
+        }
         // An HTTP 4xx is the gateway refusing the request (bad path, bad key)
         // before it reaches the node; a 5xx may have broadcast before failing.
         RpcError::Transport(TransportErrorKind::HttpError(h)) => h.status >= 500,
@@ -208,6 +210,21 @@ pub fn is_nonce_collision(err: &ContractError) -> bool {
     };
     let message = resp.message.to_ascii_lowercase();
     message.contains("nonce too low") || message.contains("replacement transaction underpriced")
+}
+
+/// Whether a JSON-RPC rejection says the node already holds this signed
+/// transaction: `already known` (geth, reth, Nitro) or `known transaction`
+/// (older geth). The text is case-insensitive. `unknown transaction …` is not
+/// a match, so the `known transaction` hit must not follow a letter.
+fn is_already_known(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("already known")
+        || message.match_indices("known transaction").any(|(at, _)| {
+            message
+                .get(..at)
+                .and_then(|before| before.chars().next_back())
+                .is_none_or(|c| !c.is_ascii_alphabetic())
+        })
 }
 
 /// Send one call, await its receipt, and fail on a revert.
@@ -294,10 +311,10 @@ pub async fn send_for_receipt<C: CallDecoder, P: Provider>(
                 SendOutcome::Rejected
             };
             let uncertainty = if broadcast_unknown {
-                " This is a transport error, not a rejection: the request may have reached the \
-                 node and broadcast the transaction before the response was lost. Check this \
-                 signer's pending and mined transactions before re-running — re-sending is not \
-                 idempotent and can double-submit."
+                " The send's outcome is unknown: the RPC node may already hold this transaction, \
+                 or the request may have reached the node and broadcast it before the response \
+                 was lost. Check this signer's pending and mined transactions before re-running \
+                 — re-sending is not idempotent and can double-submit."
             } else {
                 ""
             };

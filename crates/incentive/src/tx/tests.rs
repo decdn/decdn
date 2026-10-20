@@ -118,6 +118,35 @@ fn a_transport_failure_leaves_the_broadcast_unknown() {
     assert!(send_broadcast_unknown(&http_error(500)));
 }
 
+/// A rejection that says the node already holds this signed tx means an
+/// earlier copy of the send reached a mempool (#2432): the tx may still mine.
+/// It is not a nonce collision either, since a re-send on a fresh nonce could
+/// double-submit.
+#[test]
+fn an_already_known_rejection_leaves_the_broadcast_unknown() {
+    for message in ["already known", "Already Known", "known transaction: 0xabc"] {
+        assert!(
+            send_broadcast_unknown(&error_resp(-32000, message)),
+            "{message}"
+        );
+        assert!(
+            !is_nonce_collision(&error_resp(-32000, message)),
+            "{message}"
+        );
+    }
+    for message in [
+        "nonce too low",
+        "insufficient funds for gas * price + value",
+        "unknown transaction type",
+        "execution reverted",
+    ] {
+        assert!(
+            !send_broadcast_unknown(&error_resp(-32000, message)),
+            "{message}"
+        );
+    }
+}
+
 /// A broadcast transaction that never mines ends the wait at
 /// [`RECEIPT_TIMEOUT`]: the error names the hash, and the outcome
 /// stays `InFlight` because the transaction may still mine (#2433).
