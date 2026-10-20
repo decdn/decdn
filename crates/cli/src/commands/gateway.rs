@@ -963,7 +963,8 @@ impl Gateway {
         }
     }
 
-    /// One bundle entry, by its literal manifest path.
+    /// One bundle entry, by its literal manifest path. A path the manifest
+    /// lacks, or an entry whose hash does not parse, answers 404.
     async fn entry(
         self: &Arc<Self>,
         manifest_hash: [u8; 32],
@@ -978,9 +979,17 @@ impl Gateway {
                 &format!("the bundle has no entry {path:?}\n"),
             ));
         };
-        let hash = parse_hash(&entry.hash)
-            .with_context(|| format!("bundle entry {path:?} has a malformed hash"))
-            .map_err(PullError::Other)?;
+        let hash = match parse_hash(&entry.hash) {
+            Ok(hash) => hash,
+            // A fixed property of the content-addressed manifest, not an
+            // upstream fault: every retry gets the same answer.
+            Err(e) => {
+                return Ok(text(
+                    StatusCode::NOT_FOUND,
+                    &format!("bundle entry {path:?} has a malformed hash: {e:#}\n"),
+                ));
+            }
+        };
         self.stream(hash, namespace, paying, Some(path), entry.size)
             .await
     }
