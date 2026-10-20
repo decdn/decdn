@@ -482,9 +482,10 @@ pub enum WatermarkRow {
 /// read (a failed read, or none within [`RECEIPT_TIMEOUT`]; the error names the
 /// tx, which may still mine), or a reverted approve. A submission whose
 /// broadcast is unknown ([`decdn_incentive::tx::send_broadcast_unknown`]: the
-/// send request failed in transport, or the node answered `already known` or
-/// `nonce too low`) says the `approve` may be pending; one whose chain reads
-/// failed before the send does not, since nothing was signed.
+/// send request failed in transport, or the node answered `already known`,
+/// `nonce too low` or `replacement transaction underpriced`) says the
+/// `approve` may be pending; one whose chain reads failed before the send does
+/// not, since nothing was signed.
 pub async fn ensure_allowance<P: Provider + Clone>(
     provider: &P,
     token: Address,
@@ -507,9 +508,10 @@ pub async fn ensure_allowance<P: Provider + Clone>(
         Err(err) => {
             // A send request that failed in transport may have reached the
             // node and broadcast the `approve` before the response was lost,
-            // and an `already known` answer means an earlier copy already did.
-            // Neither returns a hash. A chain read that failed before the send
-            // signed nothing.
+            // and an answer that the node holds the tx, or that another
+            // backend's copy holds or spent its nonce, means an earlier copy
+            // may have. None returns a hash. A chain read that failed before
+            // the send signed nothing.
             let note = if decdn_incentive::tx::send_broadcast_unknown(&err) {
                 ": the transaction may already be pending with no hash returned; a \
                  re-approve to the same value is harmless"
@@ -602,12 +604,14 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// The error is classified [`PoolOpenFailureReason::RpcError`] and carries an
 /// [`OpenUnconfirmed`] with the hash and nonce. A submit whose broadcast is
 /// unknown ([`decdn_incentive::tx::send_broadcast_unknown`]: the send request
-/// failed in transport, or the node answered `already known` or `nonce too
-/// low`) carries one too, with the nonce and no hash. A gateway that retried
-/// the signed bytes on a second backend gets `nonce too low` once the first
-/// copy is sequenced, so that answer does not say the open escrowed nothing. A
-/// submit whose chain reads failed before the send carries none, since nothing
-/// was signed. The caller must resolve that transaction before
+/// failed in transport, or the node answered `already known`, `nonce too low`
+/// or `replacement transaction underpriced`) carries one too, with the nonce
+/// and no hash. A gateway that retried the signed bytes on a second backend
+/// gets `nonce too low` once the first copy is sequenced, or `replacement
+/// transaction underpriced` while a same-key transaction holds the nonce there
+/// and the first copy can still win it, so neither answer says the open
+/// escrowed nothing. A submit whose chain reads failed before the send carries
+/// none, since nothing was signed. The caller must resolve that transaction before
 /// it sends another `openPool`, and hands a receipt it reads later to
 /// [`opened_from_receipt`].
 ///
@@ -686,9 +690,10 @@ pub async fn open_pool<P: Provider + Clone>(
             // A send request that failed in transport may have reached the
             // node and broadcast the `openPool` before the response was lost,
             // an `already known` answer means an earlier copy already did, and
-            // a `nonce too low` answer may mean an earlier copy, which a
-            // gateway retried on a second backend, spent the nonce. A chain
-            // read that failed before the send signed nothing.
+            // a `nonce too low` or `replacement transaction underpriced`
+            // answer may mean an earlier copy of the send, retried by a
+            // gateway on a second backend, spent or holds the nonce there. A
+            // chain read that failed before the send signed nothing.
             let broadcast_unknown = decdn_incentive::tx::send_broadcast_unknown(&err);
             let mut err = anyhow::Error::new(err).context("submit openPool");
             if broadcast_unknown {
@@ -830,9 +835,10 @@ pub const SELF_CAPABILITY_CAP: u64 = u64::MAX;
 
 /// Typed marker on an [`open_pool`] error raised when the `openPool` may have
 /// been broadcast but is not known to have mined: its submit failed in
-/// transport, the RPC node answered that it already holds the tx, or it was
-/// broadcast and its receipt was not read (a failed read, or none within the
-/// caller's bound). An [`UnconfirmedEscrows`] entry also
+/// transport, the RPC node gave an answer
+/// [`decdn_incentive::tx::send_broadcast_unknown`] reads as uncertain, or it
+/// was broadcast and its receipt was not read (a failed read, or none within
+/// the caller's bound). An [`UnconfirmedEscrows`] entry also
 /// stands for one that mined while its record has not committed. The
 /// transaction may still mine and escrow the deposit, so a caller must
 /// resolve it before it sends another `openPool`. Recover it with
@@ -840,9 +846,10 @@ pub const SELF_CAPABILITY_CAP: u64 = u64::MAX;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenUnconfirmed {
     /// The broadcast `openPool` transaction. `None` when the submit returned
-    /// no hash (its send request failed in transport, the RPC node answered
-    /// that it already holds the tx, or it was dropped in flight): the
-    /// transaction may be in a mempool without its hash known here.
+    /// no hash (its send request failed in transport, the RPC node gave an
+    /// answer [`decdn_incentive::tx::send_broadcast_unknown`] reads as
+    /// uncertain, or it was dropped in flight): the transaction may be in a
+    /// mempool without its hash known here.
     pub tx: Option<TxHash>,
     /// The nonce the `openPool` was sent with. Once the account's confirmed
     /// nonce passes it, the `openPool` has either mined or can never mine.
@@ -1162,9 +1169,9 @@ impl UnconfirmedEscrows {
 ///
 /// The deposit overflows `uint64`, or the send fails. A send failure carries a
 /// [`PoolOpenFailureReason`] classified from its revert data. A send whose
-/// broadcast is unknown (a transport failure, or an `already known` or `nonce
-/// too low` answer) is not marked [`OpenUnconfirmed`]: the caller already holds
-/// the nonce, and reads it again to learn the outcome.
+/// broadcast is unknown ([`decdn_incentive::tx::send_broadcast_unknown`]) is
+/// not marked [`OpenUnconfirmed`]: the caller already holds the nonce, and
+/// reads it again to learn the outcome.
 pub async fn send_open_pool<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
@@ -1210,9 +1217,10 @@ impl std::error::Error for AllowanceShortfall {}
 
 /// Typed marker on a [`top_up`] error raised when the `topUp` may have been
 /// broadcast but is not known to have mined: its send request failed in
-/// transport (a timeout, a reset, an HTTP 5xx), the RPC node answered that it already
-/// holds the tx (`already known`), or it was broadcast and its receipt was not
-/// read (a failed read, or none within the caller's bound). An
+/// transport (a timeout, a reset, an HTTP 5xx), the RPC node gave an answer
+/// [`decdn_incentive::tx::send_broadcast_unknown`] reads as uncertain, or it
+/// was broadcast and its receipt was not read (a failed read, or none within
+/// the caller's bound). An
 /// [`UnconfirmedEscrows`] entry has the same meaning, and also holds a `topUp`
 /// whose future was dropped before either. The transaction may still mine, so
 /// the escrow may have moved while no local record credits it. A caller must
@@ -1222,9 +1230,10 @@ impl std::error::Error for AllowanceShortfall {}
 pub struct TopUpUnconfirmed {
     /// The broadcast `topUp` transaction, which an operator reconciles
     /// against. `None` when the submit returned no hash (it failed in
-    /// transport, the RPC node answered that it already holds the tx, or it
-    /// was dropped in flight): the transaction may be in a mempool without its
-    /// hash known here.
+    /// transport, the RPC node gave an answer
+    /// [`decdn_incentive::tx::send_broadcast_unknown`] reads as uncertain, or
+    /// it was dropped in flight): the transaction may be in a mempool without
+    /// its hash known here.
     pub tx: Option<TxHash>,
     /// The nonce the `topUp` was sent with. Once the account's confirmed nonce
     /// passes it, the `topUp` has either mined or can never mine.
@@ -1362,11 +1371,11 @@ async fn send_top_up<P: Provider + Clone>(
     // A send request that failed in transport may have reached the node and
     // broadcast the `topUp` before the response was lost, an `already known`
     // answer means an earlier copy already did, and a `nonce too low` or
-    // `replacement transaction underpriced` answer may mean an earlier copy,
-    // which a gateway retried on a second backend, holds or spent the nonce.
-    // A re-send of any of them on a fresh nonce may escrow twice; the node
-    // settles the entry against the chain instead. A chain read that failed
-    // before the send signed nothing, so the entry is released below.
+    // `replacement transaction underpriced` answer may mean an earlier copy
+    // of the send, retried by a gateway on a second backend, spent or holds
+    // the nonce there. A second `topUp` at a fresh nonce could escrow twice,
+    // so the caller settles or reports the entry instead. A chain read that
+    // failed before the send signed nothing, so the entry is released below.
     if decdn_incentive::tx::send_broadcast_unknown(&err) {
         return Err(anyhow::Error::new(err)
             .context("submit topUp")
@@ -1412,11 +1421,10 @@ fn top_up_submit_error(err: alloy::contract::Error, context: impl Into<String>) 
 ///
 /// The amount overflows `uint64`, or the send fails. A revert carries the
 /// markers [`top_up`]'s submit errors carry ([`AllowanceShortfall`],
-/// [`PoolNotOpen`]). A send whose broadcast is unknown (the send request
-/// failed in transport, or the node answered `already known` or `nonce too
-/// low`) is not marked
-/// [`TopUpUnconfirmed`]: the
-/// caller already holds the nonce, and reads it again to learn the outcome.
+/// [`PoolNotOpen`]). A send whose broadcast is unknown
+/// ([`decdn_incentive::tx::send_broadcast_unknown`]) is not marked
+/// [`TopUpUnconfirmed`]: the caller already holds the nonce, and reads it
+/// again to learn the outcome.
 pub async fn send_top_up_at<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
@@ -1464,13 +1472,14 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 /// and carry [`decdn_incentive::tx::SendLegLayer`], as
 /// [`crate::provider::build_provider`] does.
 ///
-/// A submit answered `nonce too low` or `replacement transaction underpriced`
-/// is not re-sent on a fresh nonce: a gateway that retried its signed bytes on
-/// a second backend gets either answer while the first copy can still hold or
-/// spend the nonce, so a re-send could escrow twice. It fails with
-/// [`TopUpUnconfirmed`] at that nonce, as a transport failure does, for the
-/// node to settle against the chain. The crate's lane builds use a variant
-/// that sends nothing once their fetch ends.
+/// `top_up` sends one `topUp` at one nonce and never a second at another. A
+/// submit answered `nonce too low` or `replacement transaction underpriced`
+/// fails with [`TopUpUnconfirmed`] at that nonce, as a transport failure does:
+/// a gateway that retried its signed bytes on a second backend gets either
+/// answer while the first copy can still hold or spend the nonce, so a second
+/// `topUp` at a fresh nonce could escrow twice. The node settles the nonce
+/// against the chain; `decdn get` reports it. The crate's lane builds use a
+/// variant that sends nothing once their fetch ends.
 ///
 /// A node signs its sellers' redemptions and its buyer top-ups with one key, so
 /// a top-up can lose its nonce to a redemption sent at the same moment. The
@@ -1498,7 +1507,8 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 /// Errors if the nonce read or the `topUp` transaction fails (submit, revert, or
 /// receipt). A submit whose broadcast is unknown
 /// ([`decdn_incentive::tx::send_broadcast_unknown`]: the send request failed
-/// in transport, or the node answered `already known` or `nonce too low`) and
+/// in transport, or the node answered `already known`, `nonce too low` or
+/// `replacement transaction underpriced`) and
 /// a receipt that is not read (a failed read, or none within
 /// `receipt_timeout`) both carry [`TopUpUnconfirmed`], because the `topUp` may
 /// still mine. A submit whose chain reads failed before the send carries none:

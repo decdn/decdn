@@ -1115,8 +1115,9 @@ since project inception and will roll into the first tagged release.
   / `OpenUnconfirmed` at the nonce, which the node settles against the chain
   and the CLI reports instead of retrying. A node whose seller redemption took
   the nonce resolves the settle as "escrowed nothing" once that redemption
-  mines and funds again on the next refill, which costs a settle tick where
-  the re-send cost a quarter second. Every other chain write reports both
+  mines, and funds again on the next pull that finds the deposit below the
+  low-water mark; the settle reads the chain every 5 s meanwhile, where the
+  re-send cost a quarter second. Every other chain write reports both
   answers as possibly broadcast too, as for `already known` (#2432): `pool
   close` and `pool reclaim` warn that the tx may still mine, and so do
   `publish`, key rotation, bond, register, appeal, and the USDC `approve`.
@@ -1149,7 +1150,7 @@ since project inception and will roll into the first tagged release.
   example after a gateway retried the send on a second backend. `pool close`
   and `pool reclaim` now warn that the tx may still mine, `--all` counts the
   pool as unconfirmed, and `openPool` / `topUp` keep the unconfirmed escrow
-  record, so `topUp` holds it rather than re-sending on a fresh nonce. Every
+  record, so `topUp` holds it at its nonce. Every
   other chain write reports it as possibly broadcast too: `publish` namespace,
   seat and revoke statuses, key rotation (which keeps the parked key), bond,
   register, appeal, and the USDC `approve`. A send with no tx hash now says

@@ -984,18 +984,23 @@ async fn an_open_pool_submit_answered_underpriced_stays_unconfirmed() {
     asserter.push_success(&U256::from(5u64));
     asserter.push_failure_msg("replacement transaction underpriced");
     let opens = UnconfirmedEscrows::default();
-    let err = open_tracked(mocked_pool(asserter), &opens, None)
+    let err = open_tracked(mocked_pool(asserter.clone()), &opens, None)
         .await
         .unwrap_err();
     let unconfirmed = OpenUnconfirmed { tx: None, nonce: 5 };
     assert_eq!(err.downcast_ref::<OpenUnconfirmed>(), Some(&unconfirmed));
+    assert_eq!(
+        err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
+        Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
+    );
     assert_eq!(opens.opens(), vec![unconfirmed]);
+    assert!(asserter.read_q().is_empty(), "one nonce read, one send");
 }
 
 /// A `topUp` submit the RPC node answers with `already known` may mine
-/// (#2432). It is not a nonce collision, so `top_up` reads no fresh nonce and
-/// sends nothing more: the error carries [`TopUpUnconfirmed`] at the nonce it
-/// was sent with, and `escrows` keeps that entry.
+/// (#2432). `top_up` reads no fresh nonce and sends nothing more: the error
+/// carries [`TopUpUnconfirmed`] at the nonce it was sent with, and `escrows`
+/// keeps that entry.
 #[tokio::test]
 async fn an_already_known_top_up_submit_stays_unconfirmed_and_is_not_re_sent() {
     let asserter = alloy::providers::mock::Asserter::new();

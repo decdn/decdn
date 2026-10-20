@@ -1695,9 +1695,11 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // and wedge the buyer lane. This provider is shared across
     // `approve`/`openPool`/`topUp`/`reclaim` and the reclaim sweep runs
     // concurrently with opens, so correctness relies on `SimpleNonceManager`
-    // re-reading the pending nonce each send (a transient racing collision just
-    // gets a fresh nonce on the next attempt), not on the sends being strictly
-    // serialized.
+    // re-reading the pending nonce each send, not on the sends being strictly
+    // serialized. A `reclaim` that loses a nonce race reads a fresh nonce on
+    // the next sweep; an `openPool` or `topUp` that loses one is held at its
+    // nonce and settled against the chain (`OpenUnconfirmed` /
+    // `TopUpUnconfirmed`).
     let buyer_wallet_provider = ch
         .providers
         .buyer_wallet((*infra.eth_signer).clone(), ch.event_poll_interval);

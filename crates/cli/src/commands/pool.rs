@@ -775,9 +775,10 @@ impl BatchTally {
 }
 
 /// The context on a `closePool` / `reclaim` error whose transaction may have
-/// broadcast and may still mine: its send failed in transport, the node
-/// answered that it already holds the tx, or it was broadcast and its receipt
-/// was not read (a failed read, or none within [`RECEIPT_TIMEOUT`]). A re-run
+/// broadcast and may still mine: its send failed in transport, the node gave
+/// an answer [`decdn_incentive::tx::send_broadcast_unknown`] reads as
+/// uncertain, or it was broadcast and its receipt was not read (a failed read,
+/// or none within [`RECEIPT_TIMEOUT`]). A re-run
 /// may double-submit, so a `--all` sweep counts it apart from a definite
 /// failure. Recover it with `err.downcast_ref::<TxUnconfirmed>()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -785,8 +786,8 @@ struct TxUnconfirmed {
     /// The contract call, `closePool` or `reclaim`.
     label: &'static str,
     /// The broadcast transaction. `None` when the send failed in transport, or
-    /// the node answered that it already holds the transaction: either way no
-    /// hash came back.
+    /// the node gave an answer [`decdn_incentive::tx::send_broadcast_unknown`]
+    /// reads as uncertain: either way no hash came back.
     tx: Option<TxHash>,
 }
 
@@ -1103,9 +1104,12 @@ fn send_reverted(
 /// holds the tx (`already known`, `known transaction`) also carries
 /// [`TxUnconfirmed`]: an earlier copy of the send reached a mempool (#2432).
 /// So does `nonce too low`: an earlier copy that a gateway retried on a second
-/// backend may have spent the nonce (#2562). Any other failure (any other
-/// JSON-RPC rejection, an HTTP 4xx, a local fault, a chain read that failed
-/// before the send) broadcast nothing and gets no such note (#1577, #2431).
+/// backend may have spent the nonce (#2562). So does `replacement transaction
+/// underpriced`: a same-key transaction holds the nonce on the answering
+/// backend while an earlier copy can still win it on another (#2565). Any
+/// other failure (any other JSON-RPC rejection, an HTTP 4xx, a local fault, a
+/// chain read that failed before the send) broadcast nothing and gets no such
+/// note (#1577, #2431).
 fn send_failed(err: alloy::contract::Error, label: &'static str) -> anyhow::Error {
     if decdn_incentive::tx::send_broadcast_unknown(&err) {
         anyhow::Error::new(err).context(TxUnconfirmed { label, tx: None })

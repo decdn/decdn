@@ -7,9 +7,9 @@
 //! holds further top-ups until that transaction has a receipt, or the
 //! treasury's confirmed nonce has passed the nonce it was sent with (#40). A
 //! `topUp` whose submit returned no tx hash (the send request failed in
-//! transport, or the node answered `already known`) can be settled only by
-//! its nonce. The hold is kept
-//! in memory, so a restart clears it.
+//! transport, or the node answered `already known`, `nonce too low` or
+//! `replacement transaction underpriced`) can be settled only by its nonce.
+//! The hold is kept in memory, so a restart clears it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,8 +129,9 @@ pub async fn run(
 #[derive(Clone, Copy, Debug)]
 struct Unconfirmed {
     /// The `topUp` transaction; `None` when its submit returned no tx hash
-    /// (the send request failed in transport, or the node answered `already
-    /// known`), so it may be in a mempool without its hash known here.
+    /// (the send request failed in transport, or the node gave an answer
+    /// `decdn_incentive::tx::send_broadcast_unknown` reads as uncertain), so
+    /// it may be in a mempool without its hash known here.
     tx: Option<TxHash>,
     /// The nonce the `topUp` was sent with. Once the treasury's confirmed
     /// nonce passes it, the `topUp` has mined or can never mine.

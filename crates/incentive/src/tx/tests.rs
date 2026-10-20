@@ -31,6 +31,23 @@ fn an_underpriced_replacement_rejection_leaves_the_broadcast_unknown() {
     )));
 }
 
+/// A fee rejection that is not a replacement (`transaction underpriced`, a
+/// fee below the block base fee) broadcast nothing: the node holds no other
+/// transaction at the nonce, so a re-send is safe and the answer is a
+/// rejection.
+#[test]
+fn a_plain_underpriced_fee_rejection_broadcast_nothing() {
+    for message in [
+        "transaction underpriced",
+        "max fee per gas less than block base fee",
+    ] {
+        assert!(
+            !send_broadcast_unknown(&error_resp(-32000, message)),
+            "{message}"
+        );
+    }
+}
+
 /// The tx hash reaches the receipt on every arm that has one, and only
 /// those; `maybe_effected` splits the "may be pending" arms from the
 /// definitively-nothing arms.
@@ -183,8 +200,6 @@ fn a_transport_failure_before_the_send_broadcast_nothing() {
 
 /// A rejection that says the node already holds this signed tx means an
 /// earlier copy of the send reached a mempool (#2432): the tx may still mine.
-/// It is not a nonce collision either, since a re-send on a fresh nonce could
-/// double-submit.
 #[test]
 fn an_already_known_rejection_leaves_the_broadcast_unknown() {
     for message in [
