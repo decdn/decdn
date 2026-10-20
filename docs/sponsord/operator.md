@@ -146,8 +146,9 @@ and on the treasury wallet's own balance.
 
 Also alert on `sponsord_pool_topup_unconfirmed_since_unix` staying non-zero.
 It means the keeper may have broadcast a `topUp` but does not know that it
-mined: it could not read the receipt, or the submission failed in transport
-after the RPC node may have accepted it. A second top-up could refill the
+mined: it could not read the receipt, or the submission returned no tx hash
+(a transport failure after the RPC node may have accepted it, or an `already
+known` answer because the RPC node already held it). A second top-up could refill the
 pool twice, so the keeper sends none until that transaction has a receipt,
 or until the treasury's confirmed nonce has passed the nonce it was sent
 with. The `error` log line names the nonce, and the transaction when the

@@ -169,8 +169,8 @@ pub(crate) fn name_unconfirmed_escrows<T>(
 }
 
 /// The unconfirmed `openPool` or `topUp` that `err` itself carries, from a
-/// submit lost in transport, a receipt read that failed or lapsed, or a
-/// refusal that names an earlier one.
+/// submit whose broadcast is unknown, a receipt read that failed or lapsed, or
+/// a refusal that names an earlier one.
 fn carried(err: &anyhow::Error) -> Option<EscrowUnconfirmed> {
     err.downcast_ref::<OpenUnconfirmed>()
         .copied()

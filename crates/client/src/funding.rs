@@ -1202,8 +1202,8 @@ fn escrow_held(err: &anyhow::Error) -> bool {
 /// run's `topUp` lock in `funding` from its check to its outcome: a second
 /// caller waits for the first `topUp` to resolve. A `topUp` that may have been
 /// broadcast but is not known to have mined ([`TopUpUnconfirmed`]: a lapsed or
-/// failed receipt read, a submit lost in transport, or a future dropped before
-/// either) may still mine, so the run's [`UnconfirmedEscrows`] keeps it. Every
+/// failed receipt read, a submit whose broadcast is unknown, or a future
+/// dropped before either) may still mine, so the run's [`UnconfirmedEscrows`] keeps it. Every
 /// later call through the same handle refuses with it instead of escrowing a
 /// second deposit, and the acquire loop classifies that as fatal to the
 /// command ([`crate::Fault::Fatal`]). A `funding` whose handle holds an
