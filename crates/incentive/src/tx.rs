@@ -77,11 +77,13 @@ pub async fn await_receipt(
 ///
 /// - [`NotSent`](Self::NotSent) — the initial value; also what a dry run leaves.
 /// - [`Rejected`](Self::Rejected) — `send()` failed with a JSON-RPC error
-///   response (a pre-flight gas-estimate revert, a stale nonce, an under-funded
-///   account). The node answered, and nothing entered the mempool.
+///   response other than an `already known` answer (a pre-flight gas-estimate
+///   revert, a stale nonce, an under-funded account). The node answered, and
+///   nothing entered the mempool.
 /// - [`MaybeBroadcast`](Self::MaybeBroadcast) — `send()` failed with a
-///   transport-class error. The request may have reached the node and broadcast
-///   the transaction, but no hash was captured. The outcome is UNKNOWN.
+///   transport-class error, or the node answered that it already holds the
+///   transaction. The request may have reached the node and broadcast the
+///   transaction, but no hash was captured. The outcome is UNKNOWN.
 /// - [`InFlight`](Self::InFlight) — broadcast, but the receipt could not be
 ///   read or did not arrive within [`RECEIPT_TIMEOUT`]. In flight, may still
 ///   confirm. Carries the hash.
@@ -94,13 +96,14 @@ pub enum SendOutcome {
     /// dry run leaves.
     #[default]
     NotSent,
-    /// The node rejected the call before broadcast (a JSON-RPC error response).
-    /// Nothing entered the mempool.
+    /// The node rejected the call before broadcast (a JSON-RPC error response
+    /// other than `already known`). Nothing entered the mempool.
     Rejected,
     /// `send()` failed with a transport-class error (timeout, connection reset, a
-    /// 5xx from an RPC load balancer). The transaction may have been broadcast;
-    /// no hash was captured, so the outcome is genuinely unknown and re-sending
-    /// can double-submit.
+    /// 5xx from an RPC load balancer), or the node answered that it already
+    /// holds the transaction (`already known`). The transaction may have been
+    /// broadcast; no hash was captured, so the outcome is genuinely unknown and
+    /// re-sending can double-submit.
     MaybeBroadcast,
     /// Broadcast; the receipt could not be read or did not arrive within
     /// [`RECEIPT_TIMEOUT`]. May still confirm.
@@ -233,10 +236,12 @@ fn is_already_known(message: &str) -> bool {
 /// and is the reason an out-param exists rather than just a return value:
 ///
 /// - rejected send → `None` (nothing was broadcast)
-/// - transport-class send failure → `None`, but the error text warns that the tx
-///   MAY have been broadcast — the outcome is unknown ([`SendOutcome`] carries
-///   this as [`MaybeBroadcast`](SendOutcome::MaybeBroadcast) for callers that
-///   render structured receipts)
+/// - a send failure whose broadcast is unknown (a transport-class error, or the
+///   node answers that it already holds the tx) → `None`, but the error text
+///   warns that the tx MAY have been broadcast — the outcome is unknown
+///   ([`SendOutcome`] carries this as
+///   [`MaybeBroadcast`](SendOutcome::MaybeBroadcast) for callers that render
+///   structured receipts)
 /// - broadcast, receipt unread (a failed read, or none within
 ///   [`RECEIPT_TIMEOUT`]) → `Some(hash)` **and** `Err` — the outcome is
 ///   UNKNOWN, and the caller must treat it as possibly-applied
@@ -272,7 +277,7 @@ pub async fn send<C: CallDecoder, P: Provider>(
     let result = send_for_receipt(call, label, hint, &mut outcome).await;
     // Collapse the rich outcome to the historical `Option<B256>` contract:
     // `Some(hash)` iff the transaction may have taken effect. A revert clears it
-    // (definitively no effect); a transport-class failure has no hash to give.
+    // (definitively no effect); a maybe-broadcast failure has no hash to give.
     *landed = outcome.tx().filter(|_| outcome.maybe_effected());
     result.map(|r| r.transaction_hash)
 }
@@ -300,10 +305,11 @@ pub async fn send_for_receipt<C: CallDecoder, P: Provider>(
     let pending = match call.send().await {
         Ok(pending) => pending,
         Err(err) => {
-            // A rejected send never reached the mempool; a transport-class
-            // failure may have broadcast the tx before its response was lost.
-            // The latter must not be reported as a clean "nothing happened",
-            // since re-sending is not idempotent (#1577).
+            // A rejected send never reached the mempool. A transport-class
+            // failure may have broadcast the tx before its response was lost,
+            // and an `already known` answer means an earlier copy of it already
+            // reached one. Neither may be reported as a clean "nothing
+            // happened", since re-sending is not idempotent (#1577, #2432).
             let broadcast_unknown = send_broadcast_unknown(&err);
             *outcome = if broadcast_unknown {
                 SendOutcome::MaybeBroadcast
