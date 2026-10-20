@@ -1105,8 +1105,8 @@ since project inception and will roll into the first tagged release.
 - **CLI: `decdn gateway` answers 404, not 502, for a bundle entry whose hash
   does not parse (#2479).** The manifest is content-addressed, so the bad
   `hash` field never changes and nothing upstream failed. The 404 names the
-  entry, and no pull for the entry starts, the same as a path the manifest
-  lacks.
+  entry. The manifest is still pulled, but no pull for the entry starts, the
+  same as a path the manifest lacks.
 - **CLI: a bundle pull lands no entry outside its output directory, and
   applies `[client] region_allowlist` to every entry (#2439).** A manifest
   path is checked for `..` and absolute components, but the write followed a

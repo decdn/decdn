@@ -982,7 +982,8 @@ impl Gateway {
         let hash = match parse_hash(&entry.hash) {
             Ok(hash) => hash,
             // A fixed property of the content-addressed manifest, not an
-            // upstream fault: every retry gets the same answer.
+            // upstream fault: every retry gets the same answer, so it
+            // answers 404, as a missing path does.
             Err(e) => {
                 return Ok(text(
                     StatusCode::NOT_FOUND,
