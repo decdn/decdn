@@ -43,19 +43,24 @@ DENY_ARGS = [
 # Git exports repo-scoping variables to hooks (from a linked worktree, an
 # absolute GIT_DIR and GIT_INDEX_FILE). A cargo-deny older than 0.19.6 lets
 # its advisory-db git commands inherit them, so its `git reset --hard` acts
-# on the committing repository instead of ~/.cargo/advisory-dbs/. The child
-# runs without them; the list is git's own `local_repo_env`.
+# on the committing repository instead of ~/.cargo/advisory-dbs/. Developers'
+# installs are not version-pinned, so the child runs without them on every
+# version; the list is git's own `local_repo_env`
+# (`git rev-parse --local-env-vars`).
 GIT_REPO_ENV_VARS = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR", "GIT_GRAFT_FILE", "GIT_SHALLOW_FILE", "GIT_PREFIX",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE",
     "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
 )
 
 
 def deny_env() -> dict[str, str]:
-    """The child environment for `cargo deny`: os.environ minus git's repo-scoping vars."""
+    """The environment for the `cargo deny check` run: os.environ minus git's repo-scoping vars."""
     return {k: v for k, v in os.environ.items() if k not in GIT_REPO_ENV_VARS}
+
+
 
 SUMMARY_RE = re.compile(
     r"^advisories (?:ok|FAILED), bans (?:ok|FAILED), "

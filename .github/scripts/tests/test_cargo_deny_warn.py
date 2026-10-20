@@ -99,10 +99,13 @@ def test_deny_env_drops_gits_repo_scoping_vars(monkeypatch):
     monkeypatch.setenv("GIT_DIR", "/repo/.git/worktrees/wt")
     monkeypatch.setenv("GIT_INDEX_FILE", "/repo/.git/worktrees/wt/index")
     monkeypatch.setenv("GIT_WORK_TREE", "/repo")
+    # A denylist, not a GIT_* wipe: vars that don't scope a repo survive.
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
     env = cdw.deny_env()
     for var in cdw.GIT_REPO_ENV_VARS:
         assert var not in env
     assert env["PATH"]
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
 
 
 def fake_run(version_rc: int, deny_rc: int, deny_out: str):
@@ -118,6 +121,8 @@ def fake_run(version_rc: int, deny_rc: int, deny_out: str):
 
 def test_main_exit_codes(monkeypatch, capsys):
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    # Set for real so fake_run's `"GIT_DIR" not in kwargs["env"]` is load-bearing.
+    monkeypatch.setenv("GIT_DIR", "/repo/.git/worktrees/wt")
     cases = [
         (fake_run(0, 0, CLEAN_OUT), 0),
         (fake_run(0, 0, ""), 1),
