@@ -97,8 +97,9 @@ pub enum TxState {
 /// transaction it would leave every later one queued behind the unused
 /// nonce, and after a transaction sent from elsewhere (the self-transfers
 /// that clear a held top-up) it would reuse a spent nonce. It carries the
-/// send-leg marker `top_up` reads: a `topUp` whose send request failed in
-/// transport is held as unconfirmed, one whose chain reads failed is not.
+/// send-leg marker `decdn_client::buyer_pool::top_up` and `ensure_allowance`
+/// read: a `topUp` whose send request failed in transport is held as
+/// unconfirmed, one whose chain reads failed is not.
 fn treasury_provider<S>(url: alloy::transports::http::reqwest::Url, signer: S) -> DynProvider
 where
     S: TxSigner<Signature> + Send + Sync + 'static,

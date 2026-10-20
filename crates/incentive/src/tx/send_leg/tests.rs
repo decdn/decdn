@@ -26,7 +26,7 @@ async fn send_layered(asserter: Asserter) -> ContractError {
 
 /// A send that fails with no JSON-RPC answer (here: an empty mock queue) is
 /// marked, and the marked error prints as the unmarked one does, in its
-/// `Display` and down its source chain.
+/// `Display` and through the operator-facing renders.
 #[tokio::test]
 async fn a_failed_send_request_is_marked_and_prints_unchanged() {
     let marked = send_layered(Asserter::new()).await;
@@ -62,6 +62,28 @@ async fn a_rejected_send_passes_through_unmarked() {
     let err = send_layered(asserter).await;
     assert!(SendLegFailure::from_error(&err).is_none(), "{err}");
     assert!(crate::tx::is_nonce_collision(&err), "{err}");
+}
+
+/// Every other send entry point alloy forwards is marked too.
+#[tokio::test]
+async fn the_other_send_entry_points_are_marked() {
+    let provider = builder()
+        .layer(SendLegLayer)
+        .connect_mocked_client(Asserter::new());
+    let raw = [0u8; 4];
+    let sync = provider.send_transaction_sync(request()).await.unwrap_err();
+    let raw_send = provider.send_raw_transaction(&raw).await.unwrap_err();
+    let raw_sync = provider.send_raw_transaction_sync(&raw).await.unwrap_err();
+    let conditional = provider
+        .send_raw_transaction_conditional(&raw, TransactionConditional::default())
+        .await
+        .unwrap_err();
+    for err in [sync, raw_send, raw_sync, conditional] {
+        assert!(
+            SendLegFailure::from_transport_error(&err).is_some(),
+            "{err}"
+        );
+    }
 }
 
 /// Type erasure keeps the marker: `DynProvider` forwards the send hook.

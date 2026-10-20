@@ -173,11 +173,9 @@ async fn treasury_provider_marks_a_failed_send_request() {
         ..Default::default()
     };
     let provider = treasury_provider("http://127.0.0.1:1".parse().unwrap(), signer);
-    let err = alloy::contract::Error::TransportError(
-        provider.send_transaction(request).await.unwrap_err(),
-    );
+    let err = provider.send_transaction(request).await.unwrap_err();
     assert!(
-        decdn_incentive::tx::SendLegFailure::from_error(&err).is_some(),
+        decdn_incentive::tx::SendLegFailure::from_transport_error(&err).is_some(),
         "{err}"
     );
 }

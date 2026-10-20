@@ -3238,6 +3238,21 @@ fn bare_pool_contract(
     )
 }
 
+/// [`bare_pool_contract`] with a gas filler, so an `openPool` send reads the
+/// gas estimate first: an empty queue then fails that read, before anything
+/// is sent.
+fn filled_pool_contract(
+    asserter: alloy::providers::mock::Asserter,
+) -> PaymentPool::PaymentPoolInstance<impl Provider + Clone + 'static> {
+    PaymentPool::new(
+        Address::ZERO,
+        alloy::providers::ProviderBuilder::default()
+            .layer(decdn_incentive::tx::SendLegLayer)
+            .with_gas_estimation()
+            .connect_mocked_client(asserter),
+    )
+}
+
 /// One scripted RPC answer.
 enum Reply {
     /// `eth_getTransactionReceipt` finds nothing.
@@ -3984,6 +3999,58 @@ async fn a_transport_failed_open_adopts_its_pool_once_the_nonce_is_spent() {
         store.get_by_owner(owner).unwrap().map(|row| row.pool_id),
         Some(pool_id),
         "the adopted pool is tracked, so the next miss reuses it"
+    );
+}
+
+/// An `openPool` whose gas estimate fails before the send signed nothing, so
+/// the node holds no open slot for it (#2431): the miss fails as a plain
+/// fault, `decdn_buyer_pool_open_unresolved` stays 0, no row is tracked, and
+/// the next miss sends again.
+#[tokio::test(start_paused = true)]
+async fn a_read_failed_open_holds_no_slot() {
+    let owner = Address::repeat_byte(1);
+    // The nonce read answers; the gas estimate then over-calls the queue and
+    // fails in transport, before the send.
+    let asserter = script(vec![Reply::Nonce(5)]);
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(MemoryBuyerPoolStore::new());
+    let svc = mocked_service_on(
+        filled_pool_contract(asserter.clone()),
+        Arc::clone(&store),
+        signer(),
+        owner,
+    );
+    let provider = Address::repeat_byte(3);
+
+    let err = svc
+        .open_or_reuse_pool(provider, Duration::from_secs(30))
+        .await
+        .expect_err("the open's gas estimate fails");
+    assert!(err.downcast_ref::<OpenHeld>().is_none(), "{err:#}");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("eth_estimateGas"), "{msg}");
+    assert!(!msg.contains("eth_sendTransaction"), "{msg}");
+    assert!(
+        asserter.read_q().is_empty(),
+        "the nonce read ran before the estimate failed"
+    );
+    assert!(
+        svc.open_in_flight.lock().unwrap().is_none(),
+        "no open task holds the slot"
+    );
+    assert!(!*svc.open_hold.held.borrow(), "the hold is not taken");
+    assert_eq!(open_unresolved(&svc.metrics), 0);
+    assert!(store.get_by_owner(owner).unwrap().is_none());
+
+    // The next miss sends again: the nonce read is the first call.
+    push(&asserter, vec![Reply::Nonce(5)]);
+    let again = svc
+        .open_or_reuse_pool(provider, Duration::from_secs(30))
+        .await
+        .expect_err("the open's gas estimate fails again");
+    assert!(again.downcast_ref::<OpenHeld>().is_none(), "{again:#}");
+    assert!(
+        asserter.read_q().is_empty(),
+        "the second open read the nonce"
     );
 }
 

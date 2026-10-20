@@ -835,9 +835,9 @@ pub const SELF_CAPABILITY_CAP: u64 = u64::MAX;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenUnconfirmed {
     /// The broadcast `openPool` transaction. `None` when the submit returned
-    /// no hash (it failed in transport, the RPC node answered that it already
-    /// holds the tx, or it was dropped in flight): the transaction may be in a
-    /// mempool without its hash known here.
+    /// no hash (its send request failed in transport, the RPC node answered
+    /// that it already holds the tx, or it was dropped in flight): the
+    /// transaction may be in a mempool without its hash known here.
     pub tx: Option<TxHash>,
     /// The nonce the `openPool` was sent with. Once the account's confirmed
     /// nonce passes it, the `openPool` has either mined or can never mine.
@@ -1201,8 +1201,8 @@ impl std::fmt::Display for AllowanceShortfall {
 impl std::error::Error for AllowanceShortfall {}
 
 /// Typed marker on a [`top_up`] error raised when the `topUp` may have been
-/// broadcast but is not known to have mined: its submit failed in transport
-/// (a timeout, a reset, an HTTP 5xx), the RPC node answered that it already
+/// broadcast but is not known to have mined: its send request failed in
+/// transport (a timeout, a reset, an HTTP 5xx), the RPC node answered that it already
 /// holds the tx (`already known`), or it was broadcast and its receipt was not
 /// read (a failed read, or none within the caller's bound). An
 /// [`UnconfirmedEscrows`] entry has the same meaning, and also holds a `topUp`

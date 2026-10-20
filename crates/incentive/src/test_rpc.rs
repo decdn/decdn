@@ -203,7 +203,7 @@ impl ScriptedRpc {
             .is_empty()
     }
 
-    /// A filler-free provider over this transport.
+    /// A filler-free, send-leg-marked provider over this transport.
     #[must_use]
     pub fn provider(self) -> impl Provider + Clone {
         ProviderBuilder::default()

@@ -92,6 +92,7 @@ async fn a_top_up_whose_reads_fail_before_the_send_is_not_unconfirmed() {
     assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none(), "{err:#}");
     let msg = format!("{err:#}");
     assert!(msg.contains("submit topUp"), "{msg}");
+    assert!(msg.contains("eth_estimateGas"), "{msg}");
     assert!(!msg.contains("eth_sendTransaction"), "{msg}");
     assert!(escrows.top_ups().is_empty());
 }
@@ -752,6 +753,7 @@ async fn an_open_pool_whose_reads_fail_before_the_send_is_not_unconfirmed() {
     assert!(err.downcast_ref::<OpenUnconfirmed>().is_none(), "{err:#}");
     let msg = format!("{err:#}");
     assert!(msg.contains("submit openPool"), "{msg}");
+    assert!(msg.contains("eth_estimateGas"), "{msg}");
     assert!(!msg.contains("eth_sendTransaction"), "{msg}");
     assert_eq!(
         err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
@@ -1106,8 +1108,8 @@ async fn approve_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error
 #[tokio::test]
 async fn an_approve_whose_reads_fail_before_the_send_is_not_pending() {
     let asserter = alloy::providers::mock::Asserter::new();
-    // An ABI-encoded zero allowance, so `approve` is sent; the gas estimate
-    // then finds no reply.
+    // An ABI-encoded zero allowance, so an `approve` is attempted; its gas
+    // estimate then finds no reply, before anything is sent.
     asserter.push_success(&B256::ZERO);
     let err = ensure_allowance(
         &alloy::providers::ProviderBuilder::default()
@@ -1124,6 +1126,7 @@ async fn an_approve_whose_reads_fail_before_the_send_is_not_pending() {
     let msg = format!("{err:#}");
     assert!(msg.contains("submit USDC approve"), "{msg}");
     assert!(!msg.contains(APPROVE_MAYBE_BROADCAST), "{msg}");
+    assert!(msg.contains("eth_estimateGas"), "{msg}");
     assert!(!msg.contains("eth_sendTransaction"), "{msg}");
 }
 

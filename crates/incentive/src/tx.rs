@@ -126,10 +126,10 @@ impl SendOutcome {
     /// The tx hash for any arm that captured one — [`Confirmed`](Self::Confirmed),
     /// [`Reverted`](Self::Reverted), or [`InFlight`](Self::InFlight).
     ///
-    /// [`MaybeBroadcast`](Self::MaybeBroadcast) has none by construction: its
-    /// the send request failed before returning a handle (a transport error,
-    /// or an `already known` answer), so there is no hash to give even though
-    /// a transaction may exist.
+    /// [`MaybeBroadcast`](Self::MaybeBroadcast) has none by construction: the
+    /// send request failed before returning a handle (a transport error, or an
+    /// `already known` answer), so there is no hash to give even though a
+    /// transaction may exist.
     #[must_use]
     pub const fn tx(self) -> Option<B256> {
         match self {
@@ -167,9 +167,11 @@ impl SendOutcome {
 ///   a connection reset, an HTTP 5xx from an RPC load balancer, a response body
 ///   that could not be deserialized. The transaction may already be in the
 ///   mempool, and `eth_sendRawTransaction` is not idempotent from the client's
-///   view, so the caller must not report "nothing happened". Two marked shapes
-///   are still definite: an HTTP 4xx, where the gateway refused the request
-///   outright (a bad path, an expired key) without forwarding it, and a
+///   view, so the caller must not report "nothing happened". Three marked
+///   shapes are still definite: an HTTP 4xx (with or without a `Retry-After`),
+///   where the gateway refused the request outright (a bad path, an expired
+///   key, a rate limit) without forwarding it; a request that never connected
+///   (a refused connection, a DNS or TLS failure) or could not be built; and a
 ///   client-side fault raised before the request left the process (an
 ///   unsupported feature, a local-usage error, a body that failed to
 ///   serialize);
@@ -200,9 +202,17 @@ pub fn send_broadcast_unknown(err: &ContractError) -> bool {
             RpcError::UnsupportedFeature(_)
             | RpcError::LocalUsageError(_)
             | RpcError::SerError(_) => false,
-            // An HTTP 4xx is the gateway refusing the request (bad path, bad key)
-            // before it reaches the node; a 5xx may have broadcast before failing.
-            RpcError::Transport(TransportErrorKind::HttpError(h)) => h.status >= 500,
+            // An HTTP 4xx (with or without a `Retry-After`) is the gateway
+            // refusing the request (bad path, bad key, rate limit) before it
+            // reaches the node; a 5xx may have broadcast before failing.
+            RpcError::Transport(kind) if let Some(http) = kind.as_http_error() => {
+                http.status >= 500
+            }
+            // A request that never connected, or that reqwest could not
+            // build, put nothing on the wire.
+            RpcError::Transport(TransportErrorKind::Custom(inner)) => !inner
+                .downcast_ref::<alloy::transports::http::reqwest::Error>()
+                .is_some_and(|e| e.is_connect() || e.is_builder()),
             // Timeouts, resets, a null response, an undeserializable body: the
             // request may have been processed before the answer was lost.
             _ => true,
@@ -256,9 +266,9 @@ fn is_already_known(message: &str) -> bool {
 ///
 /// - rejected send → `None` (nothing was broadcast)
 /// - a send failure whose broadcast is unknown (the send request failed in
-///   transport, or the node answers that it already holds the tx) → `None`, but the error text
-///   warns that the tx MAY have been broadcast — the outcome is unknown
-///   ([`SendOutcome`] carries this as
+///   transport, or the node answers that it already holds the tx) → `None`,
+///   but the error text warns that the tx MAY have been broadcast — the
+///   outcome is unknown ([`SendOutcome`] carries this as
 ///   [`MaybeBroadcast`](SendOutcome::MaybeBroadcast) for callers that render
 ///   structured receipts)
 /// - broadcast, receipt unread (a failed read, or none within

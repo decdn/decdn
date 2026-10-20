@@ -163,9 +163,8 @@ async fn wallet_builder_marks_a_failed_send_request() {
         .send_transaction(specified_request(&signer))
         .await
         .unwrap_err();
-    let err = alloy::contract::Error::TransportError(err);
     assert!(
-        decdn_incentive::tx::SendLegFailure::from_error(&err).is_some(),
+        decdn_incentive::tx::SendLegFailure::from_transport_error(&err).is_some(),
         "{err}"
     );
 }

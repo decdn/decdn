@@ -15,8 +15,18 @@
 //! rejection, a revert, an oversized batch.
 //!
 //! [`super::send_broadcast_unknown`] is the reader. Every provider that sends
-//! installs the layer: `ProviderBuilder::new().layer(SendLegLayer)`, before
-//! the fillers are added.
+//! installs the layer: `ProviderBuilder::new().layer(SendLegLayer)`. The
+//! fillers always sit above it, whatever the order of the builder calls; a
+//! layer added after it sits below it, so such a layer must make no chain
+//! read in its send hook. A provider without the layer reports every
+//! transport failure of a send as "nothing sent", which lets a caller re-send
+//! a transaction the node may hold; the builders in `decdn-client`, the node
+//! and `sponsord-core` each carry it, and a test per builder guards that.
+//!
+//! The layer marks every send entry point alloy's `FillProvider` forwards:
+//! `send_transaction` (the `CallBuilder::send()` path), `send_transaction_sync`,
+//! `send_raw_transaction`, `send_raw_transaction_sync` and
+//! `send_raw_transaction_conditional`.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -27,6 +37,7 @@ use alloy::network::{Ethereum, Network};
 use alloy::providers::{
     PendingTransactionBuilder, Provider, ProviderLayer, RootProvider, SendableTx,
 };
+use alloy::rpc::types::erc4337::TransactionConditional;
 use alloy::transports::{RpcError, TransportError, TransportErrorKind, TransportResult};
 use async_trait::async_trait;
 
@@ -50,8 +61,10 @@ where
     }
 }
 
-/// The provider [`SendLegLayer`] builds. Every call goes to the provider it
-/// wraps; a failed send comes back as a [`SendLegFailure`].
+/// The provider [`SendLegLayer`] builds. `root()` and the send hooks go to
+/// the provider it wraps, and a failed send comes back as a
+/// [`SendLegFailure`]; every other call uses the root, as alloy's own layers
+/// do.
 #[derive(Clone, Debug)]
 pub struct SendLegProvider<P, N = Ethereum> {
     inner: P,
@@ -80,14 +93,61 @@ where
             .await
             .map_err(SendLegFailure::mark)
     }
+
+    async fn send_transaction_sync_internal(
+        &self,
+        tx: SendableTx<N>,
+    ) -> TransportResult<N::ReceiptResponse> {
+        self.inner
+            .send_transaction_sync_internal(tx)
+            .await
+            .map_err(SendLegFailure::mark)
+    }
+
+    async fn send_raw_transaction(
+        &self,
+        encoded_tx: &[u8],
+    ) -> TransportResult<PendingTransactionBuilder<N>> {
+        self.inner
+            .send_raw_transaction(encoded_tx)
+            .await
+            .map_err(SendLegFailure::mark)
+    }
+
+    async fn send_raw_transaction_sync(
+        &self,
+        encoded_tx: &[u8],
+    ) -> TransportResult<N::ReceiptResponse> {
+        self.inner
+            .send_raw_transaction_sync(encoded_tx)
+            .await
+            .map_err(SendLegFailure::mark)
+    }
+
+    async fn send_raw_transaction_conditional(
+        &self,
+        encoded_tx: &[u8],
+        conditional: TransactionConditional,
+    ) -> TransportResult<PendingTransactionBuilder<N>> {
+        self.inner
+            .send_raw_transaction_conditional(encoded_tx, conditional)
+            .await
+            .map_err(SendLegFailure::mark)
+    }
 }
 
-/// A failure of the send request itself: the transaction was filled and
-/// signed, and `eth_sendRawTransaction` (or `eth_sendTransaction`) failed
-/// without a JSON-RPC answer. The node may have received it.
+/// A failure of the send request itself: the transaction was filled (and,
+/// with a wallet, signed), and `eth_sendRawTransaction` (or
+/// `eth_sendTransaction` on a wallet-free provider) failed without a JSON-RPC
+/// answer. The node may have received it.
 ///
 /// It prints as the failure it wraps, and its `source()` is that failure's
-/// source, so an error chain reads the same as the unwrapped one.
+/// source, so the operator-facing render
+/// ([`decdn_common::redact::sanitize_err_chain`], which folds a layer that
+/// repeats its source) reads the same as for the unwrapped failure. A plain
+/// `{err:#}` repeats the text once more, as it does for alloy's own custom
+/// transport errors. A classifier that matches on `TransportErrorKind` sees
+/// the marked error as `Custom` and must read [`Self::inner`].
 #[derive(Debug)]
 pub struct SendLegFailure(TransportError);
 
@@ -110,9 +170,17 @@ impl SendLegFailure {
     /// The marked send failure inside `err`, if that is what `err` is.
     #[must_use]
     pub fn from_error(err: &ContractError) -> Option<&Self> {
-        let ContractError::TransportError(RpcError::Transport(TransportErrorKind::Custom(boxed))) =
-            err
-        else {
+        let ContractError::TransportError(err) = err else {
+            return None;
+        };
+        Self::from_transport_error(err)
+    }
+
+    /// The marked send failure inside `err`, for a send made on the provider
+    /// directly rather than through a contract call.
+    #[must_use]
+    pub fn from_transport_error(err: &TransportError) -> Option<&Self> {
+        let RpcError::Transport(TransportErrorKind::Custom(boxed)) = err else {
             return None;
         };
         boxed.downcast_ref::<Self>()

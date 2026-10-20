@@ -45,8 +45,8 @@ fn provider_factory_preserves_role_polling_policy() {
 /// Both wallet providers carry the send-leg marker: a send request that fails
 /// in transport (nothing listens on the port) comes back as a
 /// [`decdn_incentive::tx::SendLegFailure`], so the buyer's `openPool` /
-/// `topUp` and the seller's sends can tell it from a chain read that failed
-/// before it (#2431).
+/// `topUp` / `approve` can tell it from a chain read that failed before it
+/// (#2431). The seller's `redeemMany` does not read the marker yet.
 #[tokio::test]
 async fn wallet_providers_mark_a_failed_send_request() {
     decdn_common::tls::install_crypto_provider();
@@ -74,14 +74,12 @@ async fn wallet_providers_mark_a_failed_send_request() {
             .buyer_wallet(signer.clone(), Duration::from_secs(1))
             .erased(),
     ] {
-        let err = alloy::contract::Error::TransportError(
-            provider
-                .send_transaction(request.clone())
-                .await
-                .expect_err("nothing listens on the port"),
-        );
+        let err = provider
+            .send_transaction(request.clone())
+            .await
+            .expect_err("nothing listens on the port");
         assert!(
-            decdn_incentive::tx::SendLegFailure::from_error(&err).is_some(),
+            decdn_incentive::tx::SendLegFailure::from_transport_error(&err).is_some(),
             "{err}"
         );
     }

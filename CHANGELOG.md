@@ -1115,7 +1115,10 @@ since project inception and will roll into the first tagged release.
   (`decdn_client::provider::build_provider`, the node's wallet providers,
   sponsord's treasury provider) now carry `decdn_incentive::tx::SendLegLayer`,
   which marks a failure of the send request itself, so only that failure (or
-  an `already known` answer) reads as possibly broadcast. `pool close --all` /
+  an `already known` answer) reads as possibly broadcast. A send request the
+  gateway refused with a 4xx that carries `Retry-After` (a rate limit), and
+  one that never connected (a refused connection, a DNS or TLS failure), read
+  as rejected too. `pool close --all` /
   `reclaim --all` count a pool whose reads failed as `failed`, `openPool` /
   `topUp` hold no unconfirmed escrow for it, the USDC `approve` does not say
   it may be pending, and `publish`, bond, register, appeal and key rotation

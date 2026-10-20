@@ -25,11 +25,13 @@ use decdn_incentive::tx::SendLegLayer;
 /// Build a wallet-filled HTTP provider that signs and sends transactions as
 /// `signer`. It reads the pending nonce on every send, so it stays correct
 /// after a send that pins its own nonce ([`crate::buyer_pool::top_up`]) or a
-/// transaction sent from elsewhere. It carries [`SendLegLayer`], which the
-/// senders in this crate and in `decdn_incentive::tx` read to tell a send
-/// request that failed in transport (the transaction may be in a mempool) from
-/// a chain read that failed before it (nothing was signed); a provider built
-/// elsewhere and handed to them must carry the layer too.
+/// transaction sent from elsewhere. It carries [`SendLegLayer`], which every
+/// reader of `decdn_incentive::tx::send_broadcast_unknown` (the senders in
+/// this crate, `decdn_incentive::tx`, the CLI's `closePool` / `reclaim`) uses
+/// to tell a send request that failed in transport (the transaction may be
+/// in a mempool) from a chain read that failed before it (nothing was
+/// signed); a provider built elsewhere and handed to them must carry the
+/// layer too.
 ///
 /// # Errors
 ///

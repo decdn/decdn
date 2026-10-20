@@ -814,8 +814,8 @@ async fn an_unreachable_rpc_warns_and_still_issues() {
 
 /// A `PaymentPool` on a filler-free provider whose RPC calls `asserter` answers
 /// in order; a call past the queue fails in transport. The provider carries
-/// the send-leg marker, as `provider::build_provider` does, so the one request
-/// `send()` makes is read as the send.
+/// the send-leg marker, as `decdn_client::provider::build_provider` does, so
+/// the one request `send()` makes is read as the send.
 fn pool_on(
     asserter: alloy::providers::mock::Asserter,
 ) -> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone> {
@@ -828,7 +828,8 @@ fn pool_on(
 }
 
 /// [`pool_on`] with the nonce and gas fillers, so `send()` reads the chain
-/// before it sends: an empty queue then fails a read, not the send request.
+/// before it sends: an empty queue then fails the gas estimate (the first
+/// read the fillers poll), not the send request.
 fn filled_pool_on(
     asserter: alloy::providers::mock::Asserter,
 ) -> PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone> {
@@ -1031,7 +1032,54 @@ async fn a_close_whose_reads_fail_before_the_send_is_not_unconfirmed() {
     let msg = format!("{err:#}");
     assert!(msg.contains("closePool send failed"), "{msg}");
     assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
+    assert!(msg.contains("eth_estimateGas"), "{msg}");
     assert!(!msg.contains("eth_sendTransaction"), "{msg}");
+}
+
+/// A `reclaim` whose chain reads fail before the send signed nothing, so it
+/// carries no [`TxUnconfirmed`] and no broadcast warning (#2431).
+#[tokio::test]
+async fn a_reclaim_whose_reads_fail_before_the_send_is_not_unconfirmed() {
+    let err = reclaim_and_forget(
+        &filled_pool_on(alloy::providers::mock::Asserter::new()),
+        LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+        Address::repeat_byte(0x22),
+        B256::repeat_byte(0x33),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.downcast_ref::<TxUnconfirmed>().is_none(), "{err:#}");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("reclaim send failed"), "{msg}");
+    assert!(!msg.contains(MAYBE_BROADCAST), "{msg}");
+    assert!(msg.contains("eth_estimateGas"), "{msg}");
+    assert!(!msg.contains("eth_sendTransaction"), "{msg}");
+}
+
+/// `reclaim --all` counts a pool whose `reclaim` reads failed before the send
+/// as failed, not as one that may have broadcast (#2431).
+#[tokio::test]
+async fn reclaim_all_counts_a_failed_read_before_the_send_as_failed() {
+    let owner = Address::repeat_byte(0x22);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&owned_pools(2));
+    let mut head = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+    head.header.inner.timestamp = 1_000;
+    asserter.push_success(&head);
+    for _ in 0..2 {
+        asserter.push_success(&pool_in(owner, PaymentPool::Status::Closing));
+    }
+
+    let err = reclaim_all(
+        &filled_pool_on(asserter),
+        LocalBookkeeping::DaemonOwned(Path::new("/var/lib/decdn/buyer.redb")),
+        owner,
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("2 pool(s) failed to reclaim"), "{msg}");
+    assert!(!msg.contains("may have broadcast"), "{msg}");
 }
 
 /// `close --all` counts a pool whose `closePool` reads failed before the send

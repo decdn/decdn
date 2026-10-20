@@ -1,5 +1,4 @@
 use super::*;
-use crate::tx::{SendLegFailure, SendLegLayer};
 
 /// A JSON-RPC error *response* — the node answered, rejecting the call.
 /// Built by deserializing the wire shape, since `ErrorPayload` is not
@@ -128,18 +127,55 @@ fn a_failed_send_request_leaves_the_broadcast_unknown() {
     assert!(send_broadcast_unknown(&send_leg(http_transport(500))));
 }
 
-/// A send request the gateway refused (4xx) or that never left the process
-/// broadcast nothing, marked or not.
+/// An HTTP transport error carrying `status` and a `Retry-After`, as the
+/// reqwest transport builds for any non-2xx answer that names one.
+fn http_retry_after(status: u16) -> alloy::transports::TransportError {
+    alloy::transports::TransportErrorKind::http_error_with_retry_after(
+        status,
+        String::new(),
+        Some(std::time::Duration::from_secs(1)),
+    )
+}
+
+/// A send request the gateway refused (4xx, with or without a `Retry-After`)
+/// or that never left the process broadcast nothing, marked or not. A 5xx
+/// with a `Retry-After` is as uncertain as one without.
 #[test]
 fn a_refused_or_local_send_request_is_not_a_broadcast() {
     assert!(!send_broadcast_unknown(&send_leg(http_transport(401))));
     assert!(!send_broadcast_unknown(&send_leg(http_transport(404))));
+    assert!(!send_broadcast_unknown(&send_leg(http_retry_after(429))));
+    assert!(send_broadcast_unknown(&send_leg(http_retry_after(503))));
     assert!(!send_broadcast_unknown(&send_leg(
         alloy::transports::RpcError::UnsupportedFeature("batching")
     )));
     assert!(!send_broadcast_unknown(&send_leg(
         alloy::transports::RpcError::local_usage_str("missing properties")
     )));
+}
+
+/// A send request that never connected (nothing listens on the port) put
+/// nothing on the wire: marked, and still not a possible broadcast. A
+/// filler-free provider over a real HTTP transport, so the one request is
+/// the send.
+#[tokio::test]
+async fn a_send_request_that_never_connected_is_not_a_broadcast() {
+    decdn_common::tls::install_crypto_provider();
+    let provider = alloy::providers::ProviderBuilder::<_, _, alloy::network::Ethereum>::default()
+        .layer(SendLegLayer)
+        .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let err = provider
+        .send_transaction(
+            alloy::rpc::types::TransactionRequest::default()
+                .to(alloy::primitives::Address::repeat_byte(0x01)),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        SendLegFailure::from_transport_error(&err).is_some(),
+        "{err}"
+    );
+    assert!(!send_broadcast_unknown(&ContractError::TransportError(err)));
 }
 
 /// The same transport failures *before* the send — a chain read in the
@@ -192,8 +228,8 @@ fn an_already_known_rejection_leaves_the_broadcast_unknown() {
 }
 
 /// Run [`send_for_receipt`] on a filler-free, send-leg-marked provider whose
-/// one RPC call,
-/// the send, the node answers with a JSON-RPC rejection carrying `message`.
+/// one RPC call, the send, the node answers with a JSON-RPC rejection
+/// carrying `message`.
 async fn send_rejected_with(message: &'static str) -> (anyhow::Error, SendOutcome) {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_failure_msg(message);

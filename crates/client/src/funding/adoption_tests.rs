@@ -8,6 +8,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::providers::mock::Asserter;
 use alloy::sol_types::SolValue;
 use decdn_incentive::test_rpc::SCRIPTED_TX;
+use decdn_incentive::tx::SendLegLayer;
 use std::assert_matches;
 
 const PP: Address = Address::repeat_byte(0x9c);
@@ -79,7 +80,9 @@ async fn run_in(
             None => asserter.push_failure_msg("transient rpc fault"),
         }
     }
-    let rpc = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+    let rpc = ProviderBuilder::new()
+        .layer(SendLegLayer)
+        .connect_mocked_client(asserter.clone());
     let contract = PaymentPool::new(PP, rpc.clone());
     let payer = match OwnedPayer::for_store(Arc::clone(signer), store) {
         Ok(payer) => payer,
@@ -223,7 +226,9 @@ async fn a_tracked_pool_resumes_a_new_lane_from_the_chain_watermark() {
 #[tokio::test]
 async fn a_row_from_another_deployment_is_not_reused() {
     let signer = Arc::new(PrivateKeySigner::random());
-    let rpc = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+    let rpc = ProviderBuilder::new()
+        .layer(SendLegLayer)
+        .connect_mocked_client(Asserter::new());
     let contract = PaymentPool::new(PP, rpc);
     let other_address = Deployment {
         payment_pool: Address::repeat_byte(0xDE),
@@ -321,7 +326,9 @@ async fn a_tracked_pool_is_reused_only_while_the_chain_shows_it_open() {
         }
         let contract = PaymentPool::new(
             PP,
-            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+            ProviderBuilder::new()
+                .layer(SendLegLayer)
+                .connect_mocked_client(asserter.clone()),
         );
         let funding = RunFunding::default();
         let tracked = pool_to_reuse(
@@ -1097,7 +1104,9 @@ async fn a_lane_build_reports_the_pools_other_spend() {
 async fn the_cli_funder_reads_the_run_funding() {
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
-    let rpc = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+    let rpc = ProviderBuilder::new()
+        .layer(SendLegLayer)
+        .connect_mocked_client(Asserter::new());
     let contract = PaymentPool::new(PP, rpc.clone());
     let funding = RunFunding::default();
     funding.join_lane(
@@ -1191,7 +1200,9 @@ async fn step_on_a_full_pool_holding(
             &[],
         ))
         .unwrap();
-    let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
+    let rpc = ProviderBuilder::new()
+        .layer(SendLegLayer)
+        .connect_mocked_client(asserter);
     let contract = PaymentPool::new(PP, rpc.clone());
     let opens = UnconfirmedEscrows::default();
     let funding = RunFunding::reporting_escrows_to(opens.clone());
@@ -1286,8 +1297,11 @@ async fn a_full_closing_pool_is_replaced() {
         asserter.read_q().is_empty(),
         "the estimate and the allowance ran"
     );
-    // The open's chain reads failed before the send, so nothing was signed
+    // The open's gas estimate failed before the send, so nothing was signed
     // and the run's handle holds no open (#2431).
+    let msg = format!("{err:#}");
+    assert!(msg.contains("eth_estimateGas"), "{msg}");
+    assert!(!msg.contains("eth_sendTransaction"), "{msg}");
     assert!(opens.is_empty(), "{opens:?}");
 }
 
@@ -1336,7 +1350,7 @@ async fn lane_build_open_on(
 async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_escrows() {
     let asserter = Asserter::new();
     let rpc = ProviderBuilder::default()
-        .layer(decdn_incentive::tx::SendLegLayer)
+        .layer(SendLegLayer)
         .connect_mocked_client(asserter.clone());
     let opens = UnconfirmedEscrows::default();
     lane_build_open_on(rpc, &asserter, &opens).await;
@@ -1350,11 +1364,12 @@ async fn a_lane_build_open_is_held_in_the_runs_unconfirmed_escrows() {
 async fn a_lane_build_open_whose_reads_fail_is_not_held() {
     let asserter = Asserter::new();
     let rpc = ProviderBuilder::new()
-        .layer(decdn_incentive::tx::SendLegLayer)
+        .layer(SendLegLayer)
         .connect_mocked_client(asserter.clone());
     let opens = UnconfirmedEscrows::default();
     let err = lane_build_open_on(rpc, &asserter, &opens).await;
     assert!(err.downcast_ref::<OpenUnconfirmed>().is_none(), "{err:#}");
+    assert!(format!("{err:#}").contains("eth_estimateGas"), "{err:#}");
     assert!(opens.opens().is_empty());
 }
 
@@ -1433,7 +1448,9 @@ async fn delegated_ctx(
     let asserter = Asserter::new();
     asserter.push_success(&pool(owner, WORKING, 0).abi_encode());
     asserter.push_success(&TOKEN.abi_encode());
-    let rpc = ProviderBuilder::new().connect_mocked_client(asserter);
+    let rpc = ProviderBuilder::new()
+        .layer(SendLegLayer)
+        .connect_mocked_client(asserter);
     let contract = PaymentPool::new(PP, rpc);
     let chain = ChainConfig {
         rpc_url: "http://config:8545".to_string(),

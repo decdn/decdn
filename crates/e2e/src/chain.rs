@@ -574,11 +574,13 @@ impl ChainFixture {
     }
 
     /// Build a wallet-filled provider for `signer` (simple nonce management
-    /// mirrors production — a reverted gas-estimate must not leak a cached
-    /// nonce and gap the lane).
+    /// and the send-leg marker mirror production — a reverted gas-estimate
+    /// must not leak a cached nonce and gap the lane, and the client senders
+    /// read the marker to tell a lost send from a failed chain read).
     #[must_use]
     pub fn provider_for(&self, signer: &PrivateKeySigner) -> DynProvider {
         ProviderBuilder::new()
+            .layer(decdn_incentive::tx::SendLegLayer)
             .with_simple_nonce_management()
             .wallet(EthereumWallet::from(signer.clone()))
             .connect_http(self.url.clone())
