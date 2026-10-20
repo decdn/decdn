@@ -156,6 +156,30 @@ async fn no_chain_pool_error_names_the_rpc_url() {
     }
 }
 
+/// The treasury provider carries the send-leg marker: a `topUp` whose send
+/// request fails in transport is told apart from one whose chain reads
+/// failed, which is what keeps the former held as unconfirmed (#2431).
+#[tokio::test]
+async fn treasury_provider_marks_a_failed_send_request() {
+    let signer = PrivateKeySigner::random();
+    let request = alloy::rpc::types::TransactionRequest {
+        from: Some(signer.address()),
+        to: Some(alloy::primitives::TxKind::Call(Address::repeat_byte(0x01))),
+        nonce: Some(0),
+        gas: Some(21_000),
+        chain_id: Some(1),
+        max_fee_per_gas: Some(1),
+        max_priority_fee_per_gas: Some(1),
+        ..Default::default()
+    };
+    let provider = treasury_provider("http://127.0.0.1:1".parse().unwrap(), signer);
+    let err = provider.send_transaction(request).await.unwrap_err();
+    assert!(
+        decdn_incentive::tx::SendLegFailure::from_transport_error(&err).is_some(),
+        "{err}"
+    );
+}
+
 #[test]
 fn zero_cap_and_expiry_is_unregistered() {
     let auth = |cap, expiry| Authorization {

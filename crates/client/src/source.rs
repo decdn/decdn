@@ -314,8 +314,9 @@ pub trait Funder: Send + Sync {
     /// # Errors
     ///
     /// If the on-chain `topUp` or `openPool` is rejected at submit or reverts:
-    /// the funds did not move. If a submit's broadcast is unknown (a transport
-    /// failure, or an `already known` answer) or its receipt is not obtained,
+    /// the funds did not move. If a submit's broadcast is unknown (the send
+    /// request failed in transport, or the node answered `already known`) or
+    /// its receipt is not obtained,
     /// the funds may have moved, and the error carries
     /// [`crate::buyer_pool::TopUpUnconfirmed`] for a `topUp` or
     /// [`crate::buyer_pool::OpenUnconfirmed`] for an `openPool`. If a mined

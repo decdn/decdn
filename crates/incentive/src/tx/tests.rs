@@ -64,13 +64,18 @@ fn send_outcome_hash_and_effect_are_total() {
 }
 
 /// An HTTP transport error carrying `status`, for the 4xx/5xx split.
-fn http_error(status: u16) -> ContractError {
-    ContractError::TransportError(alloy::transports::RpcError::Transport(
-        alloy::transports::TransportErrorKind::HttpError(alloy::transports::HttpError {
+fn http_transport(status: u16) -> alloy::transports::TransportError {
+    alloy::transports::RpcError::Transport(alloy::transports::TransportErrorKind::HttpError(
+        alloy::transports::HttpError {
             status,
             body: String::new(),
-        }),
+        },
     ))
+}
+
+/// [`http_transport`] as an unmarked contract error: a failed chain read.
+fn http_error(status: u16) -> ContractError {
+    ContractError::TransportError(http_transport(status))
 }
 
 /// Failures that broadcast nothing: a JSON-RPC error *response* (the node
@@ -100,22 +105,92 @@ fn a_rejection_is_not_a_broadcast() {
     assert!(!send_broadcast_unknown(&http_error(404)));
 }
 
-/// A timeout / reset / 5xx / undeserializable body leaves the tx's fate
-/// unknown — it may be in the mempool. Classifying this as a clean rejection
-/// is the #1577 bug.
+/// `err` as the send-leg marker reports it: the send request itself failed.
+fn send_leg(err: alloy::transports::TransportError) -> ContractError {
+    ContractError::TransportError(SendLegFailure::mark(err))
+}
+
+/// A send request that fails with a timeout / reset / 5xx / undeserializable
+/// body leaves the tx's fate unknown — it may be in the mempool. Classifying
+/// this as a clean rejection is the #1577 bug.
 #[test]
-fn a_transport_failure_leaves_the_broadcast_unknown() {
-    let transport = ContractError::TransportError(
-        alloy::transports::TransportErrorKind::custom_str("connection reset"),
-    );
-    assert!(send_broadcast_unknown(&transport));
+fn a_failed_send_request_leaves_the_broadcast_unknown() {
+    assert!(send_broadcast_unknown(&send_leg(
+        alloy::transports::TransportErrorKind::custom_str("connection reset")
+    )));
     // A null/absent response is transport-shaped too: no answer came back.
-    assert!(send_broadcast_unknown(&ContractError::TransportError(
+    assert!(send_broadcast_unknown(&send_leg(
         alloy::transports::RpcError::NullResp
     )));
     // HTTP 5xx: the node may have broadcast before the load balancer failed.
-    assert!(send_broadcast_unknown(&http_error(502)));
-    assert!(send_broadcast_unknown(&http_error(500)));
+    assert!(send_broadcast_unknown(&send_leg(http_transport(502))));
+    assert!(send_broadcast_unknown(&send_leg(http_transport(500))));
+}
+
+/// An HTTP transport error carrying `status` and a `Retry-After`, as the
+/// reqwest transport builds for any non-2xx answer that names one.
+fn http_retry_after(status: u16) -> alloy::transports::TransportError {
+    alloy::transports::TransportErrorKind::http_error_with_retry_after(
+        status,
+        String::new(),
+        Some(std::time::Duration::from_secs(1)),
+    )
+}
+
+/// A send request the gateway refused (4xx, with or without a `Retry-After`)
+/// or that never left the process broadcast nothing, marked or not. A 5xx
+/// with a `Retry-After` is as uncertain as one without.
+#[test]
+fn a_refused_or_local_send_request_is_not_a_broadcast() {
+    assert!(!send_broadcast_unknown(&send_leg(http_transport(401))));
+    assert!(!send_broadcast_unknown(&send_leg(http_transport(404))));
+    assert!(!send_broadcast_unknown(&send_leg(http_retry_after(429))));
+    assert!(send_broadcast_unknown(&send_leg(http_retry_after(503))));
+    assert!(!send_broadcast_unknown(&send_leg(
+        alloy::transports::RpcError::UnsupportedFeature("batching")
+    )));
+    assert!(!send_broadcast_unknown(&send_leg(
+        alloy::transports::RpcError::local_usage_str("missing properties")
+    )));
+}
+
+/// A send request that never connected (nothing listens on the port) put
+/// nothing on the wire: marked, and still not a possible broadcast. A
+/// filler-free provider over a real HTTP transport, so the one request is
+/// the send.
+#[tokio::test]
+async fn a_send_request_that_never_connected_is_not_a_broadcast() {
+    decdn_common::tls::install_crypto_provider();
+    let provider = alloy::providers::ProviderBuilder::<_, _, alloy::network::Ethereum>::default()
+        .layer(SendLegLayer)
+        .connect_http("http://127.0.0.1:1".parse().unwrap());
+    let err = provider
+        .send_transaction(
+            alloy::rpc::types::TransactionRequest::default()
+                .to(alloy::primitives::Address::repeat_byte(0x01)),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        SendLegFailure::from_transport_error(&err).is_some(),
+        "{err}"
+    );
+    assert!(!send_broadcast_unknown(&ContractError::TransportError(err)));
+}
+
+/// The same transport failures *before* the send — a chain read in the
+/// fillers that timed out, was reset, or got a 5xx — broadcast nothing:
+/// nothing was signed or sent (#2431). They reach the classifier unmarked.
+#[test]
+fn a_transport_failure_before_the_send_broadcast_nothing() {
+    assert!(!send_broadcast_unknown(&ContractError::TransportError(
+        alloy::transports::TransportErrorKind::custom_str("connection reset")
+    )));
+    assert!(!send_broadcast_unknown(&ContractError::TransportError(
+        alloy::transports::RpcError::NullResp
+    )));
+    assert!(!send_broadcast_unknown(&http_error(502)));
+    assert!(!send_broadcast_unknown(&http_error(500)));
 }
 
 /// A rejection that says the node already holds this signed tx means an
@@ -152,12 +227,15 @@ fn an_already_known_rejection_leaves_the_broadcast_unknown() {
     }
 }
 
-/// Run [`send_for_receipt`] on a filler-free provider whose one RPC call,
-/// the send, the node answers with a JSON-RPC rejection carrying `message`.
+/// Run [`send_for_receipt`] on a filler-free, send-leg-marked provider whose
+/// one RPC call, the send, the node answers with a JSON-RPC rejection
+/// carrying `message`.
 async fn send_rejected_with(message: &'static str) -> (anyhow::Error, SendOutcome) {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_failure_msg(message);
-    let provider = alloy::providers::ProviderBuilder::default().connect_mocked_client(asserter);
+    let provider = alloy::providers::ProviderBuilder::default()
+        .layer(SendLegLayer)
+        .connect_mocked_client(asserter);
     let call = CallBuilder::new_raw(&provider, alloy::primitives::Bytes::new())
         .to(alloy::primitives::Address::repeat_byte(0x01));
     let mut outcome = SendOutcome::NotSent;
@@ -186,6 +264,58 @@ async fn a_rejected_send_is_rejected_with_no_warning() {
     assert_eq!(outcome, SendOutcome::Rejected);
     let msg = format!("{err:#}");
     assert!(!msg.contains("double-submit"), "{msg}");
+}
+
+/// Run [`send_for_receipt`] through a nonce filler and a wallet on an empty
+/// mock queue. With `specified`, every field the fillers would read is set
+/// on the call, so the first request on the wire is the send; without it,
+/// the first request is the nonce read.
+async fn send_through_fillers(specified: bool) -> (anyhow::Error, SendOutcome) {
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let provider = alloy::providers::ProviderBuilder::default()
+        .layer(SendLegLayer)
+        .with_simple_nonce_management()
+        .wallet(alloy::network::EthereumWallet::from(signer.clone()))
+        .connect_mocked_client(alloy::providers::mock::Asserter::new());
+    let mut call = CallBuilder::new_raw(&provider, alloy::primitives::Bytes::new())
+        .to(alloy::primitives::Address::repeat_byte(0x01))
+        .from(signer.address());
+    if specified {
+        call = call
+            .nonce(0)
+            .gas(21_000)
+            .chain_id(1)
+            .max_fee_per_gas(1)
+            .max_priority_fee_per_gas(1);
+    }
+    let mut outcome = SendOutcome::NotSent;
+    let err = send_for_receipt(call, "topUp", None, &mut outcome)
+        .await
+        .unwrap_err();
+    (err, outcome)
+}
+
+/// A chain read that fails before the send (here the pending-nonce read)
+/// signed nothing: the outcome is `Rejected`, and the error does not warn
+/// against a re-run (#2431).
+#[tokio::test]
+async fn a_failed_read_before_the_send_is_rejected() {
+    let (err, outcome) = send_through_fillers(false).await;
+    assert_eq!(outcome, SendOutcome::Rejected);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("eth_getTransactionCount"), "{msg}");
+    assert!(!msg.contains("double-submit"), "{msg}");
+}
+
+/// The send itself failing after the fillers ran and the wallet signed is
+/// `MaybeBroadcast`, with the warning.
+#[tokio::test]
+async fn a_failed_send_after_the_fillers_is_maybe_broadcast() {
+    let (err, outcome) = send_through_fillers(true).await;
+    assert_eq!(outcome, SendOutcome::MaybeBroadcast);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("eth_sendRawTransaction"), "{msg}");
+    assert!(msg.contains("can double-submit"), "{msg}");
 }
 
 /// A broadcast transaction that never mines ends the wait at
