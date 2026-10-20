@@ -6,8 +6,9 @@
 //! can still mine, and a second one would escrow the refill twice. The keeper
 //! holds further top-ups until that transaction has a receipt, or the
 //! treasury's confirmed nonce has passed the nonce it was sent with (#40). A
-//! `topUp` whose submit failed in transport has no hash, so only its nonce can
-//! settle it. The hold is kept in memory, so a restart clears it.
+//! `topUp` whose submit returned no tx hash (a transport failure, or an
+//! `already known` answer) can be settled only by its nonce. The hold is kept
+//! in memory, so a restart clears it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -126,8 +127,9 @@ pub async fn run(
 /// (#40).
 #[derive(Clone, Copy, Debug)]
 struct Unconfirmed {
-    /// The `topUp` transaction; `None` when its submit failed in transport,
-    /// so the RPC node may have broadcast it without returning its hash.
+    /// The `topUp` transaction; `None` when its submit returned no tx hash (a
+    /// transport failure, or an `already known` answer), so it may be in a
+    /// mempool without its hash known here.
     tx: Option<TxHash>,
     /// The nonce the `topUp` was sent with. Once the treasury's confirmed
     /// nonce passes it, the `topUp` has mined or can never mine.
@@ -316,7 +318,7 @@ async fn settle(
         None if confirmed > nonce => {
             tracing::warn!(
                 pool = %pool_id, nonce, confirmed,
-                "nonce {nonce} of the pool top-up whose submit failed in transport is \
+                "nonce {nonce} of the pool top-up whose submit returned no tx hash is \
                  used, so it has mined or never will; resuming top-ups"
             );
             false
@@ -324,7 +326,7 @@ async fn settle(
         None => {
             tracing::error!(
                 pool = %pool_id, nonce, confirmed, held_secs,
-                "a pool top-up whose submit failed in transport may still mine at nonce \
+                "a pool top-up whose submit returned no tx hash may still mine at nonce \
                  {nonce}; holding further top-ups. If it was not broadcast or was \
                  dropped, send 0-value transactions from the treasury to itself until \
                  its confirmed nonce passes {nonce} ({self_transfers} at most); the hold \

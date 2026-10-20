@@ -1107,6 +1107,18 @@ since project inception and will roll into the first tagged release.
   `hash` field never changes and nothing upstream failed. The 404 names the
   entry. The manifest is still pulled, but no pull for the entry starts, the
   same as a path the manifest lacks.
+- **Payments: a send the RPC node answers with `already known` or `known
+  transaction` is reported as possibly broadcast, not rejected (#2432).** The
+  node returns it when it already holds the same signed transaction, for
+  example after a gateway retried the send on a second backend. `pool close`
+  and `pool reclaim` now warn that the tx may still mine, `--all` counts the
+  pool as unconfirmed, and `openPool` / `topUp` keep the unconfirmed escrow
+  record, so `topUp` holds it rather than re-sending on a fresh nonce. Every
+  other chain write reports it as possibly broadcast too: `publish` namespace,
+  seat and revoke statuses, key rotation (which keeps the parked key), bond,
+  register, appeal, and the USDC `approve`. A send with no tx hash now says
+  the transaction may be in a mempool, and the `approve` note says a
+  re-approve to the same value is harmless.
 - **CLI: a bundle pull lands no entry outside its output directory, and
   applies `[client] region_allowlist` to every entry (#2439).** A manifest
   path is checked for `..` and absolute components, but the write followed a

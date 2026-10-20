@@ -843,8 +843,8 @@ pub(crate) fn write_plan(
     // `node.secret`, whether or not the transaction succeeded.
     let preview_key = p.generated && !key_installed;
     // Three states, not two. `tx.is_some()` is false both for "never sent" and
-    // for `MaybeBroadcast` — a transport failure that may still have put the
-    // transaction in the mempool. Collapsing them told a `--json` wrapper
+    // for `MaybeBroadcast` — a send whose broadcast is unknown, which may still
+    // have put the transaction in the mempool. Collapsing them told a `--json` wrapper
     // "nothing happened" on the one path that also parks a key, inviting a
     // re-run that double-submits over the same binding nonce.
     let in_flight_unknown = maybe_effected && tx.is_none();
