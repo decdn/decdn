@@ -203,10 +203,12 @@ impl ScriptedRpc {
             .is_empty()
     }
 
-    /// A filler-free provider over this transport.
+    /// A filler-free, send-leg-marked provider over this transport.
     #[must_use]
     pub fn provider(self) -> impl Provider + Clone {
-        ProviderBuilder::default().connect_client(RpcClient::new(self, false))
+        ProviderBuilder::default()
+            .layer(crate::tx::SendLegLayer)
+            .connect_client(RpcClient::new(self, false))
     }
 
     /// Record the nonce the `eth_sendTransaction` request `params` names.

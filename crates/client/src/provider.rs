@@ -20,11 +20,18 @@ use alloy::network::EthereumWallet;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
+use decdn_incentive::tx::SendLegLayer;
 
 /// Build a wallet-filled HTTP provider that signs and sends transactions as
 /// `signer`. It reads the pending nonce on every send, so it stays correct
 /// after a send that pins its own nonce ([`crate::buyer_pool::top_up`]) or a
-/// transaction sent from elsewhere.
+/// transaction sent from elsewhere. It carries [`SendLegLayer`], which every
+/// reader of `decdn_incentive::tx::send_broadcast_unknown` (the senders in
+/// this crate, `decdn_incentive::tx`, the CLI's `closePool` / `reclaim`) uses
+/// to tell a send request that failed in transport (the transaction may be
+/// in a mempool) from a chain read that failed before it (nothing was
+/// signed); a provider built elsewhere and handed to them must carry the
+/// layer too.
 ///
 /// # Errors
 ///
@@ -41,6 +48,7 @@ pub fn build_provider(
 ) -> anyhow::Result<impl Provider + Clone + use<>> {
     decdn_common::tls::install_crypto_provider();
     Ok(ProviderBuilder::new()
+        .layer(SendLegLayer)
         .with_simple_nonce_management()
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_http(parse_rpc_url(rpc_url)?))

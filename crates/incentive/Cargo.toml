@@ -55,6 +55,8 @@ decdn-common = { workspace = true }
 decdn-protocol = { workspace = true }
 iroh = { workspace = true }
 alloy = { workspace = true }
+# `tx::send_leg`: the `Provider` impl of the send-leg marker layer.
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

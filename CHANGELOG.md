@@ -1121,6 +1121,24 @@ since project inception and will roll into the first tagged release.
   `hash` field never changes and nothing upstream failed. The 404 names the
   entry. The manifest is still pulled, but no pull for the entry starts, the
   same as a path the manifest lacks.
+- **Payments: a chain read that fails before a transaction is signed is
+  reported as rejected, not as possibly broadcast (#2431).** A wallet
+  provider reads the pending nonce, the gas estimate, the fees and the chain
+  id before it signs and sends; a timeout or a 5xx on one of those reads used
+  to be reported as a send whose outcome is unknown. The sending providers
+  (`decdn_client::provider::build_provider`, the node's wallet providers,
+  sponsord's treasury provider) now carry `decdn_incentive::tx::SendLegLayer`,
+  which marks a failure of the send request itself, so only that failure (or
+  an `already known` answer) reads as possibly broadcast. A send request the
+  gateway refused with a 4xx that carries `Retry-After` (a rate limit), and
+  one that never connected (a refused connection, a DNS or TLS failure), read
+  as rejected too. `pool close --all` /
+  `reclaim --all` count a pool whose reads failed as `failed`, `openPool` /
+  `topUp` hold no unconfirmed escrow for it, the USDC `approve` does not say
+  it may be pending, and `publish`, bond, register, appeal and key rotation
+  report it as `rejected`. An SDK host that builds its own provider for the
+  `decdn-client` senders must add the layer, or every transport failure reads
+  as "nothing sent".
 - **Payments: a send the RPC node answers with `already known` or `known
   transaction` is reported as possibly broadcast, not rejected (#2432).** The
   node returns it when it already holds the same signed transaction, for

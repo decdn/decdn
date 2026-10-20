@@ -6,8 +6,9 @@
 //! can still mine, and a second one would escrow the refill twice. The keeper
 //! holds further top-ups until that transaction has a receipt, or the
 //! treasury's confirmed nonce has passed the nonce it was sent with (#40). A
-//! `topUp` whose submit returned no tx hash (a transport failure, or an
-//! `already known` answer) can be settled only by its nonce. The hold is kept
+//! `topUp` whose submit returned no tx hash (the send request failed in
+//! transport, or the node answered `already known`) can be settled only by
+//! its nonce. The hold is kept
 //! in memory, so a restart clears it.
 
 use std::sync::Arc;
@@ -127,9 +128,9 @@ pub async fn run(
 /// (#40).
 #[derive(Clone, Copy, Debug)]
 struct Unconfirmed {
-    /// The `topUp` transaction; `None` when its submit returned no tx hash (a
-    /// transport failure, or an `already known` answer), so it may be in a
-    /// mempool without its hash known here.
+    /// The `topUp` transaction; `None` when its submit returned no tx hash
+    /// (the send request failed in transport, or the node answered `already
+    /// known`), so it may be in a mempool without its hash known here.
     tx: Option<TxHash>,
     /// The nonce the `topUp` was sent with. Once the treasury's confirmed
     /// nonce passes it, the `topUp` has mined or can never mine.

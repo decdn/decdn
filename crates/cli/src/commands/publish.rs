@@ -177,8 +177,9 @@ pub(crate) enum NamespaceStatus {
     /// Nothing was minted: the node rejected the send before broadcast. Distinct
     /// from `Reverted` (which mined) and `MaybeBroadcast` (whose fate is unknown).
     Failed,
-    /// A send whose broadcast is unknown: a transport-class failure (timeout,
-    /// reset, 5xx), or an `already known` answer. The transaction may have
+    /// A send whose broadcast is unknown: the send request itself failed in
+    /// transport (timeout, reset, 5xx), or the node answered `already known`.
+    /// The transaction may have
     /// minted a namespace, but no hash was captured, so the outcome is unknown
     /// and a blind retry can burn quota against `maxNamespacesPerPublisher`
     /// (#1577).
@@ -561,8 +562,9 @@ pub(crate) enum SeatOutcome {
     /// operator. Keeps its hash as a permanent handle — distinct from `Failed`,
     /// which never broadcast (#1550).
     Reverted(B256),
-    /// The send failed with a transport-class error or an `already known`
-    /// answer, so whether it broadcast is unknown and no hash was captured.
+    /// The send request itself failed in transport, or the node answered
+    /// `already known`, so whether it broadcast is unknown and no hash was
+    /// captured.
     /// Re-sending can double-submit, so this is distinct from `Failed` (#1577).
     MaybeBroadcast,
     /// The node rejected the send — nothing was ever broadcast. The usual shape,
@@ -822,8 +824,9 @@ pub(crate) enum RevokeStatus {
     /// Nothing was unseated: the node rejected the send before broadcast.
     /// Distinct from `Reverted` (mined) and `MaybeBroadcast` (fate unknown).
     Failed,
-    /// A send whose broadcast is unknown: a transport-class failure (timeout,
-    /// reset, 5xx), or an `already known` answer. The transaction may have
+    /// A send whose broadcast is unknown: the send request itself failed in
+    /// transport (timeout, reset, 5xx), or the node answered `already known`.
+    /// The transaction may have
     /// unseated the operator, but no hash was captured, so the outcome is
     /// unknown and re-running can double-submit (#1577).
     MaybeBroadcast,

@@ -96,7 +96,10 @@ pub enum TxState {
 /// than alloy's default cached count, which never re-syncs: after a dropped
 /// transaction it would leave every later one queued behind the unused
 /// nonce, and after a transaction sent from elsewhere (the self-transfers
-/// that clear a held top-up) it would reuse a spent nonce.
+/// that clear a held top-up) it would reuse a spent nonce. It carries the
+/// send-leg marker `decdn_client::buyer_pool::top_up` and `ensure_allowance`
+/// read: a `topUp` whose send request failed in transport is held as
+/// unconfirmed, one whose chain reads failed is not.
 fn treasury_provider<S>(url: alloy::transports::http::reqwest::Url, signer: S) -> DynProvider
 where
     S: TxSigner<Signature> + Send + Sync + 'static,
@@ -105,6 +108,7 @@ where
     // HTTP transport builds a `reqwest::Client` here whatever the URL scheme.
     decdn_common::tls::install_crypto_provider();
     ProviderBuilder::default()
+        .layer(decdn_incentive::tx::SendLegLayer)
         .with_gas_estimation()
         .with_simple_nonce_management()
         .fetch_chain_id()
