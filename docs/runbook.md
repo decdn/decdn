@@ -662,8 +662,9 @@ deposit the node does not track until the next restart adopts or reports it.
 
 **`decdn_buyer_topup_unresolved` at 1 means the node holds its top-up slot for a
 `topUp` it could not confirm.** The submit returned no tx hash (a transport
-failure, or the RPC node already held the transaction), or the receipt read
-failed, so the transaction may still mine. The node sends no other `topUp`
+failure, or the RPC node already held the transaction, counted its nonce as
+spent, or held another transaction of this key at that nonce), or the receipt
+read failed, so the transaction may still mine. The node sends no other `topUp`
 until the chain resolves it. A low-water refill does nothing. A funding recovery
 step that arrives meanwhile fails at once as a local fault and counts on
 `decdn_node_pull_recovery_step_refused_total`, so a cache miss whose upstreams

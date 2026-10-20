@@ -1102,20 +1102,24 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
-- **Payments: a send the RPC node answers with `nonce too low` is reported
-  as possibly broadcast, and an `openPool` or `topUp` that gets it is not sent
-  again (#2562).** A load-balancing RPC gateway that loses one backend's
-  response and retries the same signed bytes on a second backend gets `nonce
-  too low` once the first copy is sequenced. `topUp` read that answer as a
-  foreign nonce collision and re-sent on a fresh nonce, and `openPool` read it
-  as a rejection and released its entry, so either could escrow twice. Both
-  now return `TopUpUnconfirmed` / `OpenUnconfirmed` at the nonce, which the
-  node settles against the chain and the CLI reports instead of retrying.
-  Every other chain write reports the answer as possibly broadcast too, as for
-  `already known` (#2432): `pool close` and `pool reclaim` warn that the tx
-  may still mine, and so do `publish`, key rotation, bond, register, appeal,
-  and the USDC `approve`. A `replacement transaction underpriced` answer is
-  still re-sent on a fresh nonce (#2565).
+- **Payments: a send the RPC node answers with `nonce too low` or
+  `replacement transaction underpriced` is reported as possibly broadcast, and
+  an `openPool` or `topUp` that gets either is not sent again (#2562, #2565).**
+  A load-balancing RPC gateway that loses one backend's response and retries
+  the same signed bytes on a second backend gets `nonce too low` once the
+  first copy is sequenced, or `replacement transaction underpriced` while a
+  same-key transaction holds the nonce on that backend and the first copy can
+  still win it. `topUp` read either answer as a foreign nonce collision and
+  re-sent on a fresh nonce, and `openPool` read it as a rejection and released
+  its entry, so either could escrow twice. Both now return `TopUpUnconfirmed`
+  / `OpenUnconfirmed` at the nonce, which the node settles against the chain
+  and the CLI reports instead of retrying. A node whose seller redemption took
+  the nonce resolves the settle as "escrowed nothing" once that redemption
+  mines and funds again on the next refill, which costs a settle tick where
+  the re-send cost a quarter second. Every other chain write reports both
+  answers as possibly broadcast too, as for `already known` (#2432): `pool
+  close` and `pool reclaim` warn that the tx may still mine, and so do
+  `publish`, key rotation, bond, register, appeal, and the USDC `approve`.
 - **CLI: `decdn gateway` answers 404, not 502, for a bundle entry whose hash
   does not parse (#2479).** The manifest is content-addressed, so the bad
   `hash` field never changes and nothing upstream failed. The 404 names the
@@ -1388,18 +1392,16 @@ since project inception and will roll into the first tagged release.
   A replaced manifest fetch says the new pool is current and the pull must
   be run again. An entry URI's fetch starts clear of the replacement its
   manifest fetch left, as a bundle pull does.
-- **Client: a lane build drained after its fetch ended sends no `topUp`
-  re-send, and waits on no lock (#2520).** A `topUp` that lost its nonce to a
-  concurrent transaction was re-sent after a quarter-second backoff even when
-  the fetch ended meanwhile, so the run escrowed a top-up no lane would use.
-  A drained build also waited for the open-or-reuse lock (bundle-wide, or the
-  payer's for a blob `get`) and the run's `topUp` lock before it checked the
-  fetch end. A sibling that held either
-  through its receipt wait kept the build waiting for the whole 30 s drain,
-  which then logged "lane builds still running". Now the backoff ends with
-  the fetch and the re-send is refused, and a build queued on either lock
-  ends at once with the fetch. Neither sent anything, so neither escrows. A
-  refill refused so logs that it was not sent, beside its "topping up" line.
+- **Client: a lane build drained after its fetch ended sends no `topUp`,
+  and waits on no lock (#2520).** A drained build waited for the
+  open-or-reuse lock (bundle-wide, or the payer's for a blob `get`) and the
+  run's `topUp` lock before it checked the fetch end. A sibling that held
+  either through its receipt wait kept the build waiting for the whole 30 s
+  drain, which then logged "lane builds still running". Now a build queued on
+  either lock ends at once with the fetch, and one that reaches its `topUp`
+  send after the fetch ended is refused before the send. Neither sent
+  anything, so neither escrows. A refill refused so logs that it was not
+  sent, beside its "topping up" line.
 - **Node: a top-up for one pool no longer joins a `topUp` for another
   (#2496).** The top-up slot did not record which pool its `topUp` funds. When
   the store replaced the pool while a `topUp` for the old one waited for its

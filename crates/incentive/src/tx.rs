@@ -179,9 +179,9 @@ impl SendOutcome {
 /// - a JSON-RPC error *response* arrives unmarked whichever step it answers:
 ///   the node processed the request and rejected it (a pre-flight gas-estimate
 ///   revert, the modal `createNamespace` / `addOrigin` failure; an under-funded
-///   account). Two answers are exceptions, because each can be the answer to a
-///   gateway that retried the same signed bytes on a second backend after it
-///   lost the first backend's response:
+///   account). Three answers are exceptions, because each can be the answer
+///   to a gateway that retried the same signed bytes on a second backend after
+///   it lost the first backend's response:
 ///   - `already known` / `known transaction`: the node already holds this
 ///     signed transaction, because an earlier copy of the send reached a
 ///     mempool;
@@ -189,9 +189,18 @@ impl SendOutcome {
 ///     not say which transaction spent it. An earlier copy of the send that
 ///     was sequenced first spends it too. The answer is unmarked, so it may
 ///     also answer a gas estimate made at a pinned nonce; it is read as
-///     uncertain either way, and the chain resolves it.
+///     uncertain either way, and the chain resolves it;
+///   - `replacement transaction underpriced`: a different transaction from the
+///     same account holds the nonce in this node's mempool, so this node
+///     broadcast nothing of the send. The answer speaks for one backend only:
+///     the backend that lost its response may still hold the first copy, and
+///     that copy can win the nonce. A node's seller and buyer services sign
+///     with one operator key, so a top-up and a redemption sent at the same
+///     moment get this answer with no gateway at all; the chain then resolves
+///     the nonce as spent by the other transaction, and the caller funds
+///     again.
 ///
-///   Both answers are uncertain, not rejections;
+///   All three answers are uncertain, not rejections;
 /// - any other unmarked failure happened before the send: a chain read that
 ///   failed in transport, a signing fault, a local fault. Nothing was signed
 ///   or sent, so re-running is safe.
@@ -227,48 +236,33 @@ pub fn send_broadcast_unknown(err: &ContractError) -> bool {
             _ => true,
         };
     }
-    // The node already holds this signed tx, or counts its nonce as spent:
-    // an earlier copy of the send may have reached a mempool or been
-    // sequenced, so the tx may still mine or may have mined. Every other
-    // answer, and every failure before the send, broadcast nothing.
+    // The node already holds this signed tx, counts its nonce as spent, or
+    // holds another tx of ours at that nonce: an earlier copy of the send may
+    // have reached a mempool or been sequenced through another backend, so
+    // the tx may still mine or may have mined. Every other answer, and every
+    // failure before the send, broadcast nothing.
     let ContractError::TransportError(RpcError::ErrorResp(resp)) = err else {
         return false;
     };
-    is_already_known(&resp.message) || is_nonce_too_low(&resp.message)
-}
-
-/// Whether a send failed because a different transaction from the same account
-/// holds its nonce in the answering node's mempool: a same-nonce `replacement
-/// transaction underpriced`. If that node held a copy of this send, it would
-/// answer `already known`, so that node broadcast nothing of it. A provider that
-/// reads the pending nonce on every send picks the next free nonce on a
-/// re-send. A node's seller and buyer services sign with one operator key, so
-/// their transactions can collide this way.
-///
-/// The answer speaks for one backend only. A gateway that lost another
-/// backend's response to this send and retried it here can get this answer
-/// while the first copy still wins the nonce, so a re-send on a fresh nonce can
-/// then apply the send twice (#2565).
-///
-/// A sequencer chain (Arbitrum, anvil) answers most same-key collisions with
-/// `nonce too low` instead. That answer is not a collision: it counts as
-/// possibly broadcast ([`send_broadcast_unknown`]).
-#[must_use]
-pub fn is_nonce_collision(err: &ContractError) -> bool {
-    use alloy::transports::RpcError;
-
-    let ContractError::TransportError(RpcError::ErrorResp(resp)) = err else {
-        return false;
-    };
-    resp.message
-        .to_ascii_lowercase()
-        .contains("replacement transaction underpriced")
+    is_already_known(&resp.message)
+        || is_nonce_too_low(&resp.message)
+        || is_underpriced_replacement(&resp.message)
 }
 
 /// Whether a JSON-RPC rejection says the node already counts the nonce as
 /// spent: `nonce too low`. The match ignores case.
 fn is_nonce_too_low(message: &str) -> bool {
     message.to_ascii_lowercase().contains("nonce too low")
+}
+
+/// Whether a JSON-RPC rejection says a different transaction from the same
+/// account holds the nonce in the node's mempool: `replacement transaction
+/// underpriced`. The match ignores case. A sequencer chain (Arbitrum, anvil)
+/// answers most same-key collisions with `nonce too low` instead.
+fn is_underpriced_replacement(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("replacement transaction underpriced")
 }
 
 /// Whether a JSON-RPC rejection says the node already holds this signed

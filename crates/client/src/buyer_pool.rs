@@ -1323,24 +1323,15 @@ pub async fn pool_accepts_funds<P: Provider + Clone>(
     }
 }
 
-/// How many times [`top_up`] re-sends a submit rejected as a nonce collision.
-const TOPUP_NONCE_RETRIES: u32 = 3;
-
-/// How long [`top_up`] waits before re-sending after a nonce collision: long
-/// enough for the next pending-nonce read, on any backend, to count the
-/// colliding transaction and skip past it.
-const TOPUP_NONCE_BACKOFF: Duration = Duration::from_millis(250);
-
-/// Send `topUp(pool_id, amount)` from `owner` at its pending nonce, re-sent on
-/// a fresh nonce after a same-account nonce collision, and return the pending
-/// transaction with the nonce it holds. The errors are [`top_up`]'s submit
-/// errors, and [`FetchEnded`](crate::funding::FetchEnded) once `ended` fires
-/// before a send or during the backoff before a re-send.
+/// Send `topUp(pool_id, amount)` from `owner` at its pending nonce, and
+/// return the pending transaction with the nonce it holds. The errors are
+/// [`top_up`]'s submit errors, and [`FetchEnded`](crate::funding::FetchEnded)
+/// once `ended` fires before the send.
 ///
-/// `escrows` holds each submit while it is in flight, and keeps one whose
+/// `escrows` holds the submit while it is in flight, and keeps one whose
 /// broadcast is unknown (the send request failed in transport, or the node
-/// answered `already known` or `nonce too low`): each may have been broadcast
-/// with no hash returned.
+/// answered `already known`, `nonce too low` or `replacement transaction
+/// underpriced`): each may have been broadcast with no hash returned.
 /// A submit that returns a hash stays held for [`top_up`] to swap for the
 /// broadcast `topUp`; a rejected one is released.
 async fn send_top_up<P: Provider + Clone>(
@@ -1351,60 +1342,38 @@ async fn send_top_up<P: Provider + Clone>(
     escrows: &UnconfirmedEscrows,
     ended: Option<&CancellationToken>,
 ) -> Result<(PendingTransactionBuilder<Ethereum>, u64)> {
-    let mut nonce_retries = 0u32;
-    loop {
-        // Refuse a send once the fetch ended: its lane would never run. Before
-        // a re-send this costs nothing, since the collision broadcast nothing.
-        crate::funding::refuse_after_end(ended)?;
-        let nonce = contract
-            .provider()
-            .get_transaction_count(owner)
-            .pending()
-            .await
-            .context("read the pending nonce for topUp")?;
-        let call = contract.topUp(pool_id, amount).from(owner).nonce(nonce);
-        let submitted = TopUpUnconfirmed { tx: None, nonce };
-        // Held across the submit: a drop while it is in flight leaves a
-        // `topUp` the RPC node may have broadcast with no hash returned.
-        escrows.insert(submitted);
-        let err = match call.send().await {
-            Ok(pending) => return Ok((pending, nonce)),
-            Err(err) => err,
-        };
-        if nonce_retries < TOPUP_NONCE_RETRIES && decdn_incentive::tx::is_nonce_collision(&err) {
-            nonce_retries = nonce_retries.saturating_add(1);
-            escrows.remove(submitted);
-            debug!(
-                %pool_id, nonce_retries,
-                "topUp lost its nonce to a concurrent transaction; re-sending"
-            );
-            let backoff = tokio::time::sleep(TOPUP_NONCE_BACKOFF);
-            match ended {
-                Some(ended) => {
-                    tokio::select! {
-                        () = ended.cancelled() => {}
-                        () = backoff => {}
-                    }
-                }
-                None => backoff.await,
-            }
-            continue;
-        }
-        // A send request that failed in transport may have reached the node
-        // and broadcast the `topUp` before the response was lost, an `already
-        // known` answer means an earlier copy already did, and a `nonce too
-        // low` answer may mean an earlier copy, which a gateway retried on a
-        // second backend, spent the nonce. A retry of any of them may escrow
-        // twice. A chain read that failed before the send signed nothing, so
-        // the entry is released below.
-        if decdn_incentive::tx::send_broadcast_unknown(&err) {
-            return Err(anyhow::Error::new(err)
-                .context("submit topUp")
-                .context(submitted));
-        }
-        escrows.remove(submitted);
-        return Err(top_up_submit_error(err, "submit topUp"));
+    // Refuse the send once the fetch ended: its lane would never run.
+    crate::funding::refuse_after_end(ended)?;
+    let nonce = contract
+        .provider()
+        .get_transaction_count(owner)
+        .pending()
+        .await
+        .context("read the pending nonce for topUp")?;
+    let call = contract.topUp(pool_id, amount).from(owner).nonce(nonce);
+    let submitted = TopUpUnconfirmed { tx: None, nonce };
+    // Held across the submit: a drop while it is in flight leaves a
+    // `topUp` the RPC node may have broadcast with no hash returned.
+    escrows.insert(submitted);
+    let err = match call.send().await {
+        Ok(pending) => return Ok((pending, nonce)),
+        Err(err) => err,
+    };
+    // A send request that failed in transport may have reached the node and
+    // broadcast the `topUp` before the response was lost, an `already known`
+    // answer means an earlier copy already did, and a `nonce too low` or
+    // `replacement transaction underpriced` answer may mean an earlier copy,
+    // which a gateway retried on a second backend, holds or spent the nonce.
+    // A re-send of any of them on a fresh nonce may escrow twice; the node
+    // settles the entry against the chain instead. A chain read that failed
+    // before the send signed nothing, so the entry is released below.
+    if decdn_incentive::tx::send_broadcast_unknown(&err) {
+        return Err(anyhow::Error::new(err)
+            .context("submit topUp")
+            .context(submitted));
     }
+    escrows.remove(submitted);
+    Err(top_up_submit_error(err, "submit topUp"))
 }
 
 /// Wrap a failed `topUp` submit in `context`, marked by its revert.
@@ -1495,22 +1464,18 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 /// and carry [`decdn_incentive::tx::SendLegLayer`], as
 /// [`crate::provider::build_provider`] does.
 ///
-/// A submit rejected as a same-account nonce collision
-/// ([`decdn_incentive::tx::is_nonce_collision`]) broadcast nothing, so it is
-/// re-sent up to three more times, a quarter second apart, each time on a fresh
-/// pending nonce. `top_up` re-sends regardless of any fetch; the crate's lane
-/// builds use a variant that re-sends none once their fetch ends. A submit
-/// answered `nonce too low` is not re-sent: a gateway that retried its signed
-/// bytes on a second backend gets that answer once the first copy is
-/// sequenced, so the `topUp` may hold the nonce. It fails with
-/// [`TopUpUnconfirmed`] at that nonce, as a transport failure does.
+/// A submit answered `nonce too low` or `replacement transaction underpriced`
+/// is not re-sent on a fresh nonce: a gateway that retried its signed bytes on
+/// a second backend gets either answer while the first copy can still hold or
+/// spend the nonce, so a re-send could escrow twice. It fails with
+/// [`TopUpUnconfirmed`] at that nonce, as a transport failure does, for the
+/// node to settle against the chain. The crate's lane builds use a variant
+/// that sends nothing once their fetch ends.
 ///
 /// A node signs its sellers' redemptions and its buyer top-ups with one key, so
-/// a top-up can lose its nonce to a redemption sent at the same moment. A
-/// redemption still pending answers `replacement transaction underpriced`, and
-/// the top-up is re-sent. A redemption already sequenced answers `nonce too
-/// low`, and the top-up fails with [`TopUpUnconfirmed`] for the node to settle
-/// against the chain.
+/// a top-up can lose its nonce to a redemption sent at the same moment. The
+/// settle then finds the nonce spent with no deposit growth, releases the
+/// top-up slot, and the next low-water refill sends a fresh `topUp`.
 ///
 /// `receipt_timeout` bounds the receipt wait when it is `Some`, as for
 /// [`open_pool`]. A caller that bounds the wait must not send another `topUp`
@@ -1559,10 +1524,8 @@ pub async fn top_up<P: Provider + Clone>(
 }
 
 /// [`top_up`] for a lane build, which sends no `topUp` once `ended` fires
-/// ([`crate::funding::FetchEnded`]): neither the first send nor a re-send
-/// after a nonce collision. A collision broadcast nothing, so the refused
-/// re-send escrows nothing. A `topUp` already sent runs to its receipt.
-/// `None` refuses nothing, as for [`top_up`].
+/// ([`crate::funding::FetchEnded`]). A `topUp` already sent runs to its
+/// receipt. `None` refuses nothing, as for [`top_up`].
 ///
 /// # Errors
 ///

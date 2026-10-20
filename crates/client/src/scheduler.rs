@@ -3324,12 +3324,12 @@ where
 /// build still in flight, for at most 30 s: a build can be in the middle of an
 /// on-chain top-up. A lane built there never starts, so the fetch ends for
 /// its builds first: one that reaches its `openPool` or `topUp` after that
-/// sends none, one queued on the open or `topUp` lock ends at once, and a
-/// `topUp` that lost its nonce sends no re-send ([`SourceProvider::connect`]).
-/// One already inside a send (its nonce read, its submit) or past it runs to
-/// its receipt. A build that ends there with a `topUp` or `openPool` that may
-/// have escrowed USDC no record credits fails the acquire. A caller that drops
-/// the acquire skips this drain, and a build there drops mid top-up.
+/// sends none, and one queued on the open or `topUp` lock ends at once
+/// ([`SourceProvider::connect`]). One already inside a send (its nonce read,
+/// its submit) or past it runs to its receipt. A build that ends there with a
+/// `topUp` or `openPool` that may have escrowed USDC no record credits fails
+/// the acquire. A caller that drops the acquire skips this drain, and a build
+/// there drops mid top-up.
 ///
 /// # Errors
 ///
