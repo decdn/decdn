@@ -664,6 +664,29 @@ async fn a_bundle_serves_its_index_and_entries() {
     );
 }
 
+/// A manifest entry whose hash does not parse is a fixed property of the
+/// content-addressed manifest, not an upstream fault: it answers 404 naming
+/// the entry, and no pull for the entry starts.
+#[tokio::test]
+async fn a_malformed_entry_hash_is_not_found() {
+    let manifest = br#"{"version": 1, "entries": [{"path": "a.bin", "hash": "zz", "size": 3}]}"#;
+    let (gateway, caps) = recording_gateway(Reply::Bytes(manifest.to_vec()), &[]).await;
+    let blob = alloy::hex::encode(BLOB);
+    for _ in 0..2 {
+        let (status, body) = get(&gateway, &format!("/{blob}/a.bin")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            body.contains(r#"bundle entry "a.bin" has a malformed hash"#),
+            "{body}"
+        );
+    }
+    assert_eq!(
+        *caps.lock().unwrap(),
+        [MAX_MANIFEST_MB],
+        "only the manifest is pulled, once; the repeat reads the cache"
+    );
+}
+
 #[test]
 fn only_a_cap_stop_marks_a_manifest_pull_not_a_manifest() {
     let too_large = || {

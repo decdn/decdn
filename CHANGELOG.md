@@ -1102,6 +1102,11 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: `decdn gateway` answers 404, not 502, for a bundle entry whose hash
+  does not parse (#2479).** The manifest is content-addressed, so the bad
+  `hash` field never changes and nothing upstream failed. The 404 names the
+  entry. The manifest is still pulled, but no pull for the entry starts, the
+  same as a path the manifest lacks.
 - **Payments: a send the RPC node answers with `already known` or `known
   transaction` is reported as possibly broadcast, not rejected (#2432).** The
   node returns it when it already holds the same signed transaction, for
