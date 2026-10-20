@@ -193,21 +193,42 @@ pub const fn send_broadcast_unknown(err: &ContractError) -> bool {
     }
 }
 
-/// Whether a send failed because another transaction from the same account took
-/// its nonce: the node answered with a JSON-RPC rejection (`nonce too low`, or a
-/// same-nonce `replacement transaction underpriced`). Nothing was broadcast, so
-/// re-sending is safe, and a provider that reads the pending nonce on every send
-/// picks the next free nonce on the retry. A node's seller and buyer services
-/// sign with one operator key, so their transactions can collide this way.
+/// Whether a send failed because a different transaction from the same account
+/// holds its nonce in the node's mempool: a same-nonce `replacement transaction
+/// underpriced`. A retried copy of this send would be answered `already known`
+/// there, so the node broadcast nothing of it, and a provider that reads the
+/// pending nonce on every send picks the next free nonce on a re-send. A node's
+/// seller and buyer services sign with one operator key, so their transactions
+/// can collide this way.
+///
+/// `nonce too low` is not a collision: see [`is_nonce_spent`].
 #[must_use]
 pub fn is_nonce_collision(err: &ContractError) -> bool {
+    rejection_message(err)
+        .is_some_and(|message| message.contains("replacement transaction underpriced"))
+}
+
+/// Whether a send failed because the node already counts its nonce as spent
+/// (`nonce too low`). The answer does not say which transaction spent the
+/// nonce. A load-balancing gateway that loses one backend's response and
+/// retries the same signed bytes on another backend gets this answer once the
+/// first copy is sequenced. So the send itself may hold the nonce and may still
+/// take effect, and re-sending it on a fresh nonce can apply it twice. A caller
+/// that pins the nonce treats the send as possibly broadcast at that nonce.
+#[must_use]
+pub fn is_nonce_spent(err: &ContractError) -> bool {
+    rejection_message(err).is_some_and(|message| message.contains("nonce too low"))
+}
+
+/// The lowercased message of a JSON-RPC error response, or `None` for any
+/// other failure.
+fn rejection_message(err: &ContractError) -> Option<String> {
     use alloy::transports::RpcError;
 
     let ContractError::TransportError(RpcError::ErrorResp(resp)) = err else {
-        return false;
+        return None;
     };
-    let message = resp.message.to_ascii_lowercase();
-    message.contains("nonce too low") || message.contains("replacement transaction underpriced")
+    Some(resp.message.to_ascii_lowercase())
 }
 
 /// Send one call, await its receipt, and fail on a revert.

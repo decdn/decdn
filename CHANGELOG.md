@@ -1102,6 +1102,16 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Client: an `openPool` or `topUp` answered `nonce too low` stays
+  unconfirmed and is not sent again (#2562).** A load-balancing RPC gateway
+  that loses one backend's response and retries the same signed bytes on a
+  second backend gets `nonce too low` once the first copy is sequenced. The
+  answer was read as a foreign nonce collision that broadcast nothing: `topUp`
+  re-sent on a fresh nonce and `openPool` released its entry, so either could
+  escrow twice. Both now return `TopUpUnconfirmed` / `OpenUnconfirmed` at the
+  nonce, which the node settles against the chain and the CLI reports instead
+  of retrying. A `replacement transaction underpriced` answer is still re-sent on a
+  fresh nonce.
 - **CLI: a bundle pull lands no entry outside its output directory, and
   applies `[client] region_allowlist` to every entry (#2439).** A manifest
   path is checked for `..` and absolute components, but the write followed a

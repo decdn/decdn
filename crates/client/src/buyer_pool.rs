@@ -598,7 +598,9 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// The error is classified [`PoolOpenFailureReason::RpcError`] and carries an
 /// [`OpenUnconfirmed`] with the hash and nonce. A submit that fails in
 /// transport ([`decdn_incentive::tx::send_broadcast_unknown`]) carries one too,
-/// with the nonce and no hash. The caller must resolve that transaction before
+/// with the nonce and no hash. So does a submit answered `nonce too low`
+/// ([`decdn_incentive::tx::is_nonce_spent`]): a gateway that retried its signed
+/// bytes on a second backend gets that answer once the first copy is sequenced. The caller must resolve that transaction before
 /// it sends another `openPool`, and hands a receipt it reads later to
 /// [`opened_from_receipt`].
 ///
@@ -674,8 +676,10 @@ pub async fn open_pool<P: Provider + Clone>(
             // transport/RPC fault.
             let reason = PoolOpenFailureReason::classify_revert_data(err.as_revert_data().as_ref());
             // A transport failure may have reached the node and broadcast the
-            // `openPool` before the response was lost.
-            let broadcast_unknown = decdn_incentive::tx::send_broadcast_unknown(&err);
+            // `openPool` before the response was lost. A spent nonce may be
+            // this `openPool`'s own copy, sent on by a gateway retry.
+            let broadcast_unknown = decdn_incentive::tx::send_broadcast_unknown(&err)
+                || decdn_incentive::tx::is_nonce_spent(&err);
             let mut err = anyhow::Error::new(err).context("submit openPool");
             if broadcast_unknown {
                 err = err.context(submitted);
@@ -1317,7 +1321,9 @@ const TOPUP_NONCE_BACKOFF: Duration = Duration::from_millis(250);
 /// before a send or during the backoff before a re-send.
 ///
 /// `escrows` holds each submit while it is in flight, and keeps one that
-/// failed in transport: either may have been broadcast with no hash returned.
+/// failed in transport or was answered `nonce too low`
+/// ([`decdn_incentive::tx::is_nonce_spent`]): each may have been broadcast with
+/// no hash returned.
 /// A submit that returns a hash stays held for [`top_up`] to swap for the
 /// broadcast `topUp`; a rejected one is released.
 async fn send_top_up<P: Provider + Clone>(
@@ -1368,8 +1374,12 @@ async fn send_top_up<P: Provider + Clone>(
             continue;
         }
         // A transport failure may have reached the node and broadcast the
-        // `topUp` before the response was lost, so a retry may escrow twice.
-        if decdn_incentive::tx::send_broadcast_unknown(&err) {
+        // `topUp` before the response was lost, and a spent nonce may be this
+        // `topUp`'s own copy, sent on by a gateway retry. A retry of either
+        // may escrow twice.
+        if decdn_incentive::tx::send_broadcast_unknown(&err)
+            || decdn_incentive::tx::is_nonce_spent(&err)
+        {
             return Err(anyhow::Error::new(err)
                 .context("submit topUp")
                 .context(submitted));
@@ -1466,7 +1476,11 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 /// A submit rejected as a same-account nonce collision
 /// ([`decdn_incentive::tx::is_nonce_collision`]) broadcast nothing, so it is
 /// re-sent up to three more times, a quarter second apart, each time on a fresh
-/// pending nonce. `top_up` re-sends regardless of any fetch; the crate's lane
+/// pending nonce. A submit answered `nonce too low`
+/// ([`decdn_incentive::tx::is_nonce_spent`]) is not re-sent: a gateway that
+/// retried its signed bytes on a second backend gets that answer once the
+/// first copy is sequenced, so the `topUp` may hold the nonce. It fails with
+/// [`TopUpUnconfirmed`] at that nonce, as a transport failure does. `top_up` re-sends regardless of any fetch; the crate's lane
 /// builds use a variant that re-sends none once their fetch ends.
 /// A node signs its sellers' redemptions and its buyer top-ups with one key, so a
 /// top-up can lose its nonce to a redemption sent at the same moment.
@@ -1491,7 +1505,8 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 ///
 /// Errors if the nonce read or the `topUp` transaction fails (submit, revert, or
 /// receipt). A submit that fails in transport
-/// ([`decdn_incentive::tx::send_broadcast_unknown`]) and a receipt that is not
+/// ([`decdn_incentive::tx::send_broadcast_unknown`]), a submit answered
+/// `nonce too low` ([`decdn_incentive::tx::is_nonce_spent`]), and a receipt that is not
 /// read (a failed read, or none within `receipt_timeout`) both carry
 /// [`TopUpUnconfirmed`], because the `topUp` may still mine.
 pub async fn top_up<P: Provider + Clone>(

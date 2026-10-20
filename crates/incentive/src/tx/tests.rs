@@ -9,22 +9,22 @@ fn error_resp(code: i64, message: &str) -> ContractError {
     ))
 }
 
-/// A same-account nonce collision is a JSON-RPC rejection with one of the two
-/// collision messages (any case); an unrelated rejection, a revert, or a
-/// transport failure is not.
+/// A same-account nonce collision is a JSON-RPC `replacement transaction
+/// underpriced` rejection (any case). `nonce too low`, an unrelated rejection,
+/// a revert, or a transport failure is not.
 #[test]
-fn only_a_nonce_rejection_is_a_nonce_collision() {
-    assert!(super::is_nonce_collision(&error_resp(
-        -32003,
-        "nonce too low"
-    )));
-    assert!(super::is_nonce_collision(&error_resp(
-        -32000,
-        "Nonce too low: next nonce 7, tx nonce 6"
-    )));
+fn only_an_underpriced_replacement_is_a_nonce_collision() {
     assert!(super::is_nonce_collision(&error_resp(
         -32000,
         "replacement transaction underpriced"
+    )));
+    assert!(super::is_nonce_collision(&error_resp(
+        -32000,
+        "Replacement Transaction Underpriced"
+    )));
+    assert!(!super::is_nonce_collision(&error_resp(
+        -32003,
+        "nonce too low"
     )));
     assert!(!super::is_nonce_collision(&error_resp(
         3,
@@ -35,6 +35,28 @@ fn only_a_nonce_rejection_is_a_nonce_collision() {
         "insufficient funds for gas"
     )));
     assert!(!super::is_nonce_collision(&ContractError::TransportError(
+        alloy::transports::TransportErrorKind::custom_str("replacement transaction underpriced")
+    )));
+}
+
+/// #2562: a spent nonce is a JSON-RPC `nonce too low` rejection (any case).
+/// A collision, an unrelated rejection, or a transport failure is not.
+#[test]
+fn only_a_nonce_too_low_rejection_is_a_spent_nonce() {
+    assert!(super::is_nonce_spent(&error_resp(-32003, "nonce too low")));
+    assert!(super::is_nonce_spent(&error_resp(
+        -32000,
+        "Nonce too low: next nonce 7, tx nonce 6"
+    )));
+    assert!(!super::is_nonce_spent(&error_resp(
+        -32000,
+        "replacement transaction underpriced"
+    )));
+    assert!(!super::is_nonce_spent(&error_resp(
+        -32000,
+        "insufficient funds for gas"
+    )));
+    assert!(!super::is_nonce_spent(&ContractError::TransportError(
         alloy::transports::TransportErrorKind::custom_str("nonce too low")
     )));
 }
