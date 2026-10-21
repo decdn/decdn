@@ -75,7 +75,7 @@ fn debug_redacts_secrets() {
 }
 
 /// `--help` prints `[env: NAME=value]` for a set variable unless its value
-/// is hidden; the RPC URL often carries an API key (#38).
+/// is hidden; the RPC URL often carries an API key (decdn/sponsord#38).
 #[test]
 fn help_hides_secret_env_values() {
     let cmd = <Args as clap::CommandFactory>::command();

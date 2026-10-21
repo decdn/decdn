@@ -30,7 +30,7 @@ pub struct Authorization {
 }
 
 /// Render a chain-call error and its causes as `a: b: c`, without the RPC URL
-/// that reqwest's message names (#38). The causes carry the failure class
+/// that reqwest's message names (decdn/sponsord#38). The causes carry the failure class
 /// (connection refused, timeout, DNS, TLS) that the outer error's Display
 /// leaves out. Each is stripped on its own, so a removed URL cannot take the
 /// separator with it, and a cause that repeats the error before it (alloy's
@@ -224,7 +224,7 @@ impl ChainPool {
         let owner = signer.address();
         // The URL stays out of every error `ChainPool` returns: RPC URLs often
         // carry an API key in their path or query. Here it is never formatted,
-        // and chain-call errors go through `redacted` (#38).
+        // and chain-call errors go through `redacted` (decdn/sponsord#38).
         let url = rpc_url.parse().map_err(|e| {
             anyhow::anyhow!(
                 "RPC URL ({} characters) is not a valid URL: {e}",

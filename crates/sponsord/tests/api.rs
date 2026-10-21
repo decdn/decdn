@@ -291,7 +291,7 @@ async fn failed_chain_read_is_503() {
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(v["error"], "chain_unavailable");
 
-    // The warning keeps the error text but not the RPC URL (#38).
+    // The warning keeps the error text but not the RPC URL (decdn/sponsord#38).
     let text = log.text();
     assert!(text.contains("signer authorization read failed"), "{text}");
     assert!(text.contains("error sending request"), "{text}");

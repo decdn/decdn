@@ -15,7 +15,7 @@ The treasury key both owns the pool and pays for top-ups
 (`PaymentPool.topUp` is owner-only), so a compromised daemon host loses the
 wallet's funds as well as the pool. Keep only what the next few top-ups need
 in that wallet. Splitting the two is tracked in
-[#25](https://github.com/decdn/sponsord/issues/25).
+[#2547](https://github.com/decdn/decdn/issues/2547).
 
 ## What bounds a loss
 
@@ -30,10 +30,12 @@ Anyone who gets capabilities can spend, at most:
   the wallet with what you are willing to lose, and watch
   `sponsord_pool_topups_total`. While the daemon runs, a top-up whose
   receipt could not be read holds the next one until it mines or can no
-  longer mine, so one refill is not sent twice. The hold is kept in memory:
-  a restart while that transaction may still mine allows a second refill.
-  A top-up whose submission was accepted but whose response was lost is not
-  held at all (see [the operator guide, §5](operator.md#5-monitor)).
+  longer mine, so one refill is not sent twice. A top-up whose submit
+  returned no tx hash is held too, and re-sent at its nonce once no
+  transaction holds it; one whose chain reads failed before the send is not
+  held, since nothing was signed. The hold is kept in memory: a restart
+  while that transaction may still mine allows a second refill (see [the
+  operator guide, §5](operator.md#5-monitor)).
 
 How many capabilities they can get is bounded by the gate, and on the onramp
 by the per-address rate limits (`ONRAMP_FUND_RATE_PER_MIN`).

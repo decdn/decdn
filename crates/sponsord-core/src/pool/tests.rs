@@ -18,7 +18,7 @@ async fn a_malformed_rpc_url_stays_out_of_the_error() {
 }
 
 /// reqwest names the URL in a transport error; the key in its path must
-/// not survive into `ChainPool`'s error (#38).
+/// not survive into `ChainPool`'s error (decdn/sponsord#38).
 #[tokio::test]
 async fn an_unreachable_rpc_url_stays_out_of_the_error() {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -131,7 +131,7 @@ fn a_top_up_error_keeps_its_markers_but_not_the_url() {
 }
 
 /// Every chain call names the RPC URL when it fails; none of
-/// `ChainPool`'s errors may carry it (#38).
+/// `ChainPool`'s errors may carry it (decdn/sponsord#38).
 #[tokio::test]
 async fn no_chain_pool_error_names_the_rpc_url() {
     let port = std::net::TcpListener::bind("127.0.0.1:0")

@@ -101,9 +101,9 @@ and serve `http::router(state)`. The stock `sponsord-onramp` binary refuses
 hand-off, rate limits) stays as it is. `TurnstileGate`
 (`crates/sponsord-onramp/src/gate/turnstile.rs`) is a complete example.
 
-Webhook ([#22](https://github.com/decdn/sponsord/issues/22)), signed-JWT
-([#23](https://github.com/decdn/sponsord/issues/23)) and allow-all
-([#24](https://github.com/decdn/sponsord/issues/24)) gates are planned as
+Webhook ([#2550](https://github.com/decdn/decdn/issues/2550)), signed-JWT
+([#2549](https://github.com/decdn/decdn/issues/2549)) and allow-all
+([#2548](https://github.com/decdn/decdn/issues/2548)) gates are planned as
 built-ins.
 
 The onramp's own API (what the installers and the gate page call) is in
@@ -126,7 +126,7 @@ let issued = sponsor.issue(user_key, &TermsRequest::default(), now_unix).await?;
 transactions: a local `PrivateKeySigner`, or a remote signer such as AWS or
 GCP KMS. Hardware wallets aren't supported yet: alloy's `LedgerSigner` signs
 only typed data and isn't `Clone` (tracked in
-[#26](https://github.com/decdn/sponsord/issues/26)).
+[#2546](https://github.com/decdn/decdn/issues/2546)).
 `Sponsor::connect` checks that it owns the pool on-chain. With a remote
 signer, re-issuing for a registered key gives an equally valid but not
 byte-identical token.

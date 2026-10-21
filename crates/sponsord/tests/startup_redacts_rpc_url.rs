@@ -1,6 +1,6 @@
 //! A `sponsord` that cannot reach its RPC endpoint exits with an error that
 //! names the failed read but not the RPC URL, whose path carries the
-//! provider's API key (#38).
+//! provider's API key (decdn/sponsord#38).
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

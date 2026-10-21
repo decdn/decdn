@@ -5,7 +5,7 @@
 //! A `topUp` that may have been broadcast without the keeper seeing it mine
 //! can still mine, and a second one would escrow the refill twice. The keeper
 //! holds further top-ups until that transaction has a receipt, or the
-//! treasury's confirmed nonce has passed the nonce it was sent with (#40). A
+//! treasury's confirmed nonce has passed the nonce it was sent with (decdn/sponsord#40). A
 //! `topUp` whose submit returned no tx hash (the send request failed in
 //! transport, or the node answered `already known`, `nonce too low` or
 //! `replacement transaction underpriced`) can be settled only by its nonce.
@@ -132,7 +132,7 @@ pub async fn run(
 
 /// A top-up whose `topUp` may have been broadcast but whose receipt was not
 /// read. It may still mine, so no other top-up is sent until it is settled
-/// (#40).
+/// (decdn/sponsord#40).
 #[derive(Clone, Copy, Debug)]
 struct Unconfirmed {
     /// The `topUp` transaction; `None` when its submit returned no tx hash
