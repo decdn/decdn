@@ -88,7 +88,7 @@ use super::landing::Landing;
 use super::skip_cache::{self, SavedManifest, SavedMtime};
 use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
-    FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, manifest_cache, parse_hash,
+    FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, Selection, manifest_cache, parse_hash,
 };
 use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
@@ -1543,10 +1543,12 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     pub(super) chain: ChainConfig,
     pub(super) site: PullSite,
     pub(super) relays: Vec<RelayUrl>,
-    /// The node every entry is pinned to, and every active registered node
-    /// for an unpinned run to sample.
+    /// The node every entry is pinned to, or every active registered node for
+    /// an unpinned run to sample.
     pub(super) nodes: NodeSelection,
-    /// How every entry finds its holders.
+    /// The run's discovery settings: rediscovery, proxy warming, the max
+    /// sources, and a pinned node's dial address. An entry's first holders
+    /// come from [`Self::nodes`].
     pub(super) discovery: DiscoveryOptions,
     /// The highest per-MB rate a lane accepts; `0` sets no ceiling.
     pub(super) max_rate_per_mb: u64,
@@ -1688,8 +1690,8 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// fault or an empty start.
     async fn resolve_entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
         match &self.nodes.selection {
-            super::Selection::Pinned(pinned) => Ok(pinned_targets(pinned.node_id, pinned.provider)),
-            super::Selection::Registry(registry) => {
+            Selection::Pinned(pinned) => Ok(pinned_targets(pinned.node_id, pinned.provider)),
+            Selection::Registry(registry) => {
                 // The entry's round streams: its fetch starts at the first
                 // verified holder, and the holders that answer later join it.
                 let candidates = registry.entry_candidates(&self.site);

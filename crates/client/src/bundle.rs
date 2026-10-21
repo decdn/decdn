@@ -56,6 +56,8 @@ mod engine;
 mod landing;
 mod manifest_cache;
 mod skip_cache;
+#[cfg(test)]
+mod tests;
 
 #[doc(hidden)]
 pub use crate::lane_sources::FaultContext;
@@ -371,11 +373,25 @@ pub enum Funding {
 /// [`select_nodes`].
 #[derive(Debug, Clone)]
 pub struct NodeSelection {
-    /// The resolved selection.
+    /// The pinned node or the registry list.
     selection: Selection,
 }
 
-/// The resolved selection: pinned or registry, never both.
+impl NodeSelection {
+    /// `discovery` with its pinned node taken from this selection, so an
+    /// entry's first holders, its rediscovery and a pinned node's dial address
+    /// all follow one node.
+    const fn applied_to(&self, mut discovery: DiscoveryOptions) -> DiscoveryOptions {
+        discovery.pinned = match &self.selection {
+            Selection::Pinned(pinned) => Some(*pinned),
+            Selection::Registry(_) => None,
+        };
+        discovery
+    }
+}
+
+/// Where every entry of a run finds its holders, resolved once by
+/// [`select_nodes`].
 #[derive(Debug, Clone)]
 enum Selection {
     /// The node every entry pulls from.
@@ -689,7 +705,9 @@ impl BundlePuller {
     /// A builder for a pull on `chain`, keeping its peer store and scratch
     /// files in `site`, dialing from `endpoint`, recording its pool and lanes
     /// in `store`, and paying from `funding`. `discovery` and `nodes`
-    /// ([`select_nodes`]) say where entries find their holders.
+    /// ([`select_nodes`]) say where entries find their holders. `nodes`
+    /// decides whether the run is pinned and to which node: it replaces
+    /// `discovery.pinned`.
     pub fn builder(
         chain: ChainConfig,
         site: PullSite,
@@ -907,6 +925,7 @@ impl BundlePullerBuilder {
             .call()
             .await
             .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
+        let discovery = self.nodes.applied_to(self.discovery);
         let ctx = engine::PullCtx {
             voucher_dom: voucher_domain(self.chain.chain_id, self.chain.payment_pool),
             slash_dom: slash_judge_domain(self.chain.chain_id, self.chain.slash_judge),
@@ -922,7 +941,7 @@ impl BundlePullerBuilder {
             site: self.site,
             relays: self.relays,
             nodes: self.nodes,
-            discovery: self.discovery,
+            discovery,
             max_rate_per_mb: self.max_rate_per_mb,
             max_blob_bytes: self.max_blob_bytes,
             deposit,
