@@ -444,8 +444,8 @@ how they interact.
 
 ## 🤝 Contributing
 
-[CONTRIBUTING.md](CONTRIBUTING.md) covers the environment, build, tests, code style, and
-ADR conventions. Report security vulnerabilities privately as
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the environment, build, tests, code style, ADR
+conventions, the issue forms and the label scheme. Report security vulnerabilities privately as
 [SECURITY.md](SECURITY.md) describes.
 
 ## License

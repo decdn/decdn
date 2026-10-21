@@ -1,25 +1,30 @@
 name: Bug report
-description: Something in decdn-node, the decdn CLI, the client SDK, or the contracts does not work as documented.
-labels: ["bug"]
+description: decdn-node, the decdn CLI, the client SDK, sponsord or the contracts do not behave as documented.
+type: Bug
+labels: ["kind:bug"]
 body:
   - type: markdown
     attributes:
       value: |
         Do not report security vulnerabilities here. Email security@decdn.org instead (see [SECURITY.md](https://github.com/decdn/decdn/blob/main/SECURITY.md)).
+
+        Something you saw on the public testnet rather than reproduced? Use the **Testnet observation** form instead.
   - type: dropdown
     id: component
     attributes:
       label: Component
+      description: Matches the `area:` label a maintainer adds.
       options:
         - node (decdn-node daemon)
         - cli (decdn binary)
         - client (decdn-client SDK)
-        - cache
-        - incentive (pools, vouchers, staking)
-        - reputation
-        - protocol (wire format, ALPNs)
+        - cache (engine, origin pull-through, GC)
+        - payments (pools, vouchers, redeem, staking)
         - contracts (Solidity)
+        - sponsord (daemon, onramp, decdn.sh / decdn.ps1 installers)
+        - protocol (wire format, ALPNs, discovery, probe)
         - docs / ADRs
+        - CI / tooling / release
         - other
     validations:
       required: true
@@ -27,7 +32,18 @@ body:
     id: version
     attributes:
       label: Version
-      description: The Docker image tag, or the commit SHA you built from (`git rev-parse --short HEAD`).
+      description: "`decdn --version` or `decdn-node --version`, the Docker image tag, or the commit SHA you built from (`git rev-parse --short HEAD`)."
+    validations:
+      required: true
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      options:
+        - Arbitrum Sepolia testnet
+        - local anvil
+        - no chain (loopback or unit test)
+        - other / not applicable
     validations:
       required: true
   - type: input

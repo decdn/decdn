@@ -1,12 +1,45 @@
 name: Feature request
 description: Propose a new capability or a change to existing behavior.
-labels: ["enhancement"]
+type: Feature
+labels: ["kind:feature"]
 body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Matches the `area:` label a maintainer adds.
+      options:
+        - node (decdn-node daemon)
+        - cli (decdn binary)
+        - client (decdn-client SDK)
+        - cache (engine, origin pull-through, GC)
+        - payments (pools, vouchers, redeem, staking)
+        - contracts (Solidity)
+        - sponsord (daemon, onramp, decdn.sh / decdn.ps1 installers)
+        - protocol (wire format, ALPNs, discovery, probe)
+        - docs / ADRs
+        - CI / tooling / release
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: affects
+    attributes:
+      label: Who it affects
+      multiple: true
+      options:
+        - node operator
+        - client (someone running `decdn get` or the gateway)
+        - publisher (someone importing content or sponsoring downloads)
+        - token holder / governance
+        - contributor (developer experience)
+    validations:
+      required: true
   - type: textarea
     id: problem
     attributes:
       label: Problem
-      description: What can you not do today, and who does it affect (node operator, client, publisher, token holder)?
+      description: What can you not do today? A concrete scenario beats a general statement.
     validations:
       required: true
   - type: textarea
@@ -23,6 +56,6 @@ body:
     id: design-scope
     attributes:
       label: Design scope
-      description: A change to the protocol, the economics, or the on-chain contract surface needs a new or updated ADR in [`adr/`](https://github.com/decdn/decdn/tree/main/adr).
+      description: A change to the protocol, the economics, or the on-chain contract surface needs a new or updated ADR in [`adr/`](https://github.com/decdn/decdn/tree/main/adr). A maintainer adds the `design:adr` label, and the work starts once the ADR is accepted.
       options:
         - label: This proposal changes the protocol, the economics, or the contract surface.
