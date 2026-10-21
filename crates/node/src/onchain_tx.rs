@@ -60,8 +60,14 @@ pub(crate) enum TxOutcome {
     Landed(TransactionReceipt),
     /// Mined and reverted (`receipt.status() == false`).
     Reverted(TransactionReceipt),
-    /// `.send()` failed (RPC / mempool rejection) — no transaction was issued.
+    /// `.send()` failed and nothing was issued: the RPC refused the send, or a
+    /// chain read before it failed.
     SendErr(ContractError),
+    /// `.send()` failed, but the send request may have reached a mempool
+    /// ([`decdn_incentive::tx::send_broadcast_unknown`]): it failed in
+    /// transport with no answer, or the answer says a copy of it may already
+    /// be pending. No hash is known, and the transaction may still mine.
+    MaybeBroadcast(ContractError),
     /// The transaction was issued, awaiting its receipt failed, and no by-hash
     /// fetch found a receipt either. The transaction is unconfirmed and may
     /// still mine.
@@ -94,8 +100,8 @@ pub(crate) enum TxOutcome {
 /// [`TxOutcome::Timeout`]; when `None`, the wait is unbounded. A wait that
 /// fails or lapses falls back to fetching the receipt by hash, and a receipt
 /// found there classifies as `Landed` / `Reverted` like one the wait returned.
-/// Every outcome counts once into one of the five outcome counters
-/// (`decdn_onchain_tx_{landed,reverted,send_failed,receipt_failed,timeout}_total`);
+/// Every outcome counts once into one of the six outcome counters
+/// (`decdn_onchain_tx_{landed,reverted,send_failed,maybe_broadcast,receipt_failed,timeout}_total`);
 /// a wait the by-hash fetch resolved also counts into
 /// `decdn_onchain_tx_receipt_recovered_total`, which sits beside that family.
 pub(crate) async fn send_and_await_receipt(
@@ -118,6 +124,7 @@ fn count_outcome(outcome: &TxOutcome, recovered: bool, metrics: &Metrics) {
         TxOutcome::Landed(_) => metrics.onchain_tx_landed(),
         TxOutcome::Reverted(_) => metrics.onchain_tx_reverted(),
         TxOutcome::SendErr(_) => metrics.onchain_tx_send_failed(),
+        TxOutcome::MaybeBroadcast(_) => metrics.onchain_tx_maybe_broadcast(),
         TxOutcome::ReceiptErr { .. } => metrics.onchain_tx_receipt_failed(),
         TxOutcome::Timeout { .. } => metrics.onchain_tx_timeout(),
     }
@@ -139,6 +146,9 @@ async fn await_receipt(
 ) -> (TxOutcome, bool) {
     let pending = match sent {
         Ok(pending) => pending,
+        Err(err) if decdn_incentive::tx::send_broadcast_unknown(&err) => {
+            return (TxOutcome::MaybeBroadcast(err), false);
+        }
         Err(err) => return (TxOutcome::SendErr(err), false),
     };
     let tx_hash = *pending.tx_hash();

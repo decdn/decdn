@@ -875,6 +875,7 @@ fn observability_counters_export_at_zero() {
         "decdn_onchain_tx_landed_total",
         "decdn_onchain_tx_reverted_total",
         "decdn_onchain_tx_send_failed_total",
+        "decdn_onchain_tx_maybe_broadcast_total",
         "decdn_onchain_tx_receipt_failed_total",
         "decdn_onchain_tx_timeout_total",
         "decdn_onchain_tx_receipt_recovered_total",

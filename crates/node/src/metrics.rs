@@ -839,7 +839,9 @@ pub struct DecdnMetrics {
     /// or a hint-path lane that could not be read from the lane store. A
     /// chunk whose receipt stays unconfirmed after the by-hash fetch does not
     /// count here; it counts into `decdn_onchain_tx_receipt_failed_total` or
-    /// `decdn_onchain_tx_timeout_total`. Each failure is otherwise only a
+    /// `decdn_onchain_tx_timeout_total`. Nor does a chunk whose send may have
+    /// broadcast; it counts into `decdn_onchain_tx_maybe_broadcast_total`.
+    /// Each failure is otherwise only a
     /// single `warn!`; a sustained rate means accrued earnings are not being
     /// redeemed and warrants investigating the RPC / wallet. Operator-visible
     /// name: `decdn_redemption_failures_total`.
@@ -897,7 +899,8 @@ pub struct DecdnMetrics {
     /// `decdn_redemption_reconcile_failures_total`.
     pub redemption_reconcile_failures: Counter,
     /// Buyer-side reclaim-sweep passes (`reclaim_once`) that failed — a failed
-    /// buyer store read, a failed `getPool`/`reclaim` RPC, a receipt wait, an
+    /// buyer store read, a failed `getPool`/`reclaim` RPC (a `reclaim` send
+    /// with no answer included, which may still mine), a receipt wait, an
     /// on-chain revert, or a failed store write when clearing the local record
     /// after a reclaim (#906). Each is otherwise only a single `warn!` per hourly
     /// sweep; a sustained rate means a closed pool's residual is not being
@@ -2207,7 +2210,7 @@ pub struct DecdnMetrics {
     pub pool_grace_closes: Counter,
     /// `decdn_onchain_tx_landed_total`: settlement transactions (`redeemMany`)
     /// mined and succeeded. The outcome family — `landed`, `reverted`,
-    /// `send_failed`, `receipt_failed`, `timeout` — counts every transaction
+    /// `send_failed`, `maybe_broadcast`, `receipt_failed`, `timeout` — counts every transaction
     /// sent through `send_and_await_receipt` exactly once;
     /// `onchain_tx_receipt_recovered` sits beside it and is not an outcome.
     /// Buyer-side pool transactions go through `decdn-client` and are not
@@ -2216,9 +2219,16 @@ pub struct DecdnMetrics {
     /// `decdn_onchain_tx_reverted_total`: node transactions mined and reverted.
     pub onchain_tx_reverted: Counter,
     /// `decdn_onchain_tx_send_failed_total`: node transactions the RPC refused at
-    /// `send` — none was issued. An oversize `redeemMany` the redeemer then
-    /// halves and retries counts here once too.
+    /// `send`, or whose chain reads before the send failed — none was issued.
+    /// An oversize `redeemMany` the redeemer then halves and retries counts
+    /// here once too.
     pub onchain_tx_send_failed: Counter,
+    /// `decdn_onchain_tx_maybe_broadcast_total`: node transactions whose send
+    /// request failed with no answer (a timeout, a reset, an HTTP 5xx), or
+    /// whose answer says a copy may already be pending (`already known`,
+    /// `nonce too low`, `replacement transaction underpriced`). No hash is
+    /// known; the transaction may be in a mempool and may still mine.
+    pub onchain_tx_maybe_broadcast: Counter,
     /// `decdn_onchain_tx_receipt_failed_total`: issued node transactions whose
     /// receipt wait failed and whose receipt no by-hash fetch found. The
     /// transaction is unconfirmed and may still mine.
@@ -3686,6 +3696,8 @@ recorders! {
     onchain_tx_reverted => onchain_tx_reverted.inc();
     /// The RPC refused a node transaction at `send`.
     onchain_tx_send_failed => onchain_tx_send_failed.inc();
+    /// A node transaction's send request failed, but it may have broadcast.
+    onchain_tx_maybe_broadcast => onchain_tx_maybe_broadcast.inc();
     /// An issued node transaction's receipt wait failed and no by-hash fetch
     /// found the receipt.
     onchain_tx_receipt_failed => onchain_tx_receipt_failed.inc();

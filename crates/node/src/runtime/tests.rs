@@ -45,8 +45,8 @@ fn provider_factory_preserves_role_polling_policy() {
 /// Both wallet providers carry the send-leg marker: a send request that fails
 /// in transport (nothing listens on the port) comes back as a
 /// [`decdn_incentive::tx::SendLegFailure`], so the buyer's `openPool` /
-/// `topUp` / `approve` can tell it from a chain read that failed before it
-/// (#2431). The seller's `redeemMany` does not read the marker yet.
+/// `topUp` / `approve` (#2431), the reclaim sweep and the seller's
+/// `redeemMany` (#2568) can tell it from a chain read that failed before it.
 #[tokio::test]
 async fn wallet_providers_mark_a_failed_send_request() {
     decdn_common::tls::install_crypto_provider();
