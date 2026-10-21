@@ -370,12 +370,16 @@ pub enum Funding {
 /// active registered node for each entry to sample. Resolve it with
 /// [`select_nodes`].
 #[derive(Debug, Clone)]
-pub struct NodeSelection {
-    /// The node every entry pulls from, when one is pinned.
-    pinned: Option<PinnedNode>,
+pub struct NodeSelection(Selection);
+
+/// The resolved selection: pinned or registry, never both.
+#[derive(Debug, Clone)]
+enum Selection {
+    /// The node every entry pulls from.
+    Pinned(PinnedNode),
     /// Every active registered node, and whether the list is the
-    /// registry-outage fallback, when none is pinned.
-    registry: Option<engine::Registry>,
+    /// registry-outage fallback.
+    Registry(engine::Registry),
 }
 
 /// Resolve where a pull's entries find their holders, once for the run.
@@ -398,15 +402,11 @@ pub async fn select_nodes(
     discovery: &DiscoveryOptions,
 ) -> anyhow::Result<NodeSelection> {
     if let Some(pinned) = discovery.pinned {
-        return Ok(NodeSelection {
-            pinned: Some(pinned),
-            registry: None,
-        });
+        return Ok(NodeSelection(Selection::Pinned(pinned)));
     }
-    Ok(NodeSelection {
-        pinned: None,
-        registry: Some(engine::discover_candidates(chain, site, discovery).await?),
-    })
+    Ok(NodeSelection(Selection::Registry(
+        engine::discover_candidates(chain, site, discovery).await?,
+    )))
 }
 
 /// Where a bundle pull reports its progress. Every method has a default

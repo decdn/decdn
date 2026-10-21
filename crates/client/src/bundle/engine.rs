@@ -102,8 +102,8 @@ use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PullSite};
 use crate::stop::Halted;
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
-    ProbeOpts, ProbeRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
-    probe_and_order, resolve_target_node,
+    ProbeRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
+    pinned_targets, probe_and_order,
 };
 use crate::{
     ClientRangedStore, Connections, CredentialSlot, DownloadTarget, Downloader, FundingNeeded,
@@ -1687,33 +1687,24 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// [`Self::entry_targets`] before a failure is sorted into a configuration
     /// fault or an empty start.
     async fn resolve_entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
-        if self.nodes.pinned.is_some() {
-            return resolve_target_node(
-                &self.discovery,
-                (&self.chain, &self.site),
-                &self.endpoint,
-                &self.relays,
-                hash,
-                ProbeOpts {
-                    marks: None,
-                    round: ProbeRound::Stream,
-                },
-            )
-            .await;
+        match &self.nodes.0 {
+            super::Selection::Pinned(pinned) => Ok(pinned_targets(pinned.node_id, pinned.provider)),
+            super::Selection::Registry(registry) => {
+                // The entry's round streams: its fetch starts at the first
+                // verified holder, and the holders that answer later join it.
+                let candidates = registry.entry_candidates(&self.site);
+                probe_and_order(
+                    &self.endpoint,
+                    &candidates,
+                    self.relays.first(),
+                    hash,
+                    self.discovery.proxy_warming,
+                    &self.slash_dom,
+                    ProbeRound::Stream,
+                )
+                .await
+            }
         }
-        // The entry's round streams: its fetch starts at the first verified
-        // holder, and the holders that answer later join it.
-        let candidates = self.entry_candidates()?;
-        probe_and_order(
-            &self.endpoint,
-            &candidates,
-            self.relays.first(),
-            hash,
-            self.discovery.proxy_warming,
-            &self.slash_dom,
-            ProbeRound::Stream,
-        )
-        .await
     }
 
     /// Fill `ranges` of blob `hash` (`None` is the whole blob) into the ranged
@@ -1819,17 +1810,6 @@ impl<P: Provider + Clone> PullCtx<P> {
             Some(hints) => hints.annotate(err, &sources.fault_context()),
             None => err,
         })
-    }
-
-    /// This entry's probe candidates: a fresh sample of the run's registry
-    /// list ([`Registry::entry_candidates`]).
-    fn entry_candidates(&self) -> anyhow::Result<Vec<NodeCandidate>> {
-        let registry = self
-            .nodes
-            .registry
-            .as_ref()
-            .ok_or_else(|| anyhow!("no discovery candidates available"))?;
-        Ok(registry.entry_candidates(&self.site))
     }
 
     /// The manifest blob `hash`, read from `out_root`'s manifest cache when

@@ -1181,7 +1181,7 @@ impl std::fmt::Debug for ResolvedTargets {
 
 /// The one holder of a pinned `--node-id` at `provider`. Nothing was probed,
 /// so it carries no size hint.
-fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
+pub(crate) fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
     ResolvedTargets {
         candidates: vec![NodeCandidate {
             node_id,
