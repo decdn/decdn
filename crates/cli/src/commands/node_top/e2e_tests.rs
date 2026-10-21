@@ -92,10 +92,22 @@ async fn fetch_metrics_surfaces_non_2xx_as_error() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr: SocketAddr = listener.local_addr()?;
     let server = tokio::spawn(async move {
-        // One-shot: accept, write a 503, drop. Any subsequent
-        // connections close cleanly when the listener drops.
+        // One-shot: accept, read the request head, write a 503,
+        // drop. Any subsequent connections close cleanly when the
+        // listener drops. The read comes first: a response that
+        // lands before hyper finishes writing the request fails
+        // the client with "received unexpected message from
+        // connection" instead of the 503.
         if let Ok((mut sock, _)) = listener.accept().await {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(buf.get(..n).unwrap_or_default()),
+                }
+            }
             let _ = sock
                 .write_all(
                     b"HTTP/1.1 503 Service Unavailable\r\n\

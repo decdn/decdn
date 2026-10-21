@@ -54,7 +54,10 @@ async fn a_panicking_write_does_not_strand_the_writes_behind_it() {
     });
     let behind = writes.queue_awaitable(|| 7);
     release.send(()).unwrap();
-    let landed = tokio::time::timeout(std::time::Duration::from_secs(3), behind)
+    // `TEST_WAIT`, not a tight bound: the panic hook symbolizes a backtrace
+    // before the worker moves on, and that alone can take seconds on a loaded
+    // host.
+    let landed = tokio::time::timeout(TEST_WAIT, behind)
         .await
         .expect("the write behind the panic runs");
     assert_eq!(landed.unwrap(), 7);
