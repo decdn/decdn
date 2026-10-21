@@ -5,7 +5,7 @@ use sponsord_api::time::FixedClock;
 
 use super::*;
 use crate::test_support::{
-    CapturedLog, FAKE_RESENT_TOPUP_TX, FAKE_TOPUP_TX, FakePool, TEST_POOL_ID,
+    CapturedLog, FAKE_RESENT_TOPUP_TX, FAKE_TOPUP_TX, FakePool, ResendFailure, TEST_POOL_ID,
 };
 
 const CFG: KeeperConfig = KeeperConfig {
@@ -389,7 +389,7 @@ async fn a_re_send_that_reverts_pool_not_open_ends_the_hold() {
     let log = CapturedLog::default();
     let _guard = log.install();
     let (pool, status, mut held) = lost_pool().await;
-    pool.revert_resends_pool_not_open(true);
+    pool.fail_resends(Some(ResendFailure::PoolNotOpen));
     let clock = FixedClock::new(2_000);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert!(held.is_none());
@@ -460,7 +460,7 @@ async fn a_re_send_that_fails_keeps_the_hold() {
     let log = CapturedLog::default();
     let _guard = log.install();
     let (pool, status, mut held) = lost_pool().await;
-    pool.fail_resends(true);
+    pool.fail_resends(Some(ResendFailure::Transport));
     let clock = FixedClock::new(2_000);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert_eq!(held.as_ref().map(|h| h.tx), Some(None));
@@ -472,7 +472,7 @@ async fn a_re_send_that_fails_keeps_the_hold() {
     assert!(!text.contains("FAKE-RPC-KEY"), "{text}");
     assert!(!text.contains("rpc.example"), "{text}");
 
-    pool.fail_resends(false);
+    pool.fail_resends(None);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert_eq!(pool.top_up_resends(), vec![10, 10]);
     assert_eq!(
@@ -561,7 +561,7 @@ async fn a_re_send_answered_as_possibly_broadcast_keeps_the_hold_without_a_hash(
     let log = CapturedLog::default();
     let _guard = log.install();
     let (pool, status, mut held) = lost_pool().await;
-    pool.answer_resends_unknown(true);
+    pool.fail_resends(Some(ResendFailure::Unknown));
     let clock = FixedClock::new(2_000);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert_eq!(held.as_ref().map(|h| h.tx), Some(None));
@@ -582,7 +582,7 @@ async fn a_re_send_short_of_allowance_keeps_the_hold_and_names_the_remedy() {
     let log = CapturedLog::default();
     let _guard = log.install();
     let (pool, status, mut held) = lost_pool().await;
-    pool.revert_resends_allowance_short(true);
+    pool.fail_resends(Some(ResendFailure::AllowanceShort));
     let clock = FixedClock::new(2_000);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert_eq!(held.as_ref().map(|h| h.tx), Some(None));

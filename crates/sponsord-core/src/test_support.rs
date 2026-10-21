@@ -38,12 +38,28 @@ pub const FAKE_TOPUP_TX: TxHash = TxHash::repeat_byte(0xAB);
 /// The `topUp` transaction a `FakePool` re-send at a nonce returns.
 pub const FAKE_RESENT_TOPUP_TX: TxHash = TxHash::repeat_byte(0xAC);
 
+/// How [`FakePool::fail_resends`] makes `send_top_up_at` fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResendFailure {
+    /// The send request fails in transport, naming [`FAKE_RPC_URL`].
+    Transport,
+    /// It reverts; the error carries decdn's `PoolNotOpen`.
+    PoolNotOpen,
+    /// It reverts on a short allowance; the error carries decdn's
+    /// `AllowanceShortfall`.
+    AllowanceShort,
+    /// The node answers `already known`; the error carries decdn's
+    /// `TopUpUnconfirmed` with no transaction.
+    Unknown,
+}
+
 /// In-memory pool: fixed owner, a mutable remaining balance, a settable
-/// per-signer registration map, a settable transaction state (for every hash,
-/// or one), confirmed and pending nonces, a record of each re-send at a
-/// nonce, and switches to fail reads, top-ups or re-sends. A failure reads like a raw reqwest transport
-/// error naming [`FAKE_RPC_URL`]: unlike `ChainPool`, it does not redact, so
-/// tests exercise the log sites' own redaction.
+/// per-signer registration map, a settable transaction state (for every
+/// hash, or one), confirmed and pending nonces, a record of each re-send at
+/// a nonce, and switches to fail reads, top-ups or re-sends. A failure reads
+/// like a raw reqwest transport error naming [`FAKE_RPC_URL`]: unlike
+/// `ChainPool`, it does not redact, so tests exercise the log sites' own
+/// redaction.
 #[derive(Debug)]
 pub struct FakePool {
     owner: Address,
@@ -56,10 +72,7 @@ pub struct FakePool {
     lose_top_up_submit: AtomicBool,
     fail_tx_reads: AtomicBool,
     fail_pending_read: AtomicBool,
-    fail_resend: AtomicBool,
-    resend_pool_not_open: AtomicBool,
-    resend_allowance_short: AtomicBool,
-    resend_unknown: AtomicBool,
+    resend_failure: Mutex<Option<ResendFailure>>,
     tx_state: Mutex<TxState>,
     /// Per-hash states that override `tx_state`.
     tx_states: Mutex<HashMap<TxHash, TxState>>,
@@ -86,10 +99,7 @@ impl FakePool {
             lose_top_up_submit: AtomicBool::new(false),
             fail_tx_reads: AtomicBool::new(false),
             fail_pending_read: AtomicBool::new(false),
-            fail_resend: AtomicBool::new(false),
-            resend_pool_not_open: AtomicBool::new(false),
-            resend_allowance_short: AtomicBool::new(false),
-            resend_unknown: AtomicBool::new(false),
+            resend_failure: Mutex::new(None),
             tx_state: Mutex::new(TxState::Unknown),
             tx_states: Mutex::new(HashMap::new()),
             confirmed_nonce: AtomicU64::new(0),
@@ -170,28 +180,9 @@ impl FakePool {
         *self.pending_tx_count.lock().unwrap() = Some(count);
     }
 
-    /// Make every `send_top_up_at` fail in transport.
-    pub fn fail_resends(&self, fail: bool) {
-        self.fail_resend.store(fail, Ordering::SeqCst);
-    }
-
-    /// Make every `send_top_up_at` revert `PoolNotOpen`: the error carries
-    /// decdn's `PoolNotOpen`.
-    pub fn revert_resends_pool_not_open(&self, revert: bool) {
-        self.resend_pool_not_open.store(revert, Ordering::SeqCst);
-    }
-
-    /// Make every `send_top_up_at` revert on a short allowance: the error
-    /// carries decdn's `AllowanceShortfall`.
-    pub fn revert_resends_allowance_short(&self, revert: bool) {
-        self.resend_allowance_short.store(revert, Ordering::SeqCst);
-    }
-
-    /// Make every `send_top_up_at` get an answer that leaves its broadcast
-    /// unknown (`already known`): the error carries decdn's
-    /// `TopUpUnconfirmed` with no transaction.
-    pub fn answer_resends_unknown(&self, unknown: bool) {
-        self.resend_unknown.store(unknown, Ordering::SeqCst);
+    /// How every `send_top_up_at` fails from now on; `None` lets it succeed.
+    pub fn fail_resends(&self, failure: Option<ResendFailure>) {
+        *self.resend_failure.lock().unwrap() = failure;
     }
 
     /// How many times `top_up` has been called, failed or not.
@@ -300,34 +291,25 @@ impl PoolChain for FakePool {
     ) -> anyhow::Result<TxHash> {
         self.top_up_resends.lock().unwrap().push(nonce);
         // Each shaped like the matching decdn `send_top_up_at` error.
-        if self.resend_pool_not_open.load(Ordering::SeqCst) {
-            return Err(
-                anyhow::anyhow!("server returned an error response: execution reverted")
-                    .context(format!("re-send topUp at nonce {nonce}"))
-                    .context(PoolNotOpen),
-            );
+        let at = format!("re-send topUp at nonce {nonce}");
+        let reverted = || anyhow::anyhow!("server returned an error response: execution reverted");
+        match *self.resend_failure.lock().unwrap() {
+            Some(ResendFailure::PoolNotOpen) => Err(reverted().context(at).context(PoolNotOpen)),
+            Some(ResendFailure::AllowanceShort) => {
+                Err(reverted().context(at).context(AllowanceShortfall))
+            }
+            Some(ResendFailure::Unknown) => Err(anyhow::anyhow!(
+                "server returned an error response: already known"
+            )
+            .context(at)
+            .context(TopUpUnconfirmed { tx: None, nonce })),
+            Some(ResendFailure::Transport) => Err(anyhow::anyhow!(
+                "{at}: error sending request for url ({FAKE_RPC_URL})"
+            )),
+            // No receipt: `transaction` reports what `set_tx_state` says, and
+            // nothing is credited until a test says it mined.
+            None => Ok(FAKE_RESENT_TOPUP_TX),
         }
-        if self.resend_allowance_short.load(Ordering::SeqCst) {
-            return Err(
-                anyhow::anyhow!("server returned an error response: execution reverted")
-                    .context(format!("re-send topUp at nonce {nonce}"))
-                    .context(AllowanceShortfall),
-            );
-        }
-        if self.resend_unknown.load(Ordering::SeqCst) {
-            return Err(
-                anyhow::anyhow!("server returned an error response: already known")
-                    .context(format!("re-send topUp at nonce {nonce}"))
-                    .context(TopUpUnconfirmed { tx: None, nonce }),
-            );
-        }
-        anyhow::ensure!(
-            !self.fail_resend.load(Ordering::SeqCst),
-            "re-send topUp at nonce {nonce}: error sending request for url ({FAKE_RPC_URL})"
-        );
-        // No receipt: `transaction` reports what `set_tx_state` says, and
-        // nothing is credited until a test says it mined.
-        Ok(FAKE_RESENT_TOPUP_TX)
     }
 }
 

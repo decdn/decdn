@@ -77,6 +77,12 @@ pub struct KeeperSnapshot {
 }
 
 impl KeeperStatus {
+    /// Count a top-up that escrowed, at `now_unix`.
+    fn record_topup(&self, now_unix: u64) {
+        self.topups.fetch_add(1, Ordering::Relaxed);
+        self.last_topup_unix.store(now_unix, Ordering::Relaxed);
+    }
+
     /// Copy the current values. Each is read on its own, so a snapshot taken
     /// mid-tick may mix values from before and after it.
     #[must_use]
@@ -159,6 +165,19 @@ struct Unconfirmed {
 /// How many earlier hashes a hold keeps; a re-send past that drops the oldest.
 const MAX_EARLIER_TXS: usize = 8;
 
+impl Unconfirmed {
+    /// Make `tx` the latest send at the nonce; the one it replaces joins
+    /// `earlier`, which drops its oldest past [`MAX_EARLIER_TXS`].
+    fn record_resend(&mut self, tx: TxHash) {
+        if let Some(previous) = self.tx.replace(tx) {
+            if self.earlier.len() >= MAX_EARLIER_TXS {
+                self.earlier.remove(0);
+            }
+            self.earlier.push(previous);
+        }
+    }
+}
+
 /// Set or clear the hold, and publish it for metrics.
 fn set_hold(slot: &mut Option<Unconfirmed>, status: &KeeperStatus, hold: Option<Unconfirmed>) {
     let since_unix = hold.as_ref().map_or(0, |h| h.since_unix);
@@ -213,10 +232,7 @@ async fn sweep(
     }
     match pool.top_up(pool_id, cfg.refill).await {
         Ok(credited) => {
-            status.topups.fetch_add(1, Ordering::Relaxed);
-            status
-                .last_topup_unix
-                .store(clock.now_unix(), Ordering::Relaxed);
+            status.record_topup(clock.now_unix());
             status
                 .remaining
                 .store(remaining.saturating_add(credited).0, Ordering::Relaxed);
@@ -303,10 +319,7 @@ async fn settle(
     let held_secs = clock.now_unix().saturating_sub(held.since_unix);
     match state {
         Read::Hash(tx, TxState::Mined) => {
-            status.topups.fetch_add(1, Ordering::Relaxed);
-            status
-                .last_topup_unix
-                .store(clock.now_unix(), Ordering::Relaxed);
+            status.record_topup(clock.now_unix());
             tracing::info!(pool = %pool_id, %tx, "unconfirmed pool top-up mined");
             false
         }
@@ -325,10 +338,7 @@ async fn settle(
         // way.
         Read::Hash(tx, TxState::Pending { .. } | TxState::Unknown) if confirmed > nonce => {
             if let Some(mined) = earlier_mined(pool, pool_id, held, status).await {
-                status.topups.fetch_add(1, Ordering::Relaxed);
-                status
-                    .last_topup_unix
-                    .store(clock.now_unix(), Ordering::Relaxed);
+                status.record_topup(clock.now_unix());
                 tracing::info!(
                     pool = %pool_id, tx = %mined, latest = %tx, nonce,
                     "an earlier send of the unconfirmed pool top-up mined at nonce {nonce}; \
@@ -486,12 +496,7 @@ async fn resend_at_nonce(
                 "no transaction holds nonce {nonce} of the unconfirmed pool top-up; re-sent \
                  topUp at that nonce as {tx}; holding further top-ups until it has a receipt"
             );
-            if let Some(previous) = held.tx.replace(tx) {
-                if held.earlier.len() >= MAX_EARLIER_TXS {
-                    held.earlier.remove(0);
-                }
-                held.earlier.push(previous);
-            }
+            held.record_resend(tx);
             true
         }
         Err(e) if e.downcast_ref::<PoolNotOpen>().is_some() => {
