@@ -129,7 +129,7 @@ async fn lost_pool() -> (FakePool, KeeperStatus, Option<Unconfirmed>) {
     let clock = FixedClock::new(1_000);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     pool.lose_top_up_submits(false);
-    let h = held.unwrap();
+    let h = held.as_ref().unwrap();
     assert_eq!((h.tx, h.nonce, h.since_unix), (None, 10, 1_000));
     (pool, status, held)
 }
@@ -144,7 +144,7 @@ async fn an_unconfirmed_top_up_holds_further_top_ups_while_pending() {
         (s.topups, s.failures, s.topup_unconfirmed_since_unix),
         (0, 1, 1_000)
     );
-    let h = held.unwrap();
+    let h = held.as_ref().unwrap();
     assert_eq!((h.tx, h.nonce), (Some(FAKE_TOPUP_TX), 10));
     let text = log.text();
     assert!(text.contains("pool top-up unconfirmed"), "{text}");
@@ -274,8 +274,8 @@ async fn a_top_up_the_node_never_returned_clears_once_its_nonce_is_used() {
     assert!(pool.top_up_resends().is_empty());
     let text = log.text();
     assert!(text.contains("mempool holds"), "{text}");
-    assert!(text.contains("send 0-value transactions"), "{text}");
-    assert!(text.contains("passes 10 (1 at most)"), "{text}");
+    assert!(text.contains("send a 0-value transaction"), "{text}");
+    assert!(text.contains("at nonce 10 with a higher fee"), "{text}");
 
     pool.set_confirmed_tx_count(11);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
@@ -303,12 +303,17 @@ async fn a_top_up_lost_in_transport_is_held_while_a_transaction_holds_its_nonce(
     pool.set_pending_tx_count(11);
     pool.set_tx_state(TxState::Mined);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
-    assert_eq!(held.map(|h| h.tx), Some(None));
+    assert_eq!(held.as_ref().map(|h| h.tx), Some(None));
     assert_eq!(pool.top_up_calls(), 1);
     assert!(pool.top_up_resends().is_empty());
     let text = log.text();
     assert!(text.contains("mempool holds"), "{text}");
-    assert!(text.contains("passes 10 (1 at most)"), "{text}");
+    assert!(text.contains("at nonce 10 with a higher fee"), "{text}");
+    assert_eq!(
+        status.snapshot().failures,
+        1,
+        "a held top-up is not a failure"
+    );
 
     // Nonce 10 is used: it mined or never will. Unknown which, so it is
     // not counted; the sweep that learns it sends nothing, the next tops
@@ -335,7 +340,7 @@ async fn a_top_up_lost_in_transport_is_re_sent_once_its_nonce_is_vacant_and_clea
     let clock = FixedClock::new(2_000);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert_eq!(pool.top_up_resends(), vec![10]);
-    let h = held.unwrap();
+    let h = held.as_ref().unwrap();
     assert_eq!(
         (h.tx, h.nonce, h.since_unix),
         (Some(FAKE_RESENT_TOPUP_TX), 10, 1_000)
@@ -346,7 +351,11 @@ async fn a_top_up_lost_in_transport_is_re_sent_once_its_nonce_is_vacant_and_clea
         "the sweep that re-sends tops up nothing else"
     );
     let s = status.snapshot();
-    assert_eq!((s.topups, s.topup_unconfirmed_since_unix), (0, 1_000));
+    assert_eq!(
+        (s.topups, s.failures, s.topup_unconfirmed_since_unix),
+        (0, 1, 1_000),
+        "a re-send is not a failure"
+    );
     let text = log.text();
     assert!(text.contains("re-sent topUp"), "{text}");
     assert!(text.contains(&FAKE_RESENT_TOPUP_TX.to_string()), "{text}");
@@ -402,7 +411,11 @@ async fn a_top_up_the_node_does_not_know_is_re_sent_once_its_nonce_is_vacant() {
     let clock = FixedClock::new(2_000);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert_eq!(pool.top_up_resends(), vec![10]);
-    assert_eq!(held.map(|h| h.tx), Some(Some(FAKE_RESENT_TOPUP_TX)));
+    assert_eq!(
+        held.as_ref().map(|h| h.tx),
+        Some(Some(FAKE_RESENT_TOPUP_TX))
+    );
+    assert_eq!(status.snapshot().failures, 1);
     let text = log.text();
     assert!(text.contains("re-sent topUp"), "{text}");
     assert!(
@@ -428,7 +441,10 @@ async fn a_re_sent_top_up_the_node_drops_is_re_sent_again() {
     // The node does not know the re-send either, and nothing holds nonce 10.
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert_eq!(pool.top_up_resends(), vec![10, 10]);
-    assert_eq!(held.map(|h| h.tx), Some(Some(FAKE_RESENT_TOPUP_TX)));
+    assert_eq!(
+        held.as_ref().map(|h| h.tx),
+        Some(Some(FAKE_RESENT_TOPUP_TX))
+    );
 
     pool.set_tx_state(TxState::Mined);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
@@ -447,7 +463,7 @@ async fn a_re_send_that_fails_keeps_the_hold() {
     pool.fail_resends(true);
     let clock = FixedClock::new(2_000);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
-    assert_eq!(held.map(|h| h.tx), Some(None));
+    assert_eq!(held.as_ref().map(|h| h.tx), Some(None));
     assert_eq!(pool.top_up_resends(), vec![10]);
     assert_eq!(status.snapshot().failures, 2);
     let text = log.text();
@@ -459,7 +475,10 @@ async fn a_re_send_that_fails_keeps_the_hold() {
     pool.fail_resends(false);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert_eq!(pool.top_up_resends(), vec![10, 10]);
-    assert_eq!(held.map(|h| h.tx), Some(Some(FAKE_RESENT_TOPUP_TX)));
+    assert_eq!(
+        held.as_ref().map(|h| h.tx),
+        Some(Some(FAKE_RESENT_TOPUP_TX))
+    );
 }
 
 /// With an earlier nonce still unfilled, nothing at the top-up's nonce can
@@ -472,17 +491,114 @@ async fn a_queued_hashless_top_up_is_held_without_a_re_send() {
     pool.set_confirmed_tx_count(9);
     let clock = FixedClock::new(2_000);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
-    assert_eq!(held.map(|h| h.tx), Some(None));
+    assert_eq!(held.as_ref().map(|h| h.tx), Some(None));
     assert!(pool.top_up_resends().is_empty());
+    assert_eq!(status.snapshot().failures, 1);
     let text = log.text();
     assert!(text.contains("cannot mine yet"), "{text}");
     assert!(text.contains("2 at most"), "{text}");
+}
+
+/// The confirmed read works and the pending read fails: nothing is known
+/// about the mempool, so nothing is re-sent and the hold stays as it was.
+#[tokio::test]
+async fn a_failed_pending_nonce_read_keeps_the_hold_without_a_re_send() {
+    let log = CapturedLog::default();
+    let _guard = log.install();
+    let (pool, status, mut held) = lost_pool().await;
+    pool.fail_pending_reads(true);
+    let clock = FixedClock::new(2_000);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert_eq!(held.as_ref().map(|h| h.tx), Some(None));
+    assert!(pool.top_up_resends().is_empty());
+    assert_eq!(pool.top_up_calls(), 1);
+    let s = status.snapshot();
+    assert_eq!((s.failures, s.topup_unconfirmed_since_unix), (2, 1_000));
+    let text = log.text();
+    assert!(text.contains("pending-nonce check"), "{text}");
+    assert!(text.contains("error sending request"), "{text}");
+    assert!(!text.contains("rpc.example"), "{text}");
+
+    // Once the read works the nonce is still vacant: re-sent.
+    pool.fail_pending_reads(false);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert_eq!(pool.top_up_resends(), vec![10]);
+}
+
+/// A re-send moves the first hash aside, but the first send may still be
+/// the one that mines: its receipt counts the top-up.
+#[tokio::test]
+async fn a_first_send_that_mines_after_a_re_send_is_counted() {
+    let log = CapturedLog::default();
+    let _guard = log.install();
+    let (pool, status, mut held) = held_pool().await;
+    let clock = FixedClock::new(2_000);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert_eq!(
+        held.as_ref().map(|h| h.tx),
+        Some(Some(FAKE_RESENT_TOPUP_TX))
+    );
+
+    // The first send mines; the node never learns the re-send.
+    pool.set_tx_state_of(FAKE_TOPUP_TX, TxState::Mined);
+    pool.set_confirmed_tx_count(11);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert!(held.is_none());
+    let s = status.snapshot();
+    assert_eq!(
+        (s.topups, s.last_topup_unix, s.topup_unconfirmed_since_unix),
+        (1, 2_000, 0)
+    );
+    let text = log.text();
+    assert!(text.contains("an earlier send"), "{text}");
+    assert!(text.contains(&FAKE_TOPUP_TX.to_string()), "{text}");
+}
+
+/// A re-send the node answers with `already known` may be in a mempool
+/// without its hash: the hold keeps no hash, and the nonce settles it.
+#[tokio::test]
+async fn a_re_send_answered_as_possibly_broadcast_keeps_the_hold_without_a_hash() {
+    let log = CapturedLog::default();
+    let _guard = log.install();
+    let (pool, status, mut held) = lost_pool().await;
+    pool.answer_resends_unknown(true);
+    let clock = FixedClock::new(2_000);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert_eq!(held.as_ref().map(|h| h.tx), Some(None));
+    assert_eq!(pool.top_up_resends(), vec![10]);
+    assert_eq!(status.snapshot().failures, 2);
+    let text = log.text();
+    assert!(text.contains("broadcast unknown"), "{text}");
+    assert!(!text.contains("re-sending it failed"), "{text}");
+
+    pool.set_confirmed_tx_count(11);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert!(held.is_none());
+}
+
+/// A re-send short of allowance keeps the hold and names the remedy.
+#[tokio::test]
+async fn a_re_send_short_of_allowance_keeps_the_hold_and_names_the_remedy() {
+    let log = CapturedLog::default();
+    let _guard = log.install();
+    let (pool, status, mut held) = lost_pool().await;
+    pool.revert_resends_allowance_short(true);
+    let clock = FixedClock::new(2_000);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert_eq!(held.as_ref().map(|h| h.tx), Some(None));
+    assert_eq!(pool.top_up_resends(), vec![10]);
+    assert_eq!(status.snapshot().failures, 2);
+    let text = log.text();
+    assert!(text.contains("allowance"), "{text}");
+    assert!(text.contains("approve it again"), "{text}");
 }
 
 /// Read in the other order, a lost top-up that mines between the reads
 /// would look vacant and be re-sent at a nonce it has used.
 #[tokio::test]
 async fn a_hashless_top_up_that_mines_between_the_reads_is_not_re_sent() {
+    let log = CapturedLog::default();
+    let _guard = log.install();
     let (inner, status, mut held) = lost_pool().await;
     let pool = MinesBetweenReads {
         inner,
@@ -490,8 +606,9 @@ async fn a_hashless_top_up_that_mines_between_the_reads_is_not_re_sent() {
     };
     let clock = FixedClock::new(2_000);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
-    assert_eq!(held.map(|h| h.tx), Some(None));
+    assert_eq!(held.as_ref().map(|h| h.tx), Some(None));
     assert!(pool.inner.top_up_resends().is_empty());
+    assert!(log.text().contains("mempool holds"), "{}", log.text());
 
     // The next sweep sees the nonce used and clears the hold.
     sweep(&pool.inner, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;

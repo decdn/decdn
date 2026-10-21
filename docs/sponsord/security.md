@@ -33,9 +33,9 @@ Anyone who gets capabilities can spend, at most:
   longer mine, so one refill is not sent twice. A top-up whose submit
   returned no tx hash is held too; one the node shows no transaction of is
   re-sent at its nonce once nothing holds it. A top-up whose chain reads
-  failed before the send is not held, since nothing was signed. The hold is kept in memory: a restart
-  while that transaction may still mine allows a second refill (see [the
-  operator guide, §5](operator.md#5-monitor)).
+  failed before the send is not held, since no `topUp` was signed. The hold
+  is kept in memory: a restart while that transaction may still mine allows
+  a second refill (see [the operator guide, §5](operator.md#5-monitor)).
 
 How many capabilities they can get is bounded by the gate, and on the onramp
 by the per-address rate limits (`ONRAMP_FUND_RATE_PER_MIN`).

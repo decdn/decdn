@@ -8,23 +8,25 @@
 //! treasury's confirmed nonce has passed the nonce it was sent with (decdn/sponsord#40). A
 //! `topUp` whose submit returned no tx hash (the send request failed in
 //! transport, or the node answered `already known`, `nonce too low` or
-//! `replacement transaction underpriced`) can be settled only by its nonce,
-//! and so can one whose hash the node does not know. While the node shows
-//! no transaction of the top-up, the treasury's confirmed nonce equals its
-//! nonce and the pending nonce does not exceed it, no transaction holds the
-//! nonce, so the keeper re-sends the `topUp` at it and settles the hold by
-//! that receipt; two transactions at one nonce cannot both mine (#2572). A
-//! re-send that reverts `PoolNotOpen` ends the hold, since the pool accepts
-//! no funds. While the node's mempool holds a transaction at the nonce, or
-//! an earlier nonce is unfilled, the hold lasts until the nonce is used. The
-//! hold is kept in memory, so a restart clears it.
+//! `replacement transaction underpriced`) is settled by its nonce alone; one
+//! whose hash the node does not know is settled the same way while the node
+//! shows nothing of it. While the node shows no transaction of the top-up,
+//! the treasury's confirmed nonce equals its nonce and the pending nonce does
+//! not exceed it, no transaction holds the nonce, so the keeper re-sends the
+//! `topUp` at it and settles the hold by that receipt; two transactions at
+//! one nonce cannot both mine (#2572). A re-send that reverts `PoolNotOpen`
+//! ends the hold, since the pool accepts no funds. While the node's mempool
+//! holds a transaction at the nonce, or an earlier nonce is unfilled, the
+//! hold lasts until the nonce is used, the top-up has a receipt, or the nonce
+//! becomes vacant and the keeper re-sends. The hold is kept in memory, so a
+//! restart clears it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::primitives::{B256, TxHash};
-use decdn_client::buyer_pool::{PoolNotOpen, TopUpUnconfirmed};
+use decdn_client::buyer_pool::{AllowanceShortfall, PoolNotOpen, TopUpUnconfirmed};
 use decdn_common::redact::sanitize_err_chain;
 use sponsord_api::MicroUsdc;
 use sponsord_api::time::{Clock, SystemClock};
@@ -134,26 +136,36 @@ pub async fn run(
 /// A top-up whose `topUp` may have been broadcast but whose receipt was not
 /// read. It may still mine, so no other top-up is sent until it is settled
 /// (decdn/sponsord#40).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Unconfirmed {
-    /// The `topUp` transaction; `None` when its submit returned no tx hash
-    /// (the send request failed in transport, or the node gave an answer
-    /// `decdn_incentive::tx::send_broadcast_unknown` reads as uncertain), so
-    /// it may be in a mempool without its hash known here. A re-send at the
-    /// nonce records its hash here, after which the receipt settles the hold.
+    /// The latest `topUp` sent at the nonce; `None` when its submit returned
+    /// no tx hash (the send request failed in transport, or the node gave an
+    /// answer `decdn_incentive::tx::send_broadcast_unknown` reads as
+    /// uncertain), so it may be in a mempool without its hash known here. A
+    /// re-send at the nonce records its hash here, after which the receipt
+    /// settles the hold.
     tx: Option<TxHash>,
+    /// The hashes of earlier sends at the nonce, oldest first, each moved
+    /// here from `tx` by a re-send and capped at [`MAX_EARLIER_TXS`]. Any of
+    /// them may be the transaction that uses the nonce, so a used nonce is
+    /// checked against each before the top-up counts as unknown.
+    earlier: Vec<TxHash>,
     /// The nonce the `topUp` was sent with. Once the treasury's confirmed
     /// nonce passes it, the `topUp` has mined or can never mine.
     nonce: u64,
     since_unix: u64,
 }
 
+/// How many earlier hashes a hold keeps; a re-send past that drops the oldest.
+const MAX_EARLIER_TXS: usize = 8;
+
 /// Set or clear the hold, and publish it for metrics.
 fn set_hold(slot: &mut Option<Unconfirmed>, status: &KeeperStatus, hold: Option<Unconfirmed>) {
+    let since_unix = hold.as_ref().map_or(0, |h| h.since_unix);
     *slot = hold;
     status
         .topup_unconfirmed_since_unix
-        .store(hold.map_or(0, |h| h.since_unix), Ordering::Relaxed);
+        .store(since_unix, Ordering::Relaxed);
 }
 
 #[expect(
@@ -218,6 +230,7 @@ async fn sweep(
             if let Some(m) = e.downcast_ref::<TopUpUnconfirmed>() {
                 let hold = Unconfirmed {
                     tx: m.tx,
+                    earlier: Vec::new(),
                     nonce: m.nonce,
                     since_unix: clock.now_unix(),
                 };
@@ -225,7 +238,8 @@ async fn sweep(
                 tracing::error!(
                     pool = %pool_id, tx = ?m.tx, nonce = m.nonce,
                     "pool top-up unconfirmed; holding further top-ups until it has a \
-                     receipt or its nonce is used: {}",
+                     receipt, its nonce is used, or the keeper re-sends it at a vacant \
+                     nonce: {}",
                     sanitize_err_chain(&e)
                 );
             } else {
@@ -241,7 +255,7 @@ async fn sweep(
 
 /// What the RPC node shows of a held top-up.
 enum Read {
-    /// The top-up's hash is known: where the node says it stands.
+    /// The latest hash is known: where the node says it stands.
     Hash(TxHash, TxState),
     /// No hash: the node can show nothing of it.
     NoHash,
@@ -262,9 +276,10 @@ async fn settle(
     clock: &dyn Clock,
 ) -> bool {
     let nonce = held.nonce;
-    // The confirmed nonce is read first: a transaction that mines between
-    // the reads then shows as mined, or as a used nonce, never as replaced
-    // or as vacant.
+    // The confirmed nonce is read first, and the pending nonce last (in
+    // `settle_unseen`): a transaction that mines between the reads then
+    // shows as mined when its hash is known, or as still held, never as a
+    // used nonce and never as vacant.
     let read = async {
         let confirmed = pool.confirmed_nonce().await?;
         let state = match held.tx {
@@ -304,11 +319,25 @@ async fn settle(
         }
         // A used nonce settles it whatever the node says of the hash: a
         // stale or load-balanced node can still report a replaced `topUp` as
-        // pending, or not yet have the receipt of one that mined. It is not
-        // counted as a top-up; the next sweep reads the balance either way.
+        // pending, or not yet have the receipt of one that mined. An earlier
+        // send at the nonce that has a receipt is counted; otherwise the
+        // top-up is not counted, and the next sweep reads the balance either
+        // way.
         Read::Hash(tx, TxState::Pending { .. } | TxState::Unknown) if confirmed > nonce => {
+            if let Some(mined) = earlier_mined(pool, pool_id, held, status).await {
+                status.topups.fetch_add(1, Ordering::Relaxed);
+                status
+                    .last_topup_unix
+                    .store(clock.now_unix(), Ordering::Relaxed);
+                tracing::info!(
+                    pool = %pool_id, tx = %mined, latest = %tx, nonce,
+                    "an earlier send of the unconfirmed pool top-up mined at nonce {nonce}; \
+                     the latest re-send {tx} never will"
+                );
+                return false;
+            }
             tracing::warn!(
-                pool = %pool_id, %tx, nonce, confirmed,
+                pool = %pool_id, %tx, nonce, confirmed, earlier = ?held.earlier,
                 "the RPC node has no receipt for pool top-up {tx}, but its nonce {nonce} \
                  is used, so it has mined or never will; resuming top-ups"
             );
@@ -340,6 +369,31 @@ async fn settle(
     }
 }
 
+/// The earlier send at the nonce the node has a receipt for, if any, newest
+/// first. A failed read is counted and logged, and reads as no receipt.
+async fn earlier_mined(
+    pool: &dyn PoolChain,
+    pool_id: B256,
+    held: &Unconfirmed,
+    status: &KeeperStatus,
+) -> Option<TxHash> {
+    for tx in held.earlier.iter().rev() {
+        match pool.transaction(*tx).await {
+            Ok(TxState::Mined) => return Some(*tx),
+            Ok(_) => {}
+            Err(e) => {
+                status.failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    pool = %pool_id, %tx,
+                    "receipt read of an earlier send of the unconfirmed pool top-up failed: {}",
+                    sanitize_err_chain(&e)
+                );
+            }
+        }
+    }
+    None
+}
+
 /// Settle a held top-up the RPC node shows no transaction of, by where its
 /// nonce stands against the treasury's; returns whether the hold stays.
 #[expect(
@@ -356,20 +410,21 @@ async fn settle_unseen(
     held_secs: u64,
 ) -> bool {
     let nonce = held.nonce;
-    // How many 0-value self-transfers clear the hold when the top-up was
-    // dropped: one per unfilled nonce up to and including the top-up's.
-    let self_transfers = nonce.saturating_add(1).saturating_sub(confirmed);
     // An earlier nonce is unfilled, so nothing at the top-up's can mine yet,
-    // and the mempool says nothing about it.
+    // and the pending count cannot say whether the mempool holds it.
     if confirmed < nonce {
+        // One 0-value self-transfer per unfilled nonce, the top-up's
+        // included, clears the hold whatever holds them.
+        let self_transfers = nonce.saturating_add(1).saturating_sub(confirmed);
         tracing::error!(
             pool = %pool_id, tx = ?held.tx, nonce, confirmed, held_secs,
             "the unconfirmed pool top-up at nonce {nonce} cannot mine yet: the treasury's \
              confirmed nonce is {confirmed}, so an earlier nonce is unfilled; holding \
-             further top-ups. If the transaction at that nonce was dropped, send 0-value \
-             transactions from the treasury to itself; once nonce {nonce} is next the \
-             keeper re-sends the top-up if nothing holds it, and {self_transfers} at most \
-             clear the hold"
+             further top-ups. If the transaction at an earlier nonce was dropped or is \
+             stuck, send a 0-value transaction from the treasury to itself at each \
+             unfilled nonce from {confirmed} on, priced above any transaction it \
+             replaces; once nonce {nonce} is next the keeper re-sends the top-up if \
+             nothing holds it ({self_transfers} at most clear the hold)"
         );
         return true;
     }
@@ -380,8 +435,9 @@ async fn settle_unseen(
         Err(e) => {
             status.failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                pool = %pool_id, tx = ?held.tx, nonce,
-                "unconfirmed pool top-up check failed; still holding top-ups: {}",
+                pool = %pool_id, tx = ?held.tx, nonce, held_secs,
+                "pending-nonce check of the unconfirmed pool top-up failed; still holding \
+                 top-ups: {}",
                 sanitize_err_chain(&e)
             );
             return true;
@@ -392,28 +448,35 @@ async fn settle_unseen(
     // re-send there cannot escrow twice; the receipt of whichever mines
     // settles the hold.
     if pending <= nonce {
-        return resend_at_nonce(pool, pool_id, refill, held, status).await;
+        return resend_at_nonce(pool, pool_id, refill, held, status, held_secs).await;
     }
+    // A transaction the mempool drops frees the nonce, and the next sweep
+    // re-sends; only one that stays stuck needs an operator.
     tracing::error!(
         pool = %pool_id, tx = ?held.tx, nonce, confirmed, pending, held_secs,
         "the RPC node shows no transaction of the unconfirmed pool top-up at nonce \
          {nonce}, but its mempool holds a transaction at that nonce, which may be the \
          top-up; holding further top-ups. The keeper re-sends the top-up once nothing \
-         holds the nonce. If that transaction was dropped, send 0-value transactions \
-         from the treasury to itself until the confirmed nonce passes {nonce} \
-         ({self_transfers} at most); the hold then clears"
+         holds the nonce. If that transaction stays stuck, replace it: send a 0-value \
+         transaction from the treasury to itself at nonce {nonce} with a higher fee; the \
+         hold clears once the nonce is used"
     );
     true
 }
 
 /// Re-send the held top-up at its vacant nonce and record the hash on the
 /// hold; returns whether the hold stays.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "one branch per send outcome, each with its own log event; the tracing macros' expansion is most of the score"
+)]
 async fn resend_at_nonce(
     pool: &dyn PoolChain,
     pool_id: B256,
     refill: MicroUsdc,
     held: &mut Unconfirmed,
     status: &KeeperStatus,
+    held_secs: u64,
 ) -> bool {
     let nonce = held.nonce;
     match pool.send_top_up_at(pool_id, refill, nonce).await {
@@ -423,7 +486,12 @@ async fn resend_at_nonce(
                 "no transaction holds nonce {nonce} of the unconfirmed pool top-up; re-sent \
                  topUp at that nonce as {tx}; holding further top-ups until it has a receipt"
             );
-            held.tx = Some(tx);
+            if let Some(previous) = held.tx.replace(tx) {
+                if held.earlier.len() >= MAX_EARLIER_TXS {
+                    held.earlier.remove(0);
+                }
+                held.earlier.push(previous);
+            }
             true
         }
         Err(e) if e.downcast_ref::<PoolNotOpen>().is_some() => {
@@ -437,12 +505,38 @@ async fn resend_at_nonce(
             );
             false
         }
+        // The re-send may be in a mempool without its hash known here, as the
+        // first send may be; the nonce still settles both.
+        Err(e) if e.downcast_ref::<TopUpUnconfirmed>().is_some() => {
+            status.failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                pool = %pool_id, tx = ?held.tx, nonce, held_secs,
+                "re-sending the pool top-up at nonce {nonce} got an answer that leaves its \
+                 broadcast unknown; it or an earlier send may hold the nonce; holding \
+                 further top-ups until the nonce is used: {}",
+                sanitize_err_chain(&e)
+            );
+            true
+        }
+        Err(e) if e.downcast_ref::<AllowanceShortfall>().is_some() => {
+            status.failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                pool = %pool_id, tx = ?held.tx, nonce, held_secs,
+                "re-sending the pool top-up at nonce {nonce} reverted: the treasury's USDC \
+                 allowance to the PaymentPool is below the refill; approve it again from \
+                 the treasury (that transaction takes nonce {nonce}, which settles the \
+                 hold, and the next sweep tops up): {}",
+                sanitize_err_chain(&e)
+            );
+            true
+        }
         Err(e) => {
             status.failures.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                pool = %pool_id, nonce,
+            tracing::error!(
+                pool = %pool_id, tx = ?held.tx, nonce, held_secs,
                 "no transaction holds nonce {nonce} of the unconfirmed pool top-up, and \
-                 re-sending it failed; still holding top-ups: {}",
+                 re-sending it failed; holding further top-ups and re-sending on the next \
+                 sweep. Check the treasury's USDC and gas balances: {}",
                 sanitize_err_chain(&e)
             );
             true

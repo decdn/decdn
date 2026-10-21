@@ -1114,8 +1114,9 @@ since project inception and will roll into the first tagged release.
   that receipt; two transactions at one nonce cannot both mine, so the
   re-send cannot escrow twice. A re-send that reverts `PoolNotOpen` ends
   the hold, since the pool accepts no funds; any other failure is retried
-  next sweep. Self-transfers are needed only while the node's mempool holds
-  a transaction at the nonce, or an earlier nonce is unfilled.
+  next sweep. An operator steps in only when a transaction stays stuck at
+  the nonce, or an earlier nonce is unfilled: a 0-value self-transfer at
+  that nonce, priced above the stuck one, clears it.
 - **Payments: a send the RPC node answers with `nonce too low` or
   `replacement transaction underpriced` is reported as possibly broadcast, and
   an `openPool` or `topUp` that gets either is not sent again (#2562, #2565).**

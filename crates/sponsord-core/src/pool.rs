@@ -178,8 +178,12 @@ pub trait PoolChain: Send + Sync {
     /// hash without waiting for a receipt. The keeper re-sends a held top-up
     /// whose nonce no transaction holds; two transactions at one nonce cannot
     /// both mine. The allowance approved for the first send stands, so none
-    /// is approved here. A `PoolNotOpen` revert carries
-    /// [`decdn_client::buyer_pool::PoolNotOpen`].
+    /// is approved here. A revert carries the markers `top_up`'s submit
+    /// errors carry: [`decdn_client::buyer_pool::PoolNotOpen`] (the keeper
+    /// ends the hold) and [`decdn_client::buyer_pool::AllowanceShortfall`]
+    /// (the keeper retries next sweep). An answer that leaves the broadcast
+    /// unknown carries [`decdn_client::buyer_pool::TopUpUnconfirmed`] with no
+    /// hash, as a first send's does.
     async fn send_top_up_at(
         &self,
         pool_id: B256,
@@ -367,7 +371,18 @@ impl PoolChain for ChainPool {
             nonce,
         )
         .await
-        .map_err(|e| redacted_top_up(format!("re-send top up {pool_id} at nonce {nonce}"), &e))
+        .map_err(|e| {
+            // The client leaves a broadcast-unknown answer unmarked, since its
+            // caller holds the nonce and reads it again; the keeper tells it
+            // from a rejection by the marker, so it is attached here.
+            let e = match e.downcast_ref::<alloy::contract::Error>() {
+                Some(c) if decdn_incentive::tx::send_broadcast_unknown(c) => {
+                    e.context(TopUpUnconfirmed { tx: None, nonce })
+                }
+                _ => e,
+            };
+            redacted_top_up(format!("re-send top up {pool_id} at nonce {nonce}"), &e)
+        })
     }
 }
 
