@@ -1687,7 +1687,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// [`Self::entry_targets`] before a failure is sorted into a configuration
     /// fault or an empty start.
     async fn resolve_entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
-        match &self.nodes.0 {
+        match &self.nodes.selection {
             super::Selection::Pinned(pinned) => Ok(pinned_targets(pinned.node_id, pinned.provider)),
             super::Selection::Registry(registry) => {
                 // The entry's round streams: its fetch starts at the first
