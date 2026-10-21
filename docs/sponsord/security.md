@@ -31,9 +31,9 @@ Anyone who gets capabilities can spend, at most:
   `sponsord_pool_topups_total`. While the daemon runs, a top-up whose
   receipt could not be read holds the next one until it mines or can no
   longer mine, so one refill is not sent twice. A top-up whose submit
-  returned no tx hash is held too, and re-sent at its nonce once no
-  transaction holds it; one whose chain reads failed before the send is not
-  held, since nothing was signed. The hold is kept in memory: a restart
+  returned no tx hash is held too; one the node shows no transaction of is
+  re-sent at its nonce once nothing holds it. A top-up whose chain reads
+  failed before the send is not held, since nothing was signed. The hold is kept in memory: a restart
   while that transaction may still mine allows a second refill (see [the
   operator guide, §5](operator.md#5-monitor)).
 

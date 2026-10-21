@@ -1107,14 +1107,15 @@ since project inception and will roll into the first tagged release.
   ended only when the treasury's confirmed nonce passed the nonce it was
   sent with, which never happens on its own when the transaction was not
   broadcast, so every further top-up waited for an operator's 0-value
-  self-transfers. The keeper now reads the pending nonce too and, when the
-  confirmed and pending nonces both equal that nonce, re-sends the `topUp`
-  at it and settles the hold by that receipt; two transactions at one nonce
-  cannot both mine, so the re-send cannot escrow twice. A re-send that
-  reverts `PoolNotOpen` ends the hold, since the pool accepts no funds; any
-  other failure is retried next sweep. Self-transfers are needed only while
-  another transaction holds the nonce, or the node does not know a `topUp`
-  whose hash the keeper has.
+  self-transfers; a `topUp` whose hash the node did not know was held the
+  same way. The keeper now reads the pending nonce too for a top-up the
+  node shows no transaction of and, when the confirmed and pending nonces
+  both equal that nonce, re-sends the `topUp` at it and settles the hold by
+  that receipt; two transactions at one nonce cannot both mine, so the
+  re-send cannot escrow twice. A re-send that reverts `PoolNotOpen` ends
+  the hold, since the pool accepts no funds; any other failure is retried
+  next sweep. Self-transfers are needed only while the node's mempool holds
+  a transaction at the nonce, or an earlier nonce is unfilled.
 - **Payments: a send the RPC node answers with `nonce too low` or
   `replacement transaction underpriced` is reported as possibly broadcast, and
   an `openPool` or `topUp` that gets either is not sent again (#2562, #2565).**

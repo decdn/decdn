@@ -158,8 +158,9 @@ or until the treasury's confirmed nonce has passed the nonce it was sent
 with. The `error` log line names the nonce, and the transaction when the
 node returned its hash.
 
-The hold clears by itself once the transaction mines. A top-up whose submit
-returned no tx hash is re-sent by the keeper: once the treasury's confirmed
+The hold clears by itself once the transaction mines. A top-up the RPC node
+shows no transaction of (its submit returned no tx hash, or the node does
+not know the hash) is re-sent by the keeper: once the treasury's confirmed
 and pending nonces both equal the nonce it was sent with, no transaction
 holds that nonce, so the keeper sends `topUp` again at it and settles the
 hold on that receipt; the `info` log line names the new transaction. Two
@@ -167,15 +168,14 @@ transactions at one nonce cannot both mine, so the pool cannot be refilled
 twice. A re-send that reverts `PoolNotOpen` ends the hold: the pool is
 closing or closed and accepts no funds.
 
-The hold stays while a different transaction holds the nonce (the `error`
-log line names the confirmed and pending nonces) or the RPC node does not
-know a transaction whose hash the keeper has. If that transaction was
-dropped, send 0-value transactions from the treasury to itself until the
-hold clears. The log says how many it takes at most. Each one takes the
-next nonce, so a transaction still pending elsewhere either mines first or
-can never mine. Do not restart `sponsord` to clear the hold: a restart
-forgets it, and if the transaction is still pending somewhere the pool can
-be refilled twice.
+The hold stays while the node's mempool holds a transaction at the nonce
+(the `error` log line names the confirmed and pending nonces) or an earlier
+nonce is unfilled. If that transaction was dropped, send 0-value
+transactions from the treasury to itself until the hold clears. The log
+says how many it takes at most. Each one takes the next nonce, so a
+transaction still pending elsewhere either mines first or can never mine.
+Do not restart `sponsord` to clear the hold: a restart forgets it, and if
+the transaction is still pending somewhere the pool can be refilled twice.
 
 ## 6. Upgrades
 

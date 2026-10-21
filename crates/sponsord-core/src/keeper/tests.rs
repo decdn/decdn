@@ -215,10 +215,13 @@ async fn a_top_up_whose_nonce_was_used_by_another_tx_clears_the_hold() {
     pool.set_tx_state(TxState::Pending { nonce: 10 });
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
 
-    // Gone from the node, but nonce 10 is not used yet: it may come back.
+    // Gone from the node, whose mempool holds a transaction at nonce 10 that
+    // is not used yet: it may come back.
     pool.set_tx_state(TxState::Unknown);
+    pool.set_pending_tx_count(11);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert!(held.is_some());
+    assert!(pool.top_up_resends().is_empty());
 
     // Nonce 10 mined with another transaction: this one never can. The
     // sweep that learns it still sends nothing; the next one tops up.
@@ -261,11 +264,16 @@ async fn a_top_up_the_node_never_returned_clears_once_its_nonce_is_used() {
     let _guard = log.install();
     let (pool, status, mut held) = held_pool().await;
     let clock = FixedClock::new(2_000);
-    // Unknown from the start, so only its nonce settles it. The log says
-    // how many self-transfers would clear it.
+    // Unknown from the start, while the node's mempool holds a transaction
+    // at its nonce (the top-up, through another backend, or a replacement):
+    // only its nonce settles it. The log says how many self-transfers would
+    // clear it.
+    pool.set_pending_tx_count(11);
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert!(held.is_some());
+    assert!(pool.top_up_resends().is_empty());
     let text = log.text();
+    assert!(text.contains("mempool holds"), "{text}");
     assert!(text.contains("send 0-value transactions"), "{text}");
     assert!(text.contains("passes 10 (1 at most)"), "{text}");
 
@@ -299,7 +307,7 @@ async fn a_top_up_lost_in_transport_is_held_while_a_transaction_holds_its_nonce(
     assert_eq!(pool.top_up_calls(), 1);
     assert!(pool.top_up_resends().is_empty());
     let text = log.text();
-    assert!(text.contains("holds or precedes"), "{text}");
+    assert!(text.contains("mempool holds"), "{text}");
     assert!(text.contains("passes 10 (1 at most)"), "{text}");
 
     // Nonce 10 is used: it mined or never will. Unknown which, so it is
@@ -378,10 +386,55 @@ async fn a_re_send_that_reverts_pool_not_open_ends_the_hold() {
     assert!(held.is_none());
     assert_eq!(pool.top_up_resends(), vec![10]);
     let s = status.snapshot();
-    assert_eq!((s.failures, s.topup_unconfirmed_since_unix), (1, 0));
+    assert_eq!((s.failures, s.topup_unconfirmed_since_unix), (2, 0));
     let text = log.text();
     assert!(text.contains("PoolNotOpen"), "{text}");
     assert!(!text.contains("rpc.example"), "{text}");
+}
+
+/// A held top-up whose hash the node does not know is re-sent under the
+/// same rule as a hashless one: its nonce is next and nothing holds it.
+#[tokio::test]
+async fn a_top_up_the_node_does_not_know_is_re_sent_once_its_nonce_is_vacant() {
+    let log = CapturedLog::default();
+    let _guard = log.install();
+    let (pool, status, mut held) = held_pool().await;
+    let clock = FixedClock::new(2_000);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert_eq!(pool.top_up_resends(), vec![10]);
+    assert_eq!(held.map(|h| h.tx), Some(Some(FAKE_RESENT_TOPUP_TX)));
+    let text = log.text();
+    assert!(text.contains("re-sent topUp"), "{text}");
+    assert!(
+        text.contains(&FAKE_TOPUP_TX.to_string()),
+        "names the first hash: {text}"
+    );
+
+    pool.set_tx_state(TxState::Mined);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert!(held.is_none());
+    assert_eq!(status.snapshot().topups, 1);
+}
+
+/// A re-sent top-up the node drops in turn is re-sent again, not held for
+/// an operator.
+#[tokio::test]
+async fn a_re_sent_top_up_the_node_drops_is_re_sent_again() {
+    let (pool, status, mut held) = lost_pool().await;
+    let clock = FixedClock::new(2_000);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert_eq!(pool.top_up_resends(), vec![10]);
+
+    // The node does not know the re-send either, and nothing holds nonce 10.
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert_eq!(pool.top_up_resends(), vec![10, 10]);
+    assert_eq!(held.map(|h| h.tx), Some(Some(FAKE_RESENT_TOPUP_TX)));
+
+    pool.set_tx_state(TxState::Mined);
+    sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
+    assert!(held.is_none());
+    assert_eq!(status.snapshot().topups, 1);
+    assert_eq!(pool.top_up_calls(), 1);
 }
 
 /// A re-send that fails in transport leaves the hold as it was; the next
@@ -421,11 +474,9 @@ async fn a_queued_hashless_top_up_is_held_without_a_re_send() {
     sweep(&pool, TEST_POOL_ID, &CFG, &status, &clock, &mut held).await;
     assert_eq!(held.map(|h| h.tx), Some(None));
     assert!(pool.top_up_resends().is_empty());
-    assert!(
-        log.text().contains("passes 10 (2 at most)"),
-        "{}",
-        log.text()
-    );
+    let text = log.text();
+    assert!(text.contains("cannot mine yet"), "{text}");
+    assert!(text.contains("2 at most"), "{text}");
 }
 
 /// Read in the other order, a lost top-up that mines between the reads
@@ -544,6 +595,8 @@ async fn a_top_up_that_mines_between_the_reads_counts_as_mined() {
 async fn run_keeps_the_hold_across_ticks() {
     let pool = Arc::new(FakePool::new(Address::repeat_byte(1), 0));
     pool.unconfirm_top_ups(true);
+    // The node's mempool holds a transaction at the top-up's nonce 0.
+    pool.set_pending_tx_count(1);
     let status = Arc::new(KeeperStatus::default());
     let shutdown = CancellationToken::new();
     let task = tokio::spawn(run(
@@ -557,10 +610,11 @@ async fn run_keeps_the_hold_across_ticks() {
     assert_eq!(pool.top_up_calls(), 1);
     assert_ne!(status.snapshot().topup_unconfirmed_since_unix, 0);
 
-    // Three more ticks: the top-up is unknown and its nonces unused.
+    // Three more ticks: the top-up is unknown, its nonce held and unused.
     pool.unconfirm_top_ups(false);
     tokio::time::sleep(CFG.interval * 3).await;
     assert_eq!(pool.top_up_calls(), 1);
+    assert!(pool.top_up_resends().is_empty());
     assert_ne!(status.snapshot().topup_unconfirmed_since_unix, 0);
 
     // It mines: the next tick clears the hold, the one after tops up.
