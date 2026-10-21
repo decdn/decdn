@@ -2,16 +2,19 @@
 //! reads the pool's remaining balance, tops the pool up from the treasury
 //! (the hot wallet that owns the pool), reads the pool's owner (a boot-time
 //! sanity check), and reads a signer's registration. It also reads where a
-//! broadcast transaction stands and the treasury's confirmed nonce, which
-//! the keeper uses to settle a top-up it could not confirm. `ChainPool`
-//! backs it in production; tests use `test_support::FakePool`.
+//! broadcast transaction stands and the treasury's confirmed and pending
+//! nonces, and re-sends a `topUp` at a given nonce, which the keeper uses to
+//! settle a top-up it could not confirm. `ChainPool` backs it in production;
+//! tests use `test_support::FakePool`.
 
 use alloy::consensus::Transaction as _;
 use alloy::network::{EthereumWallet, TxSigner};
 use alloy::primitives::{Address, B256, Signature, TxHash, U256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use async_trait::async_trait;
-use decdn_client::buyer_pool::{AllowanceShortfall, TopUpUnconfirmed, ensure_allowance, top_up};
+use decdn_client::buyer_pool::{
+    AllowanceShortfall, PoolNotOpen, TopUpUnconfirmed, ensure_allowance, top_up,
+};
 use decdn_common::redact::strip_urls;
 use decdn_incentive::payment_pool::PaymentPool;
 use sponsord_api::MicroUsdc;
@@ -27,7 +30,7 @@ pub struct Authorization {
 }
 
 /// Render a chain-call error and its causes as `a: b: c`, without the RPC URL
-/// that reqwest's message names (#38). The causes carry the failure class
+/// that reqwest's message names (decdn/sponsord#38). The causes carry the failure class
 /// (connection refused, timeout, DNS, TLS) that the outer error's Display
 /// leaves out. Each is stripped on its own, so a removed URL cannot take the
 /// separator with it, and a cause that repeats the error before it (alloy's
@@ -51,20 +54,26 @@ fn redacted_parts(err: &(dyn std::error::Error + 'static)) -> Vec<String> {
 
 /// [`redacted`] for a `decdn_client` top-up error, keeping the typed markers
 /// a caller downcasts on: [`TopUpUnconfirmed`] (the `topUp` was broadcast and
-/// may have mined) and [`AllowanceShortfall`].
+/// may have mined), [`AllowanceShortfall`], and [`PoolNotOpen`] (the pool
+/// accepts no funds, so the keeper ends a hold on it).
 fn redacted_top_up(context: String, err: &anyhow::Error) -> anyhow::Error {
     let unconfirmed = err.downcast_ref::<TopUpUnconfirmed>().copied();
     let shortfall = err.downcast_ref::<AllowanceShortfall>().copied();
+    let not_open = err.downcast_ref::<PoolNotOpen>().copied();
     // Each marker is re-attached below, so leave its text out of the cause.
     let markers = [
         unconfirmed.map(|m| m.to_string()),
         shortfall.map(|m| m.to_string()),
+        not_open.map(|m| m.to_string()),
     ];
     let cause: Vec<String> = redacted_parts(err.as_ref())
         .into_iter()
         .filter(|part| !markers.iter().flatten().any(|m| m == part))
         .collect();
     let mut out = anyhow::Error::msg(cause.join(": "));
+    if let Some(m) = not_open {
+        out = out.context(m);
+    }
     if let Some(m) = shortfall {
         out = out.context(m);
     }
@@ -158,6 +167,29 @@ pub trait PoolChain: Send + Sync {
     /// The treasury's confirmed transaction count (its nonce at the latest
     /// block): every nonce below it has been used by a mined transaction.
     async fn confirmed_nonce(&self) -> anyhow::Result<u64>;
+
+    /// The treasury's pending transaction count (its nonce at the pending
+    /// block): the confirmed count plus the transactions the RPC node's
+    /// mempool holds for it in nonce order. Equal to the confirmed count when
+    /// the node holds none.
+    async fn pending_nonce(&self) -> anyhow::Result<u64>;
+
+    /// Send `topUp(pool_id, additional)` at exactly `nonce` and return its
+    /// hash without waiting for a receipt. The keeper re-sends a held top-up
+    /// whose nonce no transaction holds; two transactions at one nonce cannot
+    /// both mine. The allowance approved for the first send stands, so none
+    /// is approved here. A revert carries the markers `top_up`'s submit
+    /// errors carry: [`decdn_client::buyer_pool::PoolNotOpen`] (the keeper
+    /// ends the hold) and [`decdn_client::buyer_pool::AllowanceShortfall`]
+    /// (the keeper retries next sweep). An answer that leaves the broadcast
+    /// unknown carries [`decdn_client::buyer_pool::TopUpUnconfirmed`] with no
+    /// hash, as a first send's does.
+    async fn send_top_up_at(
+        &self,
+        pool_id: B256,
+        additional: MicroUsdc,
+        nonce: u64,
+    ) -> anyhow::Result<TxHash>;
 }
 
 /// The `PaymentPool` contract, read through and paid into by the treasury
@@ -196,7 +228,7 @@ impl ChainPool {
         let owner = signer.address();
         // The URL stays out of every error `ChainPool` returns: RPC URLs often
         // carry an API key in their path or query. Here it is never formatted,
-        // and chain-call errors go through `redacted` (#38).
+        // and chain-call errors go through `redacted` (decdn/sponsord#38).
         let url = rpc_url.parse().map_err(|e| {
             anyhow::anyhow!(
                 "RPC URL ({} characters) is not a valid URL: {e}",
@@ -315,6 +347,42 @@ impl PoolChain for ChainPool {
             .latest()
             .await
             .map_err(|e| anyhow::anyhow!("read the treasury's nonce: {}", redacted(&e)))
+    }
+
+    async fn pending_nonce(&self) -> anyhow::Result<u64> {
+        self.provider
+            .get_transaction_count(self.owner)
+            .pending()
+            .await
+            .map_err(|e| anyhow::anyhow!("read the treasury's pending nonce: {}", redacted(&e)))
+    }
+
+    async fn send_top_up_at(
+        &self,
+        pool_id: B256,
+        additional: MicroUsdc,
+        nonce: u64,
+    ) -> anyhow::Result<TxHash> {
+        decdn_client::buyer_pool::send_top_up_at(
+            &self.contract,
+            self.owner,
+            pool_id,
+            U256::from(additional.0),
+            nonce,
+        )
+        .await
+        .map_err(|e| {
+            // The client leaves a broadcast-unknown answer unmarked, since its
+            // caller holds the nonce and reads it again; the keeper tells it
+            // from a rejection by the marker, so it is attached here.
+            let e = match e.downcast_ref::<alloy::contract::Error>() {
+                Some(c) if decdn_incentive::tx::send_broadcast_unknown(c) => {
+                    e.context(TopUpUnconfirmed { tx: None, nonce })
+                }
+                _ => e,
+            };
+            redacted_top_up(format!("re-send top up {pool_id} at nonce {nonce}"), &e)
+        })
     }
 }
 

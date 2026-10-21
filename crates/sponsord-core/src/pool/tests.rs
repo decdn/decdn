@@ -18,7 +18,7 @@ async fn a_malformed_rpc_url_stays_out_of_the_error() {
 }
 
 /// reqwest names the URL in a transport error; the key in its path must
-/// not survive into `ChainPool`'s error (#38).
+/// not survive into `ChainPool`'s error (decdn/sponsord#38).
 #[tokio::test]
 async fn an_unreachable_rpc_url_stays_out_of_the_error() {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -111,13 +111,27 @@ fn a_top_up_error_keeps_its_markers_but_not_the_url() {
     assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none());
     assert!(!format!("{err:#}").contains("rpc.example"));
 
+    let closed = anyhow::Error::new(chain(&[REQWEST]))
+        .context("re-send topUp at nonce 7")
+        .context(PoolNotOpen);
+    let err = redacted_top_up("top up 0x11".to_owned(), &closed);
+    assert!(err.downcast_ref::<PoolNotOpen>().is_some());
+    assert!(err.downcast_ref::<TopUpUnconfirmed>().is_none());
+    let shown = format!("{err:#}");
+    assert!(!shown.contains("rpc.example"), "{shown}");
+    assert_eq!(
+        shown,
+        format!("top up 0x11: {PoolNotOpen}: re-send topUp at nonce 7: error sending request")
+    );
+
     let plain = redacted_top_up("top up 0x11".to_owned(), &anyhow::anyhow!("{REQWEST}"));
     assert!(plain.downcast_ref::<AllowanceShortfall>().is_none());
+    assert!(plain.downcast_ref::<PoolNotOpen>().is_none());
     assert_eq!(format!("{plain:#}"), "top up 0x11: error sending request");
 }
 
 /// Every chain call names the RPC URL when it fails; none of
-/// `ChainPool`'s errors may carry it (#38).
+/// `ChainPool`'s errors may carry it (decdn/sponsord#38).
 #[tokio::test]
 async fn no_chain_pool_error_names_the_rpc_url() {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -144,6 +158,11 @@ async fn no_chain_pool_error_names_the_rpc_url() {
         pool.authorization(id, owner).await.err().unwrap(),
         pool.transaction(TxHash::ZERO).await.err().unwrap(),
         pool.confirmed_nonce().await.err().unwrap(),
+        pool.pending_nonce().await.err().unwrap(),
+        pool.send_top_up_at(id, MicroUsdc(1), 0)
+            .await
+            .err()
+            .unwrap(),
     ];
     for err in errors {
         let err = format!("{err:#}");

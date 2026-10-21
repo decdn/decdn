@@ -147,24 +147,37 @@ and on the treasury wallet's own balance.
 Also alert on `sponsord_pool_topup_unconfirmed_since_unix` staying non-zero.
 It means the keeper may have broadcast a `topUp` but does not know that it
 mined: it could not read the receipt, or the submission returned no tx hash
-(the send request failed in transport after the RPC node may have accepted it,
-or the RPC node answered `already known`, `nonce too low` or `replacement
+(the send request failed in transport after the RPC node may have accepted
+it, or the RPC node answered `already known`, `nonce too low` or `replacement
 transaction underpriced`, each of which can be the answer to a gateway retry
-of a send another backend accepted). A top-up
-whose chain reads failed before the send is not held: nothing was signed. A
-second top-up could refill the
+of a send another backend accepted). A top-up whose chain reads failed before
+the send is not held: no `topUp` was signed. A second top-up could refill the
 pool twice, so the keeper sends none until that transaction has a receipt,
-or until the treasury's confirmed nonce has passed the nonce it was sent
-with. The `error` log line names the nonce, and the transaction when the
-node returned its hash.
+until the treasury's confirmed nonce has passed the nonce it was sent with,
+or until it re-sends the `topUp` at a vacant nonce (below). The `error` log
+line names the nonce, and the transaction when the node returned its hash.
 
-The hold clears by itself once the transaction mines. If it was dropped
-instead, nothing else uses its nonce, so send 0-value transactions from the
-treasury to itself until the hold clears. The log says how many it takes at
-most. Each one takes the next nonce, so a transaction still pending
-elsewhere either mines first or can never mine. Do not restart `sponsord`
-to clear the hold: a restart forgets it, and if the transaction is still
-pending somewhere the pool can be refilled twice.
+The hold clears by itself once the transaction mines. A top-up the RPC node
+shows no transaction of (its submit returned no tx hash, or the node does
+not know the hash) is re-sent by the keeper: once the treasury's confirmed
+and pending nonces both equal the nonce it was sent with, no transaction
+holds that nonce, so the keeper sends `topUp` again at it and settles the
+hold on that receipt; the `info` log line names the new transaction. Two
+transactions at one nonce cannot both mine, so the pool cannot be refilled
+twice. A re-send that reverts `PoolNotOpen` ends the hold: the pool is
+closing or closed and accepts no funds. A re-send that fails otherwise is
+retried on the next sweep; the `error` log line says what to check.
+
+The hold stays while the node's mempool holds a transaction at the nonce
+(the `error` log line names the confirmed and pending nonces) or an earlier
+nonce is unfilled. A transaction the mempool drops frees the nonce, and the
+keeper re-sends. One that stays stuck needs replacing: send a 0-value
+transaction from the treasury to itself at the nonce the log names, priced
+above the transaction it replaces (with an earlier nonce unfilled, one at
+each unfilled nonce; the log says how many at most). A transaction still
+pending elsewhere at that nonce either mines first or can never mine. Do not
+restart `sponsord` to clear the hold: a restart forgets it, and if the
+transaction is still pending somewhere the pool can be refilled twice.
 
 ## 6. Upgrades
 

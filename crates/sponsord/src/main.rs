@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 /// instead of returning it, which would let std's `Termination` impl
 /// Debug-print it unredacted. `ChainPool` already strips the RPC URL, whose
 /// path or query often holds an API key, from its errors; this is the
-/// backstop for any other error that names it (#38).
+/// backstop for any other error that names it (decdn/sponsord#38).
 #[tokio::main]
 #[expect(
     clippy::print_stderr,
@@ -31,7 +31,7 @@ async fn main() -> std::process::ExitCode {
 /// `RUST_LOG` filtering, as `tracing_subscriber::fmt::init` does, with
 /// `alloy_transport_http` held at `info` whatever `RUST_LOG` says: it logs
 /// only at debug and trace, inside a `debug_span!` that records the RPC URL,
-/// and every event inside that span (reqwest's, hyper's) would print it (#38).
+/// and every event inside that span (reqwest's, hyper's) would print it (decdn/sponsord#38).
 fn init_tracing() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive("alloy_transport_http=info".parse()?);

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use alloy::primitives::{Address, B256, TxHash};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
-use decdn_client::buyer_pool::TopUpUnconfirmed;
+use decdn_client::buyer_pool::{AllowanceShortfall, PoolNotOpen, TopUpUnconfirmed};
 use decdn_incentive::voucher_domain;
 use sponsord_api::MicroUsdc;
 
@@ -35,12 +35,31 @@ pub const TEST_POOL_ID: B256 = B256::repeat_byte(0x11);
 pub const FAKE_RPC_URL: &str = "http://rpc.example/v3/FAKE-RPC-KEY";
 /// The `topUp` transaction an unconfirmed `FakePool` top-up names.
 pub const FAKE_TOPUP_TX: TxHash = TxHash::repeat_byte(0xAB);
+/// The `topUp` transaction a `FakePool` re-send at a nonce returns.
+pub const FAKE_RESENT_TOPUP_TX: TxHash = TxHash::repeat_byte(0xAC);
+
+/// How [`FakePool::fail_resends`] makes `send_top_up_at` fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResendFailure {
+    /// The send request fails in transport, naming [`FAKE_RPC_URL`].
+    Transport,
+    /// It reverts; the error carries decdn's `PoolNotOpen`.
+    PoolNotOpen,
+    /// It reverts on a short allowance; the error carries decdn's
+    /// `AllowanceShortfall`.
+    AllowanceShort,
+    /// The node answers `already known`; the error carries decdn's
+    /// `TopUpUnconfirmed` with no transaction.
+    Unknown,
+}
 
 /// In-memory pool: fixed owner, a mutable remaining balance, a settable
-/// per-signer registration map, a settable transaction state and confirmed
-/// nonce, and switches to fail reads or top-ups. A failure reads like a raw
-/// reqwest transport error naming [`FAKE_RPC_URL`]: unlike `ChainPool`, it
-/// does not redact, so tests exercise the log sites' own redaction.
+/// per-signer registration map, a settable transaction state (for every
+/// hash, or one), confirmed and pending nonces, a record of each re-send at
+/// a nonce, and switches to fail reads, top-ups or re-sends. A failure reads
+/// like a raw reqwest transport error naming [`FAKE_RPC_URL`]: unlike
+/// `ChainPool`, it does not redact, so tests exercise the log sites' own
+/// redaction.
 #[derive(Debug)]
 pub struct FakePool {
     owner: Address,
@@ -52,9 +71,16 @@ pub struct FakePool {
     unconfirm_top_up: AtomicBool,
     lose_top_up_submit: AtomicBool,
     fail_tx_reads: AtomicBool,
+    fail_pending_read: AtomicBool,
+    resend_failure: Mutex<Option<ResendFailure>>,
     tx_state: Mutex<TxState>,
+    /// Per-hash states that override `tx_state`.
+    tx_states: Mutex<HashMap<TxHash, TxState>>,
     pub(crate) confirmed_nonce: AtomicU64,
+    /// `None` reports the confirmed count: nothing is in the mempool.
+    pending_tx_count: Mutex<Option<u64>>,
     top_up_calls: AtomicU64,
+    top_up_resends: Mutex<Vec<u64>>,
 }
 
 impl FakePool {
@@ -72,9 +98,14 @@ impl FakePool {
             unconfirm_top_up: AtomicBool::new(false),
             lose_top_up_submit: AtomicBool::new(false),
             fail_tx_reads: AtomicBool::new(false),
+            fail_pending_read: AtomicBool::new(false),
+            resend_failure: Mutex::new(None),
             tx_state: Mutex::new(TxState::Unknown),
+            tx_states: Mutex::new(HashMap::new()),
             confirmed_nonce: AtomicU64::new(0),
+            pending_tx_count: Mutex::new(None),
             top_up_calls: AtomicU64::new(0),
+            top_up_resends: Mutex::new(Vec::new()),
         }
     }
 
@@ -114,15 +145,26 @@ impl FakePool {
         self.lose_top_up_submit.store(lose, Ordering::SeqCst);
     }
 
-    /// Make every `transaction` and `confirmed_nonce` read fail (an RPC
-    /// outage).
+    /// Make every `transaction`, `confirmed_nonce` and `pending_nonce` read
+    /// fail (an RPC outage).
     pub fn fail_tx_reads(&self, fail: bool) {
         self.fail_tx_reads.store(fail, Ordering::SeqCst);
     }
 
-    /// What `transaction` reports, for any hash. Starts [`TxState::Unknown`].
+    /// Make every `pending_nonce` read fail while the other reads work.
+    pub fn fail_pending_reads(&self, fail: bool) {
+        self.fail_pending_read.store(fail, Ordering::SeqCst);
+    }
+
+    /// What `transaction` reports for a hash [`FakePool::set_tx_state_of`]
+    /// did not set. Starts [`TxState::Unknown`].
     pub fn set_tx_state(&self, state: TxState) {
         *self.tx_state.lock().unwrap() = state;
+    }
+
+    /// What `transaction` reports for `tx` alone.
+    pub fn set_tx_state_of(&self, tx: TxHash, state: TxState) {
+        self.tx_states.lock().unwrap().insert(tx, state);
     }
 
     /// What `confirmed_nonce` reports. Starts at 0. Named for the RPC's
@@ -132,10 +174,27 @@ impl FakePool {
         self.confirmed_nonce.store(count, Ordering::SeqCst);
     }
 
+    /// What `pending_nonce` reports. Until set, it is the confirmed count:
+    /// nothing is in the mempool.
+    pub fn set_pending_tx_count(&self, count: u64) {
+        *self.pending_tx_count.lock().unwrap() = Some(count);
+    }
+
+    /// How every `send_top_up_at` fails from now on; `None` lets it succeed.
+    pub fn fail_resends(&self, failure: Option<ResendFailure>) {
+        *self.resend_failure.lock().unwrap() = failure;
+    }
+
     /// How many times `top_up` has been called, failed or not.
     #[must_use]
     pub fn top_up_calls(&self) -> u64 {
         self.top_up_calls.load(Ordering::SeqCst)
+    }
+
+    /// The nonce of each `send_top_up_at` call so far, failed or not.
+    #[must_use]
+    pub fn top_up_resends(&self) -> Vec<u64> {
+        self.top_up_resends.lock().unwrap().clone()
     }
 
     /// The pool's current remaining balance.
@@ -200,12 +259,13 @@ impl PoolChain for FakePool {
         );
         Ok(self.registrations.lock().unwrap().get(&signer).copied())
     }
-    async fn transaction(&self, _tx: TxHash) -> anyhow::Result<TxState> {
+    async fn transaction(&self, tx: TxHash) -> anyhow::Result<TxState> {
         anyhow::ensure!(
             !self.fail_tx_reads.load(Ordering::SeqCst),
             "transaction read failed: error sending request for url ({FAKE_RPC_URL})"
         );
-        Ok(*self.tx_state.lock().unwrap())
+        let of_tx = self.tx_states.lock().unwrap().get(&tx).copied();
+        Ok(of_tx.unwrap_or_else(|| *self.tx_state.lock().unwrap()))
     }
     async fn confirmed_nonce(&self) -> anyhow::Result<u64> {
         anyhow::ensure!(
@@ -213,6 +273,43 @@ impl PoolChain for FakePool {
             "nonce read failed: error sending request for url ({FAKE_RPC_URL})"
         );
         Ok(self.confirmed_nonce.load(Ordering::SeqCst))
+    }
+    async fn pending_nonce(&self) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            !self.fail_tx_reads.load(Ordering::SeqCst)
+                && !self.fail_pending_read.load(Ordering::SeqCst),
+            "pending nonce read failed: error sending request for url ({FAKE_RPC_URL})"
+        );
+        let pending = *self.pending_tx_count.lock().unwrap();
+        Ok(pending.unwrap_or_else(|| self.confirmed_nonce.load(Ordering::SeqCst)))
+    }
+    async fn send_top_up_at(
+        &self,
+        _pool_id: B256,
+        _additional: MicroUsdc,
+        nonce: u64,
+    ) -> anyhow::Result<TxHash> {
+        self.top_up_resends.lock().unwrap().push(nonce);
+        // Each shaped like the matching decdn `send_top_up_at` error.
+        let at = format!("re-send topUp at nonce {nonce}");
+        let reverted = || anyhow::anyhow!("server returned an error response: execution reverted");
+        match *self.resend_failure.lock().unwrap() {
+            Some(ResendFailure::PoolNotOpen) => Err(reverted().context(at).context(PoolNotOpen)),
+            Some(ResendFailure::AllowanceShort) => {
+                Err(reverted().context(at).context(AllowanceShortfall))
+            }
+            Some(ResendFailure::Unknown) => Err(anyhow::anyhow!(
+                "server returned an error response: already known"
+            )
+            .context(at)
+            .context(TopUpUnconfirmed { tx: None, nonce })),
+            Some(ResendFailure::Transport) => Err(anyhow::anyhow!(
+                "{at}: error sending request for url ({FAKE_RPC_URL})"
+            )),
+            // No receipt: `transaction` reports what `set_tx_state` says, and
+            // nothing is credited until a test says it mined.
+            None => Ok(FAKE_RESENT_TOPUP_TX),
+        }
     }
 }
 

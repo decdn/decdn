@@ -22,7 +22,7 @@ use crate::keeper::{self, KeeperConfig, KeeperStatus};
 use crate::pool::{ChainPool, PoolChain};
 
 /// The chain, contract and pool a sponsor signs for. `Debug` shows the RPC
-/// URL's length, not the URL: it often carries an API key (#38).
+/// URL's length, not the URL: it often carries an API key (decdn/sponsord#38).
 #[derive(Clone, PartialEq, Eq)]
 pub struct ChainConfig {
     /// JSON-RPC endpoint of the chain the pool is on.
