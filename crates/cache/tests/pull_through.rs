@@ -66,6 +66,39 @@ fn err_of<T: std::fmt::Debug, E>(r: Result<T, E>) -> anyhow::Result<E> {
         .ok_or_else(|| anyhow::anyhow!("expected error, got Ok"))
 }
 
+/// Bound on a GC wait. It only catches a hung GC task: the waits count
+/// sweeps, so a loaded host makes them slower but does not fail them.
+const GC_HANG_BOUND: Duration = Duration::from_secs(30);
+
+/// Waits until the GC loop has run `target` sweeps (`gc_runs >= target`).
+async fn wait_for_gc_runs(metrics: &CacheMetrics, target: u64) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + GC_HANG_BOUND;
+    while metrics.gc_runs.get() < target {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "GC hung: gc_runs = {} after {GC_HANG_BOUND:?}, want {target}",
+            metrics.gc_runs.get()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+/// Waits until GC deletes bytes whose last tag is gone before this call, and
+/// counts them in `gc_bytes_reclaimed`.
+///
+/// Attribution lags one sweep: each sweep's protect callback diffs its
+/// pre-sweep snapshot against the previous one. Let `r` be `gc_runs` on entry.
+/// Sweep `r + 1` marks after the tag is gone, so it deletes the bytes at the
+/// latest. The snapshot of sweep `r + 2` does not hold them, so its callback
+/// counts them. The callback bumps `gc_runs` before `gc_bytes_reclaimed`, so
+/// the wait runs to sweep `r + 3`, which starts after both bumps of sweep
+/// `r + 2`.
+async fn wait_for_gc_reclaim(metrics: &CacheMetrics) -> anyhow::Result<()> {
+    let start = metrics.gc_runs.get();
+    wait_for_gc_runs(metrics, start + 3).await
+}
+
 #[tokio::test]
 async fn cache_miss_pulls_from_origin_and_caches() -> anyhow::Result<()> {
     let payload: &[u8] = b"hello, decdn";
@@ -211,15 +244,7 @@ async fn drain_mismatch_tag_deleted_lets_gc_reclaim() -> anyhow::Result<()> {
         "wrong-hash bytes must NOT be logically evicted (#853)"
     );
 
-    let deadline = std::time::Instant::now() + gc_interval * 16;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(gc_interval).await;
-        if engine.inspect(actual).await?.size_bytes.is_none()
-            && metrics.gc_bytes_reclaimed.get() > 0
-        {
-            break;
-        }
-    }
+    wait_for_gc_reclaim(&metrics).await?;
 
     anyhow::ensure!(
         engine.inspect(actual).await?.size_bytes.is_none(),
@@ -271,14 +296,7 @@ async fn evict_makes_blob_gc_eligible() -> anyhow::Result<()> {
         "evict must logically stop serving"
     );
 
-    let deadline = std::time::Instant::now() + gc_interval * 16;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(gc_interval).await;
-        if engine.inspect(hash).await?.size_bytes.is_none() && metrics.gc_bytes_reclaimed.get() > 0
-        {
-            break;
-        }
-    }
+    wait_for_gc_reclaim(&metrics).await?;
 
     anyhow::ensure!(
         engine.inspect(hash).await?.size_bytes.is_none(),
@@ -327,14 +345,7 @@ async fn evict_makes_streaming_cached_blob_gc_eligible() -> anyhow::Result<()> {
     );
     engine.evict(hash).await?;
 
-    let deadline = std::time::Instant::now() + gc_interval * 16;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(gc_interval).await;
-        if engine.inspect(hash).await?.size_bytes.is_none() && metrics.gc_bytes_reclaimed.get() > 0
-        {
-            break;
-        }
-    }
+    wait_for_gc_reclaim(&metrics).await?;
 
     anyhow::ensure!(
         engine.inspect(hash).await?.size_bytes.is_none(),
@@ -374,11 +385,8 @@ async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
     let metrics = Arc::new(CacheMetrics::default());
-    // Tight interval so the test runs in well under a second on a
-    // loaded CI machine. Two cycles are needed to observe a nonzero
-    // `gc_bytes_reclaimed_total`: cycle 1 snapshots the pre-sweep set
-    // (no prior baseline → reclaim = 0), cycle 2 sees the disappeared
-    // hash and attributes its bytes to the previous sweep.
+    // A short interval keeps the sweeps that `wait_for_gc_reclaim` counts
+    // fast.
     let gc_interval = Duration::from_millis(200);
     let engine = CacheEngine::open_full(
         tmp.path(),
@@ -411,20 +419,9 @@ async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
         "wrong-hash bytes must NOT be logically evicted on mismatch (#853 censorship vector)"
     );
 
-    // Wait for enough sweep cycles to (a) run the sweep that deletes
-    // the bytes and (b) run the next sweep whose pre-sweep snapshot
-    // observes the disappearance and bumps `gc_bytes_reclaimed_total`.
-    // Sixteen cycles' worth of slack (3.2s wallclock total at 200ms
-    // interval) absorbs scheduling jitter on heavily-loaded CI hosts
-    // without making a green path slow.
-    let deadline = std::time::Instant::now() + gc_interval * 16;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(gc_interval).await;
-        let post = engine.inspect(actual).await?;
-        if post.size_bytes.is_none() && metrics.gc_bytes_reclaimed.get() > 0 {
-            break;
-        }
-    }
+    // Wait for the sweep that deletes the bytes and for the next sweep,
+    // whose pre-sweep snapshot no longer holds them and counts them.
+    wait_for_gc_reclaim(&metrics).await?;
 
     let post = engine.inspect(actual).await?;
     anyhow::ensure!(
@@ -450,13 +447,15 @@ async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
 
 /// Locks in the **lagged-by-one-cycle attribution** documented in the
 /// `gc_bytes_reclaimed_total` metric: the first sweep records a baseline
-/// and reports zero reclaim, the second sweep attributes the previous
-/// sweep's deletes. A regression that snapshotted post-sweep instead of
-/// pre-sweep (or double-counted the first cycle) would inflate
-/// `gc_bytes_reclaimed_total` by the entire blob set on every restart —
-/// the exact alert signal `gc_bytes_reclaimed_total` exists for —
-/// and the broader-shaped `gc_reclaims_partial_import_bytes` test would
-/// still pass because it only asserts `>= mismatched_payload.len()`.
+/// and reports zero reclaim, and each later sweep counts the bytes the
+/// previous sweep deleted. The check is that the total equals the payload
+/// exactly. A first sweep that counted the whole blob set would add the
+/// payload twice, which inflates `gc_bytes_reclaimed_total` by the entire
+/// blob set on every restart — the exact alert signal
+/// `gc_bytes_reclaimed_total` exists for. A post-sweep snapshot never sees
+/// the deleted blob and counts zero. The broader-shaped
+/// `gc_reclaims_partial_import_bytes` test only asserts
+/// `>= mismatched_payload.len()`, so it passes in the first case.
 #[tokio::test]
 async fn gc_attribution_lags_one_cycle() -> anyhow::Result<()> {
     let server = MockServer::start().await;
@@ -471,10 +470,7 @@ async fn gc_attribution_lags_one_cycle() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
     let metrics = Arc::new(CacheMetrics::default());
-    // Generous interval so the polling loop has wide margins between
-    // cycle 1 and cycle 2 — we need to read the metric state after
-    // cycle 1 fires but before cycle 2 fires.
-    let gc_interval = Duration::from_millis(500);
+    let gc_interval = Duration::from_millis(200);
     let engine = CacheEngine::open_full(
         tmp.path(),
         vec![origin as Arc<dyn Origin>],
@@ -493,41 +489,16 @@ async fn gc_attribution_lags_one_cycle() -> anyhow::Result<()> {
         "expected HashMismatch, got: {err:?}"
     );
 
-    // Poll for cycle 1 to fire. The cb bumps gc_runs_total once per
-    // sweep, so the transition 0 -> 1 marks cycle 1 completion.
-    let cycle1_deadline = std::time::Instant::now() + gc_interval * 4;
-    while metrics.gc_runs.get() < 1 {
-        anyhow::ensure!(
-            std::time::Instant::now() < cycle1_deadline,
-            "cycle 1 did not fire within {}ms",
-            (gc_interval * 4).as_millis()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    // Cycle 1 fired. Both counter bumps happen in the same cb body, so
-    // observing `gc_runs_total >= 1` means `gc_bytes_reclaimed_total`
-    // has already taken its cycle-1 contribution (which must be 0 —
-    // no prior baseline to diff against).
+    // The store holds only the mismatched blob. One sweep deletes it and
+    // the next one counts it; every later snapshot lacks it, so later
+    // sweeps add nothing.
+    wait_for_gc_reclaim(&metrics).await?;
     anyhow::ensure!(
-        metrics.gc_bytes_reclaimed.get() == 0,
-        "after cycle 1, gc_bytes_reclaimed_total must be 0 (no prior baseline to diff against); got {}",
+        metrics.gc_bytes_reclaimed.get() == mismatched_payload.len() as u64,
+        "gc_bytes_reclaimed_total must count the deleted blob exactly once \
+         ({} bytes): the first sweep has no baseline and counts nothing; got {}",
+        mismatched_payload.len(),
         metrics.gc_bytes_reclaimed.get()
-    );
-
-    // Poll for cycle 2.
-    let cycle2_deadline = std::time::Instant::now() + gc_interval * 4;
-    while metrics.gc_runs.get() < 2 {
-        anyhow::ensure!(
-            std::time::Instant::now() < cycle2_deadline,
-            "cycle 2 did not fire within {}ms after cycle 1",
-            (gc_interval * 4).as_millis()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    anyhow::ensure!(
-        metrics.gc_bytes_reclaimed.get() > 0,
-        "cycle 2 must attribute cycle-1's reclaim; got 0 bytes after 2 cycles"
     );
 
     Ok(())
@@ -573,16 +544,9 @@ async fn gc_reclaims_cap_breach_partial_bytes() -> anyhow::Result<()> {
         "expected BlobTooLarge from mid-stream cap, got: {err:?}"
     );
 
-    // Wait the same way `gc_reclaims_partial_import_bytes` does:
-    // cycle 1 establishes baseline, cycle 2 observes the reclaim and
-    // attributes the bytes. Sixteen cycles' headroom for slow CI.
-    let deadline = std::time::Instant::now() + gc_interval * 16;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(gc_interval).await;
-        if metrics.gc_bytes_reclaimed.get() > 0 {
-            break;
-        }
-    }
+    // Wait the same way `gc_reclaims_partial_import_bytes` does: one
+    // sweep deletes the bytes, the next one counts them.
+    wait_for_gc_reclaim(&metrics).await?;
 
     anyhow::ensure!(
         metrics.gc_runs.get() >= 1,
