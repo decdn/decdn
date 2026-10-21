@@ -59,6 +59,46 @@ Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict,
 
 The repo-shape hooks (package-embeds, toolchain-pin, workspace-manifests, crate-edges) are stdlib-Python guards under `.github/scripts/`, each with a thin `.sh` wrapper and a pytest suite under `.github/scripts/tests/`; deployment-manifest-mirror is plain bash. They mirror the `packaging` CI job, which is authoritative. The pytest suites run in the `CI tooling tests` job, which is not part of the `CI success` gate, so a failing guard test does not block a merge — the guards themselves do. A new guard follows the same shape: a `check(...)` function the tests can drive on a fixture, a module docstring saying what breaks silently without it, a `repo: local` hook with a scoped `files:` regex, and a named step in `packaging`.
 
+## Issues and Pull Requests
+
+### Issues
+
+Blank issues are off; pick the form that fits:
+
+| Form | Use it for |
+|------|-----------|
+| Bug report | Behavior that differs from the docs and that you can reproduce with a command |
+| Testnet observation | Something you saw on the Arbitrum Sepolia fleet and could not reproduce on demand: nodes, hash, time window, logs |
+| Feature request | A new capability or a change to current behavior |
+| Design decision or ADR gap | A decision no ADR records, or an ADR that disagrees with another ADR, the code, a contract or a downstream doc |
+| Task or chore | Cleanup, test, CI, dependency, toolchain or release work |
+
+Questions go to [Discussions](https://github.com/decdn/decdn/discussions). Vulnerabilities go to `security@decdn.org`, never to a public issue ([SECURITY.md](SECURITY.md)). Deployment problems with the Ansible collection, Helm chart or Compose files belong in [decdn/devops](https://github.com/decdn/devops/issues).
+
+### Labels
+
+Each form sets the issue type (Bug, Feature, Task) and a `kind:` label; a maintainer adds the rest. Labels come in five families, one color each:
+
+| Family | Answers | Values |
+|--------|---------|--------|
+| `kind:` | what it is | bug, feature, docs, security, chore, test, question |
+| `area:` | where it lives | node, cli, client, cache, payments, contracts, sponsord, protocol, ci |
+| `prio:` | when it gets done | critical, high, medium, low |
+| `status:` | why it is not moving | blocked, backlog, mainnet-blocking |
+| `design:` | the ADR process | adr, missing-decision, consistency, economics |
+
+`good first issue`, `help wanted`, the closure reasons and the Dependabot labels (`dependencies`, `rust`, `github_actions`, `docker`) stay flat: GitHub and Dependabot key on those exact names. `rust` is a Dependabot label, not an area.
+
+The live set on GitHub is the source; there is no label file to keep in sync. Add one with `gh label create NAME --color HEX --description "…"`, using the family's color. Rename with `gh label edit OLD --name NEW`, which keeps the label on every issue and PR that carries it. Delete only after moving open issues off it: a deleted label leaves closed issues without it. An issue form's `labels:` line must name a label that exists, or GitHub drops it silently.
+
+### Pull requests
+
+- Branch from `main`; one concern per PR. A PR on a feature branch runs no CI, so stack on `main` only.
+- The PR title is a [Conventional Commit](https://www.conventionalcommits.org/) and becomes the squash-merge subject: `type(scope): subject`, with a type from `feat`, `fix`, `docs`, `chore`, `refactor`, `perf`, `test`, `build`, `ci`, `revert`, a lowercase first letter in the subject, and `!` after the type or a `BREAKING CHANGE:` footer when something breaks. The `pr-title` job gates merge and does not re-run on a title edit; push, or re-run the job.
+- Write `Closes #N` once per issue. GitHub reads only the first issue after a single keyword.
+- `CHANGELOG.md` is maintained by hand, one entry per PR, grouped by subsystem; write it as part of the work, not at release time ([RELEASING.md](RELEASING.md)).
+- The [PR template](.github/pull_request_template.md) carries the verification list: the always-run commands, and the extra gates when a PR touches contracts, a public API snapshot, `sponsord-api`, `adr/`, a crate edge or a metric name.
+
 ## Build and Test
 
 ```bash

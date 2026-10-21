@@ -1,0 +1,66 @@
+name: Testnet observation
+description: Something you saw on the Arbitrum Sepolia testnet that you could not reproduce on demand.
+type: Bug
+labels: ["kind:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A field report. The nodes, hash and time window let a maintainer find the matching log lines and metrics. If you can reproduce it with a command, use the **Bug report** form instead.
+
+        Remove private keys, keystore passwords, RPC URLs that carry API keys, and origin credentials before pasting anything.
+  - type: dropdown
+    id: role
+    attributes:
+      label: Your role
+      options:
+        - node operator
+        - client (pulling with `decdn get` or through the gateway)
+        - publisher (origin import or sponsored downloads)
+        - sponsord operator
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`decdn --version` or `decdn-node --version`, or the image tag."
+    validations:
+      required: true
+  - type: input
+    id: nodes
+    attributes:
+      label: Nodes involved
+      description: Node ids, or the fleet names a maintainer will recognize (lon1, hel1, bcl). Say which was the client, the server, or the upstream.
+    validations:
+      required: true
+  - type: input
+    id: content
+    attributes:
+      label: Content hash or bundle
+      placeholder: "decdn:… or the bundle name (sdxl, mistral, whisper, qwen)"
+  - type: input
+    id: window
+    attributes:
+      label: Time window (UTC)
+      placeholder: "2026-10-21 14:05 to 14:40 UTC"
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: What you saw
+      description: What happened, what you expected, and how often (one run, 2 of 2 runs, every day since a date).
+    validations:
+      required: true
+  - type: input
+    id: links
+    attributes:
+      label: Dashboard or log link
+      description: A Grafana or Loki link if you have access to the fleet dashboards, or the relevant [stats.decdn.org](https://stats.decdn.org) view.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt
+      description: The lines around the event, with secrets removed. Keep the timestamps.
+      render: shell

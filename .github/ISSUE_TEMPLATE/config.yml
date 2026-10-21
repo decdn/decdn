@@ -3,3 +3,15 @@ contact_links:
   - name: Report a security vulnerability
     url: https://github.com/decdn/decdn/blob/main/SECURITY.md
     about: Email security@decdn.org. Do not open a public issue for a vulnerability.
+  - name: Ask a question
+    url: https://github.com/decdn/decdn/discussions
+    about: How-to questions, design discussion and anything that is not yet a concrete change.
+  - name: Chat on Discord
+    url: https://discord.gg/vVbNswKVGX
+    about: Operators, publishers and contributors.
+  - name: Deployment problem (Ansible, Helm, Compose, cloud-init)
+    url: https://github.com/decdn/devops/issues/new/choose
+    about: The decdn/devops repository holds the operator deployment template and its own bug form.
+  - name: Website or docs site problem
+    url: https://github.com/decdn/website/issues
+    about: decdn.org and the documentation site live in decdn/website.

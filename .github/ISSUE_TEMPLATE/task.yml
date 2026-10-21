@@ -1,0 +1,45 @@
+name: Task or chore
+description: Cleanup, test, CI, dependency, toolchain or release work that is neither a bug nor a feature.
+type: Task
+labels: ["kind:chore"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Matches the `area:` label a maintainer adds.
+      options:
+        - node (decdn-node daemon)
+        - cli (decdn binary)
+        - client (decdn-client SDK)
+        - cache (engine, origin pull-through, GC)
+        - payments (pools, vouchers, redeem, staking)
+        - contracts (Solidity)
+        - sponsord (daemon, onramp, decdn.sh / decdn.ps1 installers)
+        - protocol (wire format, ALPNs, discovery, probe)
+        - docs / ADRs
+        - CI / tooling / release
+        - workspace-wide (dependencies, toolchain, lints)
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What
+      description: The change, in enough detail that someone else could pick it up.
+    validations:
+      required: true
+  - type: input
+    id: trigger
+    attributes:
+      label: Trigger
+      description: What surfaced this. An advisory id, an upstream issue or PR, a review comment, a CI run.
+      placeholder: "RUSTSEC-2026-0185, n0-computer/noq#828, review of #2577"
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      description: A checklist the closing PR can tick.
+      value: |
+        - [ ]

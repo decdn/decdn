@@ -1,0 +1,66 @@
+name: Design decision or ADR gap
+description: A decision the ADRs do not record, or an ADR that disagrees with another ADR, the code, a contract or a downstream doc.
+type: Task
+labels: ["design:adr"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        [`adr/`](https://github.com/decdn/decdn/tree/main/adr) is the only source of truth for protocol-level technical and economic claims. When a doc, a notebook parameter or marketing copy contradicts an ADR, the doc is wrong. When the code or a contract contradicts an ADR, this issue records which side changes.
+
+        Find the next ADR number by listing `adr/`; the counter in `CLAUDE.md` is a hint, not the truth. Write ADR prose in Simplified Technical English: short sentences, active voice, present tense.
+  - type: dropdown
+    id: gap
+    attributes:
+      label: Kind of gap
+      options:
+        - decision not recorded in any ADR
+        - two ADRs disagree
+        - ADR disagrees with the code
+        - ADR disagrees with a contract
+        - ADR disagrees with a downstream doc (runbook, website, finance notebooks, internal)
+    validations:
+      required: true
+  - type: input
+    id: adrs
+    attributes:
+      label: ADRs and sections affected
+      placeholder: "ADR 003 § Revocation, ADR 026 § FeeRouter split"
+    validations:
+      required: true
+  - type: textarea
+    id: adr-says
+    attributes:
+      label: What the ADR says
+      description: Quote the sentences. Paraphrase hides the ambiguity this issue is about.
+    validations:
+      required: true
+  - type: textarea
+    id: other-says
+    attributes:
+      label: What the code, contract, other ADR or doc does
+      description: File and function, contract and function, or the other ADR's section. For a missing decision, describe the behavior the code picked on its own.
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: Options
+      description: Each option with the mechanism it adds or removes. A new mechanism carries the burden of proof; "harmless at tens of nodes" and "earns its keep at scale" are not arguments either way.
+    validations:
+      required: true
+  - type: textarea
+    id: recommendation
+    attributes:
+      label: Recommendation
+      description: Which option, and why. Leave empty if you are only reporting the gap.
+  - type: checkboxes
+    id: downstream
+    attributes:
+      label: Downstream that must follow the decision
+      options:
+        - label: "`adr/architecture.md` summary"
+        - label: "`finance/notebooks/_shared/params.py` (decdn-finance) and its notebooks"
+        - label: "`docs/runbook.md` or another operator doc"
+        - label: "website docs or marketing copy (decdn/website)"
+        - label: "contracts in `contracts/` or the deployment manifest"
