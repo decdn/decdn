@@ -89,7 +89,7 @@ Each form sets the issue type (Bug, Feature, Task) and a `kind:` label; a mainta
 
 `good first issue`, `help wanted`, the closure reasons and the Dependabot labels (`dependencies`, `rust`, `github_actions`, `docker`) stay flat: GitHub and Dependabot key on those exact names. `rust` is a Dependabot label, not an area.
 
-[`.github/labels.toml`](.github/labels.toml) is the source for the set. `.github/scripts/sync-labels.sh` prints the renames, creates, updates and deletes that bring the live repository in line with it, and `--apply` executes them through `gh`. Edit the file in a PR; run the script after the merge. A rename keeps the label on every issue that carries it; move open issues off a `[[retired]]` label before the script deletes it.
+The live set on GitHub is the source; there is no label file to keep in sync. Add one with `gh label create NAME --color HEX --description "…"`, using the family's color. Rename with `gh label edit OLD --name NEW`, which keeps the label on every issue and PR that carries it. Delete only after moving open issues off it: a deleted label leaves closed issues without it. An issue form's `labels:` line must name a label that exists, or GitHub drops it silently.
 
 ### Pull requests
 
