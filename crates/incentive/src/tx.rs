@@ -212,8 +212,8 @@ impl SendOutcome {
 /// The sending providers all carry the layer (`decdn_client::provider::build_provider`,
 /// the node's wallet providers, sponsord's treasury provider). A provider
 /// without it reports every transport failure as "nothing sent", so a
-/// provider handed to a sender in this crate or `decdn-client` must install
-/// it.
+/// provider handed to a sender in this crate, `decdn-client`, or the node's
+/// redeemer and reclaim sweep must install it.
 #[must_use]
 pub fn send_broadcast_unknown(err: &ContractError) -> bool {
     use alloy::transports::{RpcError, TransportErrorKind};

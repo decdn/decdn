@@ -3914,6 +3914,14 @@ async fn reclaim_once<P: Provider + Clone>(
                 }
             }
         }
+        // A send whose fate is unknown (no answer, or an answer that an earlier
+        // copy may hold the nonce) may have mined. Either way the row stays: if
+        // it mined, the next sweep finds the pool `Closed` and drops the row;
+        // if not, the next sweep sends it again.
+        Err(err) if decdn_incentive::tx::send_broadcast_unknown(&err) => {
+            warn!(pool_id = %state.pool_id, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim send failed with no tx hash, but the transaction may be in a mempool; the next sweep retries");
+            metrics.buyer_reclaim_failure();
+        }
         Err(err) => {
             warn!(pool_id = %state.pool_id, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim submit failed");
             metrics.buyer_reclaim_failure();

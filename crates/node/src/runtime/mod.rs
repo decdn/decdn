@@ -265,9 +265,9 @@ impl ProviderFactory {
         signer: PrivateKeySigner,
         interval: Duration,
     ) -> impl Provider + Clone + use<> {
-        // The send-leg marker lets the buyer's `openPool` / `topUp` / `approve`
-        // tell a send request that failed in transport from a chain read that
-        // failed before it. The seller's `redeemMany` does not read it yet.
+        // The send-leg marker lets the buyer's `openPool` / `topUp` / `approve`,
+        // the reclaim sweep and the seller's `redeemMany` tell a send request
+        // that failed in transport from a chain read that failed before it.
         with_poll_interval(
             ProviderBuilder::new()
                 .layer(decdn_incentive::tx::SendLegLayer)

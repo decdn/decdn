@@ -206,3 +206,75 @@ async fn failed_send_classifies_as_send_err() {
     assert!(has_line(&encoded, "decdn_onchain_tx_send_failed_total 1"));
     assert!(has_line(&encoded, "decdn_onchain_tx_landed_total 0"));
 }
+
+#[tokio::test]
+async fn a_send_with_no_answer_classifies_as_maybe_broadcast() {
+    // The provider carries the send-leg marker, as the node's wallet providers
+    // do, and is filler-free, so the one request `send` makes is the send
+    // itself. The empty queue fails it in transport: the transaction may be in
+    // a mempool, so it must not count as refused, and with no hash there is no
+    // by-hash fetch.
+    let asserter = Asserter::new();
+    let provider = ProviderBuilder::default()
+        .layer(decdn_incentive::tx::SendLegLayer)
+        .connect_mocked_client(asserter.clone());
+    let request = alloy::rpc::types::TransactionRequest {
+        from: Some(Address::repeat_byte(0x02)),
+        to: Some(alloy::primitives::TxKind::Call(Address::repeat_byte(0x01))),
+        ..Default::default()
+    };
+    let sent = provider
+        .send_transaction(request)
+        .await
+        .map_err(ContractError::from);
+    let metrics = Metrics::new();
+    let outcome = send_and_await_receipt(sent, None, &metrics).await;
+    assert!(matches!(outcome, TxOutcome::MaybeBroadcast(_)));
+    let encoded = metrics.encode().expect("metrics encode");
+    assert!(has_line(
+        &encoded,
+        "decdn_onchain_tx_maybe_broadcast_total 1"
+    ));
+    assert!(has_line(&encoded, "decdn_onchain_tx_send_failed_total 0"));
+}
+
+#[tokio::test]
+async fn an_answered_send_classifies_by_its_answer() {
+    // The answers `send_broadcast_unknown` reads as uncertain can each follow
+    // an earlier copy of the send that reached a mempool, so they classify as
+    // `MaybeBroadcast`; any other answer is the RPC refusing the send.
+    for (answer, maybe_broadcast) in [
+        ("nonce too low: next nonce 5, tx nonce 4", true),
+        ("already known", true),
+        ("replacement transaction underpriced", true),
+        ("insufficient funds for gas * price + value", false),
+    ] {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg(answer);
+        let provider = ProviderBuilder::default()
+            .layer(decdn_incentive::tx::SendLegLayer)
+            .connect_mocked_client(asserter);
+        let request = alloy::rpc::types::TransactionRequest {
+            from: Some(Address::repeat_byte(0x02)),
+            to: Some(alloy::primitives::TxKind::Call(Address::repeat_byte(0x01))),
+            ..Default::default()
+        };
+        let sent = provider
+            .send_transaction(request)
+            .await
+            .map_err(ContractError::from);
+        let metrics = Metrics::new();
+        let outcome = send_and_await_receipt(sent, None, &metrics).await;
+        let encoded = metrics.encode().expect("metrics encode");
+        if maybe_broadcast {
+            assert!(matches!(outcome, TxOutcome::MaybeBroadcast(_)), "{answer}");
+            assert!(has_line(
+                &encoded,
+                "decdn_onchain_tx_maybe_broadcast_total 1"
+            ));
+        } else {
+            assert!(matches!(outcome, TxOutcome::SendErr(_)), "{answer}");
+            assert!(has_line(&encoded, "decdn_onchain_tx_send_failed_total 1"));
+        }
+    }
+}

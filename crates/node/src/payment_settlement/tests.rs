@@ -1658,8 +1658,8 @@ async fn landed_chunk_read_failure_persists_no_registration() -> Result<()> {
 }
 
 /// Only a revert and a refused send count as redemption failures (#2154).
-/// An unconfirmed chunk may have mined, so it counts only into its
-/// `onchain_tx_*` bucket.
+/// An unconfirmed chunk, or a send whose fate is unknown, may have mined, so
+/// each counts only into its `onchain_tx_*` bucket (#2568).
 #[test]
 fn only_reverts_and_refused_sends_are_redemption_failures() {
     use alloy::providers::PendingTransactionError;
@@ -1673,6 +1673,9 @@ fn only_reverts_and_refused_sends_are_redemption_failures() {
         TransportErrorKind::custom_str("rejected").into()
     )));
     assert!(!is_redemption_failure(&TxOutcome::Landed(blank_receipt())));
+    assert!(!is_redemption_failure(&TxOutcome::MaybeBroadcast(
+        TransportErrorKind::custom_str("connection reset").into()
+    )));
     assert!(!is_redemption_failure(&TxOutcome::ReceiptErr {
         error: PendingTransactionError::TransportError(TransportErrorKind::custom_str(
             "error code 26: Unknown block"
@@ -1726,6 +1729,9 @@ fn every_outcome_but_landed_is_a_chain_fault() {
     assert!(is_chain_fault(&TxOutcome::Reverted(blank_receipt())));
     assert!(is_chain_fault(&TxOutcome::SendErr(
         TransportErrorKind::custom_str("rejected").into()
+    )));
+    assert!(is_chain_fault(&TxOutcome::MaybeBroadcast(
+        TransportErrorKind::custom_str("connection reset").into()
     )));
     assert!(is_chain_fault(&TxOutcome::ReceiptErr {
         error: PendingTransactionError::TransportError(TransportErrorKind::custom_str(
@@ -3039,6 +3045,105 @@ async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Resul
         &[
             "decdn_redemption_reconcile_ok_total 1",
             "decdn_onchain_tx_send_failed_total 0",
+        ],
+    )
+}
+
+/// A `PaymentPool` whose provider carries the send-leg marker, as the node's
+/// seller wallet does, and that answers one `getWatermarks` per entry of
+/// `responses`; the next request fails in transport. Filler-free, the next
+/// request is the `redeemMany` send itself. With `gas_estimation`, it is one
+/// of the gas filler's reads before the send (the gas or the fee estimate).
+fn marked_getwatermarks_pool(
+    responses: &[Vec<PaymentPool::Lane>],
+    gas_estimation: bool,
+) -> PaymentPool::PaymentPoolInstance<alloy::providers::DynProvider> {
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+    use alloy::sol_types::SolCall;
+
+    let asserter = Asserter::new();
+    for lanes in responses {
+        asserter.push_success(&Bytes::from(
+            PaymentPool::getWatermarksCall::abi_encode_returns(lanes),
+        ));
+    }
+    let marked = ProviderBuilder::default().layer(decdn_incentive::tx::SendLegLayer);
+    let provider = if gas_estimation {
+        marked
+            .with_gas_estimation()
+            .connect_mocked_client(asserter)
+            .erased()
+    } else {
+        marked.connect_mocked_client(asserter).erased()
+    };
+    PaymentPool::new(Address::ZERO, provider)
+}
+
+/// #2568: a `redeemMany` send that gets no answer may be in a mempool. It
+/// warns so, counts as possibly broadcast rather than refused, and is not a
+/// redemption failure. It is still a chain fault: the claim stays unsettled.
+#[tokio::test]
+async fn a_redeem_send_with_no_answer_is_possibly_broadcast() -> Result<()> {
+    let log = CapturedLog::default();
+    let _subscriber = log.install();
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let contract = marked_getwatermarks_pool(&[vec![lane(0)]], false);
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 1_000, false)],
+        U256::from(1u64),
+        300,
+        false,
+        &metrics,
+    )
+    .await;
+
+    assert!(faulted, "an unsettled claim is a chain fault");
+    log.lines("may be in a mempool")?;
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_redemption_reconcile_failures_total 0",
+            "decdn_onchain_tx_maybe_broadcast_total 1",
+            "decdn_onchain_tx_send_failed_total 0",
+            "decdn_redemption_failures_total 0",
+        ],
+    )
+}
+
+/// #2568: a `redeemMany` whose gas fill fails never reached the send, so it
+/// stays a refused send and a redemption failure.
+#[tokio::test]
+async fn a_redeem_whose_gas_fill_fails_is_refused() -> Result<()> {
+    let log = CapturedLog::default();
+    let _subscriber = log.install();
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let contract = marked_getwatermarks_pool(&[vec![lane(0)]], true);
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 1_000, false)],
+        U256::from(1u64),
+        300,
+        false,
+        &metrics,
+    )
+    .await;
+
+    assert!(faulted, "a refused send is a chain fault");
+    log.lines("redeemMany send failed")?;
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_maybe_broadcast_total 0",
+            "decdn_onchain_tx_send_failed_total 1",
+            "decdn_redemption_failures_total 1",
         ],
     )
 }

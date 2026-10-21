@@ -2071,11 +2071,13 @@ async fn redeem_sweep<P: Provider + Clone>(
 /// Submit one chunk of planned lanes as a single `redeemMany`. On an oversize
 /// send failure (`is_oversize_send_err`) with more than one lane, halve the chunk
 /// and retry each half, bounded by `MAX_SPLIT_DEPTH`. A revert or a non-oversize
-/// send error records one `redemption_failure`. An unconfirmed receipt (a failed
-/// or lapsed wait that the by-hash fetch in `send_and_await_receipt` could not
-/// resolve) is not a failure: the tx may have mined, and it counts only into its
-/// `onchain_tx_*` bucket. Every non-landed outcome leaves the claims for the next
-/// sweep (cumulative, monotone, retry-safe). Does NOT seed the paid cache — each
+/// refused send records one `redemption_failure`. An unconfirmed receipt (a
+/// failed or lapsed wait that the by-hash fetch in `send_and_await_receipt`
+/// could not resolve) and a send that may have broadcast are not failures: the
+/// tx may have mined, and each counts only into its `onchain_tx_*` bucket.
+/// Every non-landed outcome leaves the claims for the next sweep (cumulative,
+/// monotone, retry-safe): a lane a mined `redeemMany` paid drops out of that
+/// sweep's plan, and a re-send of a still-pending one is an on-chain no-op. Does NOT seed the paid cache — each
 /// paid voucher emits its own `PoolRedeemed`.
 ///
 /// Returns whether the chunk hit a chain fault: any outcome other than
@@ -2157,6 +2159,10 @@ async fn submit_chunk<P: Provider + Clone>(
             record_tx_failure(&span, "send_failed", None);
             warn!(error = %sanitize_error_sources(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
         }
+        TxOutcome::MaybeBroadcast(err) => {
+            record_tx_failure(&span, "maybe_broadcast", None);
+            warn!(error = %sanitize_error_sources(&err), voucher_count, "redeemMany send failed with no tx hash, but the transaction may be in a mempool; leaving claims for retry");
+        }
         TxOutcome::ReceiptErr {
             error,
             tx_hash,
@@ -2189,6 +2195,7 @@ const fn is_chain_fault(outcome: &TxOutcome) -> bool {
         TxOutcome::Landed(_) => false,
         TxOutcome::Reverted(_)
         | TxOutcome::SendErr(_)
+        | TxOutcome::MaybeBroadcast(_)
         | TxOutcome::ReceiptErr { .. }
         | TxOutcome::Timeout { .. } => true,
     }
@@ -2200,11 +2207,16 @@ const fn is_chain_fault(outcome: &TxOutcome) -> bool {
 /// resolves every transaction the RPC can see mined, so what stays unconfirmed
 /// counts into `decdn_onchain_tx_receipt_failed_total` /
 /// `decdn_onchain_tx_timeout_total`, which `DecdnOnchainTxUnconfirmed` alerts
-/// on. An oversize send that `submit_chunk` halves never reaches this count.
+/// on. A send that may have broadcast (`MaybeBroadcast`) may also mine, so it
+/// counts only into `decdn_onchain_tx_maybe_broadcast_total`. An oversize send
+/// that `submit_chunk` halves never reaches this count.
 const fn is_redemption_failure(outcome: &TxOutcome) -> bool {
     match outcome {
         TxOutcome::Reverted(_) | TxOutcome::SendErr(_) => true,
-        TxOutcome::Landed(_) | TxOutcome::ReceiptErr { .. } | TxOutcome::Timeout { .. } => false,
+        TxOutcome::Landed(_)
+        | TxOutcome::MaybeBroadcast(_)
+        | TxOutcome::ReceiptErr { .. }
+        | TxOutcome::Timeout { .. } => false,
     }
 }
 
