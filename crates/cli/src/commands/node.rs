@@ -639,7 +639,7 @@ fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
         .map_or_else(|| "unknown".to_string(), short_node_id);
     let signer = short_node_id(&c.voucher_signer);
     let last_voucher = match c.seconds_since_last_voucher {
-        // No voucher seen since this process started — distinct from
+        // No voucher or preimage seen since this process started — distinct from
         // "<1s ago" so operators know the activity clock has no record
         // (a freshly-restarted node, or a lane that has never billed).
         None => "never".to_string(),

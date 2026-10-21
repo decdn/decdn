@@ -620,8 +620,10 @@ async fn presented_capability_is_clamped_to_the_signers_registered_terms() -> an
     Ok(())
 }
 
-/// The largest voucher cumulative the node has accepted on any lane of
-/// `pool_id`, in micro-USDC, from its admin `lanes()` surface. `0` before any.
+/// The largest amount the node is owed on any lane of `pool_id`, in
+/// micro-USDC, from its admin `lanes()` surface: the signed anchor plus the
+/// verified chain frontier, which is what the node accepted and redeems. `0`
+/// before any voucher.
 async fn accepted_on_pool(node: &NodeFixture, pool_id: B256) -> anyhow::Result<u64> {
     let wanted = format!("{pool_id}");
     let resp = node.admin_client()?.lanes().await.context("admin lanes")?;
@@ -815,31 +817,26 @@ async fn run_clamp() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
 
-    // The node redeems what it accepted. Wait for that redemption to land, then
-    // compare the node's accepted claim against what the chain pays.
+    // The node holds every payment the delegate made once the fetch returns,
+    // and it redeems all of it. Check what the node is owed against the
+    // registered cap, then wait for the chain to pay exactly that figure.
     let accepted = accepted_on_pool(&node, pool_id).await?;
-    let paid = poll(Duration::from_secs(90), || async {
-        let lane = e2e_assert::read_watermark(
-            chain.admin(),
-            payment_pool,
-            pool_id,
-            delegate_addr,
-            operator,
-        )
-        .await?;
-        Ok((lane.amount > 0).then_some(lane.amount))
-    })
-    .await?
-    .context("the node never redeemed the delegate's lane")?;
+    anyhow::ensure!(
+        accepted > 0,
+        "the node reports nothing owed on the delegate's pool, so the cap check below would \
+         pass vacuously"
+    );
     anyhow::ensure!(
         accepted <= registered.cap,
-        "the node accepted {accepted} µUSDC of vouchers under capability B, past the delegate's \
-         registered cap of {} µUSDC; the chain pays {paid} µUSDC and the remaining {} µUSDC \
-         redeems to 0",
-        registered.cap,
-        accepted.saturating_sub(paid)
+        "the node accepted {accepted} µUSDC of vouchers and preimages under capability B, past \
+         the delegate's registered cap of {} µUSDC; the part past the cap redeems to 0",
+        registered.cap
     );
+    // Each round re-reads the node's figure, so a payment the node folds after
+    // the first read is in the figure the chain must match. The node accepts
+    // nothing it cannot redeem, so the two meet exactly.
     let settled = poll(Duration::from_secs(90), || async {
+        let owed = accepted_on_pool(&node, pool_id).await?;
         let lane = e2e_assert::read_watermark(
             chain.admin(),
             payment_pool,
@@ -848,12 +845,30 @@ async fn run_clamp() -> anyhow::Result<()> {
             operator,
         )
         .await?;
-        Ok((lane.amount >= accepted).then_some(lane.amount))
+        Ok((lane.amount == owed).then_some(owed))
     })
     .await?;
+    let Some(settled) = settled else {
+        let owed = accepted_on_pool(&node, pool_id).await?;
+        let lane = e2e_assert::read_watermark(
+            chain.admin(),
+            payment_pool,
+            pool_id,
+            delegate_addr,
+            operator,
+        )
+        .await?;
+        anyhow::bail!(
+            "the chain pays {} µUSDC on the delegate's lane but the node is owed {owed} µUSDC; \
+             every payment the node accepted must redeem on-chain",
+            lane.amount
+        );
+    };
     anyhow::ensure!(
-        settled.is_some(),
-        "every voucher the node accepted ({accepted} µUSDC) must redeem on-chain"
+        settled <= registered.cap,
+        "the node accepted and redeemed {settled} µUSDC under capability B, past the delegate's \
+         registered cap of {} µUSDC",
+        registered.cap
     );
 
     // The registration is write-once: B changed nothing on-chain.

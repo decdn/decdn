@@ -223,9 +223,9 @@ async fn run() -> anyhow::Result<()> {
 /// Poll a node's admin `lanes()` for the lane `signer` signs vouchers on (the
 /// client data dir's lane key) until it reports a non-zero settled claim, or
 /// the budget expires.
-/// Mirrors `node_to_node_coalesce`'s `settled_outstanding`: the admin surface
-/// reads the persisted lane store, so a short poll rides out the fsync gap
-/// between `fetch` returning and the node durably recording the voucher.
+/// Mirrors `node_to_node_coalesce`'s `settled_outstanding`: a short poll rides
+/// out the gap between `fetch` returning and the node folding the client's
+/// trailing vouchers and preimages.
 ///
 /// The lane signer is a derived key, not the wallet, so the node must still
 /// name the wallet that owns the pool as the lane's counterparty (#2484).

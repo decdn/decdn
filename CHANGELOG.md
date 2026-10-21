@@ -1102,6 +1102,19 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node: `decdn node lanes` / `admin_v1_lanes` report what each lane is owed
+  (#2337).** `LaneSnapshot.outstanding_micro_usdc` was the cumulative of the
+  last signed voucher only. A hash-chain lane pays with preimages, which move
+  only the verified frontier, so the field trailed the lane's claim by up to
+  one chain, and read `0` on a lane's first epoch even while the node redeemed
+  it. The field is now the lane's owed amount: the signed anchor plus the
+  verified chain frontier, the same claim the redeemer submits.
+  `settlement_eligible` is measured against that figure too, and its doc no
+  longer says it predicts the next redemption: the redeemer gates on the
+  unredeemed value per `redeemMany`, not on this per-lane bar.
+  `seconds_since_last_voucher` also counts preimages. The delegated-capability
+  e2e journey now checks that the node's owed figure stays within the
+  registered cap and that the chain pays exactly that figure.
 - **Node: an oversize `redeemMany` that gets a bare HTTP 413, or that reads
   as possibly broadcast, is split in half (#2575).** The redeemer halved a
   chunk only when the refused send's text named an oversize cause. A

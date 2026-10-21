@@ -104,12 +104,12 @@ fn make_blob(len: usize) -> Vec<u8> {
     v
 }
 
-/// Read the `outstanding_micro_usdc` (cumulative accrued voucher claim) the node
-/// reports for the lane on `pool_id`, polling until a non-zero claim is visible
+/// Read the `outstanding_micro_usdc` (what the node is owed: signed anchor plus
+/// verified chain frontier) the node reports for the lane on `pool_id`, polling
+/// until a non-zero claim is visible
 /// or the budget expires. A settled full delivery has a non-zero cumulative
-/// claim; the node records it before the client's `fetch_once` returns, but the
-/// admin surface reads the persisted store, so a short poll rides out the fsync
-/// gap.
+/// claim, but the node may still be folding the client's trailing vouchers and
+/// preimages when `fetch_once` returns, so a short poll rides out that gap.
 async fn settled_outstanding(node: &NodeFixture, pool_id: B256) -> anyhow::Result<u64> {
     let admin = node.admin_client()?;
     let wanted = pool_id;
