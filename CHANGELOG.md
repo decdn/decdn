@@ -1102,6 +1102,19 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Payments: the sponsord keeper re-sends a `topUp` whose submit returned
+  no tx hash once its nonce is vacant (#2572).** A hold on such a top-up
+  ended only when the treasury's confirmed nonce passed the nonce it was
+  sent with, which never happens on its own when the transaction was not
+  broadcast, so every further top-up waited for an operator's 0-value
+  self-transfers. The keeper now reads the pending nonce too and, when the
+  confirmed and pending nonces both equal that nonce, re-sends the `topUp`
+  at it and settles the hold by that receipt; two transactions at one nonce
+  cannot both mine, so the re-send cannot escrow twice. A re-send that
+  reverts `PoolNotOpen` ends the hold, since the pool accepts no funds; any
+  other failure is retried next sweep. Self-transfers are needed only while
+  another transaction holds the nonce, or the node does not know a `topUp`
+  whose hash the keeper has.
 - **Payments: a send the RPC node answers with `nonce too low` or
   `replacement transaction underpriced` is reported as possibly broadcast, and
   an `openPool` or `topUp` that gets either is not sent again (#2562, #2565).**
