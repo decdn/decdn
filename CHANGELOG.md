@@ -1102,19 +1102,23 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
-- **Node: a `redeemMany` or sweep `reclaim` send that gets no answer is
-  reported as possibly broadcast, not refused (#2568).** The node's wallet
-  providers already carried `SendLegLayer`, but the seller's redeemer and the
-  buyer's reclaim sweep read every failed send as "nothing issued". A send
-  request that times out, resets or gets an HTTP 5xx, and a send answered
-  `already known`, `nonce too low` or `replacement transaction underpriced`,
-  now log that the transaction may be in a mempool. Such a `redeemMany`
-  counts into the new `decdn_onchain_tx_maybe_broadcast_total`, not into
+- **Node: a `redeemMany` or sweep `reclaim` send that fails with no tx hash
+  but may have broadcast is reported as possibly broadcast, not refused
+  (#2568).** The node's wallet providers already carried `SendLegLayer`, but
+  the seller's redeemer and the buyer's reclaim sweep read every failed send
+  as "nothing issued". A send request that times out, resets or gets an HTTP
+  5xx, and a send answered `already known`, `nonce too low` or `replacement
+  transaction underpriced`, now log that the transaction may be in a mempool.
+  Such a `redeemMany` counts into the new
+  `decdn_onchain_tx_maybe_broadcast_total`, not into
   `decdn_onchain_tx_send_failed_total` or `decdn_redemption_failures_total`,
   and still parks a hinted lane until a sweep finishes clean. The claims stay
-  for the next sweep either way, whose watermark read settles a `redeemMany`
-  that mined. A `reclaim` still counts into
-  `decdn_buyer_reclaim_failures_total`.
+  for the next sweep either way: if the `redeemMany` mined, that sweep skips
+  the lanes it paid; if it is still pending, the re-send is an on-chain no-op
+  that costs gas only. A `reclaim` still counts into
+  `decdn_buyer_reclaim_failures_total`. Alert on the new counter: an operator
+  who alerts on `decdn_redemption_failures_total` no longer sees a send leg
+  that keeps failing there.
 - **Payments: the sponsord keeper re-sends a `topUp` whose submit returned
   no tx hash once its nonce is vacant (#2572).** A hold on such a top-up
   ended only when the treasury's confirmed nonce passed the nonce it was

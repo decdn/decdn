@@ -1,8 +1,8 @@
 //! Shared driver for the node's on-chain `PaymentPool` write ladders.
 //!
-//! Every state-changing call the node makes against `PaymentPool` (today
-//! only the redeemer's `redeemMany`) follows the same micro-sequence: issue the transaction with `.send()`, await its receipt
-//! (optionally under a timeout), and inspect `receipt.status()` to tell a
+//! Every state-changing call the node makes through this driver (the
+//! redeemer's `redeemMany`) follows the same micro-sequence: issue the
+//! transaction with `.send()`, await its receipt (optionally under a timeout), and inspect `receipt.status()` to tell a
 //! mined-and-succeeded transaction from a mined-and-reverted one. A receipt
 //! wait that fails or lapses is not an outcome yet: the transaction was issued
 //! and often mines, and a load-balanced RPC can fail the wait on a backend that
@@ -53,20 +53,25 @@ const RESOLVE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// `status` sequence folded to a single value. Every arm past `.send()` carries
 /// the transaction hash (inside the receipt, or beside the error) so callers can
 /// log it: a transaction that is still unconfirmed may yet mine, and its hash is
-/// the only way to find it. The two error arms keep their distinct concrete
-/// types rather than being flattened.
+/// the only way to find it. The error arms keep their concrete types
+/// (`ContractError` for a failed send, `PendingTransactionError` for a failed
+/// wait) rather than being flattened.
 pub(crate) enum TxOutcome {
     /// Mined and succeeded (`receipt.status() == true`).
     Landed(TransactionReceipt),
     /// Mined and reverted (`receipt.status() == false`).
     Reverted(TransactionReceipt),
-    /// `.send()` failed and nothing was issued: the RPC refused the send, or a
-    /// chain read before it failed.
+    /// `.send()` failed and nothing was issued: the RPC refused the send, the
+    /// send request never reached it, or a chain read before it failed.
     SendErr(ContractError),
-    /// `.send()` failed, but the send request may have reached a mempool
-    /// ([`decdn_incentive::tx::send_broadcast_unknown`]): it failed in
-    /// transport with no answer, or the answer says a copy of it may already
-    /// be pending. No hash is known, and the transaction may still mine.
+    /// `.send()` failed with no tx hash, and its fate is unknown
+    /// ([`decdn_incentive::tx::send_broadcast_unknown`]): the send request
+    /// failed in transport with no answer, or the RPC answered `already
+    /// known`, `nonce too low` or `replacement transaction underpriced`, which
+    /// can each follow an earlier copy of the send that reached a mempool. The
+    /// transaction may have mined or may still mine. A collision with another
+    /// transaction from the same key at the same nonce gives the same answers,
+    /// and then nothing of this send was broadcast.
     MaybeBroadcast(ContractError),
     /// The transaction was issued, awaiting its receipt failed, and no by-hash
     /// fetch found a receipt either. The transaction is unconfirmed and may

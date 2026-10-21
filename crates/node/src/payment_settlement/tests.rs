@@ -1658,8 +1658,8 @@ async fn landed_chunk_read_failure_persists_no_registration() -> Result<()> {
 }
 
 /// Only a revert and a refused send count as redemption failures (#2154).
-/// An unconfirmed chunk, or a send with no answer, may have mined, so it
-/// counts only into its `onchain_tx_*` bucket (#2568).
+/// An unconfirmed chunk, or a send whose fate is unknown, may have mined, so
+/// each counts only into its `onchain_tx_*` bucket (#2568).
 #[test]
 fn only_reverts_and_refused_sends_are_redemption_failures() {
     use alloy::providers::PendingTransactionError;
@@ -3052,8 +3052,8 @@ async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Resul
 /// A `PaymentPool` whose provider carries the send-leg marker, as the node's
 /// seller wallet does, and that answers one `getWatermarks` per entry of
 /// `responses`; the next request fails in transport. Filler-free, the next
-/// request is the `redeemMany` send itself. With `gas_estimation`, it is the
-/// gas estimate the filler makes before the send.
+/// request is the `redeemMany` send itself. With `gas_estimation`, it is one
+/// of the gas filler's reads before the send (the gas or the fee estimate).
 fn marked_getwatermarks_pool(
     responses: &[Vec<PaymentPool::Lane>],
     gas_estimation: bool,
@@ -3107,6 +3107,7 @@ async fn a_redeem_send_with_no_answer_is_possibly_broadcast() -> Result<()> {
     ensure_metric_lines(
         &metrics,
         &[
+            "decdn_redemption_reconcile_failures_total 0",
             "decdn_onchain_tx_maybe_broadcast_total 1",
             "decdn_onchain_tx_send_failed_total 0",
             "decdn_redemption_failures_total 0",
@@ -3114,10 +3115,10 @@ async fn a_redeem_send_with_no_answer_is_possibly_broadcast() -> Result<()> {
     )
 }
 
-/// #2568: a `redeemMany` whose gas estimate fails never reached the send, so
-/// it stays a refused send and a redemption failure.
+/// #2568: a `redeemMany` whose gas fill fails never reached the send, so it
+/// stays a refused send and a redemption failure.
 #[tokio::test]
-async fn a_redeem_whose_gas_estimate_fails_is_refused() -> Result<()> {
+async fn a_redeem_whose_gas_fill_fails_is_refused() -> Result<()> {
     let log = CapturedLog::default();
     let _subscriber = log.install();
     let metrics = Arc::new(Metrics::new());

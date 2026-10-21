@@ -3154,15 +3154,24 @@ async fn an_unreadable_sweep_reclaim_receipt_logs_the_tx() -> anyhow::Result<()>
     Ok(())
 }
 
+/// How the `reclaim` send in [`sweep_with_a_failed_reclaim_send`] fails.
+enum ReclaimSendFailure {
+    /// The send request fails in transport with no answer.
+    NoAnswer,
+    /// The RPC answers the send with this error message.
+    Answer(&'static str),
+    /// One of the gas filler's reads before the send (the gas or the fee
+    /// estimate) fails, so the send never goes out.
+    GasFill,
+}
+
 /// Run one reclaim sweep over a `Closing` pool past its dispute deadline whose
-/// `reclaim` send fails, and return the WARN log and the metrics text. The
-/// provider carries the send-leg marker, as the node's buyer wallet does.
-/// `getPool` answers, the chain-head read faults (the sweep attempts the
-/// reclaim anyway), and the empty queue then fails the next request in
-/// transport: the send itself when filler-free, the gas estimate before it
-/// with `gas_estimation`. The row must survive either way.
+/// `reclaim` send fails as `failure` says, and return the WARN log and the
+/// metrics text. The provider carries the send-leg marker, as the node's buyer
+/// wallet does. `getPool` answers and the chain-head read faults (the sweep
+/// attempts the reclaim anyway). The row must survive every failure.
 async fn sweep_with_a_failed_reclaim_send(
-    gas_estimation: bool,
+    failure: ReclaimSendFailure,
 ) -> anyhow::Result<(String, String)> {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
@@ -3184,14 +3193,20 @@ async fn sweep_with_a_failed_reclaim_send(
     let asserter = Asserter::new();
     asserter.push_success(&alloy::primitives::Bytes::from(closing.abi_encode()));
     asserter.push_failure_msg("transient rpc fault");
+    if let ReclaimSendFailure::Answer(answer) = failure {
+        asserter.push_failure_msg(answer);
+    }
+    // Filler-free, the next request after the head read is the send itself;
+    // an empty queue fails it in transport.
     let marked = ProviderBuilder::default().layer(decdn_incentive::tx::SendLegLayer);
-    let provider = if gas_estimation {
-        marked
+    let provider = match failure {
+        ReclaimSendFailure::GasFill => marked
             .with_gas_estimation()
             .connect_mocked_client(asserter)
-            .erased()
-    } else {
-        marked.connect_mocked_client(asserter).erased()
+            .erased(),
+        ReclaimSendFailure::NoAnswer | ReclaimSendFailure::Answer(_) => {
+            marked.connect_mocked_client(asserter).erased()
+        }
     };
     let contract = PaymentPool::new(Address::ZERO, provider);
 
@@ -3220,10 +3235,10 @@ async fn sweep_with_a_failed_reclaim_send(
 
 /// #2568: a sweep `reclaim` send that gets no answer may be in a mempool, so
 /// the warning says so rather than calling it refused. The sweep meters it
-/// and keeps the row; if it mined, the next sweep finds the pool reclaimed.
+/// and keeps the row; if it mined, the next sweep finds the pool `Closed`.
 #[tokio::test]
 async fn a_sweep_reclaim_send_with_no_answer_may_be_in_a_mempool() -> anyhow::Result<()> {
-    let (text, exported) = sweep_with_a_failed_reclaim_send(false).await?;
+    let (text, exported) = sweep_with_a_failed_reclaim_send(ReclaimSendFailure::NoAnswer).await?;
     assert!(text.contains("may be in a mempool"), "{text}");
     assert!(!text.contains("reclaim submit failed"), "{text}");
     assert!(
@@ -3235,11 +3250,41 @@ async fn a_sweep_reclaim_send_with_no_answer_may_be_in_a_mempool() -> anyhow::Re
     Ok(())
 }
 
-/// #2568: a sweep `reclaim` whose gas estimate fails never reached the send,
-/// so it keeps the refused wording.
+/// #2568: a sweep `reclaim` the RPC answers `nonce too low` may be an earlier
+/// copy that was sequenced first, so it warns as possibly broadcast too.
 #[tokio::test]
-async fn a_sweep_reclaim_whose_gas_estimate_fails_is_refused() -> anyhow::Result<()> {
-    let (text, exported) = sweep_with_a_failed_reclaim_send(true).await?;
+async fn a_sweep_reclaim_answered_nonce_too_low_may_be_in_a_mempool() -> anyhow::Result<()> {
+    let (text, exported) =
+        sweep_with_a_failed_reclaim_send(ReclaimSendFailure::Answer("nonce too low")).await?;
+    assert!(text.contains("may be in a mempool"), "{text}");
+    assert!(!text.contains("reclaim submit failed"), "{text}");
+    assert!(
+        exported
+            .lines()
+            .any(|l| l == "decdn_buyer_reclaim_failures_total 1"),
+        "{exported}"
+    );
+    Ok(())
+}
+
+/// #2568: a sweep `reclaim` the RPC refuses with any other answer keeps the
+/// refused wording.
+#[tokio::test]
+async fn a_sweep_reclaim_answered_insufficient_funds_is_refused() -> anyhow::Result<()> {
+    let (text, _) = sweep_with_a_failed_reclaim_send(ReclaimSendFailure::Answer(
+        "insufficient funds for gas * price + value",
+    ))
+    .await?;
+    assert!(text.contains("reclaim submit failed"), "{text}");
+    assert!(!text.contains("may be in a mempool"), "{text}");
+    Ok(())
+}
+
+/// #2568: a sweep `reclaim` whose gas fill fails never reached the send, so
+/// it keeps the refused wording.
+#[tokio::test]
+async fn a_sweep_reclaim_whose_gas_fill_fails_is_refused() -> anyhow::Result<()> {
+    let (text, exported) = sweep_with_a_failed_reclaim_send(ReclaimSendFailure::GasFill).await?;
     assert!(text.contains("reclaim submit failed"), "{text}");
     assert!(!text.contains("may be in a mempool"), "{text}");
     assert!(

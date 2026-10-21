@@ -800,8 +800,9 @@ pub struct DecdnMetrics {
     /// finishes without a chain fault releases them. So an RPC outage costs one
     /// failed attempt per lane per interval: the sweep's batched retry. Hints
     /// for a parked lane stay dropped until a sweep finishes without a chain
-    /// fault. A non-zero rate tracks chain faults on the settlement path; read it beside
-    /// `decdn_onchain_tx_send_failed_total` and
+    /// fault. A non-zero rate tracks chain faults on the settlement path; read
+    /// it beside `decdn_onchain_tx_send_failed_total`,
+    /// `decdn_onchain_tx_maybe_broadcast_total` and
     /// `decdn_redemption_reconcile_failures_total`. Operator-visible name:
     /// `decdn_redeem_hints_parked_total`.
     pub redeem_hints_parked: Counter,
@@ -841,10 +842,9 @@ pub struct DecdnMetrics {
     /// count here; it counts into `decdn_onchain_tx_receipt_failed_total` or
     /// `decdn_onchain_tx_timeout_total`. Nor does a chunk whose send may have
     /// broadcast; it counts into `decdn_onchain_tx_maybe_broadcast_total`.
-    /// Each failure is otherwise only a
-    /// single `warn!`; a sustained rate means accrued earnings are not being
-    /// redeemed and warrants investigating the RPC / wallet. Operator-visible
-    /// name: `decdn_redemption_failures_total`.
+    /// Each failure is otherwise only a single `warn!`; a sustained rate means
+    /// accrued earnings are not being redeemed and warrants investigating the
+    /// RPC / wallet. Operator-visible name: `decdn_redemption_failures_total`.
     pub redemption_failures: Counter,
     /// Lanes the redeemer held or dropped for the pool's chain-observed
     /// solvency (`pool_is_redeemable`, ADR 003): a drained `Open` pool is held
@@ -900,7 +900,7 @@ pub struct DecdnMetrics {
     pub redemption_reconcile_failures: Counter,
     /// Buyer-side reclaim-sweep passes (`reclaim_once`) that failed — a failed
     /// buyer store read, a failed `getPool`/`reclaim` RPC (a `reclaim` send
-    /// with no answer included, which may still mine), a receipt wait, an
+    /// whose fate is unknown included, which may have mined), a receipt wait, an
     /// on-chain revert, or a failed store write when clearing the local record
     /// after a reclaim (#906). Each is otherwise only a single `warn!` per hourly
     /// sweep; a sustained rate means a closed pool's residual is not being
@@ -2210,24 +2210,30 @@ pub struct DecdnMetrics {
     pub pool_grace_closes: Counter,
     /// `decdn_onchain_tx_landed_total`: settlement transactions (`redeemMany`)
     /// mined and succeeded. The outcome family — `landed`, `reverted`,
-    /// `send_failed`, `maybe_broadcast`, `receipt_failed`, `timeout` — counts every transaction
-    /// sent through `send_and_await_receipt` exactly once;
+    /// `send_failed`, `maybe_broadcast`, `receipt_failed`, `timeout` — counts
+    /// every transaction sent through `send_and_await_receipt` exactly once;
     /// `onchain_tx_receipt_recovered` sits beside it and is not an outcome.
-    /// Buyer-side pool transactions go through `decdn-client` and are not
-    /// counted here.
+    /// Buyer-side pool transactions (`openPool` / `topUp` through
+    /// `decdn-client`, and the reclaim sweep's `reclaim`) are not counted here.
     pub onchain_tx_landed: Counter,
     /// `decdn_onchain_tx_reverted_total`: node transactions mined and reverted.
     pub onchain_tx_reverted: Counter,
     /// `decdn_onchain_tx_send_failed_total`: node transactions the RPC refused at
-    /// `send`, or whose chain reads before the send failed — none was issued.
+    /// `send`, whose send request never reached it, or whose chain reads before
+    /// the send failed — none was issued.
     /// An oversize `redeemMany` the redeemer then halves and retries counts
     /// here once too.
     pub onchain_tx_send_failed: Counter,
-    /// `decdn_onchain_tx_maybe_broadcast_total`: node transactions whose send
-    /// request failed with no answer (a timeout, a reset, an HTTP 5xx), or
-    /// whose answer says a copy may already be pending (`already known`,
-    /// `nonce too low`, `replacement transaction underpriced`). No hash is
-    /// known; the transaction may be in a mempool and may still mine.
+    /// `decdn_onchain_tx_maybe_broadcast_total`: settlement transactions
+    /// (`redeemMany`) whose send request failed with no answer (a timeout, a
+    /// reset, an HTTP 5xx), or whose answer is `already known`, `nonce too
+    /// low` or `replacement transaction underpriced`, which can each follow an
+    /// earlier copy that reached a mempool. No hash is known; the transaction
+    /// may have mined or may still mine. A collision with this node's buyer
+    /// service at the same nonce gives the same answers, and then nothing was
+    /// broadcast. A steady rate shows an RPC that loses send responses, a
+    /// lagging backend that hands out a stale nonce, or seller/buyer nonce
+    /// collisions.
     pub onchain_tx_maybe_broadcast: Counter,
     /// `decdn_onchain_tx_receipt_failed_total`: issued node transactions whose
     /// receipt wait failed and whose receipt no by-hash fetch found. The

@@ -2074,8 +2074,10 @@ async fn redeem_sweep<P: Provider + Clone>(
 /// refused send records one `redemption_failure`. An unconfirmed receipt (a
 /// failed or lapsed wait that the by-hash fetch in `send_and_await_receipt`
 /// could not resolve) and a send that may have broadcast are not failures: the
-/// tx may have mined, and each counts only into its `onchain_tx_*` bucket. Every non-landed outcome leaves the claims for the next
-/// sweep (cumulative, monotone, retry-safe). Does NOT seed the paid cache — each
+/// tx may have mined, and each counts only into its `onchain_tx_*` bucket.
+/// Every non-landed outcome leaves the claims for the next sweep (cumulative,
+/// monotone, retry-safe): a lane a mined `redeemMany` paid drops out of that
+/// sweep's plan, and a re-send of a still-pending one is an on-chain no-op. Does NOT seed the paid cache — each
 /// paid voucher emits its own `PoolRedeemed`.
 ///
 /// Returns whether the chunk hit a chain fault: any outcome other than
@@ -2159,7 +2161,7 @@ async fn submit_chunk<P: Provider + Clone>(
         }
         TxOutcome::MaybeBroadcast(err) => {
             record_tx_failure(&span, "maybe_broadcast", None);
-            warn!(error = %sanitize_error_sources(&err), voucher_count, "redeemMany send got no answer, but the transaction may be in a mempool; leaving claims for retry");
+            warn!(error = %sanitize_error_sources(&err), voucher_count, "redeemMany send failed with no tx hash, but the transaction may be in a mempool; leaving claims for retry");
         }
         TxOutcome::ReceiptErr {
             error,
@@ -2206,7 +2208,8 @@ const fn is_chain_fault(outcome: &TxOutcome) -> bool {
 /// counts into `decdn_onchain_tx_receipt_failed_total` /
 /// `decdn_onchain_tx_timeout_total`, which `DecdnOnchainTxUnconfirmed` alerts
 /// on. A send that may have broadcast (`MaybeBroadcast`) may also mine, so it
-/// counts only into `decdn_onchain_tx_maybe_broadcast_total`. An oversize send that `submit_chunk` halves never reaches this count.
+/// counts only into `decdn_onchain_tx_maybe_broadcast_total`. An oversize send
+/// that `submit_chunk` halves never reaches this count.
 const fn is_redemption_failure(outcome: &TxOutcome) -> bool {
     match outcome {
         TxOutcome::Reverted(_) | TxOutcome::SendErr(_) => true,
