@@ -3818,7 +3818,10 @@ async fn head_timestamp<P: Provider>(provider: &P) -> Result<u64> {
 
 /// One reclaim pass. Reads the node's tracked pool; if the on-chain pool has been
 /// closed (`disputeDeadline > 0`) and its grace window has elapsed, submits
-/// `reclaim` and forgets the row on success.
+/// `reclaim` and forgets the row on success. `owner` must be the account the
+/// contract's provider signs with: every warning of a reclaim that did not
+/// land names it as `signer`, and a send with no tx hash resolves only through
+/// that account's nonce.
 #[allow(clippy::cognitive_complexity)]
 async fn reclaim_once<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -3905,11 +3908,11 @@ async fn reclaim_once<P: Provider + Clone>(
                     info!(pool_id = %state.pool_id, %tx, "reclaimed the buyer pool residual and dropped the row");
                 }
                 Ok(_) => {
-                    warn!(pool_id = %state.pool_id, %tx, "reclaim sweep: reclaim reverted");
+                    warn!(pool_id = %state.pool_id, signer = %owner, %tx, "reclaim sweep: reclaim reverted");
                     metrics.buyer_reclaim_failure();
                 }
                 Err(err) => {
-                    warn!(pool_id = %state.pool_id, %tx, error = %sanitize_err_chain(&err), "reclaim sweep: reclaim receipt not read; the next sweep retries");
+                    warn!(pool_id = %state.pool_id, signer = %owner, %tx, error = %sanitize_err_chain(&err), "reclaim sweep: reclaim receipt not read; the next sweep retries");
                     metrics.buyer_reclaim_failure();
                 }
             }
@@ -3919,11 +3922,11 @@ async fn reclaim_once<P: Provider + Clone>(
         // it mined, the next sweep finds the pool `Closed` and drops the row;
         // if not, the next sweep sends it again.
         Err(err) if decdn_incentive::tx::send_broadcast_unknown(&err) => {
-            warn!(pool_id = %state.pool_id, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim send failed with no tx hash, but the transaction may be in a mempool; the next sweep retries");
+            warn!(pool_id = %state.pool_id, signer = %owner, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim send failed with no tx hash, but the transaction may be in a mempool; the next sweep retries");
             metrics.buyer_reclaim_failure();
         }
         Err(err) => {
-            warn!(pool_id = %state.pool_id, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim submit failed");
+            warn!(pool_id = %state.pool_id, signer = %owner, error = %sanitize_error_sources(&err), "reclaim sweep: reclaim submit failed");
             metrics.buyer_reclaim_failure();
         }
     }

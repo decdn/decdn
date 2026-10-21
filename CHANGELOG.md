@@ -1102,6 +1102,31 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Node: an oversize `redeemMany` that gets a bare HTTP 413, or that reads
+  as possibly broadcast, is split in half (#2575).** The redeemer halved a
+  chunk only when the refused send's text named an oversize cause. A
+  gateway's 413 with an empty body (`HTTP error 413 with empty body`) never
+  matched, and a proxy that turns an upstream 413 into a 5xx made the send
+  possibly broadcast, which the split never saw. In both cases the chunk was
+  re-sent at full size on every sweep, and its lanes stayed unredeemed until
+  the operator lowered `blockchain.redeem_max_vouchers_per_tx`. The split now
+  reads the HTTP status as well as the text, and runs on a possibly-broadcast
+  send too: redemption is cumulative, so if the full chunk already mined, its
+  halves settle nothing more and cost gas only. The split warning carries the
+  error and `send_outcome` (`send_failed` or `maybe_broadcast`). The halved
+  send still counts into `decdn_onchain_tx_send_failed_total` or
+  `decdn_onchain_tx_maybe_broadcast_total`, but not into
+  `decdn_redemption_failures_total`; a split on every sweep means the cap sits
+  above the RPC's body-size limit. An oversize send that cannot be halved
+  further (one lane, or the split-depth bound) is a redemption failure, even
+  when it reads as possibly broadcast, and its warning names the cap. A
+  connection reset while the body uploads carries no size signal and still
+  does not halve.
+- **Node: every warning of a `redeemMany` or `reclaim` that did not land
+  names the sending account as `signer` (#2576).** A send with no tx hash
+  resolves only by comparing that account's pending and latest nonce
+  (`cast nonce <signer> --block pending` against `--block latest`), and the
+  warning did not name it.
 - **Node: a `redeemMany` or sweep `reclaim` send that fails with no tx hash
   but may have broadcast is reported as possibly broadcast, not refused
   (#2568).** The node's wallet providers already carried `SendLegLayer`, but

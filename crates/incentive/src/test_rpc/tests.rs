@@ -31,3 +31,33 @@ async fn a_block_read_with_no_head_set_parks() {
     .await;
     assert!(read.is_err(), "the block read must still be pending");
 }
+
+/// A scripted send failure reaches the caller as the HTTP error, marked as a
+/// send-leg failure, and the send after it answers as usual.
+#[tokio::test]
+async fn a_scripted_send_failure_fails_one_send_in_transport() {
+    use alloy::rpc::types::TransactionRequest;
+
+    let provider = ScriptedRpc::parked_receipt()
+        .failing_sends([(413, String::new())])
+        .provider();
+    let tx = TransactionRequest::default().nonce(1).gas_limit(21_000);
+
+    let err = provider
+        .send_transaction(tx.clone())
+        .await
+        .expect_err("the first send fails");
+    let failure = crate::tx::SendLegFailure::from_transport_error(&err)
+        .expect("the failure is marked as a send-leg failure");
+    let status = match failure.inner() {
+        alloy::transports::RpcError::Transport(kind) => kind.as_http_error().map(|h| h.status),
+        _ => None,
+    };
+    assert_eq!(status, Some(413), "the failure is the HTTP 413");
+
+    let pending = provider
+        .send_transaction(tx)
+        .await
+        .expect("the second send answers");
+    assert_eq!(*pending.tx_hash(), super::SCRIPTED_TX);
+}

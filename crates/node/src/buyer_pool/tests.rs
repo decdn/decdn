@@ -3240,6 +3240,12 @@ async fn sweep_with_a_failed_reclaim_send(
 async fn a_sweep_reclaim_send_with_no_answer_may_be_in_a_mempool() -> anyhow::Result<()> {
     let (text, exported) = sweep_with_a_failed_reclaim_send(ReclaimSendFailure::NoAnswer).await?;
     assert!(text.contains("may be in a mempool"), "{text}");
+    let signer = format!("signer={}", Address::repeat_byte(1));
+    assert!(
+        text.lines()
+            .any(|line| line.contains("may be in a mempool") && line.contains(&signer)),
+        "the warning names the sending account: {text}"
+    );
     assert!(!text.contains("reclaim submit failed"), "{text}");
     assert!(
         exported
@@ -3277,6 +3283,12 @@ async fn a_sweep_reclaim_answered_insufficient_funds_is_refused() -> anyhow::Res
     .await?;
     assert!(text.contains("reclaim submit failed"), "{text}");
     assert!(!text.contains("may be in a mempool"), "{text}");
+    let signer = format!("signer={}", Address::repeat_byte(1));
+    assert!(
+        text.lines()
+            .any(|line| line.contains("reclaim submit failed") && line.contains(&signer)),
+        "the warning names the sending account: {text}"
+    );
     Ok(())
 }
 

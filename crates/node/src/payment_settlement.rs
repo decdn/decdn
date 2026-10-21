@@ -73,6 +73,7 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use alloy::contract::Error as ContractError;
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
@@ -2004,8 +2005,17 @@ async fn redeem_one<P: Provider + Clone>(
     let plans = plan_lanes(paid, self_address, vec![st], metrics, pool_view, now);
     // Hint path: require the durability floor and skip the submit on a failed
     // flush (`strict_flush`); the lane defers to the next sweep.
-    let chain_fault =
-        redeem_planned_lanes(contract, store, plans, floor, max_vouchers, true, metrics).await;
+    let chain_fault = redeem_planned_lanes(
+        contract,
+        store,
+        plans,
+        self_address,
+        floor,
+        max_vouchers,
+        true,
+        metrics,
+    )
+    .await;
     HintOutcome { wake, chain_fault }
 }
 
@@ -2060,6 +2070,7 @@ async fn redeem_sweep<P: Provider + Clone>(
         contract,
         store,
         plans,
+        self_address,
         floor,
         max_vouchers,
         strict_flush,
@@ -2068,17 +2079,22 @@ async fn redeem_sweep<P: Provider + Clone>(
     .await
 }
 
-/// Submit one chunk of planned lanes as a single `redeemMany`. On an oversize
-/// send failure (`is_oversize_send_err`) with more than one lane, halve the chunk
-/// and retry each half, bounded by `MAX_SPLIT_DEPTH`. A revert or a non-oversize
-/// refused send records one `redemption_failure`. An unconfirmed receipt (a
-/// failed or lapsed wait that the by-hash fetch in `send_and_await_receipt`
-/// could not resolve) and a send that may have broadcast are not failures: the
+/// Submit one chunk of planned lanes as a single `redeemMany`, sent by
+/// `signer`. On an oversize send ([`is_oversize_send`]), refused or possibly
+/// broadcast, with more than one lane, halve the chunk and retry each half,
+/// bounded by `MAX_SPLIT_DEPTH`. The halved send still counts into its
+/// `onchain_tx_*` bucket (`send_failed` or `maybe_broadcast`), but not into
+/// `redemption_failure`. A revert, a refused send that is not halved, and an
+/// oversize send that cannot be halved further (one lane, or the depth bound)
+/// each record one `redemption_failure`. An unconfirmed receipt (a failed or
+/// lapsed wait that the by-hash fetch in `send_and_await_receipt` could not
+/// resolve) and any other send that may have broadcast are not failures: the
 /// tx may have mined, and each counts only into its `onchain_tx_*` bucket.
 /// Every non-landed outcome leaves the claims for the next sweep (cumulative,
 /// monotone, retry-safe): a lane a mined `redeemMany` paid drops out of that
-/// sweep's plan, and a re-send of a still-pending one is an on-chain no-op. Does NOT seed the paid cache — each
-/// paid voucher emits its own `PoolRedeemed`.
+/// sweep's plan, and a re-send of a still-pending one is an on-chain no-op.
+/// Does NOT seed the paid cache — each paid voucher emits its own
+/// `PoolRedeemed`.
 ///
 /// Returns whether the chunk hit a chain fault: any outcome other than
 /// `Landed`, the unconfirmed ones included, in the chunk itself or in either
@@ -2086,6 +2102,8 @@ async fn redeem_sweep<P: Provider + Clone>(
 ///
 /// Runs inside an `onchain_tx` span that records the transaction hash (`tx`)
 /// and the `outcome`. A halved retry nests its two halves as child spans.
+/// Every warning of a chunk that did not land names `signer`: a send with no
+/// tx hash resolves only through that account's pending and latest nonce.
 #[allow(clippy::cognitive_complexity)]
 #[tracing::instrument(
     name = "onchain_tx",
@@ -2102,7 +2120,8 @@ async fn redeem_sweep<P: Provider + Clone>(
 async fn submit_chunk<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
-    mut lanes: Vec<PlannedLane>,
+    lanes: Vec<PlannedLane>,
+    signer: Address,
     metrics: &Arc<Metrics>,
     depth: u32,
 ) -> bool {
@@ -2118,6 +2137,10 @@ async fn submit_chunk<P: Provider + Clone>(
     let outcome = send_and_await_receipt(sent, Some(REDEEM_RECEIPT_TIMEOUT), metrics).await;
     let failed = is_redemption_failure(&outcome);
     let chain_fault = is_chain_fault(&outcome);
+    let send_outcome = match &outcome {
+        TxOutcome::MaybeBroadcast(_) => "maybe_broadcast",
+        _ => "send_failed",
+    };
     match outcome {
         TxOutcome::Landed(receipt) => {
             span.record("tx", tracing::field::display(receipt.transaction_hash));
@@ -2132,36 +2155,39 @@ async fn submit_chunk<P: Provider + Clone>(
             record_landed_chunk(contract, store, &lanes, metrics).await;
             return false;
         }
-        TxOutcome::SendErr(err)
-            if lanes.len() >= 2
-                && depth < MAX_SPLIT_DEPTH
-                && is_oversize_send_err(&err.to_string()) =>
+        // The chunk may have broadcast, and re-sending its lanes in halves is
+        // still safe: redemption is cumulative, so `PaymentPool` skips a
+        // voucher at or below its lane's watermark.
+        TxOutcome::SendErr(err) | TxOutcome::MaybeBroadcast(err)
+            if lanes.len() >= 2 && depth < MAX_SPLIT_DEPTH && is_oversize_send(&err) =>
         {
             span.record("outcome", "split");
-            let mid = lanes.len() / 2;
-            let right = lanes.split_off(mid);
             warn!(
+                error = %sanitize_error_sources(&err),
+                send_outcome,
                 voucher_count,
-                depth, "redeemMany send rejected oversized; halving chunk and retrying"
+                depth,
+                %signer,
+                "redeemMany send rejected oversized; halving chunk and retrying; lower \
+                 blockchain.redeem_max_vouchers_per_tx if this repeats every sweep"
             );
-            let left_faulted =
-                Box::pin(submit_chunk(contract, store, lanes, metrics, depth + 1)).await;
-            let right_faulted =
-                Box::pin(submit_chunk(contract, store, right, metrics, depth + 1)).await;
-            // Each half counts its own outcome; the split itself is not a failure.
-            return left_faulted || right_faulted;
+            return submit_halves(contract, store, lanes, signer, metrics, depth + 1).await;
         }
         TxOutcome::Reverted(receipt) => {
             record_tx_failure(&span, "reverted", Some(receipt.transaction_hash));
-            warn!(voucher_count, tx = %receipt.transaction_hash, "redeemMany reverted on-chain; leaving claims for retry");
+            warn!(voucher_count, %signer, tx = %receipt.transaction_hash, "redeemMany reverted on-chain; leaving claims for retry");
+        }
+        TxOutcome::SendErr(err) | TxOutcome::MaybeBroadcast(err) if is_oversize_send(&err) => {
+            record_tx_failure(&span, send_outcome, None);
+            warn!(error = %sanitize_error_sources(&err), send_outcome, voucher_count, depth, %signer, "redeemMany send rejected oversized and cannot be halved further; lower blockchain.redeem_max_vouchers_per_tx; leaving claims for retry");
         }
         TxOutcome::SendErr(err) => {
             record_tx_failure(&span, "send_failed", None);
-            warn!(error = %sanitize_error_sources(&err), voucher_count, "redeemMany send failed; leaving claims for retry");
+            warn!(error = %sanitize_error_sources(&err), voucher_count, %signer, "redeemMany send failed; leaving claims for retry");
         }
         TxOutcome::MaybeBroadcast(err) => {
             record_tx_failure(&span, "maybe_broadcast", None);
-            warn!(error = %sanitize_error_sources(&err), voucher_count, "redeemMany send failed with no tx hash, but the transaction may be in a mempool; leaving claims for retry");
+            warn!(error = %sanitize_error_sources(&err), voucher_count, %signer, "redeemMany send failed with no tx hash, but the transaction may be in a mempool; leaving claims for retry");
         }
         TxOutcome::ReceiptErr {
             error,
@@ -2169,14 +2195,14 @@ async fn submit_chunk<P: Provider + Clone>(
             last_lookup,
         } => {
             record_tx_failure(&span, "receipt_failed", Some(tx_hash));
-            warn!(error = %sanitize_error_sources(&error), %last_lookup, voucher_count, tx = %tx_hash, "redeemMany receipt wait failed and the by-hash lookup missed; unconfirmed, leaving claims for retry");
+            warn!(error = %sanitize_error_sources(&error), %last_lookup, voucher_count, %signer, tx = %tx_hash, "redeemMany receipt wait failed and the by-hash lookup missed; unconfirmed, leaving claims for retry");
         }
         TxOutcome::Timeout {
             tx_hash,
             last_lookup,
         } => {
             record_tx_failure(&span, "timeout", Some(tx_hash));
-            warn!(%last_lookup, voucher_count, tx = %tx_hash, timeout = ?REDEEM_RECEIPT_TIMEOUT, "redeemMany receipt timed out and the by-hash lookup missed; unconfirmed, leaving claims for retry");
+            warn!(%last_lookup, voucher_count, %signer, tx = %tx_hash, timeout = ?REDEEM_RECEIPT_TIMEOUT, "redeemMany receipt timed out and the by-hash lookup missed; unconfirmed, leaving claims for retry");
         }
     }
     if failed {
@@ -2185,11 +2211,30 @@ async fn submit_chunk<P: Provider + Clone>(
     chain_fault
 }
 
+/// Submit the two halves of an oversize chunk, each as its own
+/// [`submit_chunk`] at `depth`. Each half counts its own outcome; the split
+/// itself is not a failure. Returns whether either half hit a chain fault. The
+/// right half is sent whatever the left half's outcome.
+async fn submit_halves<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    store: &Arc<dyn PoolStateStore>,
+    mut lanes: Vec<PlannedLane>,
+    signer: Address,
+    metrics: &Arc<Metrics>,
+    depth: u32,
+) -> bool {
+    let right = lanes.split_off(lanes.len() / 2);
+    let left_faulted = Box::pin(submit_chunk(contract, store, lanes, signer, metrics, depth)).await;
+    let right_faulted =
+        Box::pin(submit_chunk(contract, store, right, signer, metrics, depth)).await;
+    left_faulted || right_faulted
+}
+
 /// Whether a `redeemMany` outcome is a chain fault that parks a hinted lane
 /// ([`redeemer_loop`]). Every outcome but `Landed` is one, the unconfirmed ones
 /// included: the lane's claim stays unsettled either way, so a hint that retries
-/// it at once meets the same fault. An oversize send that `submit_chunk` halves
-/// takes the outcome of its halves instead.
+/// it at once meets the same fault. An oversize send that `submit_chunk` halves,
+/// refused or possibly broadcast, takes the outcome of its halves instead.
 const fn is_chain_fault(outcome: &TxOutcome) -> bool {
     match outcome {
         TxOutcome::Landed(_) => false,
@@ -2202,21 +2247,22 @@ const fn is_chain_fault(outcome: &TxOutcome) -> bool {
 }
 
 /// Whether a `redeemMany` outcome counts into `decdn_redemption_failures_total`.
-/// A revert and a refused send are failures. A landed chunk is not, and neither
+/// A revert, a refused send, and an oversize send that may have broadcast
+/// ([`is_oversize_send`]) are failures: a body too big to accept is refused,
+/// whatever the transport status. A landed chunk is not, and neither
 /// is an unconfirmed one (`ReceiptErr` / `Timeout`): the by-hash lookup already
 /// resolves every transaction the RPC can see mined, so what stays unconfirmed
 /// counts into `decdn_onchain_tx_receipt_failed_total` /
 /// `decdn_onchain_tx_timeout_total`, which `DecdnOnchainTxUnconfirmed` alerts
-/// on. A send that may have broadcast (`MaybeBroadcast`) may also mine, so it
-/// counts only into `decdn_onchain_tx_maybe_broadcast_total`. An oversize send
-/// that `submit_chunk` halves never reaches this count.
-const fn is_redemption_failure(outcome: &TxOutcome) -> bool {
+/// on. Any other send that may have broadcast (`MaybeBroadcast`) may also mine,
+/// so it counts only into `decdn_onchain_tx_maybe_broadcast_total`. An oversize send
+/// that `submit_chunk` halves, refused or possibly broadcast, never reaches this
+/// count.
+fn is_redemption_failure(outcome: &TxOutcome) -> bool {
     match outcome {
         TxOutcome::Reverted(_) | TxOutcome::SendErr(_) => true,
-        TxOutcome::Landed(_)
-        | TxOutcome::MaybeBroadcast(_)
-        | TxOutcome::ReceiptErr { .. }
-        | TxOutcome::Timeout { .. } => false,
+        TxOutcome::MaybeBroadcast(err) => is_oversize_send(err),
+        TxOutcome::Landed(_) | TxOutcome::ReceiptErr { .. } | TxOutcome::Timeout { .. } => false,
     }
 }
 
@@ -2515,10 +2561,15 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
 /// Returns whether the cycle hit a chain fault: a failed watermark read or a
 /// chunk that did not land. A floor deferral, an empty chunk set and a failed
 /// strict flush add no fault of their own; the flush is local to this node.
+///
+/// `signer` is the account that sends each `redeemMany`, the node's operator
+/// key; the warnings of a chunk that did not land name it.
+#[allow(clippy::too_many_arguments)]
 async fn redeem_planned_lanes<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &Arc<dyn PoolStateStore>,
     plans: Vec<PlannedLane>,
+    signer: Address,
     floor: U256,
     max_vouchers: usize,
     strict_flush: bool,
@@ -2543,7 +2594,7 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
         }
         let mut faulted = read_failed;
         for chunk in chunks {
-            faulted |= submit_chunk(contract, store, chunk, metrics, 0).await;
+            faulted |= submit_chunk(contract, store, chunk, signer, metrics, 0).await;
         }
         faulted
     }
@@ -2739,12 +2790,36 @@ impl KeyedCheckpointStore for DebouncedCheckpointStore {
     }
 }
 
-/// Whether a `redeemMany` send error looks like "the transaction is too big to
-/// include" — exceeding the block gas limit or the node/mempool transaction-size
-/// cap — rather than a revert or a transient RPC fault. Matched case-insensitively
-/// against a small set of client markers; the caller also bounds retry depth, so a
-/// false negative simply leaves the claim for the next sweep and a false positive
-/// costs at most a bounded number of doomed smaller sends.
+/// Whether a failed `redeemMany` send was too big to accept: the transport
+/// answered HTTP 413 (a gateway's body-size cap, often with an empty body), or
+/// the error text names an oversize cause ([`is_oversize_send_err`]). The check
+/// reads through the send-leg marker, so a marked and an unmarked failure
+/// classify alike. A 5xx whose body says `request entity too large` (a proxy
+/// that rewrote an upstream 413) matches on its text. A connection reset during
+/// the upload carries no size signal and does not match.
+fn is_oversize_send(err: &ContractError) -> bool {
+    use alloy::transports::RpcError;
+
+    let ContractError::TransportError(transport) = err else {
+        return is_oversize_send_err(&err.to_string());
+    };
+    let inner = decdn_incentive::tx::SendLegFailure::from_transport_error(transport)
+        .map_or(transport, decdn_incentive::tx::SendLegFailure::inner);
+    let http_413 = matches!(
+        inner,
+        RpcError::Transport(kind) if kind.as_http_error().is_some_and(|http| http.status == 413)
+    );
+    http_413 || is_oversize_send_err(&err.to_string())
+}
+
+/// Whether a `redeemMany` send error text looks like "the transaction is too big
+/// to include" — exceeding the block gas limit or the node/mempool
+/// transaction-size cap — rather than a revert or a transient RPC fault: the text
+/// half of [`is_oversize_send`]. Matched case-insensitively against a small set
+/// of client markers. A false negative re-sends the chunk at full size on every
+/// sweep, and its lanes stay unredeemed until
+/// `blockchain.redeem_max_vouchers_per_tx` drops; the caller bounds retry depth,
+/// so a false positive costs at most a bounded number of doomed smaller sends.
 fn is_oversize_send_err(msg: &str) -> bool {
     const MARKERS: [&str; 5] = [
         "gas required exceeds",

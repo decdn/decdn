@@ -456,6 +456,9 @@ async fn resolving_cached_status_never_calls_getpool() -> Result<()> {
     Ok(())
 }
 
+/// The node that serves every planned lane and sends its `redeemMany`.
+const SELLER: Address = Address::new([0xEE; 20]);
+
 const AUTH_EXPIRY: u64 = 1_900_000_000;
 
 /// A registered authorization (`expiry` non-zero), or the unregistered
@@ -1415,7 +1418,7 @@ fn planned(pool: u8, signer: u8, unredeemed: u64, register: bool) -> PlannedLane
         key: LaneKey {
             pool_id: PoolId::from([pool; 32]),
             signer: signer_addr,
-            provider: Address::from([0xEE; 20]),
+            provider: SELLER,
         },
         owed: U256::from(unredeemed),
         unredeemed: U256::from(unredeemed),
@@ -2027,6 +2030,7 @@ async fn a_sub_floor_plan_set_reads_nothing_from_the_chain() -> Result<()> {
         &contract,
         &store,
         vec![planned(1, 0, 10, false)],
+        SELLER,
         U256::from(1_000_000u64),
         300,
         true,
@@ -2075,6 +2079,7 @@ async fn a_set_that_clears_the_floor_in_total_reads_every_lane() -> Result<()> {
             planned(1, 1, 300_000, false),
             planned(1, 2, 300_000, false),
         ],
+        SELLER,
         U256::from(500_000u64),
         2,
         true,
@@ -2113,6 +2118,7 @@ async fn a_zero_floor_still_reads_every_lane() -> Result<()> {
         &contract,
         &store,
         vec![planned(1, 0, 1, false), planned(1, 1, 1, false)],
+        SELLER,
         U256::ZERO,
         300,
         false,
@@ -3031,6 +3037,7 @@ async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Resul
         &contract,
         &store,
         vec![planned(1, 0, 1_000, false)],
+        SELLER,
         U256::from(1u64),
         300,
         true,
@@ -3095,6 +3102,7 @@ async fn a_redeem_send_with_no_answer_is_possibly_broadcast() -> Result<()> {
         &contract,
         &store,
         vec![planned(1, 0, 1_000, false)],
+        SELLER,
         U256::from(1u64),
         300,
         false,
@@ -3103,13 +3111,191 @@ async fn a_redeem_send_with_no_answer_is_possibly_broadcast() -> Result<()> {
     .await;
 
     assert!(faulted, "an unsettled claim is a chain fault");
-    log.lines("may be in a mempool")?;
+    let warned = log.lines("may be in a mempool")?;
+    let signer = format!("signer={SELLER}");
+    anyhow::ensure!(
+        warned.iter().all(|line| line.contains(&signer)),
+        "the warning names the sending account: {warned:?}"
+    );
     ensure_metric_lines(
         &metrics,
         &[
             "decdn_redemption_reconcile_failures_total 0",
             "decdn_onchain_tx_maybe_broadcast_total 1",
             "decdn_onchain_tx_send_failed_total 0",
+            "decdn_redemption_failures_total 0",
+        ],
+    )
+}
+
+/// Drive one `redeem_planned_lanes` cycle over `lanes` lanes of one pool,
+/// where the cycle's first sends fail in transport with `failures` (status,
+/// body), in order. The provider carries the send-leg marker and has no
+/// fillers, as in [`marked_getwatermarks_pool`]; every later send lands.
+async fn redeem_after_failed_sends(
+    lanes: u8,
+    failures: &[(u16, &str)],
+) -> Result<(bool, CapturedLog, Arc<Metrics>)> {
+    use alloy::sol_types::SolCall;
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt};
+
+    let log = CapturedLog::default();
+    let _subscriber = log.install();
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let unpaid: Vec<PaymentPool::Lane> = (0..lanes).map(|_| lane(0)).collect();
+    let watermarks = PaymentPool::getWatermarksCall::abi_encode_returns(&unpaid);
+    let provider = ScriptedRpc::mined(mined_receipt(Address::ZERO, Vec::new()))
+        .answering_calls([Bytes::from(watermarks)])
+        .failing_sends(
+            failures
+                .iter()
+                .map(|&(status, body)| (status, body.to_owned())),
+        )
+        .provider();
+    let contract = PaymentPool::new(Address::ZERO, provider);
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        (0..lanes).map(|i| planned(1, i, 1_000, false)).collect(),
+        SELLER,
+        U256::from(1u64),
+        300,
+        false,
+        &metrics,
+    )
+    .await;
+    Ok((faulted, log, metrics))
+}
+
+/// #2575: a `redeemMany` that a gateway refuses with a bare HTTP 413 (no
+/// body, so no oversize text) halves, and each half lands once.
+#[tokio::test]
+async fn a_redeem_with_a_bare_413_halves_and_lands_each_half() -> Result<()> {
+    let (faulted, log, metrics) = redeem_after_failed_sends(2, &[(413, "")]).await?;
+
+    assert!(!faulted, "both halves landed");
+    let split = log.lines("halving chunk and retrying")?;
+    let signer = format!("signer={SELLER}");
+    anyhow::ensure!(
+        split
+            .iter()
+            .all(|line| line.contains(&signer) && line.contains("send_outcome=\"send_failed\"")),
+        "the split line names the account and the refused send: {split:?}"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_send_failed_total 1",
+            "decdn_onchain_tx_landed_total 2",
+            "decdn_pool_redemptions_total 2",
+            "decdn_redemption_failures_total 0",
+        ],
+    )
+}
+
+/// #2575: an oversize `redeemMany` that reads as possibly broadcast (a proxy
+/// turned the upstream 413 into a 5xx that keeps its text) halves too, and
+/// the split line carries the error it split on.
+#[tokio::test]
+async fn a_possibly_broadcast_oversize_redeem_halves() -> Result<()> {
+    let (faulted, log, metrics) =
+        redeem_after_failed_sends(2, &[(502, "413 Request Entity Too Large")]).await?;
+
+    assert!(!faulted, "both halves landed");
+    let split = log.lines("halving chunk and retrying")?;
+    anyhow::ensure!(
+        split
+            .iter()
+            .all(|line| line.contains("Request Entity Too Large")
+                && line.contains("send_outcome=\"maybe_broadcast\"")),
+        "the split line carries the error and the send class: {split:?}"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_maybe_broadcast_total 1",
+            "decdn_onchain_tx_landed_total 2",
+            "decdn_redemption_failures_total 0",
+        ],
+    )
+}
+
+/// #2575: a possibly-broadcast send with no oversize signal does not halve.
+#[tokio::test]
+async fn a_possibly_broadcast_redeem_with_no_size_signal_does_not_halve() -> Result<()> {
+    let (faulted, log, metrics) = redeem_after_failed_sends(2, &[(503, "")]).await?;
+
+    assert!(faulted, "the unsettled chunk is a chain fault");
+    log.lines("may be in a mempool")?;
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_maybe_broadcast_total 1",
+            "decdn_onchain_tx_landed_total 0",
+        ],
+    )
+}
+
+/// #2575: a one-lane half that is still refused oversize does not halve
+/// again. Each half is a visible redemption failure that names the cap.
+#[tokio::test]
+async fn a_one_lane_half_still_refused_oversize_is_a_redemption_failure() -> Result<()> {
+    let (faulted, log, metrics) =
+        redeem_after_failed_sends(2, &[(413, ""), (413, ""), (413, "")]).await?;
+
+    assert!(faulted, "no lane settled");
+    anyhow::ensure!(
+        log.lines("halving chunk and retrying")?.len() == 1,
+        "one split only"
+    );
+    anyhow::ensure!(
+        log.lines("cannot be halved further")?.len() == 2,
+        "each one-lane half warns"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_send_failed_total 3",
+            "decdn_onchain_tx_landed_total 0",
+            "decdn_redemption_failures_total 2",
+        ],
+    )
+}
+
+/// #2575: an oversize send that may have broadcast and cannot be halved
+/// (one lane) is a redemption failure: a body too big to accept is refused,
+/// whatever the transport status.
+#[tokio::test]
+async fn a_one_lane_possibly_broadcast_oversize_redeem_is_a_redemption_failure() -> Result<()> {
+    let (faulted, log, metrics) =
+        redeem_after_failed_sends(1, &[(502, "request entity too large")]).await?;
+
+    assert!(faulted, "the lane did not settle");
+    log.lines("cannot be halved further")?;
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_maybe_broadcast_total 1",
+            "decdn_redemption_failures_total 1",
+        ],
+    )
+}
+
+/// #2575: a fault in one half does not stop the other half, and the chunk
+/// reports the fault.
+#[tokio::test]
+async fn a_split_with_one_faulted_half_lands_the_other_and_reports_the_fault() -> Result<()> {
+    let (faulted, _log, metrics) = redeem_after_failed_sends(2, &[(413, ""), (503, "")]).await?;
+
+    assert!(faulted, "the left half did not settle");
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_onchain_tx_send_failed_total 1",
+            "decdn_onchain_tx_maybe_broadcast_total 1",
+            "decdn_onchain_tx_landed_total 1",
             "decdn_redemption_failures_total 0",
         ],
     )
@@ -3129,6 +3315,7 @@ async fn a_redeem_whose_gas_fill_fails_is_refused() -> Result<()> {
         &contract,
         &store,
         vec![planned(1, 0, 1_000, false)],
+        SELLER,
         U256::from(1u64),
         300,
         false,
@@ -3163,6 +3350,7 @@ async fn a_failed_read_stays_a_chain_fault_past_a_failed_strict_flush() -> Resul
         &contract,
         &store,
         vec![planned(1, 0, 1_000, false)],
+        SELLER,
         U256::from(1u64),
         300,
         true,
@@ -3389,6 +3577,38 @@ fn is_oversize_send_err_matches_known_markers() {
     ] {
         assert!(is_oversize_send_err(m), "should flag: {m}");
     }
+}
+
+/// #2575: the oversize check reads the HTTP status, and falls back to the
+/// error text for every other shape. The halving tests cover a failure the
+/// send-leg marker wraps.
+#[test]
+fn is_oversize_send_reads_the_status_and_the_text() {
+    use alloy::transports::{RpcError, TransportErrorKind};
+
+    let http = |status: u16, body: &str| {
+        alloy::contract::Error::TransportError(TransportErrorKind::http_error(
+            status,
+            body.to_owned(),
+        ))
+    };
+    assert!(is_oversize_send(&http(413, "")), "bare 413");
+    assert!(
+        is_oversize_send(&http(502, "request entity too large")),
+        "5xx with the oversize text"
+    );
+    assert!(!is_oversize_send(&http(503, "")), "bare 503");
+    assert!(!is_oversize_send(&http(429, "")), "rate limit");
+    let answered =
+        alloy::contract::Error::TransportError(RpcError::ErrorResp(alloy_json_rpc::ErrorPayload {
+            code: -32000,
+            message: "oversized data".into(),
+            data: None,
+        }));
+    assert!(
+        is_oversize_send(&answered),
+        "a JSON-RPC answer with the oversize text"
+    );
 }
 
 #[test]
