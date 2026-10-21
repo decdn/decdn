@@ -413,33 +413,37 @@ pub struct LaneSnapshot {
     /// in the shared-pool model (a pool has no per-lane nonce), so this
     /// always reports `0`.
     pub last_nonce: u64,
-    /// Cumulative amount of the most-recently-accepted voucher, in
-    /// micro-USDC (`LaneState::last_amount`). This is the node's total
-    /// accrued claim on this lane — the figure that crosses the
-    /// redemption threshold. `0` before any voucher.
+    /// What the node is owed on this lane, in micro-USDC
+    /// (`LaneState::owed`): the cumulative amount of the last signed voucher
+    /// plus the chain frontier verified under it. This is the node's total
+    /// accrued claim on this lane — the value the redeemer submits and the
+    /// figure [`Self::settlement_eligible`] compares against the threshold.
+    /// It is cumulative: it includes value already redeemed on-chain and never
+    /// decreases. A hash-chain lane pays with preimages, which move only the
+    /// frontier, so the signed amount alone understates the claim by up to
+    /// one chain. `0` before any voucher.
     pub outstanding_micro_usdc: u64,
     /// Not tracked in the shared-pool model (the pool's deposit is shared
     /// across every lane it funds, so no single lane owns a deposit), so
     /// this always reports `0`.
     pub deposit_micro_usdc: u64,
-    /// Whole seconds since this process last accepted a voucher on this
-    /// lane, or `None` when no voucher has been observed *since the node
+    /// Whole seconds since this process last accepted a voucher or preimage
+    /// on this lane, or `None` when neither has been observed *since the node
     /// started*. The activity clock is in-memory: a lane hydrated from
-    /// `lanes.redb` at boot reports `None` until its next voucher, because
-    /// the persisted `LaneState` carries no last-voucher wall-clock.
-    /// Operators use this to spot stale lanes (high `outstanding` but no
-    /// recent vouchers).
+    /// `lanes.redb` at boot reports `None` until its next voucher or
+    /// preimage, because the persisted `LaneState` carries no last-payment
+    /// wall-clock. Operators use this to spot stale lanes (high
+    /// `outstanding` but no recent payment).
     pub seconds_since_last_voucher: Option<u64>,
     /// `true` when the accrued claim (`outstanding_micro_usdc`) has
     /// reached the node's configured redemption threshold
-    /// (`blockchain.redeem_threshold_micro_usdc`), i.e. the redeemer would
-    /// redeem this lane on its next tick. This is an **upper-bound**
-    /// signal: the admin surface does not read the on-chain redeemed
-    /// amount, so it compares the full accrued claim (not the
-    /// un-redeemed delta) against the threshold. A lane that already
-    /// redeemed up to its current claim may still report `true` until the
-    /// next voucher advances it — surfaced so operators can see which
-    /// lanes are *at or above* the redemption bar.
+    /// (`blockchain.redeem_threshold_micro_usdc`). This is an
+    /// **upper-bound** signal, not a prediction of the next redemption: it
+    /// compares the full cumulative claim, not the unredeemed part, against
+    /// the threshold, while the redeemer gates on the unredeemed value summed
+    /// across the lanes of one `redeemMany`. The claim never decreases, so a
+    /// lane stays `true` once it reaches the threshold, including after it is
+    /// redeemed in full.
     pub settlement_eligible: bool,
 }
 
@@ -738,8 +742,8 @@ pub trait AdminRpc {
 
     /// Return a live snapshot of every lane this node provides against a
     /// `PaymentPool` (issue #749): per lane the outstanding accrued claim,
-    /// time since the last voucher (in-memory, `None` after a restart
-    /// until the next voucher), and whether the accrued claim has reached
+    /// time since the last voucher or preimage (in-memory, `None` after a
+    /// restart until the next one), and whether the accrued claim has reached
     /// the redemption threshold. Backs `decdn node lanes`, giving
     /// operators a single view to spot lanes approaching settlement,
     /// stale lanes, or unusually high outstanding balances before they

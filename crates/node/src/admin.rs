@@ -180,11 +180,11 @@ impl std::fmt::Debug for BuyerPoolHandle {
 pub struct LaneStatusHandles {
     /// Persistent per-lane voucher state (same handle the client handler
     /// commits accepted vouchers to). Read via `load_all` to build the
-    /// snapshot — the freshest committed `last_*` per lane.
+    /// snapshot — each lane's committed claim, reported at [`LaneState::owed`].
     pub pool_store: Arc<dyn PoolStateStore>,
     /// Read handle over the client handler's live lane registry (issue #1733).
     /// Read for `seconds_since_last_voucher`; a lane reads back `None` until
-    /// this process accepts a voucher for it.
+    /// this process accepts a voucher or preimage for it.
     pub lane_activity: LaneActivityClock,
     /// Configured redemption threshold in micro-USDC
     /// (`blockchain.redeem_threshold_micro_usdc`). A lane whose accrued
@@ -979,14 +979,14 @@ fn build_buyer_pools_response(
     BuyerPoolsResponse { pools, skipped }
 }
 
-/// Build the wire `LaneSnapshot` list from loaded lane states, the
-/// redemption `threshold` (in micro-USDC as a `U256`), each live lane's
-/// whole-seconds last-voucher age (`ages`, keyed by [`LaneKey`]; absent ⇒
+/// Build the wire `LaneSnapshot` list from loaded lane states (each reported
+/// at [`LaneState::owed`]), the redemption `threshold` (in micro-USDC as a
+/// `U256`), each live lane's whole-seconds last-payment age (`ages`, keyed by [`LaneKey`]; absent ⇒
 /// `None`), and each pool's owner (`owners`, keyed by pool id; absent ⇒
 /// `None`). Pure (no I/O, no locks) so it's unit-testable without a store, an
 /// async runtime, a chain, or a live lane registry.
 ///
-/// Ordering: lanes with a known last-voucher age first (most recently
+/// Ordering: lanes with a known last-payment age first (most recently
 /// active ahead of those with `None`), then by descending outstanding
 /// amount — the on-call use case is "which lanes are closest to a
 /// settlement / liquidity event?". `U256` amounts narrow to `u64`
@@ -1001,7 +1001,12 @@ fn build_lane_snapshots(
     let mut snapshots: Vec<LaneSnapshot> = states
         .iter()
         .map(|state| {
-            let outstanding = state.last_amount();
+            // What the lane is owed — its signed anchor plus the frontier
+            // verified under its chain — is the claim the redeemer submits. A
+            // hash-chain lane pays in preimages, which never move the signed
+            // anchor, so the anchor alone trails the claim by up to one chain
+            // and reads `0` until the lane's first rollover.
+            let outstanding = state.owed();
             LaneSnapshot {
                 // A lane is keyed by `(pool_id, signer, provider)`. The admin
                 // surface reports the pool id as the lane id, the pool owner as
@@ -1019,12 +1024,10 @@ fn build_lane_snapshots(
                 outstanding_micro_usdc: u64::try_from(outstanding).unwrap_or(u64::MAX),
                 deposit_micro_usdc: 0,
                 seconds_since_last_voucher: ages.get(&state.key()).copied(),
-                // Upper-bound eligibility: the admin surface doesn't read
-                // the on-chain `withdrawnAmount`, so it compares the full
-                // accrued claim against the threshold (documented on the
-                // DTO field). `>=` matches the redeemer's `< floor`
-                // short-circuit (`redeem_planned_lanes` in
-                // payment_settlement.rs), whose floor is this threshold.
+                // The full claim, not `owed − paid_cumulative`, against the
+                // threshold (documented on the DTO field). The redeemer gates
+                // on the unredeemed value summed per chunk instead, so this
+                // flag is a bar, not a prediction of the next redemption.
                 settlement_eligible: outstanding >= threshold,
             }
         })

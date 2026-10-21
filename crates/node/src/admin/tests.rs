@@ -999,7 +999,8 @@ impl PoolOwnerSource for OneOwner {
 /// Build a hydrated [`LaneState`] with the given identity + outstanding
 /// claim. `pool_byte` seeds the pool id, `signer_byte` the voucher signer
 /// (never the reported counterparty: that is the pool owner);
-/// `last_amount` is the lane's cumulative claim. The provider is
+/// `last_amount` is the lane's signed cumulative. The lane holds a signature
+/// and no chain, so what it is owed equals `last_amount`. The provider is
 /// a fixed non-signer address so a signer/provider transposition would be
 /// caught.
 fn mk_lane(pool_byte: u8, signer_byte: u8, last_amount: u64) -> LaneState {
@@ -1014,7 +1015,7 @@ fn mk_lane(pool_byte: u8, signer_byte: u8, last_amount: u64) -> LaneState {
         0,                            // expiry — untracked
         U256::from(last_amount),
         U256::from(last_amount), // bytes_delivered — irrelevant to the snapshot
-        None,
+        Some([0u8; 65]),
         decdn_incentive::LaneChain::NONE,
     )
 }
@@ -1083,6 +1084,67 @@ fn build_lane_snapshots_threshold_is_inclusive() {
         snaps.first().expect("snapshot").settlement_eligible,
         "outstanding == threshold must be eligible (>=)"
     );
+}
+
+/// A hash-chain lane reports what it is owed, not its signed anchor. Its
+/// root voucher signs at the watermark and every chunk after pays with a
+/// preimage, which moves only the verified frontier. The redeemer submits
+/// anchor + frontier, so the snapshot and its eligibility follow their sum:
+/// a first-epoch lane (anchor `0`) and a rolled-over one (anchor `100`) alike
+/// (#2337).
+#[test]
+fn build_lane_snapshots_report_the_verified_chain_frontier() {
+    let lane = |anchor: u64, verified_index: u8| {
+        let mut signer = [0u8; 20];
+        signer[19] = 0xAA;
+        LaneState::hydrate(
+            lane_pool_id(1),
+            Address::from(signer),
+            Address::repeat_byte(0xEE),
+            U256::from(1_000_000_000u64),
+            0,
+            U256::from(anchor),
+            U256::from(anchor),
+            Some([0u8; 65]),
+            // `owed()` reads only the index and the price; the tip is the root
+            // because nothing here walks the chain.
+            decdn_incentive::LaneChain {
+                verified_index,
+                ..decdn_incentive::LaneChain::opened(B256::repeat_byte(0x11), U256::from(10u64))
+            },
+        )
+    };
+    let snapshot = |state: LaneState, threshold: u64| {
+        build_lane_snapshots(
+            &[state],
+            U256::from(threshold),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .into_iter()
+        .next()
+        .expect("snapshot")
+    };
+
+    let below = snapshot(lane(0, 3), 40);
+    assert_eq!(
+        below.outstanding_micro_usdc, 30,
+        "3 verified chunks at 10 each"
+    );
+    assert!(!below.settlement_eligible, "30 < 40 threshold");
+    let at = snapshot(lane(0, 4), 40);
+    assert_eq!(
+        at.outstanding_micro_usdc, 40,
+        "4 verified chunks at 10 each"
+    );
+    assert!(at.settlement_eligible, "40 >= 40 threshold");
+
+    let rolled = snapshot(lane(100, 2), 120);
+    assert_eq!(
+        rolled.outstanding_micro_usdc, 120,
+        "anchor 100 + 2 chunks at 10"
+    );
+    assert!(rolled.settlement_eligible, "120 >= 120 threshold");
 }
 
 /// A lane with recorded voucher activity sorts ahead of one with
