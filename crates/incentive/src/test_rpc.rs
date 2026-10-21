@@ -53,18 +53,20 @@ pub const fn mined_receipt(to: Address, logs: Vec<Log>) -> TransactionReceipt {
 }
 
 /// Answers `eth_getTransactionCount` with [`SCRIPTED_NONCE`], and each
-/// `eth_call` with the next answer in its queue. `eth_sendTransaction` gets
-/// [`SCRIPTED_TX`] unless the send parks, and records the nonce it was sent
-/// at. `eth_getTransactionReceipt` gets the scripted receipt when there is
-/// one. `eth_getBlockByNumber`, whatever block it names, gets a block at the
-/// timestamp [`ScriptedRpc::at_head`] set, with every other header field at its
-/// default. Every other call, an `eth_call` past the end of the queue, and an
+/// `eth_call` with the next answer in its queue. `eth_sendTransaction` fails
+/// with the next HTTP error in its [`ScriptedRpc::failing_sends`] queue. Past
+/// that queue it gets [`SCRIPTED_TX`] unless the send parks, and records the
+/// nonce it was sent at. `eth_getTransactionReceipt` gets the scripted receipt
+/// when there is one. `eth_getBlockByNumber`, whatever block it names, gets a
+/// block at the timestamp [`ScriptedRpc::at_head`] set, with every other header
+/// field at its default. Every other call, an `eth_call` past the end of the queue, and an
 /// `eth_getBlockByNumber` with no head set, never completes, so a send on it
 /// parks in its submit or its receipt wait. A [`ScriptedRpc::dropped`]
 /// transport also answers the block number, and a receipt read before
 /// [`ScriptedRpc::mine`] with "not mined".
 ///
-/// A clone shares the receipt, the `eth_call` queue and the recorded nonces.
+/// A clone shares the receipt, the `eth_call` queue, the send failures and
+/// the recorded nonces.
 #[derive(Clone, Debug)]
 pub struct ScriptedRpc {
     send: bool,
@@ -79,6 +81,8 @@ pub struct ScriptedRpc {
     head_timestamp: Option<u64>,
     calls: Arc<Mutex<VecDeque<Bytes>>>,
     sent_nonces: Arc<Mutex<Vec<u64>>>,
+    /// HTTP failures (status, body) the next sends meet, in order.
+    send_failures: Arc<Mutex<VecDeque<(u16, String)>>>,
     after_calls: AfterCalls,
 }
 
@@ -109,6 +113,7 @@ impl ScriptedRpc {
             head_timestamp: None,
             calls: Arc::default(),
             sent_nonces: Arc::default(),
+            send_failures: Arc::default(),
             after_calls: AfterCalls::default(),
         }
     }
@@ -172,6 +177,20 @@ impl ScriptedRpc {
         }
     }
 
+    /// Fail the next sends in transport with `failures`, in order: each is an
+    /// HTTP error with its status and body, as a gateway or a proxy in front
+    /// of the RPC answers. A send past the queue answers as it would without
+    /// it. A failed send records no nonce. Through [`Self::provider`] the
+    /// failure reaches the caller marked as a [`crate::tx::SendLegFailure`], so
+    /// a 4xx reads as refused and a 5xx as possibly broadcast.
+    #[must_use]
+    pub fn failing_sends(self, failures: impl IntoIterator<Item = (u16, String)>) -> Self {
+        Self {
+            send_failures: Arc::new(Mutex::new(failures.into_iter().collect())),
+            ..self
+        }
+    }
+
     /// Answer `eth_getBlockByNumber` with a head block at Unix `timestamp`: a
     /// chain-time read a caller makes before it sends.
     #[must_use]
@@ -225,6 +244,14 @@ impl ScriptedRpc {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(nonce);
         }
+    }
+
+    /// The next scripted send failure, if any is left.
+    fn next_send_failure(&self) -> Option<(u16, String)> {
+        self.send_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
     }
 
     /// The next scripted `eth_call` answer, if any is left. Handing out the
@@ -286,6 +313,9 @@ impl tower::Service<RequestPacket> for ScriptedRpc {
                 Some(answer) => serde_json::value::to_raw_value(&answer),
                 None => return Box::pin(std::future::pending()),
             },
+            ("eth_sendTransaction", ..) if let Some((status, body)) = self.next_send_failure() => {
+                return Box::pin(async move { Err(TransportErrorKind::http_error(status, body)) });
+            }
             ("eth_sendTransaction", ..) if self.send => {
                 self.record_nonce(req.params());
                 serde_json::value::to_raw_value(&SCRIPTED_TX)
