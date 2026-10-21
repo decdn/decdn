@@ -1,6 +1,6 @@
 [advisories]
 version = 2
-# Transitive advisories suppressed with justification. All four are RUSTSEC
+# Transitive advisories suppressed with justification. All three are RUSTSEC
 # "unmaintained" informational notices (not memory-safety / soundness
 # vulnerabilities), each a build-time-only proc-macro or a platform-conditional
 # dep with no runtime exposure in our binaries. None has a reachable patched
@@ -28,17 +28,6 @@ ignore = [
     # via alloy-primitives -> alloy. No fixed release exists. Re-evaluate when
     # alloy-primitives drops paste (tracked upstream in the alloy-rs/core repo).
     "RUSTSEC-2024-0436",
-    # h2 0.3.x: unbounded empty-DATA-frame DoS (low severity). Patched only in the
-    # 0.4 line (>=0.4.16); the 0.3 line has no fixed release. The production binary
-    # `decdn-node` ships hyper-1 + h2 0.4, held at 0.4.16 (patched) in Cargo.lock, so
-    # the only remaining match is the *dev/test-only* h2 0.3.27 subtree that
-    # `aws-sdk-s3`'s `test-util` feature pulls via `aws-smithy-runtime/legacy-test-util`
-    # -> `aws-smithy-http-client/hyper-014` -> hyper 0.14 -> h2 0.3. That subtree is
-    # never linked into a shipped binary (see the aws-* dependency comment in the root
-    # Cargo.toml). Keep the production tree at h2 >=0.4.16 so this ignore never masks a
-    # live-path regression. Re-evaluate when smithy-rs splits the test-util layer off
-    # legacy hyper 0.14.
-    "RUSTSEC-2026-0258",
     # NOTE: the quick-xml DoS ignores (RUSTSEC-2026-0194 O(N^2) duplicate-attribute
     # check + RUSTSEC-2026-0195 unbounded NsReader namespace allocation) were dropped
     # (#1056) when `plist 1.10` pulled the fixed `quick-xml 0.41.0` — netdev's
