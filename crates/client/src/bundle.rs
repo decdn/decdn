@@ -56,6 +56,8 @@ mod engine;
 mod landing;
 mod manifest_cache;
 mod skip_cache;
+#[cfg(test)]
+mod tests;
 
 #[doc(hidden)]
 pub use crate::lane_sources::FaultContext;
@@ -371,11 +373,32 @@ pub enum Funding {
 /// [`select_nodes`].
 #[derive(Debug, Clone)]
 pub struct NodeSelection {
-    /// The node every entry pulls from, when one is pinned.
-    pinned: Option<PinnedNode>,
+    /// The pinned node or the registry list.
+    selection: Selection,
+}
+
+impl NodeSelection {
+    /// `discovery` with its pinned node taken from this selection, so an
+    /// entry's first holders, its rediscovery and a pinned node's dial address
+    /// all follow one node.
+    const fn applied_to(&self, mut discovery: DiscoveryOptions) -> DiscoveryOptions {
+        discovery.pinned = match &self.selection {
+            Selection::Pinned(pinned) => Some(*pinned),
+            Selection::Registry(_) => None,
+        };
+        discovery
+    }
+}
+
+/// Where every entry of a run finds its holders, resolved once by
+/// [`select_nodes`].
+#[derive(Debug, Clone)]
+enum Selection {
+    /// The node every entry pulls from.
+    Pinned(PinnedNode),
     /// Every active registered node, and whether the list is the
-    /// registry-outage fallback, when none is pinned.
-    registry: Option<engine::Registry>,
+    /// registry-outage fallback.
+    Registry(engine::Registry),
 }
 
 /// Resolve where a pull's entries find their holders, once for the run.
@@ -399,13 +422,11 @@ pub async fn select_nodes(
 ) -> anyhow::Result<NodeSelection> {
     if let Some(pinned) = discovery.pinned {
         return Ok(NodeSelection {
-            pinned: Some(pinned),
-            registry: None,
+            selection: Selection::Pinned(pinned),
         });
     }
     Ok(NodeSelection {
-        pinned: None,
-        registry: Some(engine::discover_candidates(chain, site, discovery).await?),
+        selection: Selection::Registry(engine::discover_candidates(chain, site, discovery).await?),
     })
 }
 
@@ -684,7 +705,9 @@ impl BundlePuller {
     /// A builder for a pull on `chain`, keeping its peer store and scratch
     /// files in `site`, dialing from `endpoint`, recording its pool and lanes
     /// in `store`, and paying from `funding`. `discovery` and `nodes`
-    /// ([`select_nodes`]) say where entries find their holders.
+    /// ([`select_nodes`]) say where entries find their holders. `nodes`
+    /// decides whether the run is pinned and to which node: it replaces
+    /// `discovery.pinned`.
     pub fn builder(
         chain: ChainConfig,
         site: PullSite,
@@ -902,6 +925,7 @@ impl BundlePullerBuilder {
             .call()
             .await
             .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
+        let discovery = self.nodes.applied_to(self.discovery);
         let ctx = engine::PullCtx {
             voucher_dom: voucher_domain(self.chain.chain_id, self.chain.payment_pool),
             slash_dom: slash_judge_domain(self.chain.chain_id, self.chain.slash_judge),
@@ -917,7 +941,7 @@ impl BundlePullerBuilder {
             site: self.site,
             relays: self.relays,
             nodes: self.nodes,
-            discovery: self.discovery,
+            discovery,
             max_rate_per_mb: self.max_rate_per_mb,
             max_blob_bytes: self.max_blob_bytes,
             deposit,
