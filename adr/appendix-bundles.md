@@ -105,6 +105,16 @@ project-wide rename: on-wire fields elsewhere carry bare hex (e.g.
 `decdn node evict <hash>`), and that stays unchanged. Bundles are
 publisher-side and free to set their own conventions.
 
+A reader also accepts a `0x` prefix, no prefix, and uppercase hex
+digits. A reader checks `version` first. Then it rejects a manifest
+when an entry hash or a chunk hash is not 64 hex characters after an
+optional `b3:` or `0x` prefix. One bad hash makes the whole manifest
+invalid. A retry does not help. The manifest is content-addressed, so
+every read gets the same bytes. This rule applies to a chunk hash too.
+A hint is advisory, but its syntax is not. A chunk list whose sizes do
+not sum to the entry `size` is a wrong hint, not a bad hash: the client
+ignores the hints and fetches the whole file.
+
 ## Path-safety rules (creation-time invariants)
 
 `origin import` enforces every rule below; consumers SHOULD re-validate
@@ -210,6 +220,8 @@ A URI with the wrong form gives a clear result:
 
 - `decdn:<hash>/` on a blob that is not a manifest fails when the client
   parses the manifest.
+- `decdn:<hash>/` or `decdn:<hash>/<path>` on a manifest with a bad hash
+  fails. The error names the entry.
 - `decdn:<hash>` on a manifest returns the manifest JSON bytes. Use this
   form to fetch a raw manifest.
 

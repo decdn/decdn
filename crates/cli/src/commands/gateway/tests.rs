@@ -1,5 +1,5 @@
 use super::*;
-use crate::commands::fetch::MAX_MANIFEST_MB;
+use crate::commands::fetch::{MALFORMED_MANIFEST, MAX_MANIFEST_MB};
 
 fn manifest() -> Arc<BundleManifest> {
     Arc::new(BundleManifest::new([0; 32], Vec::new()))
@@ -664,26 +664,38 @@ async fn a_bundle_serves_its_index_and_entries() {
     );
 }
 
-/// A manifest entry whose hash does not parse is a fixed property of the
-/// content-addressed manifest, not an upstream fault: it answers 404 naming
-/// the entry, and no pull for the entry starts.
+/// A manifest with an entry hash that does not parse is malformed: its index
+/// and every entry, a valid sibling too, answer 404 naming the bad entry with
+/// no raw-blob hint, the index links nothing, and no pull for an entry starts.
 #[tokio::test]
-async fn a_malformed_entry_hash_is_not_found() {
-    let manifest = br#"{"version": 1, "entries": [{"path": "a.bin", "hash": "zz", "size": 3}]}"#;
-    let (gateway, caps) = recording_gateway(Reply::Bytes(manifest.to_vec()), &[]).await;
+async fn a_malformed_entry_hash_makes_the_bundle_not_found() {
+    let manifest = serde_json::json!({"version": 1, "entries": [
+        {"path": "ok.bin", "hash": alloy::hex::encode([0xe0; 32]), "size": 3},
+        {"path": "a.bin", "hash": "zz", "size": 3},
+    ]});
+    let (gateway, caps) =
+        recording_gateway(Reply::Bytes(manifest.to_string().into_bytes()), &[]).await;
     let blob = alloy::hex::encode(BLOB);
-    for _ in 0..2 {
-        let (status, body) = get(&gateway, &format!("/{blob}/a.bin")).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let paths = [
+        format!("/{blob}/a.bin"),
+        format!("/{blob}/ok.bin"),
+        format!("/{blob}/"),
+    ];
+    for path in &paths {
+        let (status, body) = get(&gateway, path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
         assert!(
             body.contains(r#"bundle entry "a.bin" has a malformed hash"#),
-            "{body}"
+            "{path}: {body}"
         );
+        assert!(body.contains(MALFORMED_MANIFEST), "{path}: {body}");
+        assert!(!body.contains("raw blob"), "{path}: {body}");
+        assert!(!body.contains("href"), "{path}: {body}");
     }
     assert_eq!(
         *caps.lock().unwrap(),
-        [MAX_MANIFEST_MB],
-        "only the manifest is pulled, once; the repeat reads the cache"
+        [MAX_MANIFEST_MB; 3],
+        "each request pulls only the manifest"
     );
 }
 

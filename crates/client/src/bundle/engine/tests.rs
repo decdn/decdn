@@ -1,4 +1,4 @@
-use super::super::{BundleManifest, ManifestChunk};
+use super::super::{BundleManifest, MalformedManifest, ManifestChunk, NotAManifest};
 use super::*;
 use alloy::signers::local::PrivateKeySigner;
 use iroh::PublicKey;
@@ -1260,17 +1260,17 @@ fn build_completed_updates_records_present_omits_failed() {
     let entries = [
         ManifestEntry {
             path: "ok.txt".into(),
-            hash: "b3:aa".into(),
+            hash: [0xaa; 32],
             size: Some(4),
             chunks: Some(vec![ManifestChunk {
-                hash: "b3:bb".into(),
+                hash: [0xbb; 32],
                 size: 4,
             }]),
             landed_from: None,
         },
         ManifestEntry {
             path: "bad.txt".into(),
-            hash: "b3:cc".into(),
+            hash: [0xcc; 32],
             size: Some(9),
             chunks: None,
             landed_from: None,
@@ -1287,7 +1287,7 @@ fn build_completed_updates_records_present_omits_failed() {
     let upd = build_completed_updates(&refs, &outcomes, TEST_BUNDLE, tmp.path());
     assert!(upd.contains_key("ok.txt"));
     let rec = upd.get("ok.txt").expect("rec");
-    assert_eq!(rec.hash, "b3:aa");
+    assert_eq!(rec.hash, format_hash([0xaa; 32]));
     assert_eq!(rec.size, 4);
     assert!(rec.chunks.is_some());
     // Failed → omitted even though the (stale) file is present on disk.
@@ -1302,14 +1302,14 @@ fn build_completed_updates_records_linked_and_skipped() {
     let entries = [
         ManifestEntry {
             path: "linked.txt".into(),
-            hash: "b3:l".into(),
+            hash: [0x11; 32],
             size: Some(2),
             chunks: None,
             landed_from: None,
         },
         ManifestEntry {
             path: "skipped.txt".into(),
-            hash: "b3:s".into(),
+            hash: [0x22; 32],
             size: Some(4),
             chunks: None,
             landed_from: None,
@@ -1319,8 +1319,14 @@ fn build_completed_updates_records_linked_and_skipped() {
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let upd = build_completed_updates(&refs, &outcomes, TEST_BUNDLE, tmp.path());
     // Both are successes this run and present on disk → both recorded.
-    assert_eq!(upd.get("linked.txt").expect("linked").hash, "b3:l");
-    assert_eq!(upd.get("skipped.txt").expect("skipped").hash, "b3:s");
+    assert_eq!(
+        upd.get("linked.txt").expect("linked").hash,
+        format_hash([0x11; 32])
+    );
+    assert_eq!(
+        upd.get("skipped.txt").expect("skipped").hash,
+        format_hash([0x22; 32])
+    );
 }
 
 #[test]
@@ -1335,14 +1341,14 @@ fn build_completed_updates_omits_entry_absent_from_outcomes() {
     let entries = [
         ManifestEntry {
             path: "done.txt".into(),
-            hash: "b3:done".into(),
+            hash: [0x33; 32],
             size: Some(3),
             chunks: None,
             landed_from: None,
         },
         ManifestEntry {
             path: "pending.txt".into(),
-            hash: "b3:new".into(), // new hash, not yet fetched
+            hash: [0x44; 32], // new hash, not yet fetched
             size: Some(3),
             chunks: None,
             landed_from: None,
@@ -1563,7 +1569,7 @@ const GROUP: u64 = CHUNK_GROUP_BYTES;
 
 fn chunk(size: u64, byte: u8) -> ManifestChunk {
     ManifestChunk {
-        hash: format!("b3:{}", blake3::Hash::from_bytes([byte; 32]).to_hex()),
+        hash: [byte; 32],
         size,
     }
 }
@@ -1574,7 +1580,7 @@ fn chunk(size: u64, byte: u8) -> ManifestChunk {
 fn hints_of_accumulates_offsets_and_validates_the_size_sum() {
     let e = ManifestEntry {
         path: "m.bin".into(),
-        hash: format!("b3:{}", blake3::Hash::from_bytes([0xff; 32]).to_hex()),
+        hash: [0xff; 32],
         size: Some(100),
         chunks: Some(vec![chunk(60, 0xaa), chunk(40, 0xbb)]),
         landed_from: None,
@@ -1597,7 +1603,7 @@ fn hints_of_accumulates_offsets_and_validates_the_size_sum() {
 fn hints_of_rejects_a_size_sum_that_disagrees_with_the_whole_file() {
     let e = ManifestEntry {
         path: "m.bin".into(),
-        hash: format!("b3:{}", blake3::Hash::from_bytes([0xff; 32]).to_hex()),
+        hash: [0xff; 32],
         size: Some(100),
         chunks: Some(vec![chunk(60, 0xaa), chunk(30, 0xbb)]),
         landed_from: None,
@@ -1605,30 +1611,17 @@ fn hints_of_rejects_a_size_sum_that_disagrees_with_the_whole_file() {
     assert!(hints_of(&e).is_none());
 }
 
-/// No whole-file `size` to validate against, or an unparseable chunk hash, both
-/// drop back to a plain fetch.
+/// No whole-file `size` to validate against drops back to a plain fetch.
 #[test]
-fn hints_of_needs_a_size_and_valid_chunk_hashes() {
+fn hints_of_needs_a_size() {
     let no_size = ManifestEntry {
         path: "m.bin".into(),
-        hash: "b3:ff".into(),
+        hash: [0xff; 32],
         size: None,
         chunks: Some(vec![chunk(60, 0xaa)]),
         landed_from: None,
     };
     assert!(hints_of(&no_size).is_none());
-
-    let bad_hash = ManifestEntry {
-        path: "m.bin".into(),
-        hash: "b3:ff".into(),
-        size: Some(4),
-        chunks: Some(vec![ManifestChunk {
-            hash: "not-a-hash".into(),
-            size: 4,
-        }]),
-        landed_from: None,
-    };
-    assert!(hints_of(&bad_hash).is_none());
 }
 
 /// A materialized chunk placed at a group-aligned offset yields a donor range
@@ -1944,7 +1937,7 @@ fn whole_deferred(hint: Hint) -> DeferredChunk {
 fn mentry(whole: u8, size: u64, chunks: &[(u64, u8)]) -> ManifestEntry {
     ManifestEntry {
         path: format!("e{whole:02x}"),
-        hash: format!("b3:{}", blake3::Hash::from_bytes([whole; 32]).to_hex()),
+        hash: [whole; 32],
         size: Some(size),
         chunks: Some(chunks.iter().map(|&(s, b)| chunk(s, b)).collect()),
         landed_from: None,
@@ -2070,11 +2063,11 @@ fn groups_ordered_smallest_first_stable() {
 /// still sort early, not last.
 #[test]
 fn groups_ordered_by_any_declared_size_not_just_the_first() {
-    let whole = format!("b3:{}", blake3::Hash::from_bytes([0x42; 32]).to_hex());
+    let whole = [0x42; 32];
     // Two paths for the same small blob; the first is unsized on the wire.
     let unsized_first = ManifestEntry {
         path: "a".into(),
-        hash: whole.clone(),
+        hash: whole,
         size: None,
         chunks: None,
         landed_from: None,
@@ -3362,11 +3355,20 @@ fn staging_path_is_the_plain_hex_final_blob_not_a_partial() {
     assert!(p.starts_with(tmp.path().join(STAGING_DIR)));
 }
 
+/// [`BundleManifest::parse`] of the JSON `manifest`.
+fn parse_json(manifest: &serde_json::Value) -> anyhow::Result<BundleManifest> {
+    BundleManifest::parse(manifest.to_string().as_bytes())
+}
+
 #[test]
 fn parse_manifest_accepts_v1_with_optional_size() {
-    let json = br#"{"version":1,"entries":[{"path":"a.txt","hash":"b3:ab","size":4},{"path":"b","hash":"b3:cd"}]}"#;
-    let m = BundleManifest::parse(json).unwrap();
+    let m = parse_json(&serde_json::json!({"version": 1, "entries": [
+        {"path": "a.txt", "hash": format_hash([0xab; 32]), "size": 4},
+        {"path": "b", "hash": format_hash([0xcd; 32])},
+    ]}))
+    .unwrap();
     assert_eq!(m.entries.len(), 2);
+    assert_eq!(m.entries[0].hash, [0xab; 32]);
     assert_eq!(m.entries[0].size, Some(4));
     assert_eq!(m.entries[1].size, None);
 }
@@ -3381,18 +3383,111 @@ fn parse_manifest_keeps_the_blob_hash() {
 
 #[test]
 fn parse_manifest_accepts_chunked_entry_in_order() {
-    let json = br#"{"version":1,"entries":[{"path":"m.bin","hash":"b3:whole","size":100,"chunks":[{"hash":"b3:c0","size":60},{"hash":"b3:c1","size":40}]}]}"#;
-    let m = BundleManifest::parse(json).unwrap();
+    let m = parse_json(&serde_json::json!({"version": 1, "entries": [{
+        "path": "m.bin", "hash": format_hash([0xff; 32]), "size": 100,
+        "chunks": [
+            {"hash": format_hash([0xc0; 32]), "size": 60},
+            {"hash": format_hash([0xc1; 32]), "size": 40},
+        ],
+    }]}))
+    .unwrap();
     let chunks = m.entries[0].chunks.as_ref().expect("chunked entry");
-    let hashes: Vec<&str> = chunks.iter().map(|c| c.hash.as_str()).collect();
-    assert_eq!(hashes, vec!["b3:c0", "b3:c1"]);
+    let hashes: Vec<[u8; 32]> = chunks.iter().map(|c| c.hash).collect();
+    assert_eq!(hashes, vec![[0xc0; 32], [0xc1; 32]]);
 }
 
 #[test]
 fn parse_manifest_plain_entry_has_no_chunks() {
-    let json = br#"{"version":1,"entries":[{"path":"a.txt","hash":"b3:ab","size":4}]}"#;
-    let m = BundleManifest::parse(json).unwrap();
+    let m = parse_json(&serde_json::json!({"version": 1, "entries": [
+        {"path": "a.txt", "hash": format_hash([0xab; 32]), "size": 4},
+    ]}))
+    .unwrap();
     assert!(m.entries[0].chunks.is_none());
+}
+
+/// A parser takes every spelling `parse_hash` takes: `b3:`, `0x` or no
+/// prefix, with upper- or lowercase hex digits.
+#[test]
+fn parse_manifest_accepts_every_hash_spelling() {
+    let hex = blake3::Hash::from_bytes([0xab; 32]).to_hex().to_string();
+    let upper = hex.to_uppercase();
+    for spelling in [
+        format!("b3:{hex}"),
+        format!("0x{hex}"),
+        hex.clone(),
+        format!("b3:{upper}"),
+    ] {
+        let m = parse_json(&serde_json::json!({"version": 1, "entries": [
+            {"path": "a", "hash": spelling},
+        ]}))
+        .expect(&spelling);
+        assert_eq!(m.entries[0].hash, [0xab; 32], "{spelling}");
+    }
+}
+
+/// One malformed entry or chunk hash makes the whole manifest
+/// [`MalformedManifest`], and the error names the entry.
+#[test]
+fn parse_manifest_rejects_a_malformed_entry_or_chunk_hash() {
+    let assert_malformed = |manifest: serde_json::Value, what: &str| {
+        let err = parse_json(&manifest).unwrap_err();
+        assert!(err.is::<MalformedManifest>(), "{manifest}: {err:#}");
+        assert!(format!("{err:#}").contains(what), "{manifest}: {err:#}");
+    };
+    let good = format_hash([0xab; 32]);
+    let hex = "ab".repeat(32);
+    for bad in [
+        "zz".to_owned(),
+        String::new(),
+        format!("b3:{}", &hex[..62]),
+        format!("b3:{hex}ab"),
+        format!("B3:{hex}"),
+    ] {
+        assert_malformed(
+            serde_json::json!({"version": 1, "entries": [
+                {"path": "ok", "hash": good},
+                {"path": "bad", "hash": bad},
+            ]}),
+            r#"bundle entry "bad" has a malformed hash"#,
+        );
+    }
+    assert_malformed(
+        serde_json::json!({"version": 1, "entries": [{
+            "path": "bad", "hash": good, "size": 4,
+            "chunks": [{"hash": good, "size": 2}, {"hash": "b3:zz", "size": 2}],
+        }]}),
+        r#"bundle entry "bad" has a malformed chunk 1 hash"#,
+    );
+}
+
+/// The version gate runs before any hash parses: a manifest of another
+/// version is [`NotAManifest`] for its version,
+/// whatever its hashes look like.
+#[test]
+fn parse_manifest_checks_the_version_before_the_hashes() {
+    let json = br#"{"version":2,"entries":[{"path":"a","hash":"sha256:00"}]}"#;
+    let err = BundleManifest::parse(json).unwrap_err();
+    assert!(err.is::<NotAManifest>(), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("unsupported bundle version 2"),
+        "{err:#}"
+    );
+}
+
+/// Two entries that spell one blob's hash two ways are one group, so the
+/// blob is fetched once.
+#[test]
+fn group_by_hash_groups_one_blob_across_hash_spellings() {
+    let hex = blake3::Hash::from_bytes([0xab; 32]).to_hex().to_string();
+    let m = parse_json(&serde_json::json!({"version": 1, "entries": [
+        {"path": "a", "hash": format!("b3:{hex}")},
+        {"path": "b", "hash": format!("0x{}", hex.to_uppercase())},
+    ]}))
+    .unwrap();
+    let refs: Vec<&ManifestEntry> = m.entries.iter().collect();
+    let groups = group_by_hash(&refs);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].entries.len(), 2);
 }
 
 #[test]
@@ -3483,10 +3578,11 @@ fn group_transfer_skips_and_fails_contribute_nothing() {
     assert_eq!(t.reconstructed, 0);
 }
 
-fn entry(path: &str, hash: &str) -> ManifestEntry {
+/// An unchunked, unsized entry at `path` whose hash is `[hash; 32]`.
+fn entry(path: &str, hash: u8) -> ManifestEntry {
     ManifestEntry {
         path: path.into(),
-        hash: hash.into(),
+        hash: [hash; 32],
         size: None,
         chunks: None,
         landed_from: None,
@@ -3499,9 +3595,9 @@ fn entry(path: &str, hash: &str) -> ManifestEntry {
 #[test]
 fn group_by_hash_collapses_duplicates_preserving_order() {
     let entries = [
-        entry("a.txt", "b3:h1"),
-        entry("b.txt", "b3:h2"),
-        entry("c.txt", "b3:h1"),
+        entry("a.txt", 0x01),
+        entry("b.txt", 0x02),
+        entry("c.txt", 0x01),
     ];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let paths: Vec<Vec<&str>> = group_by_hash(&refs)
@@ -3514,7 +3610,7 @@ fn group_by_hash_collapses_duplicates_preserving_order() {
 /// Distinct hashes never merge — each is its own unit of work, in order.
 #[test]
 fn group_by_hash_keeps_distinct_hashes_separate() {
-    let entries = [entry("a", "b3:1"), entry("b", "b3:2"), entry("c", "b3:3")];
+    let entries = [entry("a", 0x01), entry("b", 0x02), entry("c", 0x03)];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let groups = group_by_hash(&refs);
     assert_eq!(groups.len(), 3);
@@ -3530,7 +3626,7 @@ fn plan_slots_classifies_each_destination_independently() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path();
     std::fs::write(out.join("present.txt"), b"x").unwrap();
-    let entries = [entry("present.txt", "b3:h"), entry("absent.txt", "b3:h")];
+    let entries = [entry("present.txt", 0x0a), entry("absent.txt", 0x0a)];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let skip = HashSet::from(["present.txt".to_string()]);
 
@@ -3548,7 +3644,7 @@ fn plan_slots_classifies_each_destination_independently() {
 #[test]
 fn plan_slots_marks_unsafe_paths_failed() {
     let dir = tempfile::tempdir().unwrap();
-    let entries = [entry("../escape", "b3:h")];
+    let entries = [entry("../escape", 0x0a)];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let slots = plan_slots(
         &refs,
@@ -3565,7 +3661,7 @@ fn plan_slots_marks_unsafe_paths_failed() {
 #[test]
 fn plan_slots_rejects_the_reserved_staging_dir() {
     let dir = tempfile::tempdir().unwrap();
-    let entries = [entry(&format!("{STAGING_DIR}/deadbeef.partial"), "b3:h")];
+    let entries = [entry(&format!("{STAGING_DIR}/deadbeef.partial"), 0x0a)];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let slots = plan_slots(
         &refs,
@@ -3582,9 +3678,9 @@ fn plan_slots_rejects_the_reserved_staging_dir() {
 fn plan_slots_rejects_the_pull_state_paths() {
     let dir = tempfile::tempdir().unwrap();
     let entries = [
-        entry(skip_cache::SAVED_MANIFEST_NAME, "b3:h"),
-        entry(&format!("{}/x.json", manifest_cache::CACHE_DIR), "b3:h"),
-        entry("plain.bin", "b3:h"),
+        entry(skip_cache::SAVED_MANIFEST_NAME, 0x0a),
+        entry(&format!("{}/x.json", manifest_cache::CACHE_DIR), 0x0a),
+        entry("plain.bin", 0x0a),
     ];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let slots = plan_slots(
@@ -3607,7 +3703,7 @@ fn plan_slots_fails_an_entry_whose_parent_leads_out_of_the_root() {
     let outside = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), out.path().join("link")).unwrap();
     let landing = Landing::open(out.path()).unwrap();
-    let entries = [entry("link/escape.bin", "b3:h"), entry("safe.bin", "b3:h")];
+    let entries = [entry("link/escape.bin", 0x0a), entry("safe.bin", 0x0a)];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
 
     let slots = plan_slots(&refs, &landing, false, &HashSet::new());
@@ -3631,7 +3727,7 @@ fn plan_slots_skips_a_present_entry_before_it_checks_its_parent_chain() {
     let outside = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink(outside.path(), out.path().join("link")).unwrap();
     let landing = Landing::open(out.path()).unwrap();
-    let entries = [entry("link/file", "b3:h")];
+    let entries = [entry("link/file", 0x0a)];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let skip = HashSet::from(["link/file".to_string()]);
 
@@ -3744,30 +3840,30 @@ fn foreign_paths_names_each_path_no_record_vouches_for() {
         std::fs::write(out.join(name), b"abc").unwrap();
     }
     std::fs::create_dir(out.join("sub")).unwrap();
-    let pulled = entry("pulled.bin", "b3:h");
-    let landed = entry("a/config.json", "b3:h").land_at("renamed.json");
-    let edited = entry("edited.txt", "b3:h");
+    let pulled = entry("pulled.bin", 0x0a);
+    let landed = entry("a/config.json", 0x0a).land_at("renamed.json");
+    let edited = entry("edited.txt", 0x0a);
     record_landed(out, this, &[&pulled, &landed, &edited]);
     record_landed(
         out,
         other,
-        &[&entry("shared.txt", "b3:h"), &entry("same.txt", "b3:same")],
+        &[&entry("shared.txt", 0x0a), &entry("same.txt", 0x0e)],
     );
     std::fs::write(out.join("edited.txt"), b"abcd").unwrap();
 
     let manifest = BundleManifest::new(
         this,
         vec![
-            entry("mine.txt", "b3:h"),
-            entry("sub", "b3:h"),
+            entry("mine.txt", 0x0a),
+            entry("sub", 0x0a),
             pulled,
             landed,
-            entry("b/config.json", "b3:b-bytes").land_at("renamed.json"),
-            entry("shared.txt", "b3:other-bytes"),
-            entry("same.txt", "b3:same"),
+            entry("b/config.json", 0x0b).land_at("renamed.json"),
+            entry("shared.txt", 0x0d),
+            entry("same.txt", 0x0e),
             edited,
-            entry(".decdn-manifest.json", "b3:h"),
-            entry("absent.bin", "b3:h"),
+            entry(".decdn-manifest.json", 0x0a),
+            entry("absent.bin", 0x0a),
         ],
     );
     let from = |hash, path: &str| {
@@ -3808,7 +3904,7 @@ fn foreign_paths_reports_an_unusable_cache_and_an_unreadable_source() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path();
     std::fs::write(out.join("a.txt"), b"abc").unwrap();
-    let manifest = BundleManifest::new([1; 32], vec![entry("a.txt", "b3:h")]);
+    let manifest = BundleManifest::new([1; 32], vec![entry("a.txt", 0x0a)]);
 
     std::fs::write(
         out.join(".decdn-manifest.json"),
@@ -3824,7 +3920,7 @@ fn foreign_paths_reports_an_unusable_cache_and_an_unreadable_source() {
     };
     assert!(cause.contains("version 1"), "{cause}");
 
-    let mut rec = record_one(out, [1; 32], &entry("a.txt", "b3:other")).unwrap();
+    let mut rec = record_one(out, [1; 32], &entry("a.txt", 0x0c)).unwrap();
     rec.source.bundle = "not-a-hash".to_owned();
     let mut saved = SavedManifest::default();
     skip_cache::merge(&mut saved, BTreeMap::from([("a.txt".to_owned(), rec)]));
@@ -3841,7 +3937,7 @@ fn foreign_paths_reports_an_unusable_cache_and_an_unreadable_source() {
 /// A second `land_at` keeps the first manifest path.
 #[test]
 fn land_at_twice_keeps_the_first_manifest_path() {
-    let en = entry("a/x", "b3:h").land_at("x").land_at("y");
+    let en = entry("a/x", 0x0a).land_at("x").land_at("y");
     assert_eq!(en.path, "y");
     assert_eq!(en.manifest_path(), "a/x");
 }
@@ -3852,7 +3948,7 @@ fn land_at_twice_keeps_the_first_manifest_path() {
 fn record_one_names_the_manifest_path_of_a_landed_entry() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("config.json"), b"{}").unwrap();
-    let en = entry("text_encoder/config.json", "b3:h").land_at("config.json");
+    let en = entry("text_encoder/config.json", 0x0a).land_at("config.json");
     assert_eq!(en.path, "config.json");
     assert_eq!(en.manifest_path(), "text_encoder/config.json");
     let rec = record_one(tmp.path(), [7; 32], &en).expect("record");
@@ -3870,7 +3966,7 @@ async fn resolve_disk_state_skips_matching_file_by_rehash() {
     let tmp = tempfile::tempdir().expect("tmp");
     let body = b"hello world";
     std::fs::write(tmp.path().join("a.txt"), body).expect("write");
-    let h = format!("b3:{}", blake3::hash(body).to_hex());
+    let h = *blake3::hash(body).as_bytes();
     let entries = [ManifestEntry {
         path: "a.txt".into(),
         hash: h,
@@ -3897,20 +3993,20 @@ async fn resolve_disk_state_fast_skips_on_matching_record_without_rehash() {
     let size = u64::try_from(body.len()).expect("len");
     let mtime = SavedMtime::of(&meta).expect("mtime");
     // A hash the on-disk bytes provably do not produce.
-    let claimed = "b3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
+    let claimed = [0x00; 32];
     // Document the assumption the skip proof rests on: the planted bytes do
     // not hash to `claimed`, so a re-hash would fetch and only a
     // record-trusting fast-skip can pass.
     assert_ne!(
         claimed,
-        format!("b3:{}", blake3::hash(body).to_hex()),
+        *blake3::hash(body).as_bytes(),
         "planted bytes must not match the claimed hash"
     );
     let mut updates = BTreeMap::new();
     updates.insert(
         "a.txt".to_string(),
         skip_cache::SavedFile {
-            hash: claimed.clone(),
+            hash: format_hash(claimed),
             size,
             mtime,
             chunks: None,
@@ -3944,12 +4040,12 @@ async fn a_mismatched_entry_is_not_refetched_on_rerun() {
     std::fs::write(tmp.path().join("a.bin"), body).expect("write");
     let meta = std::fs::metadata(tmp.path().join("a.bin")).expect("meta");
     let size = u64::try_from(body.len()).expect("len");
-    let hash = "b3:1111111111111111111111111111111111111111111111111111111111111111".to_string();
+    let hash = [0x11; 32];
     let mut updates = BTreeMap::new();
     updates.insert(
         "a.bin".to_string(),
         skip_cache::SavedFile {
-            hash: hash.clone(),
+            hash: format_hash(hash),
             size,
             mtime: SavedMtime::of(&meta).expect("mtime"),
             chunks: None,
@@ -3979,7 +4075,7 @@ async fn resolve_disk_state_rehash_confirms_touched_but_identical_file() {
     let tmp = tempfile::tempdir().expect("tmp");
     let body = b"unchanged content";
     std::fs::write(tmp.path().join("a.txt"), body).expect("write");
-    let real = format!("b3:{}", blake3::hash(body).to_hex());
+    let real = *blake3::hash(body).as_bytes();
     let size = u64::try_from(body.len()).expect("len");
     // Right hash + size, but a stale (1970) mtime → the fast path misses.
     let stale = SavedMtime { secs: 1, nanos: 0 };
@@ -3996,7 +4092,7 @@ async fn resolve_disk_state_rehash_confirms_touched_but_identical_file() {
     updates.insert(
         "a.txt".to_string(),
         skip_cache::SavedFile {
-            hash: real.clone(),
+            hash: format_hash(real),
             size,
             mtime: stale,
             chunks: None,
@@ -4024,7 +4120,7 @@ async fn resolve_disk_state_rehash_confirms_touched_but_identical_file() {
 async fn resolve_disk_state_fetches_changed_file() {
     let tmp = tempfile::tempdir().expect("tmp");
     std::fs::write(tmp.path().join("a.txt"), b"OLD CONTENT").expect("write");
-    let new = format!("b3:{}", blake3::hash(b"NEW CONTENT").to_hex());
+    let new = *blake3::hash(b"NEW CONTENT").as_bytes();
     let entries = [ManifestEntry {
         path: "a.txt".into(),
         hash: new,
@@ -4042,7 +4138,7 @@ async fn resolve_disk_state_absent_file_fetches() {
     let tmp = tempfile::tempdir().expect("tmp");
     let entries = [ManifestEntry {
         path: "missing.txt".into(),
-        hash: "b3:00".into(),
+        hash: [0x00; 32],
         size: Some(1),
         chunks: None,
         landed_from: None,
@@ -4057,7 +4153,7 @@ async fn resolve_disk_state_overwrite_skips_nothing() {
     let tmp = tempfile::tempdir().expect("tmp");
     let body = b"hello world";
     std::fs::write(tmp.path().join("a.txt"), body).expect("write");
-    let h = format!("b3:{}", blake3::hash(body).to_hex());
+    let h = *blake3::hash(body).as_bytes();
     let entries = [ManifestEntry {
         path: "a.txt".into(),
         hash: h,
@@ -4078,11 +4174,11 @@ async fn resolve_disk_state_indexes_whole_file_donor_from_other_path() {
     let body = vec![7u8; 4096];
     std::fs::create_dir_all(tmp.path().join("game1/lib")).expect("mkdir");
     std::fs::write(tmp.path().join("game1/lib/dup.dll"), &body).expect("write");
-    let h = format!("b3:{}", blake3::hash(&body).to_hex());
+    let h = *blake3::hash(&body).as_bytes();
     // Prior run recorded game1/lib/dup.dll.
     let old_entries = [ManifestEntry {
         path: "game1/lib/dup.dll".into(),
-        hash: h.clone(),
+        hash: h,
         size: Some(4096),
         chunks: None,
         landed_from: None,
@@ -4099,15 +4195,14 @@ async fn resolve_disk_state_indexes_whole_file_donor_from_other_path() {
     // The NEW bundle wants the same content at a different path.
     let new_entries = vec![ManifestEntry {
         path: "game2/lib/dup.dll".into(),
-        hash: h.clone(),
+        hash: h,
         size: Some(4096),
         chunks: None,
         landed_from: None,
     }];
     let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
-    let want = parse_hash(&h).expect("hash");
     assert_eq!(
-        st.whole_file.get(&want),
+        st.whole_file.get(&h),
         Some(&tmp.path().join("game1/lib/dup.dll"))
     );
 }
@@ -4124,10 +4219,10 @@ async fn resolve_disk_state_excludes_will_write_path_from_whole_file_index() {
     let tmp = tempfile::tempdir().expect("tmp");
     let old_body = vec![9u8; 32];
     std::fs::write(tmp.path().join("changed.bin"), &old_body).expect("write old");
-    let old_hash = format!("b3:{}", blake3::hash(&old_body).to_hex());
+    let old_hash = *blake3::hash(&old_body).as_bytes();
     let old_entries = [ManifestEntry {
         path: "changed.bin".into(),
-        hash: old_hash.clone(),
+        hash: old_hash,
         size: Some(32),
         chunks: None,
         landed_from: None,
@@ -4145,7 +4240,7 @@ async fn resolve_disk_state_excludes_will_write_path_from_whole_file_index() {
     // The new manifest wants DIFFERENT content at the SAME path: this entry
     // is in scope and will be written (not skipped), so its saved record's
     // hash must not become a whole-file donor.
-    let new_hash = format!("b3:{}", blake3::hash(&[1u8; 32]).to_hex());
+    let new_hash = *blake3::hash(&[1u8; 32]).as_bytes();
     let new_entries = vec![ManifestEntry {
         path: "changed.bin".into(),
         hash: new_hash,
@@ -4159,9 +4254,8 @@ async fn resolve_disk_state_excludes_will_write_path_from_whole_file_index() {
         !st.skip.contains("changed.bin"),
         "changed content must fetch"
     );
-    let old_want = parse_hash(&old_hash).expect("hash");
     assert_eq!(
-        st.whole_file.get(&old_want),
+        st.whole_file.get(&old_hash),
         None,
         "a will-write path must never be indexed as a whole-file donor"
     );
@@ -4173,10 +4267,10 @@ async fn resolve_disk_state_overwrite_builds_no_whole_file_index() {
     let tmp = tempfile::tempdir().expect("tmp");
     let body = vec![7u8; 16];
     std::fs::write(tmp.path().join("a.bin"), &body).expect("write");
-    let h = format!("b3:{}", blake3::hash(&body).to_hex());
+    let h = *blake3::hash(&body).as_bytes();
     let old = [ManifestEntry {
         path: "a.bin".into(),
-        hash: h.clone(),
+        hash: h,
         size: Some(16),
         chunks: None,
         landed_from: None,
@@ -4208,7 +4302,7 @@ async fn resolve_disk_state_does_not_skip_a_symlink() {
     std::fs::write(tmp.path().join("target.bin"), body).expect("write target");
     std::os::unix::fs::symlink(tmp.path().join("target.bin"), tmp.path().join("link.txt"))
         .expect("symlink");
-    let h = format!("b3:{}", blake3::hash(body).to_hex());
+    let h = *blake3::hash(body).as_bytes();
     let entries = [ManifestEntry {
         path: "link.txt".into(),
         hash: h,
@@ -4230,8 +4324,8 @@ async fn resolve_disk_state_seeds_unchanged_and_old_chunks() {
     // unchanged file present, matches new manifest, has chunks → seed NEW chunks
     let body = vec![9u8; 20];
     std::fs::write(tmp.path().join("u.bin"), &body).expect("write");
-    let uh = format!("b3:{}", blake3::hash(&body).to_hex());
-    let ch = format!("b3:{}", blake3::hash(&body).to_hex()); // single-chunk == whole file
+    let uh = *blake3::hash(&body).as_bytes();
+    let ch = *blake3::hash(&body).as_bytes(); // single-chunk == whole file
     let entries = [ManifestEntry {
         path: "u.bin".into(),
         hash: uh,
@@ -4260,14 +4354,14 @@ async fn resolve_disk_state_seeds_old_chunks_of_a_changed_file() {
     // Build a saved record (as a prior run would have) carrying chunk hints
     // for the OLD content, then persist and reload it via the real
     // merge_and_write / load round trip.
-    let old_hash = format!("b3:{}", blake3::hash(&old_body).to_hex());
-    let old_chunk_hash = old_hash.clone(); // single-chunk == whole file
+    let old_hash = *blake3::hash(&old_body).as_bytes();
+    let old_chunk_hash = old_hash; // single-chunk == whole file
     let old_entries = [ManifestEntry {
         path: "c.bin".into(),
         hash: old_hash,
         size: Some(20),
         chunks: Some(vec![ManifestChunk {
-            hash: old_chunk_hash.clone(),
+            hash: old_chunk_hash,
             size: 20,
         }]),
         landed_from: None,
@@ -4282,7 +4376,7 @@ async fn resolve_disk_state_seeds_old_chunks_of_a_changed_file() {
     // The new manifest declares different content, but the OLD file is
     // still on disk (not yet overwritten) — a fetch, not a skip, and the
     // old bytes remain a valid donor until this entry's own materialize.
-    let new_hash = format!("b3:{}", blake3::hash(&[2u8; 20]).to_hex());
+    let new_hash = *blake3::hash(&[2u8; 20]).as_bytes();
     let new_entries = vec![ManifestEntry {
         path: "c.bin".into(),
         hash: new_hash,
@@ -4298,9 +4392,8 @@ async fn resolve_disk_state_seeds_old_chunks_of_a_changed_file() {
     // doc comment) — assert every seed entry present matches, rather than
     // pinning an exact count.
     assert!(!st.seed.is_empty());
-    let want_hash = parse_hash(&old_chunk_hash).expect("parse old chunk hash");
     for donor in &st.seed {
-        assert_eq!(donor.hash, want_hash);
+        assert_eq!(donor.hash, old_chunk_hash);
         assert_eq!(donor.source, path);
         assert_eq!(donor.offset, 0);
         assert_eq!(donor.len, 20);
@@ -4562,7 +4655,7 @@ fn settle_group_run_records_outcomes_and_passes_a_stop_through() {
     updates.insert(
         "a.bin".to_string(),
         skip_cache::SavedFile {
-            hash: "b3:00".into(),
+            hash: format_hash([0x00; 32]),
             size: 3,
             mtime: SavedMtime { secs: 1, nanos: 0 },
             chunks: None,
@@ -4715,8 +4808,8 @@ fn a_manifest_size_mismatch_warns() {
     std::fs::write(tmp.path().join("big.bin"), b"twelve bytes").expect("write");
     std::fs::write(tmp.path().join("ok.bin"), b"four").expect("write");
     let entries = [
-        ManifestEntry::new("big.bin", "b3:aa", Some(4)),
-        ManifestEntry::new("ok.bin", "b3:bb", Some(4)),
+        ManifestEntry::new("big.bin", [0xaa; 32], Some(4)),
+        ManifestEntry::new("ok.bin", [0xbb; 32], Some(4)),
     ];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let outcomes = vec![EntryOutcome::Fetched(12), EntryOutcome::Fetched(4)];
@@ -4859,11 +4952,10 @@ fn a_resumed_share_counts_only_this_runs_bytes() {
 #[tokio::test]
 async fn planned_work_leaves_out_skipped_and_donor_groups() {
     let tmp = tempfile::tempdir().expect("tmp");
-    let hash = |b: u8| format!("b3:{}", blake3::Hash::from_bytes([b; 32]).to_hex());
     let entries = vec![
-        ManifestEntry::new("fetch.bin", hash(1), Some(100)),
-        ManifestEntry::new("present.bin", hash(2), Some(200)),
-        ManifestEntry::new("donor.bin", hash(3), Some(300)),
+        ManifestEntry::new("fetch.bin", [1; 32], Some(100)),
+        ManifestEntry::new("present.bin", [2; 32], Some(200)),
+        ManifestEntry::new("donor.bin", [3; 32], Some(300)),
     ];
     let mut disk = DiskState::default();
     disk.skip.insert("present.bin".to_string());

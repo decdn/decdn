@@ -88,20 +88,24 @@ pub decdn_client::bundle::EntryLanded::spliced: u64
 #[non_exhaustive] pub struct decdn_client::bundle::ForeignPath
 pub decdn_client::bundle::ForeignPath::path: alloc::string::String
 pub decdn_client::bundle::ForeignPath::reason: decdn_client::bundle::ForeignReason
+pub struct decdn_client::bundle::MalformedManifest(_)
+impl core::error::Error for decdn_client::bundle::MalformedManifest
+impl core::fmt::Display for decdn_client::bundle::MalformedManifest
+pub fn decdn_client::bundle::MalformedManifest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct decdn_client::bundle::ManifestChunk
-pub decdn_client::bundle::ManifestChunk::hash: alloc::string::String
+pub decdn_client::bundle::ManifestChunk::hash: [u8; 32]
 pub decdn_client::bundle::ManifestChunk::size: u64
 impl decdn_client::bundle::ManifestChunk
-pub fn decdn_client::bundle::ManifestChunk::new(impl core::convert::Into<alloc::string::String>, u64) -> Self
+pub const fn decdn_client::bundle::ManifestChunk::new([u8; 32], u64) -> Self
 #[non_exhaustive] pub struct decdn_client::bundle::ManifestEntry
 pub decdn_client::bundle::ManifestEntry::chunks: core::option::Option<alloc::vec::Vec<decdn_client::bundle::ManifestChunk>>
-pub decdn_client::bundle::ManifestEntry::hash: alloc::string::String
+pub decdn_client::bundle::ManifestEntry::hash: [u8; 32]
 pub decdn_client::bundle::ManifestEntry::path: alloc::string::String
 pub decdn_client::bundle::ManifestEntry::size: core::option::Option<u64>
 impl decdn_client::bundle::ManifestEntry
 pub fn decdn_client::bundle::ManifestEntry::land_at(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn decdn_client::bundle::ManifestEntry::manifest_path(&self) -> &str
-pub fn decdn_client::bundle::ManifestEntry::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, core::option::Option<u64>) -> Self
+pub fn decdn_client::bundle::ManifestEntry::new(impl core::convert::Into<alloc::string::String>, [u8; 32], core::option::Option<u64>) -> Self
 pub fn decdn_client::bundle::ManifestEntry::with_chunks(self, alloc::vec::Vec<decdn_client::bundle::ManifestChunk>) -> Self
 pub struct decdn_client::bundle::NodeSelection
 pub struct decdn_client::bundle::NotAManifest(_)
@@ -123,6 +127,7 @@ pub fn decdn_client::bundle::FileObserver::hashed(&self, u64)
 pub fn decdn_client::bundle::FileObserver::pending(&self)
 pub fn decdn_client::bundle::FileObserver::reconstructing(&self)
 pub fn decdn_client::bundle::foreign_paths(&decdn_client::bundle::BundleManifest, &std::path::Path) -> alloc::vec::Vec<decdn_client::bundle::ForeignPath>
+pub fn decdn_client::bundle::format_hash([u8; 32]) -> alloc::string::String
 pub fn decdn_client::bundle::parse_hash(&str) -> anyhow::Result<[u8; 32]>
 pub async fn decdn_client::bundle::select_nodes(&decdn_client::session::ChainConfig, &decdn_client::session::PullSite, &decdn_client::session::DiscoveryOptions) -> anyhow::Result<decdn_client::bundle::NodeSelection>
 pub mod decdn_client::buyer_pool

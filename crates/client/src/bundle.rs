@@ -87,6 +87,13 @@ pub fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
     Ok(*h.as_bytes())
 }
 
+/// A BLAKE3 hash in the form a bundle manifest writes it: `b3:` and 64
+/// lowercase hex characters.
+#[must_use]
+pub fn format_hash(hash: [u8; 32]) -> String {
+    format!("b3:{}", blake3::Hash::from_bytes(hash).to_hex())
+}
+
 /// A bundle manifest: the files a bundle publishes (`adr/appendix-bundles.md`).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -97,11 +104,12 @@ pub struct BundleManifest {
     pub entries: Vec<ManifestEntry>,
 }
 
-/// The wire form of a manifest: a version gate around the entries.
+/// The wire form of a manifest: a version gate around the entries, whose
+/// hashes parse only once the version is known.
 #[derive(Deserialize)]
 struct ManifestV1 {
     version: u32,
-    entries: Vec<ManifestEntry>,
+    entries: Vec<WireEntry>,
 }
 
 impl BundleManifest {
@@ -121,12 +129,15 @@ impl BundleManifest {
         self.hash
     }
 
-    /// Parse manifest JSON and check its version.
+    /// Parse manifest JSON, check its version, then parse every hash.
     ///
     /// # Errors
     ///
-    /// [`NotAManifest`] when the bytes are not a manifest, or name a version
-    /// other than 1.
+    /// [`NotAManifest`] when the bytes are not a manifest or name a version
+    /// other than 1. [`MalformedManifest`] when a v1 manifest holds an entry
+    /// or chunk hash that does not parse: one malformed hash makes the whole
+    /// manifest invalid. A retry cannot fix either: the bytes are
+    /// content-addressed, so every read of them gets the same answer.
     pub fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         let manifest: ManifestV1 = serde_json::from_slice(bytes)
             .map_err(|e| NotAManifest(format!("parse bundle JSON (expected v1 manifest): {e}")))?;
@@ -137,9 +148,14 @@ impl BundleManifest {
             ))
             .into());
         }
+        let entries = manifest
+            .entries
+            .into_iter()
+            .map(WireEntry::parse)
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             hash: *blake3::hash(bytes).as_bytes(),
-            entries: manifest.entries,
+            entries,
         })
     }
 
@@ -199,7 +215,7 @@ pub fn foreign_paths(manifest: &BundleManifest, out_dir: &Path) -> Vec<ForeignPa
                     }
                     Some(rec)
                         if rec.source.is(manifest.hash, en.manifest_path())
-                            || rec.hash == en.hash =>
+                            || rec.holds(en.hash) =>
                     {
                         return None;
                     }
@@ -257,37 +273,107 @@ impl std::fmt::Display for NotAManifest {
 
 impl std::error::Error for NotAManifest {}
 
+/// A v1 bundle manifest with an entry or chunk hash that does not parse:
+/// [`BundleManifest::parse`]'s error for a manifest its publisher wrote
+/// wrong. Fetching the raw blob only returns the same broken JSON; only a
+/// fixed manifest, under a new hash, serves the entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MalformedManifest(String);
+
+impl std::fmt::Display for MalformedManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MalformedManifest {}
+
 /// One file of a [`BundleManifest`].
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ManifestEntry {
     /// The file's POSIX relative path under the output directory.
     pub path: String,
-    /// The file's whole-file BLAKE3 hash (`b3:`hex), which the fetch verifies.
-    pub hash: String,
+    /// The file's whole-file BLAKE3 hash, which the fetch verifies.
+    pub hash: [u8; 32],
     /// The file's size. Optional on the wire: the pull uses it as the first
     /// size claim and for progress totals, and verifies the true size.
-    #[serde(default)]
     pub size: Option<u64>,
     /// The file's ordered chunk decomposition, a range-dedup hint. Chunks it
     /// shares with a sibling entry are spliced from disk instead of paid for
     /// twice. The whole file is still verified by `hash`.
-    #[serde(default)]
     pub chunks: Option<Vec<ManifestChunk>>,
     /// The manifest `path` of an entry that [`Self::land_at`] moved, or `None`
     /// when `path` is still the manifest path.
-    #[serde(skip)]
     landed_from: Option<String>,
+}
+
+/// The wire form of a [`ManifestEntry`]: its hashes as the manifest writes
+/// them, before they parse.
+#[derive(Deserialize)]
+struct WireEntry {
+    path: String,
+    hash: String,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    chunks: Option<Vec<WireChunk>>,
+}
+
+/// The wire form of a [`ManifestChunk`].
+#[derive(Deserialize)]
+struct WireChunk {
+    hash: String,
+    size: u64,
+}
+
+impl WireEntry {
+    /// This entry with its hashes parsed, or the error naming the entry and
+    /// the first hash that does not parse.
+    fn parse(self) -> Result<ManifestEntry, MalformedManifest> {
+        let Self {
+            path,
+            hash,
+            size,
+            chunks,
+        } = self;
+        let malformed = |what: &str, e: anyhow::Error| {
+            MalformedManifest(format!(
+                "bundle entry {path:?} has a malformed {what}: {e:#}"
+            ))
+        };
+        let hash = parse_hash(&hash).map_err(|e| malformed("hash", e))?;
+        let chunks = chunks
+            .map(|chunks| {
+                chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        parse_hash(&c.hash)
+                            .map(|hash| ManifestChunk { hash, size: c.size })
+                            .map_err(|e| malformed(&format!("chunk {i} hash"), e))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        Ok(ManifestEntry {
+            path,
+            hash,
+            size,
+            chunks,
+            landed_from: None,
+        })
+    }
 }
 
 impl ManifestEntry {
     /// An entry for the file at `path` with whole-file `hash` and `size`, and
     /// no chunk hints.
     #[must_use]
-    pub fn new(path: impl Into<String>, hash: impl Into<String>, size: Option<u64>) -> Self {
+    pub fn new(path: impl Into<String>, hash: [u8; 32], size: Option<u64>) -> Self {
         Self {
             path: path.into(),
-            hash: hash.into(),
+            hash,
             size,
             chunks: None,
             landed_from: None,
@@ -323,11 +409,11 @@ impl ManifestEntry {
 
 /// One chunk of a [`ManifestEntry`]: an independently BLAKE3-addressed run of
 /// the file's bytes, placed at the running sum of the earlier chunks' sizes.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ManifestChunk {
-    /// The chunk's BLAKE3 hash (`b3:`hex).
-    pub hash: String,
+    /// The chunk's BLAKE3 hash.
+    pub hash: [u8; 32],
     /// The chunk's length in bytes. The sizes sum to the entry's size.
     pub size: u64,
 }
@@ -335,11 +421,8 @@ pub struct ManifestChunk {
 impl ManifestChunk {
     /// A chunk of `size` bytes with BLAKE3 `hash`.
     #[must_use]
-    pub fn new(hash: impl Into<String>, size: u64) -> Self {
-        Self {
-            hash: hash.into(),
-            size,
-        }
+    pub const fn new(hash: [u8; 32], size: u64) -> Self {
+        Self { hash, size }
     }
 }
 
@@ -631,8 +714,9 @@ pub struct BundleReport {
     pub resumed_bytes: u64,
     /// The bytes spliced from files already on disk. Never downloaded.
     pub spliced_bytes: u64,
-    /// Range-dedup hints a fault dropped: a chunk list that does not parse or
-    /// sum to the file size, or a donor that failed its check.
+    /// Range-dedup hints a fault dropped: a chunk list with no file size to
+    /// check it against, or whose sizes do not sum to it, or a donor that
+    /// failed its check.
     pub hints_ignored: u64,
     /// Every failed entry, in manifest order.
     pub failures: Vec<EntryFailure>,

@@ -1,6 +1,7 @@
 use super::*;
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
+use decdn_client::bundle::parse_hash;
 use decdn_client::sign_client_binding;
 use decdn_incentive::bind_node_id_domain;
 use std::assert_matches;
@@ -648,14 +649,21 @@ fn entry_hash_rejects_a_blob_that_is_not_a_manifest() {
     }
 }
 
+/// One malformed entry hash makes the whole manifest malformed, so a URI
+/// that names a valid sibling entry fails too. The error names the bad entry
+/// and gives no raw-blob hint.
 #[test]
 fn entry_hash_names_the_entry_of_a_malformed_hash() {
-    let bytes = manifest_json(&[("a.bin", "not-hex")]);
-    let err = format!("{:#}", entry_hash(&bytes, "a.bin").unwrap_err());
-    assert!(
-        err.contains("bundle entry \"a.bin\" has a malformed hash"),
-        "{err}"
-    );
+    let bytes = manifest_json(&[("a.bin", "not-hex"), ("b.bin", ENTRY_B)]);
+    for path in ["a.bin", "b.bin"] {
+        let err = format!("{:#}", entry_hash(&bytes, path).unwrap_err());
+        assert!(err.contains(MALFORMED_MANIFEST), "{err}");
+        assert!(!err.contains("raw blob"), "{err}");
+        assert!(
+            err.contains("bundle entry \"a.bin\" has a malformed hash"),
+            "{err}"
+        );
+    }
 }
 
 #[tokio::test]

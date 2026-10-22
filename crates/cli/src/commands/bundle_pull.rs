@@ -20,8 +20,8 @@ use anyhow::{Context as _, anyhow, bail};
 use decdn_client::PoolReplaced;
 use decdn_client::bundle::{
     BundleEnd, BundleManifest, BundleObserver, BundlePuller, BundleReport, EntryLanded,
-    FaultContext, FaultHints, FileObserver, ForeignReason, Funding, ManifestEntry, NotAManifest,
-    STAGING_DIR, select_nodes,
+    FaultContext, FaultHints, FileObserver, ForeignReason, Funding, MalformedManifest,
+    ManifestEntry, NotAManifest, STAGING_DIR, format_hash, select_nodes,
 };
 use decdn_client::buyer_pool::UnconfirmedEscrows;
 use decdn_client::endpoint as client_endpoint;
@@ -587,7 +587,7 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// whose hints saved bytes is distinguishable from one whose hints did not:
 /// `spliced_bytes` is the total bytes served from a local donor splice (bytes NOT
 /// downloaded or paid for), and `hints_ignored` counts range-dedup hints dropped
-/// by a fault — a chunk set that failed to parse or whose sizes did not sum to the
+/// by a fault — a chunk set with no file size, or whose sizes do not sum to the
 /// file size, a donor that failed its verification re-hash (or was unreadable), or
 /// a self-heal whole-file re-drive that discarded already-spliced donors. Both are
 /// reporting only and never affect payment.
@@ -1103,19 +1103,37 @@ fn report_nothing_to_fetch(reason: NothingReason) {
 
 /// The hint for a bundle URI whose hash names a blob that is not a manifest:
 /// the trailing `/` asked for a bundle, and dropping it fetches the raw blob.
-/// Every other error passes through unchanged.
+/// A malformed manifest gets no such hint: its raw blob is the same broken
+/// JSON. Every other error passes through unchanged.
 fn not_a_manifest_hint(err: anyhow::Error) -> anyhow::Error {
-    if err
-        .chain()
-        .any(<dyn std::error::Error + 'static>::is::<NotAManifest>)
-    {
+    if chain_has::<NotAManifest>(&err) {
         err.context(
             "the URI's trailing `/` names a bundle, but this blob is not a bundle manifest; \
              drop the trailing `/` to fetch the raw blob",
         )
+    } else if chain_has::<MalformedManifest>(&err) {
+        err.context(fetch::MALFORMED_MANIFEST)
     } else {
         err
     }
+}
+
+/// Whether `err` or an error in its source chain is an `E`.
+fn chain_has<E: std::error::Error + 'static>(err: &anyhow::Error) -> bool {
+    err.chain().any(<dyn std::error::Error + 'static>::is::<E>)
+}
+
+/// The `--json` dry-run plan of `entries` into `out`: each entry's path, its
+/// hash in the manifest's `b3:<hex>` form, its size and its chunk count.
+fn json_plan(out: &str, entries: &[ManifestEntry]) -> serde_json::Value {
+    serde_json::json!({
+        "output": out,
+        "count": entries.len(),
+        "entries": entries.iter().map(|e| serde_json::json!({
+            "path": e.path, "hash": format_hash(e.hash), "size": e.size,
+            "chunks": e.chunks.as_ref().map(Vec::len),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// Print the would-fetch plan and exit (no network/chain/keystore activity).
@@ -1171,15 +1189,7 @@ fn dry_run(
         // The `--json` plan stays machine-readable — an empty set is
         // `count: 0` with an empty `entries` array, no prose line. A bundle
         // with no cached manifest gives `count`/`entries` of `null`.
-        let plan = serde_json::json!({
-            "output": out.to_string(),
-            "count": manifest.entries.len(),
-            "entries": manifest.entries.iter().map(|e| serde_json::json!({
-                "path": e.path, "hash": e.hash, "size": e.size,
-                "chunks": e.chunks.as_ref().map(Vec::len),
-            })).collect::<Vec<_>>(),
-        });
-        println!("{plan}");
+        println!("{}", json_plan(&out.to_string(), &manifest.entries));
     } else if manifest.entries.is_empty() {
         // Match the real run's empty-result message rather than printing a
         // "would fetch 0 entr(ies)" plan, so `--dry-run` and a live pull
@@ -1402,7 +1412,7 @@ fn leftover_warning(dir: &Path, leftovers: &Leftovers) -> Option<String> {
 fn warn_leftover_partials(out_root: &Path, entries: &[ManifestEntry], bundle_hash: [u8; 32]) {
     let keep: HashSet<[u8; 32]> = entries
         .iter()
-        .filter_map(|e| fetch::parse_hash(&e.hash).ok())
+        .map(|e| e.hash)
         .chain([bundle_hash])
         .collect();
     let leftovers = leftover_partials(out_root, &keep);

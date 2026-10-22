@@ -90,7 +90,7 @@ fn source_matches_only_its_bundle_and_path_and_prints_its_uri() {
     assert!(src.is([3; 32], "src/b.txt"));
     assert!(!src.is([4; 32], "src/b.txt"));
     assert!(!src.is([3; 32], "b.txt"));
-    assert_eq!(src.bundle, bundle_key([3; 32]));
+    assert_eq!(src.bundle, super::super::format_hash([3; 32]));
     let uri = src.uri().expect("a hash");
     assert_eq!(uri.hash, [3u8; 32]);
     assert_eq!(uri.target, UriTarget::BundleEntry("src/b.txt".into()));
@@ -170,4 +170,24 @@ fn saved_hints_rejects_bad_sum_and_absent_chunks() {
     assert!(saved_hints(&rec).is_none()); // 10 != 99
     rec.chunks = None;
     assert!(saved_hints(&rec).is_none());
+}
+
+/// A record holds a hash by its bytes, whatever spelling wrote it, and a
+/// record whose hash does not parse holds nothing.
+#[test]
+fn holds_matches_by_bytes_across_spellings() {
+    let hex = "ab".repeat(32);
+    for spelling in [
+        format!("b3:{hex}"),
+        format!("0x{}", hex.to_uppercase()),
+        hex.clone(),
+    ] {
+        let rec = SavedFile {
+            hash: spelling.clone(),
+            ..sample()
+        };
+        assert!(rec.holds([0xab; 32]), "{spelling}");
+        assert!(!rec.holds([0xcd; 32]), "{spelling}");
+    }
+    assert!(!sample().holds([0xaa; 32]), "`b3:aa` does not parse");
 }

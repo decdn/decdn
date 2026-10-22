@@ -2,12 +2,12 @@ use super::*;
 
 /// Minimal `ManifestEntry` for the `--select` tests: path + size, no chunks.
 fn sel_entry(path: &str, size: u64) -> ManifestEntry {
-    ManifestEntry::new(path, "b3:00", Some(size))
+    ManifestEntry::new(path, [0x00; 32], Some(size))
 }
 
-/// A plain manifest entry: path + hash, no size or chunks.
-fn entry(path: &str, hash: &str) -> ManifestEntry {
-    ManifestEntry::new(path, hash, None)
+/// A plain manifest entry: path + a hash of `[hash; 32]`, no size or chunks.
+fn entry(path: &str, hash: u8) -> ManifestEntry {
+    ManifestEntry::new(path, [hash; 32], None)
 }
 
 /// Write `manifest` to `out`'s manifest cache, as a pull that fetched it
@@ -61,10 +61,10 @@ fn strs(items: &[&str]) -> Vec<String> {
 
 fn sample() -> Vec<ManifestEntry> {
     vec![
-        entry("models/a.bin", "b3:1"),
-        entry("models/b.txt", "b3:2"),
-        entry("docs/readme.md", "b3:3"),
-        entry("docs/deep/notes.txt", "b3:4"),
+        entry("models/a.bin", 0x1),
+        entry("models/b.txt", 0x2),
+        entry("docs/readme.md", 0x3),
+        entry("docs/deep/notes.txt", 0x4),
     ]
 }
 
@@ -296,12 +296,12 @@ fn filtered_paths(include: &[&str], exclude: &[&str], entries: Vec<ManifestEntry
 #[test]
 fn entry_filter_keeps_exactly_the_named_entry() {
     let entries = vec![
-        entry("x[1].txt", "b3:1"),
-        entry("x1.txt", "b3:2"),
-        entry("a*.bin", "b3:3"),
-        entry("abc.bin", "b3:4"),
-        entry("dir/{a,b}.txt", "b3:5"),
-        entry("dir/a.txt", "b3:6"),
+        entry("x[1].txt", 0x1),
+        entry("x1.txt", 0x2),
+        entry("a*.bin", 0x3),
+        entry("abc.bin", 0x4),
+        entry("dir/{a,b}.txt", 0x5),
+        entry("dir/a.txt", 0x6),
     ];
     for path in ["x[1].txt", "a*.bin", "dir/{a,b}.txt", "x1.txt"] {
         let filter = EntryFilter::compile(Some(path.to_owned()), &[], &[]).unwrap();
@@ -331,7 +331,7 @@ fn entry_filter_rejects_a_missing_entry() {
 #[test]
 fn entry_filter_reports_each_pattern_that_matched_nothing() {
     let mut entries = sample();
-    entries.push(entry("gpt/metal/model.bin", "b3:5"));
+    entries.push(entry("gpt/metal/model.bin", 0x5));
     let filter = EntryFilter::compile(
         None,
         &strs(&["models/*", "no/such/*"]),
@@ -572,8 +572,10 @@ async fn dry_run_reads_a_cached_manifest() {
         &serde_json::json!({
             "version": 1,
             "entries": [
-                {"path": "openai-gpt-oss-20b/config.json", "hash": "b3:aa", "size": 10},
-                {"path": "openai-gpt-oss-20b/metal/model.bin", "hash": "b3:bb", "size": 20},
+                {"path": "openai-gpt-oss-20b/config.json", "size": 10,
+                 "hash": format_hash([0xaa; 32])},
+                {"path": "openai-gpt-oss-20b/metal/model.bin", "size": 20,
+                 "hash": format_hash([0xbb; 32])},
             ],
         }),
     );
@@ -634,12 +636,65 @@ async fn dry_run_fails_on_a_cached_manifest_that_does_not_parse() {
     assert!(msg.contains("drop the trailing `/`"), "{msg}");
 }
 
+/// A cached manifest with one malformed hash fails the dry run of the bundle
+/// and of a valid sibling entry. The error names the bad entry and the cache
+/// file, and gives no raw-blob hint: the raw blob is the same broken JSON.
+#[tokio::test]
+async fn dry_run_fails_on_a_cached_manifest_with_a_malformed_hash() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out = tmp.path().to_str().expect("utf-8 tmp path");
+    let hash = cache_manifest(
+        tmp.path(),
+        &serde_json::json!({"version": 1, "entries": [
+            {"path": "ok.bin", "hash": format_hash([0xaa; 32]), "size": 3},
+            {"path": "bad.bin", "hash": "zz", "size": 3},
+        ]}),
+    );
+    for uri in [format!("decdn:{hash}/"), format!("decdn:{hash}/ok.bin")] {
+        let (args, parsed) = get_args(&uri, &["-o", out, "--dry-run"]);
+        let err = super::bundle_pull(&args, &Destination::of(&args, &parsed), &parsed, None)
+            .await
+            .expect_err("a malformed cached manifest fails the dry run");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(r#"bundle entry "bad.bin" has a malformed hash"#),
+            "{uri}: {msg}"
+        );
+        assert!(msg.contains(fetch::MALFORMED_MANIFEST), "{uri}: {msg}");
+        assert!(msg.contains(".decdn-bundles"), "{uri}: {msg}");
+        assert!(!msg.contains("drop the trailing `/`"), "{uri}: {msg}");
+    }
+}
+
+/// The `--json` plan writes each entry hash in the manifest's `b3:<hex>`
+/// form, whatever spelling the manifest used.
+#[test]
+fn json_plan_writes_hashes_in_the_b3_form() {
+    let json = format!(
+        r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"0x{}","size":3}}]}}"#,
+        "AB".repeat(32)
+    );
+    let manifest = BundleManifest::parse(json.as_bytes()).unwrap();
+    let plan = json_plan("out", &manifest.entries);
+    assert_eq!(
+        plan["entries"][0]["hash"],
+        format!("b3:{}", "ab".repeat(32))
+    );
+    assert_eq!(plan["count"], 1);
+}
+
 /// Only a blob that is not a manifest gets the drop-the-trailing-`/` hint.
 #[test]
 fn only_a_non_manifest_gets_the_trailing_slash_hint() {
     let not_manifest = BundleManifest::parse(b"plain bytes").unwrap_err();
     let hinted = format!("{:#}", not_a_manifest_hint(not_manifest));
     assert!(hinted.contains("drop the trailing `/`"), "{hinted}");
+
+    let malformed = BundleManifest::parse(br#"{"version":1,"entries":[{"path":"a","hash":"zz"}]}"#)
+        .unwrap_err();
+    let named = format!("{:#}", not_a_manifest_hint(malformed));
+    assert!(named.contains(fetch::MALFORMED_MANIFEST), "{named}");
+    assert!(!named.contains("drop the trailing `/`"), "{named}");
 
     let other = format!("{:#}", not_a_manifest_hint(anyhow!("no holder answered")));
     assert_eq!(other, "no holder answered");
@@ -676,7 +731,7 @@ async fn dry_run_fails_naming_a_cached_manifest_that_fails_its_hash_check() {
         tmp.path(),
         &serde_json::json!({"version": 1, "entries": []}),
     );
-    let raw = fetch::parse_hash(&hash).expect("hash");
+    let raw = decdn_client::bundle::parse_hash(&hash).expect("hash");
     std::fs::write(BundleManifest::cache_path(tmp.path(), raw), b"tampered").expect("tamper");
     let (args, uri) = get_args(&format!("decdn:{hash}/"), &["-o", out, "--dry-run"]);
     let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
@@ -941,7 +996,7 @@ fn a_default_destination_refuses_an_unrecorded_file() {
 /// Write the skip-cache record a pull of `decdn:<bundle_hex>/<manifest_path>`
 /// leaves for the file at `out/<name>`, with the file's own size and mtime and
 /// the whole-file hash `hash`.
-fn record_pull(out: &Path, name: &str, hash: &str, bundle_hex: &str, manifest_path: &str) {
+fn record_pull(out: &Path, name: &str, hash: [u8; 32], bundle_hex: &str, manifest_path: &str) {
     let meta = std::fs::symlink_metadata(out.join(name)).unwrap();
     let mtime = meta
         .modified()
@@ -949,7 +1004,7 @@ fn record_pull(out: &Path, name: &str, hash: &str, bundle_hex: &str, manifest_pa
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
     let saved = serde_json::json!({"version": 2, "files": {name: {
-        "hash": hash, "size": meta.len(),
+        "hash": format_hash(hash), "size": meta.len(),
         "mtime": {"secs": mtime.as_secs(), "nanos": mtime.subsec_nanos()},
         "source": {"bundle": format!("b3:{bundle_hex}"), "path": manifest_path},
     }}});
@@ -973,7 +1028,7 @@ fn a_default_destination_refuses_a_file_another_entry_wrote() {
     record_pull(
         out,
         "config.json",
-        "b3:11",
+        [0x11; 32],
         &hex,
         "text_encoder/config.json",
     );
@@ -982,8 +1037,8 @@ fn a_default_destination_refuses_a_file_another_entry_wrote() {
             .unwrap()
             .landing_as(Some("config.json".to_owned()));
         let entries = vec![
-            ManifestEntry::new("text_encoder/config.json", "b3:11", Some(2)),
-            ManifestEntry::new("tokenizer/config.json", "b3:22", Some(2)),
+            ManifestEntry::new("text_encoder/config.json", [0x11; 32], Some(2)),
+            ManifestEntry::new("tokenizer/config.json", [0x22; 32], Some(2)),
         ];
         BundleManifest::new([0xab; 32], filter.apply_and_warn(entries).unwrap().0)
     };
@@ -1015,7 +1070,7 @@ fn a_default_destination_refuses_a_changed_file_and_an_old_cache() {
     let out = tmp.path();
     let hex = "ab".repeat(32);
     std::fs::write(out.join("a.txt"), b"abc").unwrap();
-    record_pull(out, "a.txt", "b3:00", &hex, "a.txt");
+    record_pull(out, "a.txt", [0x00; 32], &hex, "a.txt");
     std::fs::write(out.join("a.txt"), b"abcd").unwrap();
     let manifest = BundleManifest::new([0xab; 32], vec![sel_entry("a.txt", 3)]);
     let (args, _) = get_args(&format!("decdn:{hex}/"), &[]);
@@ -1051,7 +1106,7 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
     let hash = cache_manifest(
         out,
         &serde_json::json!({"version": 1, "entries": [
-            {"path": "models/v1/c.bin", "hash": "b3:aa", "size": 3},
+            {"path": "models/v1/c.bin", "hash": format_hash([0xaa; 32]), "size": 3},
         ]}),
     );
     let uri = format!("decdn:{hash}/models/v1/c.bin");
@@ -1071,11 +1126,11 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
 
     // A record from this entry vouches for c.bin; one from another entry
     // with other bytes does not, and the refusal names that entry.
-    record_pull(out, "c.bin", "b3:bb", &hash, "models/v1/c.bin");
+    record_pull(out, "c.bin", [0xbb; 32], &hash, "models/v1/c.bin");
     super::bundle_pull(&args, &dest, &parsed, None)
         .await
         .unwrap();
-    record_pull(out, "c.bin", "b3:bb", &hash, "models/v2/c.bin");
+    record_pull(out, "c.bin", [0xbb; 32], &hash, "models/v2/c.bin");
     let err = super::bundle_pull(&args, &dest, &parsed, None)
         .await
         .expect_err("a c.bin another entry wrote must be refused");

@@ -330,3 +330,41 @@ fn collect_excluded_symlinked_dir_does_not_error() {
     let paths = collect_paths(dir.path(), true, &["tmp/**"]).unwrap();
     assert_eq!(paths, vec!["keep.txt".to_string()]);
 }
+
+/// A manifest this writer emits parses as one, with every hash and size it
+/// wrote: the writer's `b3:` form is the form the reader accepts.
+#[test]
+fn serialize_canonical_output_parses_as_a_manifest() {
+    let whole = blake3::hash(b"whole");
+    let (c0, c1) = (blake3::hash(b"c0"), blake3::hash(b"c1"));
+    let entries = vec![BundleEntry {
+        path: "model.safetensors".into(),
+        hash: b3_hex_str(whole),
+        size: 100,
+        chunks: Some(vec![
+            Chunk {
+                hash: b3_hex_str(c0),
+                size: 60,
+            },
+            Chunk {
+                hash: b3_hex_str(c1),
+                size: 40,
+            },
+        ]),
+    }];
+    let bytes = serialize_canonical(&entries).unwrap();
+    let manifest = decdn_client::bundle::BundleManifest::parse(&bytes).unwrap();
+    let [entry] = manifest.entries.as_slice() else {
+        panic!("one entry: {:?}", manifest.entries);
+    };
+    assert_eq!(entry.path, "model.safetensors");
+    assert_eq!(entry.hash, *whole.as_bytes());
+    assert_eq!(entry.size, Some(100));
+    let chunks: Vec<_> = entry
+        .chunks
+        .iter()
+        .flatten()
+        .map(|c| (c.hash, c.size))
+        .collect();
+    assert_eq!(chunks, [(*c0.as_bytes(), 60), (*c1.as_bytes(), 40)]);
+}

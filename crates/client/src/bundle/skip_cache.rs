@@ -78,6 +78,12 @@ pub(crate) struct SavedFile {
 }
 
 impl SavedFile {
+    /// Whether the record's whole-file hash is `hash`. A record whose hash
+    /// does not parse holds nothing.
+    pub(crate) fn holds(&self, hash: [u8; 32]) -> bool {
+        super::parse_hash(&self.hash).is_ok_and(|h| h == hash)
+    }
+
     /// Whether the file `meta` describes is still the one this record saw land:
     /// a regular file of the recorded size and mtime. The cheap gate that
     /// stands in for a re-hash.
@@ -91,7 +97,7 @@ impl SavedFile {
 /// so the record's key alone does not name its entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SavedSource {
-    /// The manifest blob's BLAKE3 hash, `b3:<hex>` ([`bundle_key`]).
+    /// The manifest blob's BLAKE3 hash, `b3:<hex>` ([`super::format_hash`]).
     pub(crate) bundle: String,
     /// The entry's `path` in that manifest.
     pub(crate) path: String,
@@ -102,7 +108,7 @@ impl SavedSource {
     /// `bundle`.
     pub(crate) fn new(bundle: [u8; 32], path: &str) -> Self {
         Self {
-            bundle: bundle_key(bundle),
+            bundle: super::format_hash(bundle),
             path: path.to_owned(),
         }
     }
@@ -123,11 +129,6 @@ impl SavedSource {
             None,
         ))
     }
-}
-
-/// The form a [`SavedSource`] records the manifest hash `hash` in: `b3:<hex>`.
-fn bundle_key(hash: [u8; 32]) -> String {
-    format!("b3:{}", blake3::Hash::from_bytes(hash).to_hex())
 }
 
 /// One range-dedup chunk of a [`SavedFile`]: a BLAKE3 over a byte range and its
