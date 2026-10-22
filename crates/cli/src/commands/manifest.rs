@@ -88,7 +88,7 @@ pub(crate) struct WalkOutput {
 
 /// Format a BLAKE3 hash as the `b3:<hex>` content-address string.
 pub(crate) fn b3_hex_str(h: blake3::Hash) -> String {
-    format!("b3:{}", h.to_hex())
+    decdn_client::bundle::format_hash(*h.as_bytes())
 }
 
 /// Compile the repeatable `--exclude` globs into a single matcher.

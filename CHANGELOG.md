@@ -28,6 +28,24 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Bundles: a manifest with an entry or chunk hash that does not parse is
+  malformed, and serves no entry (#2561).** `BundleManifest::parse` checks
+  the version first, then returns the new `MalformedManifest` error naming
+  the entry and the hash. `decdn get` of the bundle or of any one entry, and
+  the gateway's index and every entry, fail with it and say the publisher
+  must publish a fixed manifest; they give no raw-blob hint, since the raw
+  blob is the same broken JSON. Before, `get` of the bad entry failed, a
+  bundle pull failed only that entry's group and landed the rest, and the
+  gateway answered 404 for that entry while its index linked it.
+  `decdn-client`: `ManifestEntry::hash` and `ManifestChunk::hash` are
+  `[u8; 32]`, `ManifestEntry::new` and `ManifestChunk::new` take one, and
+  `bundle::format_hash` writes the `b3:<hex>` form. `ManifestEntry` and
+  `ManifestChunk` no longer implement `Deserialize`: `BundleManifest::parse`
+  is the way from bytes to entries. A bundle pull groups entries by the
+  parsed hash, so two spellings of one blob's hash (`b3:`, `0x` or no
+  prefix; upper- or lowercase hex) fetch it once.
+  `decdn get decdn:<hash>/ --dry-run --json` prints every entry hash in the
+  `b3:<hex>` form.
 - **`decdn-client` pools connections per node on one ALPN, on a map-chosen
   runtime (#2475).** `Connections::with_options(endpoint, alpn, dial_runtime)`
   builds a map whose every dial and connection driver runs on `dial_runtime`
@@ -1191,11 +1209,13 @@ since project inception and will roll into the first tagged release.
   answers as possibly broadcast too, as for `already known` (#2432): `pool
   close` and `pool reclaim` warn that the tx may still mine, and so do
   `publish`, key rotation, bond, register, appeal, and the USDC `approve`.
-- **CLI: `decdn gateway` answers 404, not 502, for a bundle entry whose hash
-  does not parse (#2479).** The manifest is content-addressed, so the bad
-  `hash` field never changes and nothing upstream failed. The 404 names the
-  entry. The manifest is still pulled, but no pull for the entry starts, the
-  same as a path the manifest lacks.
+- **CLI: `decdn gateway` answers 404, not 502, for a bundle with an entry
+  or chunk hash that does not parse (#2479, #2561).** The manifest is
+  content-addressed, so a bad hash never changes and nothing upstream
+  failed. The manifest is malformed, so its index and every entry answer 404
+  naming the bad entry, logged at info, and no pull for an entry starts. The
+  gateway caches only a manifest that parses, so each request pulls, and
+  pays for, the manifest again (#2478).
 - **Payments: a chain read that fails before a transaction is signed is
   reported as rejected, not as possibly broadcast (#2431).** A wallet
   provider reads the pending nonce, the gas estimate, the fees and the chain

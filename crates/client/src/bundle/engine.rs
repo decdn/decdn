@@ -88,7 +88,8 @@ use super::landing::Landing;
 use super::skip_cache::{self, SavedManifest, SavedMtime};
 use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
-    FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, Selection, manifest_cache, parse_hash,
+    FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, Selection, format_hash,
+    manifest_cache, parse_hash,
 };
 use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
@@ -115,14 +116,14 @@ use crate::{
 /// across groups and within each group. Entries that name the same blob (one
 /// file published at two paths) land in one group so it is fetched once (#1306).
 fn group_by_hash<'a>(entries: &[&'a ManifestEntry]) -> Vec<HashGroup<'a>> {
-    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut index: HashMap<[u8; 32], usize> = HashMap::new();
     let mut groups: Vec<HashGroup<'a>> = Vec::new();
     for entry in entries {
         let next = groups.len();
-        let at = *index.entry(entry.hash.as_str()).or_insert(next);
+        let at = *index.entry(entry.hash).or_insert(next);
         if at == next {
             groups.push(HashGroup {
-                hash: entry.hash.as_str(),
+                hash: entry.hash,
                 entries: vec![*entry],
             });
         } else if let Some(group) = groups.get_mut(at) {
@@ -148,7 +149,7 @@ fn order_groups_smallest_first(mut groups: Vec<HashGroup<'_>>) -> Vec<HashGroup<
         let key = |s: Option<u64>| s.unwrap_or(u64::MAX);
         key(a_size)
             .cmp(&key(b_size))
-            .then_with(|| a.hash.cmp(b.hash))
+            .then_with(|| a.hash.cmp(&b.hash))
     });
     groups
 }
@@ -239,9 +240,7 @@ async fn planned_work(
     let empty = HashMap::new();
     let mut work = HashMap::new();
     for group in group_by_hash(&refs) {
-        let Ok(hash) = parse_hash(group.hash) else {
-            continue;
-        };
+        let hash = group.hash;
         let writes = plan_slots(&group.entries, landing, overwrite, &disk.skip)
             .iter()
             .any(|slot| matches!(slot, Slot::Write { .. }));
@@ -306,20 +305,17 @@ async fn resolve_disk_state(
         // the entry's blob, so it is not fetched again on every run.
         let fast = saved
             .get(&en.path)
-            .is_some_and(|rec| rec.hash == en.hash && rec.still_matches(&meta));
+            .is_some_and(|rec| rec.holds(en.hash) && rec.still_matches(&meta));
         if fast {
             state.skip.insert(en.path.clone());
             seed_new_chunks(&mut state, en, &dest);
             continue;
         }
         // Re-hash gate: confirm the on-disk bytes against the new manifest hash.
-        let Ok(want) = parse_hash(&en.hash) else {
-            continue;
-        };
         let dest_buf = dest.clone();
         let got = tokio::task::spawn_blocking(move || hash_partial(&dest_buf)).await;
         if let Ok(Ok(got)) = got
-            && got == want
+            && got == en.hash
         {
             state.skip.insert(en.path.clone());
             seed_new_chunks(&mut state, en, &dest);
@@ -585,9 +581,9 @@ async fn materialize_from_donor(
 fn total_content_bytes(entries: &[ManifestEntry]) -> Option<u64> {
     // Entries keyed by whole-file hash, OR-ing in a declared size wherever one of
     // the same-hash entries carries it (the file bar picks its size the same way).
-    let mut by_hash: HashMap<&str, Option<u64>> = HashMap::new();
+    let mut by_hash: HashMap<[u8; 32], Option<u64>> = HashMap::new();
     for entry in entries {
-        let slot = by_hash.entry(entry.hash.as_str()).or_insert(None);
+        let slot = by_hash.entry(entry.hash).or_insert(None);
         *slot = slot.or(entry.size);
     }
     let mut sum: u64 = 0;
@@ -616,15 +612,14 @@ fn blob_download_reconstruct(
         return (0, 0);
     };
     let hints = group.entries.first().and_then(|e| hints_of(e));
-    let whole = group.entries.first().and_then(|e| parse_hash(&e.hash).ok());
-    let download = match (hints, whole) {
-        (Some(hints), Some(whole)) => plan_reassembly(&hints, index, fetch_plan, whole, total)
+    let download = match hints {
+        Some(hints) => plan_reassembly(&hints, index, fetch_plan, group.hash, total)
             .drive
             .iter()
             .map(|r| r.1)
             .fold(0u64, u64::saturating_add),
-        // No usable hints (or an unparseable hash) → the whole blob is downloaded.
-        _ => total,
+        // No usable hints → the whole blob is downloaded.
+        None => total,
     };
     (download, total.saturating_sub(download))
 }
@@ -652,12 +647,11 @@ fn download_bytes(entries: &[ManifestEntry], fetch_plan: &FetchPlan) -> Option<u
 }
 
 /// A group of manifest entries that all name the same blob `hash` — one file
-/// published at two (or more) bundle paths. Non-empty by construction; the
-/// shared `hash` is carried explicitly so consumers never re-derive it from an
-/// arbitrary member.
+/// published at two (or more) bundle paths. Non-empty by construction; every
+/// member's `hash` equals `hash`.
 #[derive(Clone)]
 struct HashGroup<'a> {
-    hash: &'a str,
+    hash: [u8; 32],
     entries: Vec<&'a ManifestEntry>,
 }
 
@@ -2128,10 +2122,8 @@ impl<P: Provider + Clone> PullCtx<P> {
                     // tail-reconcile waiter deferring a chunk assigned to it stops
                     // waiting and pays for the range itself if the group failed to
                     // register that chunk.
-                    if let Some(en) = group_entries.first()
-                        && let Ok(whole) = parse_hash(&en.hash)
-                    {
-                        index.mark_finished(whole);
+                    if let Some(en) = group_entries.first() {
+                        index.mark_finished(en.hash);
                     }
                     // `fetch_group` returns one outcome per entry, in order;
                     // `build_completed_updates` relies on that to correlate a path
@@ -2436,10 +2428,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         disk: &DiskState,
     ) -> (Arc<WorkShare>, u64, u64) {
         let (download, reconstruct) = blob_download_reconstruct(group, fetch_plan, &HashMap::new());
-        let work = parse_hash(group.hash)
-            .ok()
-            .and_then(|hash| disk.work.get(&hash).copied())
-            .unwrap_or_default();
+        let work = disk.work.get(&group.hash).copied().unwrap_or_default();
         let share = Arc::new(WorkShare::new(Arc::clone(&self.demand), work));
         (share, download, reconstruct)
     }
@@ -2462,15 +2451,11 @@ impl<P: Provider + Clone> PullCtx<P> {
     ) -> GroupRun {
         let (share, download_bytes_of_blob, reconstruct_bytes_of_blob) =
             self.work_share(&group, fetch_plan, disk);
-        // The group's shared hash is carried explicitly; parse it once, and a bad
-        // hash fails every path in the group. Then wait for the group's jobs slot:
-        // every group of the run is in flight at once, and this is the cap.
-        let slot = match parse_hash(group.hash) {
-            Ok(h) => FetchSlot::acquire(&self.gate).await.map(|slot| (h, slot)),
-            Err(e) => Err(e),
-        };
-        let (hash, slot) = match slot {
-            Ok(ok) => ok,
+        let hash = group.hash;
+        // Wait for the group's jobs slot: every group of the run is in flight at
+        // once, and this is the cap.
+        let slot = match FetchSlot::acquire(&self.gate).await {
+            Ok(slot) => slot,
             Err(e) => {
                 return GroupRun::done(
                     group
@@ -2484,13 +2469,13 @@ impl<P: Provider + Clone> PullCtx<P> {
 
         // Every entry in the group shares this blob (same whole-file hash), so its
         // chunk decomposition is identical; take the first entry's hints. `None`
-        // (no `chunks`, an unparseable chunk hash, or chunk sizes that do not sum
-        // to the whole-file size) drops back to a plain whole-file fetch.
+        // (no `chunks`, or chunk sizes that do not sum to the whole-file size)
+        // drops back to a plain whole-file fetch.
         let first = group.entries.first();
         let hints = first.and_then(|e| hints_of(e));
         // A first entry that carries `chunks` but yields no usable hints had its
-        // hint set dropped by a fault — an unparseable chunk hash, or chunk sizes
-        // that do not sum to the whole-file size. Report the dropped hints so the
+        // hint set dropped by a fault: no whole-file `size` to check it against, or
+        // chunk sizes that do not sum to it. Report the dropped hints so the
         // outcome is not silent; the whole-file `hash` still fetches the blob.
         if let Some(e) = first
             && hints.is_none()
@@ -3476,8 +3461,8 @@ struct DonorRange {
 
 /// Turn an entry's optional chunk list into placed [`Hint`]s, or `None` when the
 /// entry should be fetched as a plain whole-file blob: no `chunks`, no whole-file
-/// `size` to validate against, an unparseable chunk hash, or chunk sizes that do
-/// not sum to the whole-file `size` (a malformed hint set, logged at debug). The
+/// `size` to validate against, or chunk sizes that do not sum to the whole-file
+/// `size` (a malformed hint set; a size mismatch is logged at debug). The
 /// whole-file `hash` is authoritative in every case, so ignoring hints only ever
 /// costs dedup, never correctness.
 fn hints_of(entry: &ManifestEntry) -> Option<Vec<Hint>> {
@@ -3486,9 +3471,8 @@ fn hints_of(entry: &ManifestEntry) -> Option<Vec<Hint>> {
     let mut hints = Vec::with_capacity(chunks.len());
     let mut offset = 0u64;
     for c in chunks {
-        let hash = parse_hash(&c.hash).ok()?;
         hints.push(Hint {
-            hash,
+            hash: c.hash,
             offset,
             len: c.size,
         });
@@ -3562,10 +3546,9 @@ struct FetchPlan {
 /// Build the run-level [`FetchPlan`]: assign every chunk shared by two or more entry
 /// positions to its smallest containing entry (tie-break by whole-file hash), so a
 /// shared chunk is fetched and paid for exactly once per run and spliced into every
-/// other entry that names it. An entry without usable hints or an unparseable
-/// whole-file hash takes no part. An entry with no declared `size` ranks as
-/// `u64::MAX`, so a sized sharer — the only kind that can be spliced from anyway —
-/// always wins the assignment.
+/// other entry that names it. An entry without usable hints takes no part. An entry
+/// with no declared `size` ranks as `u64::MAX`, so a sized sharer — the only kind
+/// that can be spliced from anyway — always wins the assignment.
 fn build_fetch_plan(entries: &[ManifestEntry]) -> FetchPlan {
     struct Occurrence {
         count: u32,
@@ -3574,9 +3557,6 @@ fn build_fetch_plan(entries: &[ManifestEntry]) -> FetchPlan {
     }
     let mut seen: HashMap<[u8; 32], Occurrence> = HashMap::new();
     for e in entries {
-        let Ok(whole) = parse_hash(&e.hash) else {
-            continue;
-        };
         let Some(hints) = hints_of(e) else {
             continue;
         };
@@ -3585,15 +3565,15 @@ fn build_fetch_plan(entries: &[ManifestEntry]) -> FetchPlan {
             seen.entry(h.hash)
                 .and_modify(|o| {
                     o.count = o.count.saturating_add(1);
-                    if (size, whole) < (o.best_size, o.best_whole) {
+                    if (size, e.hash) < (o.best_size, o.best_whole) {
                         o.best_size = size;
-                        o.best_whole = whole;
+                        o.best_whole = e.hash;
                     }
                 })
                 .or_insert(Occurrence {
                     count: 1,
                     best_size: size,
-                    best_whole: whole,
+                    best_whole: e.hash,
                 });
         }
     }
@@ -4157,13 +4137,13 @@ fn record_one(
     let chunks = en.chunks.as_ref().map(|cs| {
         cs.iter()
             .map(|c| skip_cache::SavedChunk {
-                hash: c.hash.clone(),
+                hash: format_hash(c.hash),
                 size: c.size,
             })
             .collect()
     });
     Some(skip_cache::SavedFile {
-        hash: en.hash.clone(),
+        hash: format_hash(en.hash),
         size: meta.len(),
         mtime,
         chunks,

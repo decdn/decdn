@@ -59,7 +59,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::Eip712Domain;
 use anyhow::Context as _;
 use bytes::Bytes;
-use decdn_client::bundle::{BundleManifest, parse_hash};
+use decdn_client::bundle::BundleManifest;
 use decdn_client::session::ChainConfig;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::{self, ClientFetchArgs, GatewayArgs};
@@ -77,7 +77,10 @@ use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
 
-use super::fetch::{BlobFetch, Credential, MAX_MANIFEST_BYTES, manifest_cap_mb, resolve_chain};
+use super::fetch::{
+    BlobFetch, Credential, MAX_MANIFEST_BYTES, manifest_cap_mb, manifest_parse_context,
+    resolve_chain,
+};
 use crate::known_chains;
 
 mod worker;
@@ -954,7 +957,9 @@ impl Gateway {
                     self.mark_spent(paying.signer.address()).await;
                 }
                 Err(PullError::NotManifest(e)) => {
-                    return text(StatusCode::NOT_FOUND, &format!("{e:#}\n"));
+                    let error = format!("{e:#}");
+                    tracing::info!(%error, host = %page_host, "a bundle URI names no manifest");
+                    return text(StatusCode::NOT_FOUND, &format!("{error}\n"));
                 }
                 Err(PullError::Other(e)) => {
                     return text(StatusCode::BAD_GATEWAY, &format!("{e:#}\n"));
@@ -964,7 +969,8 @@ impl Gateway {
     }
 
     /// One bundle entry, by its literal manifest path. A path the manifest
-    /// lacks, or an entry whose hash does not parse, answers 404.
+    /// lacks answers 404, and so does a blob that is not a manifest or a
+    /// malformed one ([`Self::manifest`]).
     async fn entry(
         self: &Arc<Self>,
         manifest_hash: [u8; 32],
@@ -979,19 +985,7 @@ impl Gateway {
                 &format!("the bundle has no entry {path:?}\n"),
             ));
         };
-        let hash = match parse_hash(&entry.hash) {
-            Ok(hash) => hash,
-            // A fixed property of the content-addressed manifest, not an
-            // upstream fault: every retry gets the same answer, so it
-            // answers 404, as a missing path does.
-            Err(e) => {
-                return Ok(text(
-                    StatusCode::NOT_FOUND,
-                    &format!("bundle entry {path:?} has a malformed hash: {e:#}\n"),
-                ));
-            }
-        };
-        self.stream(hash, namespace, paying, Some(path), entry.size)
+        self.stream(entry.hash, namespace, paying, Some(path), entry.size)
             .await
     }
 
@@ -1035,8 +1029,10 @@ impl Gateway {
             .get(hash)
     }
 
-    /// The bundle manifest `hash`, from the cache or pulled once. The pull
-    /// requests, and so pays for, at most the manifest cap.
+    /// The bundle manifest `hash`, from the cache or pulled. The pull requests,
+    /// and so pays for, at most the manifest cap. Only a blob that parses as a
+    /// manifest is cached: a blob that does not is pulled, and paid for, again
+    /// on every request.
     async fn manifest(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -1087,7 +1083,7 @@ impl Gateway {
         // The blob fits under the manifest cap, so it fits under the gateway's.
         let manifest = Arc::new(
             BundleManifest::parse(&bytes)
-                .with_context(|| format!("not a bundle manifest; {raw}"))
+                .map_err(|e| manifest_parse_context(e, format!("not a bundle manifest; {raw}")))
                 .map_err(PullError::NotManifest)?,
         );
         self.manifests

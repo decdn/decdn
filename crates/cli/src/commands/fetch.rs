@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
 use anyhow::Context as _;
-use decdn_client::bundle::BundleManifest;
+use decdn_client::bundle::{BundleManifest, MalformedManifest};
 use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, LaneSources};
@@ -76,9 +76,6 @@ use super::interrupt::{Interrupt, Interrupted, name_held_escrows};
 use super::tab_progress::TabProgress;
 use decdn_client::ordered_writes::OrderedWrites;
 
-/// Parse a manifest entry's BLAKE3 hash: 64 hex chars, optionally `0x`- or
-/// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
-pub(crate) use decdn_client::bundle::parse_hash;
 use decdn_client::uri::{DecdnUri, UriTarget};
 
 /// Build the blob `decdn get` delivery progress bar (#1118). Drawn to stderr and
@@ -476,6 +473,24 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 /// `decdn get decdn:<hash>/<path> -o -` read into memory.
 pub(crate) const MAX_MANIFEST_BYTES: usize = 64 << 20;
 
+/// The context of a [`MalformedManifest`] error: the raw blob is the same
+/// broken JSON, so only the publisher can fix it.
+pub(crate) const MALFORMED_MANIFEST: &str =
+    "the bundle's manifest is malformed; its publisher must publish a fixed manifest";
+
+/// The [`BundleManifest::parse`] error `err` with its context:
+/// [`MALFORMED_MANIFEST`] for a malformed manifest, else `not_a_manifest`.
+pub(crate) fn manifest_parse_context<C>(err: anyhow::Error, not_a_manifest: C) -> anyhow::Error
+where
+    C: std::fmt::Display + Send + Sync + 'static,
+{
+    if err.is::<MalformedManifest>() {
+        err.context(MALFORMED_MANIFEST)
+    } else {
+        err.context(not_a_manifest)
+    }
+}
+
 /// [`MAX_MANIFEST_BYTES`] in MiB, the unit of `--max-blob-mb`.
 pub(crate) const MAX_MANIFEST_MB: u64 = 64;
 
@@ -624,20 +639,23 @@ async fn fetch_entry_hash(
 
 /// The blob hash of the entry `path` in the bundle manifest `bytes`.
 fn entry_hash(bytes: &[u8], path: &str) -> anyhow::Result<[u8; 32]> {
-    let manifest = BundleManifest::parse(bytes).context(
-        "the URI's `/<path>` names a bundle entry, but this blob is not a bundle manifest; \
-         drop the path to fetch the raw blob",
-    )?;
-    let entry = manifest
+    let manifest = BundleManifest::parse(bytes).map_err(|e| {
+        manifest_parse_context(
+            e,
+            "the URI's `/<path>` names a bundle entry, but this blob is not a bundle manifest; \
+             drop the path to fetch the raw blob",
+        )
+    })?;
+    manifest
         .entries
         .iter()
         .find(|e| e.path == path)
+        .map(|e| e.hash)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "the bundle has no entry {path:?}; a URI path names one manifest `path` exactly"
             )
-        })?;
-    parse_hash(&entry.hash).with_context(|| format!("bundle entry {path:?} has a malformed hash"))
+        })
 }
 
 /// An in-memory [`Sink::Writer`] for a bundle manifest. It holds at most
