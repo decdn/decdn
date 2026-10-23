@@ -381,6 +381,7 @@ async fn test_gateway_with(
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
+        listen: "127.0.0.1:8484".parse().unwrap(),
     })
 }
 
@@ -696,6 +697,328 @@ async fn a_malformed_entry_hash_makes_the_bundle_not_found() {
         *caps.lock().unwrap(),
         [MAX_MANIFEST_MB; 3],
         "each request pulls only the manifest"
+    );
+}
+
+/// A response's status, headers and body as text.
+struct Answer {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: String,
+}
+
+impl Answer {
+    fn header(&self, name: header::HeaderName) -> Option<&str> {
+        self.headers.get(name).and_then(|v| v.to_str().ok())
+    }
+}
+
+/// `GET path` with `Host: host` and `headers`, and no token.
+async fn request(
+    gateway: &Arc<Gateway>,
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Answer {
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header(header::HOST, host);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let response = Arc::clone(gateway)
+        .handle(req.body(Full::new(Bytes::new())).unwrap())
+        .await;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    Answer {
+        status,
+        headers,
+        body: String::from_utf8(body.to_vec()).unwrap(),
+    }
+}
+
+/// The browser headers of the site's own subresource request.
+const SAME_ORIGIN: &[(&str, &str)] = &[
+    ("sec-fetch-site", "same-origin"),
+    ("sec-fetch-mode", "no-cors"),
+    ("sec-fetch-dest", "style"),
+];
+
+/// The browser headers of a typed URL.
+const TYPED: &[(&str, &str)] = &[
+    ("sec-fetch-site", "none"),
+    ("sec-fetch-mode", "navigate"),
+    ("sec-fetch-dest", "document"),
+];
+
+/// A link click on the site's own page.
+const CLICK: &[(&str, &str)] = &[
+    ("sec-fetch-site", "same-origin"),
+    ("sec-fetch-mode", "navigate"),
+    ("sec-fetch-dest", "document"),
+];
+
+const PAGE: [u8; 32] = [0xe1; 32];
+const STYLE: [u8; 32] = [0xe2; 32];
+const DOCS: [u8; 32] = [0xe3; 32];
+const OTHER: [u8; 32] = [0xcd; 32];
+
+/// A gateway serving [`BLOB`] as a site bundle with `index.html`,
+/// `css/site.css` and `docs/index.html`, the blob [`OTHER`], and the host of
+/// that site.
+async fn site_gateway() -> (Arc<Gateway>, String) {
+    let other = alloy::hex::encode(OTHER);
+    let manifest = serde_json::json!({"version": 1, "entries": [
+        {"path": "index.html", "hash": alloy::hex::encode(PAGE)},
+        {"path": "css/site.css", "hash": alloy::hex::encode(STYLE)},
+        {"path": "docs/index.html", "hash": alloy::hex::encode(DOCS)},
+    ]});
+    let page = format!(
+        "<!doctype html><link rel=stylesheet href=\"css/site.css\">\
+         <img src=\"decdn:{other}\"><a href=\"decdn:{other}/\">other</a>"
+    );
+    let replies = HashMap::from([
+        (BLOB, Reply::Bytes(manifest.to_string().into_bytes())),
+        (PAGE, Reply::Bytes(page.into_bytes())),
+        (
+            STYLE,
+            Reply::Bytes(format!("a {{ background: url(decdn:{other}) }}").into_bytes()),
+        ),
+        (DOCS, Reply::Bytes(b"<p>docs</p>".to_vec())),
+        (OTHER, Reply::Bytes(b"other bytes".to_vec())),
+    ]);
+    let (gateway, _) = recording_gateway_of(replies, &[]).await;
+    let host = Site {
+        hash: BLOB,
+        namespace: None,
+    }
+    .host();
+    (gateway, format!("{host}:8484"))
+}
+
+#[tokio::test]
+async fn a_site_serves_its_index_as_html_with_uris_rewritten() {
+    let (gateway, host) = site_gateway().await;
+    let other = alloy::hex::encode(OTHER);
+    let page = request(&gateway, &host, "/", TYPED).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert_eq!(
+        page.header(header::CONTENT_TYPE),
+        Some("text/html; charset=utf-8")
+    );
+    assert!(
+        page.body.contains(&format!("src=\"/_decdn/{other}\"")),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains(&format!("href=\"/_decdn/{other}/\"")),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("decdn:"), "{}", page.body);
+    assert!(!page.body.contains("8484"), "{}", page.body);
+    assert_eq!(page.header(header::CONTENT_LENGTH), None);
+    let policy = page.header(header::CONTENT_SECURITY_POLICY).unwrap();
+    assert!(policy.starts_with("default-src 'self'"), "{policy}");
+
+    let style = request(&gateway, &host, "/css/site.css", SAME_ORIGIN).await;
+    assert_eq!(style.status, StatusCode::OK);
+    assert_eq!(
+        style.header(header::CONTENT_TYPE),
+        Some("text/css; charset=utf-8")
+    );
+    assert_eq!(
+        style.body,
+        format!("a {{ background: url(/_decdn/{other}) }}")
+    );
+}
+
+#[tokio::test]
+async fn a_site_directory_serves_its_index() {
+    let (gateway, host) = site_gateway().await;
+    let docs = request(&gateway, &host, "/docs/", CLICK).await;
+    assert_eq!(
+        (docs.status, docs.body.as_str()),
+        (StatusCode::OK, "<p>docs</p>")
+    );
+    let bare = request(&gateway, &host, "/docs", CLICK).await;
+    assert_eq!(bare.status, StatusCode::FOUND);
+    assert_eq!(bare.header(header::LOCATION), Some("docs/"));
+    let missing = request(&gateway, &host, "/nope.html", CLICK).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    assert!(
+        missing
+            .headers
+            .contains_key(header::CONTENT_SECURITY_POLICY)
+    );
+}
+
+#[tokio::test]
+async fn decdn_paths_serve_a_pages_requests_and_redirect_its_navigation() {
+    let (gateway, host) = site_gateway().await;
+    let other = alloy::hex::encode(OTHER);
+    let image = request(&gateway, &host, &format!("/_decdn/{other}"), SAME_ORIGIN).await;
+    assert_eq!(
+        (image.status, image.body.as_str()),
+        (StatusCode::OK, "other bytes")
+    );
+
+    let other_site = Site {
+        hash: OTHER,
+        namespace: Some(7),
+    }
+    .host();
+    let link = request(
+        &gateway,
+        &host,
+        &format!("/_decdn/{other}/a%20b.html?ns=7"),
+        CLICK,
+    )
+    .await;
+    assert_eq!(link.status, StatusCode::FOUND);
+    assert_eq!(
+        link.header(header::LOCATION),
+        Some(format!("http://{other_site}:8484/a%20b.html").as_str())
+    );
+
+    let download = request(&gateway, &host, &format!("/_decdn/{other}"), CLICK).await;
+    assert_eq!(download.status, StatusCode::OK);
+    assert!(
+        download
+            .header(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .starts_with("attachment"),
+    );
+}
+
+#[tokio::test]
+async fn other_pages_cannot_make_a_site_spend() {
+    let (gateway, host) = site_gateway().await;
+    let image = [
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "no-cors"),
+        ("sec-fetch-dest", "image"),
+    ];
+    let frame = [
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "iframe"),
+    ];
+    for headers in [&image[..], &frame[..]] {
+        let answer = request(&gateway, &host, "/", headers).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN, "{headers:?}");
+    }
+    let link = [
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ];
+    let deep = request(&gateway, &host, "/docs/", &link).await;
+    assert_eq!(
+        deep.status,
+        StatusCode::OK,
+        "a link opens a site at any path"
+    );
+    let script = request(&gateway, &host, "/", &[]).await;
+    assert_eq!(script.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_site_answers_no_gateway_api_and_a_bad_site_host_is_refused() {
+    let (gateway, host) = site_gateway().await;
+    for path in ["/_delegate", "/_capability"] {
+        let answer = request(&gateway, &host, path, TYPED).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    let answer = request(&gateway, "127.0.0.1:8484", "/_delegate", &[]).await;
+    assert_eq!(
+        answer.status,
+        StatusCode::FORBIDDEN,
+        "the bare origin answers it"
+    );
+    for bad in [
+        format!("1{}", &host[1..]),
+        host.replace("8484", "8485"),
+        "evil.example:8484".to_owned(),
+    ] {
+        let answer = request(&gateway, &bad, "/", TYPED).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn a_site_without_an_index_lists_its_entries_relatively() {
+    let manifest = serde_json::json!({"version": 1, "entries": [
+        {"path": "a b.txt", "hash": alloy::hex::encode([0xe0; 32])},
+    ]});
+    let (gateway, _) =
+        recording_gateway(Reply::Bytes(manifest.to_string().into_bytes()), &[]).await;
+    let host = format!(
+        "{}:8484",
+        Site {
+            hash: BLOB,
+            namespace: None
+        }
+        .host()
+    );
+    let list = request(&gateway, &host, "/", TYPED).await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert!(list.body.contains("href=\"./a%20b.txt\""), "{}", list.body);
+}
+
+#[tokio::test]
+async fn the_bare_origin_opens_a_bundle_as_its_site_without_the_token() {
+    let gateway = test_gateway().await;
+    let blob = alloy::hex::encode(BLOB);
+    let site = Site {
+        hash: BLOB,
+        namespace: Some(3),
+    }
+    .host();
+    let answer = request(&gateway, "127.0.0.1:8484", &format!("/{blob}/?ns=3"), TYPED).await;
+    assert_eq!(answer.status, StatusCode::FOUND);
+    assert_eq!(
+        answer.header(header::LOCATION),
+        Some(format!("http://{site}:8484/").as_str())
+    );
+    let answer = request(&gateway, "127.0.0.1:8484", &format!("/{blob}"), TYPED).await;
+    assert_eq!(
+        answer.status,
+        StatusCode::UNAUTHORIZED,
+        "a blob has no site"
+    );
+}
+
+#[tokio::test]
+async fn the_bare_origin_still_serves_markup_as_text() {
+    let (gateway, _) = site_gateway().await;
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{}/index.html", alloy::hex::encode(BLOB)))
+        .header(header::HOST, "127.0.0.1:8484")
+        .header(TOKEN_HEADER, TEST_TOKEN)
+        .header(HOST_HEADER, "decdn.org")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = Arc::clone(&gateway).handle(req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/plain; charset=utf-8"
+    );
+    assert!(
+        !response
+            .headers()
+            .contains_key(header::CONTENT_SECURITY_POLICY)
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        String::from_utf8_lossy(&body).contains("decdn:"),
+        "not rewritten"
     );
 }
 

@@ -375,6 +375,10 @@ mime_guess = "2"
 # page's wildcard scope over a public suffix, from the Public Suffix List
 # compiled into the crate.
 psl = "2"
+# `decdn gateway` names a site origin by its bundle hash in lowercase base32.
+data-encoding = "2"
+# `decdn gateway` rewrites `decdn:` URIs in a site's HTML as it streams it.
+lol_html = "3"
 
 # Raw socket options for the loopback control-plane listeners (admin RPC +
 # metrics): `SO_REUSEADDR` so the daemon rebinds its fixed ports immediately

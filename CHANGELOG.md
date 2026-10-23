@@ -4089,6 +4089,20 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: `decdn gateway` serves every bundle as a website on its own origin
+  (#2457).** `http://[<ns>.]<hash32>.localhost:<port>/` (`<hash32>` is the
+  manifest hash in lowercase unpadded base32) serves the bundle's
+  `index.html`, its entries by path, and a directory's `index.html`, with
+  HTML, CSS and scripts as themselves under a policy that confines the page
+  to its origin. It works in a plain browser: `Sec-Fetch-*` lets the site's
+  own requests, typed URLs and top-level navigation spend, refuses every
+  other cross-origin request, and pays with the capability covering the
+  site's host, `*` included. A site's `decdn:` URIs in HTML attributes,
+  `<style>` and CSS are rewritten as they stream to `/_decdn/<hash>…` on the
+  site's origin, which serves the page's requests and redirects a navigation
+  to the other bundle's site. A tokenless `GET /<hash>/[<path>]` on the
+  gateway origin redirects to the site.
+
 - **Client: `Streamer::open_range` streams one verified byte window (#2607).**
   A caller that knows a blob's size opens a consumption-paced stream over
   `[offset, offset + len)` instead of the whole blob. The fetch opens, and
