@@ -44,7 +44,9 @@ const URL_ATTRIBUTES: &[&str] = &[
 
 /// A streaming rewrite of one response body.
 pub(super) enum Rewrite {
+    /// A `text/html` body, through `lol_html`.
     Html(Box<HtmlRewrite>),
+    /// A `text/css` body, scanned as bytes.
     Css(CssRewrite),
 }
 
