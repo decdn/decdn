@@ -129,6 +129,7 @@ async fn run_acquire_with<S: BlobSource>(
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
+            bounded: false,
             store,
             hash: root,
             total_bytes: total,
@@ -2820,6 +2821,7 @@ async fn acquire_bounded<St: crate::source::IngestStore>(
         run: None,
     };
     let target = AcquireTarget {
+        bounded: false,
         store,
         hash: root,
         total_bytes: total,
@@ -3422,6 +3424,7 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
     let gate = recovery_gate();
     let err = acquire(
         AcquireTarget {
+            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -3467,6 +3470,7 @@ async fn acquire_under<S: BlobSource>(
     let stop = StopPolicy::new(false, Some(Duration::from_hours(1)), Arc::default());
     acquire(
         AcquireTarget {
+            bounded: false,
             store,
             hash: root,
             total_bytes: total,
@@ -3951,6 +3955,7 @@ async fn a_partial_holder_refusing_an_uncovered_block_is_barred_from_it() -> any
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
+            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -4031,6 +4036,7 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
+            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -4456,6 +4462,7 @@ async fn acquire_with_late_builds_halted(
         run: None,
     };
     let target = AcquireTarget {
+        bounded: false,
         store: &store,
         hash: root,
         total_bytes: total,
@@ -4805,6 +4812,7 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
+            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -4863,6 +4871,7 @@ async fn a_refill_a_later_lane_build_made_raises_the_running_lanes() -> anyhow::
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
+            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -4925,6 +4934,7 @@ async fn a_lane_built_on_a_lower_deposit_never_lowers_the_running_lanes() -> any
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
+            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -4971,6 +4981,7 @@ async fn an_empty_set_discovers_its_holders_and_completes() -> anyhow::Result<()
     let gate = recovery_gate();
     acquire(
         AcquireTarget {
+            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5011,6 +5022,7 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
     let mib = 1024 * 1024;
     acquire(
         AcquireTarget {
+            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -5498,6 +5510,7 @@ async fn acquire_capped_into(
     let gate = recovery_gate();
     let result = acquire(
         AcquireTarget {
+            bounded: false,
             store,
             hash: root,
             total_bytes: u64::try_from(data.len())?,
@@ -5960,6 +5973,7 @@ async fn acquire_over<P: crate::SourceProvider>(
     let whole = [(0, total)];
     acquire(
         AcquireTarget {
+            bounded: false,
             store,
             hash: root,
             total_bytes: total,
@@ -6500,6 +6514,7 @@ async fn a_queue_one_lane_drains_grows_an_extra_stream() -> anyhow::Result<()> {
     let runs: Vec<(u64, u64)> = (0..6).map(|i| (i * 2 * MIB, MIB)).collect();
     acquire(
         AcquireTarget {
+            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -7043,6 +7058,7 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
     };
     let fetch = acquire(
         AcquireTarget {
+            bounded: false,
             store: &store,
             hash: root,
             total_bytes: total,
@@ -7251,6 +7267,7 @@ async fn acquire_delegated_in_run(
     let gate = RecoveryGate::with_settle(Duration::ZERO);
     acquire(
         AcquireTarget {
+            bounded: false,
             store,
             hash: root,
             total_bytes: total,

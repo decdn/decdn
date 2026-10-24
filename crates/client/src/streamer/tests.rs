@@ -1011,11 +1011,12 @@ async fn a_cached_window_is_served_without_fetching() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A bounded window that reaches a size claim too small for the blob is a
-/// tail: the stream follows the proven size and the drive ends with it,
-/// instead of fetching past a reader that stopped at the window's end.
+/// A bounded window past a size claim too small for the blob is clipped to
+/// the claim: the fetch takes nothing past the end of the blob as the caller
+/// knows it, and the stream ends with an error naming the shortfall, never
+/// following the blob past a reader that stopped.
 #[tokio::test]
-async fn a_window_reaching_a_short_claim_ends_with_the_proven_size() -> anyhow::Result<()> {
+async fn a_window_past_a_short_claim_is_clipped_to_it() -> anyhow::Result<()> {
     let blob = payload(3 * 1024 * 1024 + 777);
     let (source, ledger) = paying_source(blob.clone())?;
     let claim = 2 * 1024 * 1024 + 100;
@@ -1026,6 +1027,7 @@ async fn a_window_reaching_a_short_claim_ends_with_the_proven_size() -> anyhow::
         read_ahead_bytes: 1,
         ..PullConfig::default()
     };
+    let probe = source.clone();
     let got = tokio::time::timeout(
         Duration::from_secs(20),
         drain_range(
@@ -1038,11 +1040,18 @@ async fn a_window_reaching_a_short_claim_ends_with_the_proven_size() -> anyhow::
         ),
     )
     .await
-    .context("the stream and its drive end")??;
-    let want = blob
-        .get(usize::try_from(offset)?..)
-        .context("offset inside the blob")?;
-    anyhow::ensure!(got == want, "{} of {} tail bytes", got.len(), want.len());
+    .context("the stream and its drive end")?;
+    let err = match got {
+        Ok(bytes) => anyhow::bail!("{} bytes past the claim were streamed", bytes.len()),
+        Err(err) => format!("{err:#}"),
+    };
+    anyhow::ensure!(err.contains("bytes readable"), "{err}");
+    for &(start, fetch_len) in &probe.opened_ranges() {
+        anyhow::ensure!(
+            start + fetch_len <= claim,
+            "leg ({start}, {fetch_len}) runs past the claim"
+        );
+    }
     Ok(())
 }
 
@@ -1115,5 +1124,46 @@ async fn a_whole_blob_window_streams_the_whole_blob() -> anyhow::Result<()> {
     )
     .await?;
     anyhow::ensure!(got == blob, "the whole-blob window must be the blob");
+    Ok(())
+}
+
+/// A window that ends exactly where the cap on held bytes puts the store's
+/// bound is still a bounded window: the fetch takes it and stops, instead of
+/// following the bound past the cap and failing.
+#[tokio::test]
+async fn a_window_ending_at_the_cap_stays_bounded() -> anyhow::Result<()> {
+    let blob = payload(6 * 1024 * 1024 + 99);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let root = source.root();
+    let total = source.total_bytes();
+    let probe = source.clone();
+    let cap = 1024 * 1024;
+    let (offset, len) = (2 * 1024 * 1024, cap);
+    let scratch = tempfile::tempdir()?;
+    let streamer =
+        streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?.max_blob_bytes(cap);
+    let (mut reader, mut drive) = streamer
+        .open_range(
+            root,
+            total,
+            (offset, len),
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    drive.alongside(reader.read_to_end(&mut out)).await?;
+    drive.finish().await?;
+    let want = blob
+        .get(usize::try_from(offset)?..usize::try_from(offset + len)?)
+        .context("window inside the blob")?;
+    anyhow::ensure!(out == want, "{} of {} window bytes", out.len(), want.len());
+    for &(start, fetch_len) in &probe.opened_ranges() {
+        anyhow::ensure!(
+            start + fetch_len <= offset + len,
+            "leg ({start}, {fetch_len}) runs past the window's end"
+        );
+    }
     Ok(())
 }

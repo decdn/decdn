@@ -304,12 +304,13 @@ where
         pacing_wait: &wait,
     };
     let mut sources = SourceSet::new(&provider, hash, health, holders);
-    // A window ending before the bound is one range; a tail (no end) follows
-    // the bound as the fetch proves the size.
+    // A window is one exact range; a tail (no end) follows the bound as the
+    // fetch proves the size.
     let ranges = [(
         state.start,
         state.end.map_or(0, |end| end.saturating_sub(state.start)),
     )];
+    let bounded = state.end.is_some();
     // Under consumption pacing `acquire` turns its lane watchdog off: a lane
     // parked on the consumer cursor is waiting, not stalled. A genuinely silent
     // source trips its own per-stream idle window mid-read instead.
@@ -334,6 +335,7 @@ where
             hash,
             total_bytes: state.hint,
             ranges: &ranges,
+            bounded,
         },
         &mut sources,
         &env,
@@ -559,20 +561,22 @@ where
 
     /// Open a consumption-paced stream over the byte window
     /// `[offset, offset + len)` of `hash`, as [`Self::open`] does for the whole
-    /// blob. `window` is `(offset, len)`; a window that reaches `total_bytes`,
-    /// or has a `len` of `0`, is a tail from `offset` to the size a leg proves,
-    /// and `(0, 0)` is the whole blob.
+    /// blob. `window` is `(offset, len)`; a `len` of `0` is a tail from
+    /// `offset` to the size a leg proves, and `(0, 0)` is the whole blob.
     ///
     /// The fetch opens, and pays for, the chunk-group-aligned span around the
     /// window and nothing outside it (ADR 038: any aligned range verifies alone
     /// against the root). The [`VerifiedReader`] hands out exactly the window,
-    /// so an HTTP `Range` maps onto it with no trimming. A window is never teed
-    /// to `cache`, since a revisit is served the whole blob; a cache that holds
-    /// exactly the window serves it with no fetch.
+    /// so an HTTP `Range` maps onto it with no trimming; a window past the size
+    /// a leg proves ends there. A window is never teed to `cache`, since a
+    /// revisit is served the whole blob; a cache that holds exactly the window
+    /// serves it with no fetch.
     ///
-    /// `total_bytes` is a claim. A window whose offset lies past the blob's
-    /// real size, under a claim that overstated it, ends with the fetch's
-    /// error from the reader, as no leg can verify it.
+    /// `total_bytes` is the end of the blob as the caller knows it. A window
+    /// past it is clipped to it, and the stream then ends with an error naming
+    /// the shortfall; a window whose offset lies past the blob's real size,
+    /// under a claim that overstated it, ends with the fetch's error, as no
+    /// leg can verify it.
     ///
     /// # Errors
     ///
@@ -597,11 +601,7 @@ where
             offset == 0 || offset < total_bytes,
             "stream window starts at byte {offset} of a {total_bytes}-byte blob"
         );
-        // A window that reaches the claim is a tail: it follows the size the
-        // fetch proves, as the fetch itself does, so the reader never stops
-        // short of a drive that keeps filling.
-        let end = (len > 0 && offset.saturating_add(len) < total_bytes)
-            .then(|| offset.saturating_add(len));
+        let end = (len > 0).then(|| offset.saturating_add(len));
         let want = end.map_or(total_bytes.saturating_sub(offset), |end| end - offset);
         if let Some(cached) = cache.get(hash, offset, want).await?
             && u64::try_from(cached.len()).is_ok_and(|cached_len| cached_len == want)
