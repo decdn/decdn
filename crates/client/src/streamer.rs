@@ -414,6 +414,8 @@ pub struct Streamer<'a, P, F> {
     /// kept, so a temporary directory is the usual choice. The `.partial` grows
     /// to the whole blob as the stream advances (a window's `.partial` is
     /// sparse outside the window), so the directory needs room for all of it.
+    /// The store is named by the blob's hash, so two streams of one blob in one
+    /// directory would share it: give each stream its own directory.
     scratch: &'a Path,
     /// The largest blob accepted, in bytes, or `0` for no cap
     /// ([`Self::max_blob_bytes`]).
@@ -485,9 +487,11 @@ impl<'a, P, F> Streamer<'a, P, F> {
         self
     }
 
-    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim above
-    /// the cap is clamped to it before the fill store is sized, and a blob that
-    /// holds bytes past the cap ends the stream with [`crate::BlobTooLarge`]
+    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim past
+    /// what the window can reach under the cap (the cap itself for the whole
+    /// blob, the window's offset plus the cap otherwise) is clamped before the
+    /// fill store is sized, and a blob that holds bytes past the cap ends the
+    /// stream with [`crate::BlobTooLarge`]
     /// ([`crate::AcquireEnv::max_blob_bytes`]).
     #[must_use]
     pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
@@ -555,22 +559,26 @@ where
 
     /// Open a consumption-paced stream over the byte window
     /// `[offset, offset + len)` of `hash`, as [`Self::open`] does for the whole
-    /// blob. `window` is `(offset, len)`; a `len` of `0` is a tail, from `offset`
-    /// to the size a leg proves, and `(0, 0)` is the whole blob.
+    /// blob. `window` is `(offset, len)`; a window that reaches `total_bytes`,
+    /// or has a `len` of `0`, is a tail from `offset` to the size a leg proves,
+    /// and `(0, 0)` is the whole blob.
     ///
     /// The fetch opens, and pays for, the chunk-group-aligned span around the
     /// window and nothing outside it (ADR 038: any aligned range verifies alone
     /// against the root). The [`VerifiedReader`] hands out exactly the window,
-    /// so an HTTP `Range` maps onto it with no trimming. A window that reaches
-    /// past the proven size ends there. A window is never teed to `cache`, since
-    /// a revisit is served the whole blob; a whole-blob cache hit serves the
-    /// window from the cache.
+    /// so an HTTP `Range` maps onto it with no trimming. A window is never teed
+    /// to `cache`, since a revisit is served the whole blob; a cache that holds
+    /// exactly the window serves it with no fetch.
+    ///
+    /// `total_bytes` is a claim. A window whose offset lies past the blob's
+    /// real size, under a claim that overstated it, ends with the fetch's
+    /// error from the reader, as no leg can verify it.
     ///
     /// # Errors
     ///
-    /// A window that starts at or past `total_bytes` (the caller knows the size
-    /// and answers "not satisfiable" before any fetch), plus everything
-    /// [`Self::open`] lists.
+    /// A window that starts past `0` and at or past `total_bytes` (the caller
+    /// knows the size and answers "not satisfiable" before any fetch), plus
+    /// everything [`Self::open`] lists.
     pub async fn open_range<'a>(
         self,
         hash: [u8; 32],
@@ -586,17 +594,23 @@ where
     {
         let (offset, len) = window;
         anyhow::ensure!(
-            total_bytes == 0 || offset < total_bytes,
+            offset == 0 || offset < total_bytes,
             "stream window starts at byte {offset} of a {total_bytes}-byte blob"
         );
-        let end = (len > 0).then(|| offset.saturating_add(len));
-        if let Some(cached) = cache.get(hash, 0, total_bytes).await?
-            && u64::try_from(cached.len()).is_ok_and(|cached_len| cached_len == total_bytes)
+        // A window that reaches the claim is a tail: it follows the size the
+        // fetch proves, as the fetch itself does, so the reader never stops
+        // short of a drive that keeps filling.
+        let end = (len > 0 && offset.saturating_add(len) < total_bytes)
+            .then(|| offset.saturating_add(len));
+        let want = end.map_or(total_bytes.saturating_sub(offset), |end| end - offset);
+        if let Some(cached) = cache.get(hash, offset, want).await?
+            && u64::try_from(cached.len()).is_ok_and(|cached_len| cached_len == want)
         {
-            let slice_end = end.map_or(total_bytes, |end| end.min(total_bytes));
-            let data = cached.slice(usize::try_from(offset)?..usize::try_from(slice_end)?);
             return Ok((
-                VerifiedReader::Cached { data, pos: 0 },
+                VerifiedReader::Cached {
+                    data: cached,
+                    pos: 0,
+                },
                 StreamDrive {
                     fetch: None,
                     state: None,
@@ -874,7 +888,7 @@ async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Optio
             Some(Ok(())) => {
                 return Err(io::Error::other(format!(
                     "stream fetch finished with {cursor} of {} bytes readable",
-                    state.store.bound()
+                    limit.unwrap_or_else(|| state.store.bound())
                 )));
             }
             None => {}

@@ -6,7 +6,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use bytes::Bytes;
-use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE, encode_verified_range};
+use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, align_range, encode_verified_range};
 use tokio::io::AsyncReadExt;
 
 use super::{StreamCandidate, Streamer, VerifiedReader};
@@ -121,13 +121,29 @@ async fn drain(
     cache: Arc<dyn BlobCache>,
     config: &PullConfig,
 ) -> anyhow::Result<Vec<u8>> {
-    let root = source.root();
     let total = source.total_bytes();
+    drain_range(source, ledger, total, (0, 0), cache, config).await
+}
+
+/// Open a stream over `source` for `window` with the given `claim` and drain
+/// it, then finish the drive.
+async fn drain_range(
+    source: ScriptedSource,
+    ledger: Arc<PoolLedger>,
+    claim: u64,
+    window: (u64, u64),
+    cache: Arc<dyn BlobCache>,
+    config: &PullConfig,
+) -> anyhow::Result<Vec<u8>> {
+    let root = source.root();
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
-    let (mut reader, mut drive) = streamer.open(root, total, config, cache, stop()).await?;
+    let (mut reader, mut drive) = streamer
+        .open_range(root, claim, window, config, cache, stop())
+        .await?;
     let mut out = Vec::new();
     drive.alongside(reader.read_to_end(&mut out)).await?;
+    drive.finish().await?;
     Ok(out)
 }
 
@@ -795,33 +811,11 @@ async fn finish_after_a_clean_stream_is_ok() -> anyhow::Result<()> {
     drive.finish().await
 }
 
-/// The chunk-group-aligned span `[align_down(offset), align_up(offset + len))`
-/// a window's legs may open and pay for (ADR 038).
-fn aligned_span(offset: u64, len: u64) -> (u64, u64) {
-    let start = offset / CHUNK_GROUP_BYTES * CHUNK_GROUP_BYTES;
-    let end = (offset + len).div_ceil(CHUNK_GROUP_BYTES) * CHUNK_GROUP_BYTES;
-    (start, end)
-}
-
-/// Open a range stream over `source` for `window` with the given `claim` and
-/// drain it.
-async fn drain_range(
-    source: ScriptedSource,
-    ledger: Arc<PoolLedger>,
-    claim: u64,
-    window: (u64, u64),
-    cache: Arc<dyn BlobCache>,
-) -> anyhow::Result<Vec<u8>> {
-    let root = source.root();
-    let scratch = tempfile::tempdir()?;
-    let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
-    let (mut reader, mut drive) = streamer
-        .open_range(root, claim, window, &PullConfig::default(), cache, stop())
-        .await?;
-    let mut out = Vec::new();
-    drive.alongside(reader.read_to_end(&mut out)).await?;
-    drive.finish().await?;
-    Ok(out)
+/// The chunk-group-aligned span a window's legs may open and pay for (ADR
+/// 038), as `(start, end)`.
+fn aligned_span(offset: u64, len: u64, total: u64) -> anyhow::Result<(u64, u64)> {
+    let aligned = align_range(offset, len, total)?;
+    Ok((aligned.fetch_start(), aligned.fetch_end()))
 }
 
 /// A range stream hands out exactly the requested byte window, however the
@@ -832,7 +826,15 @@ async fn a_range_stream_yields_exactly_the_window() -> anyhow::Result<()> {
     let (source, ledger) = paying_source(blob.clone())?;
     let total = source.total_bytes();
     let (offset, len) = (1_000_001u64, 500_000u64);
-    let got = drain_range(source, ledger, total, (offset, len), Arc::new(NoCache)).await?;
+    let got = drain_range(
+        source,
+        ledger,
+        total,
+        (offset, len),
+        Arc::new(NoCache),
+        &PullConfig::default(),
+    )
+    .await?;
     let want = blob
         .get(usize::try_from(offset)?..usize::try_from(offset + len)?)
         .context("window inside the blob")?;
@@ -861,9 +863,10 @@ async fn a_range_stream_opens_only_the_aligned_span() -> anyhow::Result<()> {
         total,
         (offset, len),
         Arc::new(NoCache),
+        &PullConfig::default(),
     )
     .await?;
-    let (span_start, span_end) = aligned_span(offset, len);
+    let (span_start, span_end) = aligned_span(offset, len, total)?;
     let opened = probe.opened_ranges();
     anyhow::ensure!(!opened.is_empty(), "the window was fetched");
     for &(start, fetch_len) in &opened {
@@ -892,7 +895,15 @@ async fn a_tail_window_follows_the_proven_size() -> anyhow::Result<()> {
     let (source, ledger) = paying_source(blob.clone())?;
     let offset = 2 * 1024 * 1024 + 5;
     let claim = 2 * 1024 * 1024 + 100;
-    let got = drain_range(source, ledger, claim, (offset, 0), Arc::new(NoCache)).await?;
+    let got = drain_range(
+        source,
+        ledger,
+        claim,
+        (offset, 0),
+        Arc::new(NoCache),
+        &PullConfig::default(),
+    )
+    .await?;
     let want = blob
         .get(usize::try_from(offset)?..)
         .context("offset inside the blob")?;
@@ -908,7 +919,15 @@ async fn a_window_past_the_end_stops_at_the_proven_size() -> anyhow::Result<()> 
     let (source, ledger) = paying_source(blob.clone())?;
     let total = source.total_bytes();
     let offset = total - 100;
-    let got = drain_range(source, ledger, total, (offset, 10_000), Arc::new(NoCache)).await?;
+    let got = drain_range(
+        source,
+        ledger,
+        total,
+        (offset, 10_000),
+        Arc::new(NoCache),
+        &PullConfig::default(),
+    )
+    .await?;
     let want = blob
         .get(usize::try_from(offset)?..)
         .context("offset inside the blob")?;
@@ -949,18 +968,23 @@ async fn a_window_past_the_claim_is_refused_at_open() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A whole-blob cache hit serves a window straight from the cache, without
-/// opening the source.
+/// A cache that holds the window serves it straight from the cache, without
+/// opening the source: the stream asks the cache for exactly the window.
 #[tokio::test]
-async fn a_cached_whole_blob_serves_a_window_slice() -> anyhow::Result<()> {
+async fn a_cached_window_is_served_without_fetching() -> anyhow::Result<()> {
     let blob = payload(600_000);
     let (source, ledger) = paying_source(blob.clone())?;
     let root = source.root();
     let total = source.total_bytes();
     let probe = source.clone();
-    let cache = Arc::new(MemoryBlobCache::new());
-    cache.put(root, 0, Bytes::from(blob.clone())).await?;
     let (offset, len) = (123_456u64, 70_000u64);
+    let window = blob
+        .get(usize::try_from(offset)?..usize::try_from(offset + len)?)
+        .context("window inside the blob")?;
+    let cache = Arc::new(MemoryBlobCache::new());
+    cache
+        .put(root, offset, Bytes::copy_from_slice(window))
+        .await?;
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
     let (mut reader, mut drive) = streamer
@@ -987,6 +1011,69 @@ async fn a_cached_whole_blob_serves_a_window_slice() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A bounded window that reaches a size claim too small for the blob is a
+/// tail: the stream follows the proven size and the drive ends with it,
+/// instead of fetching past a reader that stopped at the window's end.
+#[tokio::test]
+async fn a_window_reaching_a_short_claim_ends_with_the_proven_size() -> anyhow::Result<()> {
+    let blob = payload(3 * 1024 * 1024 + 777);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let claim = 2 * 1024 * 1024 + 100;
+    let offset = 2 * 1024 * 1024 + 5;
+    // The smallest read-ahead window, so a drive that outruns a stopped
+    // reader parks on it instead of finishing within the window.
+    let config = PullConfig {
+        read_ahead_bytes: 1,
+        ..PullConfig::default()
+    };
+    let got = tokio::time::timeout(
+        Duration::from_secs(20),
+        drain_range(
+            source,
+            ledger,
+            claim,
+            (offset, 1_000),
+            Arc::new(NoCache),
+            &config,
+        ),
+    )
+    .await
+    .context("the stream and its drive end")??;
+    let want = blob
+        .get(usize::try_from(offset)?..)
+        .context("offset inside the blob")?;
+    anyhow::ensure!(got == want, "{} of {} tail bytes", got.len(), want.len());
+    Ok(())
+}
+
+/// A window needs a size: only offset `0` opens against a zero claim (the
+/// empty blob, or a stream that learns the size from its first leg).
+#[tokio::test]
+async fn a_window_past_zero_needs_a_size_claim() -> anyhow::Result<()> {
+    let blob = payload(100_000);
+    let (source, ledger) = paying_source(blob)?;
+    let root = source.root();
+    let probe = source.clone();
+    let scratch = tempfile::tempdir()?;
+    let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
+    let opened = streamer
+        .open_range(
+            root,
+            0,
+            (4_096, 1_000),
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await;
+    anyhow::ensure!(opened.is_err(), "a deep window with no size must not open");
+    anyhow::ensure!(
+        probe.opened_ranges().is_empty(),
+        "nothing is fetched for it"
+    );
+    Ok(())
+}
+
 /// A range stream never tees its bytes to the cache: a window is not the
 /// whole blob a revisit would be served.
 #[tokio::test]
@@ -1002,6 +1089,7 @@ async fn a_range_stream_is_never_teed_to_the_cache() -> anyhow::Result<()> {
         total,
         (4_096, 300_000),
         Arc::clone(&cache) as Arc<dyn BlobCache>,
+        &PullConfig::default(),
     )
     .await?;
     anyhow::ensure!(
@@ -1017,7 +1105,15 @@ async fn a_whole_blob_window_streams_the_whole_blob() -> anyhow::Result<()> {
     let blob = payload(1_500_000);
     let (source, ledger) = paying_source(blob.clone())?;
     let total = source.total_bytes();
-    let got = drain_range(source, ledger, total, (0, 0), Arc::new(NoCache)).await?;
+    let got = drain_range(
+        source,
+        ledger,
+        total,
+        (0, 0),
+        Arc::new(NoCache),
+        &PullConfig::default(),
+    )
+    .await?;
     anyhow::ensure!(got == blob, "the whole-blob window must be the blob");
     Ok(())
 }
