@@ -1283,7 +1283,12 @@ impl Gateway {
                     hf::not_found(response.headers_mut(), hf::REVISION_NOT_FOUND, None);
                     return response;
                 }
-                hf::HfPath::Entry(entry) => {
+                hf::HfPath::Entry { entry, main } => {
+                    // The metadata request names the bundle it answered for,
+                    // so the download that follows is that bundle's or 404.
+                    if head && main {
+                        return redirect(&hf::pinned(&entry, &site.hash));
+                    }
                     let entry = format!("/{entry}");
                     let mut response = if head {
                         self.head_site(&site, &entry, pointer, Present::Download)

@@ -27,16 +27,37 @@ fn resolve_paths_name_their_entry() {
             "org/repo/dir/sub/file",
         ),
         ("/org/repo/resolve/main/a%20b.txt", "org/repo/a%20b.txt"),
+        (
+            "/spaces/org/demo/resolve/main/index.html",
+            "spaces/org/demo/index.html",
+        ),
+        // The delimiter comes after the repo id, so a repo named `resolve`
+        // is a repo.
+        ("/org/resolve/resolve/main/f.bin", "org/resolve/f.bin"),
+        (
+            "/datasets/org/resolve/resolve/main/f.bin",
+            "datasets/org/resolve/f.bin",
+        ),
+        (
+            "/resolve/resolve/resolve/main/f.bin",
+            "resolve/resolve/f.bin",
+        ),
     ] {
         assert_eq!(
             resolve(path, &ROOT),
-            HfPath::Entry(entry.to_owned()),
+            HfPath::Entry {
+                entry: entry.to_owned(),
+                main: true
+            },
             "{path}"
         );
     }
     assert_eq!(
         resolve(&format!("/org/repo/resolve/{commit}/f.bin"), &ROOT),
-        HfPath::Entry("org/repo/f.bin".to_owned())
+        HfPath::Entry {
+            entry: "org/repo/f.bin".to_owned(),
+            main: false
+        }
     );
     for path in [
         "/org/repo/resolve/v1.0/f.bin",
@@ -55,9 +76,33 @@ fn resolve_paths_name_their_entry() {
         "/org/repo/resolve//f.bin",
         "/org/repo/f.bin",
         "/resolve/main/f.bin",
+        // A repo id is `[<type>/]<org>/<name>`: a deeper path before the
+        // delimiter is an entry path.
+        "/a/b/c/resolve/main/f.bin",
+        "/datasets/a/b/c/resolve/main/f.bin",
+        "/datasets/org/resolve/main/f.bin",
     ] {
         assert_eq!(resolve(path, &ROOT), HfPath::NotResolve, "{path}");
     }
+}
+
+/// The commit path a `HEAD` under `main` sends the client to: the repo id,
+/// typed or not, then `resolve`, the commit and the file.
+#[test]
+fn the_pinned_path_puts_the_commit_after_the_repo() {
+    let commit = commit(&ROOT);
+    assert_eq!(
+        pinned("org/repo/dir/f.bin", &ROOT),
+        format!("/org/repo/resolve/{commit}/dir/f.bin")
+    );
+    assert_eq!(
+        pinned("datasets/org/repo/f.bin", &ROOT),
+        format!("/datasets/org/repo/resolve/{commit}/f.bin")
+    );
+    assert_eq!(
+        pinned("org/resolve/f.bin", &ROOT),
+        format!("/org/resolve/resolve/{commit}/f.bin")
+    );
 }
 
 /// The headers `huggingface_hub` reads: the commit, the entry hash as the

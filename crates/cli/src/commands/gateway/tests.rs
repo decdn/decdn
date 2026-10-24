@@ -1491,14 +1491,17 @@ async fn a_known_signer_has_its_own_lookup_budget_per_namespace() {
 }
 
 /// On a namespace host, `/<a>/<b>/resolve/<rev>/<file>` is the entry
-/// `<a>/<b>/<file>` with the headers `huggingface_hub` reads, on `GET` and
-/// `HEAD`, under `main` or the root's commit; another revision is 404. A
-/// bundle's own site has no such shim: the path is a literal entry there.
+/// `<a>/<b>/<file>` with the headers `huggingface_hub` reads, under `main`
+/// or the root's commit; another revision is 404. `HEAD` under `main`
+/// redirects to the commit path, so the client's `GET` names one bundle
+/// even if the pointer moves in between. A bundle's own site has no such
+/// shim: the path is a literal entry there.
 #[tokio::test]
 async fn a_namespace_host_resolves_hf_paths() {
     let (gateway, _logs, host) = public_gateway().await;
     hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
     let commit = alloy::hex::encode(BLOB)[..40].to_owned();
+    let etag = format!("\"{}\"", alloy::hex::encode(ENTRY));
     for rev in ["main", commit.as_str()] {
         let path = format!("/org/repo/resolve/{rev}/w.bin");
         let got = request(&gateway, "7.decdn.test", &path, &[]).await;
@@ -1511,7 +1514,6 @@ async fn a_namespace_host_resolves_hf_paths() {
             got.header(header::HeaderName::from_static("x-repo-commit")),
             Some(commit.as_str())
         );
-        let etag = format!("\"{}\"", alloy::hex::encode(ENTRY));
         assert_eq!(got.header(header::ETAG), Some(etag.as_str()));
         assert_eq!(
             got.header(header::HeaderName::from_static("x-linked-etag")),
@@ -1522,19 +1524,34 @@ async fn a_namespace_host_resolves_hf_paths() {
             Some("3")
         );
         assert_eq!(got.header(header::ACCEPT_RANGES), Some("bytes"));
-        let head = send(&gateway, Method::HEAD, "7.decdn.test", &path, &[]).await;
-        assert_eq!(head.status, StatusCode::OK, "{path}");
-        assert_eq!(
-            head.header(header::HeaderName::from_static("x-repo-commit")),
-            Some(commit.as_str())
-        );
-        assert_eq!(
-            head.header(header::HeaderName::from_static("x-linked-size")),
-            Some("3")
-        );
-        assert_eq!(head.header(header::CONTENT_LENGTH), Some("3"));
     }
-    // A range on the resolved entry is a range, and the linked size is the whole.
+    // `HEAD` under `main` pins the client to the commit; under the commit it
+    // answers from the manifest.
+    let pinned = send(
+        &gateway,
+        Method::HEAD,
+        "7.decdn.test",
+        "/org/repo/resolve/main/w.bin",
+        &[],
+    )
+    .await;
+    assert_eq!(pinned.status, StatusCode::FOUND);
+    let location = format!("/org/repo/resolve/{commit}/w.bin");
+    assert_eq!(pinned.header(header::LOCATION), Some(location.as_str()));
+    let head = send(&gateway, Method::HEAD, "7.decdn.test", &location, &[]).await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(
+        head.header(header::HeaderName::from_static("x-repo-commit")),
+        Some(commit.as_str())
+    );
+    assert_eq!(head.header(header::ETAG), Some(etag.as_str()));
+    assert_eq!(
+        head.header(header::HeaderName::from_static("x-linked-size")),
+        Some("3")
+    );
+    assert_eq!(head.header(header::CONTENT_LENGTH), Some("3"));
+    // A range on the resolved entry is a range, and the linked size is the
+    // whole.
     let ranged = request(
         &gateway,
         "7.decdn.test",
@@ -1559,35 +1576,25 @@ async fn a_namespace_host_resolves_hf_paths() {
         unknown.header(header::HeaderName::from_static("x-error-code")),
         Some("RevisionNotFound")
     );
-    let missing = request(
-        &gateway,
-        "7.decdn.test",
-        "/org/repo/resolve/main/nope.bin",
-        &[],
-    )
-    .await;
-    assert_eq!(missing.status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        missing.header(header::HeaderName::from_static("x-error-code")),
-        Some("EntryNotFound")
-    );
-    assert_eq!(
-        missing.header(header::HeaderName::from_static("x-repo-commit")),
-        Some(commit.as_str())
-    );
-    let missing_head = send(
-        &gateway,
-        Method::HEAD,
-        "7.decdn.test",
-        "/org/repo/resolve/main/nope.bin",
-        &[],
-    )
-    .await;
-    assert_eq!(missing_head.status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        missing_head.header(header::HeaderName::from_static("x-error-code")),
-        Some("EntryNotFound")
-    );
+    for method in [Method::GET, Method::HEAD] {
+        let missing = send(
+            &gateway,
+            method.clone(),
+            "7.decdn.test",
+            &format!("/org/repo/resolve/{commit}/nope.bin"),
+            &[],
+        )
+        .await;
+        assert_eq!(missing.status, StatusCode::NOT_FOUND, "{method}");
+        assert_eq!(
+            missing.header(header::HeaderName::from_static("x-error-code")),
+            Some("EntryNotFound")
+        );
+        assert_eq!(
+            missing.header(header::HeaderName::from_static("x-repo-commit")),
+            Some(commit.as_str())
+        );
+    }
     // The literal entry still serves, and the hash site knows no shim.
     let literal = request(&gateway, "7.decdn.test", "/org/repo/w.bin", &[]).await;
     assert_eq!(literal.status, StatusCode::OK);
@@ -1622,7 +1629,9 @@ async fn a_resolved_page_is_served_byte_exact_with_its_length() {
         Some(len.as_str())
     );
     assert_eq!(got.header(header::ACCEPT_RANGES), Some("bytes"));
-    let head = send(&gateway, Method::HEAD, "7.decdn.test", path, &[]).await;
+    let commit = alloy::hex::encode(BLOB)[..40].to_owned();
+    let pinned = format!("/org/repo/resolve/{commit}/report.html");
+    let head = send(&gateway, Method::HEAD, "7.decdn.test", &pinned, &[]).await;
     assert_eq!(head.status, StatusCode::OK);
     assert_eq!(head.header(header::CONTENT_LENGTH), Some(len.as_str()));
     assert_eq!(

@@ -145,12 +145,13 @@ file. A restart changes no pointer.
 
 A namespace host is an endpoint for `huggingface_hub`. With
 `HF_ENDPOINT=https://<ns>.<host>` the client asks for
-`/<repo>/resolve/<revision>/<file>`, where `<repo>` is `org/name`,
-`datasets/org/name` or `spaces/org/name`: two segments or more. A
-single-segment id such as `gpt2` is not a resolve path. On a namespace host
-that path is the entry `<repo>/<file>` of the bundle the pointer names. The
-revision is `main` or the bundle's commit: the first forty hex characters of
-its manifest hash. Another revision is 404.
+`/<repo>/resolve/<revision>/<file>`, where `<repo>` is `org/name`, with
+`datasets/`, `spaces/` or `models/` before it or not. A single-segment id
+such as `gpt2` is not a resolve path. `resolve` is looked for after the repo
+id, so a repo named `resolve` is a repo. On a namespace host that path is
+the entry `<repo>/<file>` of the bundle the pointer names. The revision is
+`main` or the bundle's commit: the first forty hex characters of its
+manifest hash. Another revision is 404.
 
 `HEAD` and `GET` carry the headers the client reads: `X-Repo-Commit` (the
 commit), `ETag` and `X-Linked-Etag` (the entry hash, quoted), `X-Linked-Size`
@@ -158,10 +159,14 @@ commit), `ETag` and `X-Linked-Etag` (the entry hash, quoted), `X-Linked-Size`
 `Accept-Ranges: bytes`. The body is the entry byte for byte, whatever its
 type: a page is not rewritten here, since the client stores the body under
 the entry hash. A 404 carries `X-Error-Code`: `RevisionNotFound`, or
-`EntryNotFound` with the commit. There is no redirect. A resume with a
+`EntryNotFound` with the commit. A `HEAD` under `main` answers 302 to the
+same path under the commit, and the client downloads from there: a pointer
+that moves between the two requests makes the download 404 instead of
+caching another bundle's bytes under the first bundle's commit. `GET` under
+`main` serves directly. Nothing redirects off the host. A resume with a
 `Range` is a range as in [Ranges](#ranges).
 
-Any `/<a>/<b>[/…]/resolve/<rev>/<file>` path on a namespace host is this
+Any `/<repo>/resolve/<rev>/<file>` path on a namespace host is this
 shim's. An entry at such a literal path is not reachable on the namespace
 host; it is on the bundle's own site. A later `/api/` or `/v2/` surface
 shadows literal paths the same way. The `/api/` surface the client's
