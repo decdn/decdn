@@ -911,3 +911,64 @@ fn chain_id_guard_matches_and_mismatches() {
     assert!(err.contains("421614"), "{err}");
     assert!(err.contains("31337"), "{err}");
 }
+
+/// `publish point` prints what it signed and where it went: a dry run loads
+/// no keystore and submits nothing; a stored pointer names the namespace's
+/// URL.
+#[test]
+fn point_dry_run_and_pointed_formats() {
+    let dry = PointOutcome {
+        publisher: None,
+        registry: Address::repeat_byte(0x01),
+        namespace_id: 7,
+        root: [0xab; 32],
+        seq: 42,
+        gateway: "https://decdn.link".parse().unwrap(),
+        status: PointStatus::DryRun,
+    };
+    let mut buf = Vec::new();
+    write_point_outcome(&mut buf, &dry, false).unwrap();
+    let text = String::from_utf8(buf).unwrap();
+    assert!(text.contains("publisher_registry=0x0101"), "{text}");
+    assert!(text.contains("namespace_id=7\n"), "{text}");
+    assert!(
+        text.contains(&format!("root={}\n", "ab".repeat(32))),
+        "{text}"
+    );
+    assert!(text.contains("seq=42\n"), "{text}");
+    assert!(text.contains("gateway=https://decdn.link/\n"), "{text}");
+    assert!(text.contains("status=dry_run submitted=false"), "{text}");
+    assert!(!text.contains("publisher="), "{text}");
+    let mut buf = Vec::new();
+    write_point_outcome(&mut buf, &dry, true).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    assert_eq!(v["status"], "dry_run");
+    assert_eq!(v["submitted"], false);
+    assert_eq!(v["namespace_id"], 7);
+    assert_eq!(v["root"], "ab".repeat(32));
+    assert_eq!(v["seq"], 42);
+    assert!(v["url"].is_null(), "{v}");
+    assert!(v["publisher"].is_null(), "{v}");
+
+    let pointed = PointOutcome {
+        publisher: Some(Address::repeat_byte(0xcd)),
+        status: PointStatus::Pointed {
+            url: "https://7.decdn.link/".to_owned(),
+        },
+        ..dry
+    };
+    let mut buf = Vec::new();
+    write_point_outcome(&mut buf, &pointed, false).unwrap();
+    let text = String::from_utf8(buf).unwrap();
+    assert!(text.contains("publisher=0xcdcd"), "{text}");
+    assert!(
+        text.contains("status=pointed url=https://7.decdn.link/\n"),
+        "{text}"
+    );
+    let mut buf = Vec::new();
+    write_point_outcome(&mut buf, &pointed, true).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    assert_eq!(v["status"], "pointed");
+    assert_eq!(v["submitted"], true);
+    assert_eq!(v["url"], "https://7.decdn.link/");
+}

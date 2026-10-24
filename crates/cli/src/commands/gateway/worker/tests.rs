@@ -138,7 +138,7 @@ fn send_pool(
     tokio::io::DuplexStream,
     oneshot::Receiver<anyhow::Result<()>>,
 ) {
-    send_paid(worker, kind, Payment::Pool, 1024)
+    send_paid(worker, kind, Payment::Pool { namespace: None }, 1024)
 }
 
 fn send_paid(
@@ -427,7 +427,7 @@ async fn a_job_refused_at_its_slot_pulls_nothing() {
                 size_cap: None,
                 range: None,
             },
-            paying: Payment::Pool,
+            paying: Payment::Pool { namespace: None },
             writer,
             done,
             admit: Some(Box::new(|| false)),

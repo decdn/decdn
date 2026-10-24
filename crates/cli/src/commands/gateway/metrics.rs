@@ -1,6 +1,6 @@
 //! The public gateway's metrics: Prometheus text exposition of what it
 //! served, refused and failed, hand-rolled as `sponsord`'s are (a registry
-//! crate would add a shape of its own for eight series).
+//! crate would add a shape of its own for nine series).
 //!
 //! One unlabeled sibling counter per outcome, as `adr/appendix-observability.md`
 //! § Reason splits prefers: each outcome has its own operator remedy (a
@@ -23,6 +23,7 @@ pub(super) struct Metrics {
     pull_failures_funding: AtomicU64,
     pull_failures_other: AtomicU64,
     pulls_active: AtomicU64,
+    pointer_updates: AtomicU64,
 }
 
 impl Metrics {
@@ -60,9 +61,14 @@ impl Metrics {
         self.pulls_active.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// A namespace pointer was stored.
+    pub(super) fn pointer_updated(&self) {
+        self.pointer_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The Prometheus text exposition.
     pub(super) fn render(&self) -> String {
-        let series: [(&str, &str, &str, &AtomicU64); 8] = [
+        let series: [(&str, &str, &str, &AtomicU64); 9] = [
             (
                 "decdn_gateway_bytes_served_total",
                 "counter",
@@ -111,6 +117,12 @@ impl Metrics {
                 "gauge",
                 "Pulls handed to the worker and not yet ended.",
                 &self.pulls_active,
+            ),
+            (
+                "decdn_gateway_pointer_updates_total",
+                "counter",
+                "Namespace pointers stored through PUT /_pointer.",
+                &self.pointer_updates,
             ),
         ];
         let mut out = String::new();

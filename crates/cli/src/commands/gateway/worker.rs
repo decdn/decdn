@@ -35,7 +35,23 @@ pub(super) enum Payment {
     /// A capability held in memory, with the delegate key it was issued to.
     Held(Credential),
     /// The gateway's own pool, from its keystore.
-    Pool,
+    Pool {
+        /// The namespace whose pointer the request is served under, so its
+        /// bytes count against that namespace's allowance; `None` for every
+        /// other request.
+        namespace: Option<u64>,
+    },
+}
+
+impl Payment {
+    /// The allowance bucket the pull spends: a pointer's namespace, or the
+    /// shared one.
+    pub(super) const fn bucket(&self) -> Option<u64> {
+        match self {
+            Self::Held(_) => None,
+            Self::Pool { namespace } => *namespace,
+        }
+    }
 }
 
 /// One pull the gateway hands the worker.
@@ -246,7 +262,7 @@ impl PayerId {
     fn of(paying: &Payment) -> Self {
         match paying {
             Payment::Held(credential) => Self::Signer(credential.signer.address()),
-            Payment::Pool => Self::Pool,
+            Payment::Pool { .. } => Self::Pool,
         }
     }
 }

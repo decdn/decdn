@@ -82,6 +82,12 @@ impl SiteDomain {
         }
     }
 
+    /// Namespace `namespace`'s own host, `<ns>.<suffix>`: on a public domain
+    /// the host its pointer serves at.
+    pub(super) fn namespace_host(&self, namespace: u64) -> String {
+        format!("{namespace}.{}", self.suffix())
+    }
+
     /// The origin of `host`, a host under this domain: the scheme and, on
     /// loopback, the port.
     pub(super) fn origin(&self, host: &str) -> String {
