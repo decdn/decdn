@@ -121,9 +121,12 @@ The gateway resolves the registry from `--publisher-registry-address`, else
 testnet's when it runs on that chain. It recovers the signer and reads
 `PublisherRegistry.ownerOf` for each pointer that passes the `seq` check.
 The reads come out of a budget per minute, so an anonymous flood of
-well-formed pointers costs the operator's RPC a bounded amount. While that
-budget is spent, every other pointer waits for the next minute. Limits per
-client belong on the proxy, which knows the client. The owner read and the
+well-formed pointers costs the operator's RPC a bounded amount. A signer the
+gateway stored a pointer from before was the owner once; it draws on a
+smaller budget of its own per namespace, which a stranger's keys cannot
+spend, so the flood does not keep a publisher from updating. A first pointer,
+or a new owner's, waits for the shared budget. Limits per client belong on
+the proxy, which knows the client. The owner read and the
 store are one step, so two pointers for one namespace resolve in the order
 their owners were read.
 

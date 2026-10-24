@@ -380,7 +380,7 @@ fn public_with(allowance: Allowance, pointers_dir: &Path) -> Public {
         metrics: Metrics::default(),
         pointers: Pointers::load(pointers_dir).unwrap(),
         registry: REGISTRY,
-        lookups: std::sync::Mutex::new(Lookups::default()),
+        lookups: std::sync::Mutex::new(Budgets::default()),
         pointer_writes: Mutex::new(()),
     }
 }
@@ -1424,6 +1424,61 @@ fn hold(gateway: &Gateway, pointer: SignedPointer, signer: Address) {
     pointers(gateway).set(pointer, signer).unwrap();
 }
 
+/// A signer the gateway stored a pointer from before draws on a lookup
+/// budget of its own per namespace, still read on-chain, so a flood of
+/// strangers on the shared budget does not keep a publisher from updating.
+/// That budget is per namespace, so one publisher's updates cannot spend
+/// another's either.
+#[tokio::test]
+async fn a_known_signer_has_its_own_lookup_budget_per_namespace() {
+    let (gateway, _logs, _) = public_gateway().await;
+    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let owner = PrivateKeySigner::random();
+    let public = gateway.public.as_ref().unwrap();
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), owner.address());
+    hold(&gateway, unsigned_pointer(8, BLOB, 1), owner.address());
+    let put = |ns: u64, seq: u64| {
+        let pointer = SignedPointer::sign(&owner, ns, OTHER, seq, &domain).unwrap();
+        let body = serde_json::to_string(&pointer).unwrap();
+        let gateway = Arc::clone(&gateway);
+        async move { send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await }
+    };
+    let (shared_spent, known_spent) = loop {
+        let now = now_secs();
+        while public.take_lookup(None, now).is_ok() {}
+        let shared_spent = put(7, 2).await;
+        let mut seq = 3;
+        while public.take_lookup(Some(7), now).is_ok() {
+            seq += 1;
+        }
+        let known_spent = put(7, seq).await;
+        if now_secs() / 60 == now / 60 {
+            break (shared_spent, known_spent);
+        }
+    };
+    // The holder's update reached the chain past the spent shared budget.
+    assert_eq!(
+        shared_spent.status,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        shared_spent.body
+    );
+    // Its own budget runs out too, per namespace.
+    assert_eq!(
+        known_spent.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        known_spent.body
+    );
+    let other_namespace = put(8, 2).await;
+    assert_eq!(
+        other_namespace.status,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        other_namespace.body
+    );
+}
+
 /// A namespace's own allowance pays for its own bundle and nothing else:
 /// `/_decdn/` content from another bundle on its host spends the shared
 /// allowance, so a stranger cannot drain the namespace's budget with
@@ -1539,7 +1594,7 @@ async fn put_pointer_owner_lookups_are_budgeted() {
     assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "{}", answer.body);
     let answer = loop {
         let now = now_secs();
-        while public.take_lookup(now).is_ok() {}
+        while public.take_lookup(None, now).is_ok() {}
         let pointer = SignedPointer::sign(&signer, 1_000, BLOB, 1, &domain).unwrap();
         let body = serde_json::to_string(&pointer).unwrap();
         let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;

@@ -4100,7 +4100,8 @@ since project inception and will roll into the first tagged release.
   what the gateway stored from the same signer is 409 before any chain
   read; one from another signer who owns the namespace now replaces the
   held one whatever the holder's `seq`; a stranger's is 403; the owner
-  lookups are budgeted per minute (429 past it). On a namespace host,
+  lookups are budgeted per minute (429 past it), with a budget of its own
+  per namespace for a signer stored before. On a namespace host,
   `/_decdn/` content from another bundle spends the shared allowance. `decdn gateway` takes `--publisher-registry-address`
   (default: the config file, else the built-in testnet) and
   `--allowance <ns>=<bytes>`, repeatable, which gives one namespace a daily

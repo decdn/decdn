@@ -98,7 +98,10 @@
 //! when its `seq` is above every one stored from that signer. The owner
 //! lookups come out of a budget per minute (`POINTER_LOOKUPS_PER_MINUTE`),
 //! so an anonymous flood of pointers costs the operator's RPC no more than
-//! that, and while the budget is spent a pointer waits for the next minute:
+//! that; a signer the gateway stored a pointer from before draws on a budget
+//! of its own per namespace (`KNOWN_SIGNER_LOOKUPS_PER_MINUTE`), which a
+//! stranger's keys cannot spend, so the flood does not keep a publisher from
+//! updating. A first pointer, or a new owner's, waits for the shared budget;
 //! limits per client belong on the proxy, which knows the client. Pointer
 //! writes run one at a time, lookup included, so a stale owner read never
 //! overtakes a fresher one. `decdn publish point` signs and sends one.
@@ -192,6 +195,12 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// answer is 429 until the minute turns, and the operator's RPC is not an
 /// anonymous caller's to spend.
 const POINTER_LOOKUPS_PER_MINUTE: u32 = 60;
+
+/// The owner lookups per minute a signer the gateway stored a pointer from
+/// before gets on that namespace, apart from the shared budget. Such a
+/// signer was the owner once, so a stranger's keys cannot spend this; a
+/// publisher updates a few times a day.
+const KNOWN_SIGNER_LOOKUPS_PER_MINUTE: u32 = 10;
 
 /// How long an owner lookup may take. The lookup runs under the pointer
 /// write lock, so a hung RPC would otherwise hold every pointer write.
@@ -405,7 +414,7 @@ fn mode(
             metrics: Metrics::default(),
             pointers,
             registry,
-            lookups: std::sync::Mutex::new(Lookups::default()),
+            lookups: std::sync::Mutex::new(Budgets::default()),
             pointer_writes: Mutex::new(()),
         }),
     ))
@@ -896,9 +905,10 @@ struct Public {
     pointers: Pointers,
     /// The `PublisherRegistry` a pointer's signer must own its namespace on.
     registry: Address,
-    /// The owner lookups made this minute, against
-    /// [`POINTER_LOOKUPS_PER_MINUTE`].
-    lookups: std::sync::Mutex<Lookups>,
+    /// The owner lookups made this minute: the shared budget against
+    /// [`POINTER_LOOKUPS_PER_MINUTE`], and each namespace's budget for its
+    /// known signers against [`KNOWN_SIGNER_LOOKUPS_PER_MINUTE`].
+    lookups: std::sync::Mutex<Budgets>,
     /// Held from a pointer's owner lookup through its store, so two pointers
     /// for one namespace resolve in the order their owners were read, and a
     /// read from before a transfer cannot overtake one from after it.
@@ -912,29 +922,58 @@ struct Lookups {
     used: u32,
 }
 
-impl Public {
-    /// Take one owner lookup from this minute's budget, or the seconds until
-    /// the minute turns and one is free again.
-    fn take_lookup(&self, now_secs: u64) -> Result<(), u64> {
+impl Lookups {
+    /// Take one lookup of `per_minute` in the minute of `now_secs`, or the
+    /// seconds until the minute turns and one is free again.
+    const fn take(&mut self, per_minute: u32, now_secs: u64) -> Result<(), u64> {
         let minute = now_secs / 60;
-        let mut lookups = self
+        if self.minute != minute {
+            *self = Self { minute, used: 0 };
+        }
+        if self.used >= per_minute {
+            return Err(60 - now_secs % 60);
+        }
+        self.used += 1;
+        Ok(())
+    }
+}
+
+/// The lookup budgets: one shared by every stranger, one per namespace for
+/// the signers the gateway stored a pointer from before.
+#[derive(Debug, Default)]
+struct Budgets {
+    shared: Lookups,
+    known: HashMap<u64, Lookups>,
+}
+
+impl Public {
+    /// Take one owner lookup from this minute's budget: the namespace's own
+    /// when `known` names the namespace the signer is known on, else the
+    /// shared one. `Err` is the seconds until the minute turns and one is
+    /// free again.
+    fn take_lookup(&self, known: Option<u64>, now_secs: u64) -> Result<(), u64> {
+        let mut budgets = self
             .lookups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if lookups.minute != minute {
-            *lookups = Lookups { minute, used: 0 };
+        match known {
+            Some(ns) => budgets
+                .known
+                .entry(ns)
+                .or_default()
+                .take(KNOWN_SIGNER_LOOKUPS_PER_MINUTE, now_secs),
+            None => budgets.shared.take(POINTER_LOOKUPS_PER_MINUTE, now_secs),
         }
-        if lookups.used >= POINTER_LOOKUPS_PER_MINUTE {
-            return Err(60 - now_secs % 60);
-        }
-        lookups.used += 1;
-        Ok(())
     }
 
     /// [`Self::take_lookup`], with the 429 to answer when the budget is
     /// spent.
-    fn take_lookup_or_refuse(&self, now_secs: u64) -> Result<(), Box<Response<Body>>> {
-        self.take_lookup(now_secs).map_err(|retry_after| {
+    fn take_lookup_or_refuse(
+        &self,
+        known: Option<u64>,
+        now_secs: u64,
+    ) -> Result<(), Box<Response<Body>>> {
+        self.take_lookup(known, now_secs).map_err(|retry_after| {
             let mut response = text(
                 StatusCode::TOO_MANY_REQUESTS,
                 "the gateway's pointer lookups for this minute are spent\n",
@@ -1312,16 +1351,19 @@ impl Gateway {
         // From any signer, only a `seq` above what it had stored is new: a
         // replay, and an old pointer of an owner the namespace came back to,
         // cost no lookup.
-        if let Some(current) = public.pointers.high_water(ns, signer)
+        let high_water = public.pointers.high_water(ns, signer);
+        if let Some(current) = high_water
             && pointer.seq <= current
         {
             return stale_pointer(current);
         }
-        // The budget is taken before the lock, so a caller past it waits on
-        // nothing. One pointer at a time from here: the owner read and the
-        // store are one step, so a read from before a transfer cannot land
-        // after one from after it.
-        if let Err(response) = public.take_lookup_or_refuse(now_secs()) {
+        // A signer stored before was the owner once: it has the namespace's
+        // own budget. The budget is taken before the lock, so a caller past
+        // it waits on nothing. One pointer at a time from here: the owner
+        // read and the store are one step, so a read from before a transfer
+        // cannot land after one from after it.
+        let known = high_water.map(|_| ns);
+        if let Err(response) = public.take_lookup_or_refuse(known, now_secs()) {
             return *response;
         }
         let _writes = public.pointer_writes.lock().await;
