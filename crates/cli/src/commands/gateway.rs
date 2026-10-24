@@ -156,6 +156,7 @@ use super::fetch::{
 use crate::known_chains;
 
 mod allowance;
+mod hf;
 mod metrics;
 pub(crate) mod pointer;
 mod rewrite;
@@ -1267,10 +1268,42 @@ impl Gateway {
             None => self.sites.site_host(&site),
         };
         let target = req.uri().path_and_query().map_or(path, |pq| pq.as_str());
+        let range = range_header(headers);
+        // A namespace host is an `HF_ENDPOINT`: a resolve path is the entry
+        // it names, with the hub's headers.
+        if pointer.is_some() && !path.starts_with("/_decdn/") {
+            match hf::resolve(path, &site.hash) {
+                hf::HfPath::NotResolve => {}
+                hf::HfPath::UnknownRevision => {
+                    return text(
+                        StatusCode::NOT_FOUND,
+                        "unknown revision: a namespace host serves `main` and the bundle's \
+                         commit\n",
+                    );
+                }
+                hf::HfPath::Entry(entry) => {
+                    let entry = format!("/{entry}");
+                    let mut response = if head {
+                        self.head_site(&site, &entry, pointer).await
+                    } else {
+                        let hex = alloy::hex::encode(site.hash);
+                        let uri = match format!("decdn:{hex}{entry}").parse::<DecdnUri>() {
+                            Ok(uri) => DecdnUri::new(uri.hash, uri.target, site.namespace),
+                            Err(e) => return text(StatusCode::NOT_FOUND, &format!("{e}\n")),
+                        };
+                        self.paid(&page_host, pointer, &uri, Present::Site, range)
+                            .await
+                    };
+                    if response.status().is_success() {
+                        hf::decorate(response.headers_mut(), &site.hash);
+                    }
+                    return response;
+                }
+            }
+        }
         if head {
             return self.head_site(&site, path, pointer).await;
         }
-        let range = range_header(headers);
         if let Some(rest) = target.strip_prefix("/_decdn/") {
             let uri: DecdnUri = match format!("decdn:{rest}").parse() {
                 Ok(uri) => uri,
@@ -2073,6 +2106,7 @@ impl Gateway {
                     name.replace(['"', '\\'], "_")
                 ),
             )
+            .header(header::ETAG, format!("\"{}\"", alloy::hex::encode(hash)))
             .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
         if let Some(size) = size {
             response = response.header(header::CONTENT_LENGTH, size);

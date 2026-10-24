@@ -4089,6 +4089,15 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: a namespace host on a public gateway is an `HF_ENDPOINT`
+  (#PR_NUMBER).** `GET` and `HEAD /<repo>/resolve/<rev>/<file>` on
+  `<ns>.<host>` serve the entry `<repo>/<file>` of the bundle the namespace
+  points at, under `main` or the bundle's commit (the first forty hex of its
+  manifest hash), with `X-Repo-Commit`, `ETag` and `X-Linked-Etag` (the entry
+  hash) and `X-Linked-Size`, so `huggingface_hub` downloads and resumes from
+  it with no redirect. Another revision is 404. Every streamed answer now
+  carries `ETag` with the blob's hash. Part of #2593.
+
 - **CLI: a namespace is a stable host on a public gateway (#2614).**
   `decdn publish point <ns> decdn:<hash>/ --gateway <origin>` signs a
   namespace pointer (an EIP-712 record over the `PublisherRegistry`

@@ -141,6 +141,27 @@ with the signer each recovered to and the highest `seq` stored from each
 signer. The gateway reads them at start and fails to start on a damaged
 file. A restart changes no pointer.
 
+## `HF_ENDPOINT`
+
+A namespace host is an endpoint for `huggingface_hub`. With
+`HF_ENDPOINT=https://<ns>.<host>` the client asks for
+`/<repo>/resolve/<revision>/<file>`, where `<repo>` is `org/name` or
+`datasets/org/name`. On a namespace host that path is the entry
+`<repo>/<file>` of the bundle the pointer names. The revision is `main` or
+the bundle's commit: the first forty hex characters of its manifest hash.
+Another revision is 404.
+
+`HEAD` and `GET` carry the headers the client reads: `X-Repo-Commit` (the
+commit), `ETag` and `X-Linked-Etag` (the entry hash, quoted), `X-Linked-Size`
+(the entry's size, the whole of it on a partial answer) and
+`Accept-Ranges: bytes`. There is no redirect. The client's resume with a
+`Range` is a range as above.
+
+Any `/<a>/<b>[/…]/resolve/<rev>/<file>` path on a namespace host is this
+shim's. An entry at such a literal path is not reachable on the namespace
+host; it is on the bundle's own site. The `/api/` surface the client's
+`snapshot_download` needs is not served.
+
 ## Ranges
 
 An entry whose manifest declares its size takes one `Range`: `bytes=a-b`,
