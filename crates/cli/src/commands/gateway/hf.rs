@@ -2,8 +2,8 @@
 //! `huggingface_hub` fetches files by, mapped onto bundle entries.
 //!
 //! With `HF_ENDPOINT=https://<ns>.<host>`, the hub client asks for
-//! `/<repo>/resolve/<revision>/<file>` (`<repo>` is `org/name`, or
-//! `datasets/`, `spaces/` or `models/` before it), `HEAD` first for the
+//! `/<repo>/resolve/<revision>/<file>` (`<repo>` is `org/name`, with
+//! `datasets/` or `spaces/` before it for those), `HEAD` first for the
 //! metadata, then `GET` with a `Range` to resume. On a namespace host that
 //! path is the entry `<repo>/<file>` of the bundle the namespace points at,
 //! under the revision `main` or the bundle's commit, the first forty hex
@@ -48,8 +48,10 @@ pub(super) fn commit(root: &[u8; 32]) -> String {
     hex
 }
 
-/// The repo types the hub puts before `org/name` in a path.
-const REPO_TYPES: &[&str] = &["datasets", "spaces", "models"];
+/// The repo types the hub puts before `org/name` in a path. A model has
+/// none: `models/` never leads a resolve path, so an org of that name is an
+/// org.
+const REPO_TYPES: &[&str] = &["datasets", "spaces"];
 
 /// What `path` (with its leading `/`) is to the shim on the bundle `root`.
 /// A resolve path is a repo id (`org/name`, with a repo type before it or

@@ -42,6 +42,8 @@ fn resolve_paths_name_their_entry() {
             "/resolve/resolve/resolve/main/f.bin",
             "resolve/resolve/f.bin",
         ),
+        // `models/` is no prefix on the hub: it is an org like any other.
+        ("/models/demo/resolve/main/a.bin", "models/demo/a.bin"),
     ] {
         assert_eq!(
             resolve(path, &ROOT),

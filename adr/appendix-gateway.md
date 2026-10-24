@@ -146,7 +146,7 @@ file. A restart changes no pointer.
 A namespace host is an endpoint for `huggingface_hub`. With
 `HF_ENDPOINT=https://<ns>.<host>` the client asks for
 `/<repo>/resolve/<revision>/<file>`, where `<repo>` is `org/name`, with
-`datasets/`, `spaces/` or `models/` before it or not. A single-segment id
+`datasets/` or `spaces/` before it for those. A single-segment id
 such as `gpt2` is not a resolve path. `resolve` is looked for after the repo
 id, so a repo named `resolve` is a repo. On a namespace host that path is
 the entry `<repo>/<file>` of the bundle the pointer names. The revision is
