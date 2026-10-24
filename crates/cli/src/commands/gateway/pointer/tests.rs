@@ -117,28 +117,51 @@ fn pointer(namespace: u64, root: u8, seq: u64) -> SignedPointer {
     }
 }
 
+/// The owner every store test's pointers are taken as signed by.
+const OWNER: Address = Address::repeat_byte(0x11);
+
 #[test]
 fn a_newer_pointer_replaces_and_an_older_or_equal_one_is_stale() {
     let dir = tempfile::tempdir().unwrap();
     let pointers = Pointers::load(dir.path()).unwrap();
     assert_eq!(pointers.root(7), None);
-    assert_eq!(pointers.seq(7), None);
-    pointers.set(pointer(7, 0x01, 5)).unwrap();
+    assert_eq!(pointers.held(7), None);
+    pointers.set(pointer(7, 0x01, 5), OWNER).unwrap();
     assert_eq!(pointers.root(7), Some([0x01; 32]));
-    assert_eq!(pointers.seq(7), Some(5));
+    assert_eq!(pointers.held(7), Some((5, OWNER)));
     for seq in [5, 4] {
-        match pointers.set(pointer(7, 0x02, seq)) {
+        match pointers.set(pointer(7, 0x02, seq), OWNER) {
             Err(SetError::Stale { current }) => assert_eq!(current, 5),
             other => panic!("seq {seq}: {other:?}"),
         }
     }
     assert_eq!(pointers.root(7), Some([0x01; 32]));
-    pointers.set(pointer(7, 0x03, 6)).unwrap();
+    pointers.set(pointer(7, 0x03, 6), OWNER).unwrap();
     assert_eq!(pointers.root(7), Some([0x03; 32]));
     // Another namespace has its own sequence.
-    pointers.set(pointer(8, 0x04, 1)).unwrap();
+    pointers.set(pointer(8, 0x04, 1), OWNER).unwrap();
     assert_eq!(pointers.root(8), Some([0x04; 32]));
     assert_eq!(pointers.root(7), Some([0x03; 32]));
+}
+
+/// A namespace changes hands on-chain: the new owner's first pointer
+/// replaces the old owner's whatever its `seq`, so a former owner's high
+/// `seq` cannot hold the host. The caller has verified the new signer owns
+/// the namespace.
+#[test]
+fn another_signer_replaces_a_pointer_at_any_seq() {
+    let dir = tempfile::tempdir().unwrap();
+    let pointers = Pointers::load(dir.path()).unwrap();
+    pointers.set(pointer(7, 0x01, u64::MAX), OWNER).unwrap();
+    let new_owner = Address::repeat_byte(0x22);
+    pointers.set(pointer(7, 0x02, 1), new_owner).unwrap();
+    assert_eq!(pointers.root(7), Some([0x02; 32]));
+    assert_eq!(pointers.held(7), Some((1, new_owner)));
+    // From then on the new owner's own sequence holds.
+    assert!(matches!(
+        pointers.set(pointer(7, 0x03, 1), new_owner),
+        Err(SetError::Stale { current: 1 })
+    ));
 }
 
 #[test]
@@ -146,15 +169,15 @@ fn pointers_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
         let pointers = Pointers::load(dir.path()).unwrap();
-        pointers.set(pointer(7, 0x01, 5)).unwrap();
-        pointers.set(pointer(9, 0x02, 2)).unwrap();
+        pointers.set(pointer(7, 0x01, 5), OWNER).unwrap();
+        pointers.set(pointer(9, 0x02, 2), OWNER).unwrap();
     }
     let reloaded = Pointers::load(dir.path()).unwrap();
     assert_eq!(reloaded.root(7), Some([0x01; 32]));
-    assert_eq!(reloaded.seq(7), Some(5));
+    assert_eq!(reloaded.held(7), Some((5, OWNER)));
     assert_eq!(reloaded.root(9), Some([0x02; 32]));
     assert!(matches!(
-        reloaded.set(pointer(7, 0x03, 5)),
+        reloaded.set(pointer(7, 0x03, 5), OWNER),
         Err(SetError::Stale { current: 5 })
     ));
 }
@@ -165,7 +188,11 @@ fn a_file_that_does_not_parse_or_is_misnamed_fails_the_load() {
     std::fs::write(dir.path().join("7.json"), b"not json").unwrap();
     assert!(Pointers::load(dir.path()).is_err());
     std::fs::remove_file(dir.path().join("7.json")).unwrap();
-    let record = serde_json::to_vec(&pointer(7, 0x01, 1)).unwrap();
+    let record = serde_json::to_vec(&Record {
+        pointer: pointer(7, 0x01, 1),
+        signer: OWNER,
+    })
+    .unwrap();
     std::fs::write(dir.path().join("8.json"), &record).unwrap();
     assert!(Pointers::load(dir.path()).is_err());
     std::fs::remove_file(dir.path().join("8.json")).unwrap();
@@ -187,7 +214,7 @@ fn the_pointer_dir_is_created_owner_only() {
         std::fs::metadata(&inner).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    pointers.set(pointer(7, 0x01, 1)).unwrap();
+    pointers.set(pointer(7, 0x01, 1), OWNER).unwrap();
     let entries: Vec<_> = std::fs::read_dir(&inner)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())

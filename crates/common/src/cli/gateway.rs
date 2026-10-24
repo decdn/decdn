@@ -29,7 +29,7 @@ pub struct GatewayArgs {
     /// pays from `--keystore`'s own pool. Chain coordinates that neither a
     /// flag nor the config file sets default to the built-in testnet, and
     /// `--data-dir` (where the gateway token, or a public gateway's buyer
-    /// store, lives) defaults to `~/.decdn/gateway`.
+    /// store and namespace pointers, live) defaults to `~/.decdn/gateway`.
     #[command(flatten)]
     pub common: ClientFetchArgs,
 }

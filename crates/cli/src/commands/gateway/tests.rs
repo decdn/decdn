@@ -380,6 +380,7 @@ fn public_with(allowance: Allowance, pointers_dir: &Path) -> Public {
         metrics: Metrics::default(),
         pointers: Pointers::load(pointers_dir).unwrap(),
         registry: REGISTRY,
+        lookups: std::sync::Mutex::new(Lookups::default()),
     }
 }
 
@@ -1417,6 +1418,11 @@ fn pointers(gateway: &Gateway) -> &Pointers {
     &gateway.public.as_ref().unwrap().pointers
 }
 
+/// Store `pointer` as signed by `signer`, past `PUT /_pointer`.
+fn hold(gateway: &Gateway, pointer: SignedPointer, signer: Address) {
+    pointers(gateway).set(pointer, signer).unwrap();
+}
+
 /// A namespace host serves the bundle its pointer names, as a site: its
 /// entries, its index, its `HEAD`, under the site policy. Without a pointer
 /// it is not found.
@@ -1425,9 +1431,7 @@ async fn a_namespace_host_serves_the_bundle_its_pointer_names() {
     let (gateway, _logs, _) = public_gateway().await;
     let before = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
     assert_eq!(before.status, StatusCode::NOT_FOUND);
-    pointers(&gateway)
-        .set(unsigned_pointer(7, BLOB, 1))
-        .unwrap();
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
     let entry = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
     assert_eq!((entry.status, entry.body.as_str()), (StatusCode::OK, "abc"));
     assert!(
@@ -1444,9 +1448,7 @@ async fn a_namespace_host_serves_the_bundle_its_pointer_names() {
     assert_eq!(head.status, StatusCode::OK);
     assert_eq!(head.header(header::CONTENT_LENGTH), Some("3"));
     // A newer pointer moves the host; the old bundle stays at its own site.
-    pointers(&gateway)
-        .set(unsigned_pointer(7, NOINDEX, 2))
-        .unwrap();
+    hold(&gateway, unsigned_pointer(7, NOINDEX, 2), Address::ZERO);
     let moved = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
     assert_eq!(moved.status, StatusCode::NOT_FOUND);
     let listing = request(&gateway, "7.decdn.test", "/", &[]).await;
@@ -1488,22 +1490,64 @@ async fn put_pointer_refuses_a_bad_body_before_the_chain() {
     assert!(answer.body.contains("signature"), "{}", answer.body);
 }
 
-/// A pointer whose `seq` is not above the one held is refused with the held
-/// `seq`, before its signature is checked or the chain is read.
+/// A pointer from the signer whose pointer is held, at a `seq` not above
+/// it, is refused with the held `seq` before the chain is read. One from
+/// another signer is not a replay: it goes to the chain, where only the
+/// current owner passes, so a namespace that changed hands is not held by
+/// its former owner's `seq`.
 #[tokio::test]
-async fn put_pointer_refuses_a_stale_seq_before_the_chain() {
+async fn put_pointer_refuses_a_stale_seq_from_the_same_signer_before_the_chain() {
     let (gateway, _logs, _) = public_gateway().await;
-    pointers(&gateway)
-        .set(unsigned_pointer(7, BLOB, 5))
-        .unwrap();
+    let owner = PrivateKeySigner::random();
+    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    hold(&gateway, unsigned_pointer(7, BLOB, 5), owner.address());
     for seq in [5, 4] {
-        let body = serde_json::to_string(&unsigned_pointer(7, OTHER, seq)).unwrap();
+        let pointer = SignedPointer::sign(&owner, 7, OTHER, seq, &domain).unwrap();
+        let body = serde_json::to_string(&pointer).unwrap();
         let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
         assert_eq!(answer.status, StatusCode::CONFLICT, "seq {seq}");
         let json: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
         assert_eq!(json["seq"], 5);
     }
+    let stranger = PrivateKeySigner::random();
+    let pointer = SignedPointer::sign(&stranger, 7, OTHER, 1, &domain).unwrap();
+    let body = serde_json::to_string(&pointer).unwrap();
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+    assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "{}", answer.body);
     assert_eq!(pointers(&gateway).root(7), Some(BLOB));
+}
+
+/// Each on-chain owner lookup a `PUT /_pointer` costs comes out of a budget
+/// per minute, so an anonymous flood of well-formed pointers cannot turn the
+/// gateway into an RPC amplifier: past it the answer is 429 with
+/// `Retry-After`, and nothing is read.
+#[tokio::test]
+async fn put_pointer_owner_lookups_are_budgeted() {
+    let (gateway, _logs, _) = public_gateway().await;
+    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let signer = PrivateKeySigner::random();
+    for ns in 1..=u64::from(POINTER_LOOKUPS_PER_MINUTE) {
+        let pointer = SignedPointer::sign(&signer, ns, BLOB, 1, &domain).unwrap();
+        let body = serde_json::to_string(&pointer).unwrap();
+        let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+        assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "lookup {ns}");
+    }
+    let pointer = SignedPointer::sign(&signer, 1_000, BLOB, 1, &domain).unwrap();
+    let body = serde_json::to_string(&pointer).unwrap();
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+    assert_eq!(
+        answer.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        answer.body
+    );
+    assert!(answer.header(header::RETRY_AFTER).is_some());
+    // A replay still costs nothing and is still a replay.
+    hold(&gateway, unsigned_pointer(7, BLOB, 5), signer.address());
+    let replay = SignedPointer::sign(&signer, 7, OTHER, 5, &domain).unwrap();
+    let body = serde_json::to_string(&replay).unwrap();
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+    assert_eq!(answer.status, StatusCode::CONFLICT);
 }
 
 /// A well-formed pointer with a fresh `seq` is checked against the
@@ -1538,9 +1582,7 @@ async fn a_namespace_with_its_own_allowance_spends_it_alone() {
     let manifest = u64::try_from(public_manifest().len()).unwrap();
     let (gateway, _logs, host) =
         public_gateway_for(Allowance::with_namespaces(u64::MAX, [(7, manifest + 6)])).await;
-    pointers(&gateway)
-        .set(unsigned_pointer(7, BLOB, 1))
-        .unwrap();
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
     for _ in 0..2 {
         let ok = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
         assert_eq!((ok.status, ok.body.as_str()), (StatusCode::OK, "abc"));

@@ -4089,6 +4089,25 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: a namespace is a stable host on a public gateway (#PR_NUMBER).**
+  `decdn publish point <ns> decdn:<hash>/ --gateway <origin>` signs a
+  namespace pointer (an EIP-712 record over the `PublisherRegistry`
+  deployment: `namespaceId`, `root`, `seq`) with the namespace owner's
+  keystore and `PUT`s it to the gateway as `/_pointer`. The gateway recovers
+  the signer, checks it against `PublisherRegistry.ownerOf`, keeps the
+  pointer in `<data-dir>/pointers/<ns>.json`, and from then on serves the
+  bundle as a website at `<ns>.<host>`. A pointer from the same signer at a
+  `seq` not above the held one is 409 before any chain read; one from
+  another signer who owns the namespace now replaces the held one at any
+  `seq`; a stranger's is 403; the owner lookups are budgeted per minute
+  (429 past it). `decdn gateway` takes `--publisher-registry-address`
+  (default: the config file, else the built-in testnet) and
+  `--allowance <ns>=<bytes>`, repeatable, which gives one namespace a daily
+  allowance of its own for the requests its pointer serves, in place of the
+  shared one; a `?ns=` or a `<ns>.<hash32>.` label still spends the shared
+  one. `decdn_gateway_pointer_updates_total` counts stored pointers. The
+  design is in `adr/appendix-gateway.md` § Namespace pointer. Part of #2593.
+
 - **CLI: the public gateway serves its metrics on a loopback listener
   (#2611).** `decdn gateway --public-url … --metrics-listen <addr>` serves
   Prometheus text at `GET /metrics`: content bytes served, answers by outcome

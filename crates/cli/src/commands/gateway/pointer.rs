@@ -12,14 +12,18 @@
 //! registry as `verifyingContract`, so a pointer signed for one deployment
 //! means nothing on another: namespace ids repeat across chains and
 //! redeploys. The gateway accepts a pointer whose signature recovers the
-//! namespace's on-chain owner and whose `seq` is above the one it holds, so a
-//! replayed or reordered pointer changes nothing. `decdn publish point` signs
-//! one with the publisher's keystore and `PUT`s it.
+//! namespace's on-chain owner and whose `seq` is above the one it holds from
+//! that signer, so a replayed or reordered pointer changes nothing. A
+//! pointer from another signer who owns the namespace now replaces the held
+//! one at any `seq`: a namespace that changed hands is not held by its former
+//! owner's sequence. `decdn publish point` signs one with the publisher's
+//! keystore and `PUT`s it.
 //!
 //! Pointers live above the protocol ([ADR 002](https://github.com/decdn/decdn/blob/main/adr/002-content-addressing.md)):
 //! nodes, the wire and the contracts never see them. The store is one JSON
-//! file per namespace, `<dir>/<ns>.json`, written whole through a temp file
-//! in the same directory, and read once at start.
+//! file per namespace, `<dir>/<ns>.json`, holding the pointer and the signer
+//! it recovered to, written whole through a temp file in the same directory,
+//! and read once at start.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -136,11 +140,20 @@ impl SignedPointer {
     }
 }
 
+/// A stored pointer: the record and the owner it recovered to when it was
+/// verified.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Record {
+    #[serde(flatten)]
+    pointer: SignedPointer,
+    signer: Address,
+}
+
 /// Why a pointer was not stored.
 #[derive(Debug)]
 pub(crate) enum SetError {
-    /// The gateway holds a pointer at `current`, and the new one's `seq` is
-    /// not above it.
+    /// The gateway holds a pointer from the same signer at `current`, and the
+    /// new one's `seq` is not above it.
     Stale {
         /// The `seq` of the pointer held.
         current: u64,
@@ -153,7 +166,7 @@ pub(crate) enum SetError {
 /// them across restarts.
 pub(crate) struct Pointers {
     dir: PathBuf,
-    live: Mutex<HashMap<u64, SignedPointer>>,
+    live: Mutex<HashMap<u64, Record>>,
 }
 
 impl Pointers {
@@ -182,15 +195,15 @@ impl Pointers {
                 continue;
             };
             let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-            let pointer: SignedPointer = serde_json::from_slice(&bytes)
+            let record: Record = serde_json::from_slice(&bytes)
                 .with_context(|| format!("{} is not a namespace pointer", path.display()))?;
             anyhow::ensure!(
-                stem == pointer.namespace.to_string(),
+                stem == record.pointer.namespace.to_string(),
                 "{} holds the pointer of namespace {}; delete it to start the gateway",
                 path.display(),
-                pointer.namespace
+                record.pointer.namespace
             );
-            live.insert(pointer.namespace, pointer);
+            live.insert(record.pointer.namespace, record);
         }
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -204,42 +217,50 @@ impl Pointers {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&namespace)
-            .map(|p| p.root.0)
+            .map(|r| r.pointer.root.0)
     }
 
-    /// The `seq` of the pointer held for `namespace`, if any.
-    pub(crate) fn seq(&self, namespace: u64) -> Option<u64> {
+    /// The `seq` of the pointer held for `namespace` and the signer it
+    /// recovered to, if any.
+    pub(crate) fn held(&self, namespace: u64) -> Option<(u64, Address)> {
         self.live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&namespace)
-            .map(|p| p.seq)
+            .map(|r| (r.pointer.seq, r.signer))
     }
 
-    /// Store `pointer` for its namespace, replacing the one held when the new
-    /// `seq` is above it. The record is written whole before the live map
-    /// changes, under the lock, so two pointers racing on one namespace
-    /// resolve in `seq` order.
+    /// Store `pointer`, verified as signed by `signer`, for its namespace.
+    /// It replaces the one held when its `seq` is above it, or when it comes
+    /// from another signer: the caller has checked that signer owns the
+    /// namespace now, so the former owner's sequence ends. The record is
+    /// written whole before the live map changes, under the lock, so two
+    /// pointers racing on one namespace resolve in order.
     ///
     /// # Errors
     ///
-    /// [`SetError::Stale`] when the held pointer's `seq` is not below the
-    /// new one; [`SetError::Io`] when the record cannot be written.
-    pub(crate) fn set(&self, pointer: SignedPointer) -> Result<(), SetError> {
+    /// [`SetError::Stale`] when the held pointer is from the same signer and
+    /// its `seq` is not below the new one; [`SetError::Io`] when the record
+    /// cannot be written.
+    pub(crate) fn set(&self, pointer: SignedPointer, signer: Address) -> Result<(), SetError> {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(current) = live.get(&pointer.namespace).map(|p| p.seq)
-            && pointer.seq <= current
+        if let Some(held) = live.get(&pointer.namespace)
+            && held.signer == signer
+            && pointer.seq <= held.pointer.seq
         {
-            return Err(SetError::Stale { current });
+            return Err(SetError::Stale {
+                current: held.pointer.seq,
+            });
         }
-        self.write(&pointer).map_err(SetError::Io)?;
-        live.insert(pointer.namespace, pointer);
+        let record = Record { pointer, signer };
+        self.write(&record).map_err(SetError::Io)?;
+        live.insert(record.pointer.namespace, record);
         Ok(())
     }
 
-    fn write(&self, pointer: &SignedPointer) -> anyhow::Result<()> {
-        let path = self.dir.join(format!("{}.json", pointer.namespace));
-        let bytes = serde_json::to_vec(pointer).context("encode the pointer")?;
+    fn write(&self, record: &Record) -> anyhow::Result<()> {
+        let path = self.dir.join(format!("{}.json", record.pointer.namespace));
+        let bytes = serde_json::to_vec(record).context("encode the pointer")?;
         let mut file = tempfile::NamedTempFile::new_in(&self.dir)
             .with_context(|| format!("create a temp file in {}", self.dir.display()))?;
         std::io::Write::write_all(&mut file, &bytes)

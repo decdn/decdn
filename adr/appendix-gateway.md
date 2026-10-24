@@ -6,7 +6,8 @@
 > gateway with a different policy, or none.
 
 **Date:** 2026-10-24 — **Status:** Accepted (`decdn gateway --public-url`
-ships). **Touches:** `decdn` CLI (`gateway`), `decdn-client` (byte windows).
+ships). **Touches:** `decdn` CLI (`gateway`, `publish point`), `decdn-client`
+(byte windows).
 
 ## Context
 
@@ -27,7 +28,7 @@ terminates TLS. A request names what it wants by its `Host`:
 | `<host>` | `GET /<hash>[/<path>][?ns=<id>]`: a blob streams; a bundle or an entry redirects to its site. |
 | `<hash32>.<host>` | The bundle whose manifest hash is `<hash32>` (lowercase unpadded base32), as a website: `/` is its `index.html` or a listing, `/<path>` an entry. |
 | `<ns>.<hash32>.<host>` | The same site, with the namespace routing hint `<ns>`. |
-| `<ns>.<host>` | The bundle the namespace's pointer names. Without a pointer the answer is 404. |
+| `<ns>.<host>` | The bundle the namespace's [pointer](#namespace-pointer) names, as a website. Without a pointer the answer is 404. |
 
 Every other `Host` is refused. The gateway's own listen address reaches the
 bare host, for a health check.
@@ -48,7 +49,12 @@ open and top-up run inside the pull path ([ADR 003](003-payments.md#adr-003-paym
 
 `--allowance-bytes-per-day` bounds the bytes the gateway delivers per UTC
 day, over every request. The namespace hint buys no bucket of its own: a
-client sets it. The gateway counts:
+client sets it. `--allowance <ns>=<bytes>` gives one namespace a bucket of
+its own. That bucket replaces the shared one for the requests the
+namespace's pointer serves, on `<ns>.<host>`, and for those alone. A pointer
+is signed by the namespace's owner, so a request on that host is the
+namespace's. A `?ns=` query or a `<ns>.<hash32>.` label is anyone's to
+write, so it spends the shared bucket. The gateway counts:
 
 - every byte a pull lands, a manifest that does not parse included;
 - an entry's declared size before its pull, and refuses one that does not
@@ -69,6 +75,57 @@ The answers:
 | 502 | The upstream pull failed. | A bare body. The detail is in the log. |
 
 A paying client continues from the `decdn:` URI on its own.
+
+## Namespace pointer
+
+A namespace id is stable. A bundle hash changes with each publish. The
+pointer is the record that makes `<ns>.<host>` name the current bundle, so a
+publisher has one URL to give out ([ADR 002](002-content-addressing.md#adr-002-content-addressing)
+puts a mutable name above the protocol). It is gateway-local: nodes, the
+wire and the contracts never see it.
+
+The pointer is an EIP-712 record:
+
+```text
+Pointer(uint256 namespaceId,bytes32 root,uint64 seq)
+```
+
+The domain is `decdn-pointer`, version `1`, with the chain id and the
+`PublisherRegistry` address as `verifyingContract`. A pointer signed for one
+deployment means nothing on another: namespace ids repeat across chains and
+redeploys. `root` is the bundle's manifest hash. `seq` orders the pointers
+of one signer: the gateway takes a pointer only above the `seq` it holds from
+that signer, so a replayed or reordered pointer changes nothing.
+
+`decdn publish point <ns> decdn:<hash>/ --gateway <origin>` signs a pointer
+with the namespace owner's keystore and sends it as `PUT /_pointer` on the
+bare host, a JSON body `{"namespace", "root", "seq", "signature"}`. `seq`
+defaults to the Unix time, so each publish advances it. No RPC call is made
+by the CLI. The gateway answers:
+
+| Status | When |
+|--------|------|
+| 201 | The pointer is stored. The body names `namespace`, `root`, `seq` and the namespace's `url`. |
+| 409 | The signer's held pointer has a `seq` at or above this one. The body gives the held `seq`. No chain read. |
+| 422 | The body is not the record, or the signature is malformed. |
+| 403 | The signature recovers an address that does not own the namespace. |
+| 404 | The namespace does not exist on this deployment. On a loopback gateway every `PUT /_pointer` is 404. |
+| 429 | The gateway's owner lookups for this minute are spent. `Retry-After` says when. |
+| 502 | The owner could not be read on-chain. |
+
+The gateway resolves the registry from `--publisher-registry-address`, else
+`blockchain.publisher_registry_address` in the config file, else the built-in
+testnet's when it runs on that chain. It recovers the signer and reads
+`PublisherRegistry.ownerOf` once per pointer that passes the `seq` check.
+The reads come out of a budget per minute, so an anonymous flood of
+well-formed pointers costs the operator's RPC a bounded amount. A pointer
+from another signer than the held one goes to the chain whatever its `seq`:
+when the namespace changed hands, the new owner's first pointer replaces the
+old owner's, and the old owner's sequence ends.
+
+Pointers live in `<data-dir>/pointers/<ns>.json`, one file per namespace,
+with the signer each recovered to. The gateway reads them at start and fails
+to start on a damaged file. A restart changes no pointer.
 
 ## Ranges
 
@@ -102,6 +159,7 @@ start.
 | `decdn_gateway_pull_failures_funding_total` | counter | Answers 503. |
 | `decdn_gateway_pull_failures_other_total` | counter | Answers 502. |
 | `decdn_gateway_pulls_active` | gauge | Pulls handed to the worker and not yet ended. |
+| `decdn_gateway_pointer_updates_total` | counter | Namespace pointers stored through `PUT /_pointer`. |
 
 The exposition is for the operator's scraper. The listener takes a loopback
 address only.
@@ -110,6 +168,8 @@ address only.
 
 - A name on chain. A namespace pointer is a gateway-local record above the
   protocol ([ADR 002](002-content-addressing.md#adr-002-content-addressing)).
+  Two gateways may hold different pointers for one namespace; the publisher
+  points each.
 - A token or capability on the public gateway. The operator pays.
 - A bucket per client-supplied namespace hint. The hint is not a trust
   anchor.

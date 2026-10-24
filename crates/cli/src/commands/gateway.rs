@@ -95,8 +95,10 @@
 //! `PublisherRegistry` the gateway runs against, that names the bundle
 //! `<ns>.<host>` serves. The gateway recovers the signer, reads the owner
 //! on-chain, and stores the pointer under `<data-dir>/pointers/<ns>.json`
-//! when its `seq` is above the one held. `decdn publish point` signs and
-//! sends one.
+//! when its `seq` is above the one held from that signer. The owner lookups
+//! come out of a budget per minute (`POINTER_LOOKUPS_PER_MINUTE`), so an
+//! anonymous flood of pointers costs the operator's RPC no more than that.
+//! `decdn publish point` signs and sends one.
 //! Sites are separate browser origins; they are separate sites, with their
 //! own cookies and site-scoped state, only when the public host is a public
 //! suffix: the operator registers it on the Public Suffix List, as
@@ -181,6 +183,12 @@ const MAX_PAGE_DELEGATES: usize = 1024;
 
 /// The largest `PUT /_capability` or `PUT /_pointer` body.
 const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// The most on-chain owner lookups `PUT /_pointer` makes per minute. A
+/// publisher points a namespace a few times a day; past the budget the
+/// answer is 429 until the minute turns, and the operator's RPC is not an
+/// anonymous caller's to spend.
+const POINTER_LOOKUPS_PER_MINUTE: u32 = 60;
 
 /// A gateway pull that makes no verified progress for this long gives up, so
 /// a stuck request does not hold its pull slot.
@@ -390,6 +398,7 @@ fn mode(
             metrics: Metrics::default(),
             pointers,
             registry,
+            lookups: std::sync::Mutex::new(Lookups::default()),
         }),
     ))
 }
@@ -879,6 +888,36 @@ struct Public {
     pointers: Pointers,
     /// The `PublisherRegistry` a pointer's signer must own its namespace on.
     registry: Address,
+    /// The owner lookups made this minute, against
+    /// [`POINTER_LOOKUPS_PER_MINUTE`].
+    lookups: std::sync::Mutex<Lookups>,
+}
+
+/// The on-chain owner lookups `PUT /_pointer` made in one minute.
+#[derive(Debug, Default)]
+struct Lookups {
+    minute: u64,
+    used: u32,
+}
+
+impl Public {
+    /// Take one owner lookup from this minute's budget, or the seconds until
+    /// the minute turns and one is free again.
+    fn take_lookup(&self, now_secs: u64) -> Result<(), u64> {
+        let minute = now_secs / 60;
+        let mut lookups = self
+            .lookups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lookups.minute != minute {
+            *lookups = Lookups { minute, used: 0 };
+        }
+        if lookups.used >= POINTER_LOOKUPS_PER_MINUTE {
+            return Err(60 - now_secs % 60);
+        }
+        lookups.used += 1;
+        Ok(())
+    }
 }
 
 /// Parsed bundle manifests by hash, least recently used first out, within
@@ -1203,8 +1242,10 @@ impl Gateway {
 
     /// `PUT /_pointer`: store a namespace pointer signed by the namespace's
     /// owner on this deployment's `PublisherRegistry`, when its `seq` is
-    /// above the one held. The held `seq` is checked before the signature
-    /// and the chain, so a replay costs no RPC call.
+    /// above the one held from the same signer. A replay is refused on the
+    /// held `seq` before the chain is read, and the lookups that do reach
+    /// the chain come out of a budget per minute, so no anonymous caller
+    /// makes the gateway spend its RPC.
     async fn put_pointer<B>(&self, req: Request<B>) -> Response<Body>
     where
         B: HttpBody<Data = Bytes>,
@@ -1233,40 +1274,24 @@ impl Gateway {
             }
         };
         let ns = pointer.namespace;
-        if let Some(current) = public.pointers.seq(ns)
-            && pointer.seq <= current
-        {
-            return stale_pointer(current);
-        }
         let domain = pointer_domain(self.chain.chain_id, public.registry);
         let signer = match pointer.signer(&domain) {
             Ok(signer) => signer,
             Err(e) => return text(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e}\n")),
         };
-        let unreachable = |e: String| {
-            text(
-                StatusCode::BAD_GATEWAY,
-                &format!("could not read the namespace's owner on-chain: {e}\n"),
-            )
-        };
-        let rpc = match decdn_client::provider::build_read_provider(&self.chain.rpc_url) {
-            Ok(rpc) => rpc,
-            Err(e) => return unreachable(sanitize_err_chain(&e)),
-        };
-        let owner = match PublisherRegistry::new(public.registry, rpc)
-            .ownerOf(U256::from(ns))
-            .call()
-            .await
+        // From the signer whose pointer is held, only a later `seq` is new.
+        // Another signer is checked against the owner on-chain, whatever its
+        // `seq`: the namespace may have changed hands.
+        if let Some((current, held_by)) = public.pointers.held(ns)
+            && held_by == signer
+            && pointer.seq <= current
         {
-            Ok(owner) => owner,
-            Err(e) => return unreachable(sanitize_error_sources(&e)),
-        };
-        if owner.is_zero() {
-            return text(
-                StatusCode::NOT_FOUND,
-                &format!("namespace {ns} does not exist on this deployment\n"),
-            );
+            return stale_pointer(current);
         }
+        let owner = match self.namespace_owner(public, ns).await {
+            Ok(owner) => owner,
+            Err(response) => return *response,
+        };
         if owner != signer {
             return text(
                 StatusCode::FORBIDDEN,
@@ -1274,7 +1299,7 @@ impl Gateway {
             );
         }
         let (root, seq) = (pointer.root, pointer.seq);
-        match public.pointers.set(pointer) {
+        match public.pointers.set(pointer, signer) {
             Ok(()) => {}
             Err(SetError::Stale { current }) => return stale_pointer(current),
             Err(SetError::Io(e)) => {
@@ -1477,6 +1502,50 @@ impl Gateway {
             })
             .collect();
         json(StatusCode::OK, &serde_json::Value::Array(list))
+    }
+
+    /// The owner of namespace `ns` on this deployment's registry, read
+    /// on-chain within the minute's lookup budget.
+    ///
+    /// # Errors
+    ///
+    /// The answer to send instead: 429 when the budget is spent, 502 when
+    /// the chain cannot be read, 404 when the namespace does not exist.
+    async fn namespace_owner(
+        &self,
+        public: &Public,
+        ns: u64,
+    ) -> Result<Address, Box<Response<Body>>> {
+        if let Err(retry_after) = public.take_lookup(now_secs()) {
+            let mut response = text(
+                StatusCode::TOO_MANY_REQUESTS,
+                "the gateway's pointer lookups for this minute are spent\n",
+            );
+            if let Ok(retry) = header::HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, retry);
+            }
+            return Err(Box::new(response));
+        }
+        let unreachable = |e: String| {
+            Box::new(text(
+                StatusCode::BAD_GATEWAY,
+                &format!("could not read the namespace's owner on-chain: {e}\n"),
+            ))
+        };
+        let rpc = decdn_client::provider::build_read_provider(&self.chain.rpc_url)
+            .map_err(|e| unreachable(sanitize_err_chain(&e)))?;
+        let owner = PublisherRegistry::new(public.registry, rpc)
+            .ownerOf(U256::from(ns))
+            .call()
+            .await
+            .map_err(|e| unreachable(sanitize_error_sources(&e)))?;
+        if owner.is_zero() {
+            return Err(Box::new(text(
+                StatusCode::NOT_FOUND,
+                &format!("namespace {ns} does not exist on this deployment\n"),
+            )));
+        }
+        Ok(owner)
     }
 
     /// Who pays a request for `host`: the gateway's own pool on a public
