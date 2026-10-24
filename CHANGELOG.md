@@ -4089,6 +4089,15 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Client: `Streamer::open_range` streams one verified byte window (#2607).**
+  A caller that knows a blob's size opens a consumption-paced stream over
+  `[offset, offset + len)` instead of the whole blob. The fetch opens, and
+  pays for, only the chunk-group-aligned span around the window (ADR 038);
+  the reader hands out exactly the window, a zero length is a tail to the
+  proven size, a window is never teed to the cache, and a whole-blob cache
+  hit serves the window from memory. `open` is the whole-blob window. This
+  is the client half of the HTTP `Range` the public gateway answers (#2593).
+
 - **CLI: `decdn self-update` and a daily update notice (#2537).**
   `decdn self-update` resolves the latest GitHub release, verifies its
   `SHA256SUMS.minisig` against a maintainer's minisign public key embedded
