@@ -698,3 +698,23 @@ fn a_manifest_fetch_caps_at_the_manifest_size() {
     assert_eq!(manifest_cap_mb(10), 10, "a lower cap stays");
     assert_eq!(manifest_cap_mb(1 << 20), MAX_MANIFEST_MB);
 }
+
+/// The cap on bytes a fetch holds: `--max-blob-mb` (0 for none), and under
+/// it the size the caller knows the blob to have. A declared size never turns
+/// into "no cap": zero caps at one byte, so a blob a manifest calls empty
+/// still ends at its first chunk group.
+#[test]
+fn a_declared_size_caps_the_fetch_and_never_lifts_the_cap() {
+    const MIB: u64 = 1024 * 1024;
+    assert_eq!(held_cap(0, None), 0, "no cap at all");
+    assert_eq!(held_cap(2, None), 2 * MIB);
+    assert_eq!(held_cap(0, Some(5)), 5);
+    assert_eq!(
+        held_cap(2, Some(5 * MIB)),
+        2 * MIB,
+        "the smaller bound wins"
+    );
+    assert_eq!(held_cap(2, Some(5)), 5);
+    assert_eq!(held_cap(0, Some(0)), 1, "zero is a cap, not its absence");
+    assert_eq!(held_cap(2, Some(0)), 1);
+}

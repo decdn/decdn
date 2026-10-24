@@ -31,6 +31,27 @@ The image runs as uid 1000. If your host user has another uid, add
 `--user "$(id -u):$(id -g)" -e HOME=/home/decdn`. Without a TTY, mount a file that holds
 the keystore password and point `DECDN_KEYSTORE_PASSWORD_FILE` at it.
 
+## Public gateway
+
+The same image runs a public HTTP gateway that pays for every request from its own
+pool, behind a proxy that terminates TLS for `decdn.link` and `*.decdn.link` (register
+the host on the Public Suffix List, so the per-bundle sites' cookies stay apart):
+
+```bash
+docker run -d --name decdn-gateway -p 127.0.0.1:8080:8080 \
+  -v ~/.decdn:/home/decdn/.decdn \
+  -v /etc/decdn/keystore-password:/run/secrets/keystore-password:ro \
+  -e DECDN_KEYSTORE_PASSWORD_FILE=/run/secrets/keystore-password \
+  decdn/decdn gateway --public-url https://decdn.link --listen 0.0.0.0:8080 \
+  --allowance-bytes-per-day 20GiB
+```
+
+The keystore under the volume funds the pool (`--working-deposit-micro-usdc` sizes it),
+and `gateway/store` under the same volume keeps the pool and its lanes across restarts.
+`--allowance-bytes-per-day` bounds the bytes the gateway delivers per UTC day. A request
+past the allowance, or one whose size does not fit what is left, gets `402` with the
+canonical `decdn:` URI to fetch with a paying client; a pool that cannot pay gets `503`.
+
 ## Tags
 
 | Tag | Points at |

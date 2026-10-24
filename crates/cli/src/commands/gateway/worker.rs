@@ -8,7 +8,11 @@
 //! capability that overlap share one [`Payer`], and with it each lane's voucher
 //! ledger, so they advance the lane's cumulative voucher through one issuer.
 //! The payer drops when its last pull ends; every pull persists its lanes'
-//! watermarks before it ends, so the next one resumes from them.
+//! watermarks before it ends, so the next one resumes from them. A gateway
+//! that pays from its own pool ([`Payment::Pool`]) builds that payer once,
+//! with the host, and every pool pull shares it for the run; a pull that ends
+//! with a pool replacement retires it, so the next pull's ledgers know only
+//! the new pool.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,6 +21,7 @@ use std::rc::Rc;
 
 use alloy::primitives::Address;
 use decdn_common::cli::ClientFetchArgs;
+use decdn_incentive::CapabilityGrant;
 use tokio::io::DuplexStream;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -24,17 +29,42 @@ use tokio::task::JoinSet;
 use super::super::fetch::{BlobFetch, Credential, FetchHost, Payer, Sink, fetch_on};
 use super::super::fetch_timings::FetchTimings;
 
+/// Who pays for a pull.
+#[derive(Clone)]
+pub(super) enum Payment {
+    /// A capability held in memory, with the delegate key it was issued to.
+    Held(Credential),
+    /// The gateway's own pool, from its keystore.
+    Pool,
+}
+
 /// One pull the gateway hands the worker.
 pub(super) struct Job {
     /// The blob to pull.
     pub(super) blob: BlobFetch,
-    /// The capability that pays for it.
-    pub(super) paying: Credential,
+    /// Who pays for it.
+    pub(super) paying: Payment,
     /// Where its verified bytes go. The pull closes it before it reports.
     pub(super) writer: DuplexStream,
     /// The pull's result, sent once `writer` is closed.
     pub(super) done: oneshot::Sender<anyhow::Result<()>>,
+    /// Whether to start the pull, asked once it has its slot: what changed
+    /// while it waited (an allowance the pulls before it spent) can still
+    /// refuse it. `false` ends the job with [`NotAdmitted`] and no paid work.
+    pub(super) admit: Option<Box<dyn FnOnce() -> bool + Send>>,
 }
+
+/// A job its [`Job::admit`] check refused at its slot.
+#[derive(Debug)]
+pub(super) struct NotAdmitted;
+
+impl std::fmt::Display for NotAdmitted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the pull was not admitted once it had its slot")
+    }
+}
+
+impl std::error::Error for NotAdmitted {}
 
 /// What the worker runs pulls on: [`FetchBackend`], or a stand-in in tests.
 pub(super) trait Backend: Send + 'static {
@@ -49,6 +79,14 @@ pub(super) trait Backend: Send + 'static {
     /// The payer for the pulls `credential` pays for.
     fn payer(&self, credential: Credential) -> anyhow::Result<Self::Payer>;
 
+    /// The payer every [`Payment::Pool`] pull shares, built on `host` once
+    /// the host is, or `None` when the gateway pays with held credentials
+    /// only.
+    async fn pool_payer(&self, host: &Self::Host) -> anyhow::Result<Option<Self::Payer>> {
+        let _ = host;
+        Ok(None)
+    }
+
     /// Pull `blob` on `host`, paid by `payer`, into `sink`.
     async fn pull(
         &self,
@@ -62,31 +100,44 @@ pub(super) trait Backend: Send + 'static {
     async fn close(&self, host: Self::Host);
 }
 
-/// The real backend: `decdn get`'s blob fetch, paid with held keys.
+/// The real backend: `decdn get`'s blob fetch, paid with held keys or from
+/// the keystore's own pool.
 pub(super) struct FetchBackend {
     /// The retrieval flags the host resolves.
     pub(super) common: ClientFetchArgs,
     /// The global `--config`.
     pub(super) config_path: Option<PathBuf>,
+    /// Whether the gateway pays from its keystore's own pool: the host then
+    /// reads `--keystore` and funds the pool, and every [`Payment::Pool`] pull
+    /// shares one payer. Otherwise every pull pays with a held key.
+    pub(super) pool: bool,
 }
 
 impl Backend for FetchBackend {
-    type Host = FetchHost;
+    /// The host, and the `--capability` delegation the flags name, if any.
+    type Host = (FetchHost, Option<CapabilityGrant>);
     type Payer = Payer;
 
-    async fn open(&self) -> anyhow::Result<FetchHost> {
-        let (host, _no_grant) =
-            FetchHost::open(&self.common, self.config_path.as_deref(), true).await?;
-        Ok(host)
+    async fn open(&self) -> anyhow::Result<Self::Host> {
+        FetchHost::open(&self.common, self.config_path.as_deref(), !self.pool).await
     }
 
     fn payer(&self, credential: Credential) -> anyhow::Result<Payer> {
         Payer::held(credential)
     }
 
+    async fn pool_payer(&self, (host, grant): &Self::Host) -> anyhow::Result<Option<Payer>> {
+        if !self.pool {
+            return Ok(None);
+        }
+        let payer = Payer::pool(grant.clone(), host.escrows.clone());
+        payer.unlock(host).await?;
+        Ok(Some(payer))
+    }
+
     async fn pull(
         &self,
-        host: &FetchHost,
+        (host, _): &Self::Host,
         payer: &Payer,
         blob: &BlobFetch,
         sink: &mut Sink,
@@ -97,7 +148,7 @@ impl Backend for FetchBackend {
         result
     }
 
-    async fn close(&self, host: FetchHost) {
+    async fn close(&self, (host, _): Self::Host) {
         host.close().await;
     }
 }
@@ -182,8 +233,27 @@ impl PullWorker {
     }
 }
 
-/// The payers of the pulls in flight, by the signer that pays.
-type Payers<P> = Rc<RefCell<HashMap<Address, Rc<P>>>>;
+/// Whose payer a pull runs under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PayerId {
+    /// The delegate key a held credential was issued to.
+    Signer(Address),
+    /// The gateway's own pool.
+    Pool,
+}
+
+impl PayerId {
+    fn of(paying: &Payment) -> Self {
+        match paying {
+            Payment::Held(credential) => Self::Signer(credential.signer.address()),
+            Payment::Pool => Self::Pool,
+        }
+    }
+}
+
+/// The payers of the pulls in flight, by who pays; the pool payer, when there
+/// is one, for the whole run.
+type Payers<P> = Rc<RefCell<HashMap<PayerId, Rc<P>>>>;
 
 /// The worker thread's body: build the host, then run each job as a local
 /// task until told to stop.
@@ -195,16 +265,28 @@ async fn run<B: Backend>(
     ready: oneshot::Sender<anyhow::Result<()>>,
 ) {
     let host = match backend.open().await {
-        Ok(host) => Rc::new(host),
+        Ok(host) => host,
         Err(e) => {
             let _ = ready.send(Err(e));
             return;
         }
     };
+    let payers: Payers<B::Payer> = Rc::default();
+    match backend.pool_payer(&host).await {
+        Ok(Some(payer)) => {
+            payers.borrow_mut().insert(PayerId::Pool, Rc::new(payer));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            backend.close(host).await;
+            let _ = ready.send(Err(e));
+            return;
+        }
+    }
+    let host = Rc::new(host);
     let _ = ready.send(Ok(()));
     let backend = Rc::new(backend);
     let slots = Rc::new(Semaphore::new(max_pulls));
-    let payers: Payers<B::Payer> = Rc::default();
     let mut tasks = JoinSet::new();
     loop {
         tokio::select! {
@@ -246,12 +328,19 @@ async fn pull<B: Backend>(
         paying,
         writer,
         done,
+        admit,
     } = job;
     let Ok(_slot) = slots.acquire().await else {
         return;
     };
-    let signer = paying.signer.address();
-    let payer = match payer_for(&*backend, &payers, signer, paying) {
+    if let Some(admit) = admit
+        && !admit()
+    {
+        let _ = done.send(Err(anyhow::Error::new(NotAdmitted)));
+        return;
+    }
+    let id = PayerId::of(&paying);
+    let payer = match payer_for(&*backend, &payers, id, paying) {
         Ok(payer) => payer,
         Err(e) => {
             let _ = done.send(Err(e));
@@ -262,34 +351,91 @@ async fn pull<B: Backend>(
     let result = backend.pull(&host, &payer, &blob, &mut sink).await;
     // The gateway reads the pipe to its end before it waits for the result.
     drop(sink);
-    release(&payers, signer, &payer);
+    match id {
+        PayerId::Pool => {
+            if let Some(replaced) = result
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<decdn_client::PoolReplaced>())
+            {
+                rebuild_pool_payer(&*backend, &host, &payers, &payer, *replaced).await;
+            }
+        }
+        PayerId::Signer(_) => release(&payers, id, &payer),
+    }
     drop(payer);
     let _ = done.send(result);
 }
 
-/// The payer of the pulls in flight under `signer`, or a new one for
-/// `paying`.
+/// The payer of the pulls in flight under `id`, or a new one for a held
+/// credential.
+///
+/// # Errors
+///
+/// A pool pull on a gateway with no pool payer, or a credential whose payer
+/// cannot be built.
 fn payer_for<B: Backend>(
     backend: &B,
     payers: &Payers<B::Payer>,
-    signer: Address,
-    paying: Credential,
+    id: PayerId,
+    paying: Payment,
 ) -> anyhow::Result<Rc<B::Payer>> {
     let mut payers = payers.borrow_mut();
-    if let Some(payer) = payers.get(&signer) {
+    if let Some(payer) = payers.get(&id) {
         return Ok(Rc::clone(payer));
     }
-    let payer = Rc::new(backend.payer(paying)?);
-    payers.insert(signer, Rc::clone(&payer));
+    let Payment::Held(credential) = paying else {
+        anyhow::bail!("this gateway has no pool of its own to pay from");
+    };
+    let payer = Rc::new(backend.payer(credential)?);
+    payers.insert(id, Rc::clone(&payer));
     Ok(payer)
 }
 
 /// Drop `payer` from the map when no pull but the caller's holds it.
-fn release<P>(payers: &Payers<P>, signer: Address, payer: &Rc<P>) {
+fn release<P>(payers: &Payers<P>, id: PayerId, payer: &Rc<P>) {
     let mut payers = payers.borrow_mut();
     // The map's copy and the caller's are the last two.
     if Rc::strong_count(payer) <= 2 {
-        payers.remove(&signer);
+        payers.remove(&id);
+    }
+}
+
+/// Retire the pool payer `retired` after a pull under it ended with
+/// `replaced`, and build the next pool pull's payer: the retired one's lane
+/// ledgers count the closed pool's lanes, which would understate the new
+/// pool's headroom. Pulls still running under the retired payer keep it. A
+/// pull that finds another already retired it changes nothing.
+async fn rebuild_pool_payer<B: Backend>(
+    backend: &B,
+    host: &B::Host,
+    payers: &Payers<B::Payer>,
+    retired: &Rc<B::Payer>,
+    replaced: decdn_client::PoolReplaced,
+) {
+    {
+        let mut payers = payers.borrow_mut();
+        let current = payers
+            .get(&PayerId::Pool)
+            .is_some_and(|current| Rc::ptr_eq(current, retired));
+        if !current {
+            return;
+        }
+        payers.remove(&PayerId::Pool);
+    }
+    tracing::warn!(
+        closed = %replaced.closed,
+        opened = %replaced.opened,
+        "the gateway's pool was replaced; once its dispute window ends, reclaim the closed \
+         pool with `decdn pool reclaim --pool {}`",
+        replaced.closed
+    );
+    match backend.pool_payer(host).await {
+        Ok(Some(payer)) => {
+            payers.borrow_mut().insert(PayerId::Pool, Rc::new(payer));
+        }
+        Ok(None) => {}
+        Err(e) => tracing::error!(error = %e, "the gateway cannot rebuild its pool payer"),
     }
 }
 

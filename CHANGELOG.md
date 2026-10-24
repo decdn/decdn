@@ -4089,6 +4089,20 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: `decdn gateway --public-url` serves anyone from its own pool
+  (#2608).** A public gateway serves a domain behind a TLS-terminating
+  proxy: `<origin>/<hash>[/<path>]` on the bare host, every bundle as a site
+  at `[<ns>.]<hash32>.<host>`, and a namespace host that answers 404 until it
+  has a pointer. It takes no token and no capability: every request pays from
+  the keystore's own pool, and `--allowance-bytes-per-day` bounds the bytes it
+  delivers per UTC day. A request past the allowance, or an entry that does
+  not fit what is left, answers 402 before any pull; a stream of unknown size
+  is cut when the allowance runs out; a pool that cannot pay answers 503. Each
+  names the canonical `decdn:` URI in a `Link` header and a JSON body. `HEAD`
+  is answered from the bundle manifest at no pull of the entry. The buyer
+  store lives in `<data-dir>/store`, so the pool survives a restart. Loopback
+  mode is unchanged. Part of #2593.
+
 - **CLI: `decdn gateway` serves every bundle as a website on its own origin
   (#2457).** `http://[<ns>.]<hash32>.localhost:<port>/` (`<hash32>` is the
   manifest hash in lowercase unpadded base32) serves the bundle's
