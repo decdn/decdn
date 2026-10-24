@@ -12,7 +12,22 @@
 //! token holder's own registration before a page's, then the earlier
 //! registration. A capability whose pull stops for funding before its first
 //! byte is retired and the next covering one takes the request. `HEAD` gets
-//! 405, since answering it would cost a paid pull.
+//! 405, since answering it would cost a paid pull. A bundle request without
+//! the token redirects to the bundle's site, at no cost.
+//!
+//! **Sites.** Every bundle is also a website on its own browser origin,
+//! `http://[<ns>.]<hash32>.localhost:<port>/` (`site`), so its pages run
+//! isolated from every other bundle and from the gateway, with no extension.
+//! `/` serves the bundle's `index.html` (or a file list), `/<path>` the entry
+//! at `<path>`, and a directory path its `index.html`; HTML, SVG and scripts
+//! are served as themselves, under a policy that confines the page to its
+//! origin. A site's `decdn:` URIs are rewritten as the page streams
+//! (`rewrite`) to `/_decdn/<hash>…` on the site's own origin, which serves
+//! that content to the page's own requests and redirects a navigation to the
+//! other bundle's site. The site origin takes no token: the browser's
+//! `Sec-Fetch-*` headers decide what may spend (`site::may_spend`), and a
+//! site pays with the capability that covers its host, as a page's request
+//! does. `/_delegate` and `/_capability` answer on the gateway origin only.
 //!
 //! **Capabilities.** The gateway holds one delegate key per capability, in
 //! memory only. `GET /_delegate` mints a fresh key and returns its address, so
@@ -38,7 +53,8 @@
 //! content never does, so a page can neither read a response nor set the
 //! token or host headers itself. The token lives in `<data-dir>/token`,
 //! owner-only. The gateway listens on loopback only and checks `Host` against
-//! DNS rebinding.
+//! DNS rebinding: it answers its own loopback names and well-formed site
+//! names on its port, nothing else.
 //!
 //! **Pulls.** Every pull runs the blob fetch of `decdn get` with its bytes
 //! going to the HTTP response, on one long-lived worker thread: the endpoint,
@@ -83,8 +99,12 @@ use super::fetch::{
 };
 use crate::known_chains;
 
+mod rewrite;
+mod site;
 mod worker;
 
+use rewrite::Rewrite;
+use site::Site;
 use worker::{FetchBackend, Job, PullWorker};
 
 /// The request header carrying the gateway token.
@@ -185,6 +205,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts(args.listen),
+        listen: args.listen,
     });
 
     println!(
@@ -596,6 +617,9 @@ struct Gateway {
     /// pull and pay once. Cache hits never wait on it.
     manifest_fill: Mutex<()>,
     hosts: Vec<String>,
+    /// The address the gateway listens on: its own origin, and the port of
+    /// every site origin.
+    listen: SocketAddr,
 }
 
 /// Parsed bundle manifests by hash, least recently used first out, within
@@ -644,6 +668,19 @@ enum PullError {
     Other(anyhow::Error),
 }
 
+/// How a response presents what it serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Present {
+    /// On the gateway origin: active types as plain text, a bundle as a list
+    /// of `decdn:` links.
+    Bare,
+    /// On a site origin: each type as itself, `decdn:` URIs in HTML and CSS
+    /// rewritten, a bundle as its `index.html` or a list of relative links.
+    Site,
+    /// As a file to save.
+    Download,
+}
+
 /// The capability a content request pays with.
 struct Paying {
     signer: Arc<PrivateKeySigner>,
@@ -661,6 +698,16 @@ impl Gateway {
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
+        if let Some(site) = Site::from_host(host, self.listen.port()) {
+            let policy = site::content_security_policy(self.listen);
+            let mut response = self.site(req, site).await;
+            if let Ok(policy) = header::HeaderValue::from_str(&policy) {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_SECURITY_POLICY, policy);
+            }
+            return response;
+        }
         if !self.hosts.iter().any(|allowed| allowed == host) {
             return text(StatusCode::FORBIDDEN, "unknown Host\n");
         }
@@ -677,8 +724,9 @@ impl Gateway {
             (Method::OPTIONS, _) => text(StatusCode::FORBIDDEN, "no cross-origin access\n"),
             (Method::GET, "/") => html(
                 StatusCode::OK,
-                "<h1>decdn gateway</h1><p>Running. Connect the deCDN browser extension with \
-                 the token <code>decdn gateway</code> printed when it started.</p>",
+                "<h1>decdn gateway</h1><p>Running. Open a bundle as a website at \
+                 <code>/&lt;hash&gt;/</code>. Connect the deCDN browser extension with the \
+                 token <code>decdn gateway</code> printed when it started.</p>",
             ),
             (Method::GET, "/favicon.ico") => text(StatusCode::NOT_FOUND, ""),
             (Method::GET, "/_delegate") => {
@@ -697,14 +745,7 @@ impl Gateway {
             }
             (Method::GET, "/_capability") if authorized => self.list().await,
             (Method::GET, "/_capability") => text(StatusCode::UNAUTHORIZED, "token required\n"),
-            // A HEAD answer would cost a paid pull and then drop its bytes.
-            (Method::HEAD, _) => {
-                let mut response = text(StatusCode::METHOD_NOT_ALLOWED, "");
-                response
-                    .headers_mut()
-                    .insert(header::ALLOW, header::HeaderValue::from_static("GET"));
-                response
-            }
+            (Method::HEAD, _) => head_refused(),
             (Method::GET, _) => {
                 let target = req
                     .uri()
@@ -716,6 +757,74 @@ impl Gateway {
             }
             _ => text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
         }
+    }
+
+    /// A request on a site origin: the site's own entries, and `/_decdn/` for
+    /// content outside its bundle.
+    async fn site<B>(self: Arc<Self>, req: Request<B>, site: Site) -> Response<Body> {
+        match *req.method() {
+            Method::GET => {}
+            Method::HEAD => return head_refused(),
+            _ => return text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
+        }
+        let path = req.uri().path();
+        if matches!(path, "/_delegate" | "/_capability") {
+            return text(
+                StatusCode::NOT_FOUND,
+                "the gateway API answers on the gateway origin only\n",
+            );
+        }
+        let headers = req.headers();
+        if let Err((status, why)) = site::may_spend(headers, self.authorized(headers)) {
+            return text(status, why);
+        }
+        let page_host = site.host();
+        let target = req.uri().path_and_query().map_or(path, |pq| pq.as_str());
+        if let Some(rest) = target.strip_prefix("/_decdn/") {
+            let uri: DecdnUri = match format!("decdn:{rest}").parse() {
+                Ok(uri) => uri,
+                Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
+            };
+            if !site::is_navigation(headers) {
+                return self.paid(&page_host, &uri, Present::Site).await;
+            }
+            // Another bundle's pages run on their own origin; a blob has none.
+            return match uri.target {
+                UriTarget::Blob => self.paid(&page_host, &uri, Present::Download).await,
+                _ => self.to_site(&uri),
+            };
+        }
+        // The query belongs to the page's scripts; a directory serves its
+        // `index.html`.
+        let entry = if path.len() > 1 && path.ends_with('/') {
+            format!("{path}index.html")
+        } else {
+            path.to_owned()
+        };
+        let hex = alloy::hex::encode(site.hash);
+        let uri = match format!("decdn:{hex}{entry}").parse::<DecdnUri>() {
+            Ok(uri) => DecdnUri::new(uri.hash, uri.target, site.namespace),
+            Err(e) => return text(StatusCode::NOT_FOUND, &format!("{e}\n")),
+        };
+        self.paid(&page_host, &uri, Present::Site).await
+    }
+
+    /// A redirect to the site that serves bundle `uri`, at its entry path.
+    fn to_site(&self, uri: &DecdnUri) -> Response<Body> {
+        let site = Site {
+            hash: uri.hash,
+            namespace: uri.namespace,
+        };
+        let path = match &uri.target {
+            UriTarget::Bundle => String::new(),
+            UriTarget::BundleEntry(path) => entry_link(uri.hash, path),
+            _ => return text(StatusCode::BAD_REQUEST, "a blob has no site\n"),
+        };
+        redirect(&format!(
+            "http://{}:{}/{path}",
+            site.host(),
+            self.listen.port()
+        ))
     }
 
     fn authorized(&self, headers: &HeaderMap) -> bool {
@@ -915,8 +1024,16 @@ impl Gateway {
         authorized: bool,
         rest: &str,
     ) -> Response<Body> {
+        let uri: DecdnUri = match format!("decdn:{rest}").parse() {
+            Ok(uri) => uri,
+            Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
+        };
         if !authorized {
-            return text(StatusCode::UNAUTHORIZED, "token required\n");
+            // A browser without the extension opens a bundle as its site.
+            return match uri.target {
+                UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
+                _ => text(StatusCode::UNAUTHORIZED, "token required\n"),
+            };
         }
         let Some(page_host) = headers
             .get(HOST_HEADER)
@@ -925,15 +1042,22 @@ impl Gateway {
         else {
             return text(StatusCode::UNAUTHORIZED, "page host required\n");
         };
-        let uri: DecdnUri = match format!("decdn:{rest}").parse() {
-            Ok(uri) => uri,
-            Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
-        };
+        self.paid(&page_host, &uri, Present::Bare).await
+    }
+
+    /// Serve `uri` as `present` says, paid with the capability that covers
+    /// `page_host`.
+    async fn paid(
+        self: &Arc<Self>,
+        page_host: &str,
+        uri: &DecdnUri,
+        present: Present,
+    ) -> Response<Body> {
         // A funding stop retires the capability and the next covering one
         // takes the request, so a capability that cannot pay costs a retry,
         // never a failed load. Each pass retires one, so the loop ends.
         loop {
-            let Some(paying) = self.paying_for(&page_host).await else {
+            let Some(paying) = self.paying_for(page_host).await else {
                 return text(
                     StatusCode::PAYMENT_REQUIRED,
                     &format!("no capability covers {page_host}\n"),
@@ -941,13 +1065,14 @@ impl Gateway {
             };
             let result = match &uri.target {
                 UriTarget::Blob => {
-                    self.stream(uri.hash, uri.namespace, &paying, None, None)
+                    self.stream(uri.hash, uri.namespace, &paying, None, None, present)
                         .await
                 }
                 UriTarget::BundleEntry(path) => {
-                    self.entry(uri.hash, uri.namespace, path, &paying).await
+                    self.entry(uri.hash, uri.namespace, path, &paying, present)
+                        .await
                 }
-                UriTarget::Bundle => self.index(uri.hash, uri.namespace, &paying).await,
+                UriTarget::Bundle => self.index(uri.hash, uri.namespace, &paying, present).await,
                 _ => return text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
             };
             match result {
@@ -970,41 +1095,78 @@ impl Gateway {
 
     /// One bundle entry, by its literal manifest path. A path the manifest
     /// lacks answers 404, and so does a blob that is not a manifest or a
-    /// malformed one ([`Self::manifest`]).
+    /// malformed one ([`Self::manifest`]). On a site, a path that names a
+    /// directory with an `index.html` redirects to the directory.
     async fn entry(
         self: &Arc<Self>,
         manifest_hash: [u8; 32],
         namespace: Option<u64>,
         path: &str,
         paying: &Paying,
+        present: Present,
     ) -> Result<Response<Body>, PullError> {
         let manifest = self.manifest(manifest_hash, namespace, paying).await?;
-        let Some(entry) = manifest.entries.iter().find(|e| e.path == path) else {
-            return Ok(text(
-                StatusCode::NOT_FOUND,
-                &format!("the bundle has no entry {path:?}\n"),
-            ));
-        };
-        self.stream(entry.hash, namespace, paying, Some(path), entry.size)
-            .await
+        if let Some(entry) = manifest.entries.iter().find(|e| e.path == path) {
+            return self
+                .stream(
+                    entry.hash,
+                    namespace,
+                    paying,
+                    Some(path),
+                    entry.size,
+                    present,
+                )
+                .await;
+        }
+        let index = format!("{path}/index.html");
+        if present == Present::Site && manifest.entries.iter().any(|e| e.path == index) {
+            // Relative to the request, so it holds under `/_decdn/` too.
+            let link = entry_link(manifest_hash, path);
+            let last = link.rsplit('/').next().unwrap_or(&link);
+            return Ok(redirect(&format!("{last}/")));
+        }
+        Ok(text(
+            StatusCode::NOT_FOUND,
+            &format!("the bundle has no entry {path:?}\n"),
+        ))
     }
 
-    /// An HTML index of a bundle's entries, each linking to its gateway URL.
+    /// A bundle as a whole: on a site, its `index.html` when it has one;
+    /// otherwise an HTML index of its entries, each linking to its URL.
     async fn index(
         self: &Arc<Self>,
         manifest_hash: [u8; 32],
         namespace: Option<u64>,
         paying: &Paying,
+        present: Present,
     ) -> Result<Response<Body>, PullError> {
         let manifest = self.manifest(manifest_hash, namespace, paying).await?;
+        if present == Present::Site
+            && let Some(entry) = manifest.entries.iter().find(|e| e.path == "index.html")
+        {
+            return self
+                .stream(
+                    entry.hash,
+                    namespace,
+                    paying,
+                    Some(&entry.path),
+                    entry.size,
+                    present,
+                )
+                .await;
+        }
         let mut rows = String::new();
         for entry in &manifest.entries {
-            let link = DecdnUri::new(
-                manifest_hash,
-                UriTarget::BundleEntry(entry.path.clone()),
-                namespace,
-            )
-            .to_string();
+            let link = if present == Present::Site {
+                format!("./{}", entry_link(manifest_hash, &entry.path))
+            } else {
+                DecdnUri::new(
+                    manifest_hash,
+                    UriTarget::BundleEntry(entry.path.clone()),
+                    namespace,
+                )
+                .to_string()
+            };
             let size = entry.size.map_or_else(String::new, human_bytes);
             let _ = write!(
                 rows,
@@ -1093,8 +1255,9 @@ impl Gateway {
         Ok(manifest)
     }
 
-    /// A response streaming `hash`'s verified bytes. Errors that come before
-    /// the first byte become the error status; a later one aborts the body.
+    /// A response streaming `hash`'s verified bytes, presented as `present`
+    /// says. Errors that come before the first byte become the error status;
+    /// a later one aborts the body.
     async fn stream(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -1102,52 +1265,91 @@ impl Gateway {
         paying: &Paying,
         path: Option<&str>,
         size: Option<u64>,
+        present: Present,
     ) -> Result<Response<Body>, PullError> {
-        let (first, reader, done) = self
-            .start_pull(hash, namespace, paying, self.common.max_blob_mb)
-            .await?;
-        let state = (Some(first), reader, Some(done));
-        let gateway = Arc::clone(self);
-        let signer = paying.signer.address();
-        let body = futures_util::stream::unfold(state, move |(first, mut reader, done)| {
-            let gateway = Arc::clone(&gateway);
-            async move {
-                if let Some(first) = first {
-                    return Some((Ok(Frame::data(first)), (None, reader, done)));
-                }
-                let mut buf = vec![0u8; CHUNK_BYTES];
-                match reader.read(&mut buf).await {
-                    Ok(0) => match finished(done?).await {
-                        Ok(()) => None,
-                        // The verified prefix is already out: abort the body so the
-                        // browser does not take it for the whole file.
-                        Err(e) => {
-                            if matches!(e, PullError::Funding(_)) {
-                                gateway.mark_spent(signer).await;
-                            }
-                            Some((
-                                Err(std::io::Error::other(pull_error_text(&e))),
-                                (None, reader, None),
-                            ))
-                        }
-                    },
-                    Ok(n) => {
-                        buf.truncate(n);
-                        Some((Ok(Frame::data(Bytes::from(buf))), (None, reader, done)))
-                    }
-                    Err(e) => Some((Err(e), (None, reader, None))),
-                }
-            }
-        });
         let name = path
             .and_then(|p| p.rsplit('/').next())
             .map_or_else(|| alloy::hex::encode(hash), str::to_owned);
+        let (content_type, rewrite) = match present {
+            Present::Bare | Present::Download => (content_type(&name), None),
+            Present::Site => {
+                let content_type = site::content_type(&name);
+                let essence = content_type.split(';').next().unwrap_or_default();
+                let rewrite = Rewrite::for_type(essence);
+                (content_type, rewrite)
+            }
+        };
+        // A rewrite changes the length.
+        let size = size.filter(|_| rewrite.is_none());
+        let (first, reader, done) = self
+            .start_pull(hash, namespace, paying, self.common.max_blob_mb)
+            .await?;
+        let state = Streaming {
+            first: Some(first),
+            reader,
+            done: Some(done),
+            rewrite,
+        };
+        let gateway = Arc::clone(self);
+        let signer = paying.signer.address();
+        let body = futures_util::stream::unfold(state, move |mut s| {
+            let gateway = Arc::clone(&gateway);
+            async move {
+                let chunk = if let Some(first) = s.first.take() {
+                    first
+                } else {
+                    let mut buf = vec![0u8; CHUNK_BYTES];
+                    match s.reader.read(&mut buf).await {
+                        Ok(0) => {
+                            if let Err(e) = finished(s.done.take()?).await {
+                                // The verified prefix is already out: abort the
+                                // body so the browser does not take it for the
+                                // whole file.
+                                if matches!(e, PullError::Funding(_)) {
+                                    gateway.mark_spent(signer).await;
+                                }
+                                s.rewrite = None;
+                                let e = std::io::Error::other(pull_error_text(&e));
+                                return Some((Err(e), s));
+                            }
+                            // The pull is whole: the rewrite lets out its tail.
+                            let tail = s.rewrite.take()?.finish().map(Frame::data);
+                            return Some((tail, s));
+                        }
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Bytes::from(buf)
+                        }
+                        Err(e) => {
+                            s.done = None;
+                            return Some((Err(e), s));
+                        }
+                    }
+                };
+                let out = match s.rewrite.as_mut() {
+                    Some(rewrite) => rewrite.feed(&chunk),
+                    None => Ok(chunk),
+                };
+                if out.is_err() {
+                    s.done = None;
+                }
+                Some((out.map(Frame::data), s))
+            }
+        });
+        let disposition = if present == Present::Download {
+            "attachment"
+        } else {
+            "inline"
+        };
         let mut response = Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type(&name))
+            .header(header::CONTENT_TYPE, content_type)
             .header(
                 header::CONTENT_DISPOSITION,
-                format!("inline; filename=\"{}\"", name.replace(['"', '\\'], "_")),
+                format!(
+                    "{disposition}; filename=\"{}\"",
+                    name.replace(['"', '\\'], "_")
+                ),
             )
             .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
         if let Some(size) = size {
@@ -1191,6 +1393,16 @@ impl Gateway {
         let (first, done_rx) = first_chunk(&mut reader, done_rx).await?;
         Ok((first, reader, done_rx))
     }
+}
+
+/// A response body in flight: the pull's first bytes until they go out, the
+/// pipe the rest arrives on, the pull's result until it is read, and the
+/// rewrite the bytes pass through, if any.
+struct Streaming {
+    first: Option<Bytes>,
+    reader: DuplexStream,
+    done: Option<oneshot::Receiver<anyhow::Result<()>>>,
+    rewrite: Option<Rewrite>,
 }
 
 /// The pull's first verified bytes, or the error it ended with before any.
@@ -1255,6 +1467,16 @@ fn over_manifest_cap(e: PullError, cap_mb: u64, raw: Option<&str>) -> PullError 
         }
         e => e,
     }
+}
+
+/// Entry `path` of bundle `hash` as a relative URL path, each segment
+/// percent-encoded as in its `decdn:` URI.
+fn entry_link(hash: [u8; 32], path: &str) -> String {
+    let uri = DecdnUri::new(hash, UriTarget::BundleEntry(path.to_owned()), None).to_string();
+    // `decdn:<hash>/` precedes the path.
+    uri.get(decdn_client::uri::SCHEME.len() + 65..)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// The hint to fetch blob `hash` raw, at its gateway path.
@@ -1330,6 +1552,23 @@ fn content_type(name: &str) -> String {
     } else {
         guess.essence_str().to_owned()
     }
+}
+
+/// The answer to `HEAD`, which would cost a paid pull and then drop its bytes.
+fn head_refused() -> Response<Body> {
+    let mut response = text(StatusCode::METHOD_NOT_ALLOWED, "");
+    response
+        .headers_mut()
+        .insert(header::ALLOW, header::HeaderValue::from_static("GET"));
+    response
+}
+
+fn redirect(location: &str) -> Response<Body> {
+    let mut response = text(StatusCode::FOUND, "");
+    if let Ok(location) = header::HeaderValue::from_str(location) {
+        response.headers_mut().insert(header::LOCATION, location);
+    }
+    response
 }
 
 fn full(body: String) -> Body {
