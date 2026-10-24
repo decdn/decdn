@@ -4089,7 +4089,7 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
-- **CLI: a namespace is a stable host on a public gateway (#PR_NUMBER).**
+- **CLI: a namespace is a stable host on a public gateway (#2614).**
   `decdn publish point <ns> decdn:<hash>/ --gateway <origin>` signs a
   namespace pointer (an EIP-712 record over the `PublisherRegistry`
   deployment: `namespaceId`, `root`, `seq`) with the namespace owner's
