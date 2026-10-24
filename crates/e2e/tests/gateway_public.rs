@@ -148,6 +148,10 @@ async fn run() -> anyhow::Result<()> {
                         ALLOWANCE,
                         "--metrics-listen",
                         &metrics,
+                        // A public gateway verifies namespace pointers, and
+                        // anvil is no chain the CLI knows a registry for.
+                        "--publisher-registry-address",
+                        &format!("{}", chain.addrs().publisher_registry),
                     ]),
                     chain_flags(&chain),
                     node_flags(&chain, &node),
