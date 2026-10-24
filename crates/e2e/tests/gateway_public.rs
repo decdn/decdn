@@ -16,6 +16,7 @@
 //!   4. The entry no longer fits the day's allowance: `402` naming its
 //!      `decdn:` URI, before any pull.
 //!   5. An unknown `Host` gets `403`.
+//!   6. The metrics listener on loopback counts what the gateway served.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and built `decdn` and `decdn-node` binaries:
@@ -128,6 +129,7 @@ async fn run() -> anyhow::Result<()> {
     // ---- GATEWAY: public, pinned to the node, on a free loopback port ----
     let port = free_port()?;
     let listen = format!("127.0.0.1:{port}");
+    let metrics = format!("127.0.0.1:{}", free_port()?);
     let mut gateway =
         tokio::process::Command::from(decdn_command(gateway_dir.path(), KEYSTORE_PASSWORD)?)
             .args(
@@ -144,6 +146,8 @@ async fn run() -> anyhow::Result<()> {
                         &DEPOSIT_MICRO_USDC.to_string(),
                         "--allowance-bytes-per-day",
                         ALLOWANCE,
+                        "--metrics-listen",
+                        &metrics,
                     ]),
                     chain_flags(&chain),
                     node_flags(&chain, &node),
@@ -346,6 +350,38 @@ async fn run() -> anyhow::Result<()> {
     // ---- (5) An unknown host ----
     let (status, _, _) = get("evil.test", "/").await?;
     anyhow::ensure!(status == StatusCode::FORBIDDEN, "evil.test: {status}");
+
+    // ---- (6) The metrics listener ----
+    let exposition = http
+        .get(format!("http://{metrics}/metrics"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let counter = |name: &str| {
+        exposition
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} ")))
+            .and_then(|n| n.parse::<u64>().ok())
+            .with_context(|| format!("{name} in the exposition"))
+    };
+    anyhow::ensure!(
+        counter("decdn_gateway_bytes_served_total")? >= 6 * a.len() as u64,
+        "bytes served: {exposition}"
+    );
+    anyhow::ensure!(
+        counter("decdn_gateway_requests_allowance_exhausted_total")? == 1,
+        "402s: {exposition}"
+    );
+    anyhow::ensure!(
+        counter("decdn_gateway_requests_refused_total")? >= 2,
+        "refused (416 and 403): {exposition}"
+    );
+    anyhow::ensure!(
+        counter("decdn_gateway_pulls_active")? == 0,
+        "pulls in flight: {exposition}"
+    );
 
     gateway.start_kill().context("stop the gateway")?;
     let _ = gateway.wait().await;
