@@ -98,12 +98,10 @@
 //! when its `seq` is above every one stored from that signer. The owner
 //! lookups come out of a budget per minute (`POINTER_LOOKUPS_PER_MINUTE`),
 //! so an anonymous flood of pointers costs the operator's RPC no more than
-//! that; a signer verified within `OWNER_VERIFIED_TTL_SECS` is not asked of
-//! the chain again for its own next pointer, so the flood does not keep a
-//! publisher from updating. Pointer writes run one at a time, lookup
-//! included, so a stale owner read never overtakes a fresher one. Limits per
-//! client belong on the proxy, which knows the client. `decdn publish point`
-//! signs and sends one.
+//! that, and while the budget is spent a pointer waits for the next minute:
+//! limits per client belong on the proxy, which knows the client. Pointer
+//! writes run one at a time, lookup included, so a stale owner read never
+//! overtakes a fresher one. `decdn publish point` signs and sends one.
 //! Sites are separate browser origins; they are separate sites, with their
 //! own cookies and site-scoped state, only when the public host is a public
 //! suffix: the operator registers it on the Public Suffix List, as
@@ -195,12 +193,9 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// anonymous caller's to spend.
 const POINTER_LOOKUPS_PER_MINUTE: u32 = 60;
 
-/// How long an owner lookup that admitted a signer stands for that signer's
-/// next pointers on the same namespace. Within it, an update from the holder
-/// costs no lookup, and no budget; after it, the chain is asked again, so a
-/// namespace that changed hands stops taking its former owner's pointers
-/// within the hour even if the new owner has not pointed it yet.
-const OWNER_VERIFIED_TTL_SECS: u64 = 3600;
+/// How long an owner lookup may take. The lookup runs under the pointer
+/// write lock, so a hung RPC would otherwise hold every pointer write.
+const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A gateway pull that makes no verified progress for this long gives up, so
 /// a stuck request does not hold its pull slot.
@@ -935,6 +930,21 @@ impl Public {
         lookups.used += 1;
         Ok(())
     }
+
+    /// [`Self::take_lookup`], with the 429 to answer when the budget is
+    /// spent.
+    fn take_lookup_or_refuse(&self, now_secs: u64) -> Result<(), Box<Response<Body>>> {
+        self.take_lookup(now_secs).map_err(|retry_after| {
+            let mut response = text(
+                StatusCode::TOO_MANY_REQUESTS,
+                "the gateway's pointer lookups for this minute are spent\n",
+            );
+            if let Ok(retry) = header::HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, retry);
+            }
+            Box::new(response)
+        })
+    }
 }
 
 /// Parsed bundle manifests by hash, least recently used first out, within
@@ -1227,15 +1237,18 @@ impl Gateway {
                 Ok(uri) => uri,
                 Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
             };
+            // The namespace's allowance pays for its own bundle alone: other
+            // content on its host spends the shared one.
+            let bucket = pointer.filter(|_| uri.hash == site.hash);
             if !site::is_navigation(headers) {
                 return self
-                    .paid(&page_host, pointer, &uri, Present::Site, range)
+                    .paid(&page_host, bucket, &uri, Present::Site, range)
                     .await;
             }
             // Another bundle's pages run on their own origin; a blob has none.
             return match uri.target {
                 UriTarget::Blob => {
-                    self.paid(&page_host, pointer, &uri, Present::Download, range)
+                    self.paid(&page_host, bucket, &uri, Present::Download, range)
                         .await
                 }
                 _ => self.to_site(&uri),
@@ -1260,10 +1273,9 @@ impl Gateway {
     /// `PUT /_pointer`: store a namespace pointer signed by the namespace's
     /// owner on this deployment's `PublisherRegistry`, when its `seq` is
     /// above every one stored from that signer. A replay is refused on that
-    /// high water before the chain is read; the holder's own next pointer
-    /// reuses a verification younger than [`OWNER_VERIFIED_TTL_SECS`]; the
-    /// lookups that do reach the chain come out of a budget per minute, so
-    /// no anonymous caller makes the gateway spend its RPC.
+    /// high water before the chain is read, and the lookups that do reach
+    /// the chain come out of a budget per minute, so no anonymous caller
+    /// makes the gateway spend its RPC.
     async fn put_pointer<B>(&self, req: Request<B>) -> Response<Body>
     where
         B: HttpBody<Data = Bytes>,
@@ -1305,37 +1317,26 @@ impl Gateway {
         {
             return stale_pointer(current);
         }
-        // One pointer at a time from here: the owner read and the store are
-        // one step, so a read from before a transfer cannot land after one
-        // from after it.
+        // The budget is taken before the lock, so a caller past it waits on
+        // nothing. One pointer at a time from here: the owner read and the
+        // store are one step, so a read from before a transfer cannot land
+        // after one from after it.
+        if let Err(response) = public.take_lookup_or_refuse(now_secs()) {
+            return *response;
+        }
         let _writes = public.pointer_writes.lock().await;
-        let now = now_secs();
-        let verified_at = match public.pointers.held(ns) {
-            // The holder's own update, verified within the hour: no lookup.
-            Some(held)
-                if held.signer == signer
-                    && now.saturating_sub(held.verified_at) < OWNER_VERIFIED_TTL_SECS =>
-            {
-                held.verified_at
-            }
-            _ => {
-                let owner = match self.namespace_owner(public, ns).await {
-                    Ok(owner) => owner,
-                    Err(response) => return *response,
-                };
-                if owner != signer {
-                    return text(
-                        StatusCode::FORBIDDEN,
-                        &format!(
-                            "the pointer is signed by {signer}; namespace {ns} is owned by {owner}\n"
-                        ),
-                    );
-                }
-                now
-            }
+        let owner = match self.namespace_owner(public, ns).await {
+            Ok(owner) => owner,
+            Err(response) => return *response,
         };
+        if owner != signer {
+            return text(
+                StatusCode::FORBIDDEN,
+                &format!("the pointer is signed by {signer}; namespace {ns} is owned by {owner}\n"),
+            );
+        }
         let (root, seq) = (pointer.root, pointer.seq);
-        match public.pointers.set(pointer, signer, verified_at) {
+        match public.pointers.set(pointer, signer) {
             Ok(()) => {}
             Err(SetError::Stale { current }) => return stale_pointer(current),
             Err(SetError::Io(e)) => {
@@ -1541,27 +1542,17 @@ impl Gateway {
     }
 
     /// The owner of namespace `ns` on this deployment's registry, read
-    /// on-chain within the minute's lookup budget.
+    /// on-chain within [`OWNER_LOOKUP_TIMEOUT`].
     ///
     /// # Errors
     ///
-    /// The answer to send instead: 429 when the budget is spent, 502 when
-    /// the chain cannot be read, 404 when the namespace does not exist.
+    /// The answer to send instead: 502 when the chain cannot be read in
+    /// time, 404 when the namespace does not exist.
     async fn namespace_owner(
         &self,
         public: &Public,
         ns: u64,
     ) -> Result<Address, Box<Response<Body>>> {
-        if let Err(retry_after) = public.take_lookup(now_secs()) {
-            let mut response = text(
-                StatusCode::TOO_MANY_REQUESTS,
-                "the gateway's pointer lookups for this minute are spent\n",
-            );
-            if let Ok(retry) = header::HeaderValue::from_str(&retry_after.to_string()) {
-                response.headers_mut().insert(header::RETRY_AFTER, retry);
-            }
-            return Err(Box::new(response));
-        }
         let unreachable = |e: String| {
             Box::new(text(
                 StatusCode::BAD_GATEWAY,
@@ -1570,10 +1561,11 @@ impl Gateway {
         };
         let rpc = decdn_client::provider::build_read_provider(&self.chain.rpc_url)
             .map_err(|e| unreachable(sanitize_err_chain(&e)))?;
-        let owner = PublisherRegistry::new(public.registry, rpc)
-            .ownerOf(U256::from(ns))
-            .call()
+        let registry = PublisherRegistry::new(public.registry, rpc);
+        let lookup = registry.ownerOf(U256::from(ns));
+        let owner = tokio::time::timeout(OWNER_LOOKUP_TIMEOUT, lookup.call())
             .await
+            .map_err(|_| unreachable("the lookup timed out".to_owned()))?
             .map_err(|e| unreachable(sanitize_error_sources(&e)))?;
         if owner.is_zero() {
             return Err(Box::new(text(

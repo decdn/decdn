@@ -24,9 +24,8 @@
 //! Pointers live above the protocol ([ADR 002](https://github.com/decdn/decdn/blob/main/adr/002-content-addressing.md)):
 //! nodes, the wire and the contracts never see them. The store is one JSON
 //! file per namespace, `<dir>/<ns>.json`, holding the pointer, the signer it
-//! recovered to and when that signer was last verified as the owner, and the
-//! highest `seq` stored from each signer; written whole through a temp file
-//! in the same directory, and read once at start.
+//! recovered to, and the highest `seq` stored from each signer; written whole
+//! through a temp file in the same directory, and read once at start.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -143,30 +142,15 @@ impl SignedPointer {
     }
 }
 
-/// A stored pointer: the record, the owner it recovered to, when that owner
-/// was last verified on-chain, and the highest `seq` stored from each signer
-/// the namespace ever had.
+/// A stored pointer: the record, the owner it recovered to, and the highest
+/// `seq` stored from each signer the namespace ever had.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Record {
     #[serde(flatten)]
     pointer: SignedPointer,
     signer: Address,
-    /// Unix seconds of the owner lookup that admitted `signer`.
-    verified_at: u64,
     /// The highest `seq` stored from each signer, holder and former holders.
     high_water: HashMap<Address, u64>,
-}
-
-/// What a gateway holds for a namespace: who signed the pointer it serves,
-/// its `seq`, and when that signer was last verified as the owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Held {
-    /// The signer of the pointer served.
-    pub(crate) signer: Address,
-    /// Its `seq`.
-    pub(crate) seq: u64,
-    /// Unix seconds of the owner lookup that admitted the signer.
-    pub(crate) verified_at: u64,
 }
 
 /// Why a pointer was not stored.
@@ -240,19 +224,6 @@ impl Pointers {
             .map(|r| r.pointer.root.0)
     }
 
-    /// What is held for `namespace`, if anything.
-    pub(crate) fn held(&self, namespace: u64) -> Option<Held> {
-        self.live
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&namespace)
-            .map(|r| Held {
-                signer: r.signer,
-                seq: r.pointer.seq,
-                verified_at: r.verified_at,
-            })
-    }
-
     /// The highest `seq` ever stored for `namespace` from `signer`, holder or
     /// not. A pointer from that signer is new only above it.
     pub(crate) fn high_water(&self, namespace: u64, signer: Address) -> Option<u64> {
@@ -264,23 +235,18 @@ impl Pointers {
     }
 
     /// Store `pointer`, signed by `signer`, whom the caller verified as the
-    /// namespace's owner at `verified_at` (Unix seconds). It replaces the
-    /// pointer held when its `seq` is above every one stored from `signer`:
-    /// from the holder, that is the pointer served; from another signer,
-    /// whatever the holder's `seq`, since the namespace changed hands. The
-    /// record is written whole before the live map changes, under the lock.
+    /// namespace's owner on-chain. It replaces the pointer held when its
+    /// `seq` is above every one stored from `signer`: from the holder, that
+    /// is the pointer served; from another signer, whatever the holder's
+    /// `seq`, since the namespace changed hands. The record is written whole
+    /// before the live map changes, under the lock.
     ///
     /// # Errors
     ///
     /// [`SetError::Stale`] when a pointer from `signer` at or above this
     /// `seq` was stored before; [`SetError::Io`] when the record cannot be
     /// written.
-    pub(crate) fn set(
-        &self,
-        pointer: SignedPointer,
-        signer: Address,
-        verified_at: u64,
-    ) -> Result<(), SetError> {
+    pub(crate) fn set(&self, pointer: SignedPointer, signer: Address) -> Result<(), SetError> {
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         let mut high_water = live
             .get(&pointer.namespace)
@@ -295,7 +261,6 @@ impl Pointers {
         let record = Record {
             pointer,
             signer,
-            verified_at,
             high_water,
         };
         self.write(&record).map_err(SetError::Io)?;
@@ -315,6 +280,11 @@ impl Pointers {
             .with_context(|| format!("sync {}", path.display()))?;
         file.persist(&path)
             .with_context(|| format!("replace {}", path.display()))?;
+        // The rename is durable only once the directory is: a 201 answered
+        // before that could serve the old pointer again after a power loss.
+        std::fs::File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("sync {}", self.dir.display()))?;
         Ok(())
     }
 }

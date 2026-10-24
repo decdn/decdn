@@ -1419,78 +1419,44 @@ fn pointers(gateway: &Gateway) -> &Pointers {
     &gateway.public.as_ref().unwrap().pointers
 }
 
-/// Store `pointer` as signed by `signer` and verified as the owner long ago,
-/// past `PUT /_pointer`.
+/// Store `pointer` as signed by `signer`, past `PUT /_pointer`.
 fn hold(gateway: &Gateway, pointer: SignedPointer, signer: Address) {
-    pointers(gateway).set(pointer, signer, 0).unwrap();
+    pointers(gateway).set(pointer, signer).unwrap();
 }
 
-/// A signer verified as the namespace's owner within the hour is not asked
-/// of the chain again for its own next pointer, so a flood on the lookup
-/// budget cannot keep a publisher from updating; once the verification is
-/// older than that, the chain is read again.
+/// A namespace's own allowance pays for its own bundle and nothing else:
+/// `/_decdn/` content from another bundle on its host spends the shared
+/// allowance, so a stranger cannot drain the namespace's budget with
+/// unrelated content, and the namespace cannot lend its budget out.
 #[tokio::test]
-async fn a_recent_owner_verification_is_reused_for_the_same_signer() {
-    let (gateway, _logs, _) = public_gateway().await;
-    let owner = PrivateKeySigner::random();
-    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
-    let now = now_secs();
-    pointers(&gateway)
-        .set(unsigned_pointer(7, BLOB, 1), owner.address(), now)
-        .unwrap();
-    let pointer = SignedPointer::sign(&owner, 7, OTHER, 2, &domain).unwrap();
-    let body = serde_json::to_string(&pointer).unwrap();
-    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
-    assert_eq!(answer.status, StatusCode::CREATED, "{}", answer.body);
-    assert_eq!(pointers(&gateway).root(7), Some(OTHER));
-    let json: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
-    assert_eq!(json["url"], "https://7.decdn.test/");
-    // The reused verification keeps its age: it is not refreshed by a write.
-    assert_eq!(pointers(&gateway).held(7).map(|h| h.verified_at), Some(now));
-    pointers(&gateway)
-        .set(
-            unsigned_pointer(9, BLOB, 1),
-            owner.address(),
-            now - OWNER_VERIFIED_TTL_SECS,
-        )
-        .unwrap();
-    let pointer = SignedPointer::sign(&owner, 9, OTHER, 2, &domain).unwrap();
-    let body = serde_json::to_string(&pointer).unwrap();
-    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
-    assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "{}", answer.body);
-    assert_eq!(pointers(&gateway).root(9), Some(BLOB));
-}
-
-/// A namespace host serves the bundle its pointer names, as a site: its
-/// entries, its index, its `HEAD`, under the site policy. Without a pointer
-/// it is not found.
-#[tokio::test]
-async fn a_namespace_host_serves_the_bundle_its_pointer_names() {
-    let (gateway, _logs, _) = public_gateway().await;
-    let before = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
-    assert_eq!(before.status, StatusCode::NOT_FOUND);
+async fn a_namespace_allowance_pays_for_its_own_bundle_only() {
+    let (gateway, _logs, _) =
+        public_gateway_for(Allowance::with_namespaces(u64::MAX, [(7, 1)])).await;
     hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
-    let entry = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
-    assert_eq!((entry.status, entry.body.as_str()), (StatusCode::OK, "abc"));
-    assert!(
-        entry
-            .header(header::CONTENT_SECURITY_POLICY)
-            .is_some_and(|p| p.ends_with("connect-src 'self'")),
-        "{:?}",
-        entry.headers
-    );
-    let page = request(&gateway, "7.decdn.test", "/", &[]).await;
-    assert_eq!(page.status, StatusCode::OK);
-    assert!(page.body.contains("<p>hi</p>"), "{}", page.body);
-    let head = send(&gateway, Method::HEAD, "7.decdn.test", "/a.txt", &[]).await;
-    assert_eq!(head.status, StatusCode::OK);
-    assert_eq!(head.header(header::CONTENT_LENGTH), Some("3"));
-    // A newer pointer moves the host; the old bundle stays at its own site.
-    hold(&gateway, unsigned_pointer(7, NOINDEX, 2), Address::ZERO);
-    let moved = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
-    assert_eq!(moved.status, StatusCode::NOT_FOUND);
-    let listing = request(&gateway, "7.decdn.test", "/", &[]).await;
-    assert!(listing.body.contains("a b.txt"), "{}", listing.body);
+    let own = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
+    assert_eq!(own.status, StatusCode::PAYMENT_REQUIRED);
+    let own_via_decdn = request(
+        &gateway,
+        "7.decdn.test",
+        &format!("/_decdn/{}/a.txt", alloy::hex::encode(BLOB)),
+        SAME_ORIGIN,
+    )
+    .await;
+    assert_eq!(own_via_decdn.status, StatusCode::PAYMENT_REQUIRED);
+    for headers in [&[][..], SAME_ORIGIN] {
+        let other = request(
+            &gateway,
+            "7.decdn.test",
+            &format!("/_decdn/{}", alloy::hex::encode(OTHER)),
+            headers,
+        )
+        .await;
+        assert_eq!(
+            (other.status, other.body.as_str()),
+            (StatusCode::OK, "other bytes"),
+            "{headers:?}"
+        );
+    }
 }
 
 /// `PUT /_pointer` answers on the public bare host only: a loopback gateway
@@ -1564,15 +1530,24 @@ async fn put_pointer_owner_lookups_are_budgeted() {
     let (gateway, _logs, _) = public_gateway().await;
     let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
     let signer = PrivateKeySigner::random();
-    for ns in 1..=u64::from(POINTER_LOOKUPS_PER_MINUTE) {
-        let pointer = SignedPointer::sign(&signer, ns, BLOB, 1, &domain).unwrap();
-        let body = serde_json::to_string(&pointer).unwrap();
-        let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
-        assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "lookup {ns}");
-    }
-    let pointer = SignedPointer::sign(&signer, 1_000, BLOB, 1, &domain).unwrap();
+    let public = gateway.public.as_ref().unwrap();
+    // One lookup reaches the chain; the rest of the minute's budget is
+    // spent directly, so the test does not straddle a minute boundary.
+    let pointer = SignedPointer::sign(&signer, 1, BLOB, 1, &domain).unwrap();
     let body = serde_json::to_string(&pointer).unwrap();
     let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+    assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "{}", answer.body);
+    let answer = loop {
+        let now = now_secs();
+        while public.take_lookup(now).is_ok() {}
+        let pointer = SignedPointer::sign(&signer, 1_000, BLOB, 1, &domain).unwrap();
+        let body = serde_json::to_string(&pointer).unwrap();
+        let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+        // The minute turned under the request: the budget is fresh again.
+        if now_secs() / 60 == now / 60 {
+            break answer;
+        }
+    };
     assert_eq!(
         answer.status,
         StatusCode::TOO_MANY_REQUESTS,

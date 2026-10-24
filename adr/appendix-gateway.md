@@ -79,9 +79,10 @@ A paying client continues from the `decdn:` URI on its own.
 ## Namespace pointer
 
 A namespace id is stable. A bundle hash changes with each publish. The
-pointer is the record that makes `<ns>.<host>` name the current bundle, so a
-publisher has one URL to give out ([ADR 002](002-content-addressing.md#adr-002-content-addressing)
-puts a mutable name above the protocol). It is gateway-local: nodes, the
+pointer is the record that makes `<ns>.<host>` name the current bundle. A
+publisher has one URL to give out.
+[ADR 002](002-content-addressing.md#adr-002-content-addressing) puts a
+mutable name above the protocol. The pointer is gateway-local: nodes, the
 wire and the contracts never see it.
 
 The pointer is an EIP-712 record:
@@ -102,8 +103,8 @@ pointer they signed before.
 `decdn publish point <ns> decdn:<hash>/ --gateway <origin>` signs a pointer
 with the namespace owner's keystore and sends it as `PUT /_pointer` on the
 bare host, a JSON body `{"namespace", "root", "seq", "signature"}`. `seq`
-defaults to the Unix time, so each publish advances it. No RPC call is made
-by the CLI. The gateway answers:
+defaults to the Unix time, so each publish advances it. The CLI makes no RPC
+call. The gateway answers:
 
 | Status | When |
 |--------|------|
@@ -118,21 +119,24 @@ by the CLI. The gateway answers:
 The gateway resolves the registry from `--publisher-registry-address`, else
 `blockchain.publisher_registry_address` in the config file, else the built-in
 testnet's when it runs on that chain. It recovers the signer and reads
-`PublisherRegistry.ownerOf` for a pointer that passes the `seq` check. The
-reads come out of a budget per minute, so an anonymous flood of well-formed
-pointers costs the operator's RPC a bounded amount. A signer the gateway
-verified as the owner within the hour is not asked of the chain again for its
-own next pointer, so that flood does not keep a publisher from updating.
-Limits per client belong on the proxy, which knows the client. A pointer from
-another signer than the holder goes to the chain whatever the holder's `seq`:
-when the namespace changed hands, the new owner's first pointer replaces the
-old owner's. The owner read and the store are one step, so two pointers for
-one namespace resolve in the order their owners were read.
+`PublisherRegistry.ownerOf` for each pointer that passes the `seq` check.
+The reads come out of a budget per minute, so an anonymous flood of
+well-formed pointers costs the operator's RPC a bounded amount. While that
+budget is spent, every other pointer waits for the next minute. Limits per
+client belong on the proxy, which knows the client. The owner read and the
+store are one step, so two pointers for one namespace resolve in the order
+their owners were read.
+
+A `GET` never reads the owner. After a transfer on-chain the gateway serves
+the former owner's bundle until the new owner points the namespace, on each
+gateway separately. The new owner's first pointer replaces the held one
+whatever the held `seq`. A transfer away from a compromised key ends that
+key's hold with one `decdn publish point`.
 
 Pointers live in `<data-dir>/pointers/<ns>.json`, one file per namespace,
-with the signer each recovered to, when that signer was verified, and the
-highest `seq` stored from each signer. The gateway reads them at start and
-fails to start on a damaged file. A restart changes no pointer.
+with the signer each recovered to and the highest `seq` stored from each
+signer. The gateway reads them at start and fails to start on a damaged
+file. A restart changes no pointer.
 
 ## Ranges
 

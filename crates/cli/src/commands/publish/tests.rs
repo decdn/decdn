@@ -972,3 +972,22 @@ fn point_dry_run_and_pointed_formats() {
     assert_eq!(v["submitted"], true);
     assert_eq!(v["url"], "https://7.decdn.link/");
 }
+
+/// `--gateway` is an origin: `/_pointer` hangs off it, and a path or query
+/// is refused instead of being joined into a URL the gateway answers 405 on.
+#[test]
+fn the_gateway_url_is_an_origin() {
+    let ok = pointer_endpoint(&"https://decdn.link".parse().unwrap()).unwrap();
+    assert_eq!(ok.as_str(), "https://decdn.link/_pointer");
+    let ok = pointer_endpoint(&"http://127.0.0.1:8484/".parse().unwrap()).unwrap();
+    assert_eq!(ok.as_str(), "http://127.0.0.1:8484/_pointer");
+    for bad in [
+        "https://decdn.link/sub",
+        "https://decdn.link/sub/",
+        "https://decdn.link/?x=1",
+        "https://decdn.link/#f",
+        "ftp://decdn.link",
+    ] {
+        assert!(pointer_endpoint(&bad.parse().unwrap()).is_err(), "{bad}");
+    }
+}

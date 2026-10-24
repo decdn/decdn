@@ -1109,6 +1109,31 @@ pub(crate) fn write_point_outcome(
     }
 }
 
+/// How long `publish point` waits on the gateway, so a gateway that never
+/// answers does not hang a CI job.
+const GATEWAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `PUT /_pointer` on `gateway`, which is an origin: a path, query or
+/// fragment is refused instead of joined into a URL the gateway does not
+/// answer.
+///
+/// # Errors
+///
+/// `gateway` is not a bare `http(s)` origin.
+fn pointer_endpoint(gateway: &url::Url) -> anyhow::Result<url::Url> {
+    anyhow::ensure!(
+        matches!(gateway.scheme(), "http" | "https")
+            && gateway.host_str().is_some()
+            && gateway.path() == "/"
+            && gateway.query().is_none()
+            && gateway.fragment().is_none(),
+        "--gateway must be an http(s) origin with no path, such as https://decdn.link"
+    );
+    gateway
+        .join("_pointer")
+        .context("the gateway URL takes no path")
+}
+
 /// Sign a pointer from a namespace to a bundle and hand it to a public
 /// gateway. The chain id and the `PublisherRegistry` address come from the
 /// usual resolution and bind the signature to one deployment; no RPC call is
@@ -1143,11 +1168,12 @@ async fn point(args: &cli::PointArgs, global_config: Option<&Path>) -> anyhow::R
         let domain = pointer_domain(resolved.chain_id, registry);
         let pointer = SignedPointer::sign(&signer, args.namespace, uri.hash, seq, &domain)
             .context("sign the pointer")?;
-        let endpoint = args
-            .gateway
-            .join("_pointer")
-            .context("the gateway URL takes no path")?;
-        let response = reqwest::Client::new()
+        let endpoint = pointer_endpoint(&args.gateway)?;
+        let response = reqwest::Client::builder()
+            .timeout(GATEWAY_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("build the HTTP client")?
             .put(endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(serde_json::to_vec(&pointer).context("encode the pointer")?)
@@ -1155,6 +1181,17 @@ async fn point(args: &cli::PointArgs, global_config: Option<&Path>) -> anyhow::R
             .await
             .with_context(|| format!("reach the gateway at {}", args.gateway))?;
         let status = response.status();
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|l| l.to_str().ok())
+                .unwrap_or("elsewhere");
+            anyhow::bail!(
+                "the gateway redirected the pointer to {location}: pass the origin it serves \
+                 as --gateway"
+            );
+        }
         let body = response.text().await.unwrap_or_default();
         anyhow::ensure!(
             status == reqwest::StatusCode::CREATED,
