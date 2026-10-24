@@ -577,6 +577,8 @@ async fn fetch_target(
     timings: &FetchTimings,
 ) -> anyhow::Result<()> {
     let blob = |hash| BlobFetch {
+        read_ahead: None,
+        size_cap: None,
         hash,
         namespace: uri.namespace,
         output: output.to_path_buf(),
@@ -613,6 +615,8 @@ async fn fetch_entry_hash(
     let mut common = args.common.clone();
     common.max_blob_mb = manifest_cap_mb(common.max_blob_mb);
     let manifest = BlobFetch {
+        read_ahead: None,
+        size_cap: None,
         hash: uri.hash,
         namespace: uri.namespace,
         output: PathBuf::from("-"),
@@ -706,11 +710,22 @@ pub(crate) struct BlobFetch {
     pub(crate) output: PathBuf,
     /// The retrieval flags.
     pub(crate) common: cli::ClientFetchArgs,
+    /// The read-ahead window of a streamed fetch, in bytes: how far the pull
+    /// runs, and pays, ahead of what the sink has taken. `None` is the
+    /// client's default. A gateway sets a small one, so a response its client
+    /// drops leaves little paid and undelivered.
+    pub(crate) read_ahead: Option<u64>,
+    /// The blob's size as the caller knows it (a bundle manifest's entry
+    /// size), in bytes: the fetch holds and pays for no more, and a longer
+    /// blob ends it with [`decdn_client::BlobTooLarge`]. `None` leaves the
+    /// `--max-blob-mb` cap alone.
+    pub(crate) size_cap: Option<u64>,
 }
 
 /// A delegate credential held in memory: the key that signs vouchers and the
 /// capability issued to it. Takes the place of `--keystore` and
 /// `--capability`.
+#[derive(Clone)]
 pub(crate) struct Credential {
     /// The delegate key.
     pub(crate) signer: Arc<alloy::signers::local::PrivateKeySigner>,
@@ -847,6 +862,11 @@ pub(crate) struct Payer {
     /// whose fetches run one at a time, each lane starting from its persisted
     /// watermark.
     ledgers: Option<LaneLedgers>,
+    /// The funding facts concurrent fetches share, so their `topUp`s run one
+    /// at a time (a `RunFunding` serializes only its own): a gateway's pool
+    /// payer. `None` for a payer whose fetches run one at a time, each pass
+    /// with its own.
+    funding: Option<Arc<RunFunding>>,
     recovery: Arc<RecoveryGate>,
     open_lock: tokio::sync::Mutex<()>,
 }
@@ -895,8 +915,72 @@ impl Payer {
                 loaded: tokio::sync::OnceCell::new(),
             },
             ledgers: None,
+            funding: None,
             recovery: Arc::new(RecoveryGate::new()),
             open_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The fetches of a gateway paying from the keystore's own pool, under
+    /// `grant` when it is delegated. Fetches that overlap share each lane's
+    /// voucher ledger and one set of funding facts on `escrows`, as a bundle
+    /// pull's entries do, so no two of them send a `topUp` at once.
+    pub(crate) fn pool(grant: Option<CapabilityGrant>, escrows: UnconfirmedEscrows) -> Self {
+        Self {
+            ledgers: Some(LaneLedgers::new()),
+            funding: Some(Arc::new(RunFunding::reporting_escrows_to(escrows))),
+            ..Self::keystore(grant)
+        }
+    }
+
+    /// Load the keystore now, so a wrong password or a missing file fails
+    /// here and not at the first fetch.
+    ///
+    /// # Errors
+    ///
+    /// The keystore cannot be read or unlocked, or the lane key cannot be
+    /// derived for `host`'s store.
+    pub(crate) async fn unlock(&self, host: &FetchHost) -> anyhow::Result<()> {
+        self.keys(host).await.map(drop)
+    }
+
+    /// The key that signs and what its lanes sign under: the held key and its
+    /// slot, or the keystore loaded once (password from the environment, else
+    /// `--keystore-password-file`, else a TTY) and reused by every later fetch
+    /// under the payer. A keystore payer on its own pool derives the data
+    /// dir's lane key at the first load.
+    async fn keys(
+        &self,
+        host: &FetchHost,
+    ) -> anyhow::Result<(Arc<alloy::signers::local::PrivateKeySigner>, PayerKeys)> {
+        match &self.key {
+            PayerKey::Held { signer, slot } => {
+                Ok((Arc::clone(signer), PayerKeys::Delegated(slot.clone())))
+            }
+            PayerKey::Keystore { grant, loaded } => loaded
+                .get_or_try_init(|| async {
+                    let password = super::chain_ctx::read_keystore_password(
+                        &super::chain_ctx::password_sources(
+                            host.chain.keystore_password_file.as_deref(),
+                            PasswordUse::Unlock,
+                        ),
+                        "eth keystore password",
+                    )?
+                    .into_secret();
+                    let signer = Arc::new(load_signer(&host.chain.keystore, &password)?);
+                    let keys = match grant {
+                        Some(grant) => {
+                            PayerKeys::Delegated(delegated_slot(grant, Arc::clone(&signer))?)
+                        }
+                        None => PayerKeys::Owned(OwnedPayer::for_store(
+                            Arc::clone(&signer),
+                            host.store.as_ref(),
+                        )?),
+                    };
+                    anyhow::Ok((signer, keys))
+                })
+                .await
+                .cloned(),
         }
     }
 
@@ -914,6 +998,7 @@ impl Payer {
                 slot,
             },
             ledgers: Some(LaneLedgers::new()),
+            funding: None,
             recovery: Arc::new(RecoveryGate::new()),
             open_lock: tokio::sync::Mutex::new(()),
         })
@@ -987,40 +1072,10 @@ pub(crate) async fn fetch_on(
     timings.mark(Mark::Resolved);
 
     // Buyer key: the held delegate key, else the keystore, loaded after holder
-    // resolution so a configuration fault never
-    // prompts for a keystore password. Password from env, else
-    // `--keystore-password-file`, else TTY.
-    // A delegated payer signs under one credential slot across every fetch it
-    // pays for, both passes of each fetch included: a held key brings its slot,
-    // and a keystore payer builds its slot at the first load. A keystore payer
-    // on its own pool derives this data dir's lane key at the first load.
-    let (signer, keys) = match &payer.key {
-        PayerKey::Held { signer, slot } => (Arc::clone(signer), PayerKeys::Delegated(slot.clone())),
-        PayerKey::Keystore { grant, loaded } => loaded
-            .get_or_try_init(|| async {
-                let password = super::chain_ctx::read_keystore_password(
-                    &super::chain_ctx::password_sources(
-                        chain.keystore_password_file.as_deref(),
-                        PasswordUse::Unlock,
-                    ),
-                    "eth keystore password",
-                )?
-                .into_secret();
-                let signer = Arc::new(load_signer(&chain.keystore, &password)?);
-                let keys = match grant {
-                    Some(grant) => {
-                        PayerKeys::Delegated(delegated_slot(grant, Arc::clone(&signer))?)
-                    }
-                    None => PayerKeys::Owned(OwnedPayer::for_store(
-                        Arc::clone(&signer),
-                        store.as_ref(),
-                    )?),
-                };
-                anyhow::Ok((signer, keys))
-            })
-            .await?
-            .clone(),
-    };
+    // resolution so a configuration fault never prompts for a keystore
+    // password ([`Payer::keys`]). A delegated payer signs under one credential
+    // slot across every fetch it pays for, both passes of each fetch included.
+    let (signer, keys) = payer.keys(host).await?;
     timings.mark(Mark::Unlocked);
     let self_address = signer.address();
 
@@ -1048,7 +1103,7 @@ pub(crate) async fn fetch_on(
         })
         .await?;
 
-    let max_blob_bytes = common.max_blob_mb.saturating_mul(1024 * 1024);
+    let max_blob_bytes = held_cap(common.max_blob_mb, args.size_cap);
     // The namespace routing hint (ADR 005 § Namespace routing): the URI's
     // `?ns=<id>` → big-endian `uint256`; absent => `NO_NAMESPACE` (best-effort
     // cache/DHT).
@@ -1080,7 +1135,12 @@ pub(crate) async fn fetch_on(
     // gate still lists it for the command to name. A keystore payer runs its
     // fetches one after another, so no fetch is still on the closed pool. A
     // held payer funds nothing, so its gate never holds one.
-    recovery.leave_carried();
+    // Only a payer whose fetches run one after another clears a carried
+    // replacement: a fetch of a shared payer may still be in its pass on the
+    // closed pool, and would open yet another one.
+    if payer.ledgers.is_none() {
+        recovery.leave_carried();
+    }
     // Set once a funding recovery step's replacement ended the first pass of a
     // file fetch: the second pass then runs the remaining work against the new
     // pool, and resumes the `.partial`.
@@ -1088,7 +1148,10 @@ pub(crate) async fn fetch_on(
     loop {
         // Per pass: the funding facts, the lanes and their handles all name the
         // pool the pass pays from.
-        let funding = RunFunding::reporting_escrows_to(escrows.clone());
+        let funding = payer
+            .funding
+            .clone()
+            .unwrap_or_else(|| Arc::new(RunFunding::reporting_escrows_to(escrows.clone())));
         // The shared pull/funding deps every lane borrows for the whole pass.
         let deps = LaneDeps {
             endpoint,
@@ -1143,7 +1206,7 @@ pub(crate) async fn fetch_on(
                     hash,
                     claim.total_bytes,
                     stop.clone(),
-                    (common.max_sources, timings),
+                    (common.max_sources, args.read_ahead, timings),
                     &mut *sink,
                 )
                 .await;
@@ -1175,6 +1238,19 @@ pub(crate) async fn fetch_on(
             Some(pass_result) => return pass_result,
             None => recovery.start_next_pass(),
         }
+    }
+}
+
+/// The cap on bytes a fetch holds for its blob: `--max-blob-mb` (`0` for no
+/// cap), and under it `size_cap`, the size the caller knows the blob to
+/// have. A declared size never lifts the cap: zero caps at one byte, so a
+/// blob a manifest calls empty still ends at its first chunk group.
+pub(crate) fn held_cap(max_blob_mb: u64, size_cap: Option<u64>) -> u64 {
+    let cap = max_blob_mb.saturating_mul(1024 * 1024);
+    match size_cap {
+        Some(size) if cap == 0 => size.max(1),
+        Some(size) => cap.min(size).max(1),
+        None => cap,
     }
 }
 
@@ -1389,17 +1465,17 @@ async fn stream_out<P>(
     hash: [u8; 32],
     total_bytes: u64,
     stop: StopPolicy,
-    (max_sources, timings): (usize, &FetchTimings),
+    (max_sources, read_ahead, timings): (usize, Option<u64>, &FetchTimings),
     sink: &mut Sink,
 ) -> anyhow::Result<()>
 where
     P: alloy::providers::Provider + Clone,
 {
-    // Read-ahead stays the default: the outstanding-spend bound for an
-    // abandoned pipe.
+    // The read-ahead is the outstanding-spend bound for an abandoned pipe:
+    // the client's default, or the caller's own.
     let pull_config = PullConfig {
         streamer_lane_cap: max_sources.max(1),
-        ..PullConfig::new()
+        read_ahead_bytes: read_ahead.unwrap_or(PullConfig::new().read_ahead_bytes),
     };
     let funder = sources.funder();
 

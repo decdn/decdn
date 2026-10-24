@@ -56,6 +56,34 @@
 //! DNS rebinding: it answers its own loopback names and well-formed site
 //! names on its port, nothing else.
 //!
+//! **Public.** With `--public-url <origin>` the gateway serves anyone at that
+//! origin, behind a proxy that terminates TLS: `<origin>/<hash>[/<path>]`,
+//! every bundle as a site at `<scheme>://[<ns>.]<hash32>.<host>/`, and a
+//! namespace at `<scheme>://<ns>.<host>/` once it has a pointer here. There
+//! is no token and no capability: every request pays from the keystore's own
+//! pool (`worker::Payment::Pool`), and the allowance (`allowance`) bounds the
+//! bytes the gateway delivers per day over every request. A request past it,
+//! or one whose known size does not fit what is left, answers `402` with the
+//! canonical `decdn:` URI in a `Link` header and a JSON body, so a paying
+//! client continues on its own; a stream of unknown size is cut when the
+//! allowance runs out; a pool that cannot pay answers `503` as a `402` does.
+//! An entry's pull is capped at the size its manifest declares, so a manifest
+//! cannot make the gateway pay for more than it says, and a declared size is
+//! what `Content-Length` and the allowance count on. `HEAD` is answered from
+//! the bundle manifest, at no pull of the entry. The API paths answer `404`,
+//! and a site's `Sec-Fetch-*` headers decide nothing: the operator pays,
+//! within the allowance. A pull runs a small read-ahead
+//! (`PUBLIC_READ_AHEAD_BYTES`), and a response that does not end cleanly (a
+//! client that drops it, a cut, a fault) is charged what the pull may have
+//! paid past the frames it delivered (`DROP_PENALTY_BYTES`), so a client
+//! that connects and drops spends no more than it is charged. An upstream
+//! failure answers a bare `502`, with the detail in the log. The buyer store
+//! lives in `<data-dir>/store`, so the pool and its lanes survive a restart.
+//! Sites are separate browser origins; they are separate sites, with their
+//! own cookies and site-scoped state, only when the public host is a public
+//! suffix: the operator registers it on the Public Suffix List, as
+//! `github.io` is.
+//!
 //! **Pulls.** Every pull runs the blob fetch of `decdn get` with its bytes
 //! going to the HTTP response, on one long-lived worker thread: the endpoint,
 //! the buyer-pool store and the connections to nodes are built once per
@@ -99,13 +127,15 @@ use super::fetch::{
 };
 use crate::known_chains;
 
+mod allowance;
 mod rewrite;
 mod site;
 mod worker;
 
+use allowance::Allowance;
 use rewrite::Rewrite;
-use site::Site;
-use worker::{FetchBackend, Job, PullWorker};
+use site::{Route, Site, SiteDomain};
+use worker::{FetchBackend, Job, Payment, PullWorker};
 
 /// The request header carrying the gateway token.
 pub const TOKEN_HEADER: &str = "x-decdn-token";
@@ -150,38 +180,74 @@ const PIPE_BYTES: usize = 1 << 20;
 /// The read size for response chunks.
 const CHUNK_BYTES: usize = 256 * 1024;
 
+/// The read-ahead window of a public gateway's pulls: how far a pull runs,
+/// and pays, ahead of what its response has taken. Small, so a dropped
+/// response leaves little paid and undelivered; the client raises it to its
+/// pull-window floor when this is below it.
+const PUBLIC_READ_AHEAD_BYTES: u64 = 2 << 20;
+
+/// The most a pull may have paid for beyond the frames its response
+/// delivered: the read-ahead window, the pipe, and one frame in flight. A
+/// response that does not end cleanly is charged this against the allowance,
+/// since nothing reports what the pull paid.
+const DROP_PENALTY_BYTES: u64 = {
+    let window = if PUBLIC_READ_AHEAD_BYTES > decdn_client::PULL_WINDOW_FLOOR {
+        PUBLIC_READ_AHEAD_BYTES
+    } else {
+        decdn_client::PULL_WINDOW_FLOOR
+    };
+    window + PIPE_BYTES as u64 + CHUNK_BYTES as u64
+};
+
 type Body = BoxBody<Bytes, std::io::Error>;
 
 /// Run the gateway until Ctrl-C.
 ///
 /// # Errors
 ///
-/// When `--listen` is not a loopback address, when keystore or capability
-/// flags are given, when the data dir, token or listener cannot be set up, or
-/// when the chain coordinates cannot be resolved.
+/// When `--listen` is not a loopback address and `--public-url` is not set,
+/// when a loopback gateway is given keystore or capability flags, when
+/// `--public-url` is not an `http(s)` origin, when the data dir, token or
+/// listener cannot be set up, when a public gateway's keystore cannot be
+/// unlocked, or when the chain coordinates cannot be resolved.
 pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.listen.ip().is_loopback(),
-        "--listen must be a loopback address"
-    );
-    let mut common = keyless(&args.common)?;
+    let public_url = args.public.public_url.clone();
+    if let Some(url) = &public_url {
+        anyhow::ensure!(
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "--public-url must be an http(s) origin with no path, such as https://decdn.link"
+        );
+    } else {
+        anyhow::ensure!(
+            args.listen.ip().is_loopback(),
+            "--listen must be a loopback address unless --public-url is set"
+        );
+    }
+    let mut common = fetch_flags(&args.common, public_url.is_some())?;
     fill_chain_defaults(&mut common, config_path)?;
-    let chain = resolve_chain(&common, &load_file_config(config_path)?)?.config;
+    let resolved = resolve_chain(&common, &load_file_config(config_path)?)?;
+    if public_url.is_some() && common.keystore.is_none() {
+        // The keystore resolves under the data dir; the buyer store moves
+        // under it below, so the keystore is pinned first.
+        common.keystore = Some(resolved.keystore.clone());
+    }
+    let chain = resolved.config;
     common.give_up_after_secs = common.give_up_after_secs.or(Some(GIVE_UP_AFTER_SECS));
     let root = common
         .data_dir
         .clone()
         .unwrap_or_else(|| cli::common::expand_tilde(Path::new("~/.decdn/gateway")));
     private_dir(&root)?;
-    let token = load_or_create_token(&root.join("token"))?;
-    // The keys die with the process, so their lane records do too: the buyer
-    // store lives in a directory removed when the gateway stops.
-    let store_dir = tempfile::Builder::new()
-        .prefix("store-")
-        .tempdir_in(&root)
-        .context("create the gateway's buyer store dir")?;
-    private_dir(store_dir.path())?;
-    common.data_dir = Some(store_dir.path().to_path_buf());
+    let token = match &public_url {
+        Some(_) => None,
+        None => Some(load_or_create_token(&root.join("token"))?),
+    };
+    let (store_dir, temp_store) = store_dir(&root, public_url.is_some())?;
+    common.data_dir = Some(store_dir);
 
     let listener = TcpListener::bind(args.listen)
         .await
@@ -190,11 +256,13 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         FetchBackend {
             common: common.clone(),
             config_path: config_path.map(Path::to_path_buf),
+            pool: public_url.is_some(),
         },
         MAX_PULLS,
     )
     .await
     .context("start the gateway's pull worker")?;
+    let (sites, public) = mode(args);
     let gateway = Arc::new(Gateway {
         common,
         token,
@@ -205,19 +273,63 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts(args.listen),
-        listen: args.listen,
+        sites,
+        public,
     });
 
-    println!(
-        "decdn gateway on http://{}/ (Ctrl-C to stop)\ngateway token: {} (also in {})",
-        args.listen,
-        gateway.token,
-        root.join("token").display()
-    );
+    match (&gateway.sites, &gateway.token) {
+        (SiteDomain::Public { origin }, _) => println!(
+            "decdn gateway serving {origin} on {} (Ctrl-C to stop)",
+            args.listen
+        ),
+        (SiteDomain::Loopback { .. }, token) => println!(
+            "decdn gateway on http://{}/ (Ctrl-C to stop)\ngateway token: {} (also in {})",
+            args.listen,
+            token.as_deref().unwrap_or_default(),
+            root.join("token").display()
+        ),
+    }
     let served = serve(&gateway, &listener).await;
     // The worker's queued lane writes land before the store dir is removed.
     gateway.pulls.stop().await;
+    drop(temp_store);
     served
+}
+
+/// Where the buyer store lives, created owner-only. A public gateway's pool
+/// and lanes outlive the process, so its store stays under `root`. A loopback
+/// gateway's keys die with the process, so their lane records do too: its
+/// store lives in a directory removed when the returned guard drops.
+fn store_dir(root: &Path, public: bool) -> anyhow::Result<(PathBuf, Option<tempfile::TempDir>)> {
+    let (dir, guard) = if public {
+        (root.join("store"), None)
+    } else {
+        let dir = tempfile::Builder::new()
+            .prefix("store-")
+            .tempdir_in(root)
+            .context("create the gateway's buyer store dir")?;
+        (dir.path().to_path_buf(), Some(dir))
+    };
+    private_dir(&dir)?;
+    Ok((dir, guard))
+}
+
+/// Where `args` put the sites, and what a public gateway holds.
+fn mode(args: &GatewayArgs) -> (SiteDomain, Option<Public>) {
+    match args.public.public_url.clone() {
+        Some(origin) => (
+            SiteDomain::Public { origin },
+            Some(Public {
+                allowance: Allowance::new(args.public.allowance_bytes_per_day),
+            }),
+        ),
+        None => (
+            SiteDomain::Loopback {
+                listen: args.listen,
+            },
+            None,
+        ),
+    }
 }
 
 /// Accept connections on `listener` until Ctrl-C.
@@ -245,10 +357,16 @@ async fn serve(gateway: &Arc<Gateway>, listener: &TcpListener) -> anyhow::Result
     }
 }
 
-/// The fetch flags the gateway pulls with. It holds its own delegate keys, so
-/// key and capability flags are refused, and a keystore password file (often
-/// `DECDN_KEYSTORE_PASSWORD_FILE` in the environment) is dropped unread.
-fn keyless(common: &ClientFetchArgs) -> anyhow::Result<ClientFetchArgs> {
+/// The fetch flags the gateway pulls with. A public gateway pays from the
+/// keystore the flags name (a `--capability` makes it a delegate of that
+/// pool), so it keeps them all. A loopback gateway holds its own delegate
+/// keys, so its key and capability flags are refused, and a keystore
+/// password file (often `DECDN_KEYSTORE_PASSWORD_FILE` in the environment)
+/// is dropped unread.
+fn fetch_flags(common: &ClientFetchArgs, public: bool) -> anyhow::Result<ClientFetchArgs> {
+    if public {
+        return Ok(common.clone());
+    }
     anyhow::ensure!(
         common.keystore.is_none()
             && common.capability.is_none()
@@ -604,7 +722,9 @@ struct RegisterRequest {
 
 struct Gateway {
     common: ClientFetchArgs,
-    token: String,
+    /// The gateway token a loopback gateway's content requests carry;
+    /// `None` on a public gateway, which takes no token.
+    token: Option<String>,
     /// The chain a registered capability's pool must live on.
     chain: ChainConfig,
     /// The EIP-712 domain a capability's owner signs under.
@@ -617,9 +737,16 @@ struct Gateway {
     /// pull and pay once. Cache hits never wait on it.
     manifest_fill: Mutex<()>,
     hosts: Vec<String>,
-    /// The address the gateway listens on: its own origin, and the port of
-    /// every site origin.
-    listen: SocketAddr,
+    /// Where site origins live, and what a `Host` names.
+    sites: SiteDomain,
+    /// What a public gateway holds beyond a loopback one; `None` on loopback.
+    public: Option<Public>,
+}
+
+/// What a public gateway holds beyond a loopback one.
+struct Public {
+    /// The bytes the gateway delivers per day from its pool.
+    allowance: Allowance,
 }
 
 /// Parsed bundle manifests by hash, least recently used first out, within
@@ -662,6 +789,9 @@ impl ManifestCache {
 enum PullError {
     /// The capability cannot pay for the rest.
     Funding(anyhow::Error),
+    /// The public allowance ran out while the request waited for its pull
+    /// slot or read a manifest.
+    Allowance,
     /// The blob cannot be read as a bundle manifest: it is over the manifest
     /// cap, or its bytes do not parse as one. Nothing upstream failed.
     NotManifest(anyhow::Error),
@@ -681,13 +811,56 @@ enum Present {
     Download,
 }
 
-/// The capability a content request pays with.
-struct Paying {
-    signer: Arc<PrivateKeySigner>,
-    grant: CapabilityGrant,
-}
-
 impl Gateway {
+    /// Whether this is a public gateway: no token, no capabilities, every
+    /// request paid from the gateway's own pool within its allowance.
+    const fn public(&self) -> bool {
+        self.public.is_some()
+    }
+
+    /// Count `bytes` delivered against the public allowance. `false` once the
+    /// day's allowance is reached. A loopback gateway has none.
+    fn charge(&self, bytes: usize) -> bool {
+        self.public.as_ref().is_none_or(|public| {
+            let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+            public.allowance.charge(bytes, now_secs())
+        })
+    }
+
+    /// Count what a pull that did not end cleanly may have paid past the
+    /// frames its response delivered ([`DROP_PENALTY_BYTES`]).
+    fn charge_drop(&self) {
+        if let Some(public) = &self.public {
+            tracing::info!(
+                penalty = DROP_PENALTY_BYTES,
+                "a pull ended short of clean; its read-ahead counts against the allowance"
+            );
+            public.allowance.charge(DROP_PENALTY_BYTES, now_secs());
+        }
+    }
+
+    /// The 402 for `uri` when `size` (its length, when known) does not fit
+    /// what is left of the public allowance today, else `None`. Refusing
+    /// before the pull costs nothing; cutting it after would waste what it
+    /// paid for.
+    fn too_large(&self, uri: &DecdnUri, size: Option<u64>) -> Option<Response<Body>> {
+        let public = self.public.as_ref()?;
+        let size = size?;
+        let (left, retry_after) = match public.allowance.remaining(now_secs()) {
+            Ok(left) => (left, 0),
+            Err(retry_after) => (0, retry_after),
+        };
+        (size > left).then(|| {
+            tracing::info!(%uri, size, left, "the entry does not fit today's allowance");
+            pay_elsewhere(
+                StatusCode::PAYMENT_REQUIRED,
+                uri,
+                retry_after,
+                "the entry does not fit what is left of the gateway's allowance today",
+            )
+        })
+    }
+
     async fn handle<B>(self: Arc<Self>, req: Request<B>) -> Response<Body>
     where
         B: HttpBody<Data = Bytes>,
@@ -698,18 +871,26 @@ impl Gateway {
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
-        if let Some(site) = Site::from_host(host, self.listen.port()) {
-            let policy = site::content_security_policy(self.listen);
-            let mut response = self.site(req, site).await;
-            if let Ok(policy) = header::HeaderValue::from_str(&policy) {
-                response
-                    .headers_mut()
-                    .insert(header::CONTENT_SECURITY_POLICY, policy);
+        match self.sites.route(host) {
+            Some(Route::Site(site)) => {
+                let policy = site::content_security_policy(&self.sites);
+                let mut response = self.site(req, site).await;
+                if let Ok(policy) = header::HeaderValue::from_str(&policy) {
+                    response
+                        .headers_mut()
+                        .insert(header::CONTENT_SECURITY_POLICY, policy);
+                }
+                return response;
             }
-            return response;
-        }
-        if !self.hosts.iter().any(|allowed| allowed == host) {
-            return text(StatusCode::FORBIDDEN, "unknown Host\n");
+            Some(Route::Namespace(ns)) => {
+                return text(
+                    StatusCode::NOT_FOUND,
+                    &format!("namespace {ns} has no pointer on this gateway\n"),
+                );
+            }
+            Some(Route::Bare) => {}
+            None if self.hosts.iter().any(|allowed| allowed == host) => {}
+            None => return text(StatusCode::FORBIDDEN, "unknown Host\n"),
         }
         let origin = req
             .headers()
@@ -719,6 +900,21 @@ impl Gateway {
         let authorized = self.authorized(req.headers());
         let path = req.uri().path().to_owned();
         let method = req.method().clone();
+        let target = req
+            .uri()
+            .path_and_query()
+            .map_or("/", |pq| pq.as_str())
+            .to_owned();
+        if self.public() {
+            match (&method, path.as_str()) {
+                (&Method::OPTIONS, _) | (_, "/_delegate" | "/_capability") => {
+                    return text(StatusCode::NOT_FOUND, "a public gateway has no API\n");
+                }
+                (&Method::HEAD, "/" | "/favicon.ico") => return text(StatusCode::OK, ""),
+                (&Method::HEAD, _) => return self.head_bare(target.trim_start_matches('/')),
+                _ => {}
+            }
+        }
         match (method, path.as_str()) {
             (Method::OPTIONS, "/_delegate" | "/_capability") => preflight(origin.as_deref()),
             (Method::OPTIONS, _) => text(StatusCode::FORBIDDEN, "no cross-origin access\n"),
@@ -747,11 +943,6 @@ impl Gateway {
             (Method::GET, "/_capability") => text(StatusCode::UNAUTHORIZED, "token required\n"),
             (Method::HEAD, _) => head_refused(),
             (Method::GET, _) => {
-                let target = req
-                    .uri()
-                    .path_and_query()
-                    .map_or("/", |pq| pq.as_str())
-                    .to_owned();
                 self.content(req.headers(), authorized, target.trim_start_matches('/'))
                     .await
             }
@@ -762,11 +953,6 @@ impl Gateway {
     /// A request on a site origin: the site's own entries, and `/_decdn/` for
     /// content outside its bundle.
     async fn site<B>(self: Arc<Self>, req: Request<B>, site: Site) -> Response<Body> {
-        match *req.method() {
-            Method::GET => {}
-            Method::HEAD => return head_refused(),
-            _ => return text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
-        }
         let path = req.uri().path();
         if matches!(path, "/_delegate" | "/_capability") {
             return text(
@@ -774,12 +960,26 @@ impl Gateway {
                 "the gateway API answers on the gateway origin only\n",
             );
         }
+        let head = match *req.method() {
+            Method::GET => false,
+            Method::HEAD if self.public() => true,
+            Method::HEAD => return head_refused(),
+            _ => return text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
+        };
         let headers = req.headers();
-        if let Err((status, why)) = site::may_spend(headers, self.authorized(headers)) {
+        // On a public gateway the operator pays for every request, within
+        // the allowance: there is no capability for the browser's headers to
+        // protect, and `curl` sends none.
+        if !self.public()
+            && let Err((status, why)) = site::may_spend(headers, self.authorized(headers))
+        {
             return text(status, why);
         }
-        let page_host = site.host();
+        let page_host = self.sites.site_host(&site);
         let target = req.uri().path_and_query().map_or(path, |pq| pq.as_str());
+        if head {
+            return self.head_site(&site, path).await;
+        }
         if let Some(rest) = target.strip_prefix("/_decdn/") {
             let uri: DecdnUri = match format!("decdn:{rest}").parse() {
                 Ok(uri) => uri,
@@ -821,17 +1021,19 @@ impl Gateway {
             _ => return text(StatusCode::BAD_REQUEST, "a blob has no site\n"),
         };
         redirect(&format!(
-            "http://{}:{}/{path}",
-            site.host(),
-            self.listen.port()
+            "{}/{path}",
+            self.sites.origin(&self.sites.site_host(&site))
         ))
     }
 
     fn authorized(&self, headers: &HeaderMap) -> bool {
+        let Some(token) = self.token.as_deref() else {
+            return false;
+        };
         headers
             .get(TOKEN_HEADER)
             .and_then(|t| t.to_str().ok())
-            .is_some_and(|given| token_matches(&self.token, given))
+            .is_some_and(|given| token_matches(token, given))
     }
 
     /// Drop delegates that waited too long for a capability, and those whose
@@ -984,9 +1186,13 @@ impl Gateway {
         json(StatusCode::OK, &serde_json::Value::Array(list))
     }
 
-    /// The live capability whose scope covers `host` most specifically, by
-    /// [`Registered::preference`].
-    async fn paying_for(&self, host: &str) -> Option<Paying> {
+    /// Who pays a request for `host`: the gateway's own pool on a public
+    /// gateway, else the live capability whose scope covers `host` most
+    /// specifically, by [`Registered::preference`].
+    async fn paying_for(&self, host: &str) -> Option<Payment> {
+        if self.public() {
+            return Some(Payment::Pool);
+        }
         let mut delegates = self.delegates.lock().await;
         Self::prune(&mut delegates);
         delegates
@@ -994,9 +1200,11 @@ impl Gateway {
             .filter_map(|d| d.capability.as_ref().map(|r| (d, r)))
             .filter(|(_, r)| !r.spent && r.scope.covers(host))
             .max_by_key(|(_, r)| r.preference())
-            .map(|(d, r)| Paying {
-                signer: Arc::clone(&d.signer),
-                grant: r.grant.clone(),
+            .map(|(d, r)| {
+                Payment::Held(Credential {
+                    signer: Arc::clone(&d.signer),
+                    grant: r.grant.clone(),
+                })
             })
     }
 
@@ -1029,9 +1237,11 @@ impl Gateway {
             Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
         if !authorized {
-            // A browser without the extension opens a bundle as its site.
+            // A browser without the extension opens a bundle as its site. On
+            // a public gateway a blob streams from the bare host as bytes.
             return match uri.target {
                 UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
+                _ if self.public() => self.paid("", &uri, Present::Bare).await,
                 _ => text(StatusCode::UNAUTHORIZED, "token required\n"),
             };
         }
@@ -1053,6 +1263,9 @@ impl Gateway {
         uri: &DecdnUri,
         present: Present,
     ) -> Response<Body> {
+        if let Some(refused) = self.allowance_refusal(uri) {
+            return refused;
+        }
         // A funding stop retires the capability and the next covering one
         // takes the request, so a capability that cannot pay costs a retry,
         // never a failed load. Each pass retires one, so the loop ends.
@@ -1063,33 +1276,68 @@ impl Gateway {
                     &format!("no capability covers {page_host}\n"),
                 );
             };
-            let result = match &uri.target {
-                UriTarget::Blob => {
-                    self.stream(uri.hash, uri.namespace, &paying, None, None, present)
-                        .await
-                }
-                UriTarget::BundleEntry(path) => {
-                    self.entry(uri.hash, uri.namespace, path, &paying, present)
-                        .await
-                }
-                UriTarget::Bundle => self.index(uri.hash, uri.namespace, &paying, present).await,
-                _ => return text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
-            };
-            match result {
+            match self.serve(uri, &paying, present).await {
                 Ok(response) => return response,
-                Err(PullError::Funding(e)) => {
-                    tracing::info!(error = %e, host = %page_host, "a capability ran out");
-                    self.mark_spent(paying.signer.address()).await;
-                }
-                Err(PullError::NotManifest(e)) => {
-                    let error = format!("{e:#}");
-                    tracing::info!(%error, host = %page_host, "a bundle URI names no manifest");
-                    return text(StatusCode::NOT_FOUND, &format!("{error}\n"));
-                }
-                Err(PullError::Other(e)) => {
-                    return text(StatusCode::BAD_GATEWAY, &format!("{e:#}\n"));
-                }
+                Err(PullError::Allowance) => return self.allowance_spent(uri),
+                Err(PullError::Funding(e)) => match &paying {
+                    Payment::Held(credential) => {
+                        tracing::info!(error = %e, host = %page_host, "a capability ran out");
+                        self.mark_spent(credential.signer.address()).await;
+                    }
+                    Payment::Pool => {
+                        return pull_failed(PullError::Funding(e), uri, page_host, true);
+                    }
+                },
+                Err(e) => return pull_failed(e, uri, page_host, self.public()),
             }
+        }
+    }
+
+    /// The 402 for `uri` once the public allowance ran out under a request
+    /// already admitted.
+    fn allowance_spent(&self, uri: &DecdnUri) -> Response<Body> {
+        self.allowance_refusal(uri).unwrap_or_else(|| {
+            pay_elsewhere(
+                StatusCode::PAYMENT_REQUIRED,
+                uri,
+                0,
+                "the gateway's allowance is spent",
+            )
+        })
+    }
+
+    /// The 402 for `uri` when the public allowance it spends is gone for the
+    /// day, else `None`.
+    fn allowance_refusal(&self, uri: &DecdnUri) -> Option<Response<Body>> {
+        let public = self.public.as_ref()?;
+        let retry_after = public.allowance.remaining(now_secs()).err()?;
+        tracing::info!(%uri, "the allowance is spent for today");
+        Some(pay_elsewhere(
+            StatusCode::PAYMENT_REQUIRED,
+            uri,
+            retry_after,
+            "the gateway's allowance is spent for today",
+        ))
+    }
+
+    /// Serve what `uri` names, as `present` says, paid by `paying`.
+    async fn serve(
+        self: &Arc<Self>,
+        uri: &DecdnUri,
+        paying: &Payment,
+        present: Present,
+    ) -> Result<Response<Body>, PullError> {
+        match &uri.target {
+            UriTarget::Blob => {
+                self.stream(uri.hash, uri.namespace, paying, None, None, present)
+                    .await
+            }
+            UriTarget::BundleEntry(path) => {
+                self.entry(uri.hash, uri.namespace, path, paying, present)
+                    .await
+            }
+            UriTarget::Bundle => self.index(uri.hash, uri.namespace, paying, present).await,
+            _ => Ok(text(StatusCode::BAD_REQUEST, "unsupported URI target\n")),
         }
     }
 
@@ -1102,11 +1350,22 @@ impl Gateway {
         manifest_hash: [u8; 32],
         namespace: Option<u64>,
         path: &str,
-        paying: &Paying,
+        paying: &Payment,
         present: Present,
     ) -> Result<Response<Body>, PullError> {
         let manifest = self.manifest(manifest_hash, namespace, paying).await?;
         if let Some(entry) = manifest.entries.iter().find(|e| e.path == path) {
+            let uri = DecdnUri::new(
+                manifest_hash,
+                UriTarget::BundleEntry(path.to_owned()),
+                namespace,
+            );
+            if let Some(refused) = self.too_large(&uri, entry.size) {
+                return Ok(refused);
+            }
+            if entry.size == Some(0) {
+                return Ok(empty_entry(path, entry.hash, present));
+            }
             return self
                 .stream(
                     entry.hash,
@@ -1137,13 +1396,20 @@ impl Gateway {
         self: &Arc<Self>,
         manifest_hash: [u8; 32],
         namespace: Option<u64>,
-        paying: &Paying,
+        paying: &Payment,
         present: Present,
     ) -> Result<Response<Body>, PullError> {
         let manifest = self.manifest(manifest_hash, namespace, paying).await?;
         if present == Present::Site
             && let Some(entry) = manifest.entries.iter().find(|e| e.path == "index.html")
         {
+            let uri = DecdnUri::new(manifest_hash, UriTarget::Bundle, namespace);
+            if let Some(refused) = self.too_large(&uri, entry.size) {
+                return Ok(refused);
+            }
+            if entry.size == Some(0) {
+                return Ok(empty_entry(&entry.path, entry.hash, present));
+            }
             return self
                 .stream(
                     entry.hash,
@@ -1175,13 +1441,18 @@ impl Gateway {
                 escape(&entry.path),
             );
         }
-        Ok(html(
-            StatusCode::OK,
-            &format!(
-                "<h1>Bundle</h1><p><code>{}</code></p><table>{rows}</table>",
-                escape(&DecdnUri::new(manifest_hash, UriTarget::Bundle, namespace).to_string())
-            ),
-        ))
+        let uri = DecdnUri::new(manifest_hash, UriTarget::Bundle, namespace);
+        let page = format!(
+            "<h1>Bundle</h1><p><code>{}</code></p><table>{rows}</table>",
+            escape(&uri.to_string())
+        );
+        // The listing has a length too: one that does not fit is refused.
+        let length = u64::try_from(page.len()).unwrap_or(u64::MAX);
+        if let Some(refused) = self.too_large(&uri, Some(length)) {
+            return Ok(refused);
+        }
+        self.charge(page.len());
+        Ok(html(StatusCode::OK, &page))
     }
 
     fn cached_manifest(&self, hash: &[u8; 32]) -> Option<Arc<BundleManifest>> {
@@ -1199,7 +1470,7 @@ impl Gateway {
         self: &Arc<Self>,
         hash: [u8; 32],
         namespace: Option<u64>,
-        paying: &Paying,
+        paying: &Payment,
     ) -> Result<Arc<BundleManifest>, PullError> {
         if let Some(manifest) = self.cached_manifest(&hash) {
             return Ok(manifest);
@@ -1216,32 +1487,47 @@ impl Gateway {
         // the manifest cap only when that cap is higher.
         let raw_past_cap = (self.common.max_blob_mb == 0 || cap_mb < self.common.max_blob_mb)
             .then_some(raw.as_str());
-        let (first, mut reader, done) = self
-            .start_pull(hash, namespace, paying, cap_mb)
+        let (first, mut reader, done, mut guard) = self
+            .start_pull(hash, namespace, paying, cap_mb, None)
             .await
             .map_err(|e| over_manifest_cap(e, cap_mb, raw_past_cap))?;
-        let mut bytes = first.to_vec();
-        let mut buf = vec![0u8; CHUNK_BYTES];
-        loop {
-            let n = reader
-                .read(&mut buf)
-                .await
-                .map_err(|e| PullError::Other(e.into()))?;
-            if n == 0 {
-                break;
-            }
-            bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
-            // A backstop: the manifest cap ends the pull before this.
-            if bytes.len() > MAX_MANIFEST_BYTES {
-                return Err(PullError::NotManifest(anyhow::anyhow!(
-                    "the blob is larger than {MAX_MANIFEST_BYTES} bytes, the most this \
-                     gateway reads as a bundle manifest"
-                )));
-            }
+        // Every byte pulled is charged as it lands, whether or not it parses:
+        // a blob that is no manifest was paid for all the same. The read stops
+        // where the allowance does, instead of draining to the manifest cap.
+        if !self.charge(first.len()) {
+            return Err(PullError::Allowance);
         }
-        finished(done)
-            .await
-            .map_err(|e| over_manifest_cap(e, cap_mb, raw_past_cap))?;
+        let mut bytes = first.to_vec();
+        let read = async {
+            let mut buf = vec![0u8; CHUNK_BYTES];
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| PullError::Other(e.into()))?;
+                if n == 0 {
+                    break;
+                }
+                if !self.charge(n) {
+                    return Err(PullError::Allowance);
+                }
+                bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
+                // A backstop: the manifest cap ends the pull before this.
+                if bytes.len() > MAX_MANIFEST_BYTES {
+                    return Err(PullError::NotManifest(anyhow::anyhow!(
+                        "the blob is larger than {MAX_MANIFEST_BYTES} bytes, the most this \
+                         gateway reads as a bundle manifest"
+                    )));
+                }
+            }
+            finished(done).await
+        }
+        .await;
+        // The pull ended whole: nothing past the bytes read was paid for. A
+        // read that ended short leaves the guard armed, and its drop charges
+        // the bound of what the pull may have paid past them.
+        read.map_err(|e| over_manifest_cap(e, cap_mb, raw_past_cap))?;
+        guard.disarm();
         // The blob fits under the manifest cap, so it fits under the gateway's.
         let manifest = Arc::new(
             BundleManifest::parse(&bytes)
@@ -1262,7 +1548,7 @@ impl Gateway {
         self: &Arc<Self>,
         hash: [u8; 32],
         namespace: Option<u64>,
-        paying: &Paying,
+        paying: &Payment,
         path: Option<&str>,
         size: Option<u64>,
         present: Present,
@@ -1279,63 +1565,28 @@ impl Gateway {
                 (content_type, rewrite)
             }
         };
-        // A rewrite changes the length.
-        let size = size.filter(|_| rewrite.is_none());
-        let (first, reader, done) = self
-            .start_pull(hash, namespace, paying, self.common.max_blob_mb)
+        // The pull holds no more than the size the manifest declares; a
+        // rewrite changes the length the response declares.
+        let (first, reader, done, guard) = self
+            .start_pull(hash, namespace, paying, self.common.max_blob_mb, size)
             .await?;
+        let size = size.filter(|_| rewrite.is_none());
         let state = Streaming {
             first: Some(first),
             reader,
             done: Some(done),
             rewrite,
+            cut: false,
+            clean: false,
+            delivered: 0,
+            size,
+            guard,
         };
-        let gateway = Arc::clone(self);
-        let signer = paying.signer.address();
-        let body = futures_util::stream::unfold(state, move |mut s| {
-            let gateway = Arc::clone(&gateway);
-            async move {
-                let chunk = if let Some(first) = s.first.take() {
-                    first
-                } else {
-                    let mut buf = vec![0u8; CHUNK_BYTES];
-                    match s.reader.read(&mut buf).await {
-                        Ok(0) => {
-                            if let Err(e) = finished(s.done.take()?).await {
-                                // The verified prefix is already out: abort the
-                                // body so the browser does not take it for the
-                                // whole file.
-                                if matches!(e, PullError::Funding(_)) {
-                                    gateway.mark_spent(signer).await;
-                                }
-                                s.rewrite = None;
-                                let e = std::io::Error::other(pull_error_text(&e));
-                                return Some((Err(e), s));
-                            }
-                            // The pull is whole: the rewrite lets out its tail.
-                            let tail = s.rewrite.take()?.finish().map(Frame::data);
-                            return Some((tail, s));
-                        }
-                        Ok(n) => {
-                            buf.truncate(n);
-                            Bytes::from(buf)
-                        }
-                        Err(e) => {
-                            s.done = None;
-                            return Some((Err(e), s));
-                        }
-                    }
-                };
-                let out = match s.rewrite.as_mut() {
-                    Some(rewrite) => rewrite.feed(&chunk),
-                    None => Ok(chunk),
-                };
-                if out.is_err() {
-                    s.done = None;
-                }
-                Some((out.map(Frame::data), s))
-            }
-        });
+        let signer = match paying {
+            Payment::Held(credential) => Some(credential.signer.address()),
+            Payment::Pool => None,
+        };
+        let body = futures_util::stream::unfold(state, move |s| next_frame(s, signer));
         let disposition = if present == Present::Download {
             "attachment"
         } else {
@@ -1360,20 +1611,118 @@ impl Gateway {
             .map_err(|e| PullError::Other(e.into()))
     }
 
-    /// Hand the pull of `hash` to the worker, capped at `max_blob_mb`, and wait
-    /// for its first verified bytes. The pull writes into a pipe the response
-    /// reads from.
+    /// `HEAD` on the public bare host: a blob's headers with no pull and no
+    /// length (nothing knows its size before a pull); a bundle or an entry
+    /// redirects to its site, as `GET` does.
+    fn head_bare(&self, rest: &str) -> Response<Body> {
+        let uri: DecdnUri = match format!("decdn:{rest}").parse() {
+            Ok(uri) => uri,
+            Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
+        };
+        match uri.target {
+            UriTarget::Blob => {
+                head_response(&content_type(&alloy::hex::encode(uri.hash)), None, uri.hash)
+            }
+            UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
+            _ => text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
+        }
+    }
+
+    /// `HEAD` on a public site: the entry's headers from the bundle manifest,
+    /// which the gateway pulls once and caches, so the request costs no pull
+    /// of the entry. A directory answers for its `index.html`, and the root
+    /// for the bundle's; a response the gateway would rewrite has no length.
+    async fn head_site(self: &Arc<Self>, site: &Site, path: &str) -> Response<Body> {
+        // The same resolution as `GET`: a directory is its `index.html`, and
+        // the path decodes as a `decdn:` URI's does.
+        let entry = if path.len() > 1 && path.ends_with('/') {
+            format!("{path}index.html")
+        } else {
+            path.to_owned()
+        };
+        let hex = alloy::hex::encode(site.hash);
+        let uri = match format!("decdn:{hex}{entry}").parse::<DecdnUri>() {
+            Ok(uri) => DecdnUri::new(uri.hash, uri.target, site.namespace),
+            Err(e) => return text(StatusCode::NOT_FOUND, &format!("{e}\n")),
+        };
+        // The manifest is a paid pull.
+        if let Some(refused) = self.allowance_refusal(&uri) {
+            return refused;
+        }
+        let manifest = match self
+            .manifest(site.hash, site.namespace, &Payment::Pool)
+            .await
+        {
+            Ok(manifest) => manifest,
+            Err(e) => return pull_failed(e, &uri, path, true),
+        };
+        let path = match &uri.target {
+            // The root is the bundle's `index.html`, else its listing: a page
+            // with no fixed length.
+            UriTarget::Bundle => {
+                if manifest.entries.iter().any(|e| e.path == "index.html") {
+                    "index.html"
+                } else {
+                    return head_response("text/html; charset=utf-8", None, site.hash);
+                }
+            }
+            UriTarget::BundleEntry(path) => path.as_str(),
+            _ => return text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
+        };
+        let Some(entry) = manifest.entries.iter().find(|e| e.path == path) else {
+            let index = format!("{path}/index.html");
+            if manifest.entries.iter().any(|e| e.path == index) {
+                let link = entry_link(site.hash, path);
+                let last = link.rsplit('/').next().unwrap_or(&link);
+                return redirect(&format!("{last}/"));
+            }
+            return text(
+                StatusCode::NOT_FOUND,
+                &format!("the bundle has no entry {path:?}\n"),
+            );
+        };
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let content_type = site::content_type(name);
+        let essence = content_type.split(';').next().unwrap_or_default();
+        let length = entry.size.filter(|_| Rewrite::for_type(essence).is_none());
+        head_response(&content_type, length, entry.hash)
+    }
+
+    /// Hand the pull of `hash` to the worker, capped at `max_blob_mb` and at
+    /// `size_cap` bytes when the blob's size is known, and wait for its first
+    /// verified bytes. The pull writes into a pipe the response reads from.
     async fn start_pull(
         self: &Arc<Self>,
         hash: [u8; 32],
         namespace: Option<u64>,
-        paying: &Paying,
+        paying: &Payment,
         max_blob_mb: u64,
-    ) -> Result<(Bytes, DuplexStream, oneshot::Receiver<anyhow::Result<()>>), PullError> {
+        size_cap: Option<u64>,
+    ) -> Result<
+        (
+            Bytes,
+            DuplexStream,
+            oneshot::Receiver<anyhow::Result<()>>,
+            PullGuard,
+        ),
+        PullError,
+    > {
         let (writer, mut reader) = tokio::io::duplex(PIPE_BYTES);
         let (done_tx, done_rx) = oneshot::channel();
         let mut common = self.common.clone();
         common.max_blob_mb = max_blob_mb;
+        // Armed before the worker has the job: a request dropped while it
+        // waits for its first byte still charges the pull's read-ahead.
+        let mut guard = PullGuard {
+            gateway: Arc::clone(self),
+            armed: self.public(),
+        };
+        // Asked once the pull has its slot: the allowance the requests before
+        // it spent while it waited refuses it before any paid work.
+        let admit = self.public().then(|| {
+            let gateway = Arc::clone(self);
+            Box::new(move || gateway.allowance_admits()) as Box<dyn FnOnce() -> bool + Send>
+        });
         self.pulls
             .pull(Job {
                 blob: BlobFetch {
@@ -1381,18 +1730,98 @@ impl Gateway {
                     output: PathBuf::from("-"),
                     namespace,
                     common,
+                    read_ahead: self.public().then_some(PUBLIC_READ_AHEAD_BYTES),
+                    size_cap,
                 },
-                paying: Credential {
-                    signer: Arc::clone(&paying.signer),
-                    grant: paying.grant.clone(),
-                },
+                paying: paying.clone(),
                 writer,
                 done: done_tx,
+                admit,
             })
             .map_err(PullError::Other)?;
-        let (first, done_rx) = first_chunk(&mut reader, done_rx).await?;
-        Ok((first, reader, done_rx))
+        let (first, done_rx) = match first_chunk(&mut reader, done_rx).await {
+            Ok(first) => first,
+            Err(e) => {
+                // The pull ended before a byte reached the response: it paid
+                // for nothing it could deliver, so it owes nothing. (A request
+                // dropped mid-wait never reaches here, and stays armed.)
+                guard.disarm();
+                return Err(e);
+            }
+        };
+        Ok((first, reader, done_rx, guard))
     }
+
+    /// Whether the public allowance admits a request right now.
+    fn allowance_admits(&self) -> bool {
+        self.public
+            .as_ref()
+            .is_none_or(|public| public.allowance.remaining(now_secs()).is_ok())
+    }
+}
+
+/// The next frame of a streaming body, or `None` at its end: the pull's first
+/// bytes, then each chunk off the pipe, charged against the allowance and
+/// passed through the rewrite. A pull error after the first byte ends the
+/// body with an error, so a browser never takes a verified prefix for the
+/// whole file; `signer` is the capability to retire on a funding stop.
+async fn next_frame(
+    mut s: Streaming,
+    signer: Option<Address>,
+) -> Option<(Result<Frame<Bytes>, std::io::Error>, Streaming)> {
+    let gateway = Arc::clone(&s.guard.gateway);
+    let chunk = if let Some(first) = s.first.take() {
+        first
+    } else {
+        let mut buf = vec![0u8; CHUNK_BYTES];
+        match s.reader.read(&mut buf).await {
+            Ok(0) => {
+                if let Err(e) = finished(s.done.take()?).await {
+                    if let (PullError::Funding(_), Some(signer)) = (&e, signer) {
+                        gateway.mark_spent(signer).await;
+                    }
+                    s.rewrite = None;
+                    let e = std::io::Error::other(pull_error_text(&e));
+                    return Some((Err(e), s));
+                }
+                // The pull is whole: the rewrite lets out its tail.
+                s.clean = true;
+                let tail = s.rewrite.take()?.finish().map(Frame::data);
+                return Some((tail, s));
+            }
+            Ok(_) if s.cut => {
+                // The frame that reached the allowance is out and more
+                // follows: the body ends with an error, not as a whole file.
+                s.done = None;
+                s.rewrite = None;
+                let e = std::io::Error::other("the gateway's allowance ran out mid-stream");
+                return Some((Err(e), s));
+            }
+            Ok(n) => {
+                buf.truncate(n);
+                Bytes::from(buf)
+            }
+            Err(e) => {
+                s.done = None;
+                return Some((Err(e), s));
+            }
+        }
+    };
+    s.delivered = s
+        .delivered
+        .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+    s.cut = !gateway.charge(chunk.len());
+    if s.cut {
+        tracing::info!("the allowance is reached; this stream ends with its current frame");
+    }
+    let out = match s.rewrite.as_mut() {
+        Some(rewrite) => rewrite.feed(&chunk),
+        None => Ok(chunk),
+    };
+    if out.is_err() {
+        s.done = None;
+    }
+    Some((out.map(Frame::data), s))
 }
 
 /// A response body in flight: the pull's first bytes until they go out, the
@@ -1403,6 +1832,55 @@ struct Streaming {
     reader: DuplexStream,
     done: Option<oneshot::Receiver<anyhow::Result<()>>>,
     rewrite: Option<Rewrite>,
+    /// Set once a frame reached the public allowance: the next frame, if
+    /// any, ends the body with an error instead.
+    cut: bool,
+    /// Set once the pull ended whole and its bytes are out.
+    clean: bool,
+    /// Content bytes handed to the response so far.
+    delivered: u64,
+    /// The response's declared length, when it has one. The server drops the
+    /// body once that many bytes are out, with no final poll, so reaching it
+    /// is as clean an end as the pull's own.
+    size: Option<u64>,
+    /// Armed since before the pull started; disarmed only by a whole end.
+    guard: PullGuard,
+}
+
+impl Drop for Streaming {
+    /// A body that ended whole owes the allowance nothing more; one dropped
+    /// before that (a client that left, a cut, a fault) is charged, by the
+    /// guard, what the pull may have paid past the frames it delivered.
+    fn drop(&mut self) {
+        if self.clean || self.size.is_some_and(|size| self.delivered >= size) {
+            self.guard.disarm();
+        }
+    }
+}
+
+/// What a pull in flight owes the public allowance if it ends short of
+/// whole: the bound of what it may have paid past the frames its response
+/// delivered ([`DROP_PENALTY_BYTES`]). Armed from before the job reaches the
+/// worker, so a request dropped at any point (waiting for its first byte
+/// included) charges it; disarmed once the pull delivered whole, or ended
+/// before it could have paid for anything.
+struct PullGuard {
+    gateway: Arc<Gateway>,
+    armed: bool,
+}
+
+impl PullGuard {
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PullGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.gateway.charge_drop();
+        }
+    }
 }
 
 /// The pull's first verified bytes, or the error it ended with before any.
@@ -1444,10 +1922,13 @@ async fn finished(done: oneshot::Receiver<anyhow::Result<()>>) -> Result<(), Pul
 }
 
 /// A pull error is a funding stop when [`decdn_client::FundingNeeded`] is
-/// attached anywhere on it, as context or as the error itself.
+/// attached anywhere on it, as context or as the error itself, and an
+/// allowance stop when the worker refused the pull at its slot.
 fn classify(e: anyhow::Error) -> PullError {
     if e.downcast_ref::<decdn_client::FundingNeeded>().is_some() {
         PullError::Funding(e)
+    } else if e.downcast_ref::<worker::NotAdmitted>().is_some() {
+        PullError::Allowance
     } else {
         PullError::Other(e)
     }
@@ -1491,6 +1972,7 @@ fn pull_error_text(e: &PullError) -> String {
         PullError::Funding(e) | PullError::NotManifest(e) | PullError::Other(e) => {
             format!("{e:#}")
         }
+        PullError::Allowance => "the gateway's allowance is spent".to_owned(),
     }
 }
 
@@ -1552,6 +2034,105 @@ fn content_type(name: &str) -> String {
     } else {
         guess.essence_str().to_owned()
     }
+}
+
+/// An entry its manifest declares empty: its headers and an empty body, with
+/// no pull. There is nothing to deliver, and a declared size of zero must not
+/// become an uncapped pull of whatever the hash really names.
+fn empty_entry(path: &str, hash: [u8; 32], present: Present) -> Response<Body> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let content_type = match present {
+        Present::Bare | Present::Download => content_type(name),
+        Present::Site => site::content_type(name),
+    };
+    head_response(&content_type, Some(0), hash)
+}
+
+/// A `HEAD` answer: the type, the length when known, and the blob's hash as
+/// the entity tag, with no body.
+fn head_response(content_type: &str, size: Option<u64>, hash: [u8; 32]) -> Response<Body> {
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ETAG, format!("\"{}\"", alloy::hex::encode(hash)))
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    if let Some(size) = size {
+        response = response.header(header::CONTENT_LENGTH, size);
+    }
+    response
+        .body(full(String::new()))
+        .unwrap_or_else(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "bad head response\n"))
+}
+
+/// The answer to a request for `uri` (on `page_host`) whose pull ended with
+/// `e`: a blob that is no manifest is not found, a pool that cannot pay asks
+/// the client to pay elsewhere, and anything else failed upstream. A
+/// `public` gateway keeps the upstream detail (node ids, addresses, chain
+/// errors) in its log and answers a bare 502; a loopback gateway shows its
+/// own user the detail.
+fn pull_failed(e: PullError, uri: &DecdnUri, page_host: &str, public: bool) -> Response<Body> {
+    match e {
+        PullError::Allowance => pay_elsewhere(
+            StatusCode::PAYMENT_REQUIRED,
+            uri,
+            0,
+            "the gateway's allowance is spent",
+        ),
+        PullError::NotManifest(e) => {
+            let error = format!("{e:#}");
+            tracing::info!(%error, host = %page_host, "a bundle URI names no manifest");
+            text(StatusCode::NOT_FOUND, &format!("{error}\n"))
+        }
+        PullError::Funding(e) => {
+            tracing::warn!(error = %e, "the gateway's pool cannot pay");
+            pool_cannot_pay(uri)
+        }
+        PullError::Other(e) if public => {
+            tracing::warn!(error = format!("{e:#}"), %uri, "an upstream pull failed");
+            text(StatusCode::BAD_GATEWAY, "the upstream pull failed\n")
+        }
+        PullError::Other(e) => text(StatusCode::BAD_GATEWAY, &format!("{e:#}\n")),
+    }
+}
+
+/// The answer when the gateway's own pool cannot pay for `uri` right now: the
+/// client did nothing wrong, so it may retry, or fetch the URI with a paying
+/// client of its own.
+fn pool_cannot_pay(uri: &DecdnUri) -> Response<Body> {
+    pay_elsewhere(
+        StatusCode::SERVICE_UNAVAILABLE,
+        uri,
+        60,
+        "the gateway's pool cannot pay right now",
+    )
+}
+
+/// The answer when the gateway does not pay for `uri` now, for `why`: `402`
+/// for a spent allowance, `503` for a pool that cannot pay. The client
+/// retries after `retry_after_secs`, or fetches the canonical URI with a
+/// paying client of its own; the `Link` header and the JSON body carry it.
+fn pay_elsewhere(
+    status: StatusCode,
+    uri: &DecdnUri,
+    retry_after_secs: u64,
+    why: &str,
+) -> Response<Body> {
+    let mut response = json(
+        status,
+        &serde_json::json!({
+            "error": why,
+            "uri": uri.to_string(),
+            "retry_after_secs": retry_after_secs,
+        }),
+    );
+    let headers = response.headers_mut();
+    if let Ok(retry) = header::HeaderValue::from_str(&retry_after_secs.to_string()) {
+        headers.insert(header::RETRY_AFTER, retry);
+    }
+    if let Ok(link) = header::HeaderValue::from_str(&format!("<{uri}>; rel=\"alternate\"")) {
+        headers.insert(header::LINK, link);
+    }
+    response
 }
 
 /// The answer to `HEAD`, which would cost a paid pull and then drop its bytes.
