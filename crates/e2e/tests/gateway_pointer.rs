@@ -14,7 +14,7 @@
 //!   4. The same `seq` again is `409`; a pointer signed by a key that does not
 //!      own the namespace is `403`.
 //!   5. `HEAD /models/demo/resolve/main/a.bin`, the `HF_ENDPOINT` form,
-//!      answers the entry's size and the bundle's commit at no pull.
+//!      answers the entry's size and the bundle's commit.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and built `decdn` and `decdn-node` binaries:

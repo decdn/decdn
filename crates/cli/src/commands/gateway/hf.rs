@@ -9,8 +9,11 @@
 //! `main` or the bundle's commit, the first forty hex characters of its
 //! manifest hash. The answer carries the headers the client reads: the
 //! commit, the entry hash as the entity tag and the linked entity tag, and
-//! the entry's size as the linked size. There is no redirect. Any
-//! `/<a>/<b>[/…]/resolve/<rev>/<file>` path on a namespace host is this
+//! the entry's size as the linked size; the body is the entry byte for byte,
+//! never rewritten, since the client stores it under the entry hash. A 404
+//! names its cause in `X-Error-Code`, which is how the client tells a
+//! missing file or revision from a lost connection. There is no redirect.
+//! Any `/<a>/<b>[/…]/resolve/<rev>/<file>` path on a namespace host is this
 //! shim's, so an entry at such a literal path is not reachable there.
 
 use hyper::HeaderMap;
@@ -61,6 +64,26 @@ pub(super) fn resolve(path: &str, root: &[u8; 32]) -> HfPath {
         return HfPath::UnknownRevision;
     }
     HfPath::Entry(format!("{}/{}", repo.join("/"), file.join("/")))
+}
+
+/// The `X-Error-Code` the hub client reads on a 404: the revision is not
+/// the bundle's.
+pub(super) const REVISION_NOT_FOUND: &str = "RevisionNotFound";
+
+/// The `X-Error-Code` the hub client reads on a 404: the bundle has no such
+/// entry. The client also keeps a negative-cache marker under the commit.
+pub(super) const ENTRY_NOT_FOUND: &str = "EntryNotFound";
+
+/// Mark a 404 for the hub client: `X-Error-Code: code`, and the commit of
+/// the bundle `root` when the revision was known.
+pub(super) fn not_found(headers: &mut HeaderMap, code: &'static str, root: Option<&[u8; 32]>) {
+    headers.insert(
+        HeaderName::from_static("x-error-code"),
+        HeaderValue::from_static(code),
+    );
+    if let Some(value) = root.and_then(|root| HeaderValue::from_str(&commit(root)).ok()) {
+        headers.insert(HeaderName::from_static("x-repo-commit"), value);
+    }
 }
 
 /// Add the hub's headers to an answer for an entry of the bundle `root`:

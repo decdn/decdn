@@ -145,21 +145,26 @@ file. A restart changes no pointer.
 
 A namespace host is an endpoint for `huggingface_hub`. With
 `HF_ENDPOINT=https://<ns>.<host>` the client asks for
-`/<repo>/resolve/<revision>/<file>`, where `<repo>` is `org/name` or
-`datasets/org/name`. On a namespace host that path is the entry
-`<repo>/<file>` of the bundle the pointer names. The revision is `main` or
-the bundle's commit: the first forty hex characters of its manifest hash.
-Another revision is 404.
+`/<repo>/resolve/<revision>/<file>`, where `<repo>` is `org/name`,
+`datasets/org/name` or `spaces/org/name`: two segments or more. A
+single-segment id such as `gpt2` is not a resolve path. On a namespace host
+that path is the entry `<repo>/<file>` of the bundle the pointer names. The
+revision is `main` or the bundle's commit: the first forty hex characters of
+its manifest hash. Another revision is 404.
 
 `HEAD` and `GET` carry the headers the client reads: `X-Repo-Commit` (the
 commit), `ETag` and `X-Linked-Etag` (the entry hash, quoted), `X-Linked-Size`
 (the entry's size, the whole of it on a partial answer) and
-`Accept-Ranges: bytes`. There is no redirect. The client's resume with a
-`Range` is a range as above.
+`Accept-Ranges: bytes`. The body is the entry byte for byte, whatever its
+type: a page is not rewritten here, since the client stores the body under
+the entry hash. A 404 carries `X-Error-Code`: `RevisionNotFound`, or
+`EntryNotFound` with the commit. There is no redirect. A resume with a
+`Range` is a range as in [Ranges](#ranges).
 
 Any `/<a>/<b>[/…]/resolve/<rev>/<file>` path on a namespace host is this
 shim's. An entry at such a literal path is not reachable on the namespace
-host; it is on the bundle's own site. The `/api/` surface the client's
+host; it is on the bundle's own site. A later `/api/` or `/v2/` surface
+shadows literal paths the same way. The `/api/` surface the client's
 `snapshot_download` needs is not served.
 
 ## Ranges
