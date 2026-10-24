@@ -4090,7 +4090,7 @@ since project inception and will roll into the first tagged release.
 ### Added
 
 - **CLI: a namespace host on a public gateway is an `HF_ENDPOINT`
-  (#PR_NUMBER).** `GET` and `HEAD /<repo>/resolve/<rev>/<file>` on
+  (#2615).** `GET` and `HEAD /<repo>/resolve/<rev>/<file>` on
   `<ns>.<host>` serve the entry `<repo>/<file>` of the bundle the namespace
   points at, under `main` or the bundle's commit (the first forty hex of its
   manifest hash), with `X-Repo-Commit`, `ETag` and `X-Linked-Etag` (the entry
