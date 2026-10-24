@@ -71,9 +71,10 @@ WORKDIR /home/decdn
 # node image inherits this volume.
 VOLUME ["/home/decdn/.decdn"]
 
-# The CLI only dials out, so it exposes no port. `CMD ["--help"]` makes a bare
-# `docker run <image>` print usage and exit 0; any arguments replace it
-# (`docker run <image> get decdn:<hash> -o <path>`).
+# The CLI dials out, so it exposes no port; a public gateway
+# (`decdn gateway --public-url … --listen 0.0.0.0:<port>`) publishes the port it
+# is given. `CMD ["--help"]` makes a bare `docker run <image>` print usage and
+# exit 0; any arguments replace it (`docker run <image> get decdn:<hash> -o <path>`).
 ENTRYPOINT ["decdn"]
 CMD ["--help"]
 

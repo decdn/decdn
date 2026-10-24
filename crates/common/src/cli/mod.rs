@@ -117,8 +117,10 @@ pub enum Command {
     Config(ConfigArgs),
     /// Probe a running node over the `cdn/probe/v1` ALPN.
     Probe(ProbeArgs),
-    /// Serve `decdn:` URIs to a browser from a loopback HTTP gateway, paid
-    /// with the scoped capabilities pages and the token holder register.
+    /// Serve `decdn:` URIs over HTTP: to a browser from a loopback gateway,
+    /// paid with the scoped capabilities pages and the token holder register,
+    /// or to anyone from a public gateway (`--public-url`) paid from its own
+    /// pool within a daily allowance.
     Gateway(Box<GatewayArgs>),
     /// Pull what a `decdn:` URI names: a blob (`decdn:<hash>`), a whole bundle
     /// (`decdn:<hash>/`), or one bundle entry (`decdn:<hash>/<path>`), over the

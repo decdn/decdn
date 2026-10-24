@@ -9,7 +9,7 @@ use decdn_incentive::CapabilityGrant;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, oneshot};
 
-use super::{Backend, Job, PullWorker};
+use super::{Backend, Job, Payment, PullWorker};
 use crate::commands::fetch::{BlobFetch, Credential, Sink};
 
 /// The blob a [`Fake`] pull stalls on: it writes more than the pipe holds.
@@ -18,6 +18,8 @@ const STALL: u8 = 0;
 const HELLO: u8 = 1;
 /// The blob a [`Fake`] pull holds open until the test releases it.
 const HOLD: u8 = 2;
+/// The blob a [`Fake`] pull ends with a pool replacement for.
+const REPLACED: u8 = 3;
 
 /// What a [`Fake`] backend did.
 #[derive(Default)]
@@ -33,6 +35,8 @@ struct Log {
 struct Fake {
     log: Arc<Mutex<Log>>,
     release: Arc<Notify>,
+    /// Whether the backend has a pool of its own to pay from.
+    pool: bool,
 }
 
 impl Backend for Fake {
@@ -50,6 +54,15 @@ impl Backend for Fake {
         Ok(log.payers_made)
     }
 
+    async fn pool_payer(&self, (): &()) -> anyhow::Result<Option<usize>> {
+        if !self.pool {
+            return Ok(None);
+        }
+        let mut log = self.log.lock().unwrap();
+        log.payers_made += 1;
+        Ok(Some(log.payers_made))
+    }
+
     async fn pull(
         &self,
         (): &(),
@@ -64,6 +77,12 @@ impl Backend for Fake {
         match blob.hash[0] {
             STALL => writer.write_all(&vec![0u8; 1 << 20]).await?,
             HOLD => self.release.notified().await,
+            REPLACED => {
+                return Err(anyhow::Error::new(decdn_client::PoolReplaced {
+                    closed: alloy::primitives::B256::repeat_byte(1),
+                    opened: alloy::primitives::B256::repeat_byte(2),
+                }));
+            }
             _ => writer.write_all(b"hello").await?,
         }
         Ok(())
@@ -108,6 +127,29 @@ fn send(
     tokio::io::DuplexStream,
     oneshot::Receiver<anyhow::Result<()>>,
 ) {
+    send_paid(worker, kind, Payment::Held(credential(signer)), pipe)
+}
+
+/// Hand the worker a pull of blob `kind` paid from the gateway's own pool.
+fn send_pool(
+    worker: &PullWorker,
+    kind: u8,
+) -> (
+    tokio::io::DuplexStream,
+    oneshot::Receiver<anyhow::Result<()>>,
+) {
+    send_paid(worker, kind, Payment::Pool, 1024)
+}
+
+fn send_paid(
+    worker: &PullWorker,
+    kind: u8,
+    paying: Payment,
+    pipe: usize,
+) -> (
+    tokio::io::DuplexStream,
+    oneshot::Receiver<anyhow::Result<()>>,
+) {
     let (writer, reader) = tokio::io::duplex(pipe);
     let (done, result) = oneshot::channel();
     worker
@@ -117,22 +159,30 @@ fn send(
                 namespace: None,
                 output: PathBuf::from("-"),
                 common: common(),
+                read_ahead: None,
+                size_cap: None,
             },
-            paying: credential(signer),
+            paying,
             writer,
             done,
+            admit: None,
         })
         .expect("the worker takes the job");
     (reader, result)
 }
 
 async fn start(max_pulls: usize) -> (PullWorker, Arc<Mutex<Log>>, Arc<Notify>) {
+    start_with(max_pulls, false).await
+}
+
+async fn start_with(max_pulls: usize, pool: bool) -> (PullWorker, Arc<Mutex<Log>>, Arc<Notify>) {
     let log = Arc::new(Mutex::new(Log::default()));
     let release = Arc::new(Notify::new());
     let worker = PullWorker::start(
         Fake {
             log: Arc::clone(&log),
             release: Arc::clone(&release),
+            pool,
         },
         max_pulls,
     )
@@ -236,6 +286,97 @@ async fn overlapping_pulls_under_one_capability_share_a_payer() {
     assert_eq!(log.payers_made, 3);
 }
 
+/// Every pull from the gateway's own pool shares one payer, built with the
+/// host, that outlives the pulls: a later pull resumes the same lanes.
+#[tokio::test]
+async fn pool_pulls_share_one_payer_that_outlives_them() {
+    let (worker, log, _release) = start_with(4, true).await;
+    for _ in 0..3 {
+        let (reader, done) = send_pool(&worker, HELLO);
+        assert_eq!(read_all(reader).await, b"hello");
+        done.await.unwrap().unwrap();
+    }
+    // A held credential beside it gets its own payer, as before.
+    let signer = Arc::new(PrivateKeySigner::random());
+    let (reader, done) = send(&worker, HELLO, &signer, 1024);
+    assert_eq!(read_all(reader).await, b"hello");
+    done.await.unwrap().unwrap();
+    worker.stop().await;
+
+    let log = log.lock().unwrap();
+    let under = &log.pulled_under;
+    assert_eq!(under[0], under[1]);
+    assert_eq!(under[1], under[2], "pool pulls share the pool payer");
+    assert_ne!(under[3], under[0], "a held credential pays on its own");
+    assert_eq!(log.payers_made, 2);
+}
+
+/// A pool pull on a worker whose backend has no pool fails, and pays nothing.
+#[tokio::test]
+async fn a_pool_pull_without_a_pool_fails() {
+    let (worker, log, _release) = start(4).await;
+    let (_reader, done) = send_pool(&worker, HELLO);
+    let err = done.await.unwrap().unwrap_err();
+    assert!(format!("{err:#}").contains("no pool"), "{err:#}");
+    worker.stop().await;
+    assert_eq!(log.lock().unwrap().payers_made, 0);
+}
+
+/// A pull that ends with a pool replacement retires the pool payer: the next
+/// pull runs under a fresh one, whose ledgers know only the new pool.
+#[tokio::test]
+async fn a_replaced_pool_rebuilds_the_pool_payer() {
+    let (worker, log, _release) = start_with(4, true).await;
+    let (_reader, done) = send_pool(&worker, REPLACED);
+    let err = done.await.unwrap().unwrap_err();
+    assert!(err.downcast_ref::<decdn_client::PoolReplaced>().is_some());
+    let (reader, done) = send_pool(&worker, HELLO);
+    assert_eq!(read_all(reader).await, b"hello");
+    done.await.unwrap().unwrap();
+    worker.stop().await;
+
+    let log = log.lock().unwrap();
+    assert_ne!(
+        log.pulled_under[0], log.pulled_under[1],
+        "the pull after a replacement runs under a new payer"
+    );
+    assert_eq!(log.payers_made, 2);
+}
+
+/// A worker whose pool payer cannot be built does not start: a wrong
+/// keystore password fails `decdn gateway` before it listens.
+#[tokio::test]
+async fn a_pool_payer_that_cannot_be_built_fails_the_start() {
+    struct NoKey;
+    impl Backend for NoKey {
+        type Host = ();
+        type Payer = ();
+        async fn open(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn payer(&self, _credential: Credential) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn pool_payer(&self, (): &()) -> anyhow::Result<Option<()>> {
+            anyhow::bail!("wrong password")
+        }
+        async fn pull(
+            &self,
+            (): &(),
+            (): &(),
+            _blob: &BlobFetch,
+            _sink: &mut Sink,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn close(&self, (): ()) {}
+    }
+    let Err(err) = PullWorker::start(NoKey, 1).await else {
+        panic!("a pool payer that cannot be built starts no worker");
+    };
+    assert!(format!("{err:#}").contains("wrong password"), "{err:#}");
+}
+
 /// A worker whose host cannot be built does not start.
 #[tokio::test]
 async fn a_host_that_cannot_be_built_fails_the_start() {
@@ -264,4 +405,38 @@ async fn a_host_that_cannot_be_built_fails_the_start() {
         panic!("a broken host starts no worker");
     };
     assert!(format!("{err:#}").contains("no endpoint"), "{err:#}");
+}
+
+/// A job's admission check runs once the pull has its slot, so what changed
+/// while it waited (an allowance spent by the pulls before it) refuses it
+/// before any paid work.
+#[tokio::test]
+async fn a_job_refused_at_its_slot_pulls_nothing() {
+    let (worker, log, _release) = start_with(4, true).await;
+    let (writer, reader) = tokio::io::duplex(1024);
+    let (done, result) = oneshot::channel();
+    worker
+        .pull(Job {
+            blob: BlobFetch {
+                hash: [HELLO; 32],
+                namespace: None,
+                output: PathBuf::from("-"),
+                common: common(),
+                read_ahead: None,
+                size_cap: None,
+            },
+            paying: Payment::Pool,
+            writer,
+            done,
+            admit: Some(Box::new(|| false)),
+        })
+        .expect("the worker takes the job");
+    let err = result.await.unwrap().unwrap_err();
+    assert!(
+        err.downcast_ref::<super::NotAdmitted>().is_some(),
+        "{err:#}"
+    );
+    assert!(read_all(reader).await.is_empty());
+    worker.stop().await;
+    assert!(log.lock().unwrap().pulled_under.is_empty(), "no pull ran");
 }

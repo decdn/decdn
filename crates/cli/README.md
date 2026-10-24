@@ -6,7 +6,9 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 
 The user-facing `decdn` binary: `get`, `probe`, `node` administration, `key-gen`,
 `config`, `pool`, `publish`, `origin`, `appeal`, `gateway` and `self-update`
-subcommands. `self-update` replaces the binary with the latest release whose
+subcommands. `gateway` serves `decdn:` URIs over HTTP: to a browser from
+loopback, or with `--public-url` to anyone at a public origin, paid from the
+gateway's own pool within a daily allowance. `self-update` replaces the binary with the latest release whose
 `SHA256SUMS.minisig` verifies against one of the maintainers' minisign keys
 embedded from the
 [`minisign-*.pub`](https://github.com/decdn/decdn/tree/main/crates/cli) files.

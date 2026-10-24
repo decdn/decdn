@@ -363,6 +363,25 @@ async fn test_gateway_with(
     backend: impl worker::Backend,
     common: cli::ClientFetchArgs,
 ) -> Arc<Gateway> {
+    let sites = SiteDomain::Loopback {
+        listen: "127.0.0.1:8484".parse().unwrap(),
+    };
+    test_gateway_in(backend, common, sites, u64::MAX).await
+}
+
+/// A gateway on `backend` whose sites live under `sites`: a loopback gateway
+/// with [`TEST_TOKEN`], or a public one with no token and `allowance` bytes
+/// per key per day.
+async fn test_gateway_in(
+    backend: impl worker::Backend,
+    common: cli::ClientFetchArgs,
+    sites: SiteDomain,
+    allowance: u64,
+) -> Arc<Gateway> {
+    let token = matches!(sites, SiteDomain::Loopback { .. }).then(|| TEST_TOKEN.to_owned());
+    let public = matches!(sites, SiteDomain::Public { .. }).then(|| Public {
+        allowance: Allowance::new(allowance),
+    });
     let chain = ChainConfig {
         // Nothing here reaches the chain: every request below stops first.
         rpc_url: "http://127.0.0.1:1".to_owned(),
@@ -373,7 +392,7 @@ async fn test_gateway_with(
     };
     Arc::new(Gateway {
         common,
-        token: TEST_TOKEN.to_owned(),
+        token,
         domain: voucher_domain(chain.chain_id, chain.payment_pool),
         chain,
         delegates: Mutex::new(HashMap::new()),
@@ -381,7 +400,8 @@ async fn test_gateway_with(
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
-        listen: "127.0.0.1:8484".parse().unwrap(),
+        sites,
+        public,
     })
 }
 
@@ -477,6 +497,10 @@ enum Reply {
     /// The pull ends at its cap before any byte, as a blob that the store
     /// already shows to be past the cap does.
     TooLarge,
+    /// The pull stops for funding before any byte.
+    Funding,
+    /// The pull writes nothing and never ends.
+    Hold,
     /// The pull writes these bytes, then ends at its cap, as a blob larger
     /// than the cap does once the cap's worth has landed.
     BytesThenTooLarge(Vec<u8>),
@@ -485,11 +509,15 @@ enum Reply {
 }
 
 /// A pull backend that answers each blob by its hash and records the
-/// `--max-blob-mb` each pull runs with.
+/// `--max-blob-mb` each pull runs with, and the size cap it carries.
 struct Recording {
-    caps: Arc<std::sync::Mutex<Vec<u64>>>,
+    caps: Log<u64>,
+    size_caps: Log<Option<u64>>,
     replies: HashMap<[u8; 32], Reply>,
 }
+
+/// A shared, appended log of what the pulls carried.
+type Log<T> = Arc<std::sync::Mutex<Vec<T>>>;
 
 impl worker::Backend for Recording {
     type Host = ();
@@ -503,6 +531,10 @@ impl worker::Backend for Recording {
         Ok(())
     }
 
+    async fn pool_payer(&self, (): &()) -> anyhow::Result<Option<()>> {
+        Ok(Some(()))
+    }
+
     async fn pull(
         &self,
         (): &(),
@@ -511,6 +543,7 @@ impl worker::Backend for Recording {
         sink: &mut super::super::fetch::Sink,
     ) -> anyhow::Result<()> {
         self.caps.lock().unwrap().push(blob.common.max_blob_mb);
+        self.size_caps.lock().unwrap().push(blob.size_cap);
         let too_large = || {
             anyhow::Error::new(decdn_client::BlobTooLarge {
                 reached: (blob.common.max_blob_mb << 20) + 1,
@@ -523,6 +556,12 @@ impl worker::Backend for Recording {
         match self.replies.get(&blob.hash) {
             None => anyhow::bail!("no node holds the blob"),
             Some(Reply::TooLarge) => Err(too_large()),
+            Some(Reply::Funding) => Err(anyhow::Error::new(
+                decdn_client::FundingNeeded::PublisherPool {
+                    pool: alloy::primitives::B256::ZERO,
+                },
+            )),
+            Some(Reply::Hold) => std::future::pending().await,
             Some(Reply::BytesThenTooLarge(bytes)) => {
                 tokio::io::AsyncWriteExt::write_all(writer, bytes).await?;
                 Err(too_large())
@@ -557,6 +596,7 @@ async fn recording_gateway_of(
     let caps = Arc::default();
     let backend = Recording {
         caps: Arc::clone(&caps),
+        size_caps: Arc::default(),
         replies,
     };
     let gateway = test_gateway_with(backend, flags(args)).await;
@@ -720,8 +760,19 @@ async fn request(
     path: &str,
     headers: &[(&str, &str)],
 ) -> Answer {
+    send(gateway, Method::GET, host, path, headers).await
+}
+
+/// `method path` with `Host: host` and `headers`, an empty body and no token.
+async fn send(
+    gateway: &Arc<Gateway>,
+    method: Method,
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Answer {
     let mut req = Request::builder()
-        .method(Method::GET)
+        .method(method)
         .uri(path)
         .header(header::HOST, host);
     for (name, value) in headers {
@@ -791,12 +842,11 @@ async fn site_gateway() -> (Arc<Gateway>, String) {
         (OTHER, Reply::Bytes(b"other bytes".to_vec())),
     ]);
     let (gateway, _) = recording_gateway_of(replies, &[]).await;
-    let host = Site {
+    let host = gateway.sites.site_host(&Site {
         hash: BLOB,
         namespace: None,
-    }
-    .host();
-    (gateway, format!("{host}:8484"))
+    });
+    (gateway, host)
 }
 
 #[tokio::test]
@@ -867,11 +917,10 @@ async fn decdn_paths_serve_a_pages_requests_and_redirect_its_navigation() {
         (StatusCode::OK, "other bytes")
     );
 
-    let other_site = Site {
+    let other_site = gateway.sites.site_host(&Site {
         hash: OTHER,
         namespace: Some(7),
-    }
-    .host();
+    });
     let link = request(
         &gateway,
         &host,
@@ -882,7 +931,7 @@ async fn decdn_paths_serve_a_pages_requests_and_redirect_its_navigation() {
     assert_eq!(link.status, StatusCode::FOUND);
     assert_eq!(
         link.header(header::LOCATION),
-        Some(format!("http://{other_site}:8484/a%20b.html").as_str())
+        Some(format!("http://{other_site}/a%20b.html").as_str())
     );
 
     let download = request(&gateway, &host, &format!("/_decdn/{other}"), CLICK).await;
@@ -957,14 +1006,10 @@ async fn a_site_without_an_index_lists_its_entries_relatively() {
     ]});
     let (gateway, _) =
         recording_gateway(Reply::Bytes(manifest.to_string().into_bytes()), &[]).await;
-    let host = format!(
-        "{}:8484",
-        Site {
-            hash: BLOB,
-            namespace: None
-        }
-        .host()
-    );
+    let host = gateway.sites.site_host(&Site {
+        hash: BLOB,
+        namespace: None,
+    });
     let list = request(&gateway, &host, "/", TYPED).await;
     assert_eq!(list.status, StatusCode::OK);
     assert!(list.body.contains("href=\"./a%20b.txt\""), "{}", list.body);
@@ -974,16 +1019,15 @@ async fn a_site_without_an_index_lists_its_entries_relatively() {
 async fn the_bare_origin_opens_a_bundle_as_its_site_without_the_token() {
     let gateway = test_gateway().await;
     let blob = alloy::hex::encode(BLOB);
-    let site = Site {
+    let site = gateway.sites.site_host(&Site {
         hash: BLOB,
         namespace: Some(3),
-    }
-    .host();
+    });
     let answer = request(&gateway, "127.0.0.1:8484", &format!("/{blob}/?ns=3"), TYPED).await;
     assert_eq!(answer.status, StatusCode::FOUND);
     assert_eq!(
         answer.header(header::LOCATION),
-        Some(format!("http://{site}:8484/").as_str())
+        Some(format!("http://{site}/").as_str())
     );
     let answer = request(&gateway, "127.0.0.1:8484", &format!("/{blob}"), TYPED).await;
     assert_eq!(
@@ -1057,16 +1101,23 @@ fn flags(args: &[&str]) -> cli::ClientFetchArgs {
 }
 
 #[test]
-fn a_keystore_password_file_is_dropped_and_key_flags_are_refused() {
-    let common = keyless(&flags(&["--keystore-password-file", "/pw"])).unwrap();
+fn a_loopback_gateway_drops_the_password_file_and_refuses_key_flags() {
+    let common = fetch_flags(&flags(&["--keystore-password-file", "/pw"]), false).unwrap();
     assert!(common.keystore_password_file.is_none());
     for flag in [
         ["--keystore", "/ks"],
         ["--capability", "dcap1:x"],
         ["--capability-file", "/cap"],
     ] {
-        assert!(keyless(&flags(&flag)).is_err(), "{flag:?}");
+        assert!(fetch_flags(&flags(&flag), false).is_err(), "{flag:?}");
+        assert!(fetch_flags(&flags(&flag), true).is_ok(), "{flag:?}");
     }
+    // A public gateway pays from its keystore, so it keeps the password file.
+    let common = fetch_flags(&flags(&["--keystore-password-file", "/pw"]), true).unwrap();
+    assert_eq!(
+        common.keystore_password_file.as_deref(),
+        Some(std::path::Path::new("/pw"))
+    );
 }
 
 #[test]
@@ -1196,4 +1247,662 @@ fn prune_drops_stale_pending_and_expired_delegates() {
     Gateway::prune(&mut delegates);
     assert!(delegates.contains_key(&fresh.address()));
     assert!(!delegates.contains_key(&stale.address()));
+}
+
+/// The entry blob of the public gateway's bundle.
+const ENTRY: [u8; 32] = [0xe4; 32];
+
+/// What one public gateway's pulls carried, in order.
+struct Logs {
+    /// The `--max-blob-mb` of each pull.
+    caps: Log<u64>,
+    /// The size cap of each pull.
+    size_caps: Log<Option<u64>>,
+}
+
+/// The blob whose pull stops for funding on the public gateway.
+const UNFUNDED: [u8; 32] = [0xe5; 32];
+
+/// A blob of several response frames on the public gateway.
+const BIG: [u8; 32] = [0xe6; 32];
+
+/// A blob whose pull writes a few bytes and then ends at its cap.
+const PARTIAL: [u8; 32] = [0xe7; 32];
+
+/// A bundle with no `index.html`, whose one entry has a space in its name.
+const NOINDEX: [u8; 32] = [0xe9; 32];
+
+/// A blob whose pull never writes a byte, and never ends.
+const HELD: [u8; 32] = [0xea; 32];
+
+/// The [`NOINDEX`] bundle's manifest.
+fn noindex_manifest() -> Vec<u8> {
+    serde_json::json!({"version": 1, "entries": [
+        {"path": "a b.txt", "hash": alloy::hex::encode(ENTRY), "size": 3},
+    ]})
+    .to_string()
+    .into_bytes()
+}
+const BIG_LEN: usize = 600 * 1024;
+
+/// The empty entry of the public gateway's bundle.
+const EMPTY: [u8; 32] = [0xe8; 32];
+
+/// The public gateway's bundle manifest.
+fn public_manifest() -> Vec<u8> {
+    serde_json::json!({"version": 1, "entries": [
+        {"path": "a.txt", "hash": alloy::hex::encode(ENTRY), "size": 3},
+        {"path": "index.html", "hash": alloy::hex::encode(PAGE)},
+        {"path": "empty.txt", "hash": alloy::hex::encode(EMPTY), "size": 0},
+    ]})
+    .to_string()
+    .into_bytes()
+}
+
+/// A gateway on [`Recording`] serving the public origin `https://decdn.test`,
+/// with [`BLOB`] a bundle of `a.txt` (3 bytes) and `index.html`, the blob
+/// [`OTHER`], and the caps its pulls record, plus the bundle's site host.
+async fn public_gateway() -> (Arc<Gateway>, Logs, String) {
+    public_gateway_with(u64::MAX).await
+}
+
+/// [`public_gateway`] with `allowance` bytes per key per day.
+async fn public_gateway_with(allowance: u64) -> (Arc<Gateway>, Logs, String) {
+    let replies = HashMap::from([
+        (BLOB, Reply::Bytes(public_manifest())),
+        (ENTRY, Reply::Bytes(b"abc".to_vec())),
+        (PAGE, Reply::Bytes(b"<p>hi</p>".to_vec())),
+        (OTHER, Reply::Bytes(b"other bytes".to_vec())),
+        (UNFUNDED, Reply::Funding),
+        (BIG, Reply::Bytes(vec![0x42; BIG_LEN])),
+        (PARTIAL, Reply::BytesThenTooLarge(b"partial".to_vec())),
+        (NOINDEX, Reply::Bytes(noindex_manifest())),
+        (HELD, Reply::Hold),
+    ]);
+    let logs = Logs {
+        caps: Arc::default(),
+        size_caps: Arc::default(),
+    };
+    let backend = Recording {
+        caps: Arc::clone(&logs.caps),
+        size_caps: Arc::clone(&logs.size_caps),
+        replies,
+    };
+    let sites = SiteDomain::Public {
+        origin: "https://decdn.test".parse().unwrap(),
+    };
+    let gateway = test_gateway_in(backend, flags(&[]), sites, allowance).await;
+    let host = gateway.sites.site_host(&Site {
+        hash: BLOB,
+        namespace: None,
+    });
+    (gateway, logs, host)
+}
+
+/// A public site serves its entries to anyone: no token, no browser
+/// headers, the operator's pool pays.
+#[tokio::test]
+async fn a_public_site_serves_to_anyone() {
+    let (gateway, _, host) = public_gateway().await;
+    let answer = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!(
+        (answer.status, answer.body.as_str()),
+        (StatusCode::OK, "abc")
+    );
+    let page = request(&gateway, &host, "/", &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("<p>hi</p>"), "{}", page.body);
+    assert_eq!(
+        page.header(header::CONTENT_TYPE),
+        Some("text/html; charset=utf-8")
+    );
+    let policy = page.header(header::CONTENT_SECURITY_POLICY).unwrap();
+    assert!(policy.ends_with("connect-src 'self'"), "{policy}");
+    assert!(!policy.contains("http"), "{policy}");
+}
+
+/// A public gateway has no delegates and no capabilities: its API paths
+/// answer 404 on every origin, and nothing answers cross-origin.
+#[tokio::test]
+async fn the_public_gateway_api_is_closed() {
+    let (gateway, logs, host) = public_gateway().await;
+    for (method, path) in [
+        (Method::GET, "/_delegate"),
+        (Method::PUT, "/_capability"),
+        (Method::GET, "/_capability"),
+        (Method::OPTIONS, "/_delegate"),
+    ] {
+        for origin in ["decdn.test", host.as_str()] {
+            let answer = send(&gateway, method.clone(), origin, path, &[]).await;
+            assert_eq!(
+                answer.status,
+                StatusCode::NOT_FOUND,
+                "{method} {path} on {origin}"
+            );
+        }
+    }
+    let landing = request(&gateway, "decdn.test", "/", &[]).await;
+    assert_eq!(landing.status, StatusCode::OK);
+    assert!(logs.caps.lock().unwrap().is_empty(), "nothing was pulled");
+}
+
+/// On the public bare host a bundle or an entry redirects to its site over
+/// the public scheme, and a blob streams.
+#[tokio::test]
+async fn the_public_bare_host_redirects_bundles_and_streams_blobs() {
+    let (gateway, _, host) = public_gateway().await;
+    let blob = alloy::hex::encode(BLOB);
+    let bundle = request(&gateway, "decdn.test", &format!("/{blob}/"), &[]).await;
+    assert_eq!(bundle.status, StatusCode::FOUND);
+    assert_eq!(
+        bundle.header(header::LOCATION),
+        Some(format!("https://{host}/").as_str())
+    );
+    let entry = request(&gateway, "decdn.test", &format!("/{blob}/a.txt"), &[]).await;
+    assert_eq!(
+        entry.header(header::LOCATION),
+        Some(format!("https://{host}/a.txt").as_str())
+    );
+    let other = alloy::hex::encode(OTHER);
+    let raw = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
+    assert_eq!(
+        (raw.status, raw.body.as_str()),
+        (StatusCode::OK, "other bytes")
+    );
+}
+
+/// A public gateway answers `HEAD` from the bundle manifest: the entry's
+/// length and hash, with no pull of the entry itself. A raw blob's `HEAD`
+/// costs no pull either, and has no length to give.
+#[tokio::test]
+async fn a_public_head_is_answered_from_the_manifest() {
+    let (gateway, logs, host) = public_gateway().await;
+    let head = send(&gateway, Method::HEAD, &host, "/a.txt", &[]).await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(head.header(header::CONTENT_LENGTH), Some("3"));
+    assert_eq!(
+        head.header(header::ETAG),
+        Some(format!("\"{}\"", alloy::hex::encode(ENTRY)).as_str())
+    );
+    assert_eq!(
+        head.header(header::CONTENT_TYPE),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(head.header(header::ACCEPT_RANGES), None);
+    assert!(head.body.is_empty());
+    assert_eq!(
+        *logs.caps.lock().unwrap(),
+        [MAX_MANIFEST_MB],
+        "only the manifest is pulled"
+    );
+
+    let page = send(&gateway, Method::HEAD, &host, "/", &[]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(
+        page.header(header::CONTENT_TYPE),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(
+        page.header(header::CONTENT_LENGTH),
+        None,
+        "no size, and HTML is rewritten"
+    );
+
+    let other = alloy::hex::encode(OTHER);
+    let raw = send(
+        &gateway,
+        Method::HEAD,
+        "decdn.test",
+        &format!("/{other}"),
+        &[],
+    )
+    .await;
+    assert_eq!(raw.status, StatusCode::OK);
+    assert_eq!(raw.header(header::CONTENT_LENGTH), None);
+    assert_eq!(
+        logs.caps.lock().unwrap().len(),
+        1,
+        "a raw blob's HEAD pulls nothing"
+    );
+
+    let missing = send(&gateway, Method::HEAD, &host, "/nope.txt", &[]).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+/// A public gateway answers its domain, its sites and its own listen
+/// address, and refuses every other `Host`.
+#[tokio::test]
+async fn a_public_gateway_refuses_unknown_hosts() {
+    let (gateway, _, _) = public_gateway().await;
+    for host in [
+        "evil.test",
+        "decdn.test.evil.test",
+        "localhost:9999",
+        "decdn.test:443",
+    ] {
+        let answer = request(&gateway, host, "/", &[]).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN, "{host}");
+    }
+    // Its own loopback names still reach the bare host, for a health check.
+    for host in ["127.0.0.1:8484", "localhost:8484"] {
+        let health = request(&gateway, host, "/", &[]).await;
+        assert_eq!(health.status, StatusCode::OK, "{host}");
+    }
+}
+
+/// A namespace host with no pointer on this gateway is not found.
+#[tokio::test]
+async fn a_public_namespace_without_a_pointer_is_not_found() {
+    let (gateway, _, _) = public_gateway().await;
+    let answer = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    assert!(answer.body.contains("namespace 7"), "{}", answer.body);
+}
+
+/// A key whose allowance is spent answers 402 before any pull, naming the
+/// canonical `decdn:` URI so a paying client continues on its own; the
+/// response that crosses the limit still completes.
+#[tokio::test]
+async fn an_exhausted_allowance_answers_402_with_the_uri() {
+    // Exactly the manifest and one entry: the first request spends it all.
+    let allowance = u64::try_from(public_manifest().len()).unwrap() + 3;
+    let (gateway, logs, host) = public_gateway_with(allowance).await;
+    let first = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!((first.status, first.body.as_str()), (StatusCode::OK, "abc"));
+    let pulls = logs.caps.lock().unwrap().len();
+
+    let refused = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
+    let uri = format!("decdn:{}/a.txt", alloy::hex::encode(BLOB));
+    assert_eq!(
+        refused.header(header::LINK),
+        Some(format!("<{uri}>; rel=\"alternate\"").as_str())
+    );
+    assert!(refused.header(header::RETRY_AFTER).is_some());
+    assert_eq!(
+        refused.header(header::CONTENT_TYPE),
+        Some("application/json")
+    );
+    let body: serde_json::Value = serde_json::from_str(&refused.body).unwrap();
+    assert_eq!(body["uri"], uri);
+    assert!(body["retry_after_secs"].is_u64(), "{body}");
+    assert_eq!(
+        logs.caps.lock().unwrap().len(),
+        pulls,
+        "a refused request pulls nothing"
+    );
+}
+
+/// Every request spends the one allowance, whatever namespace hint it
+/// carries: the hint is the client's to set, so it buys no bucket of its own.
+#[tokio::test]
+async fn every_request_spends_the_one_allowance() {
+    let (gateway, _, _) = public_gateway_with(10).await;
+    let other = alloy::hex::encode(OTHER);
+    let first = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
+    assert_eq!(first.status, StatusCode::OK);
+    for (host, path) in [
+        ("decdn.test", format!("/{other}")),
+        ("decdn.test", format!("/{other}?ns=7")),
+        (
+            &*gateway.sites.site_host(&Site {
+                hash: BLOB,
+                namespace: Some(7),
+            }),
+            "/a.txt".to_owned(),
+        ),
+    ] {
+        let spent = request(&gateway, host, &path, &[]).await;
+        assert_eq!(spent.status, StatusCode::PAYMENT_REQUIRED, "{host}{path}");
+    }
+}
+
+/// An entry whose size the manifest gives, and that does not fit what is
+/// left, is refused before its pull: the manifest is read, the entry never.
+#[tokio::test]
+async fn an_entry_that_does_not_fit_is_refused_before_its_pull() {
+    let (gateway, logs, host) = public_gateway_with(2).await;
+    let refused = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        *logs.caps.lock().unwrap(),
+        [MAX_MANIFEST_MB],
+        "only the manifest was pulled"
+    );
+    assert_eq!(
+        refused.header(header::LINK),
+        Some(
+            format!(
+                "<decdn:{}/a.txt>; rel=\"alternate\"",
+                alloy::hex::encode(BLOB)
+            )
+            .as_str()
+        )
+    );
+}
+
+/// A stream whose size nobody knew is cut once the allowance runs out: the
+/// frames already paid for go out, then the body ends with an error, never a
+/// quiet short file. A stream whose last frame reaches the bound ends whole.
+#[tokio::test]
+async fn a_stream_is_cut_when_the_allowance_runs_out() {
+    // A 600 KiB blob streams in three frames of 256 KiB; the second reaches
+    // a 300 KiB allowance and the third never goes out.
+    let (gateway, _, _) = public_gateway_with(300 * 1024).await;
+    let big = alloy::hex::encode(BIG);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{big}"))
+        .header(header::HOST, "decdn.test")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = Arc::clone(&gateway).handle(req).await;
+    assert_eq!(response.status(), StatusCode::OK, "the pull was admitted");
+    let body = response.into_body().collect().await;
+    assert!(
+        body.is_err(),
+        "the body ends with an error once the allowance is spent"
+    );
+    let next = request(&gateway, "decdn.test", &format!("/{big}"), &[]).await;
+    assert_eq!(next.status, StatusCode::PAYMENT_REQUIRED);
+
+    // Eleven bytes against ten: the one frame reaches the bound and the body
+    // still ends whole.
+    let (gateway, _, _) = public_gateway_with(10).await;
+    let other = alloy::hex::encode(OTHER);
+    let whole = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
+    assert_eq!(
+        (whole.status, whole.body.as_str()),
+        (StatusCode::OK, "other bytes")
+    );
+}
+
+/// `HEAD` reads the manifest, a paid pull, so it needs the allowance too.
+#[tokio::test]
+async fn a_public_head_needs_the_allowance() {
+    let (gateway, logs, host) = public_gateway_with(10).await;
+    let other = alloy::hex::encode(OTHER);
+    let spend = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
+    assert_eq!(spend.status, StatusCode::OK);
+    let pulls = logs.caps.lock().unwrap().len();
+    let head = send(&gateway, Method::HEAD, &host, "/a.txt", &[]).await;
+    assert_eq!(head.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(logs.caps.lock().unwrap().len(), pulls, "no manifest pull");
+}
+
+/// When the gateway's own pool cannot pay, the client did nothing wrong: 503
+/// with the URI and a retry hint, never 402.
+#[tokio::test]
+async fn a_pool_that_cannot_pay_answers_503() {
+    let (gateway, _, _) = public_gateway().await;
+    let unfunded = alloy::hex::encode(UNFUNDED);
+    let answer = request(&gateway, "decdn.test", &format!("/{unfunded}"), &[]).await;
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(answer.header(header::RETRY_AFTER), Some("60"));
+    assert_eq!(
+        answer.header(header::LINK),
+        Some(format!("<decdn:{unfunded}>; rel=\"alternate\"").as_str())
+    );
+    let body: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+    assert_eq!(body["uri"], format!("decdn:{unfunded}"));
+}
+
+/// What the public allowance has left right now.
+fn left(gateway: &Gateway) -> u64 {
+    gateway
+        .public
+        .as_ref()
+        .unwrap()
+        .allowance
+        .remaining(now_secs())
+        .unwrap_or(0)
+}
+
+/// A blob read as a manifest that turns out not to be one was still pulled
+/// and paid for: its bytes are charged. A manifest read that ends short (the
+/// blob ran past the manifest cap) is also charged the read-ahead the pull
+/// may have paid past the bytes that landed.
+#[tokio::test]
+async fn a_blob_that_is_no_manifest_is_still_charged() {
+    let allowance = 64 << 20;
+    let (gateway, _, _) = public_gateway_with(allowance).await;
+    let site = gateway.sites.site_host(&Site {
+        hash: OTHER,
+        namespace: None,
+    });
+    let answer = request(&gateway, &site, "/x", &[]).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    let after_whole = allowance - "other bytes".len() as u64;
+    assert_eq!(left(&gateway), after_whole, "a whole read costs its bytes");
+
+    let site = gateway.sites.site_host(&Site {
+        hash: PARTIAL,
+        namespace: None,
+    });
+    let answer = request(&gateway, &site, "/x", &[]).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        left(&gateway),
+        after_whole - "partial".len() as u64 - DROP_PENALTY_BYTES,
+        "a short read costs its bytes and the read-ahead bound"
+    );
+}
+
+/// A response dropped mid-stream is charged the frames it took and the
+/// read-ahead the pull paid for beyond them, so a client that connects and
+/// drops spends no more than it is charged. A stream read to its end is
+/// charged its bytes alone.
+#[tokio::test]
+async fn a_dropped_response_is_charged_its_read_ahead() {
+    let allowance = 64 << 20;
+    let (gateway, _, _) = public_gateway_with(allowance).await;
+    let big = alloy::hex::encode(BIG);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{big}"))
+        .header(header::HOST, "decdn.test")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = Arc::clone(&gateway).handle(req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap();
+    let taken = first.data_ref().unwrap().len() as u64;
+    assert!(taken > 0 && taken < BIG_LEN as u64);
+    drop(body);
+    assert_eq!(left(&gateway), allowance - taken - DROP_PENALTY_BYTES);
+
+    let whole = request(&gateway, "decdn.test", &format!("/{big}"), &[]).await;
+    assert_eq!(whole.status, StatusCode::OK);
+    assert_eq!(whole.body.len(), BIG_LEN);
+    assert_eq!(
+        left(&gateway),
+        allowance - taken - DROP_PENALTY_BYTES - BIG_LEN as u64
+    );
+}
+
+/// A body with a known length is dropped by the HTTP server once that many
+/// bytes are out, without a final poll: delivered whole, it costs its bytes
+/// and no penalty.
+#[tokio::test]
+async fn a_body_delivered_to_its_known_length_pays_no_penalty() {
+    let allowance = 64 << 20;
+    let (gateway, _, host) = public_gateway_with(allowance).await;
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/a.txt")
+        .header(header::HOST, &host)
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = Arc::clone(&gateway).handle(req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get(header::CONTENT_LENGTH).unwrap(), "3");
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap();
+    assert_eq!(first.data_ref().unwrap().len(), 3);
+    // As hyper does: the declared length is out, the stream is dropped.
+    drop(body);
+    assert_eq!(
+        left(&gateway),
+        allowance - public_manifest().len() as u64 - 3
+    );
+}
+
+/// An entry's pull is capped at the size its manifest declares, so a
+/// manifest that understates an entry cannot make the gateway pay for the
+/// rest; a manifest pull and a raw blob, whose sizes nothing declares, run
+/// under the gateway's cap alone.
+#[tokio::test]
+async fn an_entry_pull_is_capped_at_its_declared_size() {
+    let (gateway, logs, host) = public_gateway().await;
+    let before = logs.size_caps.lock().unwrap().len();
+    let answer = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!(
+        (answer.status, answer.body.as_str()),
+        (StatusCode::OK, "abc")
+    );
+    let other = alloy::hex::encode(OTHER);
+    let raw = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
+    assert_eq!(raw.status, StatusCode::OK);
+    let caps = logs.size_caps.lock().unwrap();
+    assert_eq!(
+        &caps[before..],
+        [None, Some(3), None],
+        "the manifest, then the entry at its size, then the raw blob"
+    );
+}
+
+/// An entry the manifest declares empty is answered empty, with no pull: a
+/// declared size of zero buys no uncapped pull, and nothing to deliver.
+#[tokio::test]
+async fn an_empty_entry_is_served_without_a_pull() {
+    let (gateway, logs, host) = public_gateway().await;
+    let answer = request(&gateway, &host, "/empty.txt", &[]).await;
+    assert_eq!((answer.status, answer.body.as_str()), (StatusCode::OK, ""));
+    assert_eq!(answer.header(header::CONTENT_LENGTH), Some("0"));
+    assert_eq!(
+        answer.header(header::CONTENT_TYPE),
+        Some("text/plain; charset=utf-8")
+    );
+    let head = send(&gateway, Method::HEAD, &host, "/empty.txt", &[]).await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(head.header(header::CONTENT_LENGTH), Some("0"));
+    assert_eq!(
+        *logs.caps.lock().unwrap(),
+        [MAX_MANIFEST_MB],
+        "only the manifest was pulled"
+    );
+}
+
+/// On a public site, a `/_decdn/` request with no `Sec-Fetch-*` headers comes
+/// from outside a browser, or from one that sends none, and is taken as a
+/// navigation: another bundle's pages never run on this origin, and a blob
+/// is a download. The site's own subresource requests are served as before.
+#[tokio::test]
+async fn a_headerless_request_for_another_bundle_is_a_navigation() {
+    let (gateway, _, host) = public_gateway().await;
+    let blob = alloy::hex::encode(BLOB);
+    let page = request(&gateway, &host, &format!("/_decdn/{blob}/a.txt"), &[]).await;
+    assert_eq!(page.status, StatusCode::FOUND);
+    assert_eq!(
+        page.header(header::LOCATION),
+        Some(format!("https://{host}/a.txt").as_str())
+    );
+    let other = alloy::hex::encode(OTHER);
+    let download = request(&gateway, &host, &format!("/_decdn/{other}"), &[]).await;
+    assert_eq!(download.status, StatusCode::OK);
+    assert!(
+        download
+            .header(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .starts_with("attachment")
+    );
+    let sub = request(
+        &gateway,
+        &host,
+        &format!("/_decdn/{blob}/a.txt"),
+        SAME_ORIGIN,
+    )
+    .await;
+    assert_eq!((sub.status, sub.body.as_str()), (StatusCode::OK, "abc"));
+}
+
+/// `HEAD` resolves a path as `GET` does: percent-encoded names decode, and
+/// the root of a bundle without an `index.html` is its listing, a page with
+/// no fixed length.
+#[tokio::test]
+async fn a_public_head_decodes_its_path_and_knows_a_bundle_without_an_index() {
+    let (gateway, _, _) = public_gateway().await;
+    let host = gateway.sites.site_host(&Site {
+        hash: NOINDEX,
+        namespace: None,
+    });
+    let entry = send(&gateway, Method::HEAD, &host, "/a%20b.txt", &[]).await;
+    assert_eq!(entry.status, StatusCode::OK);
+    assert_eq!(entry.header(header::CONTENT_LENGTH), Some("3"));
+    let root = send(&gateway, Method::HEAD, &host, "/", &[]).await;
+    assert_eq!(root.status, StatusCode::OK);
+    assert_eq!(
+        root.header(header::CONTENT_TYPE),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(root.header(header::CONTENT_LENGTH), None);
+}
+
+/// A generated listing has a known length too: one that does not fit what is
+/// left of the allowance is refused, not sent.
+#[tokio::test]
+async fn a_listing_that_does_not_fit_the_allowance_is_refused() {
+    let allowance = u64::try_from(noindex_manifest().len()).unwrap() + 1;
+    let (gateway, _, _) = public_gateway_with(allowance).await;
+    let host = gateway.sites.site_host(&Site {
+        hash: NOINDEX,
+        namespace: None,
+    });
+    let listing = request(&gateway, &host, "/", &[]).await;
+    assert_eq!(listing.status, StatusCode::PAYMENT_REQUIRED);
+}
+
+/// A manifest read stops at the allowance: a blob that is no manifest, read
+/// with a few bytes left, is not drained to the manifest cap. The request is
+/// refused, and the read-ahead the pull may have paid counts.
+#[tokio::test]
+async fn a_manifest_read_stops_at_the_allowance() {
+    let allowance = 100;
+    let (gateway, _, _) = public_gateway_with(allowance).await;
+    let host = gateway.sites.site_host(&Site {
+        hash: BIG,
+        namespace: None,
+    });
+    let answer = request(&gateway, &host, "/x", &[]).await;
+    assert_eq!(
+        answer.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "{}",
+        answer.body
+    );
+    assert_eq!(left(&gateway), 0);
+}
+
+/// A request dropped while its pull waits for a first byte still pays for
+/// the read-ahead that pull may have taken: the penalty is charged however
+/// early the client leaves.
+#[tokio::test]
+async fn a_request_dropped_before_its_first_byte_is_charged() {
+    let allowance = 64 << 20;
+    let (gateway, _, _) = public_gateway_with(allowance).await;
+    let held = alloy::hex::encode(HELD);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{held}"))
+        .header(header::HOST, "decdn.test")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let dropped =
+        tokio::time::timeout(Duration::from_millis(200), Arc::clone(&gateway).handle(req)).await;
+    assert!(
+        dropped.is_err(),
+        "the pull never answers, so the request is dropped"
+    );
+    assert_eq!(left(&gateway), allowance - DROP_PENALTY_BYTES);
 }
