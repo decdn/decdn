@@ -120,10 +120,33 @@ fn pointer(namespace: u64, root: u8, seq: u64) -> SignedPointer {
 /// The owner every store test's pointers are taken as signed by.
 const OWNER: Address = Address::repeat_byte(0x11);
 
+/// The deployment every store test's pointers are stored for.
+const CHAIN: u64 = 421_614;
+
+/// A store holds pointers for one deployment: namespace ids repeat across
+/// chains and redeploys, so a gateway restarted on another chain or another
+/// registry with the same data dir must not serve them.
+#[test]
+fn a_store_from_another_deployment_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    Pointers::load(dir.path(), CHAIN, REGISTRY)
+        .unwrap()
+        .set(pointer(7, 0x01, 5), OWNER)
+        .unwrap();
+    assert!(Pointers::load(dir.path(), CHAIN, REGISTRY).is_ok());
+    let other_chain = Pointers::load(dir.path(), 1, REGISTRY).unwrap_err();
+    assert!(
+        other_chain.to_string().contains("chain 421614"),
+        "{other_chain:#}"
+    );
+    let other_registry = Pointers::load(dir.path(), CHAIN, Address::repeat_byte(0x43));
+    assert!(other_registry.is_err());
+}
+
 #[test]
 fn a_newer_pointer_replaces_and_an_older_or_equal_one_is_stale() {
     let dir = tempfile::tempdir().unwrap();
-    let pointers = Pointers::load(dir.path()).unwrap();
+    let pointers = Pointers::load(dir.path(), CHAIN, REGISTRY).unwrap();
     assert_eq!(pointers.root(7), None);
     assert_eq!(pointers.high_water(7, OWNER), None);
     pointers.set(pointer(7, 0x01, 5), OWNER).unwrap();
@@ -151,7 +174,7 @@ fn a_newer_pointer_replaces_and_an_older_or_equal_one_is_stale() {
 #[test]
 fn another_signer_replaces_a_pointer_at_any_seq() {
     let dir = tempfile::tempdir().unwrap();
-    let pointers = Pointers::load(dir.path()).unwrap();
+    let pointers = Pointers::load(dir.path(), CHAIN, REGISTRY).unwrap();
     pointers.set(pointer(7, 0x01, u64::MAX), OWNER).unwrap();
     let new_owner = Address::repeat_byte(0x22);
     pointers.set(pointer(7, 0x02, 1), new_owner).unwrap();
@@ -170,7 +193,7 @@ fn another_signer_replaces_a_pointer_at_any_seq() {
 #[test]
 fn a_returning_signers_old_pointer_is_still_stale() {
     let dir = tempfile::tempdir().unwrap();
-    let pointers = Pointers::load(dir.path()).unwrap();
+    let pointers = Pointers::load(dir.path(), CHAIN, REGISTRY).unwrap();
     let other = Address::repeat_byte(0x22);
     pointers.set(pointer(7, 0x01, 5), OWNER).unwrap();
     pointers.set(pointer(7, 0x02, 1), other).unwrap();
@@ -191,12 +214,12 @@ fn pointers_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let other = Address::repeat_byte(0x22);
     {
-        let pointers = Pointers::load(dir.path()).unwrap();
+        let pointers = Pointers::load(dir.path(), CHAIN, REGISTRY).unwrap();
         pointers.set(pointer(7, 0x01, 5), OWNER).unwrap();
         pointers.set(pointer(7, 0x04, 1), other).unwrap();
         pointers.set(pointer(9, 0x02, 2), OWNER).unwrap();
     }
-    let reloaded = Pointers::load(dir.path()).unwrap();
+    let reloaded = Pointers::load(dir.path(), CHAIN, REGISTRY).unwrap();
     assert_eq!(reloaded.root(7), Some([0x04; 32]));
     assert_eq!(reloaded.root(9), Some([0x02; 32]));
     // Every signer's high water survives, not only the holder's.
@@ -214,21 +237,23 @@ fn pointers_survive_a_restart() {
 fn a_file_that_does_not_parse_or_is_misnamed_fails_the_load() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("7.json"), b"not json").unwrap();
-    assert!(Pointers::load(dir.path()).is_err());
+    assert!(Pointers::load(dir.path(), CHAIN, REGISTRY).is_err());
     std::fs::remove_file(dir.path().join("7.json")).unwrap();
     let record = serde_json::to_vec(&Record {
         pointer: pointer(7, 0x01, 1),
         signer: OWNER,
         high_water: HashMap::from([(OWNER, 1)]),
+        chain_id: CHAIN,
+        registry: REGISTRY,
     })
     .unwrap();
     std::fs::write(dir.path().join("8.json"), &record).unwrap();
-    assert!(Pointers::load(dir.path()).is_err());
+    assert!(Pointers::load(dir.path(), CHAIN, REGISTRY).is_err());
     std::fs::remove_file(dir.path().join("8.json")).unwrap();
     // A temp file a crash left behind is not a record.
     std::fs::write(dir.path().join(".tmpabc"), b"half").unwrap();
     std::fs::write(dir.path().join("7.json"), &record).unwrap();
-    let pointers = Pointers::load(dir.path()).unwrap();
+    let pointers = Pointers::load(dir.path(), CHAIN, REGISTRY).unwrap();
     assert_eq!(pointers.root(7), Some([0x01; 32]));
 }
 
@@ -238,7 +263,7 @@ fn the_pointer_dir_is_created_owner_only() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
     let inner = dir.path().join("pointers");
-    let pointers = Pointers::load(&inner).unwrap();
+    let pointers = Pointers::load(&inner, CHAIN, REGISTRY).unwrap();
     assert_eq!(
         std::fs::metadata(&inner).unwrap().permissions().mode() & 0o777,
         0o700

@@ -4095,7 +4095,9 @@ since project inception and will roll into the first tagged release.
   deployment: `namespaceId`, `root`, `seq`) with the namespace owner's
   keystore and `PUT`s it to the gateway as `/_pointer`. The gateway recovers
   the signer, checks it against `PublisherRegistry.ownerOf`, keeps the
-  pointer in `<data-dir>/pointers/<ns>.json`, and from then on serves the
+  pointer in `<data-dir>/pointers/<ns>.json` (bound to the chain and
+  registry it was verified on: a data dir moved to another deployment stops
+  the gateway instead of serving its pointers), and from then on serves the
   bundle as a website at `<ns>.<host>`. A pointer at a `seq` not above
   what the gateway stored from the same signer is 409 before any chain
   read; one from another signer who owns the namespace now replaces the

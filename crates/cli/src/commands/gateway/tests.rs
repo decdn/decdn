@@ -378,7 +378,7 @@ fn public_with(allowance: Allowance, pointers_dir: &Path) -> Public {
     Public {
         allowance,
         metrics: Metrics::default(),
-        pointers: Pointers::load(pointers_dir).unwrap(),
+        pointers: Pointers::load(pointers_dir, 421_614, REGISTRY).unwrap(),
         registry: REGISTRY,
         lookups: std::sync::Mutex::new(Budgets::default()),
         pointer_writes: Mutex::new(()),
