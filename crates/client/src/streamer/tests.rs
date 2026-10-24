@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
+use anyhow::Context as _;
 use bao_tree::io::outboard::PreOrderMemOutboard;
 use bytes::Bytes;
-use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, encode_verified_range};
+use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, align_range, encode_verified_range};
 use tokio::io::AsyncReadExt;
 
 use super::{StreamCandidate, Streamer, VerifiedReader};
@@ -120,13 +121,29 @@ async fn drain(
     cache: Arc<dyn BlobCache>,
     config: &PullConfig,
 ) -> anyhow::Result<Vec<u8>> {
-    let root = source.root();
     let total = source.total_bytes();
+    drain_range(source, ledger, total, (0, 0), cache, config).await
+}
+
+/// Open a stream over `source` for `window` with the given `claim` and drain
+/// it, then finish the drive.
+async fn drain_range(
+    source: ScriptedSource,
+    ledger: Arc<PoolLedger>,
+    claim: u64,
+    window: (u64, u64),
+    cache: Arc<dyn BlobCache>,
+    config: &PullConfig,
+) -> anyhow::Result<Vec<u8>> {
+    let root = source.root();
     let scratch = tempfile::tempdir()?;
     let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
-    let (mut reader, mut drive) = streamer.open(root, total, config, cache, stop()).await?;
+    let (mut reader, mut drive) = streamer
+        .open_range(root, claim, window, config, cache, stop())
+        .await?;
     let mut out = Vec::new();
     drive.alongside(reader.read_to_end(&mut out)).await?;
+    drive.finish().await?;
     Ok(out)
 }
 
@@ -411,7 +428,7 @@ async fn bounded_read_ahead_holds_the_spend_bound() -> anyhow::Result<()> {
                 let consumed = u64::try_from(out.len())?;
                 let ahead = match &reader {
                     VerifiedReader::Live(live) => {
-                        let present = super::present_frontier(&live.state.store).await?;
+                        let present = super::present_frontier(&live.state.store, 0).await?;
                         present.saturating_sub(consumed)
                     }
                     VerifiedReader::Cached { .. } => 0,
@@ -455,7 +472,7 @@ async fn the_drive_fills_one_window_while_the_consumer_is_paused() -> anyhow::Re
         .alongside(tokio::time::sleep(Duration::from_millis(300)))
         .await;
     let present = match &reader {
-        VerifiedReader::Live(live) => super::present_frontier(&live.state.store).await?,
+        VerifiedReader::Live(live) => super::present_frontier(&live.state.store, 0).await?,
         VerifiedReader::Cached { .. } => anyhow::bail!("a cold stream must be live"),
     };
     anyhow::ensure!(
@@ -527,12 +544,14 @@ async fn a_parked_lane_holds_the_clock_only_while_bytes_wait_unread() -> anyhow:
 
     for cursor_at_frontier in [true, false] {
         let store = crate::ClientRangedStore::open(dir.path(), "s", root)?;
-        let frontier = super::present_frontier(&store).await?;
+        let frontier = super::present_frontier(&store, 0).await?;
         anyhow::ensure!(frontier > 0 && frontier < total, "a partial store");
         let cursor = if cursor_at_frontier { frontier } else { 0 };
         let state = Arc::new(super::StreamState {
             store,
             cursor: AtomicU64::new(cursor),
+            start: 0,
+            end: None,
             hint: total,
             consumed: Notify::new(),
             progressed: Notify::new(),
@@ -790,4 +809,361 @@ async fn finish_after_a_clean_stream_is_ok() -> anyhow::Result<()> {
     drive.alongside(reader.read_to_end(&mut out)).await?;
     anyhow::ensure!(out == blob, "every verified byte reaches the reader");
     drive.finish().await
+}
+
+/// The chunk-group-aligned span a window's legs may open and pay for (ADR
+/// 038), as `(start, end)`.
+fn aligned_span(offset: u64, len: u64, total: u64) -> anyhow::Result<(u64, u64)> {
+    let aligned = align_range(offset, len, total)?;
+    Ok((aligned.fetch_start(), aligned.fetch_end()))
+}
+
+/// A range stream hands out exactly the requested byte window, however the
+/// window sits against the chunk-group grid.
+#[tokio::test]
+async fn a_range_stream_yields_exactly_the_window() -> anyhow::Result<()> {
+    let blob = payload(3 * 1024 * 1024 + 777);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let total = source.total_bytes();
+    let (offset, len) = (1_000_001u64, 500_000u64);
+    let got = drain_range(
+        source,
+        ledger,
+        total,
+        (offset, len),
+        Arc::new(NoCache),
+        &PullConfig::default(),
+    )
+    .await?;
+    let want = blob
+        .get(usize::try_from(offset)?..usize::try_from(offset + len)?)
+        .context("window inside the blob")?;
+    anyhow::ensure!(
+        got.len() == want.len(),
+        "{} of {} bytes",
+        got.len(),
+        want.len()
+    );
+    anyhow::ensure!(got == want, "the window must be byte-identical");
+    Ok(())
+}
+
+/// A range stream opens, and pays for, only the chunk-group-aligned span
+/// around its window: never the bytes before or after it.
+#[tokio::test]
+async fn a_range_stream_opens_only_the_aligned_span() -> anyhow::Result<()> {
+    let blob = payload(3 * 1024 * 1024 + 777);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let total = source.total_bytes();
+    let probe = source.clone();
+    let (offset, len) = (1_000_001u64, 500_000u64);
+    drain_range(
+        source,
+        Arc::clone(&ledger),
+        total,
+        (offset, len),
+        Arc::new(NoCache),
+        &PullConfig::default(),
+    )
+    .await?;
+    let (span_start, span_end) = aligned_span(offset, len, total)?;
+    let opened = probe.opened_ranges();
+    anyhow::ensure!(!opened.is_empty(), "the window was fetched");
+    for &(start, fetch_len) in &opened {
+        anyhow::ensure!(
+            fetch_len > 0 && start >= span_start && start + fetch_len <= span_end,
+            "leg ({start}, {fetch_len}) leaves the aligned span [{span_start}, {span_end})"
+        );
+    }
+    // Payment counts wire bytes: the aligned span plus its bao proof, which
+    // ADR 038 puts under one percent of the content.
+    let paid = ledger.paid_bytes();
+    let span = span_end - span_start;
+    anyhow::ensure!(
+        paid <= U256::from(span + span / 100) && paid < U256::from(blob.len() / 2),
+        "paid {paid} bytes for a {len}-byte window of a {}-byte blob",
+        blob.len()
+    );
+    Ok(())
+}
+
+/// A zero-length window is a tail: it streams from its offset to the size a
+/// leg proves, past a claim that was too small.
+#[tokio::test]
+async fn a_tail_window_follows_the_proven_size() -> anyhow::Result<()> {
+    let blob = payload(3 * 1024 * 1024 + 777);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let offset = 2 * 1024 * 1024 + 5;
+    let claim = 2 * 1024 * 1024 + 100;
+    let got = drain_range(
+        source,
+        ledger,
+        claim,
+        (offset, 0),
+        Arc::new(NoCache),
+        &PullConfig::default(),
+    )
+    .await?;
+    let want = blob
+        .get(usize::try_from(offset)?..)
+        .context("offset inside the blob")?;
+    anyhow::ensure!(got == want, "{} of {} tail bytes", got.len(), want.len());
+    Ok(())
+}
+
+/// A window that reaches past the blob's end streams to the proven size and
+/// stops: no error, no hang.
+#[tokio::test]
+async fn a_window_past_the_end_stops_at_the_proven_size() -> anyhow::Result<()> {
+    let blob = payload(1_500_000);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let total = source.total_bytes();
+    let offset = total - 100;
+    let got = drain_range(
+        source,
+        ledger,
+        total,
+        (offset, 10_000),
+        Arc::new(NoCache),
+        &PullConfig::default(),
+    )
+    .await?;
+    let want = blob
+        .get(usize::try_from(offset)?..)
+        .context("offset inside the blob")?;
+    anyhow::ensure!(got == want, "{} of {} bytes", got.len(), want.len());
+    Ok(())
+}
+
+/// A window that starts past the size claim is refused at open: the caller
+/// knows the size (a manifest entry) and answers its own "range not
+/// satisfiable" before any fetch.
+#[tokio::test]
+async fn a_window_past_the_claim_is_refused_at_open() -> anyhow::Result<()> {
+    let blob = payload(100_000);
+    let (source, ledger) = paying_source(blob)?;
+    let root = source.root();
+    let total = source.total_bytes();
+    let probe = source.clone();
+    let scratch = tempfile::tempdir()?;
+    let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
+    let opened = streamer
+        .open_range(
+            root,
+            total,
+            (total, 1),
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await;
+    anyhow::ensure!(
+        opened.is_err(),
+        "a window at or past the claim must not open"
+    );
+    anyhow::ensure!(
+        probe.opened_ranges().is_empty(),
+        "nothing is fetched for it"
+    );
+    Ok(())
+}
+
+/// A cache that holds the window serves it straight from the cache, without
+/// opening the source: the stream asks the cache for exactly the window.
+#[tokio::test]
+async fn a_cached_window_is_served_without_fetching() -> anyhow::Result<()> {
+    let blob = payload(600_000);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let root = source.root();
+    let total = source.total_bytes();
+    let probe = source.clone();
+    let (offset, len) = (123_456u64, 70_000u64);
+    let window = blob
+        .get(usize::try_from(offset)?..usize::try_from(offset + len)?)
+        .context("window inside the blob")?;
+    let cache = Arc::new(MemoryBlobCache::new());
+    cache
+        .put(root, offset, Bytes::copy_from_slice(window))
+        .await?;
+    let scratch = tempfile::tempdir()?;
+    let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
+    let (mut reader, mut drive) = streamer
+        .open_range(
+            root,
+            total,
+            (offset, len),
+            &PullConfig::default(),
+            cache,
+            stop(),
+        )
+        .await?;
+    anyhow::ensure!(matches!(reader, VerifiedReader::Cached { .. }));
+    let mut out = Vec::new();
+    drive.alongside(reader.read_to_end(&mut out)).await?;
+    let want = blob
+        .get(usize::try_from(offset)?..usize::try_from(offset + len)?)
+        .context("window inside the blob")?;
+    anyhow::ensure!(out == want, "the cached window must be identical");
+    anyhow::ensure!(
+        probe.opened_ranges().is_empty(),
+        "a cache hit opens no source"
+    );
+    Ok(())
+}
+
+/// A bounded window past a size claim too small for the blob is clipped to
+/// the claim: the fetch takes nothing past the end of the blob as the caller
+/// knows it, and the stream ends with an error naming the shortfall, never
+/// following the blob past a reader that stopped.
+#[tokio::test]
+async fn a_window_past_a_short_claim_is_clipped_to_it() -> anyhow::Result<()> {
+    let blob = payload(3 * 1024 * 1024 + 777);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let claim = 2 * 1024 * 1024 + 100;
+    let offset = 2 * 1024 * 1024 + 5;
+    // The smallest read-ahead window, so a drive that outruns a stopped
+    // reader parks on it instead of finishing within the window.
+    let config = PullConfig {
+        read_ahead_bytes: 1,
+        ..PullConfig::default()
+    };
+    let probe = source.clone();
+    let got = tokio::time::timeout(
+        Duration::from_secs(20),
+        drain_range(
+            source,
+            ledger,
+            claim,
+            (offset, 1_000),
+            Arc::new(NoCache),
+            &config,
+        ),
+    )
+    .await
+    .context("the stream and its drive end")?;
+    let err = match got {
+        Ok(bytes) => anyhow::bail!("{} bytes past the claim were streamed", bytes.len()),
+        Err(err) => format!("{err:#}"),
+    };
+    anyhow::ensure!(err.contains("bytes readable"), "{err}");
+    for &(start, fetch_len) in &probe.opened_ranges() {
+        anyhow::ensure!(
+            start + fetch_len <= claim,
+            "leg ({start}, {fetch_len}) runs past the claim"
+        );
+    }
+    Ok(())
+}
+
+/// A window needs a size: only offset `0` opens against a zero claim (the
+/// empty blob, or a stream that learns the size from its first leg).
+#[tokio::test]
+async fn a_window_past_zero_needs_a_size_claim() -> anyhow::Result<()> {
+    let blob = payload(100_000);
+    let (source, ledger) = paying_source(blob)?;
+    let root = source.root();
+    let probe = source.clone();
+    let scratch = tempfile::tempdir()?;
+    let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
+    let opened = streamer
+        .open_range(
+            root,
+            0,
+            (4_096, 1_000),
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await;
+    anyhow::ensure!(opened.is_err(), "a deep window with no size must not open");
+    anyhow::ensure!(
+        probe.opened_ranges().is_empty(),
+        "nothing is fetched for it"
+    );
+    Ok(())
+}
+
+/// A range stream never tees its bytes to the cache: a window is not the
+/// whole blob a revisit would be served.
+#[tokio::test]
+async fn a_range_stream_is_never_teed_to_the_cache() -> anyhow::Result<()> {
+    let blob = payload(1_500_000);
+    let (source, ledger) = paying_source(blob)?;
+    let root = source.root();
+    let total = source.total_bytes();
+    let cache = Arc::new(MemoryBlobCache::new());
+    drain_range(
+        source,
+        ledger,
+        total,
+        (4_096, 300_000),
+        Arc::clone(&cache) as Arc<dyn BlobCache>,
+        &PullConfig::default(),
+    )
+    .await?;
+    anyhow::ensure!(
+        cache.get(root, 0, total).await?.is_none(),
+        "a window must not be cached as the blob"
+    );
+    Ok(())
+}
+
+/// The whole-blob window `(0, 0)` is the plain stream.
+#[tokio::test]
+async fn a_whole_blob_window_streams_the_whole_blob() -> anyhow::Result<()> {
+    let blob = payload(1_500_000);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let total = source.total_bytes();
+    let got = drain_range(
+        source,
+        ledger,
+        total,
+        (0, 0),
+        Arc::new(NoCache),
+        &PullConfig::default(),
+    )
+    .await?;
+    anyhow::ensure!(got == blob, "the whole-blob window must be the blob");
+    Ok(())
+}
+
+/// A window that ends exactly where the cap on held bytes puts the store's
+/// bound is still a bounded window: the fetch takes it and stops, instead of
+/// following the bound past the cap and failing.
+#[tokio::test]
+async fn a_window_ending_at_the_cap_stays_bounded() -> anyhow::Result<()> {
+    let blob = payload(6 * 1024 * 1024 + 99);
+    let (source, ledger) = paying_source(blob.clone())?;
+    let root = source.root();
+    let total = source.total_bytes();
+    let probe = source.clone();
+    let cap = 1024 * 1024;
+    let (offset, len) = (2 * 1024 * 1024, cap);
+    let scratch = tempfile::tempdir()?;
+    let streamer =
+        streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?.max_blob_bytes(cap);
+    let (mut reader, mut drive) = streamer
+        .open_range(
+            root,
+            total,
+            (offset, len),
+            &PullConfig::default(),
+            Arc::new(NoCache),
+            stop(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    drive.alongside(reader.read_to_end(&mut out)).await?;
+    drive.finish().await?;
+    let want = blob
+        .get(usize::try_from(offset)?..usize::try_from(offset + len)?)
+        .context("window inside the blob")?;
+    anyhow::ensure!(out == want, "{} of {} window bytes", out.len(), want.len());
+    for &(start, fetch_len) in &probe.opened_ranges() {
+        anyhow::ensure!(
+            start + fetch_len <= offset + len,
+            "leg ({start}, {fetch_len}) runs past the window's end"
+        );
+    }
+    Ok(())
 }

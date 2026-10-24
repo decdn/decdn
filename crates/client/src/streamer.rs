@@ -59,10 +59,16 @@ const MAX_READ_CHUNK: u64 = 1024 * 1024;
 struct StreamState {
     /// The bao-verifying fill store the drive future writes and the reader reads.
     store: ClientRangedStore,
-    /// Content bytes the CONSUMER has read. It is the downstream frontier the
-    /// [`WindowPacer`] gates the pull against, so the fetch stays within one
-    /// read-ahead window of it.
+    /// Content bytes the CONSUMER has read, as a blob offset. It is the
+    /// downstream frontier the [`WindowPacer`] gates the pull against, so the
+    /// fetch stays within one read-ahead window of it.
     cursor: AtomicU64,
+    /// The first byte of the window the stream hands out: `0` for the whole
+    /// blob.
+    start: u64,
+    /// The byte the window ends before, or `None` for a tail that ends at the
+    /// size a leg proves. The stream ends at the smaller of the two.
+    end: Option<u64>,
     /// The caller's size hint: the fetch's first claim. The stream ends at the
     /// size a leg proves ([`ClientRangedStore::proven`]), whatever this says.
     hint: u64,
@@ -120,7 +126,7 @@ impl ConsumedWait {
     /// Whether verified bytes wait unread ahead of the consumer's `cursor`. A
     /// store fault reads as nothing unread, so the clock runs.
     async fn unread_ahead(&self, cursor: u64) -> bool {
-        present_frontier(&self.state.store)
+        present_frontier(&self.state.store, self.state.start)
             .await
             .is_ok_and(|frontier| frontier > cursor)
     }
@@ -298,7 +304,13 @@ where
         pacing_wait: &wait,
     };
     let mut sources = SourceSet::new(&provider, hash, health, holders);
-    let ranges = [(0, state.store.bound())];
+    // A window is one exact range; a tail (no end) follows the bound as the
+    // fetch proves the size.
+    let ranges = [(
+        state.start,
+        state.end.map_or(0, |end| end.saturating_sub(state.start)),
+    )];
+    let bounded = state.end.is_some();
     // Under consumption pacing `acquire` turns its lane watchdog off: a lane
     // parked on the consumer cursor is waiting, not stalled. A genuinely silent
     // source trips its own per-stream idle window mid-read instead.
@@ -323,6 +335,7 @@ where
             hash,
             total_bytes: state.hint,
             ranges: &ranges,
+            bounded,
         },
         &mut sources,
         &env,
@@ -339,6 +352,8 @@ where
         // huge blob is never read whole into memory just to be dropped — the
         // stream stays memory-bounded.
         if cache.caches()
+            && state.start == 0
+            && state.end.is_none()
             && let Some(proven) = state.store.proven()
             && let Ok(whole) = state.store.read(0, proven).await
         {
@@ -399,8 +414,10 @@ pub struct Streamer<'a, P, F> {
     /// A scratch directory the fill store's `.partial` lives in for the stream's
     /// lifetime. The caller owns it (and its cleanup); a streamed blob is not
     /// kept, so a temporary directory is the usual choice. The `.partial` grows
-    /// to the whole blob as the stream advances, so the directory needs room
-    /// for all of it.
+    /// to the whole blob as the stream advances (a window's `.partial` is
+    /// sparse outside the window), so the directory needs room for all of it.
+    /// The store is named by the blob's hash, so two streams of one blob in one
+    /// directory would share it: give each stream its own directory.
     scratch: &'a Path,
     /// The largest blob accepted, in bytes, or `0` for no cap
     /// ([`Self::max_blob_bytes`]).
@@ -472,9 +489,11 @@ impl<'a, P, F> Streamer<'a, P, F> {
         self
     }
 
-    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim above
-    /// the cap is clamped to it before the fill store is sized, and a blob that
-    /// holds bytes past the cap ends the stream with [`crate::BlobTooLarge`]
+    /// Cap the stream at `max_blob_bytes` (`0` for no cap). A size claim past
+    /// what the window can reach under the cap (the cap itself for the whole
+    /// blob, the window's offset plus the cap otherwise) is clamped before the
+    /// fill store is sized, and a blob that holds bytes past the cap ends the
+    /// stream with [`crate::BlobTooLarge`]
     /// ([`crate::AcquireEnv::max_blob_bytes`]).
     #[must_use]
     pub const fn max_blob_bytes(mut self, max_blob_bytes: u64) -> Self {
@@ -536,8 +555,56 @@ where
         P: 'a,
         F: 'a,
     {
-        if let Some(cached) = cache.get(hash, 0, total_bytes).await?
-            && u64::try_from(cached.len()).is_ok_and(|len| len == total_bytes)
+        self.open_range(hash, total_bytes, (0, 0), config, cache, stop)
+            .await
+    }
+
+    /// Open a consumption-paced stream over the byte window
+    /// `[offset, offset + len)` of `hash`, as [`Self::open`] does for the whole
+    /// blob. `window` is `(offset, len)`; a `len` of `0` is a tail from
+    /// `offset` to the size a leg proves, and `(0, 0)` is the whole blob.
+    ///
+    /// The fetch opens, and pays for, the chunk-group-aligned span around the
+    /// window and nothing outside it (ADR 038: any aligned range verifies alone
+    /// against the root). The [`VerifiedReader`] hands out exactly the window,
+    /// so an HTTP `Range` maps onto it with no trimming; a window past the size
+    /// a leg proves ends there. A window is never teed to `cache`, since a
+    /// revisit is served the whole blob; a cache that holds exactly the window
+    /// serves it with no fetch.
+    ///
+    /// `total_bytes` is the end of the blob as the caller knows it. A window
+    /// past it is clipped to it, and the stream then ends with an error naming
+    /// the shortfall; a window whose offset lies past the blob's real size,
+    /// under a claim that overstated it, ends with the fetch's error, as no
+    /// leg can verify it.
+    ///
+    /// # Errors
+    ///
+    /// A window that starts past `0` and at or past `total_bytes` (the caller
+    /// knows the size and answers "not satisfiable" before any fetch), plus
+    /// everything [`Self::open`] lists.
+    pub async fn open_range<'a>(
+        self,
+        hash: [u8; 32],
+        total_bytes: u64,
+        window: (u64, u64),
+        config: &PullConfig,
+        cache: Arc<dyn BlobCache>,
+        stop: StopPolicy,
+    ) -> anyhow::Result<(VerifiedReader, StreamDrive<'a>)>
+    where
+        P: 'a,
+        F: 'a,
+    {
+        let (offset, len) = window;
+        anyhow::ensure!(
+            offset == 0 || offset < total_bytes,
+            "stream window starts at byte {offset} of a {total_bytes}-byte blob"
+        );
+        let end = (len > 0).then(|| offset.saturating_add(len));
+        let want = end.map_or(total_bytes.saturating_sub(offset), |end| end - offset);
+        if let Some(cached) = cache.get(hash, offset, want).await?
+            && u64::try_from(cached.len()).is_ok_and(|cached_len| cached_len == want)
         {
             return Ok((
                 VerifiedReader::Cached {
@@ -553,12 +620,12 @@ where
         }
 
         let stem = blake3::Hash::from_bytes(hash).to_hex();
-        // A claim above the cap never sizes the store.
-        let total_bytes = if self.max_blob_bytes > 0 {
-            total_bytes.min(self.max_blob_bytes)
-        } else {
-            total_bytes
-        };
+        // A claim past what the cap on held bytes lets the window reach never
+        // sizes the store.
+        let total_bytes = total_bytes.min(crate::scheduler::claim_reach(
+            &[window],
+            self.max_blob_bytes,
+        ));
         // Off the runtime: opening a finalized blob hashes its final file.
         let store = {
             let (scratch, stem) = (self.scratch.to_path_buf(), stem.to_string());
@@ -571,7 +638,9 @@ where
         };
         let state = Arc::new(StreamState {
             store,
-            cursor: AtomicU64::new(0),
+            cursor: AtomicU64::new(offset),
+            start: offset,
+            end,
             hint: total_bytes,
             consumed: Notify::new(),
             progressed: Notify::new(),
@@ -753,36 +822,40 @@ pub struct LiveReader {
     buffered: Bytes,
 }
 
-/// The end of the store's contiguous verified-present run from offset 0 — the
-/// frontier the reader may read up to. Several lanes can fill the store at once,
-/// so the present set may hold later runs too; only the run from offset 0 is
-/// readable in order, and anything else means `0`.
+/// The end of the store's contiguous verified-present run that holds `start`
+/// — the frontier the reader may read up to. Several lanes can fill the store
+/// at once, so the present set may hold later runs too; only the run from
+/// `start` is readable in order, and no run there means `start`.
 ///
 /// # Errors
 ///
 /// A store fault reading its present ranges (I/O, a poisoned lock). Surfaced to
 /// the reader rather than masked as "nothing present", so a real fault does not
 /// look like an empty stream that stalls or ends early.
-async fn present_frontier(store: &ClientRangedStore) -> anyhow::Result<u64> {
+async fn present_frontier(store: &ClientRangedStore, start: u64) -> anyhow::Result<u64> {
     let present = store
         .present_ranges()
         .await
         .context("read present ranges")?;
     Ok(
-        match crate::driver::contiguous_byte_ranges(&present, store.bound()).first() {
-            Some(&(0, len)) => len,
-            _ => 0,
-        },
+        crate::driver::contiguous_byte_ranges(&present, store.bound())
+            .into_iter()
+            .find(|&(run_start, len)| run_start <= start && start < run_start.saturating_add(len))
+            .map_or(start, |(run_start, len)| run_start.saturating_add(len)),
     )
 }
 
 /// Wait until verified bytes past `cursor` are in the store, then read up to
 /// [`MAX_READ_CHUNK`] of them. `None` is the end of the stream: the cursor has
-/// reached the size a leg proved. A drive failure surfaces only once every
-/// verified byte before it has been read.
+/// reached the window's end or the size a leg proved. A drive failure surfaces
+/// only once every verified byte before it has been read.
 async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Option<Bytes>> {
     loop {
-        if state.store.proven().is_some_and(|proven| cursor >= proven) {
+        let limit = [state.end, state.store.proven()]
+            .into_iter()
+            .flatten()
+            .min();
+        if limit.is_some_and(|limit| cursor >= limit) {
             return Ok(None);
         }
         // Register for both wakeups BEFORE reading the frontier, so a progress
@@ -796,11 +869,14 @@ async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Optio
         // Read the outcome before the frontier: a drive that ended before this
         // frontier read left every verified byte in it.
         let outcome = state.outcome();
-        let frontier = present_frontier(&state.store)
+        let frontier = present_frontier(&state.store, state.start)
             .await
             .map_err(|e| io::Error::other(format!("present frontier: {e:#}")))?;
         if frontier > cursor {
-            let len = (frontier - cursor).min(MAX_READ_CHUNK);
+            let len = limit
+                .map_or(frontier, |limit| frontier.min(limit))
+                .saturating_sub(cursor)
+                .min(MAX_READ_CHUNK);
             return state.store.read(cursor, len).await.map(Some).map_err(|e| {
                 io::Error::other(format!("read verified prefix: {:#}", anyhow::Error::new(e)))
             });
@@ -812,7 +888,7 @@ async fn next_verified(state: Arc<StreamState>, cursor: u64) -> io::Result<Optio
             Some(Ok(())) => {
                 return Err(io::Error::other(format!(
                     "stream fetch finished with {cursor} of {} bytes readable",
-                    state.store.bound()
+                    limit.unwrap_or_else(|| state.store.bound())
                 )));
             }
             None => {}

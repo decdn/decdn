@@ -328,11 +328,16 @@ pub struct AcquireTarget<'a, St> {
     /// The first size claim: a hint. A resumed store's bound wins over it,
     /// and a leg that verifies the final chunk proves the size.
     pub total_bytes: u64,
-    /// The `(offset, len)` byte ranges to fill. A range that reaches
-    /// `total_bytes` or the store's bound, or has a zero length, is a tail: it
-    /// follows the bound as it grows or shrinks. Bytes outside the ranges and
-    /// their tail are never fetched.
+    /// The `(offset, len)` byte ranges to fill. Unless `bounded`, a range that
+    /// reaches `total_bytes` or the store's bound, or has a zero length, is a
+    /// tail: it follows the bound as it grows or shrinks. Bytes outside the
+    /// ranges and their tail are never fetched.
     pub ranges: &'a [(u64, u64)],
+    /// The ranges are exact: none is a tail, even one that reaches the end
+    /// of the blob as the caller knows it. A range past a size a leg proves
+    /// is clipped to it. A caller that wants a byte window and nothing past
+    /// it sets this; a whole-blob target leaves it unset.
+    pub bounded: bool,
 }
 
 impl<St> std::fmt::Debug for AcquireTarget<'_, St> {
@@ -2788,13 +2793,15 @@ struct Want {
 
 impl Want {
     /// `ranges` against a first bound of `bound`, cut from a first claim of
-    /// `c0`. A range that reaches the end of the blob as the caller knows it,
-    /// `min(c0, bound)`, or has a zero length, is a tail: it runs to `bound`.
-    /// Every other range is clipped to `bound`. A resumed record's bound can
-    /// be past `c0`, so a whole-blob target cut from `c0` still reaches it.
-    fn new(ranges: &[(u64, u64)], bound: u64, c0: u64) -> Self {
+    /// `c0`. Unless `bounded`, a range that reaches the end of the blob as the
+    /// caller knows it, `min(c0, bound)`, or has a zero length, is a tail: it
+    /// runs to `bound`. Every other range is clipped to `bound`. A resumed
+    /// record's bound can be past `c0`, so a whole-blob target cut from `c0`
+    /// still reaches it.
+    fn new(ranges: &[(u64, u64)], bound: u64, c0: u64, bounded: bool) -> Self {
         let end = c0.min(bound);
-        let reaches_end = |start: u64, len: u64| len == 0 || start.saturating_add(len) >= end;
+        let reaches_end =
+            |start: u64, len: u64| !bounded && (len == 0 || start.saturating_add(len) >= end);
         let tail = ranges.iter().any(|&(start, len)| reaches_end(start, len));
         let ranges: Vec<(u64, u64)> = ranges
             .iter()
@@ -3392,6 +3399,7 @@ where
         hash,
         total_bytes: c0,
         ranges,
+        bounded,
     } = target;
     let health = Arc::clone(sources.health());
     // A claim is peer- or manifest-controlled: clamp it to the furthest the
@@ -3406,7 +3414,7 @@ where
     }
     // A resumed record's bound wins over the caller's hint.
     let first_bound = store.total_bytes();
-    let mut want = Want::new(ranges, first_bound, c0);
+    let mut want = Want::new(ranges, first_bound, c0, bounded);
     let missing = missing_chunks(store, &want.ranges).await?;
     let mut pending = VecDeque::new();
     for (start, len) in contiguous_byte_ranges(&missing, first_bound) {

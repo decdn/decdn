@@ -424,6 +424,7 @@ where
                 let flush_on_drop = store.flush_on_drop();
                 let fetched = acquire(
                     AcquireTarget {
+                        bounded: false,
                         store: &store,
                         hash: target.hash,
                         total_bytes: target.total_bytes,
