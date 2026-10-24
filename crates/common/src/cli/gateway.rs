@@ -29,7 +29,7 @@ pub struct GatewayArgs {
     /// pays from `--keystore`'s own pool. Chain coordinates that neither a
     /// flag nor the config file sets default to the built-in testnet, and
     /// `--data-dir` (where the gateway token, or a public gateway's buyer
-    /// store, lives) defaults to `~/.decdn/gateway`.
+    /// store and namespace pointers, live) defaults to `~/.decdn/gateway`.
     #[command(flatten)]
     pub common: ClientFetchArgs,
 }
@@ -59,11 +59,47 @@ pub struct PublicArgs {
     )]
     pub allowance_bytes_per_day: u64,
 
+    /// Bytes per UTC day for one namespace, `<ns>=<bytes>` (`7=20GiB`),
+    /// repeatable. It replaces the shared allowance for the requests the
+    /// namespace's pointer serves, at `<ns>.<host>`, and for those alone: a
+    /// `?ns=` or a `<ns>.<hash32>.` label is anyone's to write and spends the
+    /// shared allowance.
+    #[arg(
+        long,
+        value_name = "NS=BYTES",
+        value_parser = parse_namespace_allowance,
+        requires = "public_url"
+    )]
+    pub allowance: Vec<(u64, u64)>,
+
+    /// `PublisherRegistry` address the gateway verifies namespace pointers
+    /// against (`PUT /_pointer`). Defaults to `blockchain.publisher_registry_address`
+    /// in the config file, else the built-in testnet's on that chain.
+    #[arg(long, value_name = "ADDR", requires = "public_url")]
+    pub publisher_registry_address: Option<String>,
+
     /// Serve the gateway's metrics (Prometheus text) at `GET /metrics` on
     /// this loopback address, for the operator's scraper. Nothing is served
     /// without it.
     #[arg(long, value_name = "ADDR", requires = "public_url")]
     pub metrics_listen: Option<SocketAddr>,
+}
+
+/// Parse `<ns>=<bytes>`: a canonical decimal namespace id (no leading zero,
+/// never `0`) and a byte size as `--allowance-bytes-per-day` takes it.
+fn parse_namespace_allowance(s: &str) -> Result<(u64, u64), String> {
+    let Some((ns, bytes)) = s.split_once('=') else {
+        return Err(format!("expected <ns>=<bytes>, got {s:?}"));
+    };
+    if ns.is_empty() || ns.starts_with('0') || !ns.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "invalid namespace id {ns:?}: expected a decimal id of 1 or more with no leading zero"
+        ));
+    }
+    let ns: u64 = ns
+        .parse()
+        .map_err(|_| format!("namespace id {ns:?} does not fit in 64 bits"))?;
+    Ok((ns, parse_byte_size(bytes)?))
 }
 
 #[cfg(test)]

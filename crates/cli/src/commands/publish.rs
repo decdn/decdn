@@ -14,6 +14,10 @@
 //! the keystore signer, build a wallet-filled provider, submit, and print a
 //! JSON or `key=value` receipt. `--dry-run` stops after resolution: it loads
 //! no keystore and sends no transaction, printing just the resolved parameters.
+//! `point` touches no chain: it signs a namespace pointer
+//! (`super::gateway::pointer`) under the resolved chain id and registry and
+//! `PUT`s it to a public gateway, which reads the namespace's owner on-chain
+//! itself.
 
 use std::io;
 // For `flush` on the stdout lock: a `LineWriter` can buffer a partial write and
@@ -26,6 +30,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use anyhow::Context;
+use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli;
 use decdn_incentive::origin_assignment::OriginAssignment;
 use decdn_incentive::publisher_registry::PublisherRegistry;
@@ -33,6 +38,7 @@ use decdn_incentive::tx::SendOutcome;
 
 use crate::commands::chain_ctx;
 use crate::commands::chain_ctx::ResolvedPublish;
+use crate::commands::gateway::pointer::{SignedPointer, pointer_domain};
 
 /// Entry point for `decdn publish`.
 pub async fn publish_dispatch(
@@ -45,6 +51,7 @@ pub async fn publish_dispatch(
         },
         cli::PublishCommand::Assign(a) => assign(a, global_config).await,
         cli::PublishCommand::Revoke(a) => revoke(a, global_config).await,
+        cli::PublishCommand::Point(a) => point(a, global_config).await,
     }
 }
 
@@ -1020,6 +1027,198 @@ const fn revoke_failure_context(status: RevokeStatus) -> Option<&'static str> {
         | RevokeStatus::Reverted(_)
         | RevokeStatus::Revoked(_) => None,
     }
+}
+
+// -------------------------------------------------------------------------
+// point (no transaction: a signed pointer handed to a public gateway)
+// -------------------------------------------------------------------------
+
+/// What `publish point` did with the pointer it signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PointStatus {
+    /// `--dry-run`: nothing was signed or sent, and no keystore was loaded.
+    DryRun,
+    /// The gateway stored the pointer and serves the bundle at `url`.
+    Pointed {
+        /// The namespace's URL on the gateway.
+        url: String,
+    },
+}
+
+impl PointStatus {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+            Self::Pointed { .. } => "pointed",
+        }
+    }
+
+    const fn url(&self) -> Option<&String> {
+        match self {
+            Self::DryRun => None,
+            Self::Pointed { url } => Some(url),
+        }
+    }
+}
+
+/// Receipt for `publish point`. `publisher` is `None` on a dry run, which
+/// loads no keystore.
+pub(crate) struct PointOutcome {
+    pub(crate) publisher: Option<Address>,
+    /// The registry the pointer is signed for.
+    pub(crate) registry: Address,
+    pub(crate) namespace_id: u64,
+    /// The bundle's manifest hash.
+    pub(crate) root: [u8; 32],
+    pub(crate) seq: u64,
+    pub(crate) gateway: url::Url,
+    pub(crate) status: PointStatus,
+}
+
+pub(crate) fn write_point_outcome(
+    w: &mut impl io::Write,
+    o: &PointOutcome,
+    json: bool,
+) -> io::Result<()> {
+    let submitted = o.status.url().is_some();
+    if json {
+        let value = serde_json::json!({
+            "submitted": submitted,
+            "publisher": o.publisher.map(|a| format!("{a:#x}")),
+            "publisher_registry": format!("{:#x}", o.registry),
+            "namespace_id": o.namespace_id,
+            "root": alloy::hex::encode(o.root),
+            "seq": o.seq,
+            "gateway": o.gateway.as_str(),
+            "url": o.status.url(),
+            "status": o.status.label(),
+        });
+        return writeln!(w, "{value}");
+    }
+    if let Some(publisher) = o.publisher {
+        writeln!(w, "publisher={publisher:#x}")?;
+    }
+    writeln!(w, "publisher_registry={:#x}", o.registry)?;
+    writeln!(w, "namespace_id={}", o.namespace_id)?;
+    writeln!(w, "root={}", alloy::hex::encode(o.root))?;
+    writeln!(w, "seq={}", o.seq)?;
+    writeln!(w, "gateway={}", o.gateway)?;
+    match o.status.url() {
+        Some(url) => writeln!(w, "status={} url={url}", o.status.label()),
+        None => writeln!(w, "status={} submitted=false", o.status.label()),
+    }
+}
+
+/// How long `publish point` waits on the gateway, so a gateway that never
+/// answers does not hang a CI job.
+const GATEWAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `PUT /_pointer` on `gateway`, which is an origin: a path, query or
+/// fragment is refused instead of joined into a URL the gateway does not
+/// answer.
+///
+/// # Errors
+///
+/// `gateway` is not a bare `http(s)` origin.
+fn pointer_endpoint(gateway: &url::Url) -> anyhow::Result<url::Url> {
+    anyhow::ensure!(
+        matches!(gateway.scheme(), "http" | "https")
+            && gateway.host_str().is_some()
+            && gateway.path() == "/"
+            && gateway.query().is_none()
+            && gateway.fragment().is_none(),
+        "--gateway must be an http(s) origin with no path, such as https://decdn.link"
+    );
+    gateway
+        .join("_pointer")
+        .context("the gateway URL takes no path")
+}
+
+/// Sign a pointer from a namespace to a bundle and hand it to a public
+/// gateway. The chain id and the `PublisherRegistry` address come from the
+/// usual resolution and bind the signature to one deployment; no RPC call is
+/// made, the gateway reads the owner itself.
+async fn point(args: &cli::PointArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    let (resolved, registry) = registry_ctx(&args.chain, global_config)?;
+    let uri: DecdnUri = args
+        .uri
+        .parse()
+        .with_context(|| format!("{:?} is not a decdn: URI", args.uri))?;
+    anyhow::ensure!(
+        matches!(uri.target, UriTarget::Bundle),
+        "a pointer names a bundle: pass `decdn:<hash>/`, the manifest hash with its trailing slash"
+    );
+    let seq = args.seq.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    });
+    let mut outcome = PointOutcome {
+        publisher: None,
+        registry,
+        namespace_id: args.namespace,
+        root: uri.hash,
+        seq,
+        gateway: args.gateway.clone(),
+        status: PointStatus::DryRun,
+    };
+    if !args.chain.common.dry_run {
+        let signer =
+            chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
+        let domain = pointer_domain(resolved.chain_id, registry);
+        let pointer = SignedPointer::sign(&signer, args.namespace, uri.hash, seq, &domain)
+            .context("sign the pointer")?;
+        let endpoint = pointer_endpoint(&args.gateway)?;
+        let response = reqwest::Client::builder()
+            .timeout(GATEWAY_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("build the HTTP client")?
+            .put(endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&pointer).context("encode the pointer")?)
+            .send()
+            .await
+            .with_context(|| format!("reach the gateway at {}", args.gateway))?;
+        let status = response.status();
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|l| l.to_str().ok())
+                .unwrap_or("elsewhere");
+            anyhow::bail!(
+                "the gateway redirected the pointer to {location}: pass the origin it serves \
+                 as --gateway"
+            );
+        }
+        let body = response.text().await.unwrap_or_default();
+        anyhow::ensure!(
+            status == reqwest::StatusCode::CREATED,
+            "the gateway refused the pointer: {status} {}",
+            body.trim_end()
+        );
+        let stored: serde_json::Value =
+            serde_json::from_str(&body).context("the gateway's answer is not JSON")?;
+        let url = stored
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .context("the gateway's answer names no url")?
+            .to_owned();
+        outcome.publisher = Some(signer.address());
+        outcome.status = PointStatus::Pointed { url };
+    }
+    let mut out = io::stdout().lock();
+    let write_err = write_point_outcome(&mut out, &outcome, args.chain.common.json)
+        .and_then(|()| out.flush())
+        .err();
+    drop(out);
+    propagate(
+        None,
+        write_err,
+        "failed to write point output",
+        &format!("namespace_id={} seq={seq}", args.namespace),
+    )
 }
 
 #[cfg(test)]

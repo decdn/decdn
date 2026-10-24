@@ -68,3 +68,60 @@ fn a_metrics_listener_needs_the_public_url() {
     assert!(parse(&[]).unwrap().public.metrics_listen.is_none());
     assert!(parse(&["--metrics-listen", "127.0.0.1:9100"]).is_err());
 }
+
+#[test]
+fn a_namespace_allowance_parses_as_ns_equals_bytes_and_repeats() {
+    let args = parse(&[
+        "--public-url",
+        "https://decdn.link",
+        "--allowance",
+        "7=20GiB",
+        "--allowance",
+        "9=1024",
+    ])
+    .unwrap();
+    assert_eq!(args.public.allowance, vec![(7, 20 << 30), (9, 1024)]);
+    assert!(
+        parse(&["--public-url", "https://decdn.link"])
+            .unwrap()
+            .public
+            .allowance
+            .is_empty()
+    );
+    for bad in ["7", "=1GiB", "0=1GiB", "07=1GiB", "x=1GiB", "7=", "7=1XiB"] {
+        assert!(
+            parse(&["--public-url", "https://decdn.link", "--allowance", bad]).is_err(),
+            "{bad:?}"
+        );
+    }
+    assert!(parse(&["--allowance", "7=1GiB"]).is_err());
+}
+
+#[test]
+fn the_publisher_registry_address_needs_the_public_url() {
+    let args = parse(&[
+        "--public-url",
+        "https://decdn.link",
+        "--publisher-registry-address",
+        "0x00000000000000000000000000000000000000aa",
+    ])
+    .unwrap();
+    assert_eq!(
+        args.public.publisher_registry_address.as_deref(),
+        Some("0x00000000000000000000000000000000000000aa")
+    );
+    assert!(
+        parse(&[])
+            .unwrap()
+            .public
+            .publisher_registry_address
+            .is_none()
+    );
+    assert!(
+        parse(&[
+            "--publisher-registry-address",
+            "0x00000000000000000000000000000000000000aa"
+        ])
+        .is_err()
+    );
+}

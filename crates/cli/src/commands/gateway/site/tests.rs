@@ -48,6 +48,17 @@ fn a_site_host_round_trips() {
     );
 }
 
+/// A namespace's own host on a public domain, and the route back to it.
+#[test]
+fn a_namespace_host_round_trips() {
+    let domain = public("https://decdn.test");
+    assert_eq!(domain.namespace_host(7), "7.decdn.test");
+    assert_eq!(domain.route("7.decdn.test"), Some(Route::Namespace(7)));
+    let ported = public("http://localhost:8080");
+    assert_eq!(ported.namespace_host(7), "7.localhost:8080");
+    assert_eq!(ported.route("7.localhost:8080"), Some(Route::Namespace(7)));
+}
+
 #[test]
 fn a_malformed_site_host_names_no_site() {
     let domain = loopback();

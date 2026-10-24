@@ -25,3 +25,39 @@ fn revoke_takes_exactly_one_operator_and_rejects_namespace_zero() {
         .to_string();
     assert!(err.contains("0 is reserved"), "{err}");
 }
+
+fn point(args: &[&str]) -> Result<crate::cli::PointArgs, clap::Error> {
+    let mut with_bin = vec!["decdn", "publish", "point"];
+    with_bin.extend_from_slice(args);
+    match Cli::try_parse_from(with_bin)?.command {
+        crate::cli::Command::Publish(publish) => match publish.command {
+            crate::cli::PublishCommand::Point(point) => Ok(point),
+            other => panic!("not a point command: {other:?}"),
+        },
+        other => panic!("not a publish command: {other:?}"),
+    }
+}
+
+#[test]
+fn point_takes_a_namespace_a_uri_and_the_gateway() {
+    let uri = format!("decdn:{}/", "ab".repeat(32));
+    let args = point(&["7", &uri, "--gateway", "https://decdn.link"]).unwrap();
+    assert_eq!(args.namespace, 7);
+    assert_eq!(args.uri, uri);
+    assert_eq!(args.gateway.as_str(), "https://decdn.link/");
+    assert_eq!(args.seq, None);
+    let args = point(&["7", &uri, "--gateway", "https://decdn.link", "--seq", "42"]).unwrap();
+    assert_eq!(args.seq, Some(42));
+}
+
+#[test]
+fn point_needs_the_gateway_and_rejects_namespace_zero() {
+    let uri = format!("decdn:{}/", "ab".repeat(32));
+    assert!(point(&["7", &uri]).is_err());
+    assert!(point(&["7", "--gateway", "https://decdn.link"]).is_err());
+    let err = point(&["0", &uri, "--gateway", "https://decdn.link"])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("0 is reserved"), "{err}");
+    assert!(point(&["7", &uri, "--gateway", "not a url"]).is_err());
+}

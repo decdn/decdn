@@ -366,23 +366,35 @@ async fn test_gateway_with(
     let sites = SiteDomain::Loopback {
         listen: "127.0.0.1:8484".parse().unwrap(),
     };
-    test_gateway_in(backend, common, sites, u64::MAX).await
+    test_gateway_in(backend, common, sites, None).await
+}
+
+/// The registry address a test's public gateway verifies pointers against.
+const REGISTRY: Address = Address::repeat_byte(3);
+
+/// What a test's public gateway holds: `allowance`, no pointers yet, in
+/// `pointers_dir`.
+fn public_with(allowance: Allowance, pointers_dir: &Path) -> Public {
+    Public {
+        allowance,
+        metrics: Metrics::default(),
+        pointers: Pointers::load(pointers_dir).unwrap(),
+        registry: REGISTRY,
+        lookups: std::sync::Mutex::new(Budgets::default()),
+        pointer_writes: Mutex::new(()),
+    }
 }
 
 /// A gateway on `backend` whose sites live under `sites`: a loopback gateway
-/// with [`TEST_TOKEN`], or a public one with no token and `allowance` bytes
-/// per key per day.
+/// with [`TEST_TOKEN`] and no `public`, or a public one with no token.
 async fn test_gateway_in(
     backend: impl worker::Backend,
     common: cli::ClientFetchArgs,
     sites: SiteDomain,
-    allowance: u64,
+    public: Option<Public>,
 ) -> Arc<Gateway> {
     let token = matches!(sites, SiteDomain::Loopback { .. }).then(|| TEST_TOKEN.to_owned());
-    let public = matches!(sites, SiteDomain::Public { .. }).then(|| Public {
-        allowance: Allowance::new(allowance),
-        metrics: Metrics::default(),
-    });
+    assert_eq!(matches!(sites, SiteDomain::Public { .. }), public.is_some());
     let chain = ChainConfig {
         // Nothing here reaches the chain: every request below stops first.
         rpc_url: "http://127.0.0.1:1".to_owned(),
@@ -1274,6 +1286,8 @@ struct Logs {
     size_caps: Log<Option<u64>>,
     /// The byte window of each pull.
     ranges: Log<Option<(u64, u64)>>,
+    /// Where the gateway keeps its pointers, for as long as the test runs.
+    pointers_dir: tempfile::TempDir,
 }
 
 /// The blob whose pull stops for funding on the public gateway.
@@ -1323,8 +1337,13 @@ async fn public_gateway() -> (Arc<Gateway>, Logs, String) {
     public_gateway_with(u64::MAX).await
 }
 
-/// [`public_gateway`] with `allowance` bytes per key per day.
+/// [`public_gateway`] with `allowance` bytes per day, shared by every request.
 async fn public_gateway_with(allowance: u64) -> (Arc<Gateway>, Logs, String) {
+    public_gateway_for(Allowance::with_namespaces(allowance, [])).await
+}
+
+/// [`public_gateway`] with `allowance`.
+async fn public_gateway_for(allowance: Allowance) -> (Arc<Gateway>, Logs, String) {
     let replies = HashMap::from([
         (BLOB, Reply::Bytes(public_manifest())),
         (ENTRY, Reply::Bytes(b"abc".to_vec())),
@@ -1340,6 +1359,7 @@ async fn public_gateway_with(allowance: u64) -> (Arc<Gateway>, Logs, String) {
         caps: Arc::default(),
         size_caps: Arc::default(),
         ranges: Arc::default(),
+        pointers_dir: tempfile::tempdir().unwrap(),
     };
     let backend = Recording {
         caps: Arc::clone(&logs.caps),
@@ -1350,7 +1370,8 @@ async fn public_gateway_with(allowance: u64) -> (Arc<Gateway>, Logs, String) {
     let sites = SiteDomain::Public {
         origin: "https://decdn.test".parse().unwrap(),
     };
-    let gateway = test_gateway_in(backend, flags(&[]), sites, allowance).await;
+    let public = public_with(allowance, logs.pointers_dir.path());
+    let gateway = test_gateway_in(backend, flags(&[]), sites, Some(public)).await;
     let host = gateway.sites.site_host(&Site {
         hash: BLOB,
         namespace: None,
@@ -1358,11 +1379,306 @@ async fn public_gateway_with(allowance: u64) -> (Arc<Gateway>, Logs, String) {
     (gateway, logs, host)
 }
 
+/// `method path` with `Host: host` and `body`, and no token.
+async fn send_body(
+    gateway: &Arc<Gateway>,
+    method: Method,
+    host: &str,
+    path: &str,
+    body: &str,
+) -> Answer {
+    let req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, host)
+        .body(Full::new(Bytes::from(body.to_owned())))
+        .unwrap();
+    let response = Arc::clone(gateway).handle(req).await;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    Answer {
+        status,
+        headers,
+        body: String::from_utf8(body.to_vec()).unwrap(),
+    }
+}
+
+/// A pointer from namespace `namespace` to the bundle `root`, with no real
+/// signature: stored straight into the gateway, past `PUT /_pointer`.
+fn unsigned_pointer(namespace: u64, root: [u8; 32], seq: u64) -> SignedPointer {
+    SignedPointer {
+        namespace,
+        root: alloy::primitives::B256::from(root),
+        seq,
+        signature: alloy::primitives::Bytes::from(vec![0u8; 65]),
+    }
+}
+
+fn pointers(gateway: &Gateway) -> &Pointers {
+    &gateway.public.as_ref().unwrap().pointers
+}
+
+/// Store `pointer` as signed by `signer`, past `PUT /_pointer`.
+fn hold(gateway: &Gateway, pointer: SignedPointer, signer: Address) {
+    pointers(gateway).set(pointer, signer).unwrap();
+}
+
+/// A signer the gateway stored a pointer from before draws on a lookup
+/// budget of its own per namespace, still read on-chain, so a flood of
+/// strangers on the shared budget does not keep a publisher from updating.
+/// That budget is per namespace, so one publisher's updates cannot spend
+/// another's either.
+#[tokio::test]
+async fn a_known_signer_has_its_own_lookup_budget_per_namespace() {
+    let (gateway, _logs, _) = public_gateway().await;
+    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let owner = PrivateKeySigner::random();
+    let public = gateway.public.as_ref().unwrap();
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), owner.address());
+    hold(&gateway, unsigned_pointer(8, BLOB, 1), owner.address());
+    let put = |ns: u64, seq: u64| {
+        let pointer = SignedPointer::sign(&owner, ns, OTHER, seq, &domain).unwrap();
+        let body = serde_json::to_string(&pointer).unwrap();
+        let gateway = Arc::clone(&gateway);
+        async move { send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await }
+    };
+    let (shared_spent, known_spent) = loop {
+        let now = now_secs();
+        while public.take_lookup(None, now).is_ok() {}
+        let shared_spent = put(7, 2).await;
+        let mut seq = 3;
+        while public.take_lookup(Some(7), now).is_ok() {
+            seq += 1;
+        }
+        let known_spent = put(7, seq).await;
+        if now_secs() / 60 == now / 60 {
+            break (shared_spent, known_spent);
+        }
+    };
+    // The holder's update reached the chain past the spent shared budget.
+    assert_eq!(
+        shared_spent.status,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        shared_spent.body
+    );
+    // Its own budget runs out too, per namespace.
+    assert_eq!(
+        known_spent.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        known_spent.body
+    );
+    let other_namespace = put(8, 2).await;
+    assert_eq!(
+        other_namespace.status,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        other_namespace.body
+    );
+}
+
+/// A namespace's own allowance pays for its own bundle and nothing else:
+/// `/_decdn/` content from another bundle on its host spends the shared
+/// allowance, so a stranger cannot drain the namespace's budget with
+/// unrelated content, and the namespace cannot lend its budget out.
+#[tokio::test]
+async fn a_namespace_allowance_pays_for_its_own_bundle_only() {
+    let (gateway, _logs, _) =
+        public_gateway_for(Allowance::with_namespaces(u64::MAX, [(7, 1)])).await;
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
+    let own = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
+    assert_eq!(own.status, StatusCode::PAYMENT_REQUIRED);
+    let own_via_decdn = request(
+        &gateway,
+        "7.decdn.test",
+        &format!("/_decdn/{}/a.txt", alloy::hex::encode(BLOB)),
+        SAME_ORIGIN,
+    )
+    .await;
+    assert_eq!(own_via_decdn.status, StatusCode::PAYMENT_REQUIRED);
+    for headers in [&[][..], SAME_ORIGIN] {
+        let other = request(
+            &gateway,
+            "7.decdn.test",
+            &format!("/_decdn/{}", alloy::hex::encode(OTHER)),
+            headers,
+        )
+        .await;
+        assert_eq!(
+            (other.status, other.body.as_str()),
+            (StatusCode::OK, "other bytes"),
+            "{headers:?}"
+        );
+    }
+}
+
+/// `PUT /_pointer` answers on the public bare host only: a loopback gateway
+/// holds no pointers, and a site host has no API.
+#[tokio::test]
+async fn put_pointer_answers_on_the_public_bare_host_only() {
+    let loopback = test_gateway().await;
+    let answer = send_body(&loopback, Method::PUT, "127.0.0.1:8484", "/_pointer", "{}").await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    let (gateway, _logs, host) = public_gateway().await;
+    let answer = send_body(&gateway, Method::PUT, &host, "/_pointer", "{}").await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    let answer = send_body(&gateway, Method::PUT, "7.decdn.test", "/_pointer", "{}").await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+}
+
+/// A body that is too large, not the record, or carries no signature is
+/// refused before anything is read on-chain.
+#[tokio::test]
+async fn put_pointer_refuses_a_bad_body_before_the_chain() {
+    let (gateway, _logs, _) = public_gateway().await;
+    let big = "x".repeat(MAX_BODY_BYTES + 1);
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &big).await;
+    assert_eq!(answer.status, StatusCode::PAYLOAD_TOO_LARGE);
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", "{").await;
+    assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(answer.body.contains("\"signature\""), "{}", answer.body);
+    let short = serde_json::to_string(&SignedPointer {
+        signature: alloy::primitives::Bytes::from(vec![0u8; 64]),
+        ..unsigned_pointer(7, BLOB, 1)
+    })
+    .unwrap();
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &short).await;
+    assert_eq!(answer.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(answer.body.contains("signature"), "{}", answer.body);
+}
+
+/// A pointer from the signer whose pointer is held, at a `seq` not above
+/// it, is refused with the held `seq` before the chain is read. One from
+/// another signer is not a replay: it goes to the chain, where only the
+/// current owner passes, so a namespace that changed hands is not held by
+/// its former owner's `seq`.
+#[tokio::test]
+async fn put_pointer_refuses_a_stale_seq_from_the_same_signer_before_the_chain() {
+    let (gateway, _logs, _) = public_gateway().await;
+    let owner = PrivateKeySigner::random();
+    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    hold(&gateway, unsigned_pointer(7, BLOB, 5), owner.address());
+    for seq in [5, 4] {
+        let pointer = SignedPointer::sign(&owner, 7, OTHER, seq, &domain).unwrap();
+        let body = serde_json::to_string(&pointer).unwrap();
+        let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+        assert_eq!(answer.status, StatusCode::CONFLICT, "seq {seq}");
+        let json: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        assert_eq!(json["seq"], 5);
+    }
+    let stranger = PrivateKeySigner::random();
+    let pointer = SignedPointer::sign(&stranger, 7, OTHER, 1, &domain).unwrap();
+    let body = serde_json::to_string(&pointer).unwrap();
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+    assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "{}", answer.body);
+    assert_eq!(pointers(&gateway).root(7), Some(BLOB));
+}
+
+/// Each on-chain owner lookup a `PUT /_pointer` costs comes out of a budget
+/// per minute, so an anonymous flood of well-formed pointers cannot turn the
+/// gateway into an RPC amplifier: past it the answer is 429 with
+/// `Retry-After`, and nothing is read.
+#[tokio::test]
+async fn put_pointer_owner_lookups_are_budgeted() {
+    let (gateway, _logs, _) = public_gateway().await;
+    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let signer = PrivateKeySigner::random();
+    let public = gateway.public.as_ref().unwrap();
+    // One lookup reaches the chain; the rest of the minute's budget is
+    // spent directly, so the test does not straddle a minute boundary.
+    let pointer = SignedPointer::sign(&signer, 1, BLOB, 1, &domain).unwrap();
+    let body = serde_json::to_string(&pointer).unwrap();
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+    assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "{}", answer.body);
+    let answer = loop {
+        let now = now_secs();
+        while public.take_lookup(None, now).is_ok() {}
+        let pointer = SignedPointer::sign(&signer, 1_000, BLOB, 1, &domain).unwrap();
+        let body = serde_json::to_string(&pointer).unwrap();
+        let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+        // The minute turned under the request: the budget is fresh again.
+        if now_secs() / 60 == now / 60 {
+            break answer;
+        }
+    };
+    assert_eq!(
+        answer.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        answer.body
+    );
+    assert!(answer.header(header::RETRY_AFTER).is_some());
+    // A replay still costs nothing and is still a replay.
+    hold(&gateway, unsigned_pointer(7, BLOB, 5), signer.address());
+    let replay = SignedPointer::sign(&signer, 7, OTHER, 5, &domain).unwrap();
+    let body = serde_json::to_string(&replay).unwrap();
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+    assert_eq!(answer.status, StatusCode::CONFLICT);
+}
+
+/// A well-formed pointer with a fresh `seq` is checked against the
+/// namespace's owner on-chain: with no chain to ask, the answer is 502 and
+/// nothing is stored.
+#[tokio::test]
+async fn put_pointer_with_a_valid_signature_asks_the_chain() {
+    let (gateway, _logs, _) = public_gateway().await;
+    let owner = PrivateKeySigner::random();
+    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let pointer = SignedPointer::sign(&owner, 7, BLOB, 1, &domain).unwrap();
+    let body = serde_json::to_string(&pointer).unwrap();
+    // On the bare host, and on the gateway's own listen address.
+    for host in ["decdn.test", "127.0.0.1:8484"] {
+        let answer = send_body(&gateway, Method::PUT, host, "/_pointer", &body).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_GATEWAY,
+            "{host}: {}",
+            answer.body
+        );
+    }
+    assert_eq!(pointers(&gateway).root(7), None);
+}
+
+/// A namespace with an allowance of its own spends it on the requests its
+/// pointer serves, and nothing else: past it, its host answers 402 naming
+/// the entry's URI with the namespace, while the bundle's own site, on the
+/// shared allowance, still serves.
+#[tokio::test]
+async fn a_namespace_with_its_own_allowance_spends_it_alone() {
+    let manifest = u64::try_from(public_manifest().len()).unwrap();
+    let (gateway, _logs, host) =
+        public_gateway_for(Allowance::with_namespaces(u64::MAX, [(7, manifest + 6)])).await;
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
+    for _ in 0..2 {
+        let ok = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
+        assert_eq!((ok.status, ok.body.as_str()), (StatusCode::OK, "abc"));
+    }
+    let refused = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
+    assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        refused.header(header::LINK),
+        Some(
+            format!(
+                "<decdn:{}/a.txt?ns=7>; rel=\"alternate\"",
+                alloy::hex::encode(BLOB)
+            )
+            .as_str()
+        )
+    );
+    let shared = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!(
+        (shared.status, shared.body.as_str()),
+        (StatusCode::OK, "abc")
+    );
+}
+
 /// A public site serves its entries to anyone: no token, no browser
 /// headers, the operator's pool pays.
 #[tokio::test]
 async fn a_public_site_serves_to_anyone() {
-    let (gateway, _, host) = public_gateway().await;
+    let (gateway, _logs, host) = public_gateway().await;
     let answer = request(&gateway, &host, "/a.txt", &[]).await;
     assert_eq!(
         (answer.status, answer.body.as_str()),
@@ -1409,7 +1725,7 @@ async fn the_public_gateway_api_is_closed() {
 /// the public scheme, and a blob streams.
 #[tokio::test]
 async fn the_public_bare_host_redirects_bundles_and_streams_blobs() {
-    let (gateway, _, host) = public_gateway().await;
+    let (gateway, _logs, host) = public_gateway().await;
     let blob = alloy::hex::encode(BLOB);
     let bundle = request(&gateway, "decdn.test", &format!("/{blob}/"), &[]).await;
     assert_eq!(bundle.status, StatusCode::FOUND);
@@ -1492,7 +1808,7 @@ async fn a_public_head_is_answered_from_the_manifest() {
 /// address, and refuses every other `Host`.
 #[tokio::test]
 async fn a_public_gateway_refuses_unknown_hosts() {
-    let (gateway, _, _) = public_gateway().await;
+    let (gateway, _logs, _) = public_gateway().await;
     for host in [
         "evil.test",
         "decdn.test.evil.test",
@@ -1512,7 +1828,7 @@ async fn a_public_gateway_refuses_unknown_hosts() {
 /// A namespace host with no pointer on this gateway is not found.
 #[tokio::test]
 async fn a_public_namespace_without_a_pointer_is_not_found() {
-    let (gateway, _, _) = public_gateway().await;
+    let (gateway, _logs, _) = public_gateway().await;
     let answer = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
     assert_eq!(answer.status, StatusCode::NOT_FOUND);
     assert!(answer.body.contains("namespace 7"), "{}", answer.body);
@@ -1653,7 +1969,7 @@ async fn a_public_head_needs_the_allowance() {
 /// with the URI and a retry hint, never 402.
 #[tokio::test]
 async fn a_pool_that_cannot_pay_answers_503() {
-    let (gateway, _, _) = public_gateway().await;
+    let (gateway, _logs, _) = public_gateway().await;
     let unfunded = alloy::hex::encode(UNFUNDED);
     let answer = request(&gateway, "decdn.test", &format!("/{unfunded}"), &[]).await;
     assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1673,7 +1989,7 @@ fn left(gateway: &Gateway) -> u64 {
         .as_ref()
         .unwrap()
         .allowance
-        .remaining(now_secs())
+        .remaining(None, now_secs())
         .unwrap_or(0)
 }
 
@@ -1819,7 +2135,7 @@ async fn an_empty_entry_is_served_without_a_pull() {
 /// is a download. The site's own subresource requests are served as before.
 #[tokio::test]
 async fn a_headerless_request_for_another_bundle_is_a_navigation() {
-    let (gateway, _, host) = public_gateway().await;
+    let (gateway, _logs, host) = public_gateway().await;
     let blob = alloy::hex::encode(BLOB);
     let page = request(&gateway, &host, &format!("/_decdn/{blob}/a.txt"), &[]).await;
     assert_eq!(page.status, StatusCode::FOUND);
@@ -1851,7 +2167,7 @@ async fn a_headerless_request_for_another_bundle_is_a_navigation() {
 /// no fixed length.
 #[tokio::test]
 async fn a_public_head_decodes_its_path_and_knows_a_bundle_without_an_index() {
-    let (gateway, _, _) = public_gateway().await;
+    let (gateway, _logs, _) = public_gateway().await;
     let host = gateway.sites.site_host(&Site {
         hash: NOINDEX,
         namespace: None,
@@ -2042,7 +2358,7 @@ async fn a_range_is_ignored_where_it_cannot_be_served() {
 /// gateway would answer whole.
 #[tokio::test]
 async fn accept_ranges_is_advertised_for_a_sized_entry_only() {
-    let (gateway, _, host) = public_gateway().await;
+    let (gateway, _logs, host) = public_gateway().await;
     let whole = request(&gateway, &host, "/a.txt", &[]).await;
     assert_eq!(whole.header(header::ACCEPT_RANGES), Some("bytes"));
     let head = send(&gateway, Method::HEAD, &host, "/a.txt", &[]).await;
@@ -2143,7 +2459,7 @@ async fn requests_are_counted_by_outcome() {
 /// A pool that cannot pay and an upstream fault count as pull failures.
 #[tokio::test]
 async fn pull_failures_are_counted_by_cause() {
-    let (gateway, _, _) = public_gateway().await;
+    let (gateway, _logs, _) = public_gateway().await;
     let unfunded = alloy::hex::encode(UNFUNDED);
     let answer = request(&gateway, "decdn.test", &format!("/{unfunded}"), &[]).await;
     assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -2166,7 +2482,7 @@ async fn pull_failures_are_counted_by_cause() {
 #[tokio::test]
 async fn the_metrics_listener_serves_the_exposition() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let (gateway, _, _) = public_gateway().await;
+    let (gateway, _logs, _) = public_gateway().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(serve_metrics(Arc::clone(&gateway), listener));

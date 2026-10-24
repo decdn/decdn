@@ -48,7 +48,7 @@ pub use pool::{
 };
 pub use probe::ProbeArgs;
 pub use publish::{
-    AssignArgs, NamespaceArgs, NamespaceCommand, NamespaceCreateArgs, PublishArgs,
+    AssignArgs, NamespaceArgs, NamespaceCommand, NamespaceCreateArgs, PointArgs, PublishArgs,
     PublishChainArgs, PublishCommand, RevokeArgs,
 };
 pub use run::RunArgs;

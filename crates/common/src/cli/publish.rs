@@ -7,9 +7,11 @@
 //! multisig, or governance), not through this CLI. `assign` submits one
 //! `addOrigin` per operator, so it is N transactions rather than one. Content is
 //! bound to a namespace off-chain at fetch time, so there is no per-hash
-//! on-chain claim.
+//! on-chain claim. `point` leaves the chain alone: it signs a namespace
+//! pointer with the publisher's keystore and hands it to a public gateway.
 
 use clap::{Args, Subcommand};
+use url::Url;
 
 use super::common::CommonChainArgs;
 
@@ -48,6 +50,10 @@ pub enum PublishCommand {
     Assign(AssignArgs),
     /// Unseat one authorized origin from a namespace (`removeOrigin`).
     Revoke(RevokeArgs),
+    /// Point a namespace's host on a public gateway, `<ns>.<host>`, at a
+    /// bundle: sign a pointer with the namespace owner's keystore and `PUT`
+    /// it to the gateway. Nothing goes on-chain.
+    Point(PointArgs),
 }
 
 /// `decdn publish namespace <subcommand>` (nested to match the issue's
@@ -108,6 +114,35 @@ pub struct RevokeArgs {
     pub chain: PublishChainArgs,
 }
 
+/// `decdn publish point <namespace> <uri> --gateway <url>` flags.
+#[derive(Args, Debug)]
+pub struct PointArgs {
+    /// Namespace id whose host the pointer serves.
+    #[arg(value_name = "NAMESPACE", value_parser = parse_namespace_id)]
+    pub namespace: u64,
+
+    /// The bundle to serve, as `decdn:<hash>/` (the manifest hash, with the
+    /// trailing slash).
+    #[arg(value_name = "URI")]
+    pub uri: String,
+
+    /// The public gateway's origin, `https://decdn.link`.
+    #[arg(long, value_name = "URL")]
+    pub gateway: Url,
+
+    /// The pointer's place in the namespace's sequence. The gateway takes a
+    /// pointer only above the one it holds. Defaults to the current Unix
+    /// time, so each publish advances it.
+    #[arg(long, value_name = "SEQ")]
+    pub seq: Option<u64>,
+
+    /// Chain coordinates (the chain id and the `PublisherRegistry` address
+    /// bind the signature to one deployment) and the keystore. No RPC call
+    /// is made.
+    #[command(flatten)]
+    pub chain: PublishChainArgs,
+}
+
 /// Chain coordinates shared by the publish subcommands. Mirrors `ChainArgs`
 /// but targets the publisher contracts (`PublisherRegistry`,
 /// `OriginAssignment`) instead of `CapacityBond`. The common coordinates live
@@ -132,5 +167,5 @@ pub struct PublishChainArgs {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests;

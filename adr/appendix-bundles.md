@@ -214,7 +214,9 @@ decdn:<hash>[/<path>][?ns=<id>]
 
 The URI is client-side syntax only. It resolves to the hash and the
 `namespace_id` that the wire already carries. Nodes and the protocol do
-not see it.
+not see it. A public gateway also serves a bundle at a namespace's own
+host; the [namespace pointer](appendix-gateway.md#namespace-pointer) names
+which bundle, above the URI and the protocol.
 
 A URI with the wrong form gives a clear result:
 

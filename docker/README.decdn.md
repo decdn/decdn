@@ -59,6 +59,16 @@ A bundle entry with a size in its manifest takes one `Range` (`curl -r`, a resum
 download, a BEP 19 webseed `url-list`): the response is `206` over exactly that window,
 paid for by the chunk-group-aligned span around it.
 
+A namespace is a stable host, `https://<ns>.decdn.link/`, once its owner points it at a
+bundle: `decdn publish point <ns> decdn:<hash>/ --gateway https://decdn.link` signs a
+pointer with the namespace owner's keystore and `PUT`s it; the gateway checks the
+signer against `PublisherRegistry.ownerOf` and keeps the pointer in `gateway/pointers`
+under the volume. The registry comes from `--publisher-registry-address`, the config
+file, or the built-in testnet. `--allowance <ns>=20GiB` (repeatable) gives one namespace
+a daily allowance of its own for the requests its pointer serves, in place of the shared
+one. See
+[`adr/appendix-gateway.md`](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#namespace-pointer).
+
 ## Tags
 
 | Tag | Points at |
