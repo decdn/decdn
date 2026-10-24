@@ -579,6 +579,7 @@ async fn fetch_target(
     let blob = |hash| BlobFetch {
         read_ahead: None,
         size_cap: None,
+        range: None,
         hash,
         namespace: uri.namespace,
         output: output.to_path_buf(),
@@ -617,6 +618,7 @@ async fn fetch_entry_hash(
     let manifest = BlobFetch {
         read_ahead: None,
         size_cap: None,
+        range: None,
         hash: uri.hash,
         namespace: uri.namespace,
         output: PathBuf::from("-"),
@@ -720,6 +722,10 @@ pub(crate) struct BlobFetch {
     /// blob ends it with [`decdn_client::BlobTooLarge`]. `None` leaves the
     /// `--max-blob-mb` cap alone.
     pub(crate) size_cap: Option<u64>,
+    /// The byte window `(offset, len)` to stream, or `None` for the whole
+    /// blob. Read only when the fetch streams: a window cannot be downloaded
+    /// to a file.
+    pub(crate) range: Option<(u64, u64)>,
 }
 
 /// A delegate credential held in memory: the key that signs vouchers and the
@@ -1049,6 +1055,10 @@ pub(crate) async fn fetch_on(
     let hash = args.hash;
     let common = &args.common;
     let streams = sink.streams(&args.output);
+    anyhow::ensure!(
+        args.range.is_none() || streams,
+        "a byte window streams; it cannot be downloaded to a file"
+    );
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
     // Only a configuration fault ends the fetch here; with no holder yet, the
     // first open discovers them. The round streams: the fetch starts at the
@@ -1206,7 +1216,7 @@ pub(crate) async fn fetch_on(
                     hash,
                     claim.total_bytes,
                     stop.clone(),
-                    (common.max_sources, args.read_ahead, timings),
+                    (common.max_sources, args.read_ahead, args.range, timings),
                     &mut *sink,
                 )
                 .await;
@@ -1465,7 +1475,12 @@ async fn stream_out<P>(
     hash: [u8; 32],
     total_bytes: u64,
     stop: StopPolicy,
-    (max_sources, read_ahead, timings): (usize, Option<u64>, &FetchTimings),
+    (max_sources, read_ahead, range, timings): (
+        usize,
+        Option<u64>,
+        Option<(u64, u64)>,
+        &FetchTimings,
+    ),
     sink: &mut Sink,
 ) -> anyhow::Result<()>
 where
@@ -1492,9 +1507,28 @@ where
     if let Some(slot) = sources.credentials() {
         streamer = streamer.credentials(slot);
     }
-    let (mut reader, mut drive) = streamer
-        .open(hash, total_bytes, &pull_config, Arc::new(NoCache), stop)
-        .await?;
+    // A window streams exactly its bytes, paid for by the aligned span around
+    // them; the whole blob otherwise.
+    let (mut reader, mut drive) = match range {
+        Some(window) => {
+            streamer
+                .open_range(
+                    hash,
+                    total_bytes,
+                    window,
+                    &pull_config,
+                    Arc::new(NoCache),
+                    stop,
+                )
+                .await?
+        }
+        None => {
+            streamer
+                .open(hash, total_bytes, &pull_config, Arc::new(NoCache), stop)
+                .await?
+        }
+    };
+    let expected = range.map_or(total_bytes, |(_, len)| len);
 
     // The bar draws on stderr, so it shows only when stderr is a terminal and
     // the bytes go to stdout; stdout carries the verified bytes either way.
@@ -1527,7 +1561,7 @@ where
         .alongside(copy_verified(
             &mut reader,
             out,
-            total_bytes,
+            expected,
             Some(&on_progress),
         ))
         .await;

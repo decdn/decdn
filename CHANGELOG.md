@@ -4089,6 +4089,16 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: the gateway answers `Range` on a sized bundle entry (#2612).** An
+  entry whose manifest declares its size takes one `Range` (`bytes=a-b`,
+  `bytes=a-`, `bytes=-n`): the response is 206 over exactly that window, with
+  `Content-Range` and the window's length, and the pull pays only for the
+  chunk-group-aligned span around it (ADR 038). A range past the end is 416.
+  A range the gateway cannot honour (several, another unit, a rewritten page,
+  a blob of unknown size) is ignored and the whole body is served. A sized
+  response advertises `Accept-Ranges: bytes`, on `HEAD` too, so `curl -r`, a
+  resumed download and a BEP 19 webseed work. Part of #2593.
+
 - **CLI: `decdn gateway --public-url` serves anyone from its own pool
   (#2608).** A public gateway serves a domain behind a TLS-terminating
   proxy: `<origin>/<hash>[/<path>]` on the bare host, every bundle as a site

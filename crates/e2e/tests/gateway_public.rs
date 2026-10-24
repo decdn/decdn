@@ -5,8 +5,11 @@
 //! from an operator keystore's own pool. With no token and no browser
 //! headers:
 //!
-//!   1. The bundle's site serves its entry byte-exact, and `HEAD` answers the
-//!      entry's length and hash from the manifest.
+//!   1. The bundle's site serves its entry byte-exact, `HEAD` answers the
+//!      entry's length and hash from the manifest, a `Range` is served as
+//!      206 over exactly that window, and a range past the end is 416. (That
+//!      the pull pays for the aligned span alone is the client's unit tests'
+//!      to pin down.)
 //!   2. The bare host streams a blob.
 //!   3. Four pulls run at once on the one pool payer, and the node rejects
 //!      none of their vouchers.
@@ -47,9 +50,9 @@ use reqwest::StatusCode;
 const MIB: usize = 1024 * 1024;
 /// The gateway's working deposit: 10 USDC.
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-/// The day's allowance: six 4 MiB pulls and the manifest fit, a seventh
-/// 4 MiB entry does not.
-const ALLOWANCE: &str = "26MiB";
+/// The day's allowance: six 4 MiB pulls, a 1.5 MiB range and the manifest
+/// fit, a further 4 MiB entry does not.
+const ALLOWANCE: &str = "27MiB";
 const KEYSTORE_PASSWORD: &str = "gateway-public-e2e-password";
 /// The public origin the gateway serves. Nothing resolves it: every request
 /// goes to the loopback listener with this `Host`.
@@ -229,6 +232,55 @@ async fn run() -> anyhow::Result<()> {
             == Some(format!("\"{hash_a_hex}\"").as_str()),
         "HEAD a.bin etag: {:?}",
         head.headers().get("etag")
+    );
+    anyhow::ensure!(
+        head.headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok())
+            == Some("bytes"),
+        "HEAD a.bin accept-ranges: {:?}",
+        head.headers().get("accept-ranges")
+    );
+
+    // A range off the chunk-group grid: the response is exactly the window.
+    let (first, last) = (1_048_577usize, 2_621_440usize);
+    let ranged = http
+        .get(format!("{base}/a.bin"))
+        .header("host", &site)
+        .header("range", format!("bytes={first}-{last}"))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        ranged.status() == StatusCode::PARTIAL_CONTENT,
+        "range: {}",
+        ranged.status()
+    );
+    anyhow::ensure!(
+        ranged
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            == Some(format!("bytes {first}-{last}/{}", a.len()).as_str()),
+        "content-range: {:?}",
+        ranged.headers().get("content-range")
+    );
+    let window = ranged.bytes().await?;
+    anyhow::ensure!(
+        window.as_ref() == &a[first..=last],
+        "range: got {} bytes, expected the {}-byte window byte-exact",
+        window.len(),
+        last - first + 1
+    );
+    let past = http
+        .get(format!("{base}/a.bin"))
+        .header("host", &site)
+        .header("range", format!("bytes={}-", a.len()))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        past.status() == StatusCode::RANGE_NOT_SATISFIABLE,
+        "range past the end: {}",
+        past.status()
     );
 
     // ---- (2) A blob from the bare host ----
