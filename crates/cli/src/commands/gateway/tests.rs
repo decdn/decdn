@@ -508,16 +508,18 @@ enum Reply {
     Bytes(Vec<u8>),
 }
 
+/// A shared, appended log of what the pulls carried.
+type Log<T> = Arc<std::sync::Mutex<Vec<T>>>;
+
 /// A pull backend that answers each blob by its hash and records the
-/// `--max-blob-mb` each pull runs with, and the size cap it carries.
+/// `--max-blob-mb` each pull runs with, the size cap it carries and its
+/// byte window.
 struct Recording {
     caps: Log<u64>,
     size_caps: Log<Option<u64>>,
+    ranges: Log<Option<(u64, u64)>>,
     replies: HashMap<[u8; 32], Reply>,
 }
-
-/// A shared, appended log of what the pulls carried.
-type Log<T> = Arc<std::sync::Mutex<Vec<T>>>;
 
 impl worker::Backend for Recording {
     type Host = ();
@@ -544,6 +546,7 @@ impl worker::Backend for Recording {
     ) -> anyhow::Result<()> {
         self.caps.lock().unwrap().push(blob.common.max_blob_mb);
         self.size_caps.lock().unwrap().push(blob.size_cap);
+        self.ranges.lock().unwrap().push(blob.range);
         let too_large = || {
             anyhow::Error::new(decdn_client::BlobTooLarge {
                 reached: (blob.common.max_blob_mb << 20) + 1,
@@ -567,7 +570,16 @@ impl worker::Backend for Recording {
                 Err(too_large())
             }
             Some(Reply::Bytes(bytes)) => {
-                tokio::io::AsyncWriteExt::write_all(writer, bytes).await?;
+                // A pull of a window writes the window, as the client does.
+                let window = match blob.range {
+                    Some((offset, len)) => {
+                        let start = usize::try_from(offset)?.min(bytes.len());
+                        let end = usize::try_from(offset + len)?.min(bytes.len());
+                        &bytes[start..end]
+                    }
+                    None => bytes.as_slice(),
+                };
+                tokio::io::AsyncWriteExt::write_all(writer, window).await?;
                 Ok(())
             }
         }
@@ -597,6 +609,7 @@ async fn recording_gateway_of(
     let backend = Recording {
         caps: Arc::clone(&caps),
         size_caps: Arc::default(),
+        ranges: Arc::default(),
         replies,
     };
     let gateway = test_gateway_with(backend, flags(args)).await;
@@ -1258,6 +1271,8 @@ struct Logs {
     caps: Log<u64>,
     /// The size cap of each pull.
     size_caps: Log<Option<u64>>,
+    /// The byte window of each pull.
+    ranges: Log<Option<(u64, u64)>>,
 }
 
 /// The blob whose pull stops for funding on the public gateway.
@@ -1294,6 +1309,7 @@ fn public_manifest() -> Vec<u8> {
         {"path": "a.txt", "hash": alloy::hex::encode(ENTRY), "size": 3},
         {"path": "index.html", "hash": alloy::hex::encode(PAGE)},
         {"path": "empty.txt", "hash": alloy::hex::encode(EMPTY), "size": 0},
+        {"path": "big.bin", "hash": alloy::hex::encode(BIG), "size": BIG_LEN},
     ]})
     .to_string()
     .into_bytes()
@@ -1322,10 +1338,12 @@ async fn public_gateway_with(allowance: u64) -> (Arc<Gateway>, Logs, String) {
     let logs = Logs {
         caps: Arc::default(),
         size_caps: Arc::default(),
+        ranges: Arc::default(),
     };
     let backend = Recording {
         caps: Arc::clone(&logs.caps),
         size_caps: Arc::clone(&logs.size_caps),
+        ranges: Arc::clone(&logs.ranges),
         replies,
     };
     let sites = SiteDomain::Public {
@@ -1428,7 +1446,7 @@ async fn a_public_head_is_answered_from_the_manifest() {
         head.header(header::CONTENT_TYPE),
         Some("text/plain; charset=utf-8")
     );
-    assert_eq!(head.header(header::ACCEPT_RANGES), None);
+    assert_eq!(head.header(header::ACCEPT_RANGES), Some("bytes"));
     assert!(head.body.is_empty());
     assert_eq!(
         *logs.caps.lock().unwrap(),
@@ -1905,4 +1923,176 @@ async fn a_request_dropped_before_its_first_byte_is_charged() {
         "the pull never answers, so the request is dropped"
     );
     assert_eq!(left(&gateway), allowance - DROP_PENALTY_BYTES);
+}
+
+/// `Range` → the byte window of a `size`-byte entry: one satisfiable range
+/// is served, an unsatisfiable one is refused, and anything else (several
+/// ranges, another unit, a malformed or inverted range) is ignored.
+#[test]
+fn a_range_header_names_one_window_or_none() {
+    let window = |header: &str, size: u64| byte_window(header, size);
+    assert_eq!(window("bytes=0-99", 1000), Ok(Some((0, 100))));
+    assert_eq!(window("bytes=100-", 1000), Ok(Some((100, 900))));
+    assert_eq!(window("bytes=-100", 1000), Ok(Some((900, 100))));
+    assert_eq!(window("bytes=-5000", 1000), Ok(Some((0, 1000))));
+    assert_eq!(window("bytes=0-1999", 1000), Ok(Some((0, 1000))));
+    assert_eq!(window("bytes=999-999", 1000), Ok(Some((999, 1))));
+    assert_eq!(window(" bytes = 0 - 9 ", 1000), Ok(Some((0, 10))));
+    for unsatisfiable in ["bytes=1000-", "bytes=1000-2000", "bytes=-0"] {
+        assert_eq!(window(unsatisfiable, 1000), Err(()), "{unsatisfiable}");
+    }
+    for ignored in [
+        "bytes=5-2",
+        "bytes=0-0,2-2",
+        "bits=0-1",
+        "bytes=",
+        "bytes=a-b",
+        "0-1",
+    ] {
+        assert_eq!(window(ignored, 1000), Ok(None), "{ignored}");
+    }
+}
+
+/// A range on a sized entry is served as 206 over exactly that window: the
+/// pull carries the window, the response its length and position, and the
+/// entry's size still caps the pull.
+#[tokio::test]
+async fn a_range_on_an_entry_answers_206_with_the_window() {
+    let (gateway, logs, host) = public_gateway().await;
+    let before = logs.ranges.lock().unwrap().len();
+    let answer = request(&gateway, &host, "/a.txt", &[("range", "bytes=1-2")]).await;
+    assert_eq!(answer.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(answer.header(header::CONTENT_RANGE), Some("bytes 1-2/3"));
+    assert_eq!(answer.header(header::CONTENT_LENGTH), Some("2"));
+    assert_eq!(answer.header(header::ACCEPT_RANGES), Some("bytes"));
+    let ranges = logs.ranges.lock().unwrap();
+    assert_eq!(
+        &ranges[before..],
+        [None, Some((1, 2))],
+        "the manifest, then the window"
+    );
+    let caps = logs.size_caps.lock().unwrap();
+    assert_eq!(
+        caps.last().copied().flatten(),
+        Some(3),
+        "the entry's size still caps the pull"
+    );
+}
+
+/// A range past the end is refused with the entry's size and no pull.
+#[tokio::test]
+async fn an_unsatisfiable_range_answers_416() {
+    let (gateway, logs, host) = public_gateway().await;
+    let answer = request(&gateway, &host, "/a.txt", &[("range", "bytes=3-")]).await;
+    assert_eq!(answer.status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(answer.header(header::CONTENT_RANGE), Some("bytes */3"));
+    assert_eq!(
+        *logs.caps.lock().unwrap(),
+        [MAX_MANIFEST_MB],
+        "only the manifest was pulled"
+    );
+}
+
+/// A range the gateway cannot honour is ignored, as HTTP allows: a malformed
+/// or multi-part range, a response that is rewritten (its length changes),
+/// and a blob whose size nothing knows all get the whole body as 200.
+#[tokio::test]
+async fn a_range_is_ignored_where_it_cannot_be_served() {
+    let (gateway, logs, host) = public_gateway().await;
+    let before = logs.ranges.lock().unwrap().len();
+    for bad in ["bytes=x", "bytes=0-0,2-2"] {
+        let answer = request(&gateway, &host, "/a.txt", &[("range", bad)]).await;
+        assert_eq!(
+            (answer.status, answer.body.as_str()),
+            (StatusCode::OK, "abc"),
+            "{bad}"
+        );
+    }
+    let page = request(&gateway, &host, "/", &[("range", "bytes=0-1")]).await;
+    assert_eq!(
+        page.status,
+        StatusCode::OK,
+        "a rewritten page has no fixed length"
+    );
+    assert_eq!(page.header(header::ACCEPT_RANGES), None);
+    let other = alloy::hex::encode(OTHER);
+    let raw = request(
+        &gateway,
+        "decdn.test",
+        &format!("/{other}"),
+        &[("range", "bytes=0-1")],
+    )
+    .await;
+    assert_eq!(
+        (raw.status, raw.body.as_str()),
+        (StatusCode::OK, "other bytes")
+    );
+    assert_eq!(raw.header(header::ACCEPT_RANGES), None);
+    let ranges = logs.ranges.lock().unwrap();
+    assert!(
+        ranges[before..].iter().all(Option::is_none),
+        "{:?}",
+        &ranges[before..]
+    );
+}
+
+/// A sized entry advertises ranges on `GET` and `HEAD`; a response without a
+/// fixed length does not, so a resuming client never sends a range the
+/// gateway would answer whole.
+#[tokio::test]
+async fn accept_ranges_is_advertised_for_a_sized_entry_only() {
+    let (gateway, _, host) = public_gateway().await;
+    let whole = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!(whole.header(header::ACCEPT_RANGES), Some("bytes"));
+    let head = send(&gateway, Method::HEAD, &host, "/a.txt", &[]).await;
+    assert_eq!(head.header(header::ACCEPT_RANGES), Some("bytes"));
+    let page = send(&gateway, Method::HEAD, &host, "/", &[]).await;
+    assert_eq!(page.header(header::ACCEPT_RANGES), None);
+}
+
+/// The allowance admits a range by the span the pull pays for: the window
+/// widened to whole chunk groups. A window whose span fits is served where
+/// the whole entry would be refused, and one whose span does not fit is
+/// refused even when the window itself would.
+#[tokio::test]
+async fn a_range_is_admitted_by_its_aligned_span() {
+    let manifest = u64::try_from(public_manifest().len()).unwrap();
+    let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+    let (gateway, _, host) = public_gateway_with(manifest + group).await;
+    let whole = request(&gateway, &host, "/big.bin", &[]).await;
+    assert_eq!(whole.status, StatusCode::PAYMENT_REQUIRED);
+    let part = request(&gateway, &host, "/big.bin", &[("range", "bytes=0-1")]).await;
+    assert_eq!(part.status, StatusCode::PARTIAL_CONTENT);
+
+    let (gateway, _, host) = public_gateway_with(manifest + 100).await;
+    let part = request(&gateway, &host, "/big.bin", &[("range", "bytes=0-1")]).await;
+    assert_eq!(
+        part.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "two bytes cost a chunk group"
+    );
+}
+
+/// A range is charged the span the pull pays for, not the bytes the client
+/// reads: two bytes inside one chunk group cost the group, and two bytes
+/// across a group boundary cost two.
+#[tokio::test]
+async fn a_range_is_charged_by_its_aligned_span() {
+    let allowance = 64 << 20;
+    let manifest = u64::try_from(public_manifest().len()).unwrap();
+    let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+    let (gateway, _, host) = public_gateway_with(allowance).await;
+    let part = request(&gateway, &host, "/big.bin", &[("range", "bytes=0-1")]).await;
+    assert_eq!(
+        (part.status, part.body.len()),
+        (StatusCode::PARTIAL_CONTENT, 2)
+    );
+    assert_eq!(left(&gateway), allowance - manifest - group);
+    let straddling = format!("bytes={}-{}", group - 1, group);
+    let part = request(&gateway, &host, "/big.bin", &[("range", &straddling)]).await;
+    assert_eq!(
+        (part.status, part.body.len()),
+        (StatusCode::PARTIAL_CONTENT, 2)
+    );
+    assert_eq!(left(&gateway), allowance - manifest - 3 * group);
 }
