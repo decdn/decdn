@@ -51,6 +51,9 @@ and `gateway/store` under the same volume keeps the pool and its lanes across re
 `--allowance-bytes-per-day` bounds the bytes the gateway delivers per UTC day. A request
 past the allowance, or one whose size does not fit what is left, gets `402` with the
 canonical `decdn:` URI to fetch with a paying client; a pool that cannot pay gets `503`.
+A bundle entry with a size in its manifest takes one `Range` (`curl -r`, a resumed
+download, a BEP 19 webseed `url-list`): the response is `206` over exactly that window,
+paid for by the chunk-group-aligned span around it.
 
 ## Tags
 
