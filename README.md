@@ -44,16 +44,26 @@
 
 ## ⚡ Try it in one line
 
-Download Mistral 7B Instruct v0.3 (about 29 GB) from the testnet. On macOS or Linux:
+Download Qwen2.5 0.5B Instruct, a 491 MB GGUF that runs in llama.cpp or ollama, from the
+testnet. It takes about a minute on a 100 Mbps line. On macOS or Linux:
 
 ```bash
-curl -fsSL https://up.decdn.org/decdn.sh | sh -s -- get 'decdn:9194000d7b356650e6924a7746ec4afb0b705838b65913c0e46cba6b15af69e5/?ns=1'
+curl -fsSL https://up.decdn.org/decdn.sh | sh -s -- get 'decdn:d0a3eac609db6f49de12213574a302e42afd45f15b2cd89aa46b8a3e91f74d13/?ns=1'
 ```
 
 On Windows, in PowerShell:
 
 ```powershell
-& ([scriptblock]::Create((irm https://up.decdn.org/decdn.ps1))) get 'decdn:9194000d7b356650e6924a7746ec4afb0b705838b65913c0e46cba6b15af69e5/?ns=1'
+& ([scriptblock]::Create((irm https://up.decdn.org/decdn.ps1))) get 'decdn:d0a3eac609db6f49de12213574a302e42afd45f15b2cd89aa46b8a3e91f74d13/?ns=1'
+```
+
+The file's SHA-256 is `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`, the
+one [Hugging Face](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) publishes. For a
+bigger pull, Mistral 7B Instruct v0.3 is about 29 GB; either line takes its URI in place of
+the one above:
+
+```bash
+curl -fsSL https://up.decdn.org/decdn.sh | sh -s -- get 'decdn:9194000d7b356650e6924a7746ec4afb0b705838b65913c0e46cba6b15af69e5/?ns=1'
 ```
 
 The line installs `decdn` and asks you to pass one check in the browser (it opens the
