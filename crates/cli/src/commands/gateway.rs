@@ -69,7 +69,13 @@
 //! allowance runs out; a pool that cannot pay answers `503` as a `402` does.
 //! An entry's pull is capped at the size its manifest declares, so a manifest
 //! cannot make the gateway pay for more than it says, and a declared size is
-//! what `Content-Length` and the allowance count on. `HEAD` is answered from
+//! what `Content-Length` and the allowance count on. A sized entry takes one
+//! `Range`: the response is `206` over exactly that window, the pull pays
+//! only for the chunk-group-aligned span around it (ADR 038), the allowance
+//! admits and charges the request by that span, and a window past the end is
+//! `416`; a range the gateway cannot honour (several, a
+//! rewritten page, a blob of unknown size) is ignored, as HTTP allows, so a
+//! `curl -r`, a resumed download and a BEP 19 webseed all work. `HEAD` is answered from
 //! the bundle manifest, at no pull of the entry. The API paths answer `404`,
 //! and a site's `Sec-Fetch-*` headers decide nothing: the operator pays,
 //! within the allowance. A pull runs a small read-ahead
@@ -980,17 +986,18 @@ impl Gateway {
         if head {
             return self.head_site(&site, path).await;
         }
+        let range = range_header(headers);
         if let Some(rest) = target.strip_prefix("/_decdn/") {
             let uri: DecdnUri = match format!("decdn:{rest}").parse() {
                 Ok(uri) => uri,
                 Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
             };
             if !site::is_navigation(headers) {
-                return self.paid(&page_host, &uri, Present::Site).await;
+                return self.paid(&page_host, &uri, Present::Site, range).await;
             }
             // Another bundle's pages run on their own origin; a blob has none.
             return match uri.target {
-                UriTarget::Blob => self.paid(&page_host, &uri, Present::Download).await,
+                UriTarget::Blob => self.paid(&page_host, &uri, Present::Download, range).await,
                 _ => self.to_site(&uri),
             };
         }
@@ -1006,7 +1013,7 @@ impl Gateway {
             Ok(uri) => DecdnUri::new(uri.hash, uri.target, site.namespace),
             Err(e) => return text(StatusCode::NOT_FOUND, &format!("{e}\n")),
         };
-        self.paid(&page_host, &uri, Present::Site).await
+        self.paid(&page_host, &uri, Present::Site, range).await
     }
 
     /// A redirect to the site that serves bundle `uri`, at its entry path.
@@ -1236,12 +1243,13 @@ impl Gateway {
             Ok(uri) => uri,
             Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
+        let range = range_header(headers);
         if !authorized {
             // A browser without the extension opens a bundle as its site. On
             // a public gateway a blob streams from the bare host as bytes.
             return match uri.target {
                 UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
-                _ if self.public() => self.paid("", &uri, Present::Bare).await,
+                _ if self.public() => self.paid("", &uri, Present::Bare, range).await,
                 _ => text(StatusCode::UNAUTHORIZED, "token required\n"),
             };
         }
@@ -1252,7 +1260,7 @@ impl Gateway {
         else {
             return text(StatusCode::UNAUTHORIZED, "page host required\n");
         };
-        self.paid(&page_host, &uri, Present::Bare).await
+        self.paid(&page_host, &uri, Present::Bare, range).await
     }
 
     /// Serve `uri` as `present` says, paid with the capability that covers
@@ -1262,6 +1270,7 @@ impl Gateway {
         page_host: &str,
         uri: &DecdnUri,
         present: Present,
+        range: Option<&str>,
     ) -> Response<Body> {
         if let Some(refused) = self.allowance_refusal(uri) {
             return refused;
@@ -1276,7 +1285,7 @@ impl Gateway {
                     &format!("no capability covers {page_host}\n"),
                 );
             };
-            match self.serve(uri, &paying, present).await {
+            match self.serve(uri, &paying, present, range).await {
                 Ok(response) => return response,
                 Err(PullError::Allowance) => return self.allowance_spent(uri),
                 Err(PullError::Funding(e)) => match &paying {
@@ -1320,23 +1329,37 @@ impl Gateway {
         ))
     }
 
-    /// Serve what `uri` names, as `present` says, paid by `paying`.
+    /// Serve what `uri` names, as `present` says, paid by `paying`; `range` is
+    /// the request's `Range` header, honoured on a sized entry.
     async fn serve(
         self: &Arc<Self>,
         uri: &DecdnUri,
         paying: &Payment,
         present: Present,
+        range: Option<&str>,
     ) -> Result<Response<Body>, PullError> {
         match &uri.target {
             UriTarget::Blob => {
-                self.stream(uri.hash, uri.namespace, paying, None, None, present)
-                    .await
+                // A blob's size is nobody's to declare, so a range on it is
+                // ignored.
+                self.stream(
+                    uri.hash,
+                    uri.namespace,
+                    paying,
+                    None,
+                    Extent::UNSIZED,
+                    present,
+                )
+                .await
             }
             UriTarget::BundleEntry(path) => {
-                self.entry(uri.hash, uri.namespace, path, paying, present)
+                self.entry(uri.hash, uri.namespace, path, paying, present, range)
                     .await
             }
-            UriTarget::Bundle => self.index(uri.hash, uri.namespace, paying, present).await,
+            UriTarget::Bundle => {
+                self.index(uri.hash, uri.namespace, paying, present, range)
+                    .await
+            }
             _ => Ok(text(StatusCode::BAD_REQUEST, "unsupported URI target\n")),
         }
     }
@@ -1352,6 +1375,7 @@ impl Gateway {
         path: &str,
         paying: &Payment,
         present: Present,
+        range: Option<&str>,
     ) -> Result<Response<Body>, PullError> {
         let manifest = self.manifest(manifest_hash, namespace, paying).await?;
         if let Some(entry) = manifest.entries.iter().find(|e| e.path == path) {
@@ -1360,21 +1384,18 @@ impl Gateway {
                 UriTarget::BundleEntry(path.to_owned()),
                 namespace,
             );
-            if let Some(refused) = self.too_large(&uri, entry.size) {
+            let extent = match Extent::of(entry.size, range, rewrites(present, path)) {
+                Ok(extent) => extent,
+                Err(size) => return Ok(not_satisfiable(size)),
+            };
+            if let Some(refused) = self.too_large(&uri, extent.billable()) {
                 return Ok(refused);
             }
             if entry.size == Some(0) {
                 return Ok(empty_entry(path, entry.hash, present));
             }
             return self
-                .stream(
-                    entry.hash,
-                    namespace,
-                    paying,
-                    Some(path),
-                    entry.size,
-                    present,
-                )
+                .stream(entry.hash, namespace, paying, Some(path), extent, present)
                 .await;
         }
         let index = format!("{path}/index.html");
@@ -1398,13 +1419,18 @@ impl Gateway {
         namespace: Option<u64>,
         paying: &Payment,
         present: Present,
+        range: Option<&str>,
     ) -> Result<Response<Body>, PullError> {
         let manifest = self.manifest(manifest_hash, namespace, paying).await?;
         if present == Present::Site
             && let Some(entry) = manifest.entries.iter().find(|e| e.path == "index.html")
         {
             let uri = DecdnUri::new(manifest_hash, UriTarget::Bundle, namespace);
-            if let Some(refused) = self.too_large(&uri, entry.size) {
+            let extent = match Extent::of(entry.size, range, rewrites(present, &entry.path)) {
+                Ok(extent) => extent,
+                Err(size) => return Ok(not_satisfiable(size)),
+            };
+            if let Some(refused) = self.too_large(&uri, extent.billable()) {
                 return Ok(refused);
             }
             if entry.size == Some(0) {
@@ -1416,7 +1442,7 @@ impl Gateway {
                     namespace,
                     paying,
                     Some(&entry.path),
-                    entry.size,
+                    extent,
                     present,
                 )
                 .await;
@@ -1488,7 +1514,7 @@ impl Gateway {
         let raw_past_cap = (self.common.max_blob_mb == 0 || cap_mb < self.common.max_blob_mb)
             .then_some(raw.as_str());
         let (first, mut reader, done, mut guard) = self
-            .start_pull(hash, namespace, paying, cap_mb, None)
+            .start_pull(hash, namespace, paying, cap_mb, None, None)
             .await
             .map_err(|e| over_manifest_cap(e, cap_mb, raw_past_cap))?;
         // Every byte pulled is charged as it lands, whether or not it parses:
@@ -1550,7 +1576,7 @@ impl Gateway {
         namespace: Option<u64>,
         paying: &Payment,
         path: Option<&str>,
-        size: Option<u64>,
+        extent: Extent,
         present: Present,
     ) -> Result<Response<Body>, PullError> {
         let name = path
@@ -1565,12 +1591,22 @@ impl Gateway {
                 (content_type, rewrite)
             }
         };
-        // The pull holds no more than the size the manifest declares; a
-        // rewrite changes the length the response declares.
+        // The pull holds no more than the size the manifest declares, and
+        // takes only the window a range asked for.
         let (first, reader, done, guard) = self
-            .start_pull(hash, namespace, paying, self.common.max_blob_mb, size)
+            .start_pull(
+                hash,
+                namespace,
+                paying,
+                self.common.max_blob_mb,
+                extent.size,
+                extent.window,
+            )
             .await?;
-        let size = size.filter(|_| rewrite.is_none());
+        // The frames charge the window as they go; the rest of the span the
+        // pull pays for is charged now.
+        self.charge(extent.surcharge());
+        let size = extent.length();
         let state = Streaming {
             first: Some(first),
             reader,
@@ -1592,8 +1628,13 @@ impl Gateway {
         } else {
             "inline"
         };
+        let status = if extent.window.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        };
         let mut response = Response::builder()
-            .status(StatusCode::OK)
+            .status(status)
             .header(header::CONTENT_TYPE, content_type)
             .header(
                 header::CONTENT_DISPOSITION,
@@ -1605,6 +1646,18 @@ impl Gateway {
             .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
         if let Some(size) = size {
             response = response.header(header::CONTENT_LENGTH, size);
+        }
+        if extent.fixed {
+            response = response.header(header::ACCEPT_RANGES, "bytes");
+        }
+        if let (Some((offset, len)), Some(total)) = (extent.window, extent.size) {
+            response = response.header(
+                header::CONTENT_RANGE,
+                format!(
+                    "bytes {offset}-{}/{total}",
+                    offset.saturating_add(len).saturating_sub(1)
+                ),
+            );
         }
         response
             .body(StreamBody::new(body).boxed())
@@ -1689,8 +1742,9 @@ impl Gateway {
     }
 
     /// Hand the pull of `hash` to the worker, capped at `max_blob_mb` and at
-    /// `size_cap` bytes when the blob's size is known, and wait for its first
-    /// verified bytes. The pull writes into a pipe the response reads from.
+    /// `size_cap` bytes when the blob's size is known, over the byte window
+    /// `range` or the whole blob, and wait for its first verified bytes. The
+    /// pull writes into a pipe the response reads from.
     async fn start_pull(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -1698,6 +1752,7 @@ impl Gateway {
         paying: &Payment,
         max_blob_mb: u64,
         size_cap: Option<u64>,
+        range: Option<(u64, u64)>,
     ) -> Result<
         (
             Bytes,
@@ -1732,6 +1787,7 @@ impl Gateway {
                     common,
                     read_ahead: self.public().then_some(PUBLIC_READ_AHEAD_BYTES),
                     size_cap,
+                    range,
                 },
                 paying: paying.clone(),
                 writer,
@@ -2048,8 +2104,180 @@ fn empty_entry(path: &str, hash: [u8; 32], present: Present) -> Response<Body> {
     head_response(&content_type, Some(0), hash)
 }
 
-/// A `HEAD` answer: the type, the length when known, and the blob's hash as
-/// the entity tag, with no body.
+/// What a response delivers of a blob: the size its manifest declares, when
+/// one does, the byte window a `Range` asked for within it, and whether the
+/// response has a fixed length at all (a rewritten page does not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Extent {
+    /// The blob's size as the manifest declares it.
+    size: Option<u64>,
+    /// The `(offset, len)` window served, or the whole blob.
+    window: Option<(u64, u64)>,
+    /// Whether the response's length is the window's or the size: a rewrite
+    /// changes the length, so a rewritten response has none, and takes no
+    /// range.
+    fixed: bool,
+}
+
+impl Extent {
+    /// A blob whose size nothing declares: whole, with no fixed length.
+    const UNSIZED: Self = Self {
+        size: None,
+        window: None,
+        fixed: false,
+    };
+
+    /// The extent of an entry of `size` for a request with the `Range`
+    /// header `range`, `rewritten` as it streams. A range on a sized entry
+    /// that is not rewritten is honoured; one past the end is refused with
+    /// the size; any other is ignored.
+    ///
+    /// # Errors
+    ///
+    /// The entry's size, when the range is unsatisfiable.
+    fn of(size: Option<u64>, range: Option<&str>, rewritten: bool) -> Result<Self, u64> {
+        let Some(declared) = size.filter(|_| !rewritten) else {
+            return Ok(Self {
+                size,
+                window: None,
+                fixed: false,
+            });
+        };
+        let window = match range {
+            Some(range) => byte_window(range, declared).map_err(|()| declared)?,
+            None => None,
+        };
+        Ok(Self {
+            size,
+            window,
+            fixed: true,
+        })
+    }
+
+    /// The length the response declares, when it has one.
+    fn length(&self) -> Option<u64> {
+        if !self.fixed {
+            return None;
+        }
+        self.window.map_or(self.size, |(_, len)| Some(len))
+    }
+
+    /// The bytes the pull pays for, as far as anything knows: the window
+    /// widened to whole chunk groups (ADR 038), clipped to the entry; the
+    /// declared size for the whole. What the allowance admits by, so two
+    /// bytes inside a chunk group cost what the pull pays for them.
+    fn billable(&self) -> Option<u64> {
+        let size = self.size?;
+        let Some((offset, len)) = self.window else {
+            return Some(size);
+        };
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let start = offset - offset % group;
+        let end = offset
+            .saturating_add(len)
+            .div_ceil(group)
+            .saturating_mul(group)
+            .min(size);
+        Some(end.saturating_sub(start))
+    }
+
+    /// What a window costs beyond the bytes it delivers: the rest of the
+    /// chunk groups the pull pays for around it.
+    fn surcharge(&self) -> usize {
+        let Some((_, len)) = self.window else {
+            return 0;
+        };
+        let extra = self.billable().unwrap_or(len).saturating_sub(len);
+        usize::try_from(extra).unwrap_or(usize::MAX)
+    }
+}
+
+/// Whether a response for entry `path` presented as `present` is rewritten
+/// as it streams, so its length is not the entry's.
+fn rewrites(present: Present, path: &str) -> bool {
+    if present != Present::Site {
+        return false;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let content_type = site::content_type(name);
+    let essence = content_type.split(';').next().unwrap_or_default();
+    Rewrite::for_type(essence).is_some()
+}
+
+/// The request's `Range` header, when it has one the gateway can read.
+fn range_header(headers: &HeaderMap) -> Option<&str> {
+    headers.get(header::RANGE).and_then(|v| v.to_str().ok())
+}
+
+/// The byte window `(offset, len)` of a `size`-byte entry that the `Range`
+/// header `range` asks for: `bytes=a-b`, `bytes=a-` or `bytes=-n`, with the
+/// end clipped to the entry. `Ok(None)` is a range the gateway ignores, as
+/// HTTP allows: several ranges, another unit, a malformed or inverted one.
+///
+/// # Errors
+///
+/// A range that starts at or past the end, or a suffix of nothing: the
+/// request is not satisfiable.
+fn byte_window(range: &str, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(spec) = range.trim().strip_prefix("bytes") else {
+        return Ok(None);
+    };
+    let Some(spec) = spec.trim_start().strip_prefix('=') else {
+        return Ok(None);
+    };
+    if spec.contains(',') {
+        return Ok(None);
+    }
+    let Some((start, end)) = spec.split_once('-') else {
+        return Ok(None);
+    };
+    let (start, end) = (start.trim(), end.trim());
+    let number = |s: &str| s.parse::<u64>().ok();
+    if start.is_empty() {
+        let Some(suffix) = number(end) else {
+            return Ok(None);
+        };
+        if suffix == 0 || size == 0 {
+            return Err(());
+        }
+        let len = suffix.min(size);
+        return Ok(Some((size - len, len)));
+    }
+    let Some(first) = number(start) else {
+        return Ok(None);
+    };
+    if first >= size {
+        return Err(());
+    }
+    let last = if end.is_empty() {
+        size - 1
+    } else {
+        let Some(last) = number(end) else {
+            return Ok(None);
+        };
+        if last < first {
+            return Ok(None);
+        }
+        last.min(size - 1)
+    };
+    Ok(Some((first, last - first + 1)))
+}
+
+/// The answer to a range no `size`-byte entry can satisfy.
+fn not_satisfiable(size: u64) -> Response<Body> {
+    let mut response = text(StatusCode::RANGE_NOT_SATISFIABLE, "");
+    if let Ok(value) = header::HeaderValue::from_str(&format!("bytes */{size}")) {
+        response.headers_mut().insert(header::CONTENT_RANGE, value);
+    }
+    response.headers_mut().insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("bytes"),
+    );
+    response
+}
+
+/// A `HEAD` answer: the type, the length when known (and with it that ranges
+/// are taken), and the blob's hash as the entity tag, with no body.
 fn head_response(content_type: &str, size: Option<u64>, hash: [u8; 32]) -> Response<Body> {
     let mut response = Response::builder()
         .status(StatusCode::OK)
@@ -2057,7 +2285,9 @@ fn head_response(content_type: &str, size: Option<u64>, hash: [u8; 32]) -> Respo
         .header(header::ETAG, format!("\"{}\"", alloy::hex::encode(hash)))
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
     if let Some(size) = size {
-        response = response.header(header::CONTENT_LENGTH, size);
+        response = response
+            .header(header::CONTENT_LENGTH, size)
+            .header(header::ACCEPT_RANGES, "bytes");
     }
     response
         .body(full(String::new()))
