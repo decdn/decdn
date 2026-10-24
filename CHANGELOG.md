@@ -4089,6 +4089,14 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: the public gateway serves its metrics on a loopback listener
+  (#2611).** `decdn gateway --public-url … --metrics-listen <addr>` serves
+  Prometheus text at `GET /metrics`: content bytes served, answers by outcome
+  (ok, not found, refused, allowance exhausted, pool cannot pay, upstream
+  failed) as one unlabeled sibling counter each, and pulls in flight as a
+  gauge. The listener takes a loopback address only. The series are listed in
+  `adr/appendix-gateway.md`, the gateway's new appendix. Part of #2593.
+
 - **CLI: the gateway answers `Range` on a sized bundle entry (#2610).** An
   entry whose manifest declares its size takes one `Range` (`bytes=a-b`,
   `bytes=a-`, `bytes=-n`): the response is 206 over exactly that window, with

@@ -381,6 +381,7 @@ async fn test_gateway_in(
     let token = matches!(sites, SiteDomain::Loopback { .. }).then(|| TEST_TOKEN.to_owned());
     let public = matches!(sites, SiteDomain::Public { .. }).then(|| Public {
         allowance: Allowance::new(allowance),
+        metrics: Metrics::default(),
     });
     let chain = ChainConfig {
         // Nothing here reaches the chain: every request below stops first.
@@ -2095,4 +2096,103 @@ async fn a_range_is_charged_by_its_aligned_span() {
         (StatusCode::PARTIAL_CONTENT, 2)
     );
     assert_eq!(left(&gateway), allowance - manifest - 3 * group);
+}
+
+/// The metrics of the public gateway under test.
+fn metrics(gateway: &Gateway) -> String {
+    gateway.public.as_ref().unwrap().metrics.render()
+}
+
+/// Every answer counts under the sibling its outcome names, and the bytes a
+/// response delivers count as they go out.
+#[tokio::test]
+async fn requests_are_counted_by_outcome() {
+    let allowance = u64::try_from(public_manifest().len()).unwrap() + 3;
+    let (gateway, _, host) = public_gateway_with(allowance).await;
+    // The miss first: it reads the manifest, which the entry then finds
+    // cached, so the allowance is spent exactly by the entry.
+    let missing = request(&gateway, &host, "/nope.txt", &[]).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    let ok = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!(ok.status, StatusCode::OK);
+    let spent = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!(spent.status, StatusCode::PAYMENT_REQUIRED);
+    let refused = request(&gateway, "evil.test", "/", &[]).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    let text = metrics(&gateway);
+    for line in [
+        "decdn_gateway_requests_ok_total 1",
+        "decdn_gateway_requests_not_found_total 1",
+        "decdn_gateway_requests_allowance_exhausted_total 1",
+        "decdn_gateway_requests_refused_total 1",
+        "decdn_gateway_pulls_active 0",
+    ] {
+        assert!(text.contains(&format!("\n{line}\n")), "{line}: {text}");
+    }
+    let served = text
+        .lines()
+        .find_map(|l| l.strip_prefix("decdn_gateway_bytes_served_total "))
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap();
+    assert_eq!(
+        served, 3,
+        "the entry's bytes; the manifest is not a response"
+    );
+}
+
+/// A pool that cannot pay and an upstream fault count as pull failures.
+#[tokio::test]
+async fn pull_failures_are_counted_by_cause() {
+    let (gateway, _, _) = public_gateway().await;
+    let unfunded = alloy::hex::encode(UNFUNDED);
+    let answer = request(&gateway, "decdn.test", &format!("/{unfunded}"), &[]).await;
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+    let unknown = alloy::hex::encode([0x11; 32]);
+    let answer = request(&gateway, "decdn.test", &format!("/{unknown}"), &[]).await;
+    assert_eq!(answer.status, StatusCode::BAD_GATEWAY);
+    let text = metrics(&gateway);
+    assert!(
+        text.contains("\ndecdn_gateway_pull_failures_funding_total 1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\ndecdn_gateway_pull_failures_other_total 1\n"),
+        "{text}"
+    );
+}
+
+/// The metrics listener answers `GET /metrics` with the exposition and
+/// nothing else.
+#[tokio::test]
+async fn the_metrics_listener_serves_the_exposition() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (gateway, _, _) = public_gateway().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_metrics(Arc::clone(&gateway), listener));
+    let fetch = |path: &'static str| async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: metrics\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).await.unwrap();
+        out
+    };
+    let exposition = fetch("/metrics").await;
+    assert!(exposition.starts_with("HTTP/1.1 200"), "{exposition}");
+    assert!(
+        exposition.contains("text/plain; version=0.0.4"),
+        "{exposition}"
+    );
+    assert!(
+        exposition.contains("decdn_gateway_bytes_served_total 0"),
+        "{exposition}"
+    );
+    let other = fetch("/").await;
+    assert!(other.starts_with("HTTP/1.1 404"), "{other}");
 }

@@ -58,6 +58,12 @@ pub struct PublicArgs {
         requires = "public_url"
     )]
     pub allowance_bytes_per_day: u64,
+
+    /// Serve the gateway's metrics (Prometheus text) at `GET /metrics` on
+    /// this loopback address, for the operator's scraper. Nothing is served
+    /// without it.
+    #[arg(long, value_name = "ADDR", requires = "public_url")]
+    pub metrics_listen: Option<SocketAddr>,
 }
 
 #[cfg(test)]

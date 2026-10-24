@@ -51,3 +51,20 @@ fn a_malformed_public_url_or_allowance_is_refused() {
         );
     }
 }
+
+#[test]
+fn a_metrics_listener_needs_the_public_url() {
+    let args = parse(&[
+        "--public-url",
+        "https://decdn.link",
+        "--metrics-listen",
+        "127.0.0.1:9100",
+    ])
+    .unwrap();
+    assert_eq!(
+        args.public.metrics_listen.map(|a| a.to_string()),
+        Some("127.0.0.1:9100".to_owned())
+    );
+    assert!(parse(&[]).unwrap().public.metrics_listen.is_none());
+    assert!(parse(&["--metrics-listen", "127.0.0.1:9100"]).is_err());
+}

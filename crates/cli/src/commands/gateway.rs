@@ -85,6 +85,8 @@
 //! that connects and drops spends no more than it is charged. An upstream
 //! failure answers a bare `502`, with the detail in the log. The buyer store
 //! lives in `<data-dir>/store`, so the pool and its lanes survive a restart.
+//! `--metrics-listen` serves what the gateway served, refused and failed as
+//! Prometheus text on a loopback address (`metrics`).
 //! Sites are separate browser origins; they are separate sites, with their
 //! own cookies and site-scoped state, only when the public host is a public
 //! suffix: the operator registers it on the Public Suffix List, as
@@ -134,11 +136,13 @@ use super::fetch::{
 use crate::known_chains;
 
 mod allowance;
+mod metrics;
 mod rewrite;
 mod site;
 mod worker;
 
 use allowance::Allowance;
+use metrics::Metrics;
 use rewrite::Rewrite;
 use site::{Route, Site, SiteDomain};
 use worker::{FetchBackend, Job, Payment, PullWorker};
@@ -283,6 +287,17 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         public,
     });
 
+    if let Some(metrics) = args.public.metrics_listen {
+        anyhow::ensure!(
+            metrics.ip().is_loopback(),
+            "--metrics-listen must be a loopback address: the exposition is for the operator's \
+             scraper, not the public"
+        );
+        let listener = TcpListener::bind(metrics)
+            .await
+            .with_context(|| format!("listen for metrics on {metrics}"))?;
+        tokio::spawn(serve_metrics(Arc::clone(&gateway), listener));
+    }
     match (&gateway.sites, &gateway.token) {
         (SiteDomain::Public { origin }, _) => println!(
             "decdn gateway serving {origin} on {} (Ctrl-C to stop)",
@@ -327,6 +342,7 @@ fn mode(args: &GatewayArgs) -> (SiteDomain, Option<Public>) {
             SiteDomain::Public { origin },
             Some(Public {
                 allowance: Allowance::new(args.public.allowance_bytes_per_day),
+                metrics: Metrics::default(),
             }),
         ),
         None => (
@@ -335,6 +351,42 @@ fn mode(args: &GatewayArgs) -> (SiteDomain, Option<Public>) {
             },
             None,
         ),
+    }
+}
+
+/// Serve the metrics exposition on `listener`, a loopback address, for as
+/// long as the gateway runs: `GET /metrics` answers Prometheus text, every
+/// other request 404.
+async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let gateway = Arc::clone(&gateway);
+        tokio::spawn(async move {
+            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                let gateway = Arc::clone(&gateway);
+                async move {
+                    let response = match (req.method(), req.uri().path(), &gateway.public) {
+                        (&Method::GET, "/metrics", Some(public)) => typed(
+                            StatusCode::OK,
+                            public.metrics.render(),
+                            "text/plain; version=0.0.4; charset=utf-8",
+                        ),
+                        _ => text(StatusCode::NOT_FOUND, "GET /metrics\n"),
+                    };
+                    Ok::<_, Infallible>(response)
+                }
+            });
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(Duration::from_secs(10))
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+            {
+                tracing::debug!(error = %e, "metrics connection ended");
+            }
+        });
     }
 }
 
@@ -753,6 +805,8 @@ struct Gateway {
 struct Public {
     /// The bytes the gateway delivers per day from its pool.
     allowance: Allowance,
+    /// What it served, refused and failed, for `--metrics-listen`.
+    metrics: Metrics,
 }
 
 /// Parsed bundle manifests by hash, least recently used first out, within
@@ -824,6 +878,21 @@ impl Gateway {
         self.public.is_some()
     }
 
+    /// Answer `req`, and count the answer on a public gateway.
+    async fn handle<B>(self: Arc<Self>, req: Request<B>) -> Response<Body>
+    where
+        B: HttpBody<Data = Bytes>,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let public = self.public.is_some();
+        let gateway = Arc::clone(&self);
+        let response = self.answer(req).await;
+        if public && let Some(public) = &gateway.public {
+            public.metrics.request(response.status());
+        }
+        response
+    }
+
     /// Count `bytes` delivered against the public allowance. `false` once the
     /// day's allowance is reached. A loopback gateway has none.
     fn charge(&self, bytes: usize) -> bool {
@@ -867,7 +936,7 @@ impl Gateway {
         })
     }
 
-    async fn handle<B>(self: Arc<Self>, req: Request<B>) -> Response<Body>
+    async fn answer<B>(self: Arc<Self>, req: Request<B>) -> Response<Body>
     where
         B: HttpBody<Data = Bytes>,
         B::Error: std::error::Error + Send + Sync + 'static,
@@ -1768,10 +1837,7 @@ impl Gateway {
         common.max_blob_mb = max_blob_mb;
         // Armed before the worker has the job: a request dropped while it
         // waits for its first byte still charges the pull's read-ahead.
-        let mut guard = PullGuard {
-            gateway: Arc::clone(self),
-            armed: self.public(),
-        };
+        let mut guard = PullGuard::new(Arc::clone(self));
         // Asked once the pull has its slot: the allowance the requests before
         // it spent while it waited refuses it before any paid work.
         let admit = self.public().then(|| {
@@ -1867,6 +1933,9 @@ async fn next_frame(
         .delivered
         .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
     s.cut = !gateway.charge(chunk.len());
+    if let Some(public) = &gateway.public {
+        public.metrics.bytes(chunk.len());
+    }
     if s.cut {
         tracing::info!("the allowance is reached; this stream ends with its current frame");
     }
@@ -1926,6 +1995,16 @@ struct PullGuard {
 }
 
 impl PullGuard {
+    /// A guard for a pull `gateway` is about to start: armed on a public
+    /// gateway, and counted among its pulls in flight.
+    fn new(gateway: Arc<Gateway>) -> Self {
+        if let Some(public) = &gateway.public {
+            public.metrics.pull_started();
+        }
+        let armed = gateway.public();
+        Self { gateway, armed }
+    }
+
     const fn disarm(&mut self) {
         self.armed = false;
     }
@@ -1933,6 +2012,9 @@ impl PullGuard {
 
 impl Drop for PullGuard {
     fn drop(&mut self) {
+        if let Some(public) = &self.gateway.public {
+            public.metrics.pull_ended();
+        }
         if self.armed {
             self.gateway.charge_drop();
         }
