@@ -43,8 +43,12 @@ docker run -d --name decdn-gateway -p 127.0.0.1:8080:8080 \
   -v /etc/decdn/keystore-password:/run/secrets/keystore-password:ro \
   -e DECDN_KEYSTORE_PASSWORD_FILE=/run/secrets/keystore-password \
   decdn/decdn gateway --public-url https://decdn.link --listen 0.0.0.0:8080 \
-  --allowance-bytes-per-day 20GiB
+  --allowance-bytes-per-day 20GiB --metrics-listen 127.0.0.1:9100
 ```
+
+`--metrics-listen` serves Prometheus text at `GET /metrics` on that loopback address, for
+your scraper; the series are listed in
+[`adr/appendix-gateway.md`](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#metrics).
 
 The keystore under the volume funds the pool (`--working-deposit-micro-usdc` sizes it),
 and `gateway/store` under the same volume keeps the pool and its lanes across restarts.

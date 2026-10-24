@@ -50,6 +50,10 @@ All metrics are exported in **Prometheus text format 0.0.4** on a configurable H
 
 ### Metric Registry
 
+The registry below is the node's. The public gateway's series
+(`decdn_gateway_*`) follow the same convention and are listed in
+[Public HTTP Gateway § Metrics](appendix-gateway.md#metrics).
+
 Every registry row carries two independent axes. **Tier** says how strongly the protocol requires the metric; **Status** says whether the reference implementation emits it today. They are orthogonal on purpose: an M-tier row can be `planned`, and that combination is exactly the gap worth tracking.
 
 Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
