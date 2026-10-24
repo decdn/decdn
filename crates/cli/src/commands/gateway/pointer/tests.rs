@@ -126,20 +126,28 @@ fn a_newer_pointer_replaces_and_an_older_or_equal_one_is_stale() {
     let pointers = Pointers::load(dir.path()).unwrap();
     assert_eq!(pointers.root(7), None);
     assert_eq!(pointers.held(7), None);
-    pointers.set(pointer(7, 0x01, 5), OWNER).unwrap();
+    pointers.set(pointer(7, 0x01, 5), OWNER, 1_000).unwrap();
     assert_eq!(pointers.root(7), Some([0x01; 32]));
-    assert_eq!(pointers.held(7), Some((5, OWNER)));
+    assert_eq!(
+        pointers.held(7),
+        Some(Held {
+            signer: OWNER,
+            seq: 5,
+            verified_at: 1_000
+        })
+    );
+    assert_eq!(pointers.high_water(7, OWNER), Some(5));
     for seq in [5, 4] {
-        match pointers.set(pointer(7, 0x02, seq), OWNER) {
+        match pointers.set(pointer(7, 0x02, seq), OWNER, 1_001) {
             Err(SetError::Stale { current }) => assert_eq!(current, 5),
             other => panic!("seq {seq}: {other:?}"),
         }
     }
     assert_eq!(pointers.root(7), Some([0x01; 32]));
-    pointers.set(pointer(7, 0x03, 6), OWNER).unwrap();
+    pointers.set(pointer(7, 0x03, 6), OWNER, 1_002).unwrap();
     assert_eq!(pointers.root(7), Some([0x03; 32]));
     // Another namespace has its own sequence.
-    pointers.set(pointer(8, 0x04, 1), OWNER).unwrap();
+    pointers.set(pointer(8, 0x04, 1), OWNER, 1_003).unwrap();
     assert_eq!(pointers.root(8), Some([0x04; 32]));
     assert_eq!(pointers.root(7), Some([0x03; 32]));
 }
@@ -152,33 +160,69 @@ fn a_newer_pointer_replaces_and_an_older_or_equal_one_is_stale() {
 fn another_signer_replaces_a_pointer_at_any_seq() {
     let dir = tempfile::tempdir().unwrap();
     let pointers = Pointers::load(dir.path()).unwrap();
-    pointers.set(pointer(7, 0x01, u64::MAX), OWNER).unwrap();
+    pointers.set(pointer(7, 0x01, u64::MAX), OWNER, 1).unwrap();
     let new_owner = Address::repeat_byte(0x22);
-    pointers.set(pointer(7, 0x02, 1), new_owner).unwrap();
+    pointers.set(pointer(7, 0x02, 1), new_owner, 2).unwrap();
     assert_eq!(pointers.root(7), Some([0x02; 32]));
-    assert_eq!(pointers.held(7), Some((1, new_owner)));
+    assert_eq!(pointers.held(7).map(|h| h.signer), Some(new_owner));
     // From then on the new owner's own sequence holds.
     assert!(matches!(
-        pointers.set(pointer(7, 0x03, 1), new_owner),
+        pointers.set(pointer(7, 0x03, 1), new_owner, 3),
         Err(SetError::Stale { current: 1 })
     ));
+}
+
+/// A signer's sequence outlives a change of hands: when the namespace comes
+/// back to a former owner, their old pointers are still stale, so a captured
+/// one cannot roll the host back to an earlier bundle.
+#[test]
+fn a_returning_signers_old_pointer_is_still_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let pointers = Pointers::load(dir.path()).unwrap();
+    let other = Address::repeat_byte(0x22);
+    pointers.set(pointer(7, 0x01, 5), OWNER, 1).unwrap();
+    pointers.set(pointer(7, 0x02, 1), other, 2).unwrap();
+    assert_eq!(pointers.high_water(7, OWNER), Some(5));
+    assert!(matches!(
+        pointers.set(pointer(7, 0x03, 5), OWNER, 3),
+        Err(SetError::Stale { current: 5 })
+    ));
+    assert_eq!(pointers.root(7), Some([0x02; 32]));
+    pointers.set(pointer(7, 0x03, 6), OWNER, 3).unwrap();
+    assert_eq!(pointers.root(7), Some([0x03; 32]));
+    assert_eq!(pointers.high_water(7, other), Some(1));
+    assert_eq!(pointers.high_water(7, Address::repeat_byte(0x33)), None);
 }
 
 #[test]
 fn pointers_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();
+    let other = Address::repeat_byte(0x22);
     {
         let pointers = Pointers::load(dir.path()).unwrap();
-        pointers.set(pointer(7, 0x01, 5), OWNER).unwrap();
-        pointers.set(pointer(9, 0x02, 2), OWNER).unwrap();
+        pointers.set(pointer(7, 0x01, 5), OWNER, 1_000).unwrap();
+        pointers.set(pointer(7, 0x04, 1), other, 1_001).unwrap();
+        pointers.set(pointer(9, 0x02, 2), OWNER, 1_002).unwrap();
     }
     let reloaded = Pointers::load(dir.path()).unwrap();
-    assert_eq!(reloaded.root(7), Some([0x01; 32]));
-    assert_eq!(reloaded.held(7), Some((5, OWNER)));
+    assert_eq!(reloaded.root(7), Some([0x04; 32]));
+    assert_eq!(
+        reloaded.held(7),
+        Some(Held {
+            signer: other,
+            seq: 1,
+            verified_at: 1_001
+        })
+    );
     assert_eq!(reloaded.root(9), Some([0x02; 32]));
+    // Every signer's high water survives, not only the holder's.
     assert!(matches!(
-        reloaded.set(pointer(7, 0x03, 5), OWNER),
+        reloaded.set(pointer(7, 0x03, 5), OWNER, 1_003),
         Err(SetError::Stale { current: 5 })
+    ));
+    assert!(matches!(
+        reloaded.set(pointer(7, 0x03, 1), other, 1_003),
+        Err(SetError::Stale { current: 1 })
     ));
 }
 
@@ -191,6 +235,8 @@ fn a_file_that_does_not_parse_or_is_misnamed_fails_the_load() {
     let record = serde_json::to_vec(&Record {
         pointer: pointer(7, 0x01, 1),
         signer: OWNER,
+        verified_at: 1,
+        high_water: HashMap::from([(OWNER, 1)]),
     })
     .unwrap();
     std::fs::write(dir.path().join("8.json"), &record).unwrap();
@@ -214,7 +260,7 @@ fn the_pointer_dir_is_created_owner_only() {
         std::fs::metadata(&inner).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    pointers.set(pointer(7, 0x01, 1), OWNER).unwrap();
+    pointers.set(pointer(7, 0x01, 1), OWNER, 1).unwrap();
     let entries: Vec<_> = std::fs::read_dir(&inner)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())

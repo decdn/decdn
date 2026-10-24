@@ -95,10 +95,15 @@
 //! `PublisherRegistry` the gateway runs against, that names the bundle
 //! `<ns>.<host>` serves. The gateway recovers the signer, reads the owner
 //! on-chain, and stores the pointer under `<data-dir>/pointers/<ns>.json`
-//! when its `seq` is above the one held from that signer. The owner lookups
-//! come out of a budget per minute (`POINTER_LOOKUPS_PER_MINUTE`), so an
-//! anonymous flood of pointers costs the operator's RPC no more than that.
-//! `decdn publish point` signs and sends one.
+//! when its `seq` is above every one stored from that signer. The owner
+//! lookups come out of a budget per minute (`POINTER_LOOKUPS_PER_MINUTE`),
+//! so an anonymous flood of pointers costs the operator's RPC no more than
+//! that; a signer verified within `OWNER_VERIFIED_TTL_SECS` is not asked of
+//! the chain again for its own next pointer, so the flood does not keep a
+//! publisher from updating. Pointer writes run one at a time, lookup
+//! included, so a stale owner read never overtakes a fresher one. Limits per
+//! client belong on the proxy, which knows the client. `decdn publish point`
+//! signs and sends one.
 //! Sites are separate browser origins; they are separate sites, with their
 //! own cookies and site-scoped state, only when the public host is a public
 //! suffix: the operator registers it on the Public Suffix List, as
@@ -189,6 +194,13 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// answer is 429 until the minute turns, and the operator's RPC is not an
 /// anonymous caller's to spend.
 const POINTER_LOOKUPS_PER_MINUTE: u32 = 60;
+
+/// How long an owner lookup that admitted a signer stands for that signer's
+/// next pointers on the same namespace. Within it, an update from the holder
+/// costs no lookup, and no budget; after it, the chain is asked again, so a
+/// namespace that changed hands stops taking its former owner's pointers
+/// within the hour even if the new owner has not pointed it yet.
+const OWNER_VERIFIED_TTL_SECS: u64 = 3600;
 
 /// A gateway pull that makes no verified progress for this long gives up, so
 /// a stuck request does not hold its pull slot.
@@ -399,6 +411,7 @@ fn mode(
             pointers,
             registry,
             lookups: std::sync::Mutex::new(Lookups::default()),
+            pointer_writes: Mutex::new(()),
         }),
     ))
 }
@@ -891,6 +904,10 @@ struct Public {
     /// The owner lookups made this minute, against
     /// [`POINTER_LOOKUPS_PER_MINUTE`].
     lookups: std::sync::Mutex<Lookups>,
+    /// Held from a pointer's owner lookup through its store, so two pointers
+    /// for one namespace resolve in the order their owners were read, and a
+    /// read from before a transfer cannot overtake one from after it.
+    pointer_writes: Mutex<()>,
 }
 
 /// The on-chain owner lookups `PUT /_pointer` made in one minute.
@@ -1242,10 +1259,11 @@ impl Gateway {
 
     /// `PUT /_pointer`: store a namespace pointer signed by the namespace's
     /// owner on this deployment's `PublisherRegistry`, when its `seq` is
-    /// above the one held from the same signer. A replay is refused on the
-    /// held `seq` before the chain is read, and the lookups that do reach
-    /// the chain come out of a budget per minute, so no anonymous caller
-    /// makes the gateway spend its RPC.
+    /// above every one stored from that signer. A replay is refused on that
+    /// high water before the chain is read; the holder's own next pointer
+    /// reuses a verification younger than [`OWNER_VERIFIED_TTL_SECS`]; the
+    /// lookups that do reach the chain come out of a budget per minute, so
+    /// no anonymous caller makes the gateway spend its RPC.
     async fn put_pointer<B>(&self, req: Request<B>) -> Response<Body>
     where
         B: HttpBody<Data = Bytes>,
@@ -1279,27 +1297,45 @@ impl Gateway {
             Ok(signer) => signer,
             Err(e) => return text(StatusCode::UNPROCESSABLE_ENTITY, &format!("{e}\n")),
         };
-        // From the signer whose pointer is held, only a later `seq` is new.
-        // Another signer is checked against the owner on-chain, whatever its
-        // `seq`: the namespace may have changed hands.
-        if let Some((current, held_by)) = public.pointers.held(ns)
-            && held_by == signer
+        // From any signer, only a `seq` above what it had stored is new: a
+        // replay, and an old pointer of an owner the namespace came back to,
+        // cost no lookup.
+        if let Some(current) = public.pointers.high_water(ns, signer)
             && pointer.seq <= current
         {
             return stale_pointer(current);
         }
-        let owner = match self.namespace_owner(public, ns).await {
-            Ok(owner) => owner,
-            Err(response) => return *response,
+        // One pointer at a time from here: the owner read and the store are
+        // one step, so a read from before a transfer cannot land after one
+        // from after it.
+        let _writes = public.pointer_writes.lock().await;
+        let now = now_secs();
+        let verified_at = match public.pointers.held(ns) {
+            // The holder's own update, verified within the hour: no lookup.
+            Some(held)
+                if held.signer == signer
+                    && now.saturating_sub(held.verified_at) < OWNER_VERIFIED_TTL_SECS =>
+            {
+                held.verified_at
+            }
+            _ => {
+                let owner = match self.namespace_owner(public, ns).await {
+                    Ok(owner) => owner,
+                    Err(response) => return *response,
+                };
+                if owner != signer {
+                    return text(
+                        StatusCode::FORBIDDEN,
+                        &format!(
+                            "the pointer is signed by {signer}; namespace {ns} is owned by {owner}\n"
+                        ),
+                    );
+                }
+                now
+            }
         };
-        if owner != signer {
-            return text(
-                StatusCode::FORBIDDEN,
-                &format!("the pointer is signed by {signer}; namespace {ns} is owned by {owner}\n"),
-            );
-        }
         let (root, seq) = (pointer.root, pointer.seq);
-        match public.pointers.set(pointer, signer) {
+        match public.pointers.set(pointer, signer, verified_at) {
             Ok(()) => {}
             Err(SetError::Stale { current }) => return stale_pointer(current),
             Err(SetError::Io(e)) => {

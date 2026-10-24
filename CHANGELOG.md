@@ -4096,11 +4096,12 @@ since project inception and will roll into the first tagged release.
   keystore and `PUT`s it to the gateway as `/_pointer`. The gateway recovers
   the signer, checks it against `PublisherRegistry.ownerOf`, keeps the
   pointer in `<data-dir>/pointers/<ns>.json`, and from then on serves the
-  bundle as a website at `<ns>.<host>`. A pointer from the same signer at a
-  `seq` not above the held one is 409 before any chain read; one from
-  another signer who owns the namespace now replaces the held one at any
-  `seq`; a stranger's is 403; the owner lookups are budgeted per minute
-  (429 past it). `decdn gateway` takes `--publisher-registry-address`
+  bundle as a website at `<ns>.<host>`. A pointer at a `seq` not above
+  what the gateway stored from the same signer is 409 before any chain
+  read; one from another signer who owns the namespace now replaces the
+  held one whatever the holder's `seq`; a stranger's is 403; the owner
+  lookups are budgeted per minute (429 past it), and a signer verified
+  within the hour is not looked up again for its own next pointer. `decdn gateway` takes `--publisher-registry-address`
   (default: the config file, else the built-in testnet) and
   `--allowance <ns>=<bytes>`, repeatable, which gives one namespace a daily
   allowance of its own for the requests its pointer serves, in place of the

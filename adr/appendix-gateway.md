@@ -94,8 +94,10 @@ The domain is `decdn-pointer`, version `1`, with the chain id and the
 `PublisherRegistry` address as `verifyingContract`. A pointer signed for one
 deployment means nothing on another: namespace ids repeat across chains and
 redeploys. `root` is the bundle's manifest hash. `seq` orders the pointers
-of one signer: the gateway takes a pointer only above the `seq` it holds from
-that signer, so a replayed or reordered pointer changes nothing.
+of one signer: the gateway takes a pointer only above every `seq` it has
+stored from that signer, so a replayed or reordered pointer changes nothing,
+and a namespace that comes back to a former owner cannot be rolled back to a
+pointer they signed before.
 
 `decdn publish point <ns> decdn:<hash>/ --gateway <origin>` signs a pointer
 with the namespace owner's keystore and sends it as `PUT /_pointer` on the
@@ -106,7 +108,7 @@ by the CLI. The gateway answers:
 | Status | When |
 |--------|------|
 | 201 | The pointer is stored. The body names `namespace`, `root`, `seq` and the namespace's `url`. |
-| 409 | The signer's held pointer has a `seq` at or above this one. The body gives the held `seq`. No chain read. |
+| 409 | The gateway stored a pointer from this signer at or above this `seq`. The body gives that `seq`. No chain read. |
 | 422 | The body is not the record, or the signature is malformed. |
 | 403 | The signature recovers an address that does not own the namespace. |
 | 404 | The namespace does not exist on this deployment. On a loopback gateway every `PUT /_pointer` is 404. |
@@ -116,16 +118,21 @@ by the CLI. The gateway answers:
 The gateway resolves the registry from `--publisher-registry-address`, else
 `blockchain.publisher_registry_address` in the config file, else the built-in
 testnet's when it runs on that chain. It recovers the signer and reads
-`PublisherRegistry.ownerOf` once per pointer that passes the `seq` check.
-The reads come out of a budget per minute, so an anonymous flood of
-well-formed pointers costs the operator's RPC a bounded amount. A pointer
-from another signer than the held one goes to the chain whatever its `seq`:
+`PublisherRegistry.ownerOf` for a pointer that passes the `seq` check. The
+reads come out of a budget per minute, so an anonymous flood of well-formed
+pointers costs the operator's RPC a bounded amount. A signer the gateway
+verified as the owner within the hour is not asked of the chain again for its
+own next pointer, so that flood does not keep a publisher from updating.
+Limits per client belong on the proxy, which knows the client. A pointer from
+another signer than the holder goes to the chain whatever the holder's `seq`:
 when the namespace changed hands, the new owner's first pointer replaces the
-old owner's, and the old owner's sequence ends.
+old owner's. The owner read and the store are one step, so two pointers for
+one namespace resolve in the order their owners were read.
 
 Pointers live in `<data-dir>/pointers/<ns>.json`, one file per namespace,
-with the signer each recovered to. The gateway reads them at start and fails
-to start on a damaged file. A restart changes no pointer.
+with the signer each recovered to, when that signer was verified, and the
+highest `seq` stored from each signer. The gateway reads them at start and
+fails to start on a damaged file. A restart changes no pointer.
 
 ## Ranges
 

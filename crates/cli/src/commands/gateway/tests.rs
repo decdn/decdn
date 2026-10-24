@@ -381,6 +381,7 @@ fn public_with(allowance: Allowance, pointers_dir: &Path) -> Public {
         pointers: Pointers::load(pointers_dir).unwrap(),
         registry: REGISTRY,
         lookups: std::sync::Mutex::new(Lookups::default()),
+        pointer_writes: Mutex::new(()),
     }
 }
 
@@ -1418,9 +1419,46 @@ fn pointers(gateway: &Gateway) -> &Pointers {
     &gateway.public.as_ref().unwrap().pointers
 }
 
-/// Store `pointer` as signed by `signer`, past `PUT /_pointer`.
+/// Store `pointer` as signed by `signer` and verified as the owner long ago,
+/// past `PUT /_pointer`.
 fn hold(gateway: &Gateway, pointer: SignedPointer, signer: Address) {
-    pointers(gateway).set(pointer, signer).unwrap();
+    pointers(gateway).set(pointer, signer, 0).unwrap();
+}
+
+/// A signer verified as the namespace's owner within the hour is not asked
+/// of the chain again for its own next pointer, so a flood on the lookup
+/// budget cannot keep a publisher from updating; once the verification is
+/// older than that, the chain is read again.
+#[tokio::test]
+async fn a_recent_owner_verification_is_reused_for_the_same_signer() {
+    let (gateway, _logs, _) = public_gateway().await;
+    let owner = PrivateKeySigner::random();
+    let domain = pointer_domain(gateway.chain.chain_id, REGISTRY);
+    let now = now_secs();
+    pointers(&gateway)
+        .set(unsigned_pointer(7, BLOB, 1), owner.address(), now)
+        .unwrap();
+    let pointer = SignedPointer::sign(&owner, 7, OTHER, 2, &domain).unwrap();
+    let body = serde_json::to_string(&pointer).unwrap();
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+    assert_eq!(answer.status, StatusCode::CREATED, "{}", answer.body);
+    assert_eq!(pointers(&gateway).root(7), Some(OTHER));
+    let json: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+    assert_eq!(json["url"], "https://7.decdn.test/");
+    // The reused verification keeps its age: it is not refreshed by a write.
+    assert_eq!(pointers(&gateway).held(7).map(|h| h.verified_at), Some(now));
+    pointers(&gateway)
+        .set(
+            unsigned_pointer(9, BLOB, 1),
+            owner.address(),
+            now - OWNER_VERIFIED_TTL_SECS,
+        )
+        .unwrap();
+    let pointer = SignedPointer::sign(&owner, 9, OTHER, 2, &domain).unwrap();
+    let body = serde_json::to_string(&pointer).unwrap();
+    let answer = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await;
+    assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "{}", answer.body);
+    assert_eq!(pointers(&gateway).root(9), Some(BLOB));
 }
 
 /// A namespace host serves the bundle its pointer names, as a site: its
