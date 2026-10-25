@@ -1556,6 +1556,7 @@ mod earnings {
             gross_micro_usdc: gross,
             net_micro_usdc: net,
             bytes_delivered: bytes,
+            operator: Address::repeat_byte(0xEE),
         }
     }
 
@@ -1692,6 +1693,31 @@ mod earnings {
         );
         assert_eq!(pending.next_sweep_at_unix, None, "no redeemer published");
         assert_eq!(pending.last_sweep_at_unix, None);
+    }
+
+    /// After `rotate-key eth` the ledger still holds the old address's rows;
+    /// they are neither summed nor the "since" date nor the last settlement.
+    #[test]
+    fn another_operators_rows_are_left_out() {
+        let ours = Address::repeat_byte(0xEE);
+        let mut theirs = row(1, NOW - 30 * DAY_SECS, 1_000, 2_000, 10);
+        theirs.operator = Address::repeat_byte(0x99);
+        let mut latest_theirs = row(50, NOW - 10, 1_000, 2_000, 10);
+        latest_theirs.operator = Address::repeat_byte(0x99);
+        let rows = vec![theirs, row(2, NOW - 3_600, 40, 80, 400), latest_theirs];
+        let resp = build(&rows, &[], Some(ours), None);
+        assert_eq!(resp.ledger_since_unix, Some(NOW - 3_600));
+        assert_eq!(
+            (
+                resp.since_ledger_start.settlements,
+                resp.since_ledger_start.net_micro_usdc
+            ),
+            (1, 40)
+        );
+        assert_eq!(resp.last_settlement.map(|l| l.block_number), Some(2));
+        // No operator: nothing can be attributed, so every row counts.
+        let all = build(&rows, &[], None, None);
+        assert_eq!(all.since_ledger_start.settlements, 3);
     }
 
     #[test]

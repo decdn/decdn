@@ -1048,8 +1048,19 @@ pub(crate) fn build_earnings_response(
     since_unix: Option<u64>,
     schedule: &RedeemSchedule,
 ) -> EarningsResponse {
+    // Only this operator's rows: the ledger outlives an Ethereum key rotation
+    // that kept the data directory. With no operator (a hand-built admin
+    // state) nothing can be attributed, so every row counts.
+    let rows: Vec<&SettlementRecord> = rows
+        .iter()
+        .filter(|row| operator.is_none_or(|operator| row.operator == operator))
+        .collect();
     let ledger_since_unix = rows.iter().map(|row| row.landed_at_unix).min();
-    let landed_since = |from: u64| rows.iter().filter(move |row| row.landed_at_unix >= from);
+    let landed_since = |from: u64| {
+        rows.iter()
+            .copied()
+            .filter(move |row| row.landed_at_unix >= from)
+    };
     let day = now_unix.saturating_sub(DAY_SECS);
     let week = now_unix.saturating_sub(WEEK_SECS);
     EarningsResponse {
@@ -1057,9 +1068,9 @@ pub(crate) fn build_earnings_response(
         ledger_since_unix,
         last_24h: sum_period(day, landed_since(day)),
         last_7d: sum_period(week, landed_since(week)),
-        since_ledger_start: sum_period(ledger_since_unix.unwrap_or(0), rows.iter()),
+        since_ledger_start: sum_period(ledger_since_unix.unwrap_or(0), rows.iter().copied()),
         since: since_unix.map(|since| sum_period(since, landed_since(since))),
-        last_settlement: last_settlement(rows),
+        last_settlement: last_settlement(rows.iter().copied()),
         pending: Some(pending_redeem(lanes, operator, now_unix, schedule)),
     }
 }

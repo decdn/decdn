@@ -14,8 +14,10 @@
 //! that does not decode fails the command: a clean table over a mis-decoded
 //! scan would be a lie.
 
+use std::future::IntoFuture;
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::time::Duration;
 
 use alloy::eips::BlockId;
 use alloy::primitives::{Address, U256};
@@ -36,6 +38,29 @@ use crate::known_chains;
 
 const DAY_SECS: u64 = 86_400;
 const WEEK_SECS: u64 = 7 * DAY_SECS;
+
+/// How long one RPC read of the scan may take. The read-only provider sets no
+/// request timeout of its own, and an endpoint that accepts the connection but
+/// never answers would otherwise hang the command.
+const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Await `call` for at most [`RPC_CALL_TIMEOUT`]; an elapsed deadline is an
+/// error naming `what`.
+async fn bounded<T, E>(
+    what: &str,
+    call: impl IntoFuture<Output = Result<T, E>>,
+) -> anyhow::Result<T>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match tokio::time::timeout(RPC_CALL_TIMEOUT, call.into_future()).await {
+        Ok(result) => result.with_context(|| what.to_owned()),
+        Err(_) => anyhow::bail!(
+            "{what} did not answer within {}s",
+            RPC_CALL_TIMEOUT.as_secs()
+        ),
+    }
+}
 
 /// A `[operator, buyback, treasury]` fee split, in basis points.
 type FeeSplit = [U256; 3];
@@ -137,10 +162,7 @@ pub(super) async fn run(
     let file = chain_ctx::load_optional_config(config_path)?;
     let coords = resolve_coordinates(args, &file)?;
     let provider = decdn_client::provider::build_read_provider(&coords.rpc_url)?;
-    let rpc_chain_id = provider
-        .get_chain_id()
-        .await
-        .context("failed to read the RPC's chain id")?;
+    let rpc_chain_id = bounded("eth_chainId", provider.get_chain_id()).await?;
     anyhow::ensure!(
         rpc_chain_id == coords.chain_id,
         "the RPC serves chain {rpc_chain_id}, but the addresses are for chain {}; pass \
@@ -148,15 +170,15 @@ pub(super) async fn run(
         coords.chain_id
     );
 
-    let router = PaymentPool::new(coords.payment_pool, &provider)
-        .feeRouter()
-        .call()
-        .await
-        .context("PaymentPool.feeRouter()")?;
-    let head = provider
-        .get_block(BlockId::latest())
-        .await
-        .context("failed to read the latest block")?
+    let router = bounded(
+        "PaymentPool.feeRouter()",
+        PaymentPool::new(coords.payment_pool, &provider)
+            .feeRouter()
+            .call(),
+    )
+    .await?;
+    let head = bounded("the latest block", provider.get_block(BlockId::latest()))
+        .await?
         .ok_or_else(|| anyhow::anyhow!("no latest block"))?;
     let (head_number, now) = (head.header.number, head.header.timestamp);
     let from = coords.from_block;
@@ -248,11 +270,13 @@ async fn scan_rows<P: Provider>(
     .await
     .context("scanning FeeRouter.SharesUpdated")?;
     let fee_router = FeeRouter::new(router, provider);
-    let current_shares = fee_router
-        .getShares()
-        .call()
-        .await
-        .context("FeeRouter.getShares()")?;
+    // Read at `to`, the block the scan ends at: a retune landing while the
+    // scan runs is after every row and must not price them.
+    let current_shares = bounded(
+        "FeeRouter.getShares()",
+        fee_router.getShares().block(BlockId::number(to)).call(),
+    )
+    .await?;
     let mut history = shares_history(&shares_logs)?;
     // A settlement before the first in-range change was paid under the split
     // that change replaced: read it at the block before the change. The
@@ -263,19 +287,22 @@ async fn scan_rows<P: Provider>(
         && first_settled < *first_change
     {
         let change_block = first_change.0;
-        let before = fee_router
-            .getShares()
-            .block(BlockId::number(change_block.saturating_sub(1)))
-            .call()
-            .await
-            .with_context(|| {
-                format!(
-                    "a settlement at block {} precedes the first fee-split change in the scanned \
+        let before = bounded(
+            "FeeRouter.getShares() at the block before the first change",
+            fee_router
+                .getShares()
+                .block(BlockId::number(change_block.saturating_sub(1)))
+                .call(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "a settlement at block {} precedes the first fee-split change in the scanned \
                      range (block {change_block}), and the RPC cannot read the split in force \
                      before it; pass --from-block at or before the deployment block",
-                    first_settled.0
-                )
-            })?;
+                first_settled.0
+            )
+        })?;
         history.insert(0, ((from, 0), before));
     }
     rows_from_logs(&settled, &history, current_shares)
@@ -443,6 +470,7 @@ pub(super) fn rows_from_logs(
             gross_micro_usdc: u64::try_from(event.amount).unwrap_or(u64::MAX),
             net_micro_usdc: u64::try_from(net_of(event.amount, shares)).unwrap_or(u64::MAX),
             bytes_delivered: u64::try_from(event.bytesDelivered).unwrap_or(u64::MAX),
+            operator: event.operator,
         });
     }
     rows.sort_by_key(SettlementRecord::key);
@@ -451,12 +479,13 @@ pub(super) fn rows_from_logs(
 
 /// The timestamp of `block`, Unix seconds.
 async fn block_timestamp<P: Provider>(provider: &P, block: u64) -> anyhow::Result<u64> {
-    provider
-        .get_block(BlockId::number(block))
-        .await
-        .with_context(|| format!("failed to read block {block}"))?
-        .map(|b| b.header.timestamp)
-        .ok_or_else(|| anyhow::anyhow!("block {block} not found"))
+    bounded(
+        &format!("block {block}"),
+        provider.get_block(BlockId::number(block)),
+    )
+    .await?
+    .map(|b| b.header.timestamp)
+    .ok_or_else(|| anyhow::anyhow!("block {block} not found"))
 }
 
 /// The lowest block in `[lo, hi]` whose timestamp is at or after

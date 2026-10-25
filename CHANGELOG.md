@@ -4107,8 +4107,10 @@ since project inception and will roll into the first tagged release.
     receipt (gross, bytes and epoch from `FeeRouter.Settled`, the exact net
     from the USDC transfer to the operator, the block's timestamp). The
     `PoolRedeemed` watcher backfills a row for a landing the redeemer never
-    saw. The ledger drops with the other seller tables on a `PaymentPool`
-    repoint. Nothing is backfilled from before the ledger exists, so the
+    saw, off the poller's task. Each row names its operator, so after `decdn
+    node rotate-key eth` the earlier address's rows stay in the file but out
+    of the figures. The ledger drops with the other seller tables on a
+    `PaymentPool` repoint. Nothing is backfilled from before the ledger exists, so the
     bottom row reads `since <date>`, never "all time";
   - the admin RPC gains `admin_v1_earnings` (and `EARNINGS_UNAVAILABLE_CODE`):
     named periods `last_24h`, `last_7d`, `since_ledger_start` and the optional

@@ -161,6 +161,7 @@ pub fn settlement_from_receipt(
         gross_micro_usdc: u64::try_from(settled.amount).unwrap_or(u64::MAX),
         net_micro_usdc: net,
         bytes_delivered: u64::try_from(settled.bytesDelivered).unwrap_or(u64::MAX),
+        operator,
     }))
 }
 

@@ -19,6 +19,7 @@ fn row(
         gross_micro_usdc: gross,
         net_micro_usdc: net,
         bytes_delivered: bytes,
+        operator: alloy::primitives::Address::repeat_byte(0x0E),
     }
 }
 

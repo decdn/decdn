@@ -87,7 +87,7 @@ use decdn_incentive::{
     CheckpointKey, KeyedCheckpointStore, LaneKey, LaneState, PoolId, PoolStateStore,
     SettlementLedger, StoreError,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{Instrument as _, debug, error, info, warn};
 
@@ -525,6 +525,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             pool_view: pool_view.clone(),
             recorder: recorder.clone(),
             contract: contract.clone(),
+            backfill_permits: Arc::new(Semaphore::new(LEDGER_BACKFILL_CONCURRENCY)),
         };
         let route = Route {
             addresses: vec![payment_pool_addr],
@@ -794,10 +795,19 @@ struct PoolSettlementSink<P: Provider + Clone> {
     /// Backfills a settlement ledger row (#2598) for an own-provider
     /// `PoolRedeemed` whose `redeemMany` the redeemer never saw land.
     recorder: SettlementRecorder,
-    /// The wallet contract instance; the backfill's receipt and header reads
+    /// The `PaymentPool` instance; the backfill's receipt and header reads
     /// ride its provider.
     contract: PaymentPool::PaymentPoolInstance<P>,
+    /// Bounds the backfills in flight at once. A backfill is two RPC reads
+    /// that can each wait out the call timeout, and the poller applies logs
+    /// to every route in turn, so it runs off the poller's task.
+    backfill_permits: Arc<Semaphore>,
 }
+
+/// How many settlement ledger backfills may run at once. A resume after a long
+/// outage replays every own-provider `PoolRedeemed` of the gap; this keeps
+/// that from fanning out into as many concurrent receipt reads.
+const LEDGER_BACKFILL_CONCURRENCY: usize = 4;
 
 impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
     #[allow(clippy::cognitive_complexity)]
@@ -872,9 +882,8 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
                         "recorded lane paid watermark from PoolRedeemed"
                     );
                 }
-                // After the watermark writes, so two RPC reads on a slow
-                // provider never delay `paid`.
-                self.backfill_ledger(&log, event.poolId).await;
+                // After the watermark writes, and on its own task.
+                self.backfill_ledger(&log, event.poolId);
             }
             Some(sig) if sig == PaymentPool::PoolToppedUp::SIGNATURE_HASH => {
                 let event = match PaymentPool::PoolToppedUp::decode_log_data(&log.inner.data) {
@@ -940,16 +949,27 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
     }
 }
 
-impl<P: Provider + Clone> PoolSettlementSink<P> {
+impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
     /// Ledger backfill (#2598) for an own-provider `PoolRedeemed`: a row for a
     /// landing the redeemer never saw (a receipt wait that timed out, or a
     /// landing across a restart). A transaction already in the ledger costs
     /// one ledger read and no RPC.
-    async fn backfill_ledger(&self, log: &Log, pool_id: PoolId) {
+    /// The backfill runs on its own task: the poller awaits every route's sink
+    /// in turn, and a receipt or header read that waits out its timeout must
+    /// not hold up the paid watermarks, the blacklist or the slash watcher.
+    /// `backfill_permits` bounds how many run at once; the recorder's
+    /// own-block guard makes a repeat harmless.
+    fn backfill_ledger(&self, log: &Log, pool_id: PoolId) {
         if let (Some(tx), Some(block)) = (log.transaction_hash, log.block_number) {
-            self.recorder
-                .backfill(self.contract.provider(), block, tx)
-                .await;
+            let recorder = self.recorder.clone();
+            let provider = self.contract.provider().clone();
+            let permits = Arc::clone(&self.backfill_permits);
+            tokio::spawn(async move {
+                let Ok(_permit) = permits.acquire_owned().await else {
+                    return;
+                };
+                recorder.backfill(&provider, block, tx).await;
+            });
         } else {
             warn!(
                 %pool_id,
@@ -1515,6 +1535,9 @@ async fn redeemer_loop<P: Provider + Clone>(
                         park_lane(&mut parked, key);
                     }
                     next_cutoff = next_cutoff.into_iter().chain(outcome.wake).min();
+                    // A hint can pull the next cutoff forward; the published
+                    // schedule follows it. Not a sweep, so `swept_at` stays.
+                    schedule.publish(None, next_sweep_at(next_tick_at, next_cutoff));
                     continue;
                 }
                 // All hint senders dropped — the service is going away.

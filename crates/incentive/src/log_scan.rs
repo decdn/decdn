@@ -209,6 +209,12 @@ pub enum ScanEvent {
     },
 }
 
+/// How long one `eth_getLogs` attempt may take. A provider that accepts the
+/// connection but never answers otherwise hangs the scan, because the
+/// transport sets no request timeout; an elapsed deadline takes the retry
+/// path like any other failure.
+pub const SCAN_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Fetch every log `filter` matches in `[from, to]`, one window at a time,
 /// starting at `ceiling` blocks per window. A window the provider rejects as
 /// too wide is retried at half its length; after enough accepted windows the
@@ -238,11 +244,15 @@ pub async fn scan_logs<P: Provider>(
     while start <= to {
         let end = window_end(start, to, span.current());
         let window = filter.clone().from_block(start).to_block(end);
-        match provider
-            .get_logs(&window)
-            .await
-            .with_context(|| format!("eth_getLogs [{start}, {end}]"))
-        {
+        let attempt =
+            match tokio::time::timeout(SCAN_CALL_TIMEOUT, provider.get_logs(&window)).await {
+                Ok(result) => result.map_err(anyhow::Error::from),
+                Err(_) => Err(anyhow::anyhow!(
+                    "no answer within {}s",
+                    SCAN_CALL_TIMEOUT.as_secs()
+                )),
+            };
+        match attempt.with_context(|| format!("eth_getLogs [{start}, {end}]")) {
             Ok(batch) => {
                 logs.extend(batch);
                 let _regrown = span.record_success();

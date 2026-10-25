@@ -1155,6 +1155,7 @@ async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
         gross_micro_usdc: net * 10 / 6,
         net_micro_usdc: net,
         bytes_delivered: 1_000 * block,
+        operator: Address::repeat_byte(0xEE),
     };
     ledger.record_settlement(&row(10, now - 40 * 86_400, 100))?;
     ledger.record_settlement(&row(20, now - 3 * 86_400, 200))?;

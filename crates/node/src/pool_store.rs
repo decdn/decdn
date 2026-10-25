@@ -223,6 +223,7 @@ struct StoredSettlement {
     gross_micro_usdc: u64,
     net_micro_usdc: u64,
     bytes_delivered: u64,
+    operator: [u8; 20],
 }
 
 impl StoredSettlement {
@@ -235,6 +236,7 @@ impl StoredSettlement {
             gross_micro_usdc: row.gross_micro_usdc,
             net_micro_usdc: row.net_micro_usdc,
             bytes_delivered: row.bytes_delivered,
+            operator: row.operator.into(),
         }
     }
 
@@ -258,6 +260,7 @@ impl StoredSettlement {
             gross_micro_usdc: self.gross_micro_usdc,
             net_micro_usdc: self.net_micro_usdc,
             bytes_delivered: self.bytes_delivered,
+            operator: Address::from(self.operator),
         })
     }
 }

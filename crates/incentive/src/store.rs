@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{Address, B256, U256};
 
 use crate::lane::{LaneKey, LaneState, PoolId};
 
@@ -495,6 +495,11 @@ pub struct SettlementRecord {
     pub net_micro_usdc: u64,
     /// `FeeRouter.Settled.bytesDelivered`: the bytes this settlement paid for.
     pub bytes_delivered: u64,
+    /// `FeeRouter.Settled.operator`: the address the payout went to. The
+    /// ledger outlives an Ethereum key rotation (`decdn node rotate-key eth`
+    /// keeps the data directory), so the earnings figures filter on it rather
+    /// than attribute an earlier operator's rows to the current one.
+    pub operator: Address,
 }
 
 impl SettlementRecord {

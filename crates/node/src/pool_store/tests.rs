@@ -1279,6 +1279,7 @@ mod settlement_ledger {
             gross_micro_usdc: 1_000 + block,
             net_micro_usdc: 600 + block,
             bytes_delivered: 4_096 * block,
+            operator: alloy::primitives::Address::repeat_byte(0xEE),
         }
     }
 

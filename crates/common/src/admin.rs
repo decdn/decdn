@@ -499,8 +499,9 @@ pub struct EarningsResponse {
     /// started without a seller wallet.
     pub operator_address: Option<String>,
     /// The time of the earliest settlement the figures cover. On the daemon
-    /// this is the `landed_at_unix` of the earliest ledger row, `None` while
-    /// the ledger is empty. Built from the chain (`decdn node earnings
+    /// this is the `landed_at_unix` of the earliest ledger row for this
+    /// operator (a row from before an Ethereum key rotation is not counted),
+    /// `None` while the ledger holds none. Built from the chain (`decdn node earnings
     /// --address`) it is the block time of the earliest `Settled` found from
     /// the scan's first block, `None` when the scan found none.
     pub ledger_since_unix: Option<u64>,
