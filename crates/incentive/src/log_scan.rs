@@ -174,13 +174,14 @@ const LIMIT_WORDS: [&str; 10] = [
 
 /// How many times [`scan_logs`] retries a window the provider failed for a
 /// reason other than its range: a timeout, a rate limit, a transport fault.
-/// A long scan makes hundreds of requests against a public endpoint, and one
+/// A long scan makes thousands of requests against a public endpoint, and one
 /// refused request must not discard every window before it.
 pub const SCAN_WINDOW_RETRIES: u32 = 3;
 
 /// The sleep before the first retry of a failed window; each further retry
-/// doubles it (2 s, 4 s, 8 s), which outlasts the per-minute quota windows of
-/// the free tiers.
+/// doubles it (2 s, 4 s, 8 s): enough for a short rate-limit burst to pass,
+/// not a full per-minute quota window, which fails the scan with the last
+/// scanned block named so it can be resumed.
 pub const SCAN_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// What a [`scan_logs`] caller hears about as the scan runs.

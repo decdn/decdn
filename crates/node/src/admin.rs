@@ -1080,7 +1080,8 @@ pub(crate) fn build_earnings_response(
 /// `operator` as its provider and its capability has not expired, the two
 /// local predicates the redeemer's planner applies; otherwise it counts as
 /// stranded. The planner also skips a lane whose pool cannot pay, which needs
-/// the pool view, so the pending figure is an upper bound on the next sweep.
+/// the pool view, and sweeps nothing while the total is under the redeem
+/// threshold, so the pending figure is an upper bound on the next sweep.
 fn pending_redeem(
     lanes: &[LaneState],
     operator: Option<Address>,
@@ -1096,7 +1097,7 @@ fn pending_redeem(
         next_sweep_at_unix: schedule.next_sweep_at(),
     };
     for lane in lanes {
-        let unredeemed = lane.owed().saturating_sub(lane.paid_cumulative);
+        let unredeemed = lane.unredeemed();
         if unredeemed.is_zero() {
             continue;
         }
@@ -1205,10 +1206,7 @@ fn build_lane_snapshots(
                 outstanding_micro_usdc: u64::try_from(outstanding).unwrap_or(u64::MAX),
                 // What a landed redemption has not paid yet (#2598): the claim
                 // minus the paid watermark the `PoolRedeemed` watcher recorded.
-                unredeemed_micro_usdc: u64::try_from(
-                    outstanding.saturating_sub(state.paid_cumulative),
-                )
-                .unwrap_or(u64::MAX),
+                unredeemed_micro_usdc: u64::try_from(state.unredeemed()).unwrap_or(u64::MAX),
                 deposit_micro_usdc: 0,
                 seconds_since_last_voucher: ages.get(&state.key()).copied(),
                 // The full claim, not `owed − paid_cumulative`, against the

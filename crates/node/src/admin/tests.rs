@@ -1619,6 +1619,25 @@ mod earnings {
         assert_eq!(last.tx_hash, format!("{:#x}", B256::repeat_byte(3)));
     }
 
+    /// A settlement landed exactly at a period's first second counts in it,
+    /// one landed a second earlier does not: the cutoff is inclusive, as the
+    /// chain-mode search's is.
+    #[test]
+    fn a_settlement_at_the_cutoff_second_counts_in_the_period() {
+        let rows = vec![
+            row(1, NOW - DAY_SECS - 1, 10, 20, 100),
+            row(2, NOW - DAY_SECS, 20, 40, 200),
+        ];
+        let resp = build(&rows, &[], None, Some(NOW - DAY_SECS));
+        assert_eq!(
+            (resp.last_24h.settlements, resp.last_24h.net_micro_usdc),
+            (1, 20)
+        );
+        let custom = resp.since.expect("asked for");
+        assert_eq!((custom.settlements, custom.net_micro_usdc), (1, 20));
+        assert_eq!(resp.last_7d.settlements, 2);
+    }
+
     #[test]
     fn a_since_request_fills_the_fourth_period() {
         let since = NOW - 10 * DAY_SECS;

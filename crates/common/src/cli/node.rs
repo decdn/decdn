@@ -365,7 +365,8 @@ pub struct EarningsArgs {
     pub timeout_ms: u64,
 
     /// Add a period that starts here: a UTC date `YYYY-MM-DD` (midnight) or
-    /// Unix seconds.
+    /// Unix seconds, 2000-01-01 or later (a smaller integer is read as a
+    /// date typed without its dashes and refused).
     #[arg(long, value_name = "DATE|UNIX")]
     pub since: Option<String>,
 

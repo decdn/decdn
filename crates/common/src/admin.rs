@@ -571,8 +571,9 @@ pub struct PendingRedeem {
     /// [`LaneSnapshot::unredeemed_micro_usdc`] over the lanes this operator
     /// provides whose capability has not expired. The redeemer also skips a
     /// lane whose pool cannot pay (closed, past its grace window, or
-    /// insolvent); this figure does not, so it is an upper bound on the next
-    /// sweep.
+    /// insolvent) and sweeps nothing while the total is under
+    /// `blockchain.redeem_threshold_micro_usdc`; this figure applies neither,
+    /// so it is an upper bound on the next sweep.
     pub micro_usdc: u64,
     /// How many lanes count into [`Self::micro_usdc`].
     pub lanes: u64,
@@ -588,7 +589,8 @@ pub struct PendingRedeem {
     /// When the redeemer's next sweep is due, Unix seconds: the earlier of
     /// its next interval tick and the next serve cutoff. `None` until the
     /// redeemer has published a schedule, which it does when its first
-    /// interval starts and again after every sweep.
+    /// interval starts, after every sweep, and whenever a hinted lane moves
+    /// the next serve cutoff.
     pub next_sweep_at_unix: Option<u64>,
 }
 

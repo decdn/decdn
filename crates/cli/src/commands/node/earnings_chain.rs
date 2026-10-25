@@ -263,12 +263,12 @@ async fn scan_rows<P: Provider>(
         settled_scan_progress(),
     )
     .await
-    .context("scanning FeeRouter.Settled")?;
+    .with_context(|| scan_failed("FeeRouter.Settled", span))?;
     let shares_logs = scan_logs(provider, &shares_filter(router), from, to, span, |event| {
         shares_scan_progress(&event);
     })
     .await
-    .context("scanning FeeRouter.SharesUpdated")?;
+    .with_context(|| scan_failed("FeeRouter.SharesUpdated", span))?;
     let fee_router = FeeRouter::new(router, provider);
     // Read at `to`, the block the scan ends at: a retune landing while the
     // scan runs is after every row and must not price them.
@@ -320,32 +320,48 @@ fn settled_scan_progress() -> impl FnMut(ScanEvent) {
                 eprintln!("  scanned to block {end}/{to}");
             }
         }
-        ScanEvent::Retry {
-            start,
-            end,
-            attempt,
-            delay,
-            error,
-        } => {
-            let secs = delay.as_secs();
-            eprintln!(
-                "  window {start}..={end} failed ({error}); \
-                 retry {attempt}/{SCAN_WINDOW_RETRIES} in {secs}s"
-            );
-        }
+        ScanEvent::Retry { .. } => print_retry(&event),
     }
+}
+
+/// The context on a scan that gave up: which event, the window span in force
+/// and the two levers. The inner error names the last scanned block. A
+/// provider that refuses a wide window with wording the range-rejection test
+/// does not know is retried like a transient fault and then fails here, so
+/// the span is the first thing to try; `--from-block` resumes, but the table
+/// then covers only the blocks from there.
+fn scan_failed(event: &str, span: NonZeroU64) -> String {
+    format!(
+        "scanning {event} (windows of {span} blocks); if the provider caps eth_getLogs \
+         windows, lower blockchain.get_logs_max_block_span in the config file; \
+         --from-block <last scanned + 1> resumes, but covers only the rest"
+    )
 }
 
 /// Progress lines for the `SharesUpdated` scan: its retries only.
 fn shares_scan_progress(event: &ScanEvent) {
+    if let ScanEvent::Retry { .. } = event {
+        print_retry(event);
+    }
+}
+
+/// The stderr line for a retried window: which window, why it failed, which
+/// retry this is and how long the pause before it is, so a user watching a
+/// stalled scan knows what the provider said.
+fn print_retry(event: &ScanEvent) {
     if let ScanEvent::Retry {
         start,
         end,
         attempt,
-        ..
+        delay,
+        error,
     } = event
     {
-        eprintln!("  window {start}..={end} failed; retry {attempt}");
+        let secs = delay.as_secs();
+        eprintln!(
+            "  window {start}..={end} failed ({error}); \
+             retry {attempt}/{SCAN_WINDOW_RETRIES} in {secs}s"
+        );
     }
 }
 

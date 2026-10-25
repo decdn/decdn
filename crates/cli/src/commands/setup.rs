@@ -466,8 +466,10 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     emit_readiness(json, &readiness, &args.region, multiaddr_count);
     // What the node has earned so far (#2598), when a daemon is up to answer
     // within a short deadline: a re-run of `setup` on a working node closes
-    // with the figure. No daemon within the deadline prints nothing; a daemon
-    // with an empty ledger prints a zero figure.
+    // with the figure. No daemon listening prints nothing; a daemon with an
+    // empty ledger prints a zero figure; a daemon that answers with an error,
+    // does not answer in time, or an admin address that does not resolve
+    // prints the reason.
     let earnings = node::earned_so_far(config_path, EARNINGS_TIMEOUT).await;
     if json {
         let mut summary = summary(Some(&readiness));
@@ -494,7 +496,9 @@ fn attach_earnings(
 ) {
     if let serde_json::Value::Object(map) = summary {
         let value = match earnings {
-            Ok(Some(resp)) => serde_json::to_value(resp).unwrap_or(serde_json::Value::Null),
+            Ok(Some(resp)) => serde_json::to_value(resp).unwrap_or_else(
+                |err| serde_json::json!({ "error": format!("failed to encode earnings: {err}") }),
+            ),
             Ok(None) => serde_json::Value::Null,
             Err(reason) => serde_json::json!({ "error": reason }),
         };

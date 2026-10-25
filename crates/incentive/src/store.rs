@@ -516,9 +516,11 @@ impl SettlementRecord {
 /// the `PoolRedeemed` watcher for a transaction whose receipt it missed (a
 /// receipt wait that timed out, or a landing across a restart), so a row may
 /// be written twice; [`record_settlement`](Self::record_settlement) is
-/// idempotent on the row key. A transaction hash appears in at most one row;
-/// a reorg that moves a landed `redeemMany` to another position is not
-/// reconciled, because the ledger is observability, not a claim. Nothing ever
+/// idempotent on the row key. The key is the `Settled` log's `(block_number,
+/// log_index)`, so absent a reorg a transaction hash appears in one row; a
+/// reorg that moves a landed `redeemMany` to another position is not
+/// reconciled and can leave two rows for one hash, because the ledger is
+/// observability, not a claim. Nothing ever
 /// removes a row except a repoint to another `PaymentPool` deployment, which
 /// drops the whole ledger with the other seller tables. A disk-backed
 /// implementation commits durably before returning `Ok`.

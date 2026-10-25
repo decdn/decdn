@@ -27,6 +27,29 @@ fn every_known_chain_manifest_parses_and_matches() {
     }
 }
 
+/// `l2_start_block` is an L2 height and the manifest's `deployBlock` is the
+/// L1 height the deploy script saw; on Arbitrum the L2 number is the larger
+/// by far. A redeploy that copies the manifest's number into the registry
+/// would start every `--address` scan hundreds of millions of blocks early.
+#[test]
+fn l2_start_block_is_above_the_manifests_l1_deploy_block() {
+    for chain in KNOWN_CHAINS {
+        let manifest: serde_json::Value =
+            serde_json::from_str(chain.manifest_json).expect("manifest parses");
+        let deploy_block = manifest
+            .get("deployBlock")
+            .and_then(serde_json::Value::as_u64)
+            .expect("manifest carries deployBlock");
+        assert!(
+            chain.l2_start_block > deploy_block,
+            "{}: l2_start_block {} must be the L2 height, above the manifest's L1 deployBlock {}",
+            chain.name,
+            chain.l2_start_block,
+            deploy_block
+        );
+    }
+}
+
 #[test]
 fn resolve_none_selector_yields_blank_template() {
     assert!(resolve(Some("none")).unwrap().is_none());

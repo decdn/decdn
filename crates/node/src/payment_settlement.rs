@@ -87,7 +87,7 @@ use decdn_incentive::{
     CheckpointKey, KeyedCheckpointStore, LaneKey, LaneState, PoolId, PoolStateStore,
     SettlementLedger, StoreError,
 };
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{Instrument as _, debug, error, info, warn};
 
@@ -99,7 +99,7 @@ use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
 use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
-use crate::settlement_ledger::SettlementRecorder;
+use crate::settlement_ledger::{LedgerBackfills, SettlementRecorder};
 use decdn_incentive::payment_pool::SignerAuthorization;
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint only
@@ -293,8 +293,9 @@ pub(crate) fn unix_now() -> u64 {
 /// The redeemer's sweep schedule, published for `admin_v1_earnings` (#2598):
 /// when the last sweep ran and when the next is due. One shared cell, cloned
 /// into the redeemer task and the admin surface. The redeemer publishes after
-/// its skipped first tick and after every sweep; a hint-driven single-lane
-/// redemption is not a sweep and leaves it alone.
+/// its skipped first tick, after every sweep, and after a hint-driven
+/// single-lane redemption moves the next serve cutoff; only a sweep sets
+/// `swept_at`.
 #[derive(Clone, Debug, Default)]
 pub struct RedeemSchedule {
     inner: Arc<Mutex<ScheduleState>>,
@@ -436,6 +437,9 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     /// Writes the settlement ledger row for every `redeemMany` that lands
     /// (#2598); shared with the redeemer task and the `PoolRedeemed` sink.
     recorder: SettlementRecorder,
+    /// The ledger backfills the `PoolRedeemed` sink has started; shutdown
+    /// drains them so a stop mid-catch-up does not lose their rows.
+    backfills: LedgerBackfills,
     /// The redeemer's published sweep schedule, read by `admin_v1_earnings`.
     schedule: RedeemSchedule,
     /// The redemption task handle. Held so shutdown can abort+await it before a
@@ -515,6 +519,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         // first-ever boot (cold store) anchors at head. `PoolRedeemed` is the
         // single write path for the paid side, so a drained-pool partial pay is
         // recorded exactly — the node never assumes its voucher cleared.
+        let backfills = LedgerBackfills::new(recorder.clone());
         let sink = PoolSettlementSink {
             self_address,
             store: Arc::clone(&store),
@@ -523,9 +528,8 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             redeem_tx: redeem_tx.clone(),
             metrics: Arc::clone(&metrics),
             pool_view: pool_view.clone(),
-            recorder: recorder.clone(),
             contract: contract.clone(),
-            backfill_permits: Arc::new(Semaphore::new(LEDGER_BACKFILL_CONCURRENCY)),
+            backfills: backfills.clone(),
         };
         let route = Route {
             addresses: vec![payment_pool_addr],
@@ -582,6 +586,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 metrics,
                 pool_view,
                 recorder,
+                backfills,
                 schedule,
                 redeemer: std::sync::Mutex::new(Some(redeemer)),
             },
@@ -605,9 +610,12 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         self.redeem_tx.clone()
     }
 
-    /// Graceful shutdown: quiesce the redeemer, then run one final best-effort
+    /// Graceful shutdown: quiesce the redeemer, run one final best-effort
     /// redeem sweep bounded by `deadline` so a lane whose chunk has cleared the
-    /// floor is not left un-redeemed across the stop. A pool is owner-closed only,
+    /// floor is not left un-redeemed across the stop, then wait out the ledger
+    /// backfills still in flight within what is left of `deadline`, so the
+    /// rows the poller's checkpoint has already moved past are not lost with
+    /// the process. One `deadline` bounds both. A pool is owner-closed only,
     /// so there is nothing to close here — only redeem.
     ///
     /// The paid-watermark watcher is now the shared multiplexed poller's route,
@@ -619,6 +627,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     /// checkpoint is independent of the lane-state redeem sweep and idempotent to
     /// re-scan, so the two can race without a correctness impact.
     pub async fn shutdown(&self, deadline: Duration) {
+        let started = tokio::time::Instant::now();
         self.quiesce_redeemer().await;
         if tokio::time::timeout(deadline, self.final_redeem_sweep())
             .await
@@ -629,6 +638,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 "shutdown redeem deadline elapsed; some lanes left un-redeemed (redeem later)"
             );
         }
+        self.backfills
+            .drain(deadline.saturating_sub(started.elapsed()))
+            .await;
     }
 
     /// One last pass of `redeemMany` chunks over every lane whose chunk clears the
@@ -792,22 +804,14 @@ struct PoolSettlementSink<P: Provider + Clone> {
     /// (drop) into the projection so a serve request reads `{owner, remaining}`
     /// in-memory rather than through a `getPool` `eth_call`.
     pool_view: PoolProjection,
-    /// Backfills a settlement ledger row (#2598) for an own-provider
-    /// `PoolRedeemed` whose `redeemMany` the redeemer never saw land.
-    recorder: SettlementRecorder,
     /// The `PaymentPool` instance; the backfill's receipt and header reads
     /// ride its provider.
     contract: PaymentPool::PaymentPoolInstance<P>,
-    /// Bounds the backfills in flight at once. A backfill is two RPC reads
-    /// that can each wait out the call timeout, and the poller applies logs
-    /// to every route in turn, so it runs off the poller's task.
-    backfill_permits: Arc<Semaphore>,
+    /// Backfills a settlement ledger row (#2598) for an own-provider
+    /// `PoolRedeemed` whose `redeemMany` the redeemer never saw land, each on
+    /// its own task; the service drains them at shutdown.
+    backfills: LedgerBackfills,
 }
-
-/// How many settlement ledger backfills may run at once. A resume after a long
-/// outage replays every own-provider `PoolRedeemed` of the gap; this keeps
-/// that from fanning out into as many concurrent receipt reads.
-const LEDGER_BACKFILL_CONCURRENCY: usize = 4;
 
 impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
     #[allow(clippy::cognitive_complexity)]
@@ -953,23 +957,14 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
     /// Ledger backfill (#2598) for an own-provider `PoolRedeemed`: a row for a
     /// landing the redeemer never saw (a receipt wait that timed out, or a
     /// landing across a restart). A transaction already in the ledger costs
-    /// one ledger read and no RPC.
-    /// The backfill runs on its own task: the poller awaits every route's sink
-    /// in turn, and a receipt or header read that waits out its timeout must
-    /// not hold up the paid watermarks, the blacklist or the slash watcher.
-    /// `backfill_permits` bounds how many run at once; the recorder's
-    /// own-block guard makes a repeat harmless.
+    /// one ledger read and no RPC. The backfill runs on its own task
+    /// ([`LedgerBackfills`]): the poller awaits every route's sink in turn,
+    /// and a receipt or header read that waits out its timeout must not hold
+    /// up the paid watermarks, the blacklist or the slash watcher.
     fn backfill_ledger(&self, log: &Log, pool_id: PoolId) {
         if let (Some(tx), Some(block)) = (log.transaction_hash, log.block_number) {
-            let recorder = self.recorder.clone();
-            let provider = self.contract.provider().clone();
-            let permits = Arc::clone(&self.backfill_permits);
-            tokio::spawn(async move {
-                let Ok(_permit) = permits.acquire_owned().await else {
-                    return;
-                };
-                recorder.backfill(&provider, block, tx).await;
-            });
+            self.backfills
+                .spawn(self.contract.provider().clone(), block, tx);
         } else {
             warn!(
                 %pool_id,

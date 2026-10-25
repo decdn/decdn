@@ -566,9 +566,11 @@ pub async fn status(args: &cli::StatusArgs, global_config: Option<&Path>) -> any
         // and the line names why the figures are missing. `--json` stays the
         // raw `StatusResponse`; `node earnings --json` has the figures.
         let earnings = client.earnings(EarningsRequest::default()).await;
-        let line = match &earnings {
-            Ok(resp) => EarningsLine::Available(resp),
-            Err(err) => EarningsLine::Unavailable(first_line(&err.to_string())),
+        let line = match earnings {
+            Ok(ref resp) => EarningsLine::Available(resp),
+            Err(err) => {
+                EarningsLine::Unavailable(earnings_unavailable_reason(&url, args.timeout_ms, err))
+            }
         };
         let mut stdout = io::stdout().lock();
         write_status(&mut stdout, &parsed, &line, wall_clock_us())
@@ -624,31 +626,42 @@ pub async fn earnings(
 
 /// `decdn setup`'s closing read (#2598): the running node's earnings.
 /// `Ok(Some)` when a daemon answered `admin_v1_earnings` within `timeout`;
-/// `Ok(None)` when none did (no daemon, no config, a connection refused or
-/// timed out), which `setup` passes over in silence; `Err(reason)` when a
-/// daemon answered with an error (no ledger wired, a ledger that does not
-/// decode), which `setup` prints, because an operator re-running it on a
-/// working node must hear that. The admin URL resolves from
-/// `DECDN_ADMIN_PORT`, else the config file's `observability.admin_port`,
-/// else the default port; `DECDN_ADMIN_URL` is not read here.
+/// `Ok(None)` only when no daemon is listening (the connection is refused),
+/// which `setup` passes over in silence; `Err(reason)` for everything else a
+/// daemon or its address can say (an answer carrying an error, a timeout, a
+/// response that does not decode, an admin URL that does not resolve), which
+/// `setup` prints, because an operator re-running it on a working node must
+/// hear that. The admin URL resolves from `DECDN_ADMIN_PORT`, else the config
+/// file's `observability.admin_port`, else the default port; `DECDN_ADMIN_URL`
+/// is not read here.
 pub(crate) async fn earned_so_far(
     config_path: Option<&Path>,
     timeout: Duration,
 ) -> Result<Option<EarningsResponse>, String> {
-    let Ok(url) = resolve_admin_url(None, config_path) else {
-        return Ok(None);
-    };
-    let Ok(client) = HttpClientBuilder::default()
+    let url = resolve_admin_url(None, config_path).map_err(|err| first_line(&err.to_string()))?;
+    let client = HttpClientBuilder::default()
         .request_timeout(timeout)
         .build(&url)
-    else {
-        return Ok(None);
-    };
+        .map_err(|err| format!("failed to build admin JSON-RPC client for {url}: {err}"))?;
     match client.earnings(EarningsRequest::default()).await {
         Ok(resp) => Ok(Some(resp)),
-        Err(JsonRpcClientError::Call(err)) => Err(first_line(&err.to_string())),
-        Err(_) => Ok(None),
+        Err(JsonRpcClientError::Transport(inner)) if is_connection_refused(inner.as_ref()) => {
+            Ok(None)
+        }
+        Err(err) => Err(earnings_unavailable_reason(
+            &url,
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            err,
+        )),
     }
+}
+
+/// The reason `node status` and `setup` give for a missing earnings figure:
+/// the first line of [`classify_client_error`], so a daemon's JSON-RPC error
+/// reads as its code and message (`JSON-RPC error -32010: settlement ledger
+/// load failed: …`), never as the error object's debug form.
+fn earnings_unavailable_reason(url: &str, timeout_ms: u64, err: JsonRpcClientError) -> String {
+    first_line(&classify_client_error(url, timeout_ms, err).to_string())
 }
 
 /// The `earned_so_far=` line `decdn setup` closes with: the whole-ledger net

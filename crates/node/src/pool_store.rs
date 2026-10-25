@@ -172,8 +172,8 @@ const PENDING_SETTLE_TABLE: TableDefinition<'_, &[u8; 32], u64> =
 const BUYER_PENDING_SETTLE_TABLE: TableDefinition<'_, &[u8; 32], u64> =
     TableDefinition::new("buyer_pending_settle_v1");
 
-/// redb table holding the settlement ledger (#2598): one row per landed
-/// `redeemMany`, decoded from its receipt and read by `admin_v1_earnings`.
+/// redb table holding the settlement ledger (#2598): one row per `redeemMany`
+/// that paid, decoded from its receipt and read by `admin_v1_earnings`.
 /// Lives in `settle.redb`.
 ///
 /// Key: `block_number (8 bytes, big-endian) ‖ log_index (8 bytes, big-endian)`
@@ -1058,14 +1058,13 @@ impl PersistentPoolStateStore {
     }
 }
 
-/// The value the deployment rebind forfeits for one dropped lane: the lane's
-/// full claim — [`LaneState::owed`], the signed cumulative plus the
-/// chain-verified frontier — minus its on-chain paid watermark, saturating.
-/// This is the figure the redeemer collects; counting `last_amount` alone
-/// would understate a lane by up to one whole chain, and a chain-extended
-/// redemption can leave `paid_cumulative` above `last_amount`.
+/// The value the deployment rebind forfeits for one dropped lane:
+/// [`LaneState::unredeemed`], the lane's full claim (the signed cumulative
+/// plus the chain-verified frontier) minus its on-chain paid watermark.
+/// Counting `last_amount` alone would understate a lane by up to one whole
+/// chain.
 fn forfeited_value(state: &LaneState) -> U256 {
-    state.owed().saturating_sub(state.paid_cumulative)
+    state.unredeemed()
 }
 
 /// Decode one stored record (table value) into a [`LaneState`], given its table

@@ -1003,10 +1003,12 @@ table is not in this binary's layout. The redeemer keeps landing redemptions
 and the watcher keeps its paid watermarks; only the earnings figures are
 affected, and the watcher's ledger backfill skips that block. The ledger shares
 `settle.redb` with both pending-settle sets, so do not move the file aside
-while a pool this node closed awaits its grace window (`decdn node pools` and
-the `decdn_pending_settle_*` metrics show them). Once none does, stop the node,
-move `settle.redb` aside and restart: the earnings history starts over, and
-`decdn node earnings --address` still has the chain's record.
+while a pool this node closed awaits its grace window. Nothing lists the
+pending-settle sets: `decdn_pool_grace_closes_total` counts the closes this
+node holds unredeemed value on, so wait until the dispute deadline of the last
+one has passed. Then stop the node, move `settle.redb` aside and restart: the
+earnings history starts over, and `decdn node earnings --address` still has
+the chain's record.
 
 **Before repointing:**
 

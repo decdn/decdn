@@ -17,7 +17,12 @@
 //! receipt in hand when its `redeemMany` lands, and the `PoolRedeemed` watcher,
 //! which backfills a row for a transaction the redeemer never saw land (a
 //! receipt wait that timed out, or a landing across a restart). Rows key on
-//! `(block_number, log_index)`, so the two writers never duplicate a row.
+//! `(block_number, log_index)`, so the two writers never duplicate a row. The
+//! backfills run on their own tasks ([`LedgerBackfills`]); the settlement
+//! service drains them at shutdown, because the watcher's checkpoint moves
+//! past a `PoolRedeemed` as soon as its backfill starts. Only a crash during a
+//! catch-up can lose a backfilled row; `decdn node earnings --address` still
+//! has the chain's record.
 //!
 //! The ledger is observability, not a claim: every failure here is logged,
 //! counted (`decdn_settlement_ledger_write_failures_total`,
@@ -165,19 +170,22 @@ pub fn settlement_from_receipt(
     }))
 }
 
-/// How many times [`landed_at`] retries a failed header read before it gives
-/// up, and the pause before each retry.
+/// How many times a backfill retries a failed header read before it gives up,
+/// and the pause before each retry. The redeemer's own path makes one attempt:
+/// its fallback is the wall clock, seconds from the landing, and each retry
+/// would hold the sweep for the call timeout before its next chunk.
 const HEADER_READ_RETRIES: u32 = 2;
 const HEADER_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// The timestamp of `block`, Unix seconds: the one the receipt's logs carry
 /// when the RPC fills it in, else one `eth_getBlockByNumber`, retried
-/// [`HEADER_READ_RETRIES`] times. `None` when every read fails; the caller
-/// decides between the wall clock and no row.
+/// `retries` times. `None` when every read fails; the caller decides between
+/// the wall clock and no row.
 pub(crate) async fn landed_at<P: Provider>(
     provider: &P,
     receipt: &TransactionReceipt,
     block: u64,
+    retries: u32,
 ) -> Option<u64> {
     if let Some(timestamp) = receipt
         .inner
@@ -187,7 +195,7 @@ pub(crate) async fn landed_at<P: Provider>(
     {
         return Some(timestamp);
     }
-    for attempt in 0..=HEADER_READ_RETRIES {
+    for attempt in 0..=retries {
         if attempt > 0 {
             tokio::time::sleep(HEADER_READ_RETRY_DELAY).await;
         }
@@ -398,7 +406,11 @@ impl SettlementRecorder {
         block: u64,
         fallback: TimeFallback,
     ) -> Option<u64> {
-        if let Some(at) = landed_at(provider, receipt, block).await {
+        let retries = match fallback {
+            TimeFallback::WallClock => 0,
+            TimeFallback::Skip => HEADER_READ_RETRIES,
+        };
+        if let Some(at) = landed_at(provider, receipt, block, retries).await {
             return Some(at);
         }
         let tx = receipt.transaction_hash;
@@ -470,6 +482,176 @@ impl SettlementRecorder {
                 );
                 self.metrics.settlement_ledger_write_failure();
             }
+        }
+    }
+}
+
+/// How many settlement ledger backfills may run at once. A resume after a long
+/// outage replays every own-provider `PoolRedeemed` of the gap; this keeps
+/// that from fanning out into as many concurrent receipt reads.
+pub const LEDGER_BACKFILL_CONCURRENCY: usize = 4;
+
+/// The ledger backfills in flight: one task per own-provider `PoolRedeemed`
+/// the watcher applies, each a [`SettlementRecorder::backfill`]. The watcher
+/// starts them and the settlement service drains them at shutdown, so a stop
+/// during a catch-up does not drop the rows the poller's checkpoint has
+/// already moved past. A clone shares the set.
+///
+/// A backfill runs off the poller's task: the poller applies every route's
+/// logs in turn, and a receipt or header read can wait out three attempts at
+/// the call timeout, so one slow read must not hold up the paid watermarks,
+/// the blacklist or the slash watcher. [`LEDGER_BACKFILL_CONCURRENCY`] bounds
+/// how many read at once; the rest wait on the permit. Each spawn reaps the
+/// tasks that have finished, so a panic inside one is logged and counted as a
+/// skipped row rather than lost with the handle. Once the drain has started,
+/// a spawn is refused, logged and counted: the poller can still be applying a
+/// window while the service shuts down, and a task started after the drain
+/// took the set would end with the process and no trace.
+#[derive(Clone)]
+pub struct LedgerBackfills {
+    recorder: SettlementRecorder,
+    permits: Arc<tokio::sync::Semaphore>,
+    /// A `std::sync::Mutex`: the guard is held to spawn, to reap and to take
+    /// the set for the drain, never across an `.await`.
+    state: Arc<std::sync::Mutex<BackfillSet>>,
+}
+
+/// The tasks in flight and whether the drain has begun, under one lock so a
+/// spawn cannot slip between the drain's flag and its take.
+#[derive(Default)]
+struct BackfillSet {
+    tasks: tokio::task::JoinSet<()>,
+    draining: bool,
+}
+
+impl std::fmt::Debug for LedgerBackfills {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LedgerBackfills")
+            .field("in_flight", &self.in_flight())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LedgerBackfills {
+    /// Backfills that write through `recorder`.
+    #[must_use]
+    pub fn new(recorder: SettlementRecorder) -> Self {
+        Self {
+            recorder,
+            permits: Arc::new(tokio::sync::Semaphore::new(LEDGER_BACKFILL_CONCURRENCY)),
+            state: Arc::default(),
+        }
+    }
+
+    /// Start a backfill of `tx_hash`, seen in `block_number`, on its own task.
+    /// Returns at once. The recorder's own-block guard makes a repeat of a
+    /// transaction already in the ledger cost one ledger read. After
+    /// [`Self::drain`] has started, no task starts: the miss is logged and
+    /// counted as a skipped row.
+    pub fn spawn<P: Provider + Clone + 'static>(
+        &self,
+        provider: P,
+        block_number: u64,
+        tx_hash: B256,
+    ) {
+        let recorder = self.recorder.clone();
+        let permits = Arc::clone(&self.permits);
+        let mut state = self.lock();
+        if state.draining {
+            drop(state);
+            warn!(
+                tx = %tx_hash,
+                block = block_number,
+                "settlement ledger backfills are draining for shutdown; no row for this \
+                 PoolRedeemed (`decdn node earnings --address` has the chain's record)"
+            );
+            self.recorder.metrics.settlement_ledger_skipped_row();
+            return;
+        }
+        Self::reap(&mut state.tasks, &self.recorder.metrics);
+        state.tasks.spawn(async move {
+            match permits.acquire_owned().await {
+                Ok(_permit) => recorder.backfill(&provider, block_number, tx_hash).await,
+                Err(_closed) => {
+                    warn!(
+                        tx = %tx_hash,
+                        block = block_number,
+                        "settlement ledger backfill permit unavailable; no row"
+                    );
+                    recorder.metrics.settlement_ledger_skipped_row();
+                }
+            }
+        });
+    }
+
+    /// Wait for every backfill in flight, up to `deadline`, and refuse every
+    /// spawn from here on. One still running at the deadline is aborted and
+    /// logged: its row, if the transaction has one, is left to `decdn node
+    /// earnings --address`.
+    pub async fn drain(&self, deadline: Duration) {
+        let mut tasks = {
+            let mut state = self.lock();
+            state.draining = true;
+            std::mem::take(&mut state.tasks)
+        };
+        let pending = tasks.len();
+        if pending == 0 {
+            return;
+        }
+        debug!(pending, "draining settlement ledger backfills");
+        let drained = tokio::time::timeout(deadline, async {
+            while let Some(joined) = tasks.join_next().await {
+                Self::observe(joined, &self.recorder.metrics);
+            }
+        })
+        .await;
+        if drained.is_err() {
+            let aborted = tasks.len();
+            tasks.abort_all();
+            warn!(
+                aborted,
+                deadline_secs = deadline.as_secs(),
+                "shutdown deadline elapsed with settlement ledger backfills still running; \
+                 their rows are missing from `decdn node earnings` (`--address` has the chain's record)"
+            );
+        }
+    }
+
+    /// How many backfills are in flight, finished tasks not yet reaped
+    /// included.
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.lock().tasks.len()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BackfillSet> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Take every finished task off the set, so it holds only the ones in
+    /// flight, and account for any that panicked.
+    fn reap(tasks: &mut tokio::task::JoinSet<()>, metrics: &Metrics) {
+        while let Some(joined) = tasks.try_join_next() {
+            Self::observe(joined, metrics);
+        }
+    }
+
+    /// A finished backfill task: a panic is a lost row, logged and counted;
+    /// an abort is the drain's own doing.
+    fn observe(joined: Result<(), tokio::task::JoinError>, metrics: &Metrics) {
+        match joined {
+            Ok(()) => {}
+            Err(err) if err.is_panic() => {
+                tracing::error!(
+                    error = %err,
+                    "settlement ledger backfill task panicked; its row is missing from \
+                     `decdn node earnings`"
+                );
+                metrics.settlement_ledger_skipped_row();
+            }
+            Err(err) => debug!(error = %err, "settlement ledger backfill task cancelled"),
         }
     }
 }

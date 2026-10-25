@@ -161,6 +161,18 @@ async fn block_at_or_after_binary_searches_the_headers() {
     assert_eq!(block_at_or_after(&provider, 135, 0, 7).await.unwrap(), 4);
 }
 
+/// A block whose time is exactly the target is the period's first block: the
+/// cutoff is inclusive, as the daemon's `landed_at_unix >= from` is.
+#[tokio::test]
+async fn block_at_or_after_takes_the_block_at_the_target_second() {
+    let asserter = Asserter::new();
+    for probe in [7u64, 3, 5, 4] {
+        asserter.push_success(&block(100 + 10 * probe));
+    }
+    let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+    assert_eq!(block_at_or_after(&provider, 140, 0, 7).await.unwrap(), 4);
+}
+
 #[tokio::test]
 async fn block_at_or_after_past_head_is_an_empty_period() {
     let asserter = Asserter::new();

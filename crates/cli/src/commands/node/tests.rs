@@ -1310,6 +1310,67 @@ mod earnings {
         assert_eq!(first_line("line one\nline two"), "line one");
     }
 
+    /// A daemon's JSON-RPC error reaches the status and setup lines as its
+    /// code and message, not as the error object's debug form, so the
+    /// runbook's `settlement ledger load failed: …` text is what the
+    /// operator greps for.
+    #[test]
+    fn a_daemon_error_renders_as_its_message_on_the_status_line() {
+        let err = JsonRpcClientError::Call(jsonrpsee::types::ErrorObjectOwned::owned(
+            -32_010,
+            "settlement ledger load failed: corrupt record at block 7 log 2",
+            None::<()>,
+        ));
+        let reason = earnings_unavailable_reason("http://127.0.0.1:9191", 2_000, err);
+        assert_eq!(
+            reason,
+            "admin at http://127.0.0.1:9191 returned JSON-RPC error -32010: \
+             settlement ledger load failed: corrupt record at block 7 log 2"
+        );
+        assert!(!reason.contains("ErrorObject"), "{reason}");
+        assert_eq!(
+            earnings_summary_line(&EarningsLine::Unavailable(reason.clone())),
+            format!("earnings=unavailable reason={reason:?}")
+        );
+        let timeout = earnings_unavailable_reason(
+            "http://127.0.0.1:9191",
+            2_000,
+            JsonRpcClientError::RequestTimeout,
+        );
+        assert!(
+            timeout.starts_with("admin at http://127.0.0.1:9191 did not respond within 2000ms"),
+            "{timeout}"
+        );
+    }
+
+    /// A daemon that accepts the connection and never answers is a reason on
+    /// the `earned_so_far` line, not silence; only a refused connection is
+    /// silent. The listener completes the handshake into its backlog and
+    /// nothing ever reads the request.
+    #[tokio::test]
+    async fn earned_so_far_reports_a_timeout_and_stays_silent_only_when_refused()
+    -> anyhow::Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("[observability]\nadmin_port = {port}\n"))?;
+        let reason = earned_so_far(Some(&path), Duration::from_millis(200))
+            .await
+            .expect_err("a daemon that does not answer is reported");
+        assert!(
+            reason.starts_with(&format!(
+                "admin at http://127.0.0.1:{port} did not respond within 200ms"
+            )),
+            "{reason}"
+        );
+        // Nothing listens on the port once the listener is gone.
+        drop(listener);
+        let silent = earned_so_far(Some(&path), Duration::from_millis(200)).await;
+        assert!(matches!(silent, Ok(None)), "{silent:?}");
+        Ok(())
+    }
+
     #[test]
     fn write_status_carries_the_earnings_line() -> anyhow::Result<()> {
         let status = mk_status(Some(1_000_000));

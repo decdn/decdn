@@ -280,18 +280,27 @@ mod recorder {
         assert_eq!(rows.first().map(|r| r.landed_at_unix), Some(1_700_000_999));
     }
 
+    /// The redeemer's path makes one header attempt and stamps the wall clock:
+    /// a retry would hold the sweep for the call timeout before its next chunk,
+    /// for a fallback that is seconds from the landing anyway.
     #[tokio::test(start_paused = true)]
     async fn a_failed_header_read_falls_back_to_the_wall_clock_on_the_redeemer_path() {
         let asserter = Asserter::new();
-        for _ in 0..=HEADER_READ_RETRIES {
-            asserter.push_failure_msg("internal error");
-        }
+        // One failure queued: a retry would hit the empty queue and still
+        // fall back, so the elapsed time is what proves there was none.
+        asserter.push_failure_msg("internal error");
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let ledger = Arc::new(MemorySettlementLedger::default());
         let before = unix_now();
+        let started = tokio::time::Instant::now();
         recorder(ledger.clone())
             .record_landed(&provider, &landed_receipt())
             .await;
+        assert!(
+            started.elapsed() < HEADER_READ_RETRY_DELAY,
+            "no retry pause on the redeemer path: {:?}",
+            started.elapsed()
+        );
         let rows = ledger.load_settlements().expect("ledger");
         assert!(rows.first().is_some_and(|row| row.landed_at_unix >= before));
     }
@@ -323,9 +332,10 @@ mod recorder {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let ledger = Arc::new(MemorySettlementLedger::default());
         let rec = recorder(ledger.clone());
-        // No logs at all, as a re-sent batch at its watermark produces, and
-        // nothing queued on the provider: a header read would fail loudly, and
-        // on a real RPC it could stall the redeemer for the call timeout.
+        // No logs at all, as a re-sent batch at its watermark produces. The
+        // empty ledger is the proof: a header read here would fall back to the
+        // wall clock and write a row. (The `payment_settlement` sibling parks
+        // the header read to prove it is never sent.)
         let quiet = receipt(Some(900), vec![]);
         rec.record_landed(&provider, &quiet).await;
         assert!(ledger.load_settlements().expect("ledger").is_empty());
@@ -413,5 +423,136 @@ mod recorder {
             counter(&rec.metrics, "decdn_settlement_ledger_skipped_rows"),
             1
         );
+    }
+
+    mod backfills {
+        use decdn_incentive::test_rpc::ScriptedRpc;
+
+        use super::*;
+
+        /// A receipt read that never answers does not hold the caller: the
+        /// spawn returns at once, and the backfill runs out its three
+        /// attempts at the call timeout on its own task, where the miss is
+        /// counted.
+        #[tokio::test(start_paused = true)]
+        async fn a_backfill_runs_off_the_caller_and_its_miss_is_counted() {
+            let ledger = Arc::new(MemorySettlementLedger::default());
+            let rec = recorder(ledger.clone());
+            let backfills = LedgerBackfills::new(rec.clone());
+            // Every unscripted read on this transport parks forever.
+            let provider = ScriptedRpc::parked_receipt().provider();
+            let started = tokio::time::Instant::now();
+            backfills.spawn(provider, 900, B256::repeat_byte(0x55));
+            assert_eq!(backfills.in_flight(), 1);
+            // Three attempts at the call timeout plus the pauses between them;
+            // the paused clock skips ahead whenever every task is parked, and
+            // the drain returns the moment the task gives up.
+            backfills.drain(Duration::from_secs(60)).await;
+            assert_eq!(
+                started.elapsed(),
+                3 * crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT + 2 * HEADER_READ_RETRY_DELAY,
+                "three receipt attempts at the call timeout, two pauses between them"
+            );
+            assert_eq!(
+                counter(&rec.metrics, "decdn_settlement_ledger_skipped_rows"),
+                1,
+                "the backfill ran to its miss on its own task"
+            );
+            assert!(ledger.load_settlements().expect("ledger").is_empty());
+        }
+
+        /// Shutdown waits for a backfill that has not run yet: the row it
+        /// writes is in the ledger when `drain` returns.
+        #[tokio::test]
+        async fn drain_waits_for_a_backfill_in_flight() {
+            let asserter = Asserter::new();
+            asserter.push_success(&landed_receipt());
+            asserter.push_success(&block(1_700_000_500));
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let ledger = Arc::new(MemorySettlementLedger::default());
+            let backfills = LedgerBackfills::new(recorder(ledger.clone()));
+            backfills.spawn(provider, 900, landed_receipt().transaction_hash);
+            // The task has not been polled yet: nothing is written before the
+            // drain yields to it.
+            assert!(ledger.load_settlements().expect("ledger").is_empty());
+            backfills.drain(Duration::from_secs(5)).await;
+            assert_eq!(ledger.load_settlements().expect("ledger").len(), 1);
+            assert_eq!(backfills.in_flight(), 0);
+        }
+
+        /// A backfill still parked at the deadline is aborted, not waited on
+        /// past it, and the set is empty afterwards.
+        #[tokio::test(start_paused = true)]
+        async fn drain_aborts_what_outlives_the_deadline() {
+            let ledger = Arc::new(MemorySettlementLedger::default());
+            let backfills = LedgerBackfills::new(recorder(ledger.clone()));
+            backfills.spawn(
+                ScriptedRpc::parked_receipt().provider(),
+                900,
+                B256::repeat_byte(0x55),
+            );
+            let started = tokio::time::Instant::now();
+            backfills.drain(Duration::from_secs(1)).await;
+            assert_eq!(started.elapsed(), Duration::from_secs(1));
+            assert_eq!(backfills.in_flight(), 0);
+            // A drain after the abort has nothing to wait for.
+            backfills.drain(Duration::from_secs(1)).await;
+            assert_eq!(started.elapsed(), Duration::from_secs(1));
+        }
+
+        /// A spawn after the drain has begun starts no task: the poller can
+        /// still be applying a window while the service shuts down, and a
+        /// task started then would end with the process. The miss is counted.
+        #[tokio::test]
+        async fn a_spawn_after_the_drain_is_refused_and_counted() {
+            // Nothing queued: a receipt read would fail loudly.
+            let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+            let ledger = Arc::new(MemorySettlementLedger::default());
+            let rec = recorder(ledger.clone());
+            let backfills = LedgerBackfills::new(rec.clone());
+            backfills.drain(Duration::from_secs(1)).await;
+            backfills.spawn(provider, 900, B256::repeat_byte(0x55));
+            assert_eq!(backfills.in_flight(), 0, "no task started");
+            tokio::task::yield_now().await;
+            assert_eq!(
+                counter(&rec.metrics, "decdn_settlement_ledger_skipped_rows"),
+                1
+            );
+        }
+
+        /// A spawn reaps the finished tasks, so the set holds only the ones
+        /// in flight.
+        #[tokio::test]
+        async fn a_spawn_reaps_the_finished_tasks() {
+            let asserter = Asserter::new();
+            asserter.push_success(&landed_receipt());
+            asserter.push_success(&block(1_700_000_500));
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let ledger = Arc::new(MemorySettlementLedger::default());
+            let backfills = LedgerBackfills::new(recorder(ledger.clone()));
+            let tx = landed_receipt().transaction_hash;
+            backfills.spawn(provider.clone(), 900, tx);
+            // Wait for the task, not only the row: the row is visible once the
+            // blocking write returns, a moment before the task's final poll
+            // hands its permit back and joins the set. The row first, because
+            // it proves the permit was taken; the permit's return then proves
+            // the final poll ran.
+            let finished = tokio::time::timeout(Duration::from_secs(5), async {
+                while ledger.load_settlements().expect("ledger").is_empty() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                while backfills.permits.available_permits() < LEDGER_BACKFILL_CONCURRENCY {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            assert!(finished.is_ok(), "the first backfill finishes");
+            // A second spawn of the same tx costs one ledger read and no RPC
+            // (nothing is queued), and reaps the first task.
+            backfills.spawn(provider, 900, tx);
+            assert_eq!(backfills.in_flight(), 1, "only the new task is held");
+            backfills.drain(Duration::from_secs(5)).await;
+            assert_eq!(backfills.in_flight(), 0);
+        }
     }
 }
