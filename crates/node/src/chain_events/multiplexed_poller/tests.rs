@@ -1634,7 +1634,7 @@ async fn a_mid_backfill_rejection_retries_from_the_rejected_window() {
 /// `decdn_chain_get_logs_range_rejections_total`.
 #[tokio::test]
 async fn span_hooks_report_the_shrink_and_the_regrow() {
-    use crate::chain_events::backfill::SPAN_REGROW_AFTER_WINDOWS;
+    use decdn_incentive::log_scan::SPAN_REGROW_AFTER_WINDOWS;
     let asserter = alloy::providers::mock::Asserter::new();
     let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
     let (route, _sink, _store) = checkpoint_route(1);

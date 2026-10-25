@@ -423,6 +423,13 @@ pub struct LaneSnapshot {
     /// frontier, so the signed amount alone understates the claim by up to
     /// one chain. `0` before any voucher.
     pub outstanding_micro_usdc: u64,
+    /// The part of [`Self::outstanding_micro_usdc`] no landed redemption has
+    /// paid yet, in micro-USDC: `owed − paid_cumulative`, where the paid
+    /// watermark is the `newPaidCumulative` of the last `PoolRedeemed` the
+    /// node observed for the lane. Unlike the outstanding figure it falls to
+    /// `0` after a redeem. This is the per-lane term of `admin_v1_earnings`'s
+    /// pending total (#2598). Saturating.
+    pub unredeemed_micro_usdc: u64,
     /// Not tracked in the shared-pool model (the pool's deposit is shared
     /// across every lane it funds, so no single lane owns a deposit), so
     /// this always reports `0`.
@@ -464,6 +471,127 @@ pub struct LanesResponse {
     /// the bar each [`LaneSnapshot::settlement_eligible`] is measured
     /// against without the operator cross-referencing the config.
     pub redeem_threshold_micro_usdc: u64,
+}
+
+/// Request body for `admin_v1_earnings` (#2598).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EarningsRequest {
+    /// Start of one extra period, in Unix seconds. The response then fills
+    /// [`EarningsResponse::since`] with every settlement landed at or after
+    /// this time. `None` asks for the three standard periods only.
+    pub since_unix: Option<u64>,
+}
+
+/// Response body for `admin_v1_earnings` (#2598): what this node has been
+/// paid, per period, and what it is still owed. Shared between the server,
+/// `decdn node earnings` (which also builds it from the chain alone in
+/// `--address` mode) and the integration tests.
+///
+/// Every USDC figure is in micro-USDC (`u64`), the unit the `PaymentPool`
+/// counters use. The settled figures come from the node's settlement ledger:
+/// one row per landed `redeemMany`, decoded from its receipt. The ledger is
+/// forward-only, so the figures start at [`Self::ledger_since_unix`], not at
+/// the node's first ever redemption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EarningsResponse {
+    /// The operator address the figures belong to, EIP-55 checksummed with a
+    /// `0x` prefix (`alloy`'s `Address` `Display`). `None` when the node
+    /// started without a seller wallet.
+    pub operator_address: Option<String>,
+    /// The time of the earliest settlement the figures cover. On the daemon
+    /// this is the `landed_at_unix` of the earliest ledger row for this
+    /// operator (a row from before an Ethereum key rotation is not counted),
+    /// `None` while the ledger holds none. Built from the chain (`decdn node earnings
+    /// --address`) it is the block time of the earliest `Settled` found from
+    /// the scan's first block, `None` when the scan found none.
+    pub ledger_since_unix: Option<u64>,
+    /// The 24 hours before the request.
+    pub last_24h: EarningsPeriod,
+    /// The 7 days before the request.
+    pub last_7d: EarningsPeriod,
+    /// Every settlement the figures cover. Its `from_unix` is
+    /// [`Self::ledger_since_unix`], or `0` when there is none.
+    pub since_ledger_start: EarningsPeriod,
+    /// The period [`EarningsRequest::since_unix`] asked for; `None` when the
+    /// request asked for none.
+    pub since: Option<EarningsPeriod>,
+    /// The most recent settlement in chain order, or `None` on an empty
+    /// ledger.
+    pub last_settlement: Option<LastSettlement>,
+    /// What the node is owed but has not redeemed yet. `None` when the
+    /// figures were built from the chain alone (`decdn node earnings
+    /// --address`), which sees no lane state.
+    pub pending: Option<PendingRedeem>,
+}
+
+/// The settlements landed in one period, summed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EarningsPeriod {
+    /// The period's inclusive start, Unix seconds. Its end is the request.
+    /// The figures cover only settlements the ledger holds, so a start before
+    /// [`EarningsResponse::ledger_since_unix`] sums a shorter span than it
+    /// names; the CLI says so in the row label.
+    pub from_unix: u64,
+    /// Micro-USDC the operator actually received: the sum of the USDC
+    /// transfers from the `FeeRouter` to the operator, one per settlement.
+    pub net_micro_usdc: u64,
+    /// Micro-USDC routed before the fee split: the sum of
+    /// `FeeRouter.Settled.amount`. `net` is `gross` minus the buyback and
+    /// treasury buckets.
+    pub gross_micro_usdc: u64,
+    /// Bytes the settlements paid for: the sum of
+    /// `FeeRouter.Settled.bytesDelivered`. Bytes served but not yet redeemed
+    /// are not in this figure.
+    pub bytes_settled: u64,
+    /// How many `redeemMany` transactions landed in the period.
+    pub settlements: u64,
+}
+
+/// The most recent settlement in the ledger, in chain order
+/// (`block_number`, then log index), never by wall clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastSettlement {
+    /// When it landed, Unix seconds: the block's timestamp. On the daemon, the
+    /// wall clock at the time of the write when the header could not be read
+    /// (the node logs that).
+    pub at_unix: u64,
+    /// The `redeemMany` transaction, `0x`-prefixed lowercase hex.
+    pub tx_hash: String,
+    /// The block it landed in.
+    pub block_number: u64,
+    /// Micro-USDC the operator received from it.
+    pub net_micro_usdc: u64,
+}
+
+/// What the node is owed but has not redeemed yet, split into what the next
+/// sweep can redeem and what no sweep will.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRedeem {
+    /// Micro-USDC the redeemer can still cash: the sum of
+    /// [`LaneSnapshot::unredeemed_micro_usdc`] over the lanes this operator
+    /// provides whose capability has not expired. The redeemer also skips a
+    /// lane whose pool cannot pay (closed, past its grace window, or
+    /// insolvent) and sweeps nothing while the total is under
+    /// `blockchain.redeem_threshold_micro_usdc`; this figure applies neither,
+    /// so it is an upper bound on the next sweep.
+    pub micro_usdc: u64,
+    /// How many lanes count into [`Self::micro_usdc`].
+    pub lanes: u64,
+    /// Micro-USDC owed on lanes no sweep redeems: the capability has expired
+    /// (the contract pays `0`), or the lane names another provider (left from
+    /// a key rotation). Shown so the operator knows the sum is not coming.
+    pub stranded_micro_usdc: u64,
+    /// How many lanes count into [`Self::stranded_micro_usdc`].
+    pub stranded_lanes: u64,
+    /// When the redeemer's last sweep scanned the lanes, Unix seconds.
+    /// `None` before the first sweep of this process.
+    pub last_sweep_at_unix: Option<u64>,
+    /// When the redeemer's next sweep is due, Unix seconds: the earlier of
+    /// its next interval tick and the next serve cutoff. `None` until the
+    /// redeemer has published a schedule, which it does when its first
+    /// interval starts, after every sweep, and whenever a hinted lane moves
+    /// the next serve cutoff.
+    pub next_sweep_at_unix: Option<u64>,
 }
 
 /// One lane the node pays on, as the buyer's own store records it
@@ -663,6 +791,15 @@ pub const BUYER_POOL_STORE_ERROR_CODE: i32 = -32_010;
 /// list, which is the answer this code exists to avoid giving.
 pub const BUYER_POOL_UNAVAILABLE_CODE: i32 = -32_011;
 
+/// JSON-RPC error code: `admin_v1_earnings` was called on an admin surface
+/// with no settlement ledger attached, so it can say nothing about what this
+/// node earned. The production runtime attaches the ledger with the seller
+/// leg, so a running daemon does not answer this; it covers a hand-built
+/// `AdminState`, the same posture as [`BUYER_POOL_UNAVAILABLE_CODE`]. A
+/// ledger read failure is [`POOL_STORE_ERROR_CODE`]: the ledger lives in the
+/// seller store.
+pub const EARNINGS_UNAVAILABLE_CODE: i32 = -32_012;
+
 /// Admin RPC surface. Versioned via the namespace prefix
 /// (`admin_v1_...`): new methods may be added backwards-compatibly
 /// within `v1`, a breaking change cuts over to `admin_v2_...`.
@@ -777,6 +914,20 @@ pub trait AdminRpc {
     /// [`BUYER_POOL_STORE_ERROR_CODE`] when the store cannot be read.
     #[method(name = "pools")]
     async fn pools(&self) -> RpcResult<BuyerPoolsResponse>;
+
+    /// Return what this node has earned (#2598): settled USDC, bytes and
+    /// settlement counts over the last 24 hours, the last 7 days and the whole
+    /// settlement ledger (plus one period of the caller's choosing), the most
+    /// recent settlement, and what the lanes still owe. Backs `decdn node
+    /// earnings` and the one-line summary in `decdn node status`. The ledger
+    /// starts when the node first ran with one; a period that starts earlier
+    /// sums a shorter span than it names.
+    ///
+    /// Returns [`EARNINGS_UNAVAILABLE_CODE`] when no settlement ledger is
+    /// wired, and [`POOL_STORE_ERROR_CODE`] when the ledger or the lane store
+    /// cannot be read.
+    #[method(name = "earnings")]
+    async fn earnings(&self, req: EarningsRequest) -> RpcResult<EarningsResponse>;
 }
 
 /// Decode a 64-character hex BLAKE3 hash into a [`struct@Hash`].

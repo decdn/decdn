@@ -1263,3 +1263,153 @@ fn concurrent_records_during_flush_are_not_lost() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+mod settlement_ledger {
+    use decdn_incentive::{SettlementLedger, SettlementRecord};
+
+    use super::*;
+
+    fn row(block: u64, log_index: u64, tx_byte: u8) -> SettlementRecord {
+        SettlementRecord {
+            block_number: block,
+            log_index,
+            tx_hash: B256::repeat_byte(tx_byte),
+            landed_at_unix: 1_700_000_000 + block,
+            epoch: 9,
+            gross_micro_usdc: 1_000 + block,
+            net_micro_usdc: 600 + block,
+            bytes_delivered: 4_096 * block,
+            operator: alloy::primitives::Address::repeat_byte(0xEE),
+        }
+    }
+
+    #[test]
+    fn rows_round_trip_in_chain_order_across_a_reopen() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        {
+            let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+            assert!(
+                store.load_settlements()?.is_empty(),
+                "a fresh store has no rows"
+            );
+            // Out of chain order on purpose: the key, not the write order, sorts.
+            store.record_settlement(&row(30, 2, 0xC))?;
+            store.record_settlement(&row(10, 7, 0xA))?;
+            store.record_settlement(&row(30, 0, 0xB))?;
+        }
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+        let rows = store.load_settlements()?;
+        assert_eq!(
+            rows,
+            vec![row(10, 7, 0xA), row(30, 0, 0xB), row(30, 2, 0xC)]
+        );
+        assert!(store.has_settlement_tx(30, B256::repeat_byte(0xB))?);
+        assert!(!store.has_settlement_tx(30, B256::repeat_byte(0xD))?);
+        assert!(
+            !store.has_settlement_tx(10, B256::repeat_byte(0xB))?,
+            "the guard reads the named block's rows only"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_rewritten_key_overwrites_the_row() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+        store.record_settlement(&row(10, 0, 0xA))?;
+        let mut again = row(10, 0, 0xA);
+        again.net_micro_usdc = 1;
+        store.record_settlement(&again)?;
+        assert_eq!(store.load_settlements()?, vec![again]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_foreign_deployment_drops_the_ledger() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        {
+            let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+            store.record_settlement(&row(10, 0, 0xA))?;
+        }
+        let other = Deployment {
+            chain_id: DEPLOYMENT.chain_id,
+            payment_pool: address!("00000000000000000000000000000000000000cf"),
+        };
+        let store = PersistentPoolStateStore::open(dir.path(), other)?;
+        assert!(
+            store.load_settlements()?.is_empty(),
+            "the ledger belongs to the deployment it was written against"
+        );
+        Ok(())
+    }
+
+    /// Write raw `value` bytes under the ledger key `(block, 0)`, bypassing the
+    /// encoder, to seed a row this binary cannot read.
+    fn write_raw(store: &PersistentPoolStateStore, block: u64, value: &[u8]) -> anyhow::Result<()> {
+        let txn = store.settle_db.begin_write()?;
+        {
+            let mut table = txn.open_table(SETTLEMENT_LEDGER_TABLE)?;
+            table.insert(&settlement_key(block, 0), value)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_newer_schema_version_is_refused_and_an_equal_one_loads() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+        let mut stored = StoredSettlement::from_record(&row(10, 0, 0xA));
+        stored.schema_version = SETTLEMENT_SCHEMA_VERSION + 1;
+        write_raw(&store, 10, &postcard::to_allocvec(&stored)?)?;
+        assert!(matches!(
+            store.load_settlements(),
+            Err(StoreError::UnsupportedSchema { found, supported })
+                if found == SETTLEMENT_SCHEMA_VERSION + 1 && supported == SETTLEMENT_SCHEMA_VERSION
+        ));
+        stored.schema_version = SETTLEMENT_SCHEMA_VERSION;
+        write_raw(&store, 10, &postcard::to_allocvec(&stored)?)?;
+        assert_eq!(store.load_settlements()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_corrupt_row_names_its_position_and_does_not_stop_another_blocks_guard()
+    -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+        store.record_settlement(&row(5, 0, 0xA))?;
+        write_raw(&store, 10, &[0xFF, 0x00])?;
+        let Err(StoreError::Corrupt {
+            pool_id: None,
+            detail,
+        }) = store.load_settlements()
+        else {
+            anyhow::bail!("expected a Corrupt row");
+        };
+        assert!(detail.contains("block 10 log 0"), "{detail}");
+        // The guard reads only the named block, so block 5 still answers and
+        // block 10 reports the corruption.
+        assert!(store.has_settlement_tx(5, B256::repeat_byte(0xA))?);
+        assert!(matches!(
+            store.has_settlement_tx(10, B256::repeat_byte(0xA)),
+            Err(StoreError::Corrupt { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn the_key_encodes_block_then_log_index_big_endian() {
+        let key = settlement_key(0x0102_0304_0506_0708, 0x0a0b_0c0d_0e0f_1011);
+        assert_eq!(
+            key,
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11
+            ]
+        );
+        assert_eq!(
+            settlement_key_parts(&key),
+            (0x0102_0304_0506_0708, 0x0a0b_0c0d_0e0f_1011)
+        );
+    }
+}

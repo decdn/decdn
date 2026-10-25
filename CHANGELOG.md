@@ -28,6 +28,12 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Admin wire: `LaneSnapshot` carries `unredeemed_micro_usdc` (#2598).** The
+  field is required, so a `decdn` CLI at this release reads `admin_v1_lanes`
+  only from a daemon at this release (`decdn node lanes` fails with "missing
+  field `unredeemed_micro_usdc`" against an older one), and the `node lanes`
+  text table gains an `UNREDEEMED` column between `OUTSTANDING` and
+  `DEPOSIT`, which moves the positional columns after it.
 - **Bundles: a manifest with an entry or chunk hash that does not parse is
   malformed, and serves no entry (#2561).** `BundleManifest::parse` checks
   the version first, then returns the new `MalformedManifest` error naming
@@ -4089,6 +4095,49 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: `decdn node earnings` prints settled and owed USDC per period
+  (#2598).** The table has one row per period (the last 24 hours, the last
+  7 days, and since the node's settlement ledger started) with the USDC the
+  operator received, the bytes those settlements paid for and the settlement
+  count, then the last settlement (time, tx, block) and the pending line:
+  what the lanes still owe and when the next redeem sweep is due. `--json`
+  prints the `admin_v1_earnings` response; `--since <YYYY-MM-DD|unix>` adds a
+  period. `--address <0x…>` builds the same table from the chain alone (no
+  daemon, no pending line): a windowed `FeeRouter.Settled` scan for that
+  operator from the deployment's L2 block, with the net per settlement
+  reconstructed from the fee split in force; slow on an RPC that caps
+  `eth_getLogs` windows, so progress prints to stderr and `--from-block`
+  shortens it. Behind it:
+  - the daemon keeps a forward-only **settlement ledger** (`settlement_ledger_v1`
+    in `settle.redb`): one row per `redeemMany` that paid, decoded from the
+    receipt (gross, bytes and epoch from `FeeRouter.Settled`, the exact net
+    from the USDC transfer to the operator, the block's timestamp). The
+    `PoolRedeemed` watcher backfills a row for a landing the redeemer never
+    saw, off the poller's task; shutdown waits for the backfills in flight, so
+    only a crash mid-catch-up can lose one (`--address` has the chain's
+    record). Each row names its operator, so after `decdn
+    node rotate-key eth` the earlier address's rows stay in the file but out
+    of the figures. The ledger drops with the other seller tables on a
+    `PaymentPool` repoint. Nothing is backfilled from before the ledger exists, so the
+    bottom row reads `since <date>`, never "all time";
+  - the admin RPC gains `admin_v1_earnings` (and `EARNINGS_UNAVAILABLE_CODE`):
+    named periods `last_24h`, `last_7d`, `since_ledger_start` and the optional
+    `since`, the last settlement, and `pending` split into what the next sweep
+    can redeem and what is stranded (expired capability, another provider's
+    lane). `LaneSnapshot` gains `unredeemed_micro_usdc` (`owed −
+    paid_cumulative`, the per-lane term of the pending total), which `decdn
+    node lanes` shows as an `UNREDEEMED` column;
+  - the redeemer publishes its sweep schedule for the "next sweep in" and
+    "last sweep" figures;
+  - two counters: `decdn_settlement_ledger_write_failures_total` and
+    `decdn_settlement_ledger_skipped_rows_total`, so a ledger that stops
+    growing is visible to a dashboard and not only to `node earnings`;
+  - `decdn node status` appends an `earnings=ok …` / `earnings=unavailable
+    reason=…` line (text mode only) and `decdn setup` closes with
+    `earned_so_far=` when a daemon answers, or `earned_so_far=unavailable
+    reason=…` when one is listening but its answer is an error, late, or does
+    not decode; only a refused connection prints nothing. Both lines render a
+    daemon's JSON-RPC error as its code and message.
 - **CLI: a namespace is a stable host on a public gateway (#2614).**
   `decdn publish point <ns> decdn:<hash>/ --gateway <origin>` signs a
   namespace pointer (an EIP-712 record over the `PublisherRegistry`

@@ -2035,6 +2035,7 @@ async fn a_sub_floor_plan_set_reads_nothing_from_the_chain() -> Result<()> {
         300,
         true,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -2084,6 +2085,7 @@ async fn a_set_that_clears_the_floor_in_total_reads_every_lane() -> Result<()> {
         2,
         true,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -2123,6 +2125,7 @@ async fn a_zero_floor_still_reads_every_lane() -> Result<()> {
         300,
         false,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -2163,8 +2166,21 @@ fn shutdown_service<P: Provider + Clone + 'static>(
         redeem_max_vouchers_per_tx: 300,
         metrics,
         pool_view: PoolProjection::new(),
+        recorder: test_recorder(),
+        backfills: LedgerBackfills::new(test_recorder()),
+        schedule: RedeemSchedule::default(),
         redeemer: std::sync::Mutex::new(None),
     }
+}
+
+/// A recorder over a throwaway in-memory ledger, for tests that exercise the
+/// redemption path and not the ledger.
+fn test_recorder() -> SettlementRecorder {
+    SettlementRecorder::new(
+        Arc::new(decdn_incentive::MemorySettlementLedger::default()),
+        Address::from([20u8; 20]),
+        Arc::new(Metrics::new()),
+    )
 }
 
 /// Persist one lane that provider `[20; 20]` holds. The lane is registered
@@ -2534,6 +2550,8 @@ fn spawn_redeemer<P: Provider + Clone + 'static>(
         rx,
         metrics,
         PoolProjection::new(),
+        test_recorder(),
+        RedeemSchedule::default(),
     ));
     (tx, handle, margin)
 }
@@ -3042,6 +3060,7 @@ async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Resul
         300,
         true,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -3107,6 +3126,7 @@ async fn a_redeem_send_with_no_answer_is_possibly_broadcast() -> Result<()> {
         300,
         false,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -3164,6 +3184,7 @@ async fn redeem_after_failed_sends(
         300,
         false,
         &metrics,
+        &test_recorder(),
     )
     .await;
     Ok((faulted, log, metrics))
@@ -3320,6 +3341,7 @@ async fn a_redeem_whose_gas_fill_fails_is_refused() -> Result<()> {
         300,
         false,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -3355,6 +3377,7 @@ async fn a_failed_read_stays_a_chain_fault_past_a_failed_strict_flush() -> Resul
         300,
         true,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -3949,4 +3972,327 @@ fn record_does_not_regress_paid_cumulative() -> Result<()> {
         "record must not regress the persisted paid watermark to zero"
     );
     Ok(())
+}
+
+mod redeem_schedule {
+    use super::*;
+
+    #[test]
+    fn a_fresh_schedule_reads_nothing() {
+        let schedule = RedeemSchedule::default();
+        assert_eq!(schedule.next_sweep_at(), None);
+        assert_eq!(schedule.swept_at(), None);
+    }
+
+    #[test]
+    fn publish_sets_the_next_sweep_and_keeps_the_last_swept_at() {
+        let schedule = RedeemSchedule::default();
+        // The first publish, at loop start: no sweep yet, a tick ahead.
+        schedule.publish(None, 1_000);
+        assert_eq!(
+            (schedule.swept_at(), schedule.next_sweep_at()),
+            (None, Some(1_000))
+        );
+        schedule.publish(Some(900), 1_200);
+        assert_eq!(
+            (schedule.swept_at(), schedule.next_sweep_at()),
+            (Some(900), Some(1_200))
+        );
+        // A tick whose lane load failed republishes the due time only.
+        schedule.publish(None, 1_500);
+        assert_eq!(
+            (schedule.swept_at(), schedule.next_sweep_at()),
+            (Some(900), Some(1_500))
+        );
+    }
+
+    #[test]
+    fn the_next_sweep_is_the_earlier_of_tick_and_cutoff() {
+        assert_eq!(next_sweep_at(1_000, None), 1_000);
+        assert_eq!(next_sweep_at(1_000, Some(700)), 700);
+        assert_eq!(next_sweep_at(1_000, Some(1_300)), 1_000);
+    }
+
+    /// The loop publishes its schedule as soon as it starts, before any
+    /// sweep, and the figure is a real time ahead of the clock.
+    #[tokio::test]
+    async fn the_redeemer_publishes_at_start() -> Result<()> {
+        let schedule = RedeemSchedule::default();
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        let (contract, _asserter) = mocked_getwatermarks_pool(&[]);
+        let (tx, rx) = mpsc::channel(1);
+        let interval = Duration::from_secs(3_600);
+        let handle = tokio::spawn(redeemer_loop(
+            contract,
+            store,
+            PaidWatermarks::default(),
+            Address::from([20u8; 20]),
+            U256::from(1u64),
+            300,
+            interval,
+            capability_expiry_margin_secs(interval.as_secs()),
+            rx,
+            Arc::new(Metrics::new()),
+            PoolProjection::new(),
+            test_recorder(),
+            schedule.clone(),
+        ));
+        let published = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(at) = schedule.next_sweep_at() {
+                    return at;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("the loop publishes within its first moments"))?;
+        let now = unix_now();
+        assert!(
+            published > now && published <= now + interval.as_secs() + 1,
+            "{published}"
+        );
+        assert_eq!(schedule.swept_at(), None, "no sweep has run");
+        drop(tx);
+        let _ = handle.await;
+        Ok(())
+    }
+
+    /// A hinted lane whose serve cutoff falls before the next tick moves the
+    /// published next sweep to that cutoff. The lane is sub-floor, so the
+    /// hint reads nothing from the chain, and a hint is not a sweep, so
+    /// `swept_at` stays unset.
+    #[tokio::test]
+    async fn a_hint_that_pulls_the_cutoff_forward_republishes_the_schedule() -> Result<()> {
+        let schedule = RedeemSchedule::default();
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        // Nothing queued: the sub-floor hint reads nothing from the chain.
+        let (contract, _asserter) = mocked_getwatermarks_pool(&[]);
+        let (tx, rx) = mpsc::channel(1);
+        let interval = Duration::from_secs(3_600);
+        let margin = capability_expiry_margin_secs(interval.as_secs());
+        let handle = tokio::spawn(redeemer_loop(
+            contract,
+            store.clone(),
+            PaidWatermarks::default(),
+            Address::from([20u8; 20]),
+            U256::MAX,
+            300,
+            interval,
+            margin,
+            rx,
+            Arc::new(Metrics::new()),
+            PoolProjection::new(),
+            test_recorder(),
+            schedule.clone(),
+        ));
+        let wait_for = |pred: Box<dyn Fn(Option<u64>) -> bool + Send>| {
+            let schedule = schedule.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let at = schedule.next_sweep_at();
+                        if pred(at) {
+                            return at;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+            }
+        };
+        let first = wait_for(Box::new(|at| at.is_some()))
+            .await
+            .map_err(|_| anyhow::anyhow!("the loop publishes within its first moments"))?
+            .unwrap_or_default();
+        // A lane this node provides, expiring 10 minutes past its margin: its
+        // cutoff wake lands about 10 minutes out, well before the hour tick.
+        let expiry = unix_now() + margin + 600;
+        let mut st = expiring_lane(1, expiry);
+        st.registered_until = u64::MAX;
+        store.record(&st)?;
+        tx.send(LaneKey {
+            pool_id: st.pool_id,
+            signer: st.signer,
+            provider: st.provider,
+        })
+        .await?;
+        let moved = wait_for(Box::new(move |at| at.is_some_and(|at| at < first)))
+            .await
+            .map_err(|_| anyhow::anyhow!("the hint republishes the next sweep; last seen {first}"))?
+            .unwrap_or_default();
+        let cutoff_wake = expiry - margin + 1;
+        assert_eq!(
+            moved, cutoff_wake,
+            "the next sweep is the lane's cutoff wake"
+        );
+        assert_eq!(schedule.swept_at(), None, "a hint is not a sweep");
+        drop(tx);
+        let _ = handle.await;
+        Ok(())
+    }
+}
+
+mod settlement_ledger_rows {
+    use alloy::sol_types::{SolCall, SolEvent};
+    use decdn_incentive::erc20::Erc20;
+    use decdn_incentive::payment_pool::FeeRouter;
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt};
+    use decdn_incentive::{MemorySettlementLedger, SettlementLedger};
+
+    use super::*;
+
+    const ROUTER: Address = Address::repeat_byte(0xF0);
+
+    fn log(address: Address, data: alloy::primitives::LogData, log_index: u64) -> Log {
+        Log {
+            inner: alloy::primitives::Log { address, data },
+            block_hash: None,
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: Some(log_index),
+            removed: false,
+        }
+    }
+
+    /// Drive one `redeem_planned_lanes` cycle whose single `redeemMany` lands
+    /// with `logs` in its receipt, against a ledger the test can read back.
+    async fn land_with(
+        logs: Vec<Log>,
+        head_timestamp: Option<u64>,
+    ) -> Result<(Arc<MemorySettlementLedger>, Arc<Metrics>)> {
+        let metrics = Arc::new(Metrics::new());
+        let ledger = Arc::new(MemorySettlementLedger::default());
+        let recorder = SettlementRecorder::new(
+            Arc::clone(&ledger) as Arc<dyn SettlementLedger>,
+            SELLER,
+            Arc::clone(&metrics),
+        );
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        let watermarks = PaymentPool::getWatermarksCall::abi_encode_returns(&vec![lane(0)]);
+        let mut rpc = ScriptedRpc::mined(mined_receipt(Address::ZERO, logs))
+            .answering_calls([Bytes::from(watermarks)]);
+        if let Some(timestamp) = head_timestamp {
+            rpc = rpc.at_head(timestamp);
+        }
+        let contract = PaymentPool::new(Address::ZERO, rpc.provider());
+        let faulted = redeem_planned_lanes(
+            &contract,
+            &store,
+            vec![planned(1, 0, 1_000, false)],
+            SELLER,
+            U256::from(1u64),
+            300,
+            false,
+            &metrics,
+            &recorder,
+        )
+        .await;
+        anyhow::ensure!(!faulted, "the redeem landed");
+        Ok((ledger, metrics))
+    }
+
+    /// `shutdown` waits for a ledger backfill the watcher started: the row is
+    /// in the ledger when it returns. No lane is seeded, so the final sweep
+    /// reads nothing from the chain and the drain is what the test times.
+    #[tokio::test]
+    async fn shutdown_drains_the_ledger_backfills() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let ledger = Arc::new(MemorySettlementLedger::default());
+        let recorder = SettlementRecorder::new(
+            Arc::clone(&ledger) as Arc<dyn SettlementLedger>,
+            SELLER,
+            Arc::clone(&metrics),
+        );
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        let (contract, _asserter) = mocked_getwatermarks_pool(&[]);
+        let mut svc = shutdown_service(contract, store, SELLER, U256::from(1u64), metrics);
+        svc.backfills = LedgerBackfills::new(recorder);
+        let settled = FeeRouter::Settled {
+            operator: SELLER,
+            bytesDelivered: U256::from(4_096u64),
+            amount: U256::from(1_000u64),
+            epoch: 7,
+        };
+        let transfer = Erc20::Transfer {
+            from: ROUTER,
+            to: SELLER,
+            value: U256::from(600u64),
+        };
+        let receipt = mined_receipt(
+            Address::ZERO,
+            vec![
+                log(Address::repeat_byte(0xA0), transfer.encode_log_data(), 2),
+                log(ROUTER, settled.encode_log_data(), 3),
+            ],
+        );
+        let tx = receipt.transaction_hash;
+        let rpc = ScriptedRpc::mined(receipt).at_head(1_700_000_500);
+        svc.backfills.spawn(rpc.provider(), 1, tx);
+        assert!(
+            ledger.load_settlements()?.is_empty(),
+            "the backfill has not been polled before shutdown"
+        );
+        svc.shutdown(Duration::from_secs(5)).await;
+        let rows = ledger.load_settlements()?;
+        assert_eq!(
+            rows.iter().map(|row| row.tx_hash).collect::<Vec<_>>(),
+            vec![tx]
+        );
+        assert_eq!(svc.backfills.in_flight(), 0);
+        Ok(())
+    }
+
+    /// The Landed arm of `submit_chunk` writes the ledger row: gross, bytes
+    /// and epoch from `Settled`, net from the router's transfer, the block
+    /// time from the header.
+    #[tokio::test]
+    async fn a_landed_redeem_writes_its_ledger_row() -> Result<()> {
+        let settled = FeeRouter::Settled {
+            operator: SELLER,
+            bytesDelivered: U256::from(4_096u64),
+            amount: U256::from(1_000u64),
+            epoch: 7,
+        };
+        let transfer = Erc20::Transfer {
+            from: ROUTER,
+            to: SELLER,
+            value: U256::from(600u64),
+        };
+        let logs = vec![
+            log(Address::repeat_byte(0xA0), transfer.encode_log_data(), 2),
+            log(ROUTER, settled.encode_log_data(), 3),
+        ];
+        let (ledger, _metrics) = land_with(logs, Some(1_700_000_000)).await?;
+        let rows = ledger.load_settlements()?;
+        anyhow::ensure!(rows.len() == 1, "one row per landed redeemMany: {rows:?}");
+        let row = rows.first().ok_or_else(|| anyhow::anyhow!("one row"))?;
+        assert_eq!((row.block_number, row.log_index), (1, 3));
+        assert_eq!((row.gross_micro_usdc, row.net_micro_usdc), (1_000, 600));
+        assert_eq!((row.bytes_delivered, row.epoch), (4_096, 7));
+        assert_eq!(row.landed_at_unix, 1_700_000_000);
+        Ok(())
+    }
+
+    /// A `redeemMany` that paid nothing lands with no logs: no row, no header
+    /// read (the scripted transport parks one forever), no skip counted.
+    #[tokio::test]
+    async fn a_zero_pay_landing_writes_no_row_and_reads_no_header() -> Result<()> {
+        let started = std::time::Instant::now();
+        let (ledger, metrics) = land_with(Vec::new(), None).await?;
+        anyhow::ensure!(
+            started.elapsed() < Duration::from_secs(5),
+            "a zero-pay landing must not wait on a block header"
+        );
+        anyhow::ensure!(ledger.load_settlements()?.is_empty());
+        ensure_metric_lines(
+            &metrics,
+            &[
+                "decdn_settlement_ledger_skipped_rows_total 0",
+                "decdn_settlement_ledger_write_failures_total 0",
+            ],
+        )
+    }
 }

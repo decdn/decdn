@@ -21,13 +21,15 @@ use decdn_common::admin::{
     AdminRpcServer, BUYER_POOL_STORE_ERROR_CODE, BUYER_POOL_UNAVAILABLE_CODE, BucketStat,
     BuyerLaneSnapshot, BuyerPoolSnapshot, BuyerPoolsResponse, CACHE_ERROR_CODE,
     CONFIG_PATH_UNSET_CODE, DHT_POISONED_CODE, DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse,
-    EvictPreview, EvictRequest, EvictResponse, HealthResponse, LaneSnapshot, LanesResponse,
-    POOL_STORE_ERROR_CODE, RELOAD_ERROR_CODE, RecordStoreHealth, ReloadResponse, RepublishHealth,
+    EARNINGS_UNAVAILABLE_CODE, EarningsRequest, EarningsResponse, EvictPreview, EvictRequest,
+    EvictResponse, HealthResponse, LaneSnapshot, LanesResponse, POOL_STORE_ERROR_CODE,
+    PendingRedeem, RELOAD_ERROR_CODE, RecordStoreHealth, ReloadResponse, RepublishHealth,
     RoutingHealth, SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse,
     StatusResponse, parse_hash_arg,
 };
 use decdn_incentive::buyer_pool::{BuyerPoolState, BuyerPoolStore};
-use decdn_incentive::{LaneKey, LaneState, PoolStateStore};
+use decdn_incentive::earnings::{last_settlement, sum_period};
+use decdn_incentive::{LaneKey, LaneState, PoolStateStore, SettlementLedger, SettlementRecord};
 
 pub use crate::handlers::client::LaneActivityClock;
 use jsonrpsee::core::{RpcResult, async_trait};
@@ -40,6 +42,7 @@ use crate::admin::pool_owners::PoolOwners;
 use crate::binding_check::BindingReport;
 use crate::dht::{RecordStore, RepublishScheduler, RoutingTable, StakerSet};
 use crate::metrics::Metrics;
+use crate::payment_settlement::{RedeemSchedule, capability_expired, unix_now};
 
 // Wire types live in `decdn_common::admin`. We import the server-side
 // trait, the request DTO, and the few error codes the server impl
@@ -153,6 +156,36 @@ pub struct AdminState {
     /// `None` (unit tests, and any build with no chain wiring) reports
     /// `operator_address: None`, the honest answer when nothing supplied one.
     operator_address: Option<Address>,
+    /// Settlement ledger, lane store and redeemer schedule backing
+    /// `admin_v1_earnings` (#2598), attached via [`AdminState::with_earnings`].
+    /// `None` (unit tests, a build with no seller leg) answers
+    /// [`EARNINGS_UNAVAILABLE_CODE`].
+    earnings: Option<EarningsHandles>,
+}
+
+/// Read-only handles the `admin_v1_earnings` handler reads (#2598). Each is a
+/// clone of state the settlement service already owns, so attaching this to
+/// [`AdminState`] adds read access, not new ownership.
+#[derive(Clone)]
+pub struct EarningsHandles {
+    /// The settlement ledger: one row per landed `redeemMany`, the source of
+    /// every settled figure.
+    pub ledger: Arc<dyn SettlementLedger>,
+    /// Persistent per-lane voucher state, read for the pending total
+    /// (`owed − paid_cumulative` per lane).
+    pub pool_store: Arc<dyn PoolStateStore>,
+    /// The redeemer's published sweep schedule, for "next sweep in".
+    pub schedule: RedeemSchedule,
+}
+
+// `AdminState` derives `Debug`; the trait objects carry no `Debug` bound, so
+// name the struct without formatting the handles.
+impl std::fmt::Debug for EarningsHandles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EarningsHandles")
+            .field("schedule", &self.schedule)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The buyer pool store handle `admin_v1_pools` reads, wrapped so
@@ -382,6 +415,7 @@ impl AdminState {
             dht: None,
             lanes: None,
             buyer_pools: None,
+            earnings: None,
             slash_detection: None,
             binding: BindingReport::unknown(),
             warming: None,
@@ -461,6 +495,17 @@ impl AdminState {
     #[must_use]
     pub fn with_buyer_pools(mut self, buyer_pools: Arc<dyn BuyerPoolStore>) -> Self {
         self.buyer_pools = Some(BuyerPoolHandle(buyer_pools));
+        self
+    }
+
+    /// Attach the settlement ledger, lane store and redeemer schedule so
+    /// `admin_v1_earnings` can report what the node earned (#2598). The
+    /// production runtime calls this once after `new`, with the seller leg's
+    /// own handles; without it, `earnings` returns
+    /// [`EARNINGS_UNAVAILABLE_CODE`].
+    #[must_use]
+    pub fn with_earnings(mut self, earnings: EarningsHandles) -> Self {
+        self.earnings = Some(earnings);
         self
     }
 
@@ -931,6 +976,143 @@ impl AdminRpcServer for AdminRpcImpl {
 
         Ok(build_buyer_pools_response(load.pools, &load.skipped))
     }
+
+    async fn earnings(&self, req: EarningsRequest) -> RpcResult<EarningsResponse> {
+        let Some(h) = self.state.earnings.as_ref() else {
+            return Err(ErrorObjectOwned::owned(
+                EARNINGS_UNAVAILABLE_CODE,
+                "no settlement ledger is attached to this admin surface, so this node can say \
+                 nothing about what it earned",
+                None::<()>,
+            ));
+        };
+        // Both reads are blocking redb I/O; one blocking task loads the ledger
+        // rows and the lane states together, then the pure aggregation runs on
+        // the returned `Vec`s. Each read names itself in its error, so a lane
+        // store fault is never reported as a ledger fault.
+        let ledger = Arc::clone(&h.ledger);
+        let store = Arc::clone(&h.pool_store);
+        let (rows, lanes) = tokio::task::spawn_blocking(move || {
+            let rows = ledger
+                .load_settlements()
+                .map_err(|err| format!("settlement ledger load failed: {err}"))?;
+            let lanes = store
+                .load_all()
+                .map_err(|err| format!("lane store load failed: {err}"))?;
+            Ok::<_, String>((rows, lanes))
+        })
+        .await
+        .map_err(|join_err| {
+            let cause = if join_err.is_cancelled() {
+                "cancelled"
+            } else {
+                "panicked"
+            };
+            tracing::error!(error = %join_err, cause, "earnings load task did not complete");
+            ErrorObjectOwned::owned(
+                POOL_STORE_ERROR_CODE,
+                "earnings load task failed",
+                None::<()>,
+            )
+        })?
+        .map_err(|message| {
+            tracing::error!(error = %message, "admin_v1_earnings load failed");
+            ErrorObjectOwned::owned(POOL_STORE_ERROR_CODE, message, None::<()>)
+        })?;
+        Ok(build_earnings_response(
+            &rows,
+            &lanes,
+            self.state.operator_address,
+            unix_now(),
+            req.since_unix,
+            &h.schedule,
+        ))
+    }
+}
+
+/// Seconds in the two fixed `admin_v1_earnings` periods.
+const DAY_SECS: u64 = 86_400;
+const WEEK_SECS: u64 = 7 * DAY_SECS;
+
+/// Build the wire [`EarningsResponse`] from the ledger rows and lane states at
+/// `now_unix`. Pure (no I/O) so the periods, the empty-ledger shape and the
+/// pending split are unit-testable without a store.
+///
+/// A row falls in a period when its `landed_at_unix` is at or after the
+/// period's start. The pending section is [`pending_redeem`].
+pub(crate) fn build_earnings_response(
+    rows: &[SettlementRecord],
+    lanes: &[LaneState],
+    operator: Option<Address>,
+    now_unix: u64,
+    since_unix: Option<u64>,
+    schedule: &RedeemSchedule,
+) -> EarningsResponse {
+    // Only this operator's rows: the ledger outlives an Ethereum key rotation
+    // that kept the data directory. With no operator (a hand-built admin
+    // state) nothing can be attributed, so every row counts.
+    let rows: Vec<&SettlementRecord> = rows
+        .iter()
+        .filter(|row| operator.is_none_or(|operator| row.operator == operator))
+        .collect();
+    let ledger_since_unix = rows.iter().map(|row| row.landed_at_unix).min();
+    let landed_since = |from: u64| {
+        rows.iter()
+            .copied()
+            .filter(move |row| row.landed_at_unix >= from)
+    };
+    let day = now_unix.saturating_sub(DAY_SECS);
+    let week = now_unix.saturating_sub(WEEK_SECS);
+    EarningsResponse {
+        operator_address: operator.map(|a| a.to_string()),
+        ledger_since_unix,
+        last_24h: sum_period(day, landed_since(day)),
+        last_7d: sum_period(week, landed_since(week)),
+        since_ledger_start: sum_period(ledger_since_unix.unwrap_or(0), rows.iter().copied()),
+        since: since_unix.map(|since| sum_period(since, landed_since(since))),
+        last_settlement: last_settlement(rows.iter().copied()),
+        pending: Some(pending_redeem(lanes, operator, now_unix, schedule)),
+    }
+}
+
+/// What the lanes still owe this node at `now_unix`. Each lane's
+/// `owed − paid_cumulative` (saturating) counts as pending when the lane names
+/// `operator` as its provider and its capability has not expired, the two
+/// local predicates the redeemer's planner applies; otherwise it counts as
+/// stranded. The planner also skips a lane whose pool cannot pay, which needs
+/// the pool view, and sweeps nothing while the total is under the redeem
+/// threshold, so the pending figure is an upper bound on the next sweep.
+fn pending_redeem(
+    lanes: &[LaneState],
+    operator: Option<Address>,
+    now_unix: u64,
+    schedule: &RedeemSchedule,
+) -> PendingRedeem {
+    let mut pending = PendingRedeem {
+        micro_usdc: 0,
+        lanes: 0,
+        stranded_micro_usdc: 0,
+        stranded_lanes: 0,
+        last_sweep_at_unix: schedule.swept_at(),
+        next_sweep_at_unix: schedule.next_sweep_at(),
+    };
+    for lane in lanes {
+        let unredeemed = lane.unredeemed();
+        if unredeemed.is_zero() {
+            continue;
+        }
+        let amount = u64::try_from(unredeemed).unwrap_or(u64::MAX);
+        let redeemable =
+            operator == Some(lane.provider) && !capability_expired(lane.expiry, now_unix);
+        if redeemable {
+            pending.micro_usdc = pending.micro_usdc.saturating_add(amount);
+            pending.lanes = pending.lanes.saturating_add(1);
+        } else {
+            pending.stranded_micro_usdc = pending.stranded_micro_usdc.saturating_add(amount);
+            pending.stranded_lanes = pending.stranded_lanes.saturating_add(1);
+        }
+    }
+    pending
 }
 
 /// Build the wire [`BuyerPoolsResponse`] from loaded buyer pool states and the
@@ -1022,6 +1204,9 @@ fn build_lane_snapshots(
                 voucher_signer: state.signer.to_string(),
                 last_nonce: 0,
                 outstanding_micro_usdc: u64::try_from(outstanding).unwrap_or(u64::MAX),
+                // What a landed redemption has not paid yet (#2598): the claim
+                // minus the paid watermark the `PoolRedeemed` watcher recorded.
+                unredeemed_micro_usdc: u64::try_from(state.unredeemed()).unwrap_or(u64::MAX),
                 deposit_micro_usdc: 0,
                 seconds_since_last_voucher: ages.get(&state.key()).copied(),
                 // The full claim, not `owed − paid_cumulative`, against the

@@ -688,6 +688,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     )?);
     let store: Arc<dyn PoolStateStore> = concrete_store.clone();
     let checkpoint_store: Arc<dyn KeyedCheckpointStore> = concrete_store.clone();
+    let ledger: Arc<dyn decdn_incentive::SettlementLedger> = concrete_store.clone();
 
     let node_eth = Arc::new(node_signer.clone());
     let metrics = Arc::new(Metrics::new());
@@ -734,6 +735,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         node_addr,
         Arc::clone(&store),
         Arc::clone(&checkpoint_store),
+        Arc::clone(&ledger),
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         300,
@@ -1171,6 +1173,76 @@ async fn run_e2e() -> anyhow::Result<()> {
         "second sweep must attach NO CapabilityReg — registration is already known from the \
          persisted registered_until watermark, so the batched-read skip must fire: \
          cap_count={cap_count_second}"
+    );
+
+    // The settlement ledger (#2598): one row per landed `redeemMany`, in chain
+    // order, decoded from each receipt. The redeemer writes the row after the
+    // receipt lands (one header read in between), so poll for the second one.
+    let rows = poll_until(Duration::from_secs(10), || {
+        let store = Arc::clone(&concrete_store);
+        async move {
+            let rows = decdn_incentive::SettlementLedger::load_settlements(store.as_ref()).ok()?;
+            (rows.len() >= 2).then_some(rows)
+        }
+    })
+    .await
+    .ok_or_else(|| anyhow::anyhow!("the settlement ledger did not record both redeems"))?;
+    anyhow::ensure!(rows.len() == 2, "one ledger row per redeemMany: {rows:?}");
+    anyhow::ensure!(
+        rows[0].tx_hash == tx_first && rows[0].block_number == block_first,
+        "the first row is the first redeem ({tx_first} at {block_first}): {:?}",
+        rows[0]
+    );
+    anyhow::ensure!(
+        rows[1].tx_hash == tx_second,
+        "the second row is the second redeem ({tx_second}): {:?}",
+        rows[1]
+    );
+    let fee_router_addr = PaymentPool::new(payment_pool, &node_provider)
+        .feeRouter()
+        .call()
+        .await?;
+    let shares = decdn_incentive::payment_pool::FeeRouter::new(fee_router_addr, &node_provider)
+        .getShares()
+        .call()
+        .await?;
+    let bps = U256::from(10_000u64);
+    for row in &rows {
+        anyhow::ensure!(
+            row.gross_micro_usdc > 0 && row.bytes_delivered > 0 && row.landed_at_unix > 0,
+            "a ledger row carries the gross, the bytes paid and the block time: {row:?}"
+        );
+        let gross = U256::from(row.gross_micro_usdc);
+        let expected_net = gross - gross * shares[1] / bps - gross * shares[2] / bps;
+        anyhow::ensure!(
+            U256::from(row.net_micro_usdc) == expected_net,
+            "a ledger row's net is the operator's share of the gross under the live split \
+             {shares:?}: {row:?}"
+        );
+    }
+    // The watcher's backfill decodes the same receipt into the same row, and a
+    // second backfill of a known transaction fetches nothing.
+    let backfill_ledger = Arc::new(decdn_incentive::MemorySettlementLedger::default());
+    let recorder = decdn_node::settlement_ledger::SettlementRecorder::new(
+        backfill_ledger.clone(),
+        node_addr,
+        Arc::clone(&metrics),
+    );
+    recorder
+        .backfill(&node_provider, block_first, tx_first)
+        .await;
+    let backfilled = decdn_incentive::SettlementLedger::load_settlements(backfill_ledger.as_ref())?;
+    anyhow::ensure!(
+        backfilled.as_slice() == &rows[..1],
+        "a backfilled row equals the redeemer's row: {backfilled:?} vs {:?}",
+        rows[0]
+    );
+    recorder
+        .backfill(&node_provider, block_first, tx_first)
+        .await;
+    anyhow::ensure!(
+        decdn_incentive::SettlementLedger::load_settlements(backfill_ledger.as_ref())?.len() == 1,
+        "a known transaction is not written twice"
     );
 
     // ============================================================

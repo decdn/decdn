@@ -36,10 +36,10 @@ pub use gateway::GatewayArgs;
 pub use get::GetArgs;
 pub use key_gen::KeyGenArgs;
 pub use node::{
-    BondArgs, ChainArgs, DeregisterArgs, DoctorArgs, DrainArgs, EvictArgs, HealthArgs, LanesArgs,
-    LookupArgs, NodeArgs, NodeCommand, PoolsArgs, RegisterArgs, ReloadArgs, RotateKeyArgs,
-    RotateKeyTarget, SlashesArgs, StatusArgs, TopArgs, UnbondArgs, UpdateMultiaddrsArgs,
-    UpdateRegionArgs,
+    BondArgs, ChainArgs, DeregisterArgs, DoctorArgs, DrainArgs, EarningsArgs, EvictArgs,
+    HealthArgs, LanesArgs, LookupArgs, NodeArgs, NodeCommand, PoolsArgs, RegisterArgs, ReloadArgs,
+    RotateKeyArgs, RotateKeyTarget, SlashesArgs, StatusArgs, TopArgs, UnbondArgs,
+    UpdateMultiaddrsArgs, UpdateRegionArgs,
 };
 pub use origin::{OriginArgs, OriginCommand, OriginImportArgs};
 pub use pool::{

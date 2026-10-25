@@ -108,6 +108,8 @@ fn flags_override_config() {
         publisher_registry_address: None,
         origin_assignment_address: None,
         slash_appeal_address: None,
+        payment_pool_address: None,
+        get_logs_max_block_span: None,
     });
     let r = resolve(&chain, &file).unwrap();
     assert_eq!(r.rpc_url, "http://flag:8545");
@@ -126,6 +128,8 @@ fn config_fills_unset_flags() {
         publisher_registry_address: None,
         origin_assignment_address: None,
         slash_appeal_address: None,
+        payment_pool_address: None,
+        get_logs_max_block_span: None,
     });
     let r = resolve(&chain, &file).unwrap();
     assert_eq!(r.rpc_url, "http://config:8545");
@@ -146,6 +150,8 @@ fn keystore_defaults_under_data_dir() {
         publisher_registry_address: None,
         origin_assignment_address: None,
         slash_appeal_address: None,
+        payment_pool_address: None,
+        get_logs_max_block_span: None,
     });
     let r = resolve(&chain, &file).unwrap();
     assert_eq!(r.keystore, PathBuf::from("/tmp/decdn-test/keystore.json"));
@@ -280,6 +286,8 @@ fn resolve_publish_flag_beats_config() {
         publisher_registry_address: Some(CONFIG_ADDR.to_string()),
         origin_assignment_address: Some(OA_ADDR.to_string()),
         slash_appeal_address: None,
+        payment_pool_address: None,
+        get_logs_max_block_span: None,
     });
     let r = resolve_publish(&args, &file).unwrap();
     assert_eq!(r.rpc_url, "http://flag:8545");

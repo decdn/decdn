@@ -1510,3 +1510,243 @@ async fn bind_accepts_loopback_and_warns_on_non_loopback() {
     );
     drop(listener);
 }
+
+/// `unredeemed_micro_usdc` is `owed − paid_cumulative`, saturating at 0 when a
+/// replayed watermark exceeds the claim, and never above the outstanding
+/// figure.
+#[test]
+fn build_lane_snapshots_report_the_unredeemed_part() {
+    let mut partly_paid = mk_lane(1, 1, 1_000);
+    partly_paid.paid_cumulative = U256::from(400u64);
+    let mut over_paid = mk_lane(1, 2, 100);
+    over_paid.paid_cumulative = U256::from(500u64);
+    let snapshots = build_lane_snapshots(
+        &[partly_paid, over_paid],
+        U256::MAX,
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let by_signer = |byte: u8| {
+        let mut s = [0u8; 20];
+        s[19] = byte;
+        let signer = Address::from(s).to_string();
+        snapshots
+            .iter()
+            .find(|snap| snap.voucher_signer == signer)
+            .map(|snap| (snap.outstanding_micro_usdc, snap.unredeemed_micro_usdc))
+    };
+    assert_eq!(by_signer(1), Some((1_000, 600)));
+    assert_eq!(by_signer(2), Some((100, 0)));
+}
+
+mod earnings {
+    use decdn_incentive::SettlementRecord;
+
+    use super::*;
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn row(block: u64, landed_at: u64, net: u64, gross: u64, bytes: u64) -> SettlementRecord {
+        SettlementRecord {
+            block_number: block,
+            log_index: 0,
+            tx_hash: B256::repeat_byte(u8::try_from(block).unwrap_or(0)),
+            landed_at_unix: landed_at,
+            epoch: 1,
+            gross_micro_usdc: gross,
+            net_micro_usdc: net,
+            bytes_delivered: bytes,
+            operator: Address::repeat_byte(0xEE),
+        }
+    }
+
+    /// Three rows: one an hour old, one three days old, one a month old.
+    fn rows() -> Vec<SettlementRecord> {
+        vec![
+            row(1, NOW - 30 * DAY_SECS, 10, 20, 100),
+            row(2, NOW - 3 * DAY_SECS, 20, 40, 200),
+            row(3, NOW - 3_600, 40, 80, 400),
+        ]
+    }
+
+    fn build(
+        rows: &[SettlementRecord],
+        lanes: &[LaneState],
+        operator: Option<Address>,
+        since: Option<u64>,
+    ) -> EarningsResponse {
+        build_earnings_response(
+            rows,
+            lanes,
+            operator,
+            NOW,
+            since,
+            &RedeemSchedule::default(),
+        )
+    }
+
+    #[test]
+    fn periods_bucket_rows_by_landed_time() {
+        let resp = build(&rows(), &[], None, None);
+        assert!(resp.since.is_none(), "no `since` asked for");
+        let day = &resp.last_24h;
+        assert_eq!(
+            (day.from_unix, day.settlements, day.net_micro_usdc),
+            (NOW - DAY_SECS, 1, 40)
+        );
+        let week = &resp.last_7d;
+        assert_eq!(
+            (
+                week.from_unix,
+                week.settlements,
+                week.net_micro_usdc,
+                week.gross_micro_usdc,
+                week.bytes_settled
+            ),
+            (NOW - WEEK_SECS, 2, 60, 120, 600)
+        );
+        let all = &resp.since_ledger_start;
+        assert_eq!(
+            (all.from_unix, all.settlements, all.net_micro_usdc),
+            (NOW - 30 * DAY_SECS, 3, 70)
+        );
+        assert_eq!(resp.ledger_since_unix, Some(NOW - 30 * DAY_SECS));
+        let last = resp.last_settlement.expect("a last settlement");
+        assert_eq!(
+            (last.block_number, last.net_micro_usdc, last.at_unix),
+            (3, 40, NOW - 3_600)
+        );
+        assert_eq!(last.tx_hash, format!("{:#x}", B256::repeat_byte(3)));
+    }
+
+    /// A settlement landed exactly at a period's first second counts in it,
+    /// one landed a second earlier does not: the cutoff is inclusive, as the
+    /// chain-mode search's is.
+    #[test]
+    fn a_settlement_at_the_cutoff_second_counts_in_the_period() {
+        let rows = vec![
+            row(1, NOW - DAY_SECS - 1, 10, 20, 100),
+            row(2, NOW - DAY_SECS, 20, 40, 200),
+        ];
+        let resp = build(&rows, &[], None, Some(NOW - DAY_SECS));
+        assert_eq!(
+            (resp.last_24h.settlements, resp.last_24h.net_micro_usdc),
+            (1, 20)
+        );
+        let custom = resp.since.expect("asked for");
+        assert_eq!((custom.settlements, custom.net_micro_usdc), (1, 20));
+        assert_eq!(resp.last_7d.settlements, 2);
+    }
+
+    #[test]
+    fn a_since_request_fills_the_fourth_period() {
+        let since = NOW - 10 * DAY_SECS;
+        let resp = build(&rows(), &[], None, Some(since));
+        let custom = resp.since.expect("asked for");
+        assert_eq!(
+            (custom.from_unix, custom.settlements, custom.net_micro_usdc),
+            (since, 2, 60)
+        );
+    }
+
+    #[test]
+    fn an_empty_ledger_has_no_start_and_zero_periods() {
+        let resp = build(&[], &[], None, None);
+        assert_eq!(resp.ledger_since_unix, None);
+        assert_eq!(resp.last_settlement, None);
+        let all = &resp.since_ledger_start;
+        assert_eq!(
+            (
+                all.from_unix,
+                all.settlements,
+                all.net_micro_usdc,
+                all.bytes_settled
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn last_settlement_is_by_block_not_by_timestamp() {
+        // The higher block carries a wall-clock fallback stamp that is older.
+        let rows = vec![row(10, NOW - 10, 1, 1, 1), row(20, NOW - 5_000, 2, 2, 2)];
+        let resp = build(&rows, &[], None, None);
+        assert_eq!(resp.last_settlement.map(|l| l.block_number), Some(20));
+    }
+
+    #[test]
+    fn pending_splits_redeemable_from_stranded() {
+        let operator = Address::repeat_byte(0xEE); // `mk_lane`'s provider
+        let mut paid_in_part = mk_lane(1, 1, 1_000);
+        paid_in_part.paid_cumulative = U256::from(400u64);
+        let mut paid_in_full = mk_lane(1, 2, 700);
+        paid_in_full.paid_cumulative = U256::from(700u64);
+        let untouched = mk_lane(2, 3, 250);
+        // A watermark above the claim (a replayed older state) saturates to 0.
+        let mut over_paid = mk_lane(2, 4, 100);
+        over_paid.paid_cumulative = U256::from(500u64);
+        // An expired capability: the contract pays 0, so no sweep collects it.
+        let mut expired = mk_lane(3, 5, 80);
+        expired.expiry = NOW - 1;
+        // A lane another provider holds (left from a key rotation).
+        let mut foreign = mk_lane(3, 6, 30);
+        foreign.provider = Address::repeat_byte(0x99);
+        let lanes = [
+            paid_in_part,
+            paid_in_full,
+            untouched,
+            over_paid,
+            expired,
+            foreign,
+        ];
+        let resp = build(&[], &lanes, Some(operator), None);
+        assert_eq!(
+            resp.operator_address.as_deref(),
+            Some(operator.to_string().as_str())
+        );
+        let pending = resp.pending.expect("daemon mode reports pending");
+        assert_eq!((pending.micro_usdc, pending.lanes), (600 + 250, 2));
+        assert_eq!(
+            (pending.stranded_micro_usdc, pending.stranded_lanes),
+            (80 + 30, 2)
+        );
+        assert_eq!(pending.next_sweep_at_unix, None, "no redeemer published");
+        assert_eq!(pending.last_sweep_at_unix, None);
+    }
+
+    /// After `rotate-key eth` the ledger still holds the old address's rows;
+    /// they are neither summed nor the "since" date nor the last settlement.
+    #[test]
+    fn another_operators_rows_are_left_out() {
+        let ours = Address::repeat_byte(0xEE);
+        let mut theirs = row(1, NOW - 30 * DAY_SECS, 1_000, 2_000, 10);
+        theirs.operator = Address::repeat_byte(0x99);
+        let mut latest_theirs = row(50, NOW - 10, 1_000, 2_000, 10);
+        latest_theirs.operator = Address::repeat_byte(0x99);
+        let rows = vec![theirs, row(2, NOW - 3_600, 40, 80, 400), latest_theirs];
+        let resp = build(&rows, &[], Some(ours), None);
+        assert_eq!(resp.ledger_since_unix, Some(NOW - 3_600));
+        assert_eq!(
+            (
+                resp.since_ledger_start.settlements,
+                resp.since_ledger_start.net_micro_usdc
+            ),
+            (1, 40)
+        );
+        assert_eq!(resp.last_settlement.map(|l| l.block_number), Some(2));
+        // No operator: nothing can be attributed, so every row counts.
+        let all = build(&rows, &[], None, None);
+        assert_eq!(all.since_ledger_start.settlements, 3);
+    }
+
+    #[test]
+    fn pending_without_an_operator_is_all_stranded() {
+        // No seller wallet: nothing can redeem, so nothing is pending.
+        let resp = build(&[], &[mk_lane(1, 1, 1_000)], None, None);
+        let pending = resp.pending.expect("pending");
+        assert_eq!(
+            (pending.micro_usdc, pending.stranded_micro_usdc),
+            (0, 1_000)
+        );
+    }
+}

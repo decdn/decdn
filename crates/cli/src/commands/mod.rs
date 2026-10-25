@@ -11,6 +11,7 @@ pub mod bundle_pull;
 pub(crate) mod buyer_store;
 pub mod chain_ctx;
 pub mod chunker;
+pub(crate) mod civil_time;
 pub mod config;
 pub mod deregister;
 pub mod doctor;

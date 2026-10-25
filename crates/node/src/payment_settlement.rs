@@ -84,7 +84,8 @@ use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::sig_canon::is_high_s;
 use decdn_incentive::{
-    CheckpointKey, KeyedCheckpointStore, LaneKey, LaneState, PoolId, PoolStateStore, StoreError,
+    CheckpointKey, KeyedCheckpointStore, LaneKey, LaneState, PoolId, PoolStateStore,
+    SettlementLedger, StoreError,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -98,6 +99,7 @@ use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
 use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
+use crate::settlement_ledger::{LedgerBackfills, SettlementRecorder};
 use decdn_incentive::payment_pool::SignerAuthorization;
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint only
@@ -288,6 +290,62 @@ pub(crate) fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The redeemer's sweep schedule, published for `admin_v1_earnings` (#2598):
+/// when the last sweep ran and when the next is due. One shared cell, cloned
+/// into the redeemer task and the admin surface. The redeemer publishes after
+/// its skipped first tick, after every sweep, and after a hint-driven
+/// single-lane redemption moves the next serve cutoff; only a sweep sets
+/// `swept_at`.
+#[derive(Clone, Debug, Default)]
+pub struct RedeemSchedule {
+    inner: Arc<Mutex<ScheduleState>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ScheduleState {
+    swept_at: Option<u64>,
+    next_sweep_at: Option<u64>,
+}
+
+impl RedeemSchedule {
+    /// When the next sweep is due, Unix seconds: the earlier of the next
+    /// interval tick and the next serve cutoff. `None` until the redeemer has
+    /// published once, which it does when its first interval starts.
+    #[must_use]
+    pub fn next_sweep_at(&self) -> Option<u64> {
+        self.read().next_sweep_at
+    }
+
+    /// When the last sweep scanned the lanes, Unix seconds. `None` before the
+    /// first sweep of this process.
+    #[must_use]
+    pub fn swept_at(&self) -> Option<u64> {
+        self.read().swept_at
+    }
+
+    fn read(&self) -> ScheduleState {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn publish(&self, swept_at: Option<u64>, next_sweep_at: u64) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.swept_at = swept_at.or(guard.swept_at);
+        guard.next_sweep_at = Some(next_sweep_at);
+    }
+}
+
+/// When the redeemer next sweeps: the earlier of its next interval tick and
+/// the next serve cutoff, if one is scheduled.
+fn next_sweep_at(next_tick_at: u64, next_cutoff: Option<u64>) -> u64 {
+    next_cutoff.map_or(next_tick_at, |cutoff| cutoff.min(next_tick_at))
+}
+
 /// Debounce thresholds for the watcher scan checkpoint (#784). The persisted
 /// checkpoint is only a *floor* for the resume backfill: the resumable watcher's
 /// `resolve_persisted_start` rounds it down by `REORG_MARGIN_BLOCKS` and every
@@ -376,6 +434,14 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     redeem_max_vouchers_per_tx: usize,
     metrics: Arc<Metrics>,
     pool_view: PoolProjection,
+    /// Writes the settlement ledger row for every `redeemMany` that lands
+    /// (#2598); shared with the redeemer task and the `PoolRedeemed` sink.
+    recorder: SettlementRecorder,
+    /// The ledger backfills the `PoolRedeemed` sink has started; shutdown
+    /// drains them so a stop mid-catch-up does not lose their rows.
+    backfills: LedgerBackfills,
+    /// The redeemer's published sweep schedule, read by `admin_v1_earnings`.
+    schedule: RedeemSchedule,
     /// The redemption task handle. Held so shutdown can abort+await it before a
     /// final redeem sweep. `take()`n by [`Self::quiesce_redeemer`]; the [`Drop`]
     /// impl aborts whatever remains. A `std::sync::Mutex` (not `tokio`): the guard
@@ -417,6 +483,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         self_address: Address,
         store: Arc<dyn PoolStateStore>,
         checkpoint_store: Arc<dyn KeyedCheckpointStore>,
+        ledger: Arc<dyn SettlementLedger>,
         handler: Arc<ClientHandler>,
         redeem_threshold: U256,
         redeem_max_vouchers_per_tx: usize,
@@ -428,6 +495,10 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         redeem_rx: mpsc::Receiver<LaneKey>,
     ) -> Result<(Self, Route)> {
         let contract = PaymentPool::new(payment_pool_addr, provider);
+        // One recorder for both ledger writers: the redeemer (receipt in hand)
+        // and the `PoolRedeemed` sink (backfill of a landing it never saw).
+        let recorder = SettlementRecorder::new(ledger, self_address, Arc::clone(&metrics));
+        let schedule = RedeemSchedule::default();
 
         let usdc_token = usdc_self_check(&contract, boot).await?;
         info!(
@@ -448,6 +519,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         // first-ever boot (cold store) anchors at head. `PoolRedeemed` is the
         // single write path for the paid side, so a drained-pool partial pay is
         // recorded exactly — the node never assumes its voucher cleared.
+        let backfills = LedgerBackfills::new(recorder.clone());
         let sink = PoolSettlementSink {
             self_address,
             store: Arc::clone(&store),
@@ -456,6 +528,8 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             redeem_tx: redeem_tx.clone(),
             metrics: Arc::clone(&metrics),
             pool_view: pool_view.clone(),
+            contract: contract.clone(),
+            backfills: backfills.clone(),
         };
         let route = Route {
             addresses: vec![payment_pool_addr],
@@ -496,6 +570,8 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             redeem_rx,
             Arc::clone(&metrics),
             pool_view.clone(),
+            recorder.clone(),
+            schedule.clone(),
         ));
 
         Ok((
@@ -509,10 +585,20 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 redeem_max_vouchers_per_tx,
                 metrics,
                 pool_view,
+                recorder,
+                backfills,
+                schedule,
                 redeemer: std::sync::Mutex::new(Some(redeemer)),
             },
             route,
         ))
+    }
+
+    /// The redeemer's sweep schedule, for `admin_v1_earnings`'s "next sweep
+    /// in" figure (#2598). A clone of the cell the redeemer publishes into.
+    #[must_use]
+    pub fn redeem_schedule(&self) -> RedeemSchedule {
+        self.schedule.clone()
     }
 
     /// Sender the voucher-accept path uses to hint that a lane's accrued claim
@@ -524,9 +610,12 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         self.redeem_tx.clone()
     }
 
-    /// Graceful shutdown: quiesce the redeemer, then run one final best-effort
+    /// Graceful shutdown: quiesce the redeemer, run one final best-effort
     /// redeem sweep bounded by `deadline` so a lane whose chunk has cleared the
-    /// floor is not left un-redeemed across the stop. A pool is owner-closed only,
+    /// floor is not left un-redeemed across the stop, then wait out the ledger
+    /// backfills still in flight within what is left of `deadline`, so the
+    /// rows the poller's checkpoint has already moved past are not lost with
+    /// the process. One `deadline` bounds both. A pool is owner-closed only,
     /// so there is nothing to close here — only redeem.
     ///
     /// The paid-watermark watcher is now the shared multiplexed poller's route,
@@ -538,6 +627,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     /// checkpoint is independent of the lane-state redeem sweep and idempotent to
     /// re-scan, so the two can race without a correctness impact.
     pub async fn shutdown(&self, deadline: Duration) {
+        let started = tokio::time::Instant::now();
         self.quiesce_redeemer().await;
         if tokio::time::timeout(deadline, self.final_redeem_sweep())
             .await
@@ -548,6 +638,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
                 "shutdown redeem deadline elapsed; some lanes left un-redeemed (redeem later)"
             );
         }
+        self.backfills
+            .drain(deadline.saturating_sub(started.elapsed()))
+            .await;
     }
 
     /// One last pass of `redeemMany` chunks over every lane whose chunk clears the
@@ -574,6 +667,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             false,
             &self.metrics,
             &self.pool_view,
+            &self.recorder,
         )
         .await;
     }
@@ -696,7 +790,7 @@ fn settlement_route_topic0s() -> Vec<B256> {
 /// `PoolReclaimed` forget failure is logged and skipped (`Ok`) — the settled lane
 /// owes nothing and the forget is idempotent. An undecodable log is log-and-skip
 /// so a permanently undecodable log never hot-loops the deterministic re-scan.
-struct PoolSettlementSink {
+struct PoolSettlementSink<P: Provider + Clone> {
     self_address: Address,
     store: Arc<dyn PoolStateStore>,
     handler: Arc<ClientHandler>,
@@ -710,9 +804,16 @@ struct PoolSettlementSink {
     /// (drop) into the projection so a serve request reads `{owner, remaining}`
     /// in-memory rather than through a `getPool` `eth_call`.
     pool_view: PoolProjection,
+    /// The `PaymentPool` instance; the backfill's receipt and header reads
+    /// ride its provider.
+    contract: PaymentPool::PaymentPoolInstance<P>,
+    /// Backfills a settlement ledger row (#2598) for an own-provider
+    /// `PoolRedeemed` whose `redeemMany` the redeemer never saw land, each on
+    /// its own task; the service drains them at shutdown.
+    backfills: LedgerBackfills,
 }
 
-impl LogSink for PoolSettlementSink {
+impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
     #[allow(clippy::cognitive_complexity)]
     async fn apply(&mut self, log: Log) -> Result<()> {
         match log.topic0().copied() {
@@ -785,6 +886,8 @@ impl LogSink for PoolSettlementSink {
                         "recorded lane paid watermark from PoolRedeemed"
                     );
                 }
+                // After the watermark writes, and on its own task.
+                self.backfill_ledger(&log, event.poolId);
             }
             Some(sig) if sig == PaymentPool::PoolToppedUp::SIGNATURE_HASH => {
                 let event = match PaymentPool::PoolToppedUp::decode_log_data(&log.inner.data) {
@@ -850,7 +953,27 @@ impl LogSink for PoolSettlementSink {
     }
 }
 
-impl PoolSettlementSink {
+impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
+    /// Ledger backfill (#2598) for an own-provider `PoolRedeemed`: a row for a
+    /// landing the redeemer never saw (a receipt wait that timed out, or a
+    /// landing across a restart). A transaction already in the ledger costs
+    /// one ledger read and no RPC. The backfill runs on its own task
+    /// ([`LedgerBackfills`]): the poller awaits every route's sink in turn,
+    /// and a receipt or header read that waits out its timeout must not hold
+    /// up the paid watermarks, the blacklist or the slash watcher.
+    fn backfill_ledger(&self, log: &Log, pool_id: PoolId) {
+        if let (Some(tx), Some(block)) = (log.transaction_hash, log.block_number) {
+            self.backfills
+                .spawn(self.contract.provider().clone(), block, tx);
+        } else {
+            warn!(
+                %pool_id,
+                "PoolRedeemed log names no transaction or block; no settlement ledger backfill"
+            );
+            self.metrics.settlement_ledger_skipped_row();
+        }
+    }
+
     /// Whether this node provides a lane of `pool_id` that is owed more than the
     /// chain has paid it — revenue that must redeem inside the grace window. A
     /// store read failure answers `false`: the counter this feeds is advisory.
@@ -1364,13 +1487,19 @@ async fn redeemer_loop<P: Provider + Clone>(
     mut redeem_rx: mpsc::Receiver<LaneKey>,
     metrics: Arc<Metrics>,
     pool_view: PoolProjection,
+    recorder: SettlementRecorder,
+    schedule: RedeemSchedule,
 ) {
     let mut ticker = tokio::time::interval(redeem_interval);
+    let interval_secs = redeem_interval.as_secs();
     // Skip the immediate first tick: new vouchers hint anyway, and the first
     // sweep waits one interval. A lane persisted before a restart whose claim
     // cannot wait that long gets its cutoff sweep instead: no scan has run yet,
     // so a cutoff that passed while the node was down is due at once.
     ticker.tick().await;
+    // When the ticker fires next, for the published schedule. The ticker runs
+    // on its own clock, so a cutoff sweep between ticks does not move it.
+    let mut next_tick_at = unix_now().saturating_add(interval_secs);
     let mut swept_at = 0;
     let mut parked: HashSet<LaneKey> = HashSet::new();
     let mut next_cutoff = load_lanes(store.as_ref()).and_then(|states| {
@@ -1383,6 +1512,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             unix_now(),
         )
     });
+    schedule.publish(None, next_sweep_at(next_tick_at, next_cutoff));
     loop {
         tokio::select! {
             hint = redeem_rx.recv() => match hint {
@@ -1393,19 +1523,24 @@ async fn redeemer_loop<P: Provider + Clone>(
                     }
                     let outcome = redeem_one(
                         &contract, &store, &paid, self_address, margin_secs, swept_at,
-                        redeem_threshold, max_vouchers, key, &metrics, &pool_view,
+                        redeem_threshold, max_vouchers, key, &metrics, &pool_view, &recorder,
                     )
                     .await;
                     if outcome.chain_fault {
                         park_lane(&mut parked, key);
                     }
                     next_cutoff = next_cutoff.into_iter().chain(outcome.wake).min();
+                    // A hint can pull the next cutoff forward; the published
+                    // schedule follows it. Not a sweep, so `swept_at` stays.
+                    schedule.publish(None, next_sweep_at(next_tick_at, next_cutoff));
                     continue;
                 }
                 // All hint senders dropped — the service is going away.
                 None => break,
             },
-            _ = ticker.tick() => {}
+            _ = ticker.tick() => {
+                next_tick_at = unix_now().saturating_add(interval_secs);
+            }
             () = sleep_until_unix(next_cutoff) => {}
         }
         // A tick or a cutoff: sweep every lane, and schedule the next cutoff
@@ -1416,6 +1551,10 @@ async fn redeemer_loop<P: Provider + Clone>(
         // stays.
         let Some(states) = load_lanes(store.as_ref()) else {
             next_cutoff = next_cutoff.filter(|wake| *wake > unix_now());
+            schedule.publish(
+                (swept_at > 0).then_some(swept_at),
+                next_sweep_at(next_tick_at, next_cutoff),
+            );
             continue;
         };
         swept_at = unix_now();
@@ -1427,6 +1566,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             swept_at,
             swept_at,
         );
+        schedule.publish(Some(swept_at), next_sweep_at(next_tick_at, next_cutoff));
         let chain_fault = redeem_sweep(
             &contract,
             &store,
@@ -1438,6 +1578,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             true,
             &metrics,
             &pool_view,
+            &recorder,
         )
         .await;
         // Release the parked lanes only after a sweep without a chain fault. A
@@ -1628,7 +1769,7 @@ fn partition_redeemable(
 /// [`REDEEM_LANDING_SLACK_SECS`] of `now`, so a redemption planned now would land
 /// on an expired capability and pay 0. `0` means no tracked expiry and never
 /// expires.
-const fn capability_expired(expiry: u64, now: u64) -> bool {
+pub(crate) const fn capability_expired(expiry: u64, now: u64) -> bool {
     expiry != 0 && now.saturating_add(REDEEM_LANDING_SLACK_SECS) >= expiry
 }
 
@@ -1990,6 +2131,7 @@ async fn redeem_one<P: Provider + Clone>(
     key: LaneKey,
     metrics: &Arc<Metrics>,
     pool_view: &PoolProjection,
+    recorder: &SettlementRecorder,
 ) -> HintOutcome {
     let st = match store.get(key) {
         Ok(Some(st)) => st,
@@ -2014,6 +2156,7 @@ async fn redeem_one<P: Provider + Clone>(
         max_vouchers,
         true,
         metrics,
+        recorder,
     )
     .await;
     HintOutcome { wake, chain_fault }
@@ -2049,6 +2192,7 @@ async fn redeem_sweep<P: Provider + Clone>(
     strict_flush: bool,
     metrics: &Arc<Metrics>,
     pool_view: &PoolProjection,
+    recorder: &SettlementRecorder,
 ) -> bool {
     let plans = plan_lanes(paid, self_address, states, metrics, pool_view, unix_now());
     // Publish the pending-redemption total once per sweep. This is the whole
@@ -2075,6 +2219,7 @@ async fn redeem_sweep<P: Provider + Clone>(
         max_vouchers,
         strict_flush,
         metrics,
+        recorder,
     )
     .await
 }
@@ -2123,6 +2268,7 @@ async fn submit_chunk<P: Provider + Clone>(
     lanes: Vec<PlannedLane>,
     signer: Address,
     metrics: &Arc<Metrics>,
+    recorder: &SettlementRecorder,
     depth: u32,
 ) -> bool {
     if lanes.is_empty() {
@@ -2153,6 +2299,9 @@ async fn submit_chunk<P: Provider + Clone>(
                 "batched lane redemption landed (redeemMany)"
             );
             record_landed_chunk(contract, store, &lanes, metrics).await;
+            // The ledger row for `decdn node earnings` (#2598): the receipt
+            // carries the router's `Settled` and the operator's USDC transfer.
+            recorder.record_landed(contract.provider(), &receipt).await;
             return false;
         }
         // The chunk may have broadcast, and re-sending its lanes in halves is
@@ -2171,7 +2320,8 @@ async fn submit_chunk<P: Provider + Clone>(
                 "redeemMany send rejected oversized; halving chunk and retrying; lower \
                  blockchain.redeem_max_vouchers_per_tx if this repeats every sweep"
             );
-            return submit_halves(contract, store, lanes, signer, metrics, depth + 1).await;
+            return submit_halves(contract, store, lanes, signer, metrics, recorder, depth + 1)
+                .await;
         }
         TxOutcome::Reverted(receipt) => {
             record_tx_failure(&span, "reverted", Some(receipt.transaction_hash));
@@ -2221,12 +2371,18 @@ async fn submit_halves<P: Provider + Clone>(
     mut lanes: Vec<PlannedLane>,
     signer: Address,
     metrics: &Arc<Metrics>,
+    recorder: &SettlementRecorder,
     depth: u32,
 ) -> bool {
     let right = lanes.split_off(lanes.len() / 2);
-    let left_faulted = Box::pin(submit_chunk(contract, store, lanes, signer, metrics, depth)).await;
-    let right_faulted =
-        Box::pin(submit_chunk(contract, store, right, signer, metrics, depth)).await;
+    let left_faulted = Box::pin(submit_chunk(
+        contract, store, lanes, signer, metrics, recorder, depth,
+    ))
+    .await;
+    let right_faulted = Box::pin(submit_chunk(
+        contract, store, right, signer, metrics, recorder, depth,
+    ))
+    .await;
     left_faulted || right_faulted
 }
 
@@ -2574,6 +2730,7 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     max_vouchers: usize,
     strict_flush: bool,
     metrics: &Arc<Metrics>,
+    recorder: &SettlementRecorder,
 ) -> bool {
     // Apply the floor on the cached total before any chain read.
     if plans.is_empty() || sum_unredeemed(&plans) < floor {
@@ -2594,7 +2751,7 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
         }
         let mut faulted = read_failed;
         for chunk in chunks {
-            faulted |= submit_chunk(contract, store, chunk, signer, metrics, 0).await;
+            faulted |= submit_chunk(contract, store, chunk, signer, metrics, recorder, 0).await;
         }
         faulted
     }

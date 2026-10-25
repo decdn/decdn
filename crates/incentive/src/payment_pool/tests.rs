@@ -376,3 +376,24 @@ fn signer_authorization_covers_a_floor_within_headroom_and_expiry() {
     assert!(!auth.covers(U256::from(1u64), 100), "expired at its expiry");
     assert!(SignerAuthorization::Unregistered.covers(U256::MAX, u64::MAX));
 }
+
+/// Pins the `FeeRouter.Settled` event signature to
+/// `contracts/src/FeeRouter.sol`, so a drift fails here instead of silently
+/// mis-decoding the settlement ledger's receipts and the earnings scan.
+#[test]
+fn fee_router_settled_signature_matches_contract() {
+    assert_eq!(
+        super::FeeRouter::Settled::SIGNATURE,
+        "Settled(address,uint256,uint256,uint64)"
+    );
+}
+
+/// Pins the ERC-20 `Transfer` signature the settlement ledger reads the
+/// operator's net payout from.
+#[test]
+fn erc20_transfer_signature_is_the_standard_one() {
+    assert_eq!(
+        crate::erc20::Erc20::Transfer::SIGNATURE,
+        "Transfer(address,address,uint256)"
+    );
+}

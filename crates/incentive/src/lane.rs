@@ -405,6 +405,16 @@ impl LaneState {
         self.live_claim().map_or(U256::ZERO, |c| c.value())
     }
 
+    /// What this lane is owed that the chain has not paid: [`Self::owed`]
+    /// minus the paid watermark, saturating. The figure the redeemer collects,
+    /// the pending total `admin_v1_earnings` reports and the value a
+    /// deployment rebind forfeits. Saturating because a chain-extended
+    /// redemption can leave `paid_cumulative` above the signed claim.
+    #[must_use]
+    pub fn unredeemed(&self) -> U256 {
+        self.owed().saturating_sub(self.paid_cumulative)
+    }
+
     /// Adopt a chain from a voucher that did **not** advance the money — the
     /// already-satisfied case (ADR 003 §Voucher ordering).
     ///

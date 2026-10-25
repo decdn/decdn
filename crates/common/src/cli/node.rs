@@ -54,6 +54,14 @@ pub enum NodeCommand {
     /// liquidity risk — without scraping metrics or reading logs. Same
     /// admin-URL resolution and timeout semantics as `decdn node health`.
     Lanes(LanesArgs),
+    /// Print what the node has earned (#2598): settled USDC, bytes and
+    /// settlement counts over the last 24 hours, the last 7 days and the
+    /// whole settlement ledger, the most recent settlement, and what the
+    /// lanes still owe with the time of the next redeem sweep. Reads
+    /// `admin_v1_earnings` on the running node; with `--address` it reads
+    /// the chain alone (no daemon, no pending section), scanning
+    /// `FeeRouter.Settled` for that operator.
+    Earnings(EarningsArgs),
     /// Print every slash the node's watcher has detected against its own
     /// operator via `admin_v1_slashes` (#1032, G-NODE-05): per slash the
     /// `slashId`, offense type, amount, evidence digest, block, and the
@@ -320,6 +328,74 @@ pub struct LanesArgs {
     /// Roundtrip timeout in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
+}
+
+/// `decdn node earnings` — settled and owed USDC per period (#2598), via
+/// `admin_v1_earnings` or, with `--address`, from the chain alone. Same
+/// admin-URL resolution and timeout semantics as `decdn node health` in
+/// daemon mode.
+#[derive(Args, Debug)]
+pub struct EarningsArgs {
+    /// Base URL of the node's admin HTTP surface.
+    ///
+    /// Also read from `DECDN_ADMIN_URL` when unset; clap folds the env
+    /// var into this field. If still unset, the admin port is derived
+    /// from `observability.admin_port` in the config file (see
+    /// `--config`). Example: `http://127.0.0.1:9191`. Unused with
+    /// `--address`.
+    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
+    pub admin_url: Option<String>,
+
+    /// Path to the TOML config file. In daemon mode it derives the admin
+    /// URL when `--admin-url` / `DECDN_ADMIN_URL` are unset; in `--address`
+    /// mode it supplies `blockchain.rpc_url`,
+    /// `blockchain.payment_pool_address`, `blockchain.chain_id` and
+    /// `blockchain.get_logs_max_block_span`. Takes precedence over the
+    /// top-level `decdn --config`; if neither is set, resolution falls
+    /// through to `~/.decdn/node.toml`.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Emit the response body as JSON instead of the human-readable table.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Roundtrip timeout in milliseconds for the admin call (daemon mode).
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+
+    /// Add a period that starts here: a UTC date `YYYY-MM-DD` (midnight) or
+    /// Unix seconds, 2000-01-01 or later (a smaller integer is read as a
+    /// date typed without its dashes and refused).
+    #[arg(long, value_name = "DATE|UNIX")]
+    pub since: Option<String>,
+
+    /// Read the chain instead of the daemon, for this operator address
+    /// (`0x…`). Scans `FeeRouter.Settled` from the deployment's first block
+    /// (or `--from-block`) to head, so it needs no running node and works for
+    /// any operator, but
+    /// it sees no lane state: the pending line is omitted. Slow on an RPC
+    /// that caps `eth_getLogs` windows (the free tiers do); progress prints
+    /// to stderr.
+    #[arg(long, value_name = "ADDRESS")]
+    pub address: Option<String>,
+
+    /// `--address` mode: JSON-RPC endpoint. Overrides `blockchain.rpc_url`;
+    /// falls back to the known chain's public endpoint.
+    #[arg(long, value_name = "URL", requires = "address")]
+    pub rpc_url: Option<String>,
+
+    /// `--address` mode: `PaymentPool` address, from which the `FeeRouter` is
+    /// read. Overrides `blockchain.payment_pool_address`; falls back to the
+    /// known chain's deployment manifest.
+    #[arg(long, value_name = "ADDRESS", requires = "address")]
+    pub payment_pool_address: Option<String>,
+
+    /// `--address` mode: first L2 block to scan. Defaults to the known
+    /// chain's deployment block. Raise it to shorten the scan when the
+    /// earlier history does not matter.
+    #[arg(long, value_name = "BLOCK", requires = "address")]
+    pub from_block: Option<u64>,
 }
 
 /// `decdn node slashes` — list detected slashes against this node's
