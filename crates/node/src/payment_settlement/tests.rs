@@ -4057,3 +4057,116 @@ mod redeem_schedule {
         Ok(())
     }
 }
+
+mod settlement_ledger_rows {
+    use alloy::sol_types::{SolCall, SolEvent};
+    use decdn_incentive::erc20::Erc20;
+    use decdn_incentive::payment_pool::FeeRouter;
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt};
+    use decdn_incentive::{MemorySettlementLedger, SettlementLedger};
+
+    use super::*;
+
+    const ROUTER: Address = Address::repeat_byte(0xF0);
+
+    fn log(address: Address, data: alloy::primitives::LogData, log_index: u64) -> Log {
+        Log {
+            inner: alloy::primitives::Log { address, data },
+            block_hash: None,
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: Some(log_index),
+            removed: false,
+        }
+    }
+
+    /// Drive one `redeem_planned_lanes` cycle whose single `redeemMany` lands
+    /// with `logs` in its receipt, against a ledger the test can read back.
+    async fn land_with(
+        logs: Vec<Log>,
+        head_timestamp: Option<u64>,
+    ) -> Result<(Arc<MemorySettlementLedger>, Arc<Metrics>)> {
+        let metrics = Arc::new(Metrics::new());
+        let ledger = Arc::new(MemorySettlementLedger::default());
+        let recorder = SettlementRecorder::new(
+            Arc::clone(&ledger) as Arc<dyn SettlementLedger>,
+            SELLER,
+            Arc::clone(&metrics),
+        );
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        let watermarks = PaymentPool::getWatermarksCall::abi_encode_returns(&vec![lane(0)]);
+        let mut rpc = ScriptedRpc::mined(mined_receipt(Address::ZERO, logs))
+            .answering_calls([Bytes::from(watermarks)]);
+        if let Some(timestamp) = head_timestamp {
+            rpc = rpc.at_head(timestamp);
+        }
+        let contract = PaymentPool::new(Address::ZERO, rpc.provider());
+        let faulted = redeem_planned_lanes(
+            &contract,
+            &store,
+            vec![planned(1, 0, 1_000, false)],
+            SELLER,
+            U256::from(1u64),
+            300,
+            false,
+            &metrics,
+            &recorder,
+        )
+        .await;
+        anyhow::ensure!(!faulted, "the redeem landed");
+        Ok((ledger, metrics))
+    }
+
+    /// The Landed arm of `submit_chunk` writes the ledger row: gross, bytes
+    /// and epoch from `Settled`, net from the router's transfer, the block
+    /// time from the header.
+    #[tokio::test]
+    async fn a_landed_redeem_writes_its_ledger_row() -> Result<()> {
+        let settled = FeeRouter::Settled {
+            operator: SELLER,
+            bytesDelivered: U256::from(4_096u64),
+            amount: U256::from(1_000u64),
+            epoch: 7,
+        };
+        let transfer = Erc20::Transfer {
+            from: ROUTER,
+            to: SELLER,
+            value: U256::from(600u64),
+        };
+        let logs = vec![
+            log(Address::repeat_byte(0xA0), transfer.encode_log_data(), 2),
+            log(ROUTER, settled.encode_log_data(), 3),
+        ];
+        let (ledger, _metrics) = land_with(logs, Some(1_700_000_000)).await?;
+        let rows = ledger.load_settlements()?;
+        anyhow::ensure!(rows.len() == 1, "one row per landed redeemMany: {rows:?}");
+        let row = rows.first().ok_or_else(|| anyhow::anyhow!("one row"))?;
+        assert_eq!((row.block_number, row.log_index), (1, 3));
+        assert_eq!((row.gross_micro_usdc, row.net_micro_usdc), (1_000, 600));
+        assert_eq!((row.bytes_delivered, row.epoch), (4_096, 7));
+        assert_eq!(row.landed_at_unix, 1_700_000_000);
+        Ok(())
+    }
+
+    /// A `redeemMany` that paid nothing lands with no logs: no row, no header
+    /// read (the scripted transport parks one forever), no skip counted.
+    #[tokio::test]
+    async fn a_zero_pay_landing_writes_no_row_and_reads_no_header() -> Result<()> {
+        let started = std::time::Instant::now();
+        let (ledger, metrics) = land_with(Vec::new(), None).await?;
+        anyhow::ensure!(
+            started.elapsed() < Duration::from_secs(5),
+            "a zero-pay landing must not wait on a block header"
+        );
+        anyhow::ensure!(ledger.load_settlements()?.is_empty());
+        ensure_metric_lines(
+            &metrics,
+            &[
+                "decdn_settlement_ledger_skipped_rows_total 0",
+                "decdn_settlement_ledger_write_failures_total 0",
+            ],
+        )
+    }
+}

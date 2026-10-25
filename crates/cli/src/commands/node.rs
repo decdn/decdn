@@ -622,32 +622,52 @@ pub async fn earnings(
     Ok(())
 }
 
-/// `decdn setup`'s closing read (#2598): the running node's earnings when a
-/// daemon answers `admin_v1_earnings` within `timeout`, else `None`. Every
-/// failure is `None`: no daemon, no config, no ledger. The admin URL resolves
-/// from `DECDN_ADMIN_PORT`, else the config file's `observability.admin_port`,
+/// `decdn setup`'s closing read (#2598): the running node's earnings.
+/// `Ok(Some)` when a daemon answered `admin_v1_earnings` within `timeout`;
+/// `Ok(None)` when none did (no daemon, no config, a connection refused or
+/// timed out), which `setup` passes over in silence; `Err(reason)` when a
+/// daemon answered with an error (no ledger wired, a ledger that does not
+/// decode), which `setup` prints, because an operator re-running it on a
+/// working node must hear that. The admin URL resolves from
+/// `DECDN_ADMIN_PORT`, else the config file's `observability.admin_port`,
 /// else the default port; `DECDN_ADMIN_URL` is not read here.
 pub(crate) async fn earned_so_far(
     config_path: Option<&Path>,
     timeout: Duration,
-) -> Option<EarningsResponse> {
-    let url = resolve_admin_url(None, config_path).ok()?;
-    let client = HttpClientBuilder::default()
+) -> Result<Option<EarningsResponse>, String> {
+    let Ok(url) = resolve_admin_url(None, config_path) else {
+        return Ok(None);
+    };
+    let Ok(client) = HttpClientBuilder::default()
         .request_timeout(timeout)
         .build(&url)
-        .ok()?;
-    client.earnings(EarningsRequest::default()).await.ok()
+    else {
+        return Ok(None);
+    };
+    match client.earnings(EarningsRequest::default()).await {
+        Ok(resp) => Ok(Some(resp)),
+        Err(JsonRpcClientError::Call(err)) => Err(first_line(&err.to_string())),
+        Err(_) => Ok(None),
+    }
 }
 
 /// The `earned_so_far=` line `decdn setup` closes with: the whole-ledger net
-/// figure, or `None` when there is no response to read it from.
-pub(crate) fn earned_so_far_line(earnings: Option<&EarningsResponse>) -> Option<String> {
-    let all = &earnings?.since_ledger_start;
-    Some(format!(
-        "earned_so_far={} USDC settlements={}",
-        format_usdc(all.net_micro_usdc),
-        all.settlements
-    ))
+/// figure, the daemon's error, or `None` when no daemon answered.
+pub(crate) fn earned_so_far_line(
+    earnings: &Result<Option<EarningsResponse>, String>,
+) -> Option<String> {
+    match earnings {
+        Ok(Some(resp)) => {
+            let all = &resp.since_ledger_start;
+            Some(format!(
+                "earned_so_far={} USDC settlements={}",
+                format_usdc(all.net_micro_usdc),
+                all.settlements
+            ))
+        }
+        Ok(None) => None,
+        Err(reason) => Some(format!("earned_so_far=unavailable reason={reason:?}")),
+    }
 }
 
 /// Write the earnings report to `w`: a `key=value` header, the per-period

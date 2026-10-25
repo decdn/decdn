@@ -1016,7 +1016,7 @@ impl AdminRpcServer for AdminRpcImpl {
             )
         })?
         .map_err(|message| {
-            tracing::error!(error = %message, "admin_v1_earnings could not read the seller store");
+            tracing::error!(error = %message, "admin_v1_earnings load failed");
             ErrorObjectOwned::owned(POOL_STORE_ERROR_CODE, message, None::<()>)
         })?;
         Ok(build_earnings_response(

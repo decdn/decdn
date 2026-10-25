@@ -180,8 +180,10 @@ mod scan {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let filter = Filter::new().address(Address::repeat_byte(0x11));
         let mut ends = Vec::new();
-        let logs = scan_logs(&provider, &filter, 0, 29, ceiling(10), |end, to| {
-            ends.push((end, to));
+        let logs = scan_logs(&provider, &filter, 0, 29, ceiling(10), |event| {
+            if let ScanEvent::Window { end, to } = event {
+                ends.push((end, to));
+            }
         })
         .await
         .expect("scan");
@@ -199,7 +201,7 @@ mod scan {
         asserter.push_failure_msg("ranges over 0 blocks are not supported");
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let filter = Filter::new().address(Address::repeat_byte(0x11));
-        let err = scan_logs(&provider, &filter, 7, 7, ceiling(10), |_, _| {})
+        let err = scan_logs(&provider, &filter, 7, 7, ceiling(10), |_| {})
             .await
             .expect_err("a one-block rejection cannot shrink");
         assert!(
@@ -217,12 +219,18 @@ mod scan {
         }
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let filter = Filter::new().address(Address::repeat_byte(0x11));
-        let err = scan_logs(&provider, &filter, 0, 99, ceiling(10), |_, _| {})
-            .await
-            .expect_err("not a range rejection");
+        let mut retries = Vec::new();
+        let err = scan_logs(&provider, &filter, 0, 99, ceiling(10), |event| {
+            if let ScanEvent::Retry { attempt, .. } = event {
+                retries.push(attempt);
+            }
+        })
+        .await
+        .expect_err("not a range rejection");
         let text = format!("{err:#}");
         assert!(text.contains("eth_getLogs [0, 9]"), "{text}");
         assert!(text.contains("blocks below 0 were scanned"), "{text}");
+        assert_eq!(retries, vec![1, 2, 3], "every retry is reported");
     }
 
     #[tokio::test(start_paused = true)]
@@ -234,8 +242,10 @@ mod scan {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let filter = Filter::new().address(Address::repeat_byte(0x11));
         let mut ends = Vec::new();
-        scan_logs(&provider, &filter, 0, 19, ceiling(10), |end, _| {
-            ends.push(end);
+        scan_logs(&provider, &filter, 0, 19, ceiling(10), |event| {
+            if let ScanEvent::Window { end, .. } = event {
+                ends.push(end);
+            }
         })
         .await
         .expect("the second window succeeds on retry");
@@ -247,7 +257,7 @@ mod scan {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let filter = Filter::new().address(Address::repeat_byte(0x11));
-        let logs = scan_logs(&provider, &filter, 10, 9, ceiling(10), |_, _| {
+        let logs = scan_logs(&provider, &filter, 10, 9, ceiling(10), |_| {
             panic!("no window");
         })
         .await

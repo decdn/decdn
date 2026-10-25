@@ -182,13 +182,40 @@ pub const SCAN_WINDOW_RETRIES: u32 = 3;
 /// the free tiers.
 pub const SCAN_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// What a [`scan_logs`] caller hears about as the scan runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanEvent {
+    /// A window was accepted: its last block, and the scan's last block.
+    Window {
+        /// The accepted window's last block.
+        end: u64,
+        /// The scan's last block.
+        to: u64,
+    },
+    /// A window failed for a reason other than its range and is about to be
+    /// retried after `delay`.
+    Retry {
+        /// The window's first block.
+        start: u64,
+        /// The window's last block.
+        end: u64,
+        /// Which retry this is, from 1.
+        attempt: u32,
+        /// The sleep before it.
+        delay: Duration,
+        /// The failure, one line.
+        error: String,
+    },
+}
+
 /// Fetch every log `filter` matches in `[from, to]`, one window at a time,
 /// starting at `ceiling` blocks per window. A window the provider rejects as
 /// too wide is retried at half its length; after enough accepted windows the
 /// span doubles back. Any other failure of a window is retried
-/// [`SCAN_WINDOW_RETRIES`] times with a doubling delay. `on_window` runs after
-/// each accepted window with the window's last block and `to`, for progress
-/// output. The logs come back in request order, which is chain order.
+/// [`SCAN_WINDOW_RETRIES`] times with a doubling delay. `on_event` hears each
+/// accepted window and each retry ([`ScanEvent`]), for progress output; a
+/// retry is also a `tracing` warning. The logs come back in request order,
+/// which is chain order.
 ///
 /// # Errors
 ///
@@ -201,7 +228,7 @@ pub async fn scan_logs<P: Provider>(
     from: u64,
     to: u64,
     ceiling: NonZeroU64,
-    mut on_window: impl FnMut(u64, u64),
+    mut on_event: impl FnMut(ScanEvent),
 ) -> anyhow::Result<Vec<Log>> {
     let mut span = WindowSpan::new(ceiling);
     let mut logs = Vec::new();
@@ -219,7 +246,7 @@ pub async fn scan_logs<P: Provider>(
                 logs.extend(batch);
                 let _regrown = span.record_success();
                 retries = 0;
-                on_window(end, to);
+                on_event(ScanEvent::Window { end, to });
                 start = end.saturating_add(1);
                 if end == u64::MAX {
                     break;
@@ -234,9 +261,25 @@ pub async fn scan_logs<P: Provider>(
                     ));
                 }
             }
-            Err(_) if retries < SCAN_WINDOW_RETRIES => {
-                tokio::time::sleep(SCAN_WINDOW_RETRY_DELAY * 2u32.pow(retries)).await;
+            Err(err) if retries < SCAN_WINDOW_RETRIES => {
+                let delay = SCAN_WINDOW_RETRY_DELAY * 2u32.pow(retries);
                 retries += 1;
+                let error = format!("{err:#}");
+                tracing::warn!(
+                    error,
+                    start,
+                    end,
+                    attempt = retries,
+                    "eth_getLogs window failed; retrying"
+                );
+                on_event(ScanEvent::Retry {
+                    start,
+                    end,
+                    attempt: retries,
+                    delay,
+                    error,
+                });
+                tokio::time::sleep(delay).await;
             }
             Err(err) => {
                 return Err(err.context(format!(

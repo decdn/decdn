@@ -471,9 +471,9 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     let earnings = node::earned_so_far(config_path, EARNINGS_TIMEOUT).await;
     if json {
         let mut summary = summary(Some(&readiness));
-        attach_earnings(&mut summary, earnings.as_ref());
+        attach_earnings(&mut summary, &earnings);
         println!("{summary}");
-    } else if let Some(line) = node::earned_so_far_line(earnings.as_ref()) {
+    } else if let Some(line) = node::earned_so_far_line(&earnings) {
         println!("  {line}");
     }
 
@@ -486,15 +486,18 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
 const EARNINGS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Add the `earnings` key to the `--json` summary object: the
-/// `admin_v1_earnings` response when a daemon answered, else `null`.
+/// `admin_v1_earnings` response when a daemon answered, `{"error": …}` when
+/// it answered with an error, else `null`.
 fn attach_earnings(
     summary: &mut serde_json::Value,
-    earnings: Option<&decdn_common::admin::EarningsResponse>,
+    earnings: &Result<Option<decdn_common::admin::EarningsResponse>, String>,
 ) {
     if let serde_json::Value::Object(map) = summary {
-        let value = earnings
-            .and_then(|e| serde_json::to_value(e).ok())
-            .unwrap_or(serde_json::Value::Null);
+        let value = match earnings {
+            Ok(Some(resp)) => serde_json::to_value(resp).unwrap_or(serde_json::Value::Null),
+            Ok(None) => serde_json::Value::Null,
+            Err(reason) => serde_json::json!({ "error": reason }),
+        };
         map.insert("earnings".to_owned(), value);
     }
 }

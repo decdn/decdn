@@ -420,7 +420,7 @@ mod earnings_key {
     #[test]
     fn attach_earnings_adds_null_without_a_daemon_and_the_response_with_one() {
         let mut summary = serde_json::json!({ "partial": false, "keys_generated": true });
-        attach_earnings(&mut summary, None);
+        attach_earnings(&mut summary, &Ok(None));
         assert!(summary["earnings"].is_null());
         assert_eq!(
             summary["partial"],
@@ -438,12 +438,14 @@ mod earnings_key {
             last_settlement: None,
             pending: None,
         };
-        attach_earnings(&mut summary, Some(&resp));
+        attach_earnings(&mut summary, &Ok(Some(resp)));
         assert_eq!(
             summary["earnings"]["since_ledger_start"]["net_micro_usdc"],
             3
         );
         assert_eq!(summary["earnings"]["ledger_since_unix"], 5);
         assert!(summary["earnings"]["since"].is_null());
+        attach_earnings(&mut summary, &Err("ledger corrupt".to_owned()));
+        assert_eq!(summary["earnings"]["error"], "ledger corrupt");
     }
 }

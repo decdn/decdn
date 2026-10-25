@@ -323,17 +323,10 @@ mod recorder {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let ledger = Arc::new(MemorySettlementLedger::default());
         let rec = recorder(ledger.clone());
-        // One unrelated log, stamped so no header read is needed.
-        let mut quiet = receipt(
-            Some(900),
-            vec![transfer(
-                Address::repeat_byte(0x77),
-                OPERATOR,
-                U256::from(1),
-                0,
-            )],
-        );
-        stamp_logs(&mut quiet, 1_700_000_000);
+        // No logs at all, as a re-sent batch at its watermark produces, and
+        // nothing queued on the provider: a header read would fail loudly, and
+        // on a real RPC it could stall the redeemer for the call timeout.
+        let quiet = receipt(Some(900), vec![]);
         rec.record_landed(&provider, &quiet).await;
         assert!(ledger.load_settlements().expect("ledger").is_empty());
         assert_eq!(
@@ -357,12 +350,19 @@ mod recorder {
         assert_eq!(ledger.load_settlements().expect("ledger").len(), 1);
         rec.backfill(&provider, 900, tx).await;
         assert_eq!(ledger.load_settlements().expect("ledger").len(), 1);
+        assert_eq!(
+            counter(&rec.metrics, "decdn_settlement_ledger_skipped_rows"),
+            0,
+            "a re-fetch against the empty queue would have been counted as a skip"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn backfill_of_a_receipt_the_rpc_lacks_writes_nothing() {
         let asserter = Asserter::new();
-        asserter.push_success(&Option::<TransactionReceipt>::None);
+        for _ in 0..=HEADER_READ_RETRIES {
+            asserter.push_success(&Option::<TransactionReceipt>::None);
+        }
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let ledger = Arc::new(MemorySettlementLedger::default());
         let rec = recorder(ledger.clone());

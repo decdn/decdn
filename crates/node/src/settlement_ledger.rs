@@ -9,8 +9,9 @@
 //! voucher at or below its lane's watermark, as after a re-send of a batch
 //! that had already landed) skips the router: it lands with no `Settled` and
 //! no `PoolRedeemed`, and gets no row. Decoding the receipt costs no extra RPC;
-//! the one read is the block header, for the row's timestamp, and only when
-//! the receipt's logs do not carry it.
+//! the redeemer's one read is the block header, for the row's timestamp, only
+//! when the receipt's logs do not carry it and only once the receipt has
+//! decoded to a row. The watcher's backfill adds the receipt read itself.
 //!
 //! Two writers share [`SettlementRecorder`]: the redeemer, which has the
 //! receipt in hand when its `redeemMany` lands, and the `PoolRedeemed` watcher,
@@ -303,24 +304,34 @@ impl SettlementRecorder {
         }
     }
 
-    /// The receipt of `tx_hash`, or `None` (counted) when the RPC has none or
-    /// the read fails.
+    /// The receipt of `tx_hash`, retried like the header read (a load-balanced
+    /// provider whose backend lags head answers `null` for a moment), or
+    /// `None` (counted) when every attempt fails.
     async fn fetch_receipt<P: Provider>(
         &self,
         provider: &P,
         tx_hash: B256,
     ) -> Option<TransactionReceipt> {
-        let fetched = timed(
-            None,
-            "ledger backfill getTransactionReceipt",
-            provider.get_transaction_receipt(tx_hash),
-        )
-        .await;
-        let why = match fetched {
-            Ok(Some(receipt)) => return Some(receipt),
-            Ok(None) => "PoolRedeemed names a transaction the RPC has no receipt for".to_owned(),
-            Err(err) => format!("receipt read failed: {}", sanitize_err_chain(&err)),
-        };
+        let mut why = String::new();
+        for attempt in 0..=HEADER_READ_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(HEADER_READ_RETRY_DELAY).await;
+            }
+            let fetched = timed(
+                None,
+                "ledger backfill getTransactionReceipt",
+                provider.get_transaction_receipt(tx_hash),
+            )
+            .await;
+            why = match fetched {
+                Ok(Some(receipt)) => return Some(receipt),
+                Ok(None) => {
+                    "PoolRedeemed names a transaction the RPC has no receipt for".to_owned()
+                }
+                Err(err) => format!("receipt read failed: {}", sanitize_err_chain(&err)),
+            };
+            debug!(tx = %tx_hash, attempt, why, "settlement ledger backfill receipt read missed");
+        }
         self.skip(tx_hash, None, &why);
         None
     }
@@ -342,15 +353,18 @@ impl SettlementRecorder {
             self.skip(tx, None, "the receipt names no block");
             return;
         };
+        // Decode first: a redemption that paid nothing gets no row and must
+        // cost no header read, which can stall for the RPC timeout.
+        let Some(mut row) = self.decode_or_skip(receipt, block) else {
+            return;
+        };
         let Some(landed_at_unix) = self
             .landed_at_or_skip(provider, receipt, block, fallback)
             .await
         else {
             return;
         };
-        let Some(row) = self.decode_or_skip(receipt, block, landed_at_unix) else {
-            return;
-        };
+        row.landed_at_unix = landed_at_unix;
         if row.net_micro_usdc > row.gross_micro_usdc {
             warn!(
                 %tx,
@@ -398,16 +412,12 @@ impl SettlementRecorder {
         }
     }
 
-    /// The decoded row, or `None`: silently for a redemption that paid
-    /// nothing, counted for a receipt that yields no row.
-    fn decode_or_skip(
-        &self,
-        receipt: &TransactionReceipt,
-        block: u64,
-        landed_at_unix: u64,
-    ) -> Option<SettlementRecord> {
+    /// The decoded row with `landed_at_unix` still `0`, or `None`: silently
+    /// for a redemption that paid nothing, counted for a receipt that yields no
+    /// row.
+    fn decode_or_skip(&self, receipt: &TransactionReceipt, block: u64) -> Option<SettlementRecord> {
         let tx = receipt.transaction_hash;
-        match settlement_from_receipt(receipt, self.operator, block, landed_at_unix) {
+        match settlement_from_receipt(receipt, self.operator, block, 0) {
             Ok(Some(row)) => Some(row),
             Ok(None) => {
                 debug!(

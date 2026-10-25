@@ -1299,10 +1299,14 @@ mod earnings {
             "earnings=unavailable reason=\"settlement ledger load failed: corrupt\""
         );
         assert_eq!(
-            earned_so_far_line(Some(&resp)).as_deref(),
+            earned_so_far_line(&Ok(Some(resp.clone()))).as_deref(),
             Some("earned_so_far=121.410000 USDC settlements=1160")
         );
-        assert_eq!(earned_so_far_line(None), None);
+        assert_eq!(earned_so_far_line(&Ok(None)), None);
+        assert_eq!(
+            earned_so_far_line(&Err("no ledger".to_owned())).as_deref(),
+            Some("earned_so_far=unavailable reason=\"no ledger\"")
+        );
         assert_eq!(first_line("line one\nline two"), "line one");
     }
 

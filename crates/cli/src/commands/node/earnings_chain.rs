@@ -28,7 +28,7 @@ use decdn_common::cli;
 use decdn_common::config::{DEFAULT_CHAIN_ID, DEFAULT_GET_LOGS_MAX_BLOCK_SPAN};
 use decdn_incentive::SettlementRecord;
 use decdn_incentive::earnings::{last_settlement, sum_period};
-use decdn_incentive::log_scan::scan_logs;
+use decdn_incentive::log_scan::{ScanEvent, scan_logs};
 use decdn_incentive::payment_pool::{FeeRouter, PaymentPool};
 
 use crate::commands::chain_ctx;
@@ -105,7 +105,12 @@ pub(super) fn resolve_coordinates(
         file.get_logs_max_block_span()
             .unwrap_or(DEFAULT_GET_LOGS_MAX_BLOCK_SPAN),
     )
-    .unwrap_or(NonZeroU64::MIN);
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "blockchain.get_logs_max_block_span = 0 would scan one block per request; use at \
+             least 1"
+        )
+    })?;
     Ok(ChainCoordinates {
         chain_id,
         rpc_url,
@@ -234,18 +239,41 @@ async fn scan_rows<P: Provider>(
         from,
         to,
         span,
-        |end, to| {
-            windows = windows.wrapping_add(1);
-            if end == to || windows.is_multiple_of(PROGRESS_EVERY_WINDOWS) {
-                eprintln!("  scanned to block {end}/{to}");
+        |event| match event {
+            ScanEvent::Window { end, to } => {
+                windows = windows.wrapping_add(1);
+                if end == to || windows.is_multiple_of(PROGRESS_EVERY_WINDOWS) {
+                    eprintln!("  scanned to block {end}/{to}");
+                }
             }
+            ScanEvent::Retry {
+                start,
+                end,
+                attempt,
+                delay,
+                error,
+            } => eprintln!(
+                "  window {start}..={end} failed ({error}); retry {attempt}/{} in {}s",
+                decdn_incentive::log_scan::SCAN_WINDOW_RETRIES,
+                delay.as_secs()
+            ),
         },
     )
     .await
     .context("scanning FeeRouter.Settled")?;
-    let shares_logs = scan_logs(provider, &shares_filter(router), from, to, span, |_, _| {})
-        .await
-        .context("scanning FeeRouter.SharesUpdated")?;
+    let shares_logs = scan_logs(provider, &shares_filter(router), from, to, span, |event| {
+        if let ScanEvent::Retry {
+            start,
+            end,
+            attempt,
+            ..
+        } = event
+        {
+            eprintln!("  window {start}..={end} failed; retry {attempt}");
+        }
+    })
+    .await
+    .context("scanning FeeRouter.SharesUpdated")?;
     let fee_router = FeeRouter::new(router, provider);
     let current_shares = fee_router
         .getShares()
@@ -257,10 +285,11 @@ async fn scan_rows<P: Provider>(
     // that change replaced: read it at the block before the change. The
     // constructor emits `SharesUpdated`, so a scan from the deployment block
     // never needs this; `--from-block` past a retune does.
-    if let (Some(first_settled), Some(((change_block, _), _))) =
+    if let (Some(first_settled), Some((first_change, _))) =
         (settled.first().and_then(log_position), history.first())
-        && first_settled < (*change_block, 0)
+        && first_settled < *first_change
     {
+        let change_block = first_change.0;
         let before = fee_router
             .getShares()
             .block(BlockId::number(change_block.saturating_sub(1)))

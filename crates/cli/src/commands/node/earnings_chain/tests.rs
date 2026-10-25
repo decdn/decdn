@@ -267,3 +267,90 @@ fn an_unknown_chain_needs_every_coordinate_spelled_out() {
         .expect("all spelled out");
     assert_eq!(coords.chain_id, 31_337);
 }
+
+mod scan {
+    use alloy::sol_types::SolValue;
+
+    use super::*;
+
+    /// ABI-encode a `getShares()` answer.
+    fn shares_answer(split: [U256; 3]) -> alloy::primitives::Bytes {
+        alloy::primitives::Bytes::from(split.abi_encode())
+    }
+
+    /// Drive `scan_rows` over one window: the `Settled` scan, the
+    /// `SharesUpdated` scan, `getShares()`, and, when the first settlement
+    /// precedes the first change, the block-tagged `getShares()`.
+    async fn scan(
+        settled_logs: Vec<Log>,
+        shares_logs: Vec<Log>,
+        current: [U256; 3],
+        before: Option<[U256; 3]>,
+    ) -> anyhow::Result<Vec<SettlementRecord>> {
+        let asserter = Asserter::new();
+        asserter.push_success(&settled_logs);
+        asserter.push_success(&shares_logs);
+        asserter.push_success(&shares_answer(current));
+        if let Some(before) = before {
+            asserter.push_success(&shares_answer(before));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        scan_rows(
+            &provider,
+            ROUTER,
+            OPERATOR,
+            0,
+            999,
+            NonZeroU64::new(10_000).expect("non-zero"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_settlement_before_the_first_change_uses_the_split_read_at_the_block_before() {
+        let rows = scan(
+            vec![settled(50, 0, 1_000, 10), settled(200, 0, 1_000, 10)],
+            vec![shares_updated(100, 0, shares(9000, 0, 1000))],
+            shares(9000, 0, 1000),
+            Some(shares(6000, 3000, 1000)),
+        )
+        .await
+        .expect("scan");
+        assert_eq!(
+            rows.iter().map(|r| r.net_micro_usdc).collect::<Vec<_>>(),
+            vec![600, 900],
+            "the block-50 row is priced under the split in force before block 100"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settlement_earlier_in_the_change_block_is_priced_under_the_old_split() {
+        let rows = scan(
+            vec![settled(100, 2, 1_000, 10), settled(100, 7, 1_000, 10)],
+            vec![shares_updated(100, 5, shares(9000, 0, 1000))],
+            shares(9000, 0, 1000),
+            Some(shares(6000, 3000, 1000)),
+        )
+        .await
+        .expect("scan");
+        assert_eq!(
+            rows.iter().map(|r| r.net_micro_usdc).collect::<Vec<_>>(),
+            vec![600, 900],
+            "log order inside the change block decides"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_with_no_change_prices_every_row_under_the_current_split() {
+        // Nothing queued for a block-tagged read: a request for one fails.
+        let rows = scan(
+            vec![settled(50, 0, 1_000, 10)],
+            vec![],
+            shares(9000, 0, 1000),
+            None,
+        )
+        .await
+        .expect("scan");
+        assert_eq!(rows.first().map(|r| r.net_micro_usdc), Some(900));
+    }
+}
