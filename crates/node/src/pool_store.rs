@@ -8,7 +8,9 @@
 //!   redeemer's registration payload lands in the same durable write as the
 //!   frontier it backs. The file also holds the deployment stamp
 //!   (`deployment_v1`).
-//! - `settle.redb` — the seller and buyer pending-settle sets.
+//! - `settle.redb` — the seller and buyer pending-settle sets, and the
+//!   settlement ledger (`settlement_ledger_v1`): one row per landed
+//!   `redeemMany`, read by `admin_v1_earnings`.
 //! - `checkpoint.redb` — the settlement watcher's scan checkpoints.
 //! - `buyer.redb` — the buyer pool state and its owner index.
 //!
@@ -90,7 +92,7 @@ pub use decdn_incentive::Deployment;
 use decdn_incentive::buyer_pool_table::BuyerPoolTable;
 use decdn_incentive::store::{
     CheckpointKey, KeyedCheckpointStore, PendingSettle, PendingSettleStore, PoolStateStore,
-    StoreError,
+    SettlementLedger, SettlementRecord, StoreError,
 };
 use decdn_incentive::{
     AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, BuyerPoolStore, DepositOutcome,
@@ -169,6 +171,91 @@ const PENDING_SETTLE_TABLE: TableDefinition<'_, &[u8; 32], u64> =
 /// seller settle sweep never settle each other's closes. Lives in `settle.redb`.
 const BUYER_PENDING_SETTLE_TABLE: TableDefinition<'_, &[u8; 32], u64> =
     TableDefinition::new("buyer_pending_settle_v1");
+
+/// redb table holding the settlement ledger (#2598): one row per landed
+/// `redeemMany`, decoded from its receipt and read by `admin_v1_earnings`.
+/// Lives in `settle.redb`.
+///
+/// Key: `block_number (8 bytes, big-endian) ‖ log_index (8 bytes, big-endian)`
+/// ([`settlement_key`]), so a table iteration is chain order and the last row is
+/// the latest settlement. Value: postcard-encoded [`StoredSettlement`].
+const SETTLEMENT_LEDGER_TABLE: TableDefinition<'_, &[u8; 16], &[u8]> =
+    TableDefinition::new("settlement_ledger_v1");
+
+/// The `schema_version` [`StoredSettlement`] rows are written with. A row
+/// carrying a higher version is [`StoreError::UnsupportedSchema`].
+const SETTLEMENT_SCHEMA_VERSION: u32 = 1;
+
+/// Encode a ledger row's `(block_number, log_index)` into its table key.
+fn settlement_key(block_number: u64, log_index: u64) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(&block_number.to_be_bytes());
+    key[8..].copy_from_slice(&log_index.to_be_bytes());
+    key
+}
+
+/// Decode a ledger table key back into `(block_number, log_index)`.
+fn settlement_key_parts(key: &[u8; 16]) -> (u64, u64) {
+    let mut block = [0u8; 8];
+    let mut index = [0u8; 8];
+    block.copy_from_slice(&key[..8]);
+    index.copy_from_slice(&key[8..]);
+    (u64::from_be_bytes(block), u64::from_be_bytes(index))
+}
+
+/// On-disk value of one [`SETTLEMENT_LEDGER_TABLE`] row: a
+/// [`SettlementRecord`] without its key fields. Postcard-encoded, every field
+/// required; a row written in another layout fails to decode as
+/// [`StoreError::Corrupt`], and recovery moves `settle.redb` aside, which
+/// forfeits the earnings history and nothing else (the ledger is
+/// observability, not a claim).
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredSettlement {
+    schema_version: u32,
+    tx_hash: [u8; 32],
+    landed_at_unix: u64,
+    epoch: u64,
+    gross_micro_usdc: u64,
+    net_micro_usdc: u64,
+    bytes_delivered: u64,
+}
+
+impl StoredSettlement {
+    fn from_record(row: &SettlementRecord) -> Self {
+        Self {
+            schema_version: SETTLEMENT_SCHEMA_VERSION,
+            tx_hash: row.tx_hash.into(),
+            landed_at_unix: row.landed_at_unix,
+            epoch: row.epoch,
+            gross_micro_usdc: row.gross_micro_usdc,
+            net_micro_usdc: row.net_micro_usdc,
+            bytes_delivered: row.bytes_delivered,
+        }
+    }
+
+    fn into_record(
+        self,
+        block_number: u64,
+        log_index: u64,
+    ) -> Result<SettlementRecord, StoreError> {
+        if self.schema_version > SETTLEMENT_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema {
+                found: self.schema_version,
+                supported: SETTLEMENT_SCHEMA_VERSION,
+            });
+        }
+        Ok(SettlementRecord {
+            block_number,
+            log_index,
+            tx_hash: B256::from(self.tx_hash),
+            landed_at_unix: self.landed_at_unix,
+            epoch: self.epoch,
+            gross_micro_usdc: self.gross_micro_usdc,
+            net_micro_usdc: self.net_micro_usdc,
+            bytes_delivered: self.bytes_delivered,
+        })
+    }
+}
 
 /// redb table holding each on-chain watcher's scan checkpoint (#751, keyed in
 /// #1092/#1108): the last block scanned per [`CheckpointKey`], so a bring-up
@@ -673,6 +760,7 @@ impl PersistentPoolStateStore {
             Self::delete_tables(settle_db, "settle", |txn| {
                 txn.delete_table(PENDING_SETTLE_TABLE)?;
                 txn.delete_table(BUYER_PENDING_SETTLE_TABLE)?;
+                txn.delete_table(SETTLEMENT_LEDGER_TABLE)?;
                 Ok(())
             })?;
             Self::delete_tables(checkpoint_db, "checkpoint", |txn| {
@@ -1639,6 +1727,78 @@ impl KeyedCheckpointStore for PersistentPoolStateStore {
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
         Ok(())
+    }
+}
+
+impl SettlementLedger for PersistentPoolStateStore {
+    fn record_settlement(&self, row: &SettlementRecord) -> Result<(), StoreError> {
+        let key = settlement_key(row.block_number, row.log_index);
+        let value = postcard::to_allocvec(&StoredSettlement::from_record(row))
+            .map_err(|err| StoreError::Codec(format!("settlement row encode: {err}")))?;
+        let mut write_txn = self
+            .settle_db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        // Force fsync-on-commit, same durability discipline as the other tables:
+        // the redemption has already landed on-chain, and a row lost to a crash
+        // is a settlement the operator never sees in `decdn node earnings`.
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(SETTLEMENT_LEDGER_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            table
+                .insert(&key, value.as_slice())
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+
+    fn load_settlements(&self) -> Result<Vec<SettlementRecord>, StoreError> {
+        let read_txn = self
+            .settle_db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        // A never-written ledger table is the empty ledger: no redemption has
+        // landed since the table exists.
+        let table = match read_txn.open_table(SETTLEMENT_LEDGER_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let mut out = Vec::new();
+        let iter = table
+            .iter()
+            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
+        for entry in iter {
+            let (key_guard, value_guard) =
+                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
+            let (block_number, log_index) = settlement_key_parts(key_guard.value());
+            let stored: StoredSettlement =
+                postcard::from_bytes(value_guard.value()).map_err(|err| StoreError::Corrupt {
+                    pool_id: None,
+                    detail: format!(
+                        "settlement ledger row at block {block_number} log {log_index} does not \
+                         decode: {err}"
+                    ),
+                })?;
+            out.push(stored.into_record(block_number, log_index)?);
+        }
+        Ok(out)
+    }
+
+    fn has_settlement_tx(&self, tx_hash: B256) -> Result<bool, StoreError> {
+        // One row per redemption, so a full read is a few hundred rows a month;
+        // the watcher calls this once per own-provider `PoolRedeemed`.
+        Ok(self
+            .load_settlements()?
+            .iter()
+            .any(|row| row.tx_hash == tx_hash))
     }
 }
 

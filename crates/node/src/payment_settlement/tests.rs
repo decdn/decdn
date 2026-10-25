@@ -2035,6 +2035,7 @@ async fn a_sub_floor_plan_set_reads_nothing_from_the_chain() -> Result<()> {
         300,
         true,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -2084,6 +2085,7 @@ async fn a_set_that_clears_the_floor_in_total_reads_every_lane() -> Result<()> {
         2,
         true,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -2123,6 +2125,7 @@ async fn a_zero_floor_still_reads_every_lane() -> Result<()> {
         300,
         false,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -2163,8 +2166,19 @@ fn shutdown_service<P: Provider + Clone + 'static>(
         redeem_max_vouchers_per_tx: 300,
         metrics,
         pool_view: PoolProjection::new(),
+        recorder: test_recorder(),
+        schedule: RedeemSchedule::default(),
         redeemer: std::sync::Mutex::new(None),
     }
+}
+
+/// A recorder over a throwaway in-memory ledger, for tests that exercise the
+/// redemption path and not the ledger.
+fn test_recorder() -> SettlementRecorder {
+    SettlementRecorder::new(
+        Arc::new(decdn_incentive::MemorySettlementLedger::default()),
+        Address::from([20u8; 20]),
+    )
 }
 
 /// Persist one lane that provider `[20; 20]` holds. The lane is registered
@@ -2534,6 +2548,8 @@ fn spawn_redeemer<P: Provider + Clone + 'static>(
         rx,
         metrics,
         PoolProjection::new(),
+        test_recorder(),
+        RedeemSchedule::default(),
     ));
     (tx, handle, margin)
 }
@@ -3042,6 +3058,7 @@ async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Resul
         300,
         true,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -3107,6 +3124,7 @@ async fn a_redeem_send_with_no_answer_is_possibly_broadcast() -> Result<()> {
         300,
         false,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -3164,6 +3182,7 @@ async fn redeem_after_failed_sends(
         300,
         false,
         &metrics,
+        &test_recorder(),
     )
     .await;
     Ok((faulted, log, metrics))
@@ -3320,6 +3339,7 @@ async fn a_redeem_whose_gas_fill_fails_is_refused() -> Result<()> {
         300,
         false,
         &metrics,
+        &test_recorder(),
     )
     .await;
 
@@ -3355,6 +3375,7 @@ async fn a_failed_read_stays_a_chain_fault_past_a_failed_strict_flush() -> Resul
         300,
         true,
         &metrics,
+        &test_recorder(),
     )
     .await;
 

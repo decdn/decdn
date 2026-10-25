@@ -32,6 +32,13 @@ pub struct KnownChain {
     /// Public JSON-RPC endpoint baked into the emitted config. Fine for light
     /// use; operators point this at their own provider for production.
     pub public_rpc: &'static str,
+    /// The L2 block the deployment's contracts were created in: where a
+    /// from-genesis log scan (`decdn node earnings --address`) starts. The
+    /// manifest's `deployBlock` is not this number: the deploy script writes
+    /// `block.number`, which Arbitrum reports as the L1 block, and
+    /// `eth_getLogs` takes L2 numbers. Update it with the manifest on a
+    /// redeploy, from the earliest contract creation block on the explorer.
+    pub l2_start_block: u64,
     /// The embedded `deployments/<chainId>.json` manifest — the sole source of
     /// this chain's contract addresses.
     manifest_json: &'static str,
@@ -46,8 +53,15 @@ pub const KNOWN_CHAINS: &[KnownChain] = &[KnownChain {
     label: "Arbitrum Sepolia testnet",
     chain_id: 421_614,
     public_rpc: "https://sepolia-rollup.arbitrum.io/rpc",
+    l2_start_block: 310_903_026,
     manifest_json: include_str!("../deployments/421614.json"),
 }];
+
+/// The known chain with EIP-155 id `chain_id`, if any.
+#[must_use]
+pub fn by_chain_id(chain_id: u64) -> Option<&'static KnownChain> {
+    KNOWN_CHAINS.iter().find(|chain| chain.chain_id == chain_id)
+}
 
 /// Contract addresses read from a chain's manifest, mapped to `[blockchain]`
 /// config keys. Every field is an EIP-55 checksummed `0x` string exactly as the

@@ -233,7 +233,7 @@ covers [testnet funds](https://docs.decdn.org/run-a-node/testnet-funds), the
 decdn config init            # writes ~/.decdn/node.toml with the testnet RPC and contract addresses
 decdn setup --mbps 100 --region US --multiaddr /ip4/203.0.113.10/udp/4433/quic-v1
 decdn-node run
-decdn node health            # then: node status, node lanes, node top
+decdn node health            # then: node status, node lanes, node earnings, node top
 ```
 
 `setup` generates the node key and keystore when neither exists, shows the operator terms,

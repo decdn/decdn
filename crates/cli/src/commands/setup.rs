@@ -28,7 +28,8 @@ use decdn_incentive::Erc20;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::eth_identity;
 
-use crate::commands::{bond, chain_ctx, key_gen, register, terms};
+use crate::commands::civil_time::days_from_civil;
+use crate::commands::{bond, chain_ctx, key_gen, node, register, terms};
 
 /// Clock synchronization (ADR 019): the local clock should be within
 /// 10 s of UTC before onboarding, catching a misconfigured host clock before
@@ -463,11 +464,38 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     };
 
     emit_readiness(json, &readiness, &args.region, multiaddr_count);
+    // What the node has earned so far (#2598), when a daemon is up to answer
+    // within a short deadline: a re-run of `setup` on a working node closes
+    // with the figure. No daemon, or no settlement ledger yet, prints nothing.
+    let earnings = node::earned_so_far(config_path, EARNINGS_TIMEOUT).await;
     if json {
-        println!("{}", summary(Some(&readiness)));
+        let mut summary = summary(Some(&readiness));
+        attach_earnings(&mut summary, earnings.as_ref());
+        println!("{summary}");
+    } else if let Some(line) = node::earned_so_far_line(earnings.as_ref()) {
+        println!("  {line}");
     }
 
     Ok(())
+}
+
+/// How long `setup`'s closing earnings read waits for the daemon. Short: the
+/// daemon is usually not running during a first `setup`, and the line is a
+/// courtesy, not a step.
+const EARNINGS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Add the `earnings` key to the `--json` summary object: the
+/// `admin_v1_earnings` response when a daemon answered, else `null`.
+fn attach_earnings(
+    summary: &mut serde_json::Value,
+    earnings: Option<&decdn_common::admin::EarningsResponse>,
+) {
+    if let serde_json::Value::Object(map) = summary {
+        let value = earnings
+            .and_then(|e| serde_json::to_value(e).ok())
+            .unwrap_or(serde_json::Value::Null);
+        map.insert("earnings".to_owned(), value);
+    }
 }
 
 /// Decide what to do about the key material before any signer load. Pure
@@ -802,18 +830,6 @@ fn month_num(m: &str) -> Option<i64> {
         "Dec" => 12,
         _ => return None,
     })
-}
-
-/// Days from 1970-01-01 to the given proleptic-Gregorian date (Howard
-/// Hinnant's `days_from_civil`, public domain). Pure integer math, no casts.
-const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = if month > 2 { month - 3 } else { month + 9 }; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
 }
 
 /// Prompt `[y/N]` for the bond submission. Returns `false` on EOF / a

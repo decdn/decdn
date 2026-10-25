@@ -37,6 +37,30 @@ impl FileConfig {
     pub fn bind_port(&self) -> u16 {
         decdn_common::config::configured_bind_port(self.network.as_ref().and_then(|n| n.bind_port))
     }
+
+    /// `blockchain.rpc_url`, when the file sets it.
+    pub fn rpc_url(&self) -> Option<&str> {
+        self.blockchain.as_ref().and_then(|b| b.rpc_url.as_deref())
+    }
+
+    /// `blockchain.chain_id`, when the file sets it.
+    pub fn chain_id(&self) -> Option<u64> {
+        self.blockchain.as_ref().and_then(|b| b.chain_id)
+    }
+
+    /// `blockchain.payment_pool_address`, when the file sets it.
+    pub fn payment_pool_address(&self) -> Option<&str> {
+        self.blockchain
+            .as_ref()
+            .and_then(|b| b.payment_pool_address.as_deref())
+    }
+
+    /// `blockchain.get_logs_max_block_span`, when the file sets it.
+    pub fn get_logs_max_block_span(&self) -> Option<u64> {
+        self.blockchain
+            .as_ref()
+            .and_then(|b| b.get_logs_max_block_span)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -53,6 +77,8 @@ struct FileBlockchain {
     publisher_registry_address: Option<String>,
     origin_assignment_address: Option<String>,
     slash_appeal_address: Option<String>,
+    payment_pool_address: Option<String>,
+    get_logs_max_block_span: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

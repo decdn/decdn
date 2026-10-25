@@ -155,3 +155,81 @@ fn windows_cover_a_large_gap_without_overlap_or_gap() {
         "the final window must reach `to`"
     );
 }
+
+mod scan {
+    use alloy::primitives::Address;
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+    use alloy::rpc::types::Log;
+
+    use super::*;
+
+    fn ceiling(n: u64) -> NonZeroU64 {
+        NonZeroU64::new(n).unwrap_or(NonZeroU64::MIN)
+    }
+
+    #[tokio::test]
+    async fn scan_logs_halves_a_rejected_window_and_covers_the_range_once() {
+        let asserter = Asserter::new();
+        // The 10-block ceiling is over the provider's cap: one rejection,
+        // then every 5-block window is accepted.
+        asserter.push_failure_msg("ranges over 5 blocks are not supported");
+        for _ in 0..6 {
+            asserter.push_success(&Vec::<Log>::new());
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let filter = Filter::new().address(Address::repeat_byte(0x11));
+        let mut ends = Vec::new();
+        let logs = scan_logs(&provider, &filter, 0, 29, ceiling(10), |end, to| {
+            ends.push((end, to));
+        })
+        .await
+        .expect("scan");
+        assert!(logs.is_empty());
+        assert_eq!(
+            ends,
+            vec![(4, 29), (9, 29), (14, 29), (19, 29), (24, 29), (29, 29)],
+            "contiguous 5-block windows after the shrink, the last clamped to `to`"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_logs_fails_on_a_rejected_one_block_window() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("ranges over 0 blocks are not supported");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let filter = Filter::new().address(Address::repeat_byte(0x11));
+        let err = scan_logs(&provider, &filter, 7, 7, ceiling(10), |_, _| {})
+            .await
+            .expect_err("a one-block rejection cannot shrink");
+        assert!(
+            format!("{err:#}").contains("one-block"),
+            "names the unshrinkable window: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_logs_surfaces_any_other_error() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("internal error");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let filter = Filter::new().address(Address::repeat_byte(0x11));
+        let err = scan_logs(&provider, &filter, 0, 99, ceiling(10), |_, _| {})
+            .await
+            .expect_err("not a range rejection");
+        assert!(format!("{err:#}").contains("eth_getLogs [0, 9]"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn scan_logs_of_an_empty_range_makes_no_request() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let filter = Filter::new().address(Address::repeat_byte(0x11));
+        let logs = scan_logs(&provider, &filter, 10, 9, ceiling(10), |_, _| {
+            panic!("no window");
+        })
+        .await
+        .expect("empty scan");
+        assert!(logs.is_empty());
+    }
+}

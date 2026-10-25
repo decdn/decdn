@@ -16,12 +16,12 @@
 //! |---|---|
 //! | Vouchers and metering | [`voucher`] (sign and verify), [`chain`] (hash chains), [`rate`] (rate checks), [`credit`] (credit window), [`client_bridge`] (to and from the wire [`decdn_protocol::Voucher`]) |
 //! | Spend delegation | [`capability`] (the signed capability), [`capability_grant`] (its transferable `dcap1:` form) |
-//! | Lane state | [`lane`] (the seller's per-lane watermark), [`store`] (persistence traits and in-memory stores), [`deployment`] (which `PaymentPool` a state belongs to) |
+//! | Lane state | [`lane`] (the seller's per-lane watermark), [`store`] (persistence traits and in-memory stores, the settlement ledger among them), [`earnings`] (sums over the ledger for `decdn node earnings`), [`deployment`] (which `PaymentPool` a state belongs to) |
 //! | Buyer bookkeeping | [`buyer_pool`] (the buyer's pools and lanes), `buyer_pool_table` and `buyer_pool_redb` (an on-disk `redb` store, behind the `buyer-store-core` and `redb` features) |
 //! | Response signatures | [`probe_sig`] and [`stream_sig`] (the `slash_sig` on probe and stream responses), [`bind_sig`] (client bindings), [`sig_canon`] (canonical `s`) |
 //! | Keys | [`eth_identity`] (Web3 Secret Storage keystores and the `PrivateKeySigner` they load) |
 //! | Contract bindings | [`payment_pool`], [`capacity_bond`], [`node_register`], [`erc20`], [`slash_judge`], [`slash_appeal`], [`origin_assignment`], [`publisher_registry`], [`content_blacklist`] |
-//! | Transactions | [`tx`] (send, await the receipt, fail on a revert), [`pool_open_error`] (`PaymentPool` revert decoding) |
+//! | Transactions | [`tx`] (send, await the receipt, fail on a revert), [`pool_open_error`] (`PaymentPool` revert decoding), [`log_scan`] (bounded `eth_getLogs` windows that learn a provider's range cap) |
 //!
 //! # Sign and verify a voucher
 //!
@@ -64,6 +64,8 @@ pub mod bind_sig;
 pub mod buyer_pool;
 pub mod credit;
 pub mod deployment;
+pub mod earnings;
+pub mod log_scan;
 // NOTE: no outer `///` docs on these two — each module's `//!` header is its
 // documentation. An outer doc here would be a second copy free to drift, and
 // rustdoc merges it with the `//!` block and resolves the result in *this*
@@ -135,8 +137,9 @@ pub use rate::{
     BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, pool_budget_covers, verify_rate,
 };
 pub use store::{
-    CheckpointKey, KeyedCheckpointStore, MemoryPoolStateStore, PendingSettle, PendingSettleStore,
-    PoolStateStore, StoreError,
+    CheckpointKey, KeyedCheckpointStore, MemoryPoolStateStore, MemorySettlementLedger,
+    PendingSettle, PendingSettleStore, PoolStateStore, SettlementLedger, SettlementRecord,
+    StoreError,
 };
 pub use stream_sig::{STREAM_RESPONSE_TYPEHASH, StreamSlashData, StreamSlashError};
 pub use voucher::{

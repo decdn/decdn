@@ -19,9 +19,10 @@ use decdn_client::discovery::{self, NodeCandidate, SELECT_K, select_candidates};
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::probe::probe_once;
 use decdn_common::admin::{
-    AdminRpcClient, BindingStatus, BuyerPoolsResponse, DrainRequest, DrainResponse, EvictRequest,
-    EvictResponse, HealthResponse, LaneSnapshot, LanesResponse, ReloadResponse, SlashesResponse,
-    StatusResponse,
+    AdminRpcClient, BindingStatus, BuyerPoolsResponse, DrainRequest, DrainResponse, EarningsPeriod,
+    EarningsRequest, EarningsResponse, EvictRequest, EvictResponse, HealthResponse, LaneSnapshot,
+    LanesResponse, PERIOD_LAST_7D, PERIOD_LAST_24H, PERIOD_SINCE, PERIOD_SINCE_LEDGER_START,
+    ReloadResponse, SlashesResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -29,7 +30,11 @@ use decdn_common::cli::common::expand_tilde;
 use decdn_common::config::DEFAULT_ADMIN_PORT;
 use decdn_protocol::Region;
 
+use crate::commands::bundle_pull::human_bytes;
 use crate::commands::chain_ctx;
+use crate::commands::civil_time;
+
+mod earnings_chain;
 
 /// Partial deserializer for the TOML config — only the path
 /// `observability.admin_port` is interesting to the `node` admin
@@ -64,6 +69,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Health(h) => health(h, global_config).await,
         cli::NodeCommand::Status(s) => status(s, global_config).await,
         cli::NodeCommand::Lanes(c) => lanes(c, global_config).await,
+        cli::NodeCommand::Earnings(e) => earnings(e, global_config).await,
         cli::NodeCommand::Slashes(s) => slashes(s, global_config).await,
         cli::NodeCommand::Pools(p) => pools(p, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
@@ -556,12 +562,185 @@ pub async fn status(args: &cli::StatusArgs, global_config: Option<&Path>) -> any
             serde_json::to_string_pretty(&parsed).context("failed to encode status as JSON")?;
         println!("{pretty}");
     } else {
+        // The one-line earnings summary (#2598) is a second call, tolerated to
+        // fail: a node without a settlement ledger still has a status to show.
+        // `--json` stays the raw `StatusResponse`; `node earnings --json` has
+        // the figures.
+        let earnings = client.earnings(EarningsRequest::default()).await.ok();
         let mut stdout = io::stdout().lock();
-        write_status(&mut stdout, &parsed, wall_clock_us())
+        write_status(&mut stdout, &parsed, earnings.as_ref(), wall_clock_us())
             .context("failed to write status report")?;
     }
 
     Ok(())
+}
+
+/// `decdn node earnings`: what the node has earned, per period (#2598). In
+/// daemon mode one `admin_v1_earnings` call; with `--address` the same table
+/// from the chain alone (`earnings_chain`), without the pending line.
+pub async fn earnings(
+    args: &cli::EarningsArgs,
+    global_config: Option<&Path>,
+) -> anyhow::Result<()> {
+    let since_unix = args
+        .since
+        .as_deref()
+        .map(civil_time::parse_since)
+        .transpose()?;
+    let resp = if let Some(address) = args.address.as_deref() {
+        let operator = chain_ctx::parse_nonzero_address(address, "--address")?;
+        earnings_chain::run(args, operator, since_unix, global_config).await?
+    } else {
+        anyhow::ensure!(
+            args.timeout_ms > 0,
+            "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+             'never' rather than 'sub-millisecond deadline')"
+        );
+        let config_path = args.config.as_deref().or(global_config);
+        let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
+        let client = HttpClientBuilder::default()
+            .request_timeout(Duration::from_millis(args.timeout_ms))
+            .build(&url)
+            .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+        client
+            .earnings(EarningsRequest { since_unix })
+            .await
+            .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?
+    };
+
+    if args.json {
+        let pretty =
+            serde_json::to_string_pretty(&resp).context("failed to encode earnings as JSON")?;
+        println!("{pretty}");
+    } else {
+        let mut stdout = io::stdout().lock();
+        write_earnings(&mut stdout, &resp, unix_now()).context("failed to write earnings")?;
+    }
+    Ok(())
+}
+
+/// `decdn setup`'s closing read (#2598): the running node's earnings when a
+/// daemon answers `admin_v1_earnings` within `timeout`, else `None`. Every
+/// failure is `None`: no daemon, no config, no ledger. The admin URL resolves
+/// as for every `node` command.
+pub(crate) async fn earned_so_far(
+    config_path: Option<&Path>,
+    timeout: Duration,
+) -> Option<EarningsResponse> {
+    let url = resolve_admin_url(None, config_path).ok()?;
+    let client = HttpClientBuilder::default()
+        .request_timeout(timeout)
+        .build(&url)
+        .ok()?;
+    client.earnings(EarningsRequest::default()).await.ok()
+}
+
+/// The `earned_so_far=` line `decdn setup` closes with: the whole-ledger net
+/// figure, or `None` when there is no response to read it from.
+pub(crate) fn earned_so_far_line(earnings: Option<&EarningsResponse>) -> Option<String> {
+    let all = earnings?
+        .periods
+        .iter()
+        .find(|p| p.label == PERIOD_SINCE_LEDGER_START)?;
+    Some(format!(
+        "earned_so_far={} USDC settlements={}",
+        format_usdc(all.net_micro_usdc),
+        all.settlements
+    ))
+}
+
+/// Write the earnings report to `w`: a `key=value` header, the per-period
+/// table, the last settlement and (daemon mode) the pending line. Pure, like
+/// [`write_lanes_table`], so the layout is unit-testable. `now_unix` is for
+/// the "next sweep in" figure.
+pub(crate) fn write_earnings(
+    w: &mut impl io::Write,
+    resp: &EarningsResponse,
+    now_unix: u64,
+) -> io::Result<()> {
+    writeln!(
+        w,
+        "operator={} ledger_since={}",
+        resp.operator_address.as_deref().unwrap_or("(unknown)"),
+        resp.ledger_since_unix.map_or_else(
+            || "(no settlements yet)".to_owned(),
+            civil_time::format_date
+        ),
+    )?;
+    writeln!(
+        w,
+        "{:<24} {:>14} {:>14} {:>12}",
+        "PERIOD", "SETTLED_USDC", "BYTES_SETTLED", "SETTLEMENTS",
+    )?;
+    for period in &resp.periods {
+        writeln!(
+            w,
+            "{:<24} {:>14} {:>14} {:>12}",
+            period_label(period, resp.ledger_since_unix),
+            format_usdc(period.net_micro_usdc),
+            human_bytes(period.bytes_settled),
+            period.settlements,
+        )?;
+    }
+    match &resp.last_settlement {
+        None => writeln!(w, "last settlement: none")?,
+        Some(last) => writeln!(
+            w,
+            "last settlement: {}, tx {}, block {}",
+            civil_time::format_utc(last.at_unix),
+            last.tx_hash,
+            last.block_number,
+        )?,
+    }
+    if let Some(pending) = &resp.pending {
+        let next = match pending.next_sweep_at_unix {
+            None => "next sweep not scheduled yet".to_owned(),
+            Some(at) if at <= now_unix => "next sweep due now".to_owned(),
+            Some(at) => format!("next sweep in ~{}", approx_duration(at - now_unix)),
+        };
+        writeln!(
+            w,
+            "pending redeem: {} USDC over {} lanes ({next})",
+            format_usdc(pending.micro_usdc),
+            pending.lanes,
+        )?;
+    }
+    Ok(())
+}
+
+/// The human label of a period row. The ledger-wide row names the date the
+/// ledger starts, so the operator reads "since 2026-10-26", never an "all
+/// time" the forward-only ledger cannot promise.
+fn period_label(period: &EarningsPeriod, ledger_since_unix: Option<u64>) -> String {
+    match period.label.as_str() {
+        PERIOD_LAST_24H => "last 24h".to_owned(),
+        PERIOD_LAST_7D => "last 7d".to_owned(),
+        PERIOD_SINCE_LEDGER_START => ledger_since_unix.map_or_else(
+            || "since (no settlements yet)".to_owned(),
+            |since| format!("since {}", civil_time::format_date(since)),
+        ),
+        PERIOD_SINCE => format!("since {}", civil_time::format_date(period.from_unix)),
+        other => other.to_owned(),
+    }
+}
+
+/// A rounded duration for "next sweep in ~…": seconds under a minute, whole
+/// minutes under an hour, then hours and minutes.
+fn approx_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{}h {}m", secs / 3_600, (secs % 3_600) / 60)
+    }
+}
+
+/// Whole seconds since the Unix epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// `decdn node lanes`: call `admin_v1_lanes` on the running node and
@@ -614,12 +793,19 @@ fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result
         return writeln!(w, "(no open lanes)");
     }
     // Fixed-column layout: lane preview | counterparty preview | voucher
-    // signer preview | nonce | outstanding | deposit | last-voucher age |
-    // eligible.
+    // signer preview | nonce | outstanding | unredeemed | deposit |
+    // last-voucher age | eligible.
     writeln!(
         w,
-        "{:<14} {:<14} {:<14} {:>6} {:>12} {:>12} {:>12} ELIGIBLE",
-        "LANE", "COUNTERPARTY", "SIGNER", "NONCE", "OUTSTANDING", "DEPOSIT", "LAST_VOUCHER",
+        "{:<14} {:<14} {:<14} {:>6} {:>12} {:>12} {:>12} {:>12} ELIGIBLE",
+        "LANE",
+        "COUNTERPARTY",
+        "SIGNER",
+        "NONCE",
+        "OUTSTANDING",
+        "UNREDEEMED",
+        "DEPOSIT",
+        "LAST_VOUCHER",
     )?;
     for c in &resp.lanes {
         write_lane_row(w, c)?;
@@ -652,10 +838,11 @@ fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
     let eligible = if c.settlement_eligible { "yes" } else { "no" };
     writeln!(
         w,
-        "{lane:<14} {counterparty:<14} {signer:<14} {:>6} {:>12} {:>12} {last_voucher:>12} \
+        "{lane:<14} {counterparty:<14} {signer:<14} {:>6} {:>12} {:>12} {:>12} {last_voucher:>12} \
          {eligible}",
         c.last_nonce,
         format_usdc(c.outstanding_micro_usdc),
+        format_usdc(c.unredeemed_micro_usdc),
         format_usdc(c.deposit_micro_usdc),
     )
 }
@@ -1047,7 +1234,12 @@ fn format_age(delta_us: u64) -> String {
 /// mirroring [`write_lanes_table`]. The summary block uses stable
 /// `key=value` tokens so operator scripts can `grep` them without
 /// `--json`; the per-non-empty-bucket fill table follows.
-fn write_status(w: &mut impl io::Write, s: &StatusResponse, now_us: u64) -> io::Result<()> {
+fn write_status(
+    w: &mut impl io::Write,
+    s: &StatusResponse,
+    earnings: Option<&EarningsResponse>,
+    now_us: u64,
+) -> io::Result<()> {
     writeln!(w, "node_id={}", s.node_id)?;
     // The operator wallet this node runs under. `None` when the node reports no
     // resolvable operator (no chain wiring); render an explicit sentinel rather
@@ -1084,6 +1276,7 @@ fn write_status(w: &mut impl io::Write, s: &StatusResponse, now_us: u64) -> io::
         s.republish.scheduled_records
     )?;
     writeln!(w, "chain_denied_origins={}", s.chain_denied_origins)?;
+    writeln!(w, "{}", earnings_summary_line(earnings))?;
 
     if s.routing.buckets.is_empty() {
         return writeln!(w, "(routing table empty — no buckets populated)");
@@ -1098,6 +1291,37 @@ fn write_status(w: &mut impl io::Write, s: &StatusResponse, now_us: u64) -> io::
         writeln!(w, "{:<8} {fill:<8} {pct}", b.index)?;
     }
     Ok(())
+}
+
+/// The `node status` earnings line (#2598): net USDC over the three standard
+/// periods, the pending total and the last settlement, as `key=value` tokens.
+/// `(unavailable)` when the node answered no `admin_v1_earnings`.
+fn earnings_summary_line(earnings: Option<&EarningsResponse>) -> String {
+    let Some(e) = earnings else {
+        return "earnings=(unavailable)".to_owned();
+    };
+    let net = |label: &str| {
+        e.periods
+            .iter()
+            .find(|p| p.label == label)
+            .map_or_else(|| "n/a".to_owned(), |p| format_usdc(p.net_micro_usdc))
+    };
+    let pending = e
+        .pending
+        .as_ref()
+        .map_or_else(|| "n/a".to_owned(), |p| format_usdc(p.micro_usdc));
+    let last = e
+        .last_settlement
+        .as_ref()
+        .map_or_else(|| "never".to_owned(), |l| civil_time::format_utc(l.at_unix));
+    format!(
+        "earnings 24h={} 7d={} since_ledger_start={} pending={} last_settlement={}",
+        net(PERIOD_LAST_24H),
+        net(PERIOD_LAST_7D),
+        net(PERIOD_SINCE_LEDGER_START),
+        pending,
+        last.replace(' ', "T"),
+    )
 }
 
 /// Integer percentage of `num/den` as an `"NN%"` string. A `den` of 0

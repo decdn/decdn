@@ -46,6 +46,12 @@ mod sol_types {
 
             /// Token balance of `account`.
             function balanceOf(address account) external view returns (uint256);
+
+            /// `value` tokens moved from `from` to `to`. The settlement
+            /// ledger reads the one from the `FeeRouter` to the operator out
+            /// of a landed `redeemMany` receipt: it is the operator's exact
+            /// net payout, after the fee split.
+            event Transfer(address indexed from, address indexed to, uint256 value);
         }
     }
 }

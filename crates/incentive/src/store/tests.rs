@@ -124,3 +124,58 @@ fn memory_store_flush_is_noop_ok() -> anyhow::Result<()> {
     anyhow::ensure!(store.len() == 1);
     Ok(())
 }
+
+mod settlement_ledger {
+    use super::*;
+
+    fn row(block: u64, log_index: u64, tx_byte: u8) -> SettlementRecord {
+        SettlementRecord {
+            block_number: block,
+            log_index,
+            tx_hash: B256::repeat_byte(tx_byte),
+            landed_at_unix: 1_700_000_000 + block,
+            epoch: 3,
+            gross_micro_usdc: 1_000,
+            net_micro_usdc: 600,
+            bytes_delivered: 2_048,
+        }
+    }
+
+    #[test]
+    fn memory_ledger_loads_in_chain_order() -> Result<(), StoreError> {
+        let ledger = MemorySettlementLedger::default();
+        ledger.record_settlement(&row(20, 1, 0xC))?;
+        ledger.record_settlement(&row(10, 5, 0xA))?;
+        ledger.record_settlement(&row(20, 0, 0xB))?;
+        let keys: Vec<_> = ledger
+            .load_settlements()?
+            .iter()
+            .map(SettlementRecord::key)
+            .collect();
+        assert_eq!(keys, vec![(10, 5), (20, 0), (20, 1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_ledger_overwrites_the_same_key() -> Result<(), StoreError> {
+        let ledger = MemorySettlementLedger::default();
+        ledger.record_settlement(&row(10, 0, 0xA))?;
+        let mut again = row(10, 0, 0xA);
+        again.net_micro_usdc = 601;
+        ledger.record_settlement(&again)?;
+        let rows = ledger.load_settlements()?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.first().map(|r| r.net_micro_usdc), Some(601));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_ledger_knows_its_tx_hashes() -> Result<(), StoreError> {
+        let ledger = MemorySettlementLedger::default();
+        assert!(!ledger.has_settlement_tx(B256::repeat_byte(0xA))?);
+        ledger.record_settlement(&row(10, 0, 0xA))?;
+        assert!(ledger.has_settlement_tx(B256::repeat_byte(0xA))?);
+        assert!(!ledger.has_settlement_tx(B256::repeat_byte(0xB))?);
+        Ok(())
+    }
+}

@@ -415,6 +415,10 @@ struct Infra {
     concrete_pool_store: Arc<PersistentPoolStateStore>,
     pool_state_store: Arc<dyn PoolStateStore>,
     watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
+    /// The settlement ledger (#2598): the same redb store as the lane state,
+    /// through the ledger trait. Written by the settlement service, read by
+    /// `admin_v1_earnings`.
+    settlement_ledger: Arc<dyn decdn_incentive::SettlementLedger>,
     receipt_sink: Arc<dyn crate::receipt_log::ReceiptSink>,
     /// Stop handle for the background receipt writer: cancelled after the
     /// router drains on shutdown, then awaited in the drain phase so the audit
@@ -533,6 +537,7 @@ async fn build_infra(
     // on its own per-family redb file); `concrete_pool_store` stays bound for
     // the buyer handle built further below.
     let pool_state_store: Arc<dyn PoolStateStore> = concrete_pool_store.clone();
+    let settlement_ledger: Arc<dyn decdn_incentive::SettlementLedger> = concrete_pool_store.clone();
     // Debounce the scan-checkpoint writes (#784, keyed in #1092): the settlement
     // watcher, the only watcher that persists a cursor (`CheckpointKey::PoolOpened`),
     // advances it once per completed `eth_getLogs` window — on the live tail, once
@@ -726,6 +731,7 @@ async fn build_infra(
         concrete_pool_store,
         pool_state_store,
         watcher_checkpoint_store,
+        settlement_ledger,
         receipt_sink,
         receipt_writer,
         lane_flush_task,
@@ -1483,6 +1489,7 @@ async fn build_chain_and_handlers(
         infra.eth_signer.address(),
         Arc::clone(&infra.pool_state_store),
         Arc::clone(&infra.watcher_checkpoint_store),
+        Arc::clone(&infra.settlement_ledger),
         Arc::clone(&client_handler),
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
         usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
@@ -2336,6 +2343,14 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             lane_activity: ch.client_handler.lane_activity_clock(),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
             pool_owners: ch.pool_owners.clone(),
+        })
+        // Earnings for `admin_v1_earnings` (#2598): the settlement ledger the
+        // settlement service writes, the lane store for the pending total, and
+        // the redeemer's published schedule — read-only here.
+        .with_earnings(admin::EarningsHandles {
+            ledger: Arc::clone(&infra.settlement_ledger),
+            pool_store: Arc::clone(&infra.pool_state_store),
+            schedule: ch.payment_service.redeem_schedule(),
         })
         // Buyer-pool introspection for `admin_v1_pools` (#2078). The SAME store
         // handle `BuyerPoolService` records into, so the admin surface reports

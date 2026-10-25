@@ -1423,7 +1423,7 @@ fn warn_leftover_partials(out_root: &Path, entries: &[ManifestEntry], bundle_has
 
 /// Format a byte count as a short decimal-unit label (`13.8 GB`). SI (1000-based)
 /// units match how file and model sizes are usually quoted.
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if n < 1000 {
         return format!("{n} B");

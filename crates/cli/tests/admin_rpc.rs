@@ -1130,3 +1130,127 @@ async fn cli_status_rejects_zero_timeout() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `admin_v1_earnings` round-trips a seeded ledger and lane store: the
+/// three standard periods plus the requested `since`, the last settlement by
+/// chain order, and the pending total as `owed − paid` over the lanes.
+#[tokio::test]
+async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
+    use alloy::primitives::{Address, B256, U256};
+    use decdn_common::admin::{EarningsRequest, PERIOD_SINCE, PERIOD_SINCE_LEDGER_START};
+    use decdn_incentive::{MemorySettlementLedger, SettlementLedger, SettlementRecord};
+    use decdn_node::admin::EarningsHandles;
+    use decdn_node::payment_settlement::RedeemSchedule;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let ledger = Arc::new(MemorySettlementLedger::default());
+    let row = |block: u64, landed_at: u64, net: u64| SettlementRecord {
+        block_number: block,
+        log_index: 0,
+        tx_hash: B256::repeat_byte(u8::try_from(block).unwrap_or(0)),
+        landed_at_unix: landed_at,
+        epoch: 1,
+        gross_micro_usdc: net * 10 / 6,
+        net_micro_usdc: net,
+        bytes_delivered: 1_000 * block,
+    };
+    ledger.record_settlement(&row(10, now - 40 * 86_400, 100))?;
+    ledger.record_settlement(&row(20, now - 3 * 86_400, 200))?;
+    ledger.record_settlement(&row(30, now - 60, 400))?;
+
+    let mut lane = LaneState::hydrate(
+        B256::repeat_byte(0x01),
+        Address::repeat_byte(0xAA),
+        Address::repeat_byte(0xEE),
+        U256::from(1_000_000_000u64),
+        0,
+        U256::from(900_000u64),
+        U256::from(900_000u64),
+        Some([0u8; 65]),
+        decdn_incentive::LaneChain::NONE,
+    );
+    lane.paid_cumulative = U256::from(300_000u64);
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&lane)?;
+
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        Arc::new(DrainTrigger::new()),
+        Arc::new(Metrics::new()),
+    )
+    .with_operator_address(Address::repeat_byte(0xEE))
+    .with_earnings(EarningsHandles {
+        ledger: ledger as Arc<dyn SettlementLedger>,
+        pool_store: store as Arc<dyn PoolStateStore>,
+        schedule: RedeemSchedule::default(),
+    });
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+
+    let client = HttpClientBuilder::default().build(&url)?;
+    let resp = client
+        .earnings(EarningsRequest {
+            since_unix: Some(now - 10 * 86_400),
+        })
+        .await?;
+    assert_eq!(
+        resp.operator_address.as_deref(),
+        Some(Address::repeat_byte(0xEE).to_string().as_str())
+    );
+    assert_eq!(resp.ledger_since_unix, Some(now - 40 * 86_400));
+    let by_label = |label: &str| {
+        resp.periods
+            .iter()
+            .find(|p| p.label == label)
+            .map(|p| (p.net_micro_usdc, p.settlements))
+    };
+    assert_eq!(by_label("last_24h"), Some((400, 1)));
+    assert_eq!(by_label("last_7d"), Some((600, 2)));
+    assert_eq!(by_label(PERIOD_SINCE_LEDGER_START), Some((700, 3)));
+    assert_eq!(by_label(PERIOD_SINCE), Some((600, 2)));
+    let last = resp.last_settlement.expect("last settlement");
+    assert_eq!((last.block_number, last.net_micro_usdc), (30, 400));
+    let pending = resp.pending.expect("daemon mode reports pending");
+    assert_eq!((pending.micro_usdc, pending.lanes), (600_000, 1));
+    assert_eq!(
+        pending.next_sweep_at_unix, None,
+        "no redeemer published a schedule"
+    );
+
+    stop_tx.send(()).ok();
+    join.await?;
+    Ok(())
+}
+
+/// A hand-built `AdminState` with no ledger answers the dedicated code, not
+/// an empty ledger: "this node cannot say" and "this node earned nothing"
+/// call for different operator responses.
+#[tokio::test]
+async fn earnings_unavailable_without_handles() -> anyhow::Result<()> {
+    use decdn_common::admin::{EARNINGS_UNAVAILABLE_CODE, EarningsRequest};
+
+    let (cache, _tmp) = test_cache().await?;
+    let state = AdminState::new(
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        Arc::new(DrainTrigger::new()),
+        Arc::new(Metrics::new()),
+    );
+    let (url, stop_tx, join) = spawn_admin(state).await?;
+    let client = HttpClientBuilder::default().build(&url)?;
+    let err = client
+        .earnings(EarningsRequest::default())
+        .await
+        .expect_err("no ledger attached");
+    assert_matches!(err, ClientError::Call(ref obj) if obj.code() == EARNINGS_UNAVAILABLE_CODE);
+    stop_tx.send(()).ok();
+    join.await?;
+    Ok(())
+}

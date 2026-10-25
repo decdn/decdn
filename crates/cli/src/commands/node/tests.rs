@@ -255,7 +255,7 @@ fn write_status_renders_summary_and_bucket_table() -> anyhow::Result<()> {
     // last_seen 1s past epoch, now 1s later → "1s ago".
     let status = mk_status(Some(1_000_000));
     let mut buf = Vec::<u8>::new();
-    write_status(&mut buf, &status, 2_000_000)?;
+    write_status(&mut buf, &status, None, 2_000_000)?;
     let s = String::from_utf8(buf)?;
     assert!(s.contains(&format!("node_id={}", "ab".repeat(32))), "{s}");
     assert!(
@@ -287,7 +287,7 @@ fn write_status_absent_operator_renders_unknown_sentinel() -> anyhow::Result<()>
     let mut status = mk_status(Some(1_000_000));
     status.operator_address = None;
     let mut buf = Vec::<u8>::new();
-    write_status(&mut buf, &status, 2_000_000)?;
+    write_status(&mut buf, &status, None, 2_000_000)?;
     let s = String::from_utf8(buf)?;
     assert!(s.contains("operator_address=(unknown)"), "{s}");
     Ok(())
@@ -297,7 +297,7 @@ fn write_status_absent_operator_renders_unknown_sentinel() -> anyhow::Result<()>
 fn write_status_never_refreshed_renders_never() -> anyhow::Result<()> {
     let status = mk_status(None);
     let mut buf = Vec::<u8>::new();
-    write_status(&mut buf, &status, 2_000_000)?;
+    write_status(&mut buf, &status, None, 2_000_000)?;
     let s = String::from_utf8(buf)?;
     assert!(s.contains("last_refresh=never"), "{s}");
     Ok(())
@@ -313,7 +313,7 @@ fn write_status_empty_routing_table_renders_sentinel() -> anyhow::Result<()> {
     status.routing.non_empty_buckets = 0;
     status.routing.total_peers = 0;
     let mut buf = Vec::<u8>::new();
-    write_status(&mut buf, &status, 2_000_000)?;
+    write_status(&mut buf, &status, None, 2_000_000)?;
     let s = String::from_utf8(buf)?;
     assert!(s.contains("(routing table empty"), "{s}");
     assert!(
@@ -331,7 +331,7 @@ fn write_status_future_last_refresh_renders_in_future() -> anyhow::Result<()> {
     let status = mk_status(Some(5_000_000));
     let mut buf = Vec::<u8>::new();
     // now_us earlier than the stamp.
-    write_status(&mut buf, &status, 1_000_000)?;
+    write_status(&mut buf, &status, None, 1_000_000)?;
     let s = String::from_utf8(buf)?;
     assert!(s.contains("last_refresh=in future"), "{s}");
     Ok(())
@@ -512,6 +512,9 @@ fn mk_lane(
         voucher_signer: counterparty.to_string(),
         last_nonce,
         outstanding_micro_usdc: outstanding,
+        // Half the claim is still unredeemed in every fixture; the lanes
+        // table renders both columns.
+        unredeemed_micro_usdc: outstanding / 2,
         deposit_micro_usdc: deposit,
         seconds_since_last_voucher: secs_since,
         settlement_eligible: eligible,
@@ -1058,4 +1061,194 @@ fn filter_candidates_node_id_and_region_combine() {
         decdn_protocol::Region::parse("US"),
     );
     assert_eq!(out, vec![a]);
+}
+
+mod earnings {
+    use decdn_common::admin::{
+        EarningsPeriod, LastSettlement, PERIOD_LAST_7D, PERIOD_LAST_24H, PERIOD_SINCE,
+        PERIOD_SINCE_LEDGER_START, PendingRedeem,
+    };
+
+    use super::*;
+
+    const NOW: u64 = 1_792_926_150; // 2026-10-25 11:02:30 UTC
+
+    fn period(label: &str, from: u64, net: u64, bytes: u64, settlements: u64) -> EarningsPeriod {
+        EarningsPeriod {
+            label: label.to_owned(),
+            from_unix: from,
+            net_micro_usdc: net,
+            gross_micro_usdc: net * 10 / 6,
+            bytes_settled: bytes,
+            settlements,
+        }
+    }
+
+    fn response() -> EarningsResponse {
+        EarningsResponse {
+            operator_address: Some("0x52908400098527886E0F7030069857D2E4169EE7".to_owned()),
+            ledger_since_unix: Some(1_780_000_000), // 2026-05-28
+            periods: vec![
+                period(PERIOD_LAST_24H, NOW - 86_400, 4_120_000, 412_300_000_000, 9),
+                period(
+                    PERIOD_LAST_7D,
+                    NOW - 604_800,
+                    29_070_000,
+                    2_900_000_000_000,
+                    61,
+                ),
+                period(
+                    PERIOD_SINCE_LEDGER_START,
+                    1_780_000_000,
+                    121_410_000,
+                    12_400_000_000_000,
+                    1_160,
+                ),
+            ],
+            last_settlement: Some(LastSettlement {
+                at_unix: NOW - 3_600,
+                tx_hash: "0xabc".to_owned(),
+                block_number: 123_456_789,
+                net_micro_usdc: 500_000,
+            }),
+            pending: Some(PendingRedeem {
+                micro_usdc: 380_000,
+                lanes: 3,
+                next_sweep_at_unix: Some(NOW + 250),
+            }),
+        }
+    }
+
+    fn render(resp: &EarningsResponse) -> String {
+        let mut buf = Vec::<u8>::new();
+        write_earnings(&mut buf, resp, NOW).expect("write");
+        String::from_utf8(buf).expect("utf8")
+    }
+
+    #[test]
+    fn write_earnings_renders_header_table_last_and_pending() {
+        let s = render(&response());
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(
+            lines.first().copied(),
+            Some("operator=0x52908400098527886E0F7030069857D2E4169EE7 ledger_since=2026-05-28")
+        );
+        assert!(
+            lines.get(1).is_some_and(|l| l.starts_with("PERIOD")
+                && l.contains("SETTLED_USDC")
+                && l.contains("BYTES_SETTLED")
+                && l.contains("SETTLEMENTS")),
+            "{s}"
+        );
+        let day = lines.get(2).copied().unwrap_or_default();
+        assert!(day.starts_with("last 24h"), "{day}");
+        assert!(
+            day.contains("4.120000") && day.contains("412.3 GB") && day.trim_end().ends_with('9'),
+            "{day}"
+        );
+        let week = lines.get(3).copied().unwrap_or_default();
+        assert!(
+            week.starts_with("last 7d")
+                && week.contains("29.070000")
+                && week.contains("2.9 TB")
+                && week.contains("61"),
+            "{week}"
+        );
+        let all = lines.get(4).copied().unwrap_or_default();
+        assert!(
+            all.starts_with("since 2026-05-28")
+                && all.contains("121.410000")
+                && all.contains("12.4 TB")
+                && all.contains("1160"),
+            "{all}"
+        );
+        assert_eq!(
+            lines.get(5).copied(),
+            Some("last settlement: 2026-10-25 10:02 UTC, tx 0xabc, block 123456789")
+        );
+        assert_eq!(
+            lines.get(6).copied(),
+            Some("pending redeem: 0.380000 USDC over 3 lanes (next sweep in ~4 min)")
+        );
+        assert_eq!(lines.len(), 7);
+    }
+
+    #[test]
+    fn write_earnings_names_an_empty_ledger_and_a_missing_schedule() {
+        let mut resp = response();
+        resp.ledger_since_unix = None;
+        resp.last_settlement = None;
+        resp.periods = vec![period(PERIOD_SINCE_LEDGER_START, 0, 0, 0, 0)];
+        resp.pending = Some(PendingRedeem {
+            micro_usdc: 0,
+            lanes: 0,
+            next_sweep_at_unix: None,
+        });
+        let s = render(&resp);
+        assert!(s.contains("ledger_since=(no settlements yet)"), "{s}");
+        assert!(s.contains("since (no settlements yet)"), "{s}");
+        assert!(s.contains("0 B"), "{s}");
+        assert!(s.contains("last settlement: none"), "{s}");
+        assert!(
+            s.contains("pending redeem: 0.000000 USDC over 0 lanes (next sweep not scheduled yet)"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn write_earnings_in_chain_mode_omits_pending_and_dates_the_since_row() {
+        let mut resp = response();
+        resp.pending = None;
+        resp.periods
+            .push(period(PERIOD_SINCE, 1_790_812_800, 7_000_000, 1_000, 2));
+        let s = render(&resp);
+        assert!(!s.contains("pending redeem"), "{s}");
+        assert!(
+            s.lines()
+                .any(|l| l.starts_with("since 2026-10-01") && l.contains("7.000000")),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn a_due_sweep_says_so() {
+        let mut resp = response();
+        if let Some(p) = resp.pending.as_mut() {
+            p.next_sweep_at_unix = Some(NOW - 1);
+        }
+        assert!(render(&resp).contains("(next sweep due now)"));
+    }
+
+    #[test]
+    fn approx_duration_rounds_to_the_unit_that_reads() {
+        assert_eq!(approx_duration(5), "5s");
+        assert_eq!(approx_duration(250), "4 min");
+        assert_eq!(approx_duration(3_600 + 120), "1h 2m");
+    }
+
+    #[test]
+    fn status_line_and_setup_line_summarise_the_response() {
+        let resp = response();
+        assert_eq!(
+            earnings_summary_line(Some(&resp)),
+            "earnings 24h=4.120000 7d=29.070000 since_ledger_start=121.410000 pending=0.380000 \
+             last_settlement=2026-10-25T10:02TUTC"
+        );
+        assert_eq!(earnings_summary_line(None), "earnings=(unavailable)");
+        assert_eq!(
+            earned_so_far_line(Some(&resp)).as_deref(),
+            Some("earned_so_far=121.410000 USDC settlements=1160")
+        );
+        assert_eq!(earned_so_far_line(None), None);
+    }
+
+    #[test]
+    fn write_status_carries_the_earnings_line() -> anyhow::Result<()> {
+        let status = mk_status(Some(1_000_000));
+        let mut buf = Vec::<u8>::new();
+        write_status(&mut buf, &status, Some(&response()), 2_000_000)?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("\nearnings 24h=4.120000 7d=29.070000"), "{s}");
+        Ok(())
+    }
 }

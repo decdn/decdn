@@ -355,6 +355,17 @@ mod sol_types {
             /// node's live cell so a governance retune reaches running nodes
             /// without a restart.
             event SharesUpdated(uint256[3] newShares);
+
+            /// One `redeemMany` routed its payout to `operator`: `amount` is
+            /// the gross USDC before the `[operator, buyback, treasury]`
+            /// split, `bytesDelivered` the bytes the batch paid for, and
+            /// `epoch` the router's `block.timestamp / epochLength`. Emitted
+            /// once per transaction, in the same transaction as the
+            /// `PaymentPool.PoolRedeemed` events that triggered it. The
+            /// operator receives `amount` minus the buyback and treasury
+            /// buckets; that net figure is on the USDC `Transfer` from the
+            /// router to the operator in the same transaction.
+            event Settled(address indexed operator, uint256 bytesDelivered, uint256 amount, uint64 indexed epoch);
         }
     }
 }

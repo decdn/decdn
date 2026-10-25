@@ -140,7 +140,7 @@ use crate::rpc_metrics::is_rate_limit;
 
 use super::resumable_watcher::{CursorStart, LogSink, WatcherHandle, WatcherHook, fire};
 use super::shared_head::HeadSource;
-use super::{Shrunk, WindowSpan, timed, window_end};
+use super::{Shrunk, WindowSpan, is_range_rejection, timed, window_end};
 use super::{WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
 
 /// Object-safe adapter over [`LogSink`], so routes with different concrete sink
@@ -735,49 +735,6 @@ fn fire_route_hooks(poller: &mut MultiplexedPoller, shutdown: &CancellationToken
     }
     any_errored
 }
-
-/// Whether a failed `eth_getLogs` is the provider refusing the window's block
-/// range (or its result count), so a smaller window can succeed. Providers use
-/// different codes for this: dRPC `35 "ranges over 10000 blocks are not
-/// supported"`, Alchemy `-32600 "… up to a 10 block range"`, Infura `-32005
-/// "query returned more than 10000 results"` (also its rate-limit code),
-/// Quicknode `-32614 "eth_getLogs is limited to a 10,000 range"`, Ankr
-/// `"block range is too wide"`. The codes do not agree, so the test is the
-/// message: a JSON-RPC error response that names a range or a result count
-/// *and* a limit ([`LIMIT_WORDS`]). Both parts are required because a false
-/// match still costs throughput until the span doubles back: a load-balanced provider whose backend lags head reports a
-/// `toBlock` past that backend's head with range wording but no limit ("block
-/// range extends beyond current head block", "block number is out of range"),
-/// and a smaller window is not the fix for that. Any other error — a timeout, a
-/// transport failure, a rate limit, an unknown block — leaves the window span
-/// alone, so a transient fault cannot shrink it: it is retried in place
-/// ([`is_transient_window_error`]) or takes the backoff path.
-fn is_range_rejection(err: &anyhow::Error) -> bool {
-    err.chain()
-        .find_map(|cause| cause.downcast_ref::<TransportError>())
-        .and_then(TransportError::as_error_resp)
-        .is_some_and(|resp| {
-            let message = resp.message.to_ascii_lowercase();
-            (message.contains("range") || message.contains("results"))
-                && !message.contains("out of range")
-                && LIMIT_WORDS.iter().any(|word| message.contains(word))
-        })
-}
-
-/// Words that mark a range or result-count message as a limit, not a
-/// head-lag or lookup error. See [`is_range_rejection`].
-const LIMIT_WORDS: [&str; 10] = [
-    "limit",
-    "max",
-    "exceed",
-    "up to",
-    " over ",
-    "more than",
-    "too many",
-    "too wide",
-    "too large",
-    "not supported",
-];
 
 /// How many times [`run_tick`] retries a transiently failed `get_logs` window
 /// before it defers the window to the next tick. At an independent per-call

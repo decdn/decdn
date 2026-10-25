@@ -983,9 +983,11 @@ identity rotation, host clock skew breaking TLS.
 seller payment state.** The lane store binds to one `PaymentPool` deployment
 (ADR 003 § Off-chain voucher state persistence): on the first boot against a
 different deployment the node deletes its seller lane frontiers, both
-pending-settle sets, and the event-scan checkpoints, because their pool ids
-repeat on the new deployment. Unredeemed vouchers on the old deployment are
-forfeit after the drop.
+pending-settle sets, the event-scan checkpoints, and the settlement ledger
+`decdn node earnings` reads, because their pool ids repeat on the new
+deployment. Unredeemed vouchers on the old deployment are forfeit after the
+drop, and the earnings history starts over; `decdn node earnings --address`
+still reads the old deployment's settlements from the chain.
 
 **Before repointing:**
 

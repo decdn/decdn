@@ -1510,3 +1510,142 @@ async fn bind_accepts_loopback_and_warns_on_non_loopback() {
     );
     drop(listener);
 }
+
+mod earnings {
+    use decdn_incentive::SettlementRecord;
+
+    use super::*;
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn row(block: u64, landed_at: u64, net: u64, gross: u64, bytes: u64) -> SettlementRecord {
+        SettlementRecord {
+            block_number: block,
+            log_index: 0,
+            tx_hash: B256::repeat_byte(u8::try_from(block).unwrap_or(0)),
+            landed_at_unix: landed_at,
+            epoch: 1,
+            gross_micro_usdc: gross,
+            net_micro_usdc: net,
+            bytes_delivered: bytes,
+        }
+    }
+
+    fn period<'a>(
+        resp: &'a EarningsResponse,
+        label: &str,
+    ) -> &'a decdn_common::admin::EarningsPeriod {
+        resp.periods
+            .iter()
+            .find(|p| p.label == label)
+            .unwrap_or_else(|| panic!("period {label}"))
+    }
+
+    /// Three rows: one an hour old, one three days old, one a month old.
+    fn rows() -> Vec<SettlementRecord> {
+        vec![
+            row(1, NOW - 30 * DAY_SECS, 10, 20, 100),
+            row(2, NOW - 3 * DAY_SECS, 20, 40, 200),
+            row(3, NOW - 3_600, 40, 80, 400),
+        ]
+    }
+
+    #[test]
+    fn periods_bucket_rows_by_landed_time() {
+        let resp = build_earnings_response(&rows(), &[], None, NOW, None, None);
+        assert_eq!(resp.periods.len(), 3, "no `since` asked for");
+        let day = period(&resp, PERIOD_LAST_24H);
+        assert_eq!(
+            (day.from_unix, day.settlements, day.net_micro_usdc),
+            (NOW - DAY_SECS, 1, 40)
+        );
+        let week = period(&resp, PERIOD_LAST_7D);
+        assert_eq!(
+            (
+                week.from_unix,
+                week.settlements,
+                week.net_micro_usdc,
+                week.gross_micro_usdc,
+                week.bytes_settled
+            ),
+            (NOW - WEEK_SECS, 2, 60, 120, 600)
+        );
+        let all = period(&resp, PERIOD_SINCE_LEDGER_START);
+        assert_eq!(
+            (all.from_unix, all.settlements, all.net_micro_usdc),
+            (NOW - 30 * DAY_SECS, 3, 70)
+        );
+        assert_eq!(resp.ledger_since_unix, Some(NOW - 30 * DAY_SECS));
+        let last = resp.last_settlement.expect("a last settlement");
+        assert_eq!(
+            (last.block_number, last.net_micro_usdc, last.at_unix),
+            (3, 40, NOW - 3_600)
+        );
+        assert_eq!(last.tx_hash, format!("{:#x}", B256::repeat_byte(3)));
+    }
+
+    #[test]
+    fn a_since_request_adds_a_fourth_period() {
+        let since = NOW - 10 * DAY_SECS;
+        let resp = build_earnings_response(&rows(), &[], None, NOW, Some(since), None);
+        assert_eq!(resp.periods.len(), 4);
+        let custom = period(&resp, PERIOD_SINCE);
+        assert_eq!(
+            (custom.from_unix, custom.settlements, custom.net_micro_usdc),
+            (since, 2, 60)
+        );
+        assert_eq!(
+            resp.periods.last().map(|p| p.label.as_str()),
+            Some(PERIOD_SINCE),
+            "the custom period prints last"
+        );
+    }
+
+    #[test]
+    fn an_empty_ledger_has_no_start_and_zero_periods() {
+        let resp = build_earnings_response(&[], &[], None, NOW, None, None);
+        assert_eq!(resp.ledger_since_unix, None);
+        assert_eq!(resp.last_settlement, None);
+        let all = period(&resp, PERIOD_SINCE_LEDGER_START);
+        assert_eq!(
+            (
+                all.from_unix,
+                all.settlements,
+                all.net_micro_usdc,
+                all.bytes_settled
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn last_settlement_is_by_block_not_by_timestamp() {
+        // The higher block carries a wall-clock fallback stamp that is older.
+        let rows = vec![row(10, NOW - 10, 1, 1, 1), row(20, NOW - 5_000, 2, 2, 2)];
+        let resp = build_earnings_response(&rows, &[], None, NOW, None, None);
+        assert_eq!(resp.last_settlement.map(|l| l.block_number), Some(20));
+    }
+
+    #[test]
+    fn pending_sums_owed_minus_paid_and_counts_only_lanes_still_owed() {
+        let mut paid_in_part = mk_lane(1, 1, 1_000);
+        paid_in_part.paid_cumulative = U256::from(400u64);
+        let mut paid_in_full = mk_lane(1, 2, 700);
+        paid_in_full.paid_cumulative = U256::from(700u64);
+        let untouched = mk_lane(2, 3, 250);
+        // A watermark above the claim (a replayed older state) saturates to 0.
+        let mut over_paid = mk_lane(2, 4, 100);
+        over_paid.paid_cumulative = U256::from(500u64);
+        let lanes = [paid_in_part, paid_in_full, untouched, over_paid];
+        let operator = Address::repeat_byte(0xEE);
+        let resp = build_earnings_response(&[], &lanes, Some(operator), NOW, None, Some(NOW + 240));
+        assert_eq!(
+            resp.operator_address.as_deref(),
+            Some(operator.to_string().as_str())
+        );
+        let pending = resp.pending.expect("daemon mode reports pending");
+        assert_eq!(pending.micro_usdc, 600 + 250);
+        assert_eq!(pending.lanes, 2);
+        assert_eq!(pending.next_sweep_at_unix, Some(NOW + 240));
+    }
+}
