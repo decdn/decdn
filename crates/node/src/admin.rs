@@ -42,7 +42,7 @@ use crate::admin::pool_owners::PoolOwners;
 use crate::binding_check::BindingReport;
 use crate::dht::{RecordStore, RepublishScheduler, RoutingTable, StakerSet};
 use crate::metrics::Metrics;
-use crate::payment_settlement::{RedeemSchedule, capability_expired};
+use crate::payment_settlement::{RedeemSchedule, capability_expired, unix_now};
 
 // Wire types live in `decdn_common::admin`. We import the server-side
 // trait, the request DTO, and the few error codes the server impl
@@ -1023,7 +1023,7 @@ impl AdminRpcServer for AdminRpcImpl {
             &rows,
             &lanes,
             self.state.operator_address,
-            crate::payment_settlement::unix_now(),
+            unix_now(),
             req.since_unix,
             &h.schedule,
         ))
@@ -1039,12 +1039,7 @@ const WEEK_SECS: u64 = 7 * DAY_SECS;
 /// pending split are unit-testable without a store.
 ///
 /// A row falls in a period when its `landed_at_unix` is at or after the
-/// period's start. Each lane's `owed − paid_cumulative` (saturating) counts as
-/// pending when the lane names `operator` as its provider and its capability
-/// has not expired, the two local predicates the redeemer's planner applies;
-/// otherwise it counts as stranded. The planner also skips a lane whose pool
-/// cannot pay, which needs the pool view, so the pending figure is an upper
-/// bound on the next sweep.
+/// period's start. The pending section is [`pending_redeem`].
 pub(crate) fn build_earnings_response(
     rows: &[SettlementRecord],
     lanes: &[LaneState],
@@ -1057,6 +1052,30 @@ pub(crate) fn build_earnings_response(
     let landed_since = |from: u64| rows.iter().filter(move |row| row.landed_at_unix >= from);
     let day = now_unix.saturating_sub(DAY_SECS);
     let week = now_unix.saturating_sub(WEEK_SECS);
+    EarningsResponse {
+        operator_address: operator.map(|a| a.to_string()),
+        ledger_since_unix,
+        last_24h: sum_period(day, landed_since(day)),
+        last_7d: sum_period(week, landed_since(week)),
+        since_ledger_start: sum_period(ledger_since_unix.unwrap_or(0), rows.iter()),
+        since: since_unix.map(|since| sum_period(since, landed_since(since))),
+        last_settlement: last_settlement(rows),
+        pending: Some(pending_redeem(lanes, operator, now_unix, schedule)),
+    }
+}
+
+/// What the lanes still owe this node at `now_unix`. Each lane's
+/// `owed − paid_cumulative` (saturating) counts as pending when the lane names
+/// `operator` as its provider and its capability has not expired, the two
+/// local predicates the redeemer's planner applies; otherwise it counts as
+/// stranded. The planner also skips a lane whose pool cannot pay, which needs
+/// the pool view, so the pending figure is an upper bound on the next sweep.
+fn pending_redeem(
+    lanes: &[LaneState],
+    operator: Option<Address>,
+    now_unix: u64,
+    schedule: &RedeemSchedule,
+) -> PendingRedeem {
     let mut pending = PendingRedeem {
         micro_usdc: 0,
         lanes: 0,
@@ -1081,16 +1100,7 @@ pub(crate) fn build_earnings_response(
             pending.stranded_lanes = pending.stranded_lanes.saturating_add(1);
         }
     }
-    EarningsResponse {
-        operator_address: operator.map(|a| a.to_string()),
-        ledger_since_unix,
-        last_24h: sum_period(day, landed_since(day)),
-        last_7d: sum_period(week, landed_since(week)),
-        since_ledger_start: sum_period(ledger_since_unix.unwrap_or(0), rows.iter()),
-        since: since_unix.map(|since| sum_period(since, landed_since(since))),
-        last_settlement: last_settlement(rows),
-        pending: Some(pending),
-    }
+    pending
 }
 
 /// Build the wire [`BuyerPoolsResponse`] from loaded buyer pool states and the

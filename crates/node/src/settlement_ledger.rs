@@ -35,7 +35,7 @@ use alloy::sol_types::SolEvent;
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::erc20::Erc20;
 use decdn_incentive::payment_pool::{FeeRouter, PaymentPool};
-use decdn_incentive::{SettlementLedger, SettlementRecord};
+use decdn_incentive::{SettlementLedger, SettlementRecord, StoreError};
 use tracing::{debug, warn};
 
 use crate::chain_events::timed;
@@ -288,12 +288,9 @@ impl SettlementRecorder {
     /// Whether the ledger already holds `tx_hash` in `block_number`; `None`
     /// after a failed read, which is counted and ends the backfill.
     async fn is_known(&self, block_number: u64, tx_hash: B256) -> Option<bool> {
-        let ledger = Arc::clone(&self.ledger);
-        let known =
-            tokio::task::spawn_blocking(move || ledger.has_settlement_tx(block_number, tx_hash))
-                .await
-                .map_err(|join| join.to_string())
-                .and_then(|read| read.map_err(|err| err.to_string()));
+        let known = self
+            .on_ledger(move |ledger| ledger.has_settlement_tx(block_number, tx_hash))
+            .await;
         match known {
             Ok(known) => Some(known),
             Err(error) => {
@@ -334,6 +331,20 @@ impl SettlementRecorder {
         }
         self.skip(tx_hash, None, &why);
         None
+    }
+
+    /// Run one blocking ledger call on the blocking pool. A task that did not
+    /// complete and a store error both come back as their message.
+    async fn on_ledger<T, F>(&self, call: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn SettlementLedger) -> Result<T, StoreError> + Send + 'static,
+    {
+        let ledger = Arc::clone(&self.ledger);
+        tokio::task::spawn_blocking(move || call(ledger.as_ref()))
+            .await
+            .map_err(|join| join.to_string())
+            .and_then(|result| result.map_err(|err| err.to_string()))
     }
 
     /// Log and count a landed redemption that gets no row.
@@ -437,11 +448,9 @@ impl SettlementRecorder {
 
     /// Write `row`, logging the outcome and counting a failure.
     async fn write(&self, row: SettlementRecord) {
-        let ledger = Arc::clone(&self.ledger);
-        let written = tokio::task::spawn_blocking(move || ledger.record_settlement(&row))
-            .await
-            .map_err(|join| join.to_string())
-            .and_then(|write| write.map_err(|err| err.to_string()));
+        let written = self
+            .on_ledger(move |ledger| ledger.record_settlement(&row))
+            .await;
         match written {
             Ok(()) => debug!(
                 tx = %row.tx_hash,

@@ -41,27 +41,23 @@ pub(crate) fn format_date(unix: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// `(hour, minute)` of a Unix time, UTC.
+const fn hour_minute(unix: u64) -> (u64, u64) {
+    let secs_of_day = unix % 86_400;
+    (secs_of_day / 3_600, (secs_of_day % 3_600) / 60)
+}
+
 /// `YYYY-MM-DD HH:MM UTC` of a Unix time.
 pub(crate) fn format_utc(unix: u64) -> String {
-    let secs_of_day = unix % 86_400;
-    format!(
-        "{} {:02}:{:02} UTC",
-        format_date(unix),
-        secs_of_day / 3_600,
-        (secs_of_day % 3_600) / 60
-    )
+    let (hour, minute) = hour_minute(unix);
+    format!("{} {hour:02}:{minute:02} UTC", format_date(unix))
 }
 
 /// `YYYY-MM-DDTHH:MMZ` of a Unix time: one `key=value`-safe token with no
 /// space, for the `node status` line.
 pub(crate) fn format_utc_token(unix: u64) -> String {
-    let secs_of_day = unix % 86_400;
-    format!(
-        "{}T{:02}:{:02}Z",
-        format_date(unix),
-        secs_of_day / 3_600,
-        (secs_of_day % 3_600) / 60
-    )
+    let (hour, minute) = hour_minute(unix);
+    format!("{}T{hour:02}:{minute:02}Z", format_date(unix))
 }
 
 /// The earliest Unix time `parse_since` accepts as a bare integer:
@@ -87,19 +83,7 @@ pub(crate) fn parse_since(value: &str) -> anyhow::Result<u64> {
         );
         return Ok(unix);
     }
-    let parts: Vec<&str> = value.split('-').collect();
-    let date = match parts.as_slice() {
-        [y, m, d] if y.len() == 4 && m.len() == 2 && d.len() == 2 => {
-            match (y.parse::<i64>(), m.parse::<i64>(), d.parse::<i64>()) {
-                (Ok(y), Ok(m), Ok(d)) if (1..=12).contains(&m) && (1..=31).contains(&d) => {
-                    Some((y, m, d))
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    };
-    let Some((year, month, day)) = date else {
+    let Some((year, month, day)) = parse_ymd(value) else {
         anyhow::bail!("--since takes a UTC date `YYYY-MM-DD` or Unix seconds, not `{value}`");
     };
     let days = days_from_civil(year, month, day);
@@ -111,6 +95,21 @@ pub(crate) fn parse_since(value: &str) -> anyhow::Result<u64> {
     );
     u64::try_from(days * DAY_SECS)
         .map_err(|_| anyhow::anyhow!("--since: `{value}` is before 1970-01-01"))
+}
+
+/// `(year, month, day)` of a `YYYY-MM-DD` string whose month is 1 to 12 and
+/// whose day is 1 to 31; `None` for any other shape. Whether the day exists
+/// in that month is the caller's check.
+fn parse_ymd(value: &str) -> Option<(i64, i64, i64)> {
+    let parts: Vec<&str> = value.split('-').collect();
+    let [y, m, d] = parts.as_slice() else {
+        return None;
+    };
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return None;
+    }
+    let (year, month, day) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    ((1..=12).contains(&month) && (1..=31).contains(&day)).then_some((year, month, day))
 }
 
 #[cfg(test)]

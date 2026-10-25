@@ -21,7 +21,7 @@ use decdn_client::probe::probe_once;
 use decdn_common::admin::{
     AdminRpcClient, BindingStatus, BuyerPoolsResponse, DrainRequest, DrainResponse, EarningsPeriod,
     EarningsRequest, EarningsResponse, EvictRequest, EvictResponse, HealthResponse, LaneSnapshot,
-    LanesResponse, ReloadResponse, SlashesResponse, StatusResponse,
+    LanesResponse, PendingRedeem, ReloadResponse, SlashesResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -731,34 +731,41 @@ pub(crate) fn write_earnings(
             last.block_number,
         )?,
     }
-    if let Some(pending) = &resp.pending {
-        let next = match pending.next_sweep_at_unix {
-            None => "next sweep not scheduled yet".to_owned(),
-            Some(at) if at <= now_unix => "next sweep due now".to_owned(),
-            Some(at) => format!("next sweep in ~{}", approx_duration(at - now_unix)),
-        };
-        let last = match pending.last_sweep_at_unix {
-            None => "no sweep yet".to_owned(),
-            Some(at) => format!(
-                "last sweep {} ago",
-                approx_duration(now_unix.saturating_sub(at))
-            ),
-        };
+    match &resp.pending {
+        Some(pending) => write_pending(w, pending, now_unix),
+        None => Ok(()),
+    }
+}
+
+/// The daemon-mode pending lines of [`write_earnings`]: the redeemable total
+/// with the sweep schedule, then the stranded total when any lane is stranded.
+fn write_pending(w: &mut impl io::Write, pending: &PendingRedeem, now_unix: u64) -> io::Result<()> {
+    let next = match pending.next_sweep_at_unix {
+        None => "next sweep not scheduled yet".to_owned(),
+        Some(at) if at <= now_unix => "next sweep due now".to_owned(),
+        Some(at) => format!("next sweep in ~{}", approx_duration(at - now_unix)),
+    };
+    let last = match pending.last_sweep_at_unix {
+        None => "no sweep yet".to_owned(),
+        Some(at) => format!(
+            "last sweep {} ago",
+            approx_duration(now_unix.saturating_sub(at))
+        ),
+    };
+    writeln!(
+        w,
+        "pending redeem: {} USDC over {} lanes ({next}, {last})",
+        format_usdc(pending.micro_usdc),
+        pending.lanes,
+    )?;
+    if pending.stranded_lanes > 0 {
         writeln!(
             w,
-            "pending redeem: {} USDC over {} lanes ({next}, {last})",
-            format_usdc(pending.micro_usdc),
-            pending.lanes,
+            "stranded: {} USDC over {} lanes (expired capability or another provider's \
+             lane; no sweep redeems it)",
+            format_usdc(pending.stranded_micro_usdc),
+            pending.stranded_lanes,
         )?;
-        if pending.stranded_lanes > 0 {
-            writeln!(
-                w,
-                "stranded: {} USDC over {} lanes (expired capability or another provider's \
-                 lane; no sweep redeems it)",
-                format_usdc(pending.stranded_micro_usdc),
-                pending.stranded_lanes,
-            )?;
-        }
     }
     Ok(())
 }

@@ -28,7 +28,7 @@ use decdn_common::cli;
 use decdn_common::config::{DEFAULT_CHAIN_ID, DEFAULT_GET_LOGS_MAX_BLOCK_SPAN};
 use decdn_incentive::SettlementRecord;
 use decdn_incentive::earnings::{last_settlement, sum_period};
-use decdn_incentive::log_scan::{ScanEvent, scan_logs};
+use decdn_incentive::log_scan::{SCAN_WINDOW_RETRIES, ScanEvent, scan_logs};
 use decdn_incentive::payment_pool::{FeeRouter, PaymentPool};
 
 use crate::commands::chain_ctx;
@@ -232,45 +232,18 @@ async fn scan_rows<P: Provider>(
         "scanning FeeRouter.Settled for {operator} over blocks {from}..={to} \
          (windows of {span} blocks, shrinking if the provider rejects them)"
     );
-    let mut windows = 0u32;
     let settled = scan_logs(
         provider,
         &settled_filter(router, operator),
         from,
         to,
         span,
-        |event| match event {
-            ScanEvent::Window { end, to } => {
-                windows = windows.wrapping_add(1);
-                if end == to || windows.is_multiple_of(PROGRESS_EVERY_WINDOWS) {
-                    eprintln!("  scanned to block {end}/{to}");
-                }
-            }
-            ScanEvent::Retry {
-                start,
-                end,
-                attempt,
-                delay,
-                error,
-            } => eprintln!(
-                "  window {start}..={end} failed ({error}); retry {attempt}/{} in {}s",
-                decdn_incentive::log_scan::SCAN_WINDOW_RETRIES,
-                delay.as_secs()
-            ),
-        },
+        settled_scan_progress(),
     )
     .await
     .context("scanning FeeRouter.Settled")?;
     let shares_logs = scan_logs(provider, &shares_filter(router), from, to, span, |event| {
-        if let ScanEvent::Retry {
-            start,
-            end,
-            attempt,
-            ..
-        } = event
-        {
-            eprintln!("  window {start}..={end} failed; retry {attempt}");
-        }
+        shares_scan_progress(&event);
     })
     .await
     .context("scanning FeeRouter.SharesUpdated")?;
@@ -306,6 +279,47 @@ async fn scan_rows<P: Provider>(
         history.insert(0, ((from, 0), before));
     }
     rows_from_logs(&settled, &history, current_shares)
+}
+
+/// Progress lines for the `Settled` scan: every
+/// [`PROGRESS_EVERY_WINDOWS`]th accepted window and the last one, and each
+/// retry with its cause and delay.
+fn settled_scan_progress() -> impl FnMut(ScanEvent) {
+    let mut windows = 0u32;
+    move |event| match event {
+        ScanEvent::Window { end, to } => {
+            windows = windows.wrapping_add(1);
+            if end == to || windows.is_multiple_of(PROGRESS_EVERY_WINDOWS) {
+                eprintln!("  scanned to block {end}/{to}");
+            }
+        }
+        ScanEvent::Retry {
+            start,
+            end,
+            attempt,
+            delay,
+            error,
+        } => {
+            let secs = delay.as_secs();
+            eprintln!(
+                "  window {start}..={end} failed ({error}); \
+                 retry {attempt}/{SCAN_WINDOW_RETRIES} in {secs}s"
+            );
+        }
+    }
+}
+
+/// Progress lines for the `SharesUpdated` scan: its retries only.
+fn shares_scan_progress(event: &ScanEvent) {
+    if let ScanEvent::Retry {
+        start,
+        end,
+        attempt,
+        ..
+    } = event
+    {
+        eprintln!("  window {start}..={end} failed; retry {attempt}");
+    }
 }
 
 /// `FeeRouter.Settled` logs for `operator`: the event signature as topic 0 and

@@ -16,6 +16,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::transports::TransportError;
 use anyhow::Context;
+use decdn_common::redact::sanitize_err_chain;
 
 /// The inclusive end of the `eth_getLogs` window that starts at `start`: at
 /// most `span` blocks, clamped to `to`. A scan walks `[from, to]` with it one
@@ -264,7 +265,9 @@ pub async fn scan_logs<P: Provider>(
             Err(err) if retries < SCAN_WINDOW_RETRIES => {
                 let delay = SCAN_WINDOW_RETRY_DELAY * 2u32.pow(retries);
                 retries += 1;
-                let error = format!("{err:#}");
+                // Redacted: a transport error can echo the RPC URL, and an
+                // RPC URL commonly carries an API key.
+                let error = sanitize_err_chain(&err);
                 tracing::warn!(
                     error,
                     start,

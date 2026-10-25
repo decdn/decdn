@@ -182,6 +182,9 @@ const BUYER_PENDING_SETTLE_TABLE: TableDefinition<'_, &[u8; 32], u64> =
 const SETTLEMENT_LEDGER_TABLE: TableDefinition<'_, &[u8; 16], &[u8]> =
     TableDefinition::new("settlement_ledger_v1");
 
+/// [`SETTLEMENT_LEDGER_TABLE`] opened for reading.
+type SettlementLedgerTable = redb::ReadOnlyTable<&'static [u8; 16], &'static [u8]>;
+
 /// The `schema_version` [`StoredSettlement`] rows are written with. A row
 /// carrying a higher version is [`StoreError::UnsupportedSchema`].
 const SETTLEMENT_SCHEMA_VERSION: u32 = 1;
@@ -1762,47 +1765,28 @@ impl SettlementLedger for PersistentPoolStateStore {
     }
 
     fn load_settlements(&self) -> Result<Vec<SettlementRecord>, StoreError> {
-        let read_txn = self
-            .settle_db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
         // A never-written ledger table is the empty ledger: no redemption has
         // landed since the table exists.
-        let table = match read_txn.open_table(SETTLEMENT_LEDGER_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        let Some(table) = self.open_settlement_ledger()? else {
+            return Ok(Vec::new());
         };
-        let mut out = Vec::new();
         let iter = table
             .iter()
             .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
+        let mut out = Vec::new();
         for entry in iter {
-            let (key_guard, value_guard) =
+            let (key, value) =
                 entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
-            let (block_number, log_index) = settlement_key_parts(key_guard.value());
-            let stored: StoredSettlement =
-                postcard::from_bytes(value_guard.value()).map_err(|err| StoreError::Corrupt {
-                    pool_id: None,
-                    detail: format!(
-                        "settlement ledger row at block {block_number} log {log_index} does not \
-                         decode: {err}"
-                    ),
-                })?;
+            let (block_number, log_index, stored) =
+                decode_settlement_entry(key.value(), value.value())?;
             out.push(stored.into_record(block_number, log_index)?);
         }
         Ok(out)
     }
 
     fn has_settlement_tx(&self, block_number: u64, tx_hash: B256) -> Result<bool, StoreError> {
-        let read_txn = self
-            .settle_db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        let table = match read_txn.open_table(SETTLEMENT_LEDGER_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
-            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        let Some(table) = self.open_settlement_ledger()? else {
+            return Ok(false);
         };
         // Only this block's rows: the key is `block ‖ log_index`, so the range
         // is a few entries however large the ledger, and a row elsewhere that
@@ -1813,23 +1797,48 @@ impl SettlementLedger for PersistentPoolStateStore {
             .range::<&[u8; 16]>(&lo..=&hi)
             .map_err(|err| StoreError::Backend(format!("table range: {err}")))?;
         for entry in iter {
-            let (key_guard, value_guard) =
+            let (key, value) =
                 entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
-            let (_, log_index) = settlement_key_parts(key_guard.value());
-            let stored: StoredSettlement =
-                postcard::from_bytes(value_guard.value()).map_err(|err| StoreError::Corrupt {
-                    pool_id: None,
-                    detail: format!(
-                        "settlement ledger row at block {block_number} log {log_index} does not \
-                         decode: {err}"
-                    ),
-                })?;
+            let (_, _, stored) = decode_settlement_entry(key.value(), value.value())?;
             if B256::from(stored.tx_hash) == tx_hash {
                 return Ok(true);
             }
         }
         Ok(false)
     }
+}
+
+impl PersistentPoolStateStore {
+    /// Open [`SETTLEMENT_LEDGER_TABLE`] for reading; `None` when no row was
+    /// ever written.
+    fn open_settlement_ledger(&self) -> Result<Option<SettlementLedgerTable>, StoreError> {
+        let read_txn = self
+            .settle_db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        match read_txn.open_table(SETTLEMENT_LEDGER_TABLE) {
+            Ok(table) => Ok(Some(table)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(err) => Err(StoreError::Backend(format!("open_table: {err}"))),
+        }
+    }
+}
+
+/// Decode one [`SETTLEMENT_LEDGER_TABLE`] entry into
+/// `(block_number, log_index, value)`. A value that does not decode is
+/// [`StoreError::Corrupt`] naming its block and log index.
+fn decode_settlement_entry(
+    key: &[u8; 16],
+    value: &[u8],
+) -> Result<(u64, u64, StoredSettlement), StoreError> {
+    let (block_number, log_index) = settlement_key_parts(key);
+    let stored = postcard::from_bytes(value).map_err(|err| StoreError::Corrupt {
+        pool_id: None,
+        detail: format!(
+            "settlement ledger row at block {block_number} log {log_index} does not decode: {err}"
+        ),
+    })?;
+    Ok((block_number, log_index, stored))
 }
 
 #[cfg(test)]

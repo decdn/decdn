@@ -552,33 +552,34 @@ pub trait SettlementLedger: Send + Sync {
 /// `crates/node`.
 #[derive(Debug, Default)]
 pub struct MemorySettlementLedger {
-    inner: Mutex<BTreeMap<(u64, u64), SettlementRecord>>,
+    inner: Mutex<LedgerRows>,
+}
+
+/// [`MemorySettlementLedger`]'s rows, keyed by [`SettlementRecord::key`].
+type LedgerRows = BTreeMap<(u64, u64), SettlementRecord>;
+
+impl MemorySettlementLedger {
+    /// The rows, or [`StoreError::Backend`] when the mutex is poisoned.
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, LedgerRows>, StoreError> {
+        self.inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory ledger mutex poisoned: {err}")))
+    }
 }
 
 impl SettlementLedger for MemorySettlementLedger {
     fn record_settlement(&self, row: &SettlementRecord) -> Result<(), StoreError> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|err| StoreError::Backend(format!("memory ledger mutex poisoned: {err}")))?;
-        guard.insert(row.key(), *row);
+        self.lock()?.insert(row.key(), *row);
         Ok(())
     }
 
     fn load_settlements(&self) -> Result<Vec<SettlementRecord>, StoreError> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|err| StoreError::Backend(format!("memory ledger mutex poisoned: {err}")))?;
-        Ok(guard.values().copied().collect())
+        Ok(self.lock()?.values().copied().collect())
     }
 
     fn has_settlement_tx(&self, block_number: u64, tx_hash: B256) -> Result<bool, StoreError> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|err| StoreError::Backend(format!("memory ledger mutex poisoned: {err}")))?;
-        Ok(guard
+        Ok(self
+            .lock()?
             .range((block_number, 0)..=(block_number, u64::MAX))
             .any(|(_, row)| row.tx_hash == tx_hash))
     }
