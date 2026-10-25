@@ -172,10 +172,14 @@ mod settlement_ledger {
     #[test]
     fn memory_ledger_knows_its_tx_hashes() -> Result<(), StoreError> {
         let ledger = MemorySettlementLedger::default();
-        assert!(!ledger.has_settlement_tx(B256::repeat_byte(0xA))?);
+        assert!(!ledger.has_settlement_tx(10, B256::repeat_byte(0xA))?);
         ledger.record_settlement(&row(10, 0, 0xA))?;
-        assert!(ledger.has_settlement_tx(B256::repeat_byte(0xA))?);
-        assert!(!ledger.has_settlement_tx(B256::repeat_byte(0xB))?);
+        assert!(ledger.has_settlement_tx(10, B256::repeat_byte(0xA))?);
+        assert!(!ledger.has_settlement_tx(10, B256::repeat_byte(0xB))?);
+        assert!(
+            !ledger.has_settlement_tx(11, B256::repeat_byte(0xA))?,
+            "the guard reads the named block only"
+        );
         Ok(())
     }
 }

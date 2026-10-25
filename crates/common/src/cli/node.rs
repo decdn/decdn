@@ -371,7 +371,8 @@ pub struct EarningsArgs {
 
     /// Read the chain instead of the daemon, for this operator address
     /// (`0x…`). Scans `FeeRouter.Settled` from the deployment's first block
-    /// to head, so it needs no running node and works for any operator, but
+    /// (or `--from-block`) to head, so it needs no running node and works for
+    /// any operator, but
     /// it sees no lane state: the pending line is omitted. Slow on an RPC
     /// that caps `eth_getLogs` windows (the free tiers do); progress prints
     /// to stderr.

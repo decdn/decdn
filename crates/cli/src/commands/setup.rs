@@ -466,7 +466,8 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     emit_readiness(json, &readiness, &args.region, multiaddr_count);
     // What the node has earned so far (#2598), when a daemon is up to answer
     // within a short deadline: a re-run of `setup` on a working node closes
-    // with the figure. No daemon, or no settlement ledger yet, prints nothing.
+    // with the figure. No daemon within the deadline prints nothing; a daemon
+    // with an empty ledger prints a zero figure.
     let earnings = node::earned_so_far(config_path, EARNINGS_TIMEOUT).await;
     if json {
         let mut summary = summary(Some(&readiness));

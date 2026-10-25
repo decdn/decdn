@@ -401,3 +401,49 @@ fn present_label_maps() {
     assert_eq!(present_label(true), "present");
     assert_eq!(present_label(false), "absent");
 }
+
+mod earnings_key {
+    use decdn_common::admin::{EarningsPeriod, EarningsResponse};
+
+    use super::*;
+
+    fn period(net: u64) -> EarningsPeriod {
+        EarningsPeriod {
+            from_unix: 0,
+            net_micro_usdc: net,
+            gross_micro_usdc: net,
+            bytes_settled: 0,
+            settlements: 1,
+        }
+    }
+
+    #[test]
+    fn attach_earnings_adds_null_without_a_daemon_and_the_response_with_one() {
+        let mut summary = serde_json::json!({ "partial": false, "keys_generated": true });
+        attach_earnings(&mut summary, None);
+        assert!(summary["earnings"].is_null());
+        assert_eq!(
+            summary["partial"],
+            serde_json::json!(false),
+            "other keys untouched"
+        );
+
+        let resp = EarningsResponse {
+            operator_address: None,
+            ledger_since_unix: Some(5),
+            last_24h: period(1),
+            last_7d: period(2),
+            since_ledger_start: period(3),
+            since: None,
+            last_settlement: None,
+            pending: None,
+        };
+        attach_earnings(&mut summary, Some(&resp));
+        assert_eq!(
+            summary["earnings"]["since_ledger_start"]["net_micro_usdc"],
+            3
+        );
+        assert_eq!(summary["earnings"]["ledger_since_unix"], 5);
+        assert!(summary["earnings"]["since"].is_null());
+    }
+}

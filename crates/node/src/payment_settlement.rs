@@ -493,7 +493,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         let contract = PaymentPool::new(payment_pool_addr, provider);
         // One recorder for both ledger writers: the redeemer (receipt in hand)
         // and the `PoolRedeemed` sink (backfill of a landing it never saw).
-        let recorder = SettlementRecorder::new(ledger, self_address);
+        let recorder = SettlementRecorder::new(ledger, self_address, Arc::clone(&metrics));
         let schedule = RedeemSchedule::default();
 
         let usdc_token = usdc_self_check(&contract, boot).await?;
@@ -838,7 +838,6 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
                 if event.provider != self.self_address {
                     return Ok(());
                 }
-                self.backfill_ledger(&log, event.poolId).await;
                 // One event carries every lane the batch paid on this pool, so
                 // the watermark write is per entry, not per log.
                 for lane in &event.lanes {
@@ -873,6 +872,9 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
                         "recorded lane paid watermark from PoolRedeemed"
                     );
                 }
+                // After the watermark writes, so two RPC reads on a slow
+                // provider never delay `paid`.
+                self.backfill_ledger(&log, event.poolId).await;
             }
             Some(sig) if sig == PaymentPool::PoolToppedUp::SIGNATURE_HASH => {
                 let event = match PaymentPool::PoolToppedUp::decode_log_data(&log.inner.data) {
@@ -944,13 +946,16 @@ impl<P: Provider + Clone> PoolSettlementSink<P> {
     /// landing across a restart). A transaction already in the ledger costs
     /// one ledger read and no RPC.
     async fn backfill_ledger(&self, log: &Log, pool_id: PoolId) {
-        if let Some(tx) = log.transaction_hash {
-            self.recorder.backfill(self.contract.provider(), tx).await;
+        if let (Some(tx), Some(block)) = (log.transaction_hash, log.block_number) {
+            self.recorder
+                .backfill(self.contract.provider(), block, tx)
+                .await;
         } else {
             warn!(
                 %pool_id,
-                "PoolRedeemed log names no transaction; no settlement ledger backfill"
+                "PoolRedeemed log names no transaction or block; no settlement ledger backfill"
             );
+            self.metrics.settlement_ledger_skipped_row();
         }
     }
 
@@ -1746,7 +1751,7 @@ fn partition_redeemable(
 /// [`REDEEM_LANDING_SLACK_SECS`] of `now`, so a redemption planned now would land
 /// on an expired capability and pay 0. `0` means no tracked expiry and never
 /// expires.
-const fn capability_expired(expiry: u64, now: u64) -> bool {
+pub(crate) const fn capability_expired(expiry: u64, now: u64) -> bool {
     expiry != 0 && now.saturating_add(REDEEM_LANDING_SLACK_SECS) >= expiry
 }
 

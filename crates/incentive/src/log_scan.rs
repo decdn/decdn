@@ -2,7 +2,7 @@
 //!
 //! Providers cap the block range one `eth_getLogs` may span, each with its own
 //! error code and limit, and the free tiers sit far below the advertised number
-//! (dRPC rejects above about 150 blocks). Every scan here walks `[from, to]`
+//! (dRPC's free plan rejects above about 100 blocks). Every scan here walks `[from, to]`
 //! one window at a time, halves a window the provider rejects as too wide
 //! ([`is_range_rejection`]) and doubles it back after a run of accepted
 //! windows ([`WindowSpan`]). The daemon's chain poller drives the same
@@ -10,6 +10,7 @@
 //! a one-shot scan such as `decdn node earnings --address`.
 
 use std::num::NonZeroU64;
+use std::time::Duration;
 
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
@@ -170,17 +171,30 @@ const LIMIT_WORDS: [&str; 10] = [
     "not supported",
 ];
 
+/// How many times [`scan_logs`] retries a window the provider failed for a
+/// reason other than its range: a timeout, a rate limit, a transport fault.
+/// A long scan makes hundreds of requests against a public endpoint, and one
+/// refused request must not discard every window before it.
+pub const SCAN_WINDOW_RETRIES: u32 = 3;
+
+/// The sleep before the first retry of a failed window; each further retry
+/// doubles it (2 s, 4 s, 8 s), which outlasts the per-minute quota windows of
+/// the free tiers.
+pub const SCAN_WINDOW_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 /// Fetch every log `filter` matches in `[from, to]`, one window at a time,
 /// starting at `ceiling` blocks per window. A window the provider rejects as
 /// too wide is retried at half its length; after enough accepted windows the
-/// span doubles back. `on_window` runs after each accepted window with the
-/// window's last block and `to`, for progress output. The logs come back in
-/// request order, which is chain order.
+/// span doubles back. Any other failure of a window is retried
+/// [`SCAN_WINDOW_RETRIES`] times with a doubling delay. `on_window` runs after
+/// each accepted window with the window's last block and `to`, for progress
+/// output. The logs come back in request order, which is chain order.
 ///
 /// # Errors
 ///
-/// Any `eth_getLogs` failure that is not a range rejection, and a range
-/// rejection of a one-block window, which no smaller window can fix.
+/// A window that fails every retry, and a range rejection of a one-block
+/// window, which no smaller window can fix. The error names the window, so a
+/// caller can resume from it.
 pub async fn scan_logs<P: Provider>(
     provider: &P,
     filter: &Filter,
@@ -192,6 +206,7 @@ pub async fn scan_logs<P: Provider>(
     let mut span = WindowSpan::new(ceiling);
     let mut logs = Vec::new();
     let mut start = from;
+    let mut retries = 0u32;
     while start <= to {
         let end = window_end(start, to, span.current());
         let window = filter.clone().from_block(start).to_block(end);
@@ -203,6 +218,7 @@ pub async fn scan_logs<P: Provider>(
             Ok(batch) => {
                 logs.extend(batch);
                 let _regrown = span.record_success();
+                retries = 0;
                 on_window(end, to);
                 start = end.saturating_add(1);
                 if end == u64::MAX {
@@ -212,12 +228,22 @@ pub async fn scan_logs<P: Provider>(
             Err(err) if is_range_rejection(&err) => {
                 if span.shrink(start, end).is_none() {
                     return Err(err.context(
-                        "the RPC provider rejects even a one-block eth_getLogs window; \
-                         use another provider",
+                        "the RPC provider rejects even a one-block eth_getLogs window (a range \
+                         cap, or more results in one block than it returns); use another \
+                         provider",
                     ));
                 }
             }
-            Err(err) => return Err(err),
+            Err(_) if retries < SCAN_WINDOW_RETRIES => {
+                tokio::time::sleep(SCAN_WINDOW_RETRY_DELAY * 2u32.pow(retries)).await;
+                retries += 1;
+            }
+            Err(err) => {
+                return Err(err.context(format!(
+                    "gave up after {SCAN_WINDOW_RETRIES} retries; blocks below {start} were \
+                     scanned"
+                )));
+            }
         }
     }
     Ok(logs)

@@ -1511,6 +1511,34 @@ async fn bind_accepts_loopback_and_warns_on_non_loopback() {
     drop(listener);
 }
 
+/// `unredeemed_micro_usdc` is `owed − paid_cumulative`, saturating at 0 when a
+/// replayed watermark exceeds the claim, and never above the outstanding
+/// figure.
+#[test]
+fn build_lane_snapshots_report_the_unredeemed_part() {
+    let mut partly_paid = mk_lane(1, 1, 1_000);
+    partly_paid.paid_cumulative = U256::from(400u64);
+    let mut over_paid = mk_lane(1, 2, 100);
+    over_paid.paid_cumulative = U256::from(500u64);
+    let snapshots = build_lane_snapshots(
+        &[partly_paid, over_paid],
+        U256::MAX,
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let by_signer = |byte: u8| {
+        let mut s = [0u8; 20];
+        s[19] = byte;
+        let signer = Address::from(s).to_string();
+        snapshots
+            .iter()
+            .find(|snap| snap.voucher_signer == signer)
+            .map(|snap| (snap.outstanding_micro_usdc, snap.unredeemed_micro_usdc))
+    };
+    assert_eq!(by_signer(1), Some((1_000, 600)));
+    assert_eq!(by_signer(2), Some((100, 0)));
+}
+
 mod earnings {
     use decdn_incentive::SettlementRecord;
 
@@ -1531,16 +1559,6 @@ mod earnings {
         }
     }
 
-    fn period<'a>(
-        resp: &'a EarningsResponse,
-        label: &str,
-    ) -> &'a decdn_common::admin::EarningsPeriod {
-        resp.periods
-            .iter()
-            .find(|p| p.label == label)
-            .unwrap_or_else(|| panic!("period {label}"))
-    }
-
     /// Three rows: one an hour old, one three days old, one a month old.
     fn rows() -> Vec<SettlementRecord> {
         vec![
@@ -1550,16 +1568,32 @@ mod earnings {
         ]
     }
 
+    fn build(
+        rows: &[SettlementRecord],
+        lanes: &[LaneState],
+        operator: Option<Address>,
+        since: Option<u64>,
+    ) -> EarningsResponse {
+        build_earnings_response(
+            rows,
+            lanes,
+            operator,
+            NOW,
+            since,
+            &RedeemSchedule::default(),
+        )
+    }
+
     #[test]
     fn periods_bucket_rows_by_landed_time() {
-        let resp = build_earnings_response(&rows(), &[], None, NOW, None, None);
-        assert_eq!(resp.periods.len(), 3, "no `since` asked for");
-        let day = period(&resp, PERIOD_LAST_24H);
+        let resp = build(&rows(), &[], None, None);
+        assert!(resp.since.is_none(), "no `since` asked for");
+        let day = &resp.last_24h;
         assert_eq!(
             (day.from_unix, day.settlements, day.net_micro_usdc),
             (NOW - DAY_SECS, 1, 40)
         );
-        let week = period(&resp, PERIOD_LAST_7D);
+        let week = &resp.last_7d;
         assert_eq!(
             (
                 week.from_unix,
@@ -1570,7 +1604,7 @@ mod earnings {
             ),
             (NOW - WEEK_SECS, 2, 60, 120, 600)
         );
-        let all = period(&resp, PERIOD_SINCE_LEDGER_START);
+        let all = &resp.since_ledger_start;
         assert_eq!(
             (all.from_unix, all.settlements, all.net_micro_usdc),
             (NOW - 30 * DAY_SECS, 3, 70)
@@ -1585,28 +1619,22 @@ mod earnings {
     }
 
     #[test]
-    fn a_since_request_adds_a_fourth_period() {
+    fn a_since_request_fills_the_fourth_period() {
         let since = NOW - 10 * DAY_SECS;
-        let resp = build_earnings_response(&rows(), &[], None, NOW, Some(since), None);
-        assert_eq!(resp.periods.len(), 4);
-        let custom = period(&resp, PERIOD_SINCE);
+        let resp = build(&rows(), &[], None, Some(since));
+        let custom = resp.since.expect("asked for");
         assert_eq!(
             (custom.from_unix, custom.settlements, custom.net_micro_usdc),
             (since, 2, 60)
-        );
-        assert_eq!(
-            resp.periods.last().map(|p| p.label.as_str()),
-            Some(PERIOD_SINCE),
-            "the custom period prints last"
         );
     }
 
     #[test]
     fn an_empty_ledger_has_no_start_and_zero_periods() {
-        let resp = build_earnings_response(&[], &[], None, NOW, None, None);
+        let resp = build(&[], &[], None, None);
         assert_eq!(resp.ledger_since_unix, None);
         assert_eq!(resp.last_settlement, None);
-        let all = period(&resp, PERIOD_SINCE_LEDGER_START);
+        let all = &resp.since_ledger_start;
         assert_eq!(
             (
                 all.from_unix,
@@ -1622,12 +1650,13 @@ mod earnings {
     fn last_settlement_is_by_block_not_by_timestamp() {
         // The higher block carries a wall-clock fallback stamp that is older.
         let rows = vec![row(10, NOW - 10, 1, 1, 1), row(20, NOW - 5_000, 2, 2, 2)];
-        let resp = build_earnings_response(&rows, &[], None, NOW, None, None);
+        let resp = build(&rows, &[], None, None);
         assert_eq!(resp.last_settlement.map(|l| l.block_number), Some(20));
     }
 
     #[test]
-    fn pending_sums_owed_minus_paid_and_counts_only_lanes_still_owed() {
+    fn pending_splits_redeemable_from_stranded() {
+        let operator = Address::repeat_byte(0xEE); // `mk_lane`'s provider
         let mut paid_in_part = mk_lane(1, 1, 1_000);
         paid_in_part.paid_cumulative = U256::from(400u64);
         let mut paid_in_full = mk_lane(1, 2, 700);
@@ -1636,16 +1665,43 @@ mod earnings {
         // A watermark above the claim (a replayed older state) saturates to 0.
         let mut over_paid = mk_lane(2, 4, 100);
         over_paid.paid_cumulative = U256::from(500u64);
-        let lanes = [paid_in_part, paid_in_full, untouched, over_paid];
-        let operator = Address::repeat_byte(0xEE);
-        let resp = build_earnings_response(&[], &lanes, Some(operator), NOW, None, Some(NOW + 240));
+        // An expired capability: the contract pays 0, so no sweep collects it.
+        let mut expired = mk_lane(3, 5, 80);
+        expired.expiry = NOW - 1;
+        // A lane another provider holds (left from a key rotation).
+        let mut foreign = mk_lane(3, 6, 30);
+        foreign.provider = Address::repeat_byte(0x99);
+        let lanes = [
+            paid_in_part,
+            paid_in_full,
+            untouched,
+            over_paid,
+            expired,
+            foreign,
+        ];
+        let resp = build(&[], &lanes, Some(operator), None);
         assert_eq!(
             resp.operator_address.as_deref(),
             Some(operator.to_string().as_str())
         );
         let pending = resp.pending.expect("daemon mode reports pending");
-        assert_eq!(pending.micro_usdc, 600 + 250);
-        assert_eq!(pending.lanes, 2);
-        assert_eq!(pending.next_sweep_at_unix, Some(NOW + 240));
+        assert_eq!((pending.micro_usdc, pending.lanes), (600 + 250, 2));
+        assert_eq!(
+            (pending.stranded_micro_usdc, pending.stranded_lanes),
+            (80 + 30, 2)
+        );
+        assert_eq!(pending.next_sweep_at_unix, None, "no redeemer published");
+        assert_eq!(pending.last_sweep_at_unix, None);
+    }
+
+    #[test]
+    fn pending_without_an_operator_is_all_stranded() {
+        // No seller wallet: nothing can redeem, so nothing is pending.
+        let resp = build(&[], &[mk_lane(1, 1, 1_000)], None, None);
+        let pending = resp.pending.expect("pending");
+        assert_eq!(
+            (pending.micro_usdc, pending.stranded_micro_usdc),
+            (0, 1_000)
+        );
     }
 }

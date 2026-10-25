@@ -11,16 +11,14 @@ use decdn_common::admin::{EarningsPeriod, LastSettlement};
 
 use crate::store::SettlementRecord;
 
-/// Sum `rows` into one period. The caller has already chosen which rows fall
-/// in the period (by `landed_at_unix` on the daemon, by block number in chain
-/// mode), so this only adds. Every sum saturates.
+/// Sum `rows` into one period starting at `from_unix`. The caller has already
+/// chosen which rows fall in the period (by `landed_at_unix` on the daemon, by
+/// block number in chain mode), so this only adds. Every sum saturates.
 pub fn sum_period<'a>(
-    label: &str,
     from_unix: u64,
     rows: impl IntoIterator<Item = &'a SettlementRecord>,
 ) -> EarningsPeriod {
     let mut period = EarningsPeriod {
-        label: label.to_owned(),
         from_unix,
         net_micro_usdc: 0,
         gross_micro_usdc: 0,

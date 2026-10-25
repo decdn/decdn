@@ -52,15 +52,39 @@ pub(crate) fn format_utc(unix: u64) -> String {
     )
 }
 
+/// `YYYY-MM-DDTHH:MMZ` of a Unix time: one `key=value`-safe token with no
+/// space, for the `node status` line.
+pub(crate) fn format_utc_token(unix: u64) -> String {
+    let secs_of_day = unix % 86_400;
+    format!(
+        "{}T{:02}:{:02}Z",
+        format_date(unix),
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60
+    )
+}
+
+/// The earliest Unix time `parse_since` accepts as a bare integer:
+/// 2000-01-01. A smaller integer is a date typed without its dashes
+/// (`20261001`), not a time anyone means.
+const EARLIEST_UNIX_SINCE: u64 = 946_684_800;
+
 /// Parse a `--since` value: a UTC date `YYYY-MM-DD` (midnight) or Unix
-/// seconds.
+/// seconds at or after 2000-01-01.
 ///
 /// # Errors
 ///
-/// Fails on anything else, naming both accepted forms.
+/// Fails on any other shape (naming both accepted forms), on a bare integer
+/// before 2000-01-01, on a date that does not exist, and on a date before
+/// 1970-01-01.
 pub(crate) fn parse_since(value: &str) -> anyhow::Result<u64> {
     let value = value.trim();
     if let Ok(unix) = value.parse::<u64>() {
+        anyhow::ensure!(
+            unix >= EARLIEST_UNIX_SINCE,
+            "--since takes a UTC date `YYYY-MM-DD` or Unix seconds; `{value}` is before \
+             2000-01-01 as Unix seconds (a date needs its dashes)"
+        );
         return Ok(unix);
     }
     let parts: Vec<&str> = value.split('-').collect();

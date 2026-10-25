@@ -208,16 +208,38 @@ mod scan {
         );
     }
 
-    #[tokio::test]
-    async fn scan_logs_surfaces_any_other_error() {
+    #[tokio::test(start_paused = true)]
+    async fn scan_logs_retries_a_transient_failure_then_gives_up_naming_the_window() {
         let asserter = Asserter::new();
-        asserter.push_failure_msg("internal error");
+        // One failure more than the retries: every attempt on [0, 9] fails.
+        for _ in 0..=SCAN_WINDOW_RETRIES {
+            asserter.push_failure_msg("internal error");
+        }
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let filter = Filter::new().address(Address::repeat_byte(0x11));
         let err = scan_logs(&provider, &filter, 0, 99, ceiling(10), |_, _| {})
             .await
             .expect_err("not a range rejection");
-        assert!(format!("{err:#}").contains("eth_getLogs [0, 9]"), "{err:#}");
+        let text = format!("{err:#}");
+        assert!(text.contains("eth_getLogs [0, 9]"), "{text}");
+        assert!(text.contains("blocks below 0 were scanned"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_logs_recovers_from_a_transient_failure() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_failure_msg("request timeout");
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let filter = Filter::new().address(Address::repeat_byte(0x11));
+        let mut ends = Vec::new();
+        scan_logs(&provider, &filter, 0, 19, ceiling(10), |end, _| {
+            ends.push(end);
+        })
+        .await
+        .expect("the second window succeeds on retry");
+        assert_eq!(ends, vec![9, 19]);
     }
 
     #[tokio::test]

@@ -1302,8 +1302,12 @@ mod settlement_ledger {
             rows,
             vec![row(10, 7, 0xA), row(30, 0, 0xB), row(30, 2, 0xC)]
         );
-        assert!(store.has_settlement_tx(B256::repeat_byte(0xB))?);
-        assert!(!store.has_settlement_tx(B256::repeat_byte(0xD))?);
+        assert!(store.has_settlement_tx(30, B256::repeat_byte(0xB))?);
+        assert!(!store.has_settlement_tx(30, B256::repeat_byte(0xD))?);
+        assert!(
+            !store.has_settlement_tx(10, B256::repeat_byte(0xB))?,
+            "the guard reads the named block's rows only"
+        );
         Ok(())
     }
 
@@ -1335,6 +1339,61 @@ mod settlement_ledger {
             store.load_settlements()?.is_empty(),
             "the ledger belongs to the deployment it was written against"
         );
+        Ok(())
+    }
+
+    /// Write raw `value` bytes under the ledger key `(block, 0)`, bypassing the
+    /// encoder, to seed a row this binary cannot read.
+    fn write_raw(store: &PersistentPoolStateStore, block: u64, value: &[u8]) -> anyhow::Result<()> {
+        let txn = store.settle_db.begin_write()?;
+        {
+            let mut table = txn.open_table(SETTLEMENT_LEDGER_TABLE)?;
+            table.insert(&settlement_key(block, 0), value)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_newer_schema_version_is_refused_and_an_equal_one_loads() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+        let mut stored = StoredSettlement::from_record(&row(10, 0, 0xA));
+        stored.schema_version = SETTLEMENT_SCHEMA_VERSION + 1;
+        write_raw(&store, 10, &postcard::to_allocvec(&stored)?)?;
+        assert!(matches!(
+            store.load_settlements(),
+            Err(StoreError::UnsupportedSchema { found, supported })
+                if found == SETTLEMENT_SCHEMA_VERSION + 1 && supported == SETTLEMENT_SCHEMA_VERSION
+        ));
+        stored.schema_version = SETTLEMENT_SCHEMA_VERSION;
+        write_raw(&store, 10, &postcard::to_allocvec(&stored)?)?;
+        assert_eq!(store.load_settlements()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_corrupt_row_names_its_position_and_does_not_stop_another_blocks_guard()
+    -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+        store.record_settlement(&row(5, 0, 0xA))?;
+        write_raw(&store, 10, &[0xFF, 0x00])?;
+        let Err(StoreError::Corrupt {
+            pool_id: None,
+            detail,
+        }) = store.load_settlements()
+        else {
+            anyhow::bail!("expected a Corrupt row");
+        };
+        assert!(detail.contains("block 10 log 0"), "{detail}");
+        // The guard reads only the named block, so block 5 still answers and
+        // block 10 reports the corruption.
+        assert!(store.has_settlement_tx(5, B256::repeat_byte(0xA))?);
+        assert!(matches!(
+            store.has_settlement_tx(10, B256::repeat_byte(0xA)),
+            Err(StoreError::Corrupt { .. })
+        ));
         Ok(())
     }
 

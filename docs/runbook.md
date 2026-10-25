@@ -986,8 +986,27 @@ different deployment the node deletes its seller lane frontiers, both
 pending-settle sets, the event-scan checkpoints, and the settlement ledger
 `decdn node earnings` reads, because their pool ids repeat on the new
 deployment. Unredeemed vouchers on the old deployment are forfeit after the
-drop, and the earnings history starts over; `decdn node earnings --address`
-still reads the old deployment's settlements from the chain.
+drop, and the earnings history starts over. The old deployment's settlements
+are still on the chain:
+
+```bash
+decdn node earnings --address <operator> \
+  --payment-pool-address <old PaymentPool> --from-block <old deployment's L2 block>
+```
+
+## A settlement ledger row that does not decode
+
+`decdn node earnings` and `decdn node status` answer
+`settlement ledger load failed: corrupt record … settlement ledger row at block
+N log M does not decode` when a row in `settle.redb`'s `settlement_ledger_v1`
+table is not in this binary's layout. The redeemer keeps landing redemptions
+and the watcher keeps its paid watermarks; only the earnings figures are
+affected, and the watcher's ledger backfill skips that block. The ledger shares
+`settle.redb` with both pending-settle sets, so do not move the file aside
+while a pool this node closed awaits its grace window (`decdn node pools` and
+the `decdn_pending_settle_*` metrics show them). Once none does, stop the node,
+move `settle.redb` aside and restart: the earnings history starts over, and
+`decdn node earnings --address` still has the chain's record.
 
 **Before repointing:**
 

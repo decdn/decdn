@@ -57,7 +57,7 @@ pub(crate) mod rpc_metrics;
 pub mod runtime;
 pub mod selection;
 pub mod serve_economics;
-pub(crate) mod settlement_ledger;
+pub mod settlement_ledger;
 pub mod slash_watcher;
 pub mod stop_handle;
 pub mod systemd_watchdog;

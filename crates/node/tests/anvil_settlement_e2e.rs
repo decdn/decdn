@@ -1198,11 +1198,11 @@ async fn run_e2e() -> anyhow::Result<()> {
         "the second row is the second redeem ({tx_second}): {:?}",
         rows[1]
     );
-    let router = PaymentPool::new(payment_pool, &node_provider)
+    let fee_router_addr = PaymentPool::new(payment_pool, &node_provider)
         .feeRouter()
         .call()
         .await?;
-    let shares = decdn_incentive::payment_pool::FeeRouter::new(router, &node_provider)
+    let shares = decdn_incentive::payment_pool::FeeRouter::new(fee_router_addr, &node_provider)
         .getShares()
         .call()
         .await?;
@@ -1220,6 +1220,30 @@ async fn run_e2e() -> anyhow::Result<()> {
              {shares:?}: {row:?}"
         );
     }
+    // The watcher's backfill decodes the same receipt into the same row, and a
+    // second backfill of a known transaction fetches nothing.
+    let backfill_ledger = Arc::new(decdn_incentive::MemorySettlementLedger::default());
+    let recorder = decdn_node::settlement_ledger::SettlementRecorder::new(
+        backfill_ledger.clone(),
+        node_addr,
+        Arc::clone(&metrics),
+    );
+    recorder
+        .backfill(&node_provider, block_first, tx_first)
+        .await;
+    let backfilled = decdn_incentive::SettlementLedger::load_settlements(backfill_ledger.as_ref())?;
+    anyhow::ensure!(
+        backfilled.as_slice() == &rows[..1],
+        "a backfilled row equals the redeemer's row: {backfilled:?} vs {:?}",
+        rows[0]
+    );
+    recorder
+        .backfill(&node_provider, block_first, tx_first)
+        .await;
+    anyhow::ensure!(
+        decdn_incentive::SettlementLedger::load_settlements(backfill_ledger.as_ref())?.len() == 1,
+        "a known transaction is not written twice"
+    );
 
     // ============================================================
     // BUYER PATH — a dedicated `buyer_addr` identity drives a `BuyerPoolService`:

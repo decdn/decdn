@@ -1137,7 +1137,7 @@ async fn cli_status_rejects_zero_timeout() -> anyhow::Result<()> {
 #[tokio::test]
 async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
     use alloy::primitives::{Address, B256, U256};
-    use decdn_common::admin::{EarningsRequest, PERIOD_SINCE, PERIOD_SINCE_LEDGER_START};
+    use decdn_common::admin::EarningsRequest;
     use decdn_incentive::{MemorySettlementLedger, SettlementLedger, SettlementRecord};
     use decdn_node::admin::EarningsHandles;
     use decdn_node::payment_settlement::RedeemSchedule;
@@ -1203,24 +1203,25 @@ async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
         Some(Address::repeat_byte(0xEE).to_string().as_str())
     );
     assert_eq!(resp.ledger_since_unix, Some(now - 40 * 86_400));
-    let by_label = |label: &str| {
-        resp.periods
-            .iter()
-            .find(|p| p.label == label)
-            .map(|p| (p.net_micro_usdc, p.settlements))
-    };
-    assert_eq!(by_label("last_24h"), Some((400, 1)));
-    assert_eq!(by_label("last_7d"), Some((600, 2)));
-    assert_eq!(by_label(PERIOD_SINCE_LEDGER_START), Some((700, 3)));
-    assert_eq!(by_label(PERIOD_SINCE), Some((600, 2)));
+    let summary = |p: &decdn_common::admin::EarningsPeriod| (p.net_micro_usdc, p.settlements);
+    assert_eq!(summary(&resp.last_24h), (400, 1));
+    assert_eq!(summary(&resp.last_7d), (600, 2));
+    assert_eq!(summary(&resp.since_ledger_start), (700, 3));
+    assert_eq!(resp.since.as_ref().map(summary), Some((600, 2)));
     let last = resp.last_settlement.expect("last settlement");
     assert_eq!((last.block_number, last.net_micro_usdc), (30, 400));
     let pending = resp.pending.expect("daemon mode reports pending");
     assert_eq!((pending.micro_usdc, pending.lanes), (600_000, 1));
     assert_eq!(
+        (pending.stranded_micro_usdc, pending.stranded_lanes),
+        (0, 0),
+        "the lane names the operator and its capability has no expiry"
+    );
+    assert_eq!(
         pending.next_sweep_at_unix, None,
         "no redeemer published a schedule"
     );
+    assert_eq!(pending.last_sweep_at_unix, None);
 
     stop_tx.send(()).ok();
     join.await?;

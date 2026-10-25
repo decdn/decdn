@@ -29,6 +29,12 @@ fn format_utc_renders_date_and_minutes() {
 }
 
 #[test]
+fn format_utc_token_has_no_spaces() {
+    assert_eq!(format_utc_token(1_792_926_150), "2026-10-25T11:02Z");
+    assert_eq!(format_utc_token(0), "1970-01-01T00:00Z");
+}
+
+#[test]
 fn parse_since_takes_a_date_or_unix_seconds() {
     assert_eq!(parse_since("1700000000").unwrap(), 1_700_000_000);
     assert_eq!(parse_since("1970-01-02").unwrap(), 86_400);
@@ -48,6 +54,7 @@ fn parse_since_refuses_what_is_neither() {
         "26-10-01",
         "1969-12-31",
         "-5",
+        "20261001",
     ] {
         assert!(parse_since(bad).is_err(), "{bad}");
     }

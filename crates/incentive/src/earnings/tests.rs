@@ -28,8 +28,7 @@ fn sum_period_adds_every_field_and_counts_rows() {
         row(1, 0, 10, 60, 100, 1_000),
         row(2, 3, 20, 120, 200, 2_000),
     ];
-    let period = sum_period("last_24h", 5, &rows);
-    assert_eq!(period.label, "last_24h");
+    let period = sum_period(5, &rows);
     assert_eq!(period.from_unix, 5);
     assert_eq!(period.net_micro_usdc, 180);
     assert_eq!(period.gross_micro_usdc, 300);
@@ -39,7 +38,7 @@ fn sum_period_adds_every_field_and_counts_rows() {
 
 #[test]
 fn sum_period_of_nothing_is_zero() {
-    let period = sum_period("since", 7, &[]);
+    let period = sum_period(7, &[]);
     assert_eq!(period.settlements, 0);
     assert_eq!(period.net_micro_usdc, 0);
     assert_eq!(period.gross_micro_usdc, 0);
@@ -52,7 +51,7 @@ fn sum_period_saturates() {
         row(1, 0, 10, u64::MAX, u64::MAX, u64::MAX),
         row(2, 0, 20, 1, 1, 1),
     ];
-    let period = sum_period("x", 0, &rows);
+    let period = sum_period(0, &rows);
     assert_eq!(period.net_micro_usdc, u64::MAX);
     assert_eq!(period.gross_micro_usdc, u64::MAX);
     assert_eq!(period.bytes_settled, u64::MAX);

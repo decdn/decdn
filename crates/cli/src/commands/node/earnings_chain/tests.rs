@@ -68,7 +68,8 @@ fn shares_at_picks_the_latest_change_at_or_before_the_position() {
     let history = shares_history(&[
         shares_updated(100, 0, shares(6000, 3000, 1000)),
         shares_updated(500, 3, shares(9000, 0, 1000)),
-    ]);
+    ])
+    .expect("decodes");
     let current = shares(5000, 4000, 1000);
     assert_eq!(
         shares_at(&history, current, (100, 0)),
@@ -91,20 +92,19 @@ fn shares_at_picks_the_latest_change_at_or_before_the_position() {
         shares_at(&history, current, (9_999, 0)),
         shares(9000, 0, 1000)
     );
-    // Before the first known change: the first change stands in (the caller
-    // warns). No history at all: the current split.
-    assert_eq!(
-        shares_at(&history, current, (50, 0)),
-        shares(6000, 3000, 1000)
-    );
+    // Before every entry, or no history at all: the current split. `scan_rows`
+    // inserts the split in force before the first change, so the first case
+    // is unreachable from it.
+    assert_eq!(shares_at(&history, current, (50, 0)), current);
     assert_eq!(shares_at(&[], current, (50, 0)), current);
 }
 
 #[test]
 fn rows_decode_in_chain_order_with_the_split_in_force() {
-    let history = shares_history(&[shares_updated(1, 0, shares(6000, 3000, 1000))]);
+    let history =
+        shares_history(&[shares_updated(1, 0, shares(6000, 3000, 1000))]).expect("decodes");
     let logs = vec![settled(300, 2, 1_000, 4_096), settled(200, 0, 2_000, 8_192)];
-    let rows = rows_from_logs(&logs, &history, shares(9000, 0, 1000));
+    let rows = rows_from_logs(&logs, &history, shares(9000, 0, 1000)).expect("decodes");
     assert_eq!(rows.len(), 2);
     let first = rows.first().expect("row");
     assert_eq!((first.block_number, first.log_index), (200, 0));
@@ -114,6 +114,32 @@ fn rows_decode_in_chain_order_with_the_split_in_force() {
     assert_eq!(first.tx_hash, B256::repeat_byte(200));
     assert_eq!(first.landed_at_unix, 0, "stamped by the caller, not here");
     assert_eq!(rows.last().map(|r| r.net_micro_usdc), Some(600));
+}
+
+#[test]
+fn an_undecodable_or_positionless_log_fails_the_scan() {
+    let mut garbage = settled(300, 2, 1_000, 4_096);
+    garbage.inner.data = alloy::primitives::LogData::new_unchecked(
+        garbage.inner.data.topics().to_vec(),
+        alloy::primitives::Bytes::from(vec![0u8; 3]),
+    );
+    let err = rows_from_logs(&[garbage], &[], shares(9000, 0, 1000)).expect_err("ABI drift");
+    assert!(format!("{err:#}").contains("block 300 log 2"), "{err:#}");
+
+    let mut pending = settled(300, 2, 1_000, 4_096);
+    pending.block_number = None;
+    let err = rows_from_logs(&[pending], &[], shares(9000, 0, 1000)).expect_err("no position");
+    assert!(
+        format!("{err:#}").contains("without a block number"),
+        "{err:#}"
+    );
+
+    let mut garbage = shares_updated(100, 0, shares(6000, 3000, 1000));
+    garbage.inner.data = alloy::primitives::LogData::new_unchecked(
+        garbage.inner.data.topics().to_vec(),
+        alloy::primitives::Bytes::from(vec![0u8; 3]),
+    );
+    assert!(shares_history(&[garbage]).is_err());
 }
 
 /// A block at `timestamp`, as `eth_getBlockByNumber` returns it.
@@ -169,6 +195,7 @@ fn coordinates_default_to_the_known_testnet() {
     let coords = resolve_coordinates(&args(None, None, None), &chain_ctx::FileConfig::default())
         .expect("known chain fills every field");
     let known = known_chains::by_chain_id(DEFAULT_CHAIN_ID).expect("default chain is known");
+    assert_eq!(coords.chain_id, DEFAULT_CHAIN_ID);
     assert_eq!(coords.rpc_url, known.public_rpc);
     assert_eq!(coords.from_block, known.l2_start_block);
     assert_eq!(
@@ -193,4 +220,50 @@ fn flags_override_the_known_chain() {
     assert_eq!(coords.rpc_url, "http://rpc.example");
     assert_eq!(coords.payment_pool, pool);
     assert_eq!(coords.from_block, 77);
+}
+
+#[test]
+fn the_config_file_fills_what_flags_leave_unset_and_flags_still_win() {
+    let file: chain_ctx::FileConfig = toml::from_str(
+        r#"
+[blockchain]
+rpc_url = "http://file.example"
+chain_id = 421614
+payment_pool_address = "0x0000000000000000000000000000000000000042"
+get_logs_max_block_span = 100
+"#,
+    )
+    .expect("parses");
+    let coords = resolve_coordinates(&args(None, None, None), &file).expect("resolves");
+    assert_eq!(coords.rpc_url, "http://file.example");
+    assert_eq!(coords.payment_pool, Address::with_last_byte(0x42));
+    assert_eq!(coords.span.get(), 100);
+    assert_eq!(
+        coords.from_block,
+        known_chains::by_chain_id(421_614)
+            .expect("known")
+            .l2_start_block,
+        "the deployment block still comes from the known chain"
+    );
+    let coords = resolve_coordinates(&args(Some("http://flag.example"), None, Some(5)), &file)
+        .expect("resolves");
+    assert_eq!(coords.rpc_url, "http://flag.example");
+    assert_eq!(coords.from_block, 5);
+}
+
+#[test]
+fn an_unknown_chain_needs_every_coordinate_spelled_out() {
+    let file: chain_ctx::FileConfig =
+        toml::from_str("[blockchain]\nchain_id = 31337\n").expect("parses");
+    let err = resolve_coordinates(&args(None, None, None), &file).expect_err("no rpc");
+    assert!(err.to_string().contains("--rpc-url"), "{err}");
+    let err = resolve_coordinates(&args(Some("http://x"), None, None), &file).expect_err("no pool");
+    assert!(err.to_string().contains("--payment-pool-address"), "{err}");
+    let pool = Address::repeat_byte(0x42).to_string();
+    let err = resolve_coordinates(&args(Some("http://x"), Some(&pool), None), &file)
+        .expect_err("no from block");
+    assert!(err.to_string().contains("--from-block"), "{err}");
+    let coords = resolve_coordinates(&args(Some("http://x"), Some(&pool), Some(1)), &file)
+        .expect("all spelled out");
+    assert_eq!(coords.chain_id, 31_337);
 }

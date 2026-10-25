@@ -206,9 +206,11 @@ fn settlement_key_parts(key: &[u8; 16]) -> (u64, u64) {
 /// On-disk value of one [`SETTLEMENT_LEDGER_TABLE`] row: a
 /// [`SettlementRecord`] without its key fields. Postcard-encoded, every field
 /// required; a row written in another layout fails to decode as
-/// [`StoreError::Corrupt`], and recovery moves `settle.redb` aside, which
-/// forfeits the earnings history and nothing else (the ledger is
-/// observability, not a claim).
+/// [`StoreError::Corrupt`] naming its block and log index. The ledger itself
+/// is observability, not a claim, but it shares `settle.redb` with both
+/// pending-settle sets, so moving that file aside also forfeits the pools this
+/// node closed that await their grace window. Recovery is to let those settle
+/// first (see `docs/runbook.md`).
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredSettlement {
     schema_version: u32,
@@ -1792,13 +1794,41 @@ impl SettlementLedger for PersistentPoolStateStore {
         Ok(out)
     }
 
-    fn has_settlement_tx(&self, tx_hash: B256) -> Result<bool, StoreError> {
-        // One row per redemption, so a full read is a few hundred rows a month;
-        // the watcher calls this once per own-provider `PoolRedeemed`.
-        Ok(self
-            .load_settlements()?
-            .iter()
-            .any(|row| row.tx_hash == tx_hash))
+    fn has_settlement_tx(&self, block_number: u64, tx_hash: B256) -> Result<bool, StoreError> {
+        let read_txn = self
+            .settle_db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let table = match read_txn.open_table(SETTLEMENT_LEDGER_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        // Only this block's rows: the key is `block ‖ log_index`, so the range
+        // is a few entries however large the ledger, and a row elsewhere that
+        // does not decode cannot stop the guard.
+        let lo = settlement_key(block_number, 0);
+        let hi = settlement_key(block_number, u64::MAX);
+        let iter = table
+            .range::<&[u8; 16]>(&lo..=&hi)
+            .map_err(|err| StoreError::Backend(format!("table range: {err}")))?;
+        for entry in iter {
+            let (key_guard, value_guard) =
+                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
+            let (_, log_index) = settlement_key_parts(key_guard.value());
+            let stored: StoredSettlement =
+                postcard::from_bytes(value_guard.value()).map_err(|err| StoreError::Corrupt {
+                    pool_id: None,
+                    detail: format!(
+                        "settlement ledger row at block {block_number} log {log_index} does not \
+                         decode: {err}"
+                    ),
+                })?;
+            if B256::from(stored.tx_hash) == tx_hash {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 

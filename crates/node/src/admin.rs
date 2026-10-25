@@ -22,11 +22,10 @@ use decdn_common::admin::{
     BuyerLaneSnapshot, BuyerPoolSnapshot, BuyerPoolsResponse, CACHE_ERROR_CODE,
     CONFIG_PATH_UNSET_CODE, DHT_POISONED_CODE, DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse,
     EARNINGS_UNAVAILABLE_CODE, EarningsRequest, EarningsResponse, EvictPreview, EvictRequest,
-    EvictResponse, HealthResponse, LaneSnapshot, LanesResponse, PERIOD_LAST_7D, PERIOD_LAST_24H,
-    PERIOD_SINCE, PERIOD_SINCE_LEDGER_START, POOL_STORE_ERROR_CODE, PendingRedeem,
-    RELOAD_ERROR_CODE, RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth,
-    SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse, StatusResponse,
-    parse_hash_arg,
+    EvictResponse, HealthResponse, LaneSnapshot, LanesResponse, POOL_STORE_ERROR_CODE,
+    PendingRedeem, RELOAD_ERROR_CODE, RecordStoreHealth, ReloadResponse, RepublishHealth,
+    RoutingHealth, SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse,
+    StatusResponse, parse_hash_arg,
 };
 use decdn_incentive::buyer_pool::{BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::earnings::{last_settlement, sum_period};
@@ -43,7 +42,7 @@ use crate::admin::pool_owners::PoolOwners;
 use crate::binding_check::BindingReport;
 use crate::dht::{RecordStore, RepublishScheduler, RoutingTable, StakerSet};
 use crate::metrics::Metrics;
-use crate::payment_settlement::RedeemSchedule;
+use crate::payment_settlement::{RedeemSchedule, capability_expired};
 
 // Wire types live in `decdn_common::admin`. We import the server-side
 // trait, the request DTO, and the few error codes the server impl
@@ -989,13 +988,18 @@ impl AdminRpcServer for AdminRpcImpl {
         };
         // Both reads are blocking redb I/O; one blocking task loads the ledger
         // rows and the lane states together, then the pure aggregation runs on
-        // the returned `Vec`s.
+        // the returned `Vec`s. Each read names itself in its error, so a lane
+        // store fault is never reported as a ledger fault.
         let ledger = Arc::clone(&h.ledger);
         let store = Arc::clone(&h.pool_store);
         let (rows, lanes) = tokio::task::spawn_blocking(move || {
-            let rows = ledger.load_settlements()?;
-            let lanes = store.load_all()?;
-            Ok::<_, decdn_incentive::StoreError>((rows, lanes))
+            let rows = ledger
+                .load_settlements()
+                .map_err(|err| format!("settlement ledger load failed: {err}"))?;
+            let lanes = store
+                .load_all()
+                .map_err(|err| format!("lane store load failed: {err}"))?;
+            Ok::<_, String>((rows, lanes))
         })
         .await
         .map_err(|join_err| {
@@ -1007,17 +1011,13 @@ impl AdminRpcServer for AdminRpcImpl {
             tracing::error!(error = %join_err, cause, "earnings load task did not complete");
             ErrorObjectOwned::owned(
                 POOL_STORE_ERROR_CODE,
-                "settlement ledger load task failed",
+                "earnings load task failed",
                 None::<()>,
             )
         })?
-        .map_err(|store_err| {
-            tracing::error!(error = %store_err, "admin_v1_earnings could not load the seller store");
-            ErrorObjectOwned::owned(
-                POOL_STORE_ERROR_CODE,
-                format!("settlement ledger load failed: {store_err}"),
-                None::<()>,
-            )
+        .map_err(|message| {
+            tracing::error!(error = %message, "admin_v1_earnings could not read the seller store");
+            ErrorObjectOwned::owned(POOL_STORE_ERROR_CODE, message, None::<()>)
         })?;
         Ok(build_earnings_response(
             &rows,
@@ -1025,7 +1025,7 @@ impl AdminRpcServer for AdminRpcImpl {
             self.state.operator_address,
             crate::payment_settlement::unix_now(),
             req.since_unix,
-            h.schedule.next_sweep_at(),
+            &h.schedule,
         ))
     }
 }
@@ -1036,55 +1036,60 @@ const WEEK_SECS: u64 = 7 * DAY_SECS;
 
 /// Build the wire [`EarningsResponse`] from the ledger rows and lane states at
 /// `now_unix`. Pure (no I/O) so the periods, the empty-ledger shape and the
-/// pending total are unit-testable without a store.
+/// pending split are unit-testable without a store.
 ///
 /// A row falls in a period when its `landed_at_unix` is at or after the
-/// period's start. The pending total is `owed − paid_cumulative` summed over
-/// every lane (saturating), and `pending.lanes` counts the lanes with a
-/// non-zero term.
+/// period's start. Each lane's `owed − paid_cumulative` (saturating) counts as
+/// pending when the lane names `operator` as its provider and its capability
+/// has not expired, the two local predicates the redeemer's planner applies;
+/// otherwise it counts as stranded. The planner also skips a lane whose pool
+/// cannot pay, which needs the pool view, so the pending figure is an upper
+/// bound on the next sweep.
 pub(crate) fn build_earnings_response(
     rows: &[SettlementRecord],
     lanes: &[LaneState],
     operator: Option<Address>,
     now_unix: u64,
     since_unix: Option<u64>,
-    next_sweep_at_unix: Option<u64>,
+    schedule: &RedeemSchedule,
 ) -> EarningsResponse {
     let ledger_since_unix = rows.iter().map(|row| row.landed_at_unix).min();
     let landed_since = |from: u64| rows.iter().filter(move |row| row.landed_at_unix >= from);
     let day = now_unix.saturating_sub(DAY_SECS);
     let week = now_unix.saturating_sub(WEEK_SECS);
-    let mut periods = vec![
-        sum_period(PERIOD_LAST_24H, day, landed_since(day)),
-        sum_period(PERIOD_LAST_7D, week, landed_since(week)),
-        sum_period(
-            PERIOD_SINCE_LEDGER_START,
-            ledger_since_unix.unwrap_or(0),
-            rows.iter(),
-        ),
-    ];
-    if let Some(since) = since_unix {
-        periods.push(sum_period(PERIOD_SINCE, since, landed_since(since)));
-    }
-    let mut pending_total = U256::ZERO;
-    let mut pending_lanes = 0u64;
+    let mut pending = PendingRedeem {
+        micro_usdc: 0,
+        lanes: 0,
+        stranded_micro_usdc: 0,
+        stranded_lanes: 0,
+        last_sweep_at_unix: schedule.swept_at(),
+        next_sweep_at_unix: schedule.next_sweep_at(),
+    };
     for lane in lanes {
         let unredeemed = lane.owed().saturating_sub(lane.paid_cumulative);
-        if !unredeemed.is_zero() {
-            pending_total = pending_total.saturating_add(unredeemed);
-            pending_lanes = pending_lanes.saturating_add(1);
+        if unredeemed.is_zero() {
+            continue;
+        }
+        let amount = u64::try_from(unredeemed).unwrap_or(u64::MAX);
+        let redeemable =
+            operator == Some(lane.provider) && !capability_expired(lane.expiry, now_unix);
+        if redeemable {
+            pending.micro_usdc = pending.micro_usdc.saturating_add(amount);
+            pending.lanes = pending.lanes.saturating_add(1);
+        } else {
+            pending.stranded_micro_usdc = pending.stranded_micro_usdc.saturating_add(amount);
+            pending.stranded_lanes = pending.stranded_lanes.saturating_add(1);
         }
     }
     EarningsResponse {
         operator_address: operator.map(|a| a.to_string()),
         ledger_since_unix,
-        periods,
+        last_24h: sum_period(day, landed_since(day)),
+        last_7d: sum_period(week, landed_since(week)),
+        since_ledger_start: sum_period(ledger_since_unix.unwrap_or(0), rows.iter()),
+        since: since_unix.map(|since| sum_period(since, landed_since(since))),
         last_settlement: last_settlement(rows),
-        pending: Some(PendingRedeem {
-            micro_usdc: u64::try_from(pending_total).unwrap_or(u64::MAX),
-            lanes: pending_lanes,
-            next_sweep_at_unix,
-        }),
+        pending: Some(pending),
     }
 }
 

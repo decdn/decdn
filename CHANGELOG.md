@@ -4110,13 +4110,21 @@ since project inception and will roll into the first tagged release.
     saw. The ledger drops with the other seller tables on a `PaymentPool`
     repoint. Nothing is backfilled from before the ledger exists, so the
     bottom row reads `since <date>`, never "all time";
-  - the admin RPC gains `admin_v1_earnings` (and `EARNINGS_UNAVAILABLE_CODE`)
-    and `LaneSnapshot` gains `unredeemed_micro_usdc` (`owed − paid_cumulative`,
-    the per-lane term of the pending total), which `decdn node lanes` shows as
-    an `UNREDEEMED` column;
-  - the redeemer publishes its sweep schedule for the "next sweep in" figure;
-  - `decdn node status` appends an `earnings …` line (text mode only) and
-    `decdn setup` closes with `earned_so_far=` when a daemon answers.
+  - the admin RPC gains `admin_v1_earnings` (and `EARNINGS_UNAVAILABLE_CODE`):
+    named periods `last_24h`, `last_7d`, `since_ledger_start` and the optional
+    `since`, the last settlement, and `pending` split into what the next sweep
+    can redeem and what is stranded (expired capability, another provider's
+    lane). `LaneSnapshot` gains `unredeemed_micro_usdc` (`owed −
+    paid_cumulative`, the per-lane term of the pending total), which `decdn
+    node lanes` shows as an `UNREDEEMED` column;
+  - the redeemer publishes its sweep schedule for the "next sweep in" and
+    "last sweep" figures;
+  - two counters: `decdn_settlement_ledger_write_failures_total` and
+    `decdn_settlement_ledger_skipped_rows_total`, so a ledger that stops
+    growing is visible to a dashboard and not only to `node earnings`;
+  - `decdn node status` appends an `earnings=ok …` / `earnings=unavailable
+    reason=…` line (text mode only) and `decdn setup` closes with
+    `earned_so_far=` when a daemon answers.
 - **CLI: a namespace is a stable host on a public gateway (#2614).**
   `decdn publish point <ns> decdn:<hash>/ --gateway <origin>` signs a
   namespace pointer (an EIP-712 record over the `PublisherRegistry`

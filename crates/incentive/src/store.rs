@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use alloy::primitives::{B256, U256};
-use serde::{Deserialize, Serialize};
 
 use crate::lane::{LaneKey, LaneState, PoolId};
 
@@ -467,11 +466,12 @@ impl PoolStateStore for MemoryPoolStateStore {
 /// The rows back `admin_v1_earnings` (#2598).
 ///
 /// Rows order by `(block_number, log_index)`, which is chain order; the
-/// `landed_at_unix` wall clock is for period bucketing only and never orders
+/// `landed_at_unix` timestamp is for period bucketing only and never orders
 /// rows. Every amount is in micro-USDC, narrowed from the on-chain `uint256`
 /// with saturation (the `PaymentPool` counters are `uint64`, so a real value
-/// never saturates).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// never saturates). Not a disk or wire shape: the node's store has its own
+/// row layout, and the admin DTOs carry the sums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettlementRecord {
     /// The block the `redeemMany` landed in.
     pub block_number: u64,
@@ -481,8 +481,10 @@ pub struct SettlementRecord {
     pub log_index: u64,
     /// The `redeemMany` transaction hash.
     pub tx_hash: B256,
-    /// The block's timestamp, Unix seconds. The wall clock at landing when the
-    /// header read failed, which the node logs.
+    /// The block's timestamp, Unix seconds. On the daemon's redeemer path,
+    /// the wall clock at the time of the write when the header could not be
+    /// read, which the node logs. `0` on a row the producer has not stamped:
+    /// `decdn node earnings --address` stamps only the rows it prints.
     pub landed_at_unix: u64,
     /// `FeeRouter.Settled.epoch`: the router's `block.timestamp / epochLength`.
     pub epoch: u64,
@@ -509,10 +511,12 @@ impl SettlementRecord {
 /// the `PoolRedeemed` watcher for a transaction whose receipt it missed (a
 /// receipt wait that timed out, or a landing across a restart), so a row may
 /// be written twice; [`record_settlement`](Self::record_settlement) is
-/// idempotent on the row key. Nothing ever removes a row except a repoint to
-/// another `PaymentPool` deployment, which drops the whole ledger with the
-/// other seller tables. A disk-backed implementation commits durably before
-/// returning `Ok`.
+/// idempotent on the row key. A transaction hash appears in at most one row;
+/// a reorg that moves a landed `redeemMany` to another position is not
+/// reconciled, because the ledger is observability, not a claim. Nothing ever
+/// removes a row except a repoint to another `PaymentPool` deployment, which
+/// drops the whole ledger with the other seller tables. A disk-backed
+/// implementation commits durably before returning `Ok`.
 pub trait SettlementLedger: Send + Sync {
     /// Append one row, or overwrite the row with the same
     /// [`key`](SettlementRecord::key).
@@ -530,13 +534,17 @@ pub trait SettlementLedger: Send + Sync {
     /// row this binary cannot decode.
     fn load_settlements(&self) -> Result<Vec<SettlementRecord>, StoreError>;
 
-    /// Whether a row for `tx_hash` exists: the watcher's guard before it
-    /// fetches a receipt it may already have recorded.
+    /// Whether a row for `tx_hash`, landed in `block_number`, exists: the
+    /// watcher's guard before it fetches a receipt it may already have
+    /// recorded. The block narrows the read to that block's rows, so the cost
+    /// does not grow with the ledger and a row elsewhere that does not decode
+    /// does not stop the guard.
     ///
     /// # Errors
     ///
-    /// Returns a [`StoreError`] if the backing store is unreadable.
-    fn has_settlement_tx(&self, tx_hash: B256) -> Result<bool, StoreError>;
+    /// Returns a [`StoreError`] if the backing store is unreadable or a row of
+    /// that block does not decode.
+    fn has_settlement_tx(&self, block_number: u64, tx_hash: B256) -> Result<bool, StoreError>;
 }
 
 /// In-memory [`SettlementLedger`] for tests and the trait's reference
@@ -565,12 +573,14 @@ impl SettlementLedger for MemorySettlementLedger {
         Ok(guard.values().copied().collect())
     }
 
-    fn has_settlement_tx(&self, tx_hash: B256) -> Result<bool, StoreError> {
+    fn has_settlement_tx(&self, block_number: u64, tx_hash: B256) -> Result<bool, StoreError> {
         let guard = self
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory ledger mutex poisoned: {err}")))?;
-        Ok(guard.values().any(|row| row.tx_hash == tx_hash))
+        Ok(guard
+            .range((block_number, 0)..=(block_number, u64::MAX))
+            .any(|(_, row)| row.tx_hash == tx_hash))
     }
 }
 

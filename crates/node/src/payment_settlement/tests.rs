@@ -2178,6 +2178,7 @@ fn test_recorder() -> SettlementRecorder {
     SettlementRecorder::new(
         Arc::new(decdn_incentive::MemorySettlementLedger::default()),
         Address::from([20u8; 20]),
+        Arc::new(Metrics::new()),
     )
 }
 
@@ -3970,4 +3971,89 @@ fn record_does_not_regress_paid_cumulative() -> Result<()> {
         "record must not regress the persisted paid watermark to zero"
     );
     Ok(())
+}
+
+mod redeem_schedule {
+    use super::*;
+
+    #[test]
+    fn a_fresh_schedule_reads_nothing() {
+        let schedule = RedeemSchedule::default();
+        assert_eq!(schedule.next_sweep_at(), None);
+        assert_eq!(schedule.swept_at(), None);
+    }
+
+    #[test]
+    fn publish_sets_the_next_sweep_and_keeps_the_last_swept_at() {
+        let schedule = RedeemSchedule::default();
+        // The first publish, at loop start: no sweep yet, a tick ahead.
+        schedule.publish(None, 1_000);
+        assert_eq!(
+            (schedule.swept_at(), schedule.next_sweep_at()),
+            (None, Some(1_000))
+        );
+        schedule.publish(Some(900), 1_200);
+        assert_eq!(
+            (schedule.swept_at(), schedule.next_sweep_at()),
+            (Some(900), Some(1_200))
+        );
+        // A tick whose lane load failed republishes the due time only.
+        schedule.publish(None, 1_500);
+        assert_eq!(
+            (schedule.swept_at(), schedule.next_sweep_at()),
+            (Some(900), Some(1_500))
+        );
+    }
+
+    #[test]
+    fn the_next_sweep_is_the_earlier_of_tick_and_cutoff() {
+        assert_eq!(next_sweep_at(1_000, None), 1_000);
+        assert_eq!(next_sweep_at(1_000, Some(700)), 700);
+        assert_eq!(next_sweep_at(1_000, Some(1_300)), 1_000);
+    }
+
+    /// The loop publishes its schedule as soon as it starts, before any
+    /// sweep, and the figure is a real time ahead of the clock.
+    #[tokio::test]
+    async fn the_redeemer_publishes_at_start() -> Result<()> {
+        let schedule = RedeemSchedule::default();
+        let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+        let (contract, _asserter) = mocked_getwatermarks_pool(&[]);
+        let (tx, rx) = mpsc::channel(1);
+        let interval = Duration::from_secs(3_600);
+        let handle = tokio::spawn(redeemer_loop(
+            contract,
+            store,
+            PaidWatermarks::default(),
+            Address::from([20u8; 20]),
+            U256::from(1u64),
+            300,
+            interval,
+            capability_expiry_margin_secs(interval.as_secs()),
+            rx,
+            Arc::new(Metrics::new()),
+            PoolProjection::new(),
+            test_recorder(),
+            schedule.clone(),
+        ));
+        let published = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(at) = schedule.next_sweep_at() {
+                    return at;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("the loop publishes within its first moments"))?;
+        let now = unix_now();
+        assert!(
+            published > now && published <= now + interval.as_secs() + 1,
+            "{published}"
+        );
+        assert_eq!(schedule.swept_at(), None, "no sweep has run");
+        drop(tx);
+        let _ = handle.await;
+        Ok(())
+    }
 }

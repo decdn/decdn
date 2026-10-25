@@ -946,6 +946,19 @@ pub struct DecdnMetrics {
     /// fsynced — the frontier-only replay surface is widening. Operator-visible
     /// name: `decdn_lane_flush_failures_total`.
     pub lane_flush_failures: Counter,
+    /// Settlement ledger rows (#2598) that decoded from a landed `redeemMany`
+    /// but could not be written to `settle.redb`. The redemption stands; the
+    /// row is what `decdn node earnings` reads, so a non-zero rate means the
+    /// earnings table silently trails the chain (disk full, store locked).
+    /// Operator-visible name: `decdn_settlement_ledger_write_failures_total`.
+    pub settlement_ledger_write_failures: Counter,
+    /// Landed redemptions that produced no settlement ledger row (#2598) for a
+    /// reason other than paying nothing: a receipt whose `Settled` does not
+    /// decode or names no log index, a backfill whose block time or receipt
+    /// the RPC could not supply, a ledger read that failed before the guard.
+    /// Each is also a `warn!`. Operator-visible name:
+    /// `decdn_settlement_ledger_skipped_rows_total`.
+    pub settlement_ledger_skipped_rows: Counter,
     /// Slashes detected against this node's operator by the slash watcher
     /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
     /// bring-up backfill and the live stream (#1032). A non-zero value means the
@@ -3114,6 +3127,16 @@ recorders! {
     /// shutdown failed. Pairs with the `warn!`s in the background flush task
     /// and the shutdown flush in `runtime/mod.rs`.
     lane_flush_failure => lane_flush_failures.inc();
+
+    /// A settlement ledger row decoded from a landed `redeemMany` could not be
+    /// written (`settlement_ledger.rs`). Pairs with the `warn!` "settlement
+    /// ledger write failed".
+    settlement_ledger_write_failure => settlement_ledger_write_failures.inc();
+
+    /// A landed redemption yielded no settlement ledger row for a reason other
+    /// than paying nothing (`settlement_ledger.rs`). Pairs with a per-site
+    /// `warn!`.
+    settlement_ledger_skipped_row => settlement_ledger_skipped_rows.inc();
 
     /// A distinct slash against this node's operator was detected by the slash
     /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).

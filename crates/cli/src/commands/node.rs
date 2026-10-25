@@ -21,8 +21,7 @@ use decdn_client::probe::probe_once;
 use decdn_common::admin::{
     AdminRpcClient, BindingStatus, BuyerPoolsResponse, DrainRequest, DrainResponse, EarningsPeriod,
     EarningsRequest, EarningsResponse, EvictRequest, EvictResponse, HealthResponse, LaneSnapshot,
-    LanesResponse, PERIOD_LAST_7D, PERIOD_LAST_24H, PERIOD_SINCE, PERIOD_SINCE_LEDGER_START,
-    ReloadResponse, SlashesResponse, StatusResponse,
+    LanesResponse, ReloadResponse, SlashesResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -563,12 +562,16 @@ pub async fn status(args: &cli::StatusArgs, global_config: Option<&Path>) -> any
         println!("{pretty}");
     } else {
         // The one-line earnings summary (#2598) is a second call, tolerated to
-        // fail: a node without a settlement ledger still has a status to show.
-        // `--json` stays the raw `StatusResponse`; `node earnings --json` has
-        // the figures.
-        let earnings = client.earnings(EarningsRequest::default()).await.ok();
+        // fail: a node without a settlement ledger still has a status to show,
+        // and the line names why the figures are missing. `--json` stays the
+        // raw `StatusResponse`; `node earnings --json` has the figures.
+        let earnings = client.earnings(EarningsRequest::default()).await;
+        let line = match &earnings {
+            Ok(resp) => EarningsLine::Available(resp),
+            Err(err) => EarningsLine::Unavailable(first_line(&err.to_string())),
+        };
         let mut stdout = io::stdout().lock();
-        write_status(&mut stdout, &parsed, earnings.as_ref(), wall_clock_us())
+        write_status(&mut stdout, &parsed, &line, wall_clock_us())
             .context("failed to write status report")?;
     }
 
@@ -622,7 +625,8 @@ pub async fn earnings(
 /// `decdn setup`'s closing read (#2598): the running node's earnings when a
 /// daemon answers `admin_v1_earnings` within `timeout`, else `None`. Every
 /// failure is `None`: no daemon, no config, no ledger. The admin URL resolves
-/// as for every `node` command.
+/// from `DECDN_ADMIN_PORT`, else the config file's `observability.admin_port`,
+/// else the default port; `DECDN_ADMIN_URL` is not read here.
 pub(crate) async fn earned_so_far(
     config_path: Option<&Path>,
     timeout: Duration,
@@ -638,10 +642,7 @@ pub(crate) async fn earned_so_far(
 /// The `earned_so_far=` line `decdn setup` closes with: the whole-ledger net
 /// figure, or `None` when there is no response to read it from.
 pub(crate) fn earned_so_far_line(earnings: Option<&EarningsResponse>) -> Option<String> {
-    let all = earnings?
-        .periods
-        .iter()
-        .find(|p| p.label == PERIOD_SINCE_LEDGER_START)?;
+    let all = &earnings?.since_ledger_start;
     Some(format!(
         "earned_so_far={} USDC settlements={}",
         format_usdc(all.net_micro_usdc),
@@ -650,7 +651,7 @@ pub(crate) fn earned_so_far_line(earnings: Option<&EarningsResponse>) -> Option<
 }
 
 /// Write the earnings report to `w`: a `key=value` header, the per-period
-/// table, the last settlement and (daemon mode) the pending line. Pure, like
+/// table, the last settlement and (daemon mode) the pending lines. Pure, like
 /// [`write_lanes_table`], so the layout is unit-testable. `now_unix` is for
 /// the "next sweep in" figure.
 pub(crate) fn write_earnings(
@@ -669,14 +670,32 @@ pub(crate) fn write_earnings(
     )?;
     writeln!(
         w,
-        "{:<24} {:>14} {:>14} {:>12}",
+        "{:<34} {:>14} {:>14} {:>12}",
         "PERIOD", "SETTLED_USDC", "BYTES_SETTLED", "SETTLEMENTS",
     )?;
-    for period in &resp.periods {
+    let since_ledger = resp.ledger_since_unix.map_or_else(
+        || "since (no settlements yet)".to_owned(),
+        |since| format!("since {}", civil_time::format_date(since)),
+    );
+    let mut rows = vec![
+        (
+            period_label("last 24h", &resp.last_24h, resp.ledger_since_unix),
+            &resp.last_24h,
+        ),
+        (
+            period_label("last 7d", &resp.last_7d, resp.ledger_since_unix),
+            &resp.last_7d,
+        ),
+        (since_ledger, &resp.since_ledger_start),
+    ];
+    if let Some(since) = &resp.since {
+        let label = format!("since {}", civil_time::format_date(since.from_unix));
+        rows.push((period_label(&label, since, resp.ledger_since_unix), since));
+    }
+    for (label, period) in rows {
         writeln!(
             w,
-            "{:<24} {:>14} {:>14} {:>12}",
-            period_label(period, resp.ledger_since_unix),
+            "{label:<34} {:>14} {:>14} {:>12}",
             format_usdc(period.net_micro_usdc),
             human_bytes(period.bytes_settled),
             period.settlements,
@@ -698,29 +717,41 @@ pub(crate) fn write_earnings(
             Some(at) if at <= now_unix => "next sweep due now".to_owned(),
             Some(at) => format!("next sweep in ~{}", approx_duration(at - now_unix)),
         };
+        let last = match pending.last_sweep_at_unix {
+            None => "no sweep yet".to_owned(),
+            Some(at) => format!(
+                "last sweep {} ago",
+                approx_duration(now_unix.saturating_sub(at))
+            ),
+        };
         writeln!(
             w,
-            "pending redeem: {} USDC over {} lanes ({next})",
+            "pending redeem: {} USDC over {} lanes ({next}, {last})",
             format_usdc(pending.micro_usdc),
             pending.lanes,
         )?;
+        if pending.stranded_lanes > 0 {
+            writeln!(
+                w,
+                "stranded: {} USDC over {} lanes (expired capability or another provider's \
+                 lane; no sweep redeems it)",
+                format_usdc(pending.stranded_micro_usdc),
+                pending.stranded_lanes,
+            )?;
+        }
     }
     Ok(())
 }
 
-/// The human label of a period row. The ledger-wide row names the date the
-/// ledger starts, so the operator reads "since 2026-10-26", never an "all
-/// time" the forward-only ledger cannot promise.
-fn period_label(period: &EarningsPeriod, ledger_since_unix: Option<u64>) -> String {
-    match period.label.as_str() {
-        PERIOD_LAST_24H => "last 24h".to_owned(),
-        PERIOD_LAST_7D => "last 7d".to_owned(),
-        PERIOD_SINCE_LEDGER_START => ledger_since_unix.map_or_else(
-            || "since (no settlements yet)".to_owned(),
-            |since| format!("since {}", civil_time::format_date(since)),
-        ),
-        PERIOD_SINCE => format!("since {}", civil_time::format_date(period.from_unix)),
-        other => other.to_owned(),
+/// A period row's label. A period that starts before the ledger does says so,
+/// because the forward-only ledger sums a shorter span than the label names;
+/// `decdn node earnings --address` has the earlier history.
+fn period_label(name: &str, period: &EarningsPeriod, ledger_since_unix: Option<u64>) -> String {
+    match ledger_since_unix {
+        Some(since) if period.from_unix < since => {
+            format!("{name} (ledger from {})", civil_time::format_date(since))
+        }
+        _ => name.to_owned(),
     }
 }
 
@@ -1237,7 +1268,7 @@ fn format_age(delta_us: u64) -> String {
 fn write_status(
     w: &mut impl io::Write,
     s: &StatusResponse,
-    earnings: Option<&EarningsResponse>,
+    earnings: &EarningsLine<'_>,
     now_us: u64,
 ) -> io::Result<()> {
     writeln!(w, "node_id={}", s.node_id)?;
@@ -1293,34 +1324,50 @@ fn write_status(
     Ok(())
 }
 
-/// The `node status` earnings line (#2598): net USDC over the three standard
-/// periods, the pending total and the last settlement, as `key=value` tokens.
-/// `(unavailable)` when the node answered no `admin_v1_earnings`.
-fn earnings_summary_line(earnings: Option<&EarningsResponse>) -> String {
-    let Some(e) = earnings else {
-        return "earnings=(unavailable)".to_owned();
-    };
-    let net = |label: &str| {
-        e.periods
-            .iter()
-            .find(|p| p.label == label)
-            .map_or_else(|| "n/a".to_owned(), |p| format_usdc(p.net_micro_usdc))
+/// What `node status` has to say about earnings (#2598): the response, or
+/// why there is none.
+#[derive(Debug)]
+pub(crate) enum EarningsLine<'a> {
+    /// The node answered `admin_v1_earnings`.
+    Available(&'a EarningsResponse),
+    /// It did not; the reason is the first line of the error, or empty.
+    Unavailable(String),
+}
+
+/// The first line of an error message, so a multi-line cause fits one
+/// `key=value` token.
+fn first_line(message: &str) -> String {
+    message.lines().next().unwrap_or_default().trim().to_owned()
+}
+
+/// The `node status` earnings line (#2598), as `key=value` tokens:
+/// `earnings=ok` then the net USDC over the three standard periods, the
+/// redeemable pending total and the last settlement as a `YYYY-MM-DDTHH:MMZ`
+/// token; or `earnings=unavailable` with the reason, so a node whose ledger
+/// cannot be read looks different from one with no ledger wired.
+fn earnings_summary_line(earnings: &EarningsLine<'_>) -> String {
+    let e = match earnings {
+        EarningsLine::Available(e) => e,
+        EarningsLine::Unavailable(reason) if reason.is_empty() => {
+            return "earnings=unavailable".to_owned();
+        }
+        EarningsLine::Unavailable(reason) => {
+            return format!("earnings=unavailable reason={reason:?}");
+        }
     };
     let pending = e
         .pending
         .as_ref()
         .map_or_else(|| "n/a".to_owned(), |p| format_usdc(p.micro_usdc));
-    let last = e
-        .last_settlement
-        .as_ref()
-        .map_or_else(|| "never".to_owned(), |l| civil_time::format_utc(l.at_unix));
+    let last = e.last_settlement.as_ref().map_or_else(
+        || "never".to_owned(),
+        |l| civil_time::format_utc_token(l.at_unix),
+    );
     format!(
-        "earnings 24h={} 7d={} since_ledger_start={} pending={} last_settlement={}",
-        net(PERIOD_LAST_24H),
-        net(PERIOD_LAST_7D),
-        net(PERIOD_SINCE_LEDGER_START),
-        pending,
-        last.replace(' ', "T"),
+        "earnings=ok 24h={} 7d={} since_ledger_start={} pending={pending} last_settlement={last}",
+        format_usdc(e.last_24h.net_micro_usdc),
+        format_usdc(e.last_7d.net_micro_usdc),
+        format_usdc(e.since_ledger_start.net_micro_usdc),
     )
 }
 

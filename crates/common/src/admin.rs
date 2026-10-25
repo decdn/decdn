@@ -476,10 +476,9 @@ pub struct LanesResponse {
 /// Request body for `admin_v1_earnings` (#2598).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EarningsRequest {
-    /// Start of one extra period, in Unix seconds. The response then carries
-    /// a fourth [`EarningsPeriod`] labelled [`PERIOD_SINCE`] that sums every
-    /// settlement landed at or after this time. `None` asks for the three
-    /// standard periods only.
+    /// Start of one extra period, in Unix seconds. The response then fills
+    /// [`EarningsResponse::since`] with every settlement landed at or after
+    /// this time. `None` asks for the three standard periods only.
     pub since_unix: Option<u64>,
 }
 
@@ -499,13 +498,22 @@ pub struct EarningsResponse {
     /// `0x` prefix (`alloy`'s `Address` `Display`). `None` when the node
     /// started without a seller wallet.
     pub operator_address: Option<String>,
-    /// `landed_at_unix` of the earliest ledger row. `None` while the ledger
-    /// is empty: no redemption has landed since the ledger exists.
+    /// The time of the earliest settlement the figures cover. On the daemon
+    /// this is the `landed_at_unix` of the earliest ledger row, `None` while
+    /// the ledger is empty. Built from the chain (`decdn node earnings
+    /// --address`) it is the block time of the earliest `Settled` found from
+    /// the scan's first block, `None` when the scan found none.
     pub ledger_since_unix: Option<u64>,
-    /// The periods, in the order the table prints them: [`PERIOD_LAST_24H`],
-    /// [`PERIOD_LAST_7D`], [`PERIOD_SINCE_LEDGER_START`], then
-    /// [`PERIOD_SINCE`] when the request asked for one.
-    pub periods: Vec<EarningsPeriod>,
+    /// The 24 hours before the request.
+    pub last_24h: EarningsPeriod,
+    /// The 7 days before the request.
+    pub last_7d: EarningsPeriod,
+    /// Every settlement the figures cover. Its `from_unix` is
+    /// [`Self::ledger_since_unix`], or `0` when there is none.
+    pub since_ledger_start: EarningsPeriod,
+    /// The period [`EarningsRequest::since_unix`] asked for; `None` when the
+    /// request asked for none.
+    pub since: Option<EarningsPeriod>,
     /// The most recent settlement in chain order, or `None` on an empty
     /// ledger.
     pub last_settlement: Option<LastSettlement>,
@@ -515,24 +523,13 @@ pub struct EarningsResponse {
     pub pending: Option<PendingRedeem>,
 }
 
-/// [`EarningsPeriod::label`]: the 24 hours before the request.
-pub const PERIOD_LAST_24H: &str = "last_24h";
-/// [`EarningsPeriod::label`]: the 7 days before the request.
-pub const PERIOD_LAST_7D: &str = "last_7d";
-/// [`EarningsPeriod::label`]: every row the ledger holds. `from_unix` is
-/// [`EarningsResponse::ledger_since_unix`], or `0` on an empty ledger.
-pub const PERIOD_SINCE_LEDGER_START: &str = "since_ledger_start";
-/// [`EarningsPeriod::label`]: the period [`EarningsRequest::since_unix`]
-/// asked for.
-pub const PERIOD_SINCE: &str = "since";
-
 /// The settlements landed in one period, summed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EarningsPeriod {
-    /// Which period: one of the `PERIOD_*` constants. A stable machine token;
-    /// the CLI renders the human label and the date.
-    pub label: String,
     /// The period's inclusive start, Unix seconds. Its end is the request.
+    /// The figures cover only settlements the ledger holds, so a start before
+    /// [`EarningsResponse::ledger_since_unix`] sums a shorter span than it
+    /// names; the CLI says so in the row label.
     pub from_unix: u64,
     /// Micro-USDC the operator actually received: the sum of the USDC
     /// transfers from the `FeeRouter` to the operator, one per settlement.
@@ -553,7 +550,9 @@ pub struct EarningsPeriod {
 /// (`block_number`, then log index), never by wall clock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastSettlement {
-    /// When it landed, Unix seconds: the block's timestamp.
+    /// When it landed, Unix seconds: the block's timestamp. On the daemon, the
+    /// wall clock at the time of the write when the header could not be read
+    /// (the node logs that).
     pub at_unix: u64,
     /// The `redeemMany` transaction, `0x`-prefixed lowercase hex.
     pub tx_hash: String,
@@ -563,17 +562,32 @@ pub struct LastSettlement {
     pub net_micro_usdc: u64,
 }
 
-/// What the node is owed but has not redeemed yet.
+/// What the node is owed but has not redeemed yet, split into what the next
+/// sweep can redeem and what no sweep will.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRedeem {
-    /// Micro-USDC across every lane: the sum of each lane's
-    /// [`LaneSnapshot::unredeemed_micro_usdc`].
+    /// Micro-USDC the redeemer can still cash: the sum of
+    /// [`LaneSnapshot::unredeemed_micro_usdc`] over the lanes this operator
+    /// provides whose capability has not expired. The redeemer also skips a
+    /// lane whose pool cannot pay (closed, past its grace window, or
+    /// insolvent); this figure does not, so it is an upper bound on the next
+    /// sweep.
     pub micro_usdc: u64,
-    /// How many lanes carry a non-zero unredeemed amount.
+    /// How many lanes count into [`Self::micro_usdc`].
     pub lanes: u64,
-    /// When the redeemer's next sweep is due, Unix seconds. `None` until the
-    /// redeemer has published a schedule (it does so after its first
-    /// interval).
+    /// Micro-USDC owed on lanes no sweep redeems: the capability has expired
+    /// (the contract pays `0`), or the lane names another provider (left from
+    /// a key rotation). Shown so the operator knows the sum is not coming.
+    pub stranded_micro_usdc: u64,
+    /// How many lanes count into [`Self::stranded_micro_usdc`].
+    pub stranded_lanes: u64,
+    /// When the redeemer's last sweep scanned the lanes, Unix seconds.
+    /// `None` before the first sweep of this process.
+    pub last_sweep_at_unix: Option<u64>,
+    /// When the redeemer's next sweep is due, Unix seconds: the earlier of
+    /// its next interval tick and the next serve cutoff. `None` until the
+    /// redeemer has published a schedule, which it does when its first
+    /// interval starts and again after every sweep.
     pub next_sweep_at_unix: Option<u64>,
 }
 
@@ -902,7 +916,9 @@ pub trait AdminRpc {
     /// settlement counts over the last 24 hours, the last 7 days and the whole
     /// settlement ledger (plus one period of the caller's choosing), the most
     /// recent settlement, and what the lanes still owe. Backs `decdn node
-    /// earnings` and the one-line summary in `decdn node status`.
+    /// earnings` and the one-line summary in `decdn node status`. The ledger
+    /// starts when the node first ran with one; a period that starts earlier
+    /// sums a shorter span than it names.
     ///
     /// Returns [`EARNINGS_UNAVAILABLE_CODE`] when no settlement ledger is
     /// wired, and [`POOL_STORE_ERROR_CODE`] when the ledger or the lane store
