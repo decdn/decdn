@@ -152,7 +152,7 @@ fn seed_lane(
         signer,
         provider,
         U256::from(DEPOSIT_MICRO_USDC), // cap
-        0,                              // expiry: 0 = untracked, never expires
+        u64::MAX,                       // expiry: far future, never expires in-test
         U256::ZERO,
         U256::ZERO,
         None,

@@ -2415,7 +2415,7 @@ fn serve_cutoff_wake_skips_lanes_that_need_no_redeem() {
     assert_eq!(
         serve_cutoff_wake(&expiring_lane(1, 0), &paid, me, 420, 0, 0),
         None,
-        "a lane with no tracked expiry never expires"
+        "a lane with expiry 0 is already expired, so it gets no cutoff wake"
     );
     let other = Address::from([9u8; 20]);
     assert_eq!(
@@ -2786,8 +2786,8 @@ async fn the_self_tick_sweeps_a_lane_without_a_hint() -> Result<()> {
     let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
     let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
-    // No tracked expiry, so no cutoff wake.
-    let (_, total) = record_lanes(store.as_ref(), 1..=1, 0)?;
+    // A far-future expiry, so no cutoff wake fires within the test.
+    let (_, total) = record_lanes(store.as_ref(), 1..=1, u64::MAX)?;
     let (tx, handle, _) = spawn_redeemer(
         contract,
         store,
@@ -2816,9 +2816,9 @@ async fn a_chain_fault_parks_the_lane_until_the_next_sweep() -> Result<()> {
     let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
     let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
-    // No tracked expiry, so no cutoff wake, and a one-hour tick: only the
+    // A far-future expiry, so no cutoff wake fires, and a one-hour tick: only the
     // hints act within the test.
-    let (hinted, total) = record_lanes(store.as_ref(), 1..=1, 0)?;
+    let (hinted, total) = record_lanes(store.as_ref(), 1..=1, u64::MAX)?;
     let (tx, handle, _) = spawn_redeemer(
         contract,
         store,
@@ -2890,7 +2890,7 @@ async fn a_failed_sweep_keeps_the_lane_parked() -> Result<()> {
     // One read and one failed send each for the first hint and the sweep.
     let (contract, asserter) =
         mocked_redeem_pool(&[Some(vec![lane(0)]), None, Some(vec![lane(0)]), None]);
-    let (hinted, total) = record_lanes(store.as_ref(), 1..=1, 0)?;
+    let (hinted, total) = record_lanes(store.as_ref(), 1..=1, u64::MAX)?;
     let (tx, handle, _) = spawn_redeemer(
         contract,
         store,
@@ -2938,7 +2938,7 @@ async fn a_failed_sweep_keeps_the_lane_parked() -> Result<()> {
 async fn a_clean_sweep_releases_a_parked_lane() -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
-    let (hinted, total) = record_lanes(store.as_ref(), 1..=1, 0)?;
+    let (hinted, total) = record_lanes(store.as_ref(), 1..=1, u64::MAX)?;
     let settled = u64::try_from(total)?;
     // A read and a failed send for the first hint, then a read that shows
     // the lane settled for the sweep and for the hint after it.
@@ -3008,10 +3008,10 @@ async fn a_chain_fault_parks_only_its_own_lane() -> Result<()> {
         Address::ZERO,
         ProviderBuilder::new().connect_mocked_client(asserter.clone()),
     );
-    // No tracked expiry, so no cutoff wake, and a one-hour tick: only the
+    // A far-future expiry, so no cutoff wake fires, and a one-hour tick: only the
     // hints act within the test. The floor is one lane's value, so each
     // one-lane hint clears it.
-    let (lane_a, _) = record_lanes(store.as_ref(), 1..=2, 0)?;
+    let (lane_a, _) = record_lanes(store.as_ref(), 1..=2, u64::MAX)?;
     let lane_b = expiring_lane(2, 0).key();
     let (tx, handle, _) = spawn_redeemer(
         contract,
@@ -3697,12 +3697,20 @@ fn cursor_start_resumes_from_pool_opened_checkpoint() {
     }
 }
 
-/// The redeemer's expiry check: `0` never expires, and a capability counts
+/// The redeemer's expiry check: `0` is expired (the contract reads it as
+/// already past, so a redemption under it pays 0), and a capability counts
 /// as expired from the landing slack before its expiry onward.
 #[test]
 fn capability_expired_holds_the_landing_slack() {
     let expiry = 10_000;
-    assert!(!super::capability_expired(0, u64::MAX), "0 = not tracked");
+    assert!(
+        super::capability_expired(0, 0),
+        "0 = expired, never redeemable"
+    );
+    assert!(
+        super::capability_expired(0, u64::MAX),
+        "0 is expired at every now"
+    );
     assert!(!super::capability_expired(
         expiry,
         expiry - REDEEM_LANDING_SLACK_SECS - 1
@@ -3751,6 +3759,24 @@ fn plan_lanes_skips_an_expired_capability() {
         plans.is_empty(),
         "an expiring capability pays 0 and is skipped"
     );
+    assert_eq!(skipped_expired(&metrics), 1);
+}
+
+/// A lane with value owed and held registration material whose expiry is `0`
+/// is never planned: the contract reads `0` as already expired, and a
+/// `CapabilityReg` carrying it would pin the signer's write-once registration
+/// to unredeemable terms. The skip is metered like any expired capability.
+#[test]
+fn plan_lanes_never_plans_a_zero_expiry_lane() {
+    let me = Address::from([20u8; 20]);
+    let mut st = signed_lane_state(1, 10, 20, Some(sig_with_v(1)));
+    st.expiry = 0;
+    let paid = PaidWatermarks::default();
+    let projection = PoolProjection::new();
+    let metrics = Arc::new(Metrics::new());
+
+    let plans = plan_lanes(&paid, me, vec![st], &metrics, &projection, 0);
+    assert!(plans.is_empty(), "a zero-expiry lane is never planned");
     assert_eq!(skipped_expired(&metrics), 1);
 }
 

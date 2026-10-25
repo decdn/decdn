@@ -1767,10 +1767,11 @@ fn partition_redeemable(
 
 /// Whether a capability `expiry` has passed, or falls within
 /// [`REDEEM_LANDING_SLACK_SECS`] of `now`, so a redemption planned now would land
-/// on an expired capability and pay 0. `0` means no tracked expiry and never
-/// expires.
+/// on an expired capability and pay 0. An `expiry` of `0` is expired: the
+/// contract reads it as already past (`block.timestamp >= expiry`), intake
+/// refuses it, and a persisted lane that still holds one is never swept.
 pub(crate) const fn capability_expired(expiry: u64, now: u64) -> bool {
-    expiry != 0 && now.saturating_add(REDEEM_LANDING_SLACK_SECS) >= expiry
+    expiry == 0 || now.saturating_add(REDEEM_LANDING_SLACK_SECS) >= expiry
 }
 
 /// When the redeemer wakes for one lane's serve cutoff, in Unix seconds, or
@@ -1786,8 +1787,9 @@ pub(crate) const fn capability_expired(expiry: u64, now: u64) -> bool {
 /// [`capability_expired`] skips the lane, and [`REDEEM_LANDING_SLACK_SECS`] to
 /// land it.
 ///
-/// Only a lane this node provides, with a finite expiry and value owed beyond its
-/// cached paid watermark, needs a wake.
+/// Only a lane this node provides, with a nonzero expiry and value owed beyond
+/// its cached paid watermark, needs a wake. An expiry of `0` is already past
+/// ([`capability_expired`]), so its lane has no cutoff to wake for.
 fn lane_cutoff_wake(
     st: &LaneState,
     paid: &PaidWatermarks,

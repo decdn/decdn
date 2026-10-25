@@ -1012,7 +1012,7 @@ fn mk_lane(pool_byte: u8, signer_byte: u8, last_amount: u64) -> LaneState {
         Address::from(signer),
         provider,
         U256::from(1_000_000_000u64), // cap — irrelevant to the snapshot
-        0,                            // expiry — untracked
+        u64::MAX,                     // expiry — irrelevant to the snapshot
         U256::from(last_amount),
         U256::from(last_amount), // bytes_delivered — irrelevant to the snapshot
         Some([0u8; 65]),
@@ -1102,7 +1102,7 @@ fn build_lane_snapshots_report_the_verified_chain_frontier() {
             Address::from(signer),
             Address::repeat_byte(0xEE),
             U256::from(1_000_000_000u64),
-            0,
+            u64::MAX,
             U256::from(anchor),
             U256::from(anchor),
             Some([0u8; 65]),

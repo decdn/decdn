@@ -105,7 +105,7 @@ async fn handler_over_http_origin(
         client,               // capability signer
         server_eth.address(), // provider (the serving node operator)
         U256::from(10_000_000u64),
-        0, // expiry: 0 = untracked, never expires
+        u64::MAX, // expiry: far future, never expires in-test
         U256::ZERO,
         U256::ZERO,
         None,
@@ -2548,7 +2548,7 @@ async fn span_capped_floor_accepts_a_small_range_a_window_poor_pool() -> anyhow:
         client_eth.address(),
         provider,
         U256::from(10_000_000u64),
-        0,
+        u64::MAX,
         U256::ZERO,
         U256::ZERO,
         None,
@@ -3218,7 +3218,7 @@ async fn handler_two_pools_over_http_origin(
             client,               // capability signer
             server_eth.address(), // provider
             U256::from(10_000_000u64),
-            0,
+            u64::MAX,
             U256::ZERO,
             U256::ZERO,
             None,
@@ -3335,7 +3335,7 @@ async fn mid_blob_open_behind_a_paying_owners_frontier_attaches() -> anyhow::Res
             client,
             server_eth.address(),
             U256::from(10_000_000u64),
-            0,
+            u64::MAX,
             U256::ZERO,
             U256::ZERO,
             None,

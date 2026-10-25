@@ -82,7 +82,8 @@ pub struct LaneState {
     pub cap: U256,
     /// The capability expiry the node holds (Unix seconds), clamped like
     /// [`Self::cap`]. The node handler holds the clock and refuses vouchers at or
-    /// past this; `0` means "unknown / not tracked".
+    /// past this. An `expiry` of `0` is expired: the payment contract reads it as
+    /// already past, and intake never registers a lane with it.
     pub expiry: u64,
     /// The observed on-chain capability expiry for this lane's signer
     /// (`authorized[pool_id][signer].expiry`), in Unix seconds; `0` means
@@ -310,8 +311,9 @@ impl LaneState {
     /// keeps `min(held, registered)` for each and records the registered expiry
     /// as `registered_until`. Returns whether any field changed.
     ///
-    /// The chain reads a registered `expiry` of `0` as already expired, while a
-    /// lane `expiry` of `0` means "not tracked". The clamp therefore holds such a
+    /// A held expiry of `0` takes the registered expiry: the chain's write-once
+    /// registration is the term that redeems. The chain reads a registered
+    /// `expiry` of `0` as already expired, so the clamp holds such a
     /// registration as expiry `1`, a moment that is always past.
     ///
     /// A clamped lane holds terms its `owner_sig` does not cover. That is sound:

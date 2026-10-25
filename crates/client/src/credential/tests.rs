@@ -106,6 +106,16 @@ fn running_low_fires_inside_the_node_expiry_margin() {
     assert_eq!(outside.event(), None);
 }
 
+/// A capability with an `expiry` of `0` reads as expiring at every `now`: the
+/// payment contract reads `0` as already expired.
+#[test]
+fn running_low_fires_for_a_zero_expiry() {
+    let quotes = quoted(10);
+    let zero = CredentialView::of(&credential(u64::MAX, 0), U256::ZERO, MB, &quotes, NOW);
+    assert!(zero.event().is_some());
+    assert_eq!(zero.cause(), Some(CapabilityCause::Expired));
+}
+
 /// The projection prices the work at the HIGHEST rate any lane was quoted.
 #[test]
 fn the_projection_uses_the_highest_quote() {

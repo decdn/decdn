@@ -151,10 +151,11 @@ pub const fn capability_expiry_margin_secs(redeem_interval_secs: u64) -> u64 {
 }
 /// Whether the Unix second `now` falls inside the expiry margin of a capability
 /// that expires at `expiry`: `now + margin_secs >= expiry`. An `expiry` of `0`
-/// means "not tracked" and is never inside the margin.
+/// is always inside the margin: the payment contract reads it as already
+/// expired, so no proof under it can ever redeem.
 #[must_use]
 pub const fn inside_capability_expiry_margin(expiry: u64, margin_secs: u64, now: u64) -> bool {
-    expiry != 0 && now.saturating_add(margin_secs) >= expiry
+    expiry == 0 || now.saturating_add(margin_secs) >= expiry
 }
 /// Upper bound on the redeemer self-tick interval: 6h (`21_600s`). The sweep is the
 /// node's only defense against an owner's grace-window close — it must run several

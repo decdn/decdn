@@ -20,7 +20,7 @@ async fn a_loaded_lane_counts_its_proved_frontier_as_credited() {
         Address::repeat_byte(0x33),
         Address::repeat_byte(0x55),
         U256::MAX,
-        0,
+        u64::MAX,
         U256::from(3_000u64),
         U256::from(3 * CHUNK_BYTES),
         Some([9u8; 65]),
@@ -362,7 +362,7 @@ async fn distinct_lanes_register_resolve_and_forget_concurrently() {
             key.signer,
             key.provider,
             U256::from(1_000_000u64),
-            0,
+            u64::MAX,
             U256::ZERO,
             U256::ZERO,
             None,
@@ -464,7 +464,7 @@ async fn lane_count_gauge_tracks_the_live_map() {
         lane.signer,
         lane.provider,
         U256::from(10u64),
-        0,
+        u64::MAX,
         U256::ZERO,
         U256::ZERO,
         None,
@@ -513,7 +513,7 @@ async fn lane_gauge_matches_live_count_after_concurrent_register_and_remove() {
                 lane.signer,
                 lane.provider,
                 U256::from(10u64),
-                0,
+                u64::MAX,
                 U256::ZERO,
                 U256::ZERO,
                 None,
@@ -575,7 +575,7 @@ async fn concurrent_first_streams_on_one_lane_count_it_once() {
                 lane.signer,
                 lane.provider,
                 U256::from(10u64),
-                0,
+                u64::MAX,
                 U256::ZERO,
                 U256::ZERO,
                 None,
@@ -874,6 +874,63 @@ async fn intake_rejects_wrong_owner_capability() {
         lane_owner_sig(&handler, &lane_key).await,
         Some(expected_sig),
         "the verified owner signature is captured on the lane record for the redeemer"
+    );
+}
+
+/// Capability intake refuses a capability with an `expiry` of `0`: the
+/// contract reads it as already expired, and on-chain registration is
+/// write-once per `(pool, signer)`, so such a grant must never register a lane
+/// or reach the lane store. The same capability with a future expiry registers
+/// its lane (control).
+#[tokio::test]
+async fn intake_rejects_zero_expiry_capability() {
+    let metrics = Arc::new(Metrics::new());
+    let owner = PrivateKeySigner::random();
+    let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
+    let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
+    let pool_id = B256::repeat_byte(0x66);
+    let signer = Address::repeat_byte(0x22);
+    let spending_cap = 1_000_000u64;
+
+    let make_wire = |expiry: u64| -> decdn_protocol::client::WireCapability {
+        let signed_cap = Capability {
+            signer,
+            spending_cap,
+            pool_id,
+            expiry,
+        }
+        .sign(&owner, &domain)
+        .expect("sign capability");
+        decdn_protocol::client::WireCapability {
+            spending_cap,
+            expiry,
+            owner_signature: signed_cap.signature.as_bytes().to_vec(),
+        }
+    };
+
+    let lane_key = LaneKey {
+        pool_id,
+        signer,
+        provider: handler.eth_signer.address(),
+    };
+
+    // A validly-signed capability with `expiry == 0` is dropped: no lane in the
+    // map or the store, so the voucher path keeps refusing the lane as unknown.
+    handler.intake_capability(pool_id, signer, owner.address(), &make_wire(0));
+    assert!(
+        !handler.lanes.contains_key(&lane_key),
+        "a zero-expiry capability must not register a lane"
+    );
+    assert!(
+        matches!(handler.pool_state_store.get(lane_key), Ok(None)),
+        "a zero-expiry capability never reaches the lane store"
+    );
+
+    // The same grant with a far-future expiry registers the lane.
+    handler.intake_capability(pool_id, signer, owner.address(), &make_wire(u64::MAX));
+    assert!(
+        handler.lanes.contains_key(&lane_key),
+        "a future-expiry capability registers its lane"
     );
 }
 
@@ -1839,7 +1896,7 @@ async fn a_loaded_lane_starts_empty_and_banks_for_the_next_stream() {
         Address::repeat_byte(0x22),
         Address::repeat_byte(0x33),
         U256::MAX,
-        0,
+        u64::MAX,
         U256::from(9_000_000u64),
         U256::from(9u64 << 20),
         None,
@@ -1887,7 +1944,7 @@ async fn lane_activity_clock_ages_reports_stamped_and_omits_unstamped() {
                 key.signer,
                 key.provider,
                 U256::MAX,
-                0,
+                u64::MAX,
                 U256::ZERO,
                 U256::ZERO,
                 None,

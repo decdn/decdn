@@ -4912,6 +4912,18 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node and client: a capability `expiry` of `0` reads as expired
+  (GHSA-vq47-w6q7-4rrj).** The node read a capability `expiry` of `0` as
+  "never expires", while the on-chain `PaymentPool` reads it as already
+  expired. `intake_capability` now drops a `0`-expiry capability before any
+  lane registers, so the request refuses as an unknown lane and the client
+  must present a valid capability. Defense in depth: the redeemer's
+  `capability_expired` predicate and the shared
+  `inside_capability_expiry_margin` (the node's admission, voucher and
+  preimage gates, and the client's credential view) read an `expiry` of `0`
+  as expired too. A previously persisted `0`-expiry lane is neither served
+  nor swept, and a client holding a `0`-expiry credential reports it as
+  expired. The wire format and contracts are unchanged.
 - **Node: the mid-stream pool-solvency re-check stops delivery whenever the
   pool's remaining deposit falls to the refundable floor `M`, independent of
   outstanding floor-credit accounting (GHSA-3742-7954-qjwq).** Both delivery

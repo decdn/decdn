@@ -13,6 +13,17 @@ fn capability_expiry_margin_is_one_interval_plus_the_slack() {
     assert_eq!(capability_expiry_margin_secs(u64::MAX), u64::MAX);
 }
 
+/// An `expiry` of `0` is always inside the margin: the payment contract reads
+/// it as already expired. A nonzero expiry enters the margin `margin_secs`
+/// before it.
+#[test]
+fn zero_expiry_is_always_inside_the_margin() {
+    assert!(inside_capability_expiry_margin(0, 0, 0));
+    assert!(inside_capability_expiry_margin(0, 420, u64::MAX));
+    assert!(!inside_capability_expiry_margin(10_000, 420, 9_579));
+    assert!(inside_capability_expiry_margin(10_000, 420, 9_580));
+}
+
 #[test]
 fn normalize_region_accepts_and_uppercases() -> anyhow::Result<()> {
     assert_eq!(normalize_region("US")?, "US");

@@ -217,7 +217,7 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
             Address::from(signer),
             provider,
             U256::from(1_000_000_000u64), // cap — irrelevant to the snapshot
-            0,                            // expiry — untracked
+            u64::MAX,                     // expiry — irrelevant to the snapshot
             U256::from(last_amount),
             U256::from(last_amount), // bytes_delivered — irrelevant to the snapshot
             Some([0u8; 65]),         // signature — `owed()` is 0 on a lane holding none
@@ -1166,7 +1166,7 @@ async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
         Address::repeat_byte(0xAA),
         Address::repeat_byte(0xEE),
         U256::from(1_000_000_000u64),
-        0,
+        u64::MAX,
         U256::from(900_000u64),
         U256::from(900_000u64),
         Some([0u8; 65]),

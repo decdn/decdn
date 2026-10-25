@@ -257,7 +257,7 @@ impl LaneActivityClock {
                 key.signer,
                 key.provider,
                 U256::MAX,
-                0,
+                u64::MAX,
                 U256::ZERO,
                 U256::ZERO,
                 None,
@@ -1811,6 +1811,17 @@ impl ClientHandler {
     ) {
         let spending_cap = capability.spending_cap;
         let expiry = capability.expiry;
+        // The on-chain `PaymentPool` reads an expiry of `0` as already expired
+        // (`block.timestamp >= expiry`), so a `0`-expiry grant can never redeem.
+        // On-chain registration is write-once per `(pool, signer)`, so a
+        // redemption that registered such a grant would pin the signer to
+        // unredeemable terms. Drop it: the node registers no lane, the request
+        // refuses as an unknown lane, and the client must present a valid
+        // capability.
+        if expiry == 0 {
+            tracing::debug!(%pool_id, %signer, "dropping capability: expiry 0 is never redeemable");
+            return;
+        }
         // Only the common EOA (65-byte) owner signature is recoverable off-chain;
         // a contract-wallet signature is dropped rather than persisted unverified.
         let Ok(sig_bytes) = <[u8; 65]>::try_from(capability.owner_signature.as_slice()) else {

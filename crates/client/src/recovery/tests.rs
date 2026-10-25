@@ -400,7 +400,7 @@ fn slot(wait: Duration) -> crate::CredentialSlot {
         signer: signer.address(),
         spending_cap: 1,
         pool_id: B256::repeat_byte(0x11),
-        expiry: 0,
+        expiry: u64::MAX,
     }
     .sign(
         &signer,

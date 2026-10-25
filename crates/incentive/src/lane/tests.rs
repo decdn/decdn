@@ -12,7 +12,7 @@ fn registered_until_defaults_zero_and_survives_stage_voucher_clone() {
         Address::ZERO,
         Address::ZERO,
         U256::MAX,
-        0,
+        u64::MAX,
         U256::ZERO,
         U256::ZERO,
         None,
@@ -65,14 +65,14 @@ fn clamp_to_registration_holds_the_lower_terms() {
     );
 }
 
-/// A lane expiry of `0` means untracked; the clamp takes the registered
-/// expiry. A registered expiry of `0` is already expired on-chain, so the
-/// lane holds a past expiry rather than the untracked `0`.
+/// A held expiry of `0` takes the registered expiry, the term the chain
+/// redeems under. A registered expiry of `0` is already expired on-chain, so
+/// the lane holds the past moment `1`.
 #[test]
 fn clamp_to_registration_maps_the_zero_expiries() {
-    let mut untracked = lane_with_terms(100, 0);
-    untracked.clamp_to_registration(100, 1_000);
-    assert_eq!(untracked.expiry, 1_000);
+    let mut held_zero = lane_with_terms(100, 0);
+    held_zero.clamp_to_registration(100, 1_000);
+    assert_eq!(held_zero.expiry, 1_000);
 
     let mut expired = lane_with_terms(100, 0);
     expired.clamp_to_registration(100, 0);
@@ -136,7 +136,7 @@ fn fixture() -> (
         signer.address(),
         PROVIDER,
         U256::from(10_000_000u64), // 10 USDC cap
-        0,
+        u64::MAX,
         U256::ZERO,
         U256::ZERO,
         None,
@@ -1271,7 +1271,7 @@ fn a_reveal_past_the_spending_cap_is_refused() -> anyhow::Result<()> {
         signer.address(),
         PROVIDER,
         cap,
-        0,
+        u64::MAX,
         U256::ZERO,
         U256::ZERO,
         None,
