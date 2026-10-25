@@ -1177,6 +1177,48 @@ async fn pool_budget_covers_reserve_accounts_committed_floor() -> anyhow::Result
     Ok(())
 }
 
+/// The mid-stream solvency re-check holds with an EMPTY committed-floor ledger.
+/// A stream releases its floor reservation once it is repaid, so on a pool whose
+/// streams have all repaid, `committed == 0` and the covers-check holds vacuously
+/// at ANY `remaining`; the `remaining > M` bound in `pool_funds_committed` is what
+/// stops a drained pool then (ADR 003 §Pool solvency).
+#[tokio::test]
+async fn pool_funds_committed_stops_at_floor_with_empty_ledger() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let m = U256::from(5_000_000u64);
+    let (handler, _dir) = handler_for_tests_with_floor(&metrics, m).await;
+    let pool = B256::repeat_byte(0x33);
+    // No floor row exists for the pool: committed == 0.
+    anyhow::ensure!(
+        !handler.pool_funds_committed(pool, U256::ZERO),
+        "a fully drained pool (remaining = 0) does not fund delivery"
+    );
+    anyhow::ensure!(
+        !handler.pool_funds_committed(pool, m),
+        "remaining at the refundable floor M does not fund delivery"
+    );
+    anyhow::ensure!(
+        handler.pool_funds_committed(pool, m.saturating_add(U256::from(1u64))),
+        "remaining above M funds delivery while nothing is committed"
+    );
+    // A live reservation narrows the bound further: the headroom above M must
+    // still cover it, exactly as the covers-check always required.
+    let floor = floor_micro(1_000_000);
+    let _guard = handler.reserve_floor(pool, TEST_SIGNER, floor);
+    anyhow::ensure!(
+        handler.pool_funds_committed(pool, m.saturating_add(floor)),
+        "headroom above M covering the committed floor funds delivery"
+    );
+    anyhow::ensure!(
+        !handler.pool_funds_committed(
+            pool,
+            m.saturating_add(floor).saturating_sub(U256::from(1u64))
+        ),
+        "headroom above M one short of the committed floor does not"
+    );
+    Ok(())
+}
+
 /// `try_reserve_floor` reserves atomically: it charges the budget only when
 /// `remaining − M` covers the pool's committed live reservation plus the new floor,
 /// and the charge is visible to the very next call so a second reserve on an

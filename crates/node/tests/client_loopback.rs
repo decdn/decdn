@@ -6555,7 +6555,9 @@ impl decdn_node::pool_view::PoolView for DrainingPoolView {
 
 /// `spawn_handler_server_with_pool` wired with a [`DrainingPoolView`] instead of a
 /// fixed one, so a test can drop the pool's `remaining` mid-stream by flipping the
-/// shared `drained` flag.
+/// shared `drained` flag. `pool_min_remaining_deposit` is the floor-`M` the
+/// solvency gates hold back (zero in the committed-ledger tests, nonzero where the
+/// `remaining > M` bound itself is under test).
 async fn spawn_handler_server_with_draining_pool(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
@@ -6563,6 +6565,7 @@ async fn spawn_handler_server_with_draining_pool(
     low: U256,
     drained: Arc<std::sync::atomic::AtomicBool>,
     recheck_interval: Duration,
+    pool_min_remaining_deposit: U256,
 ) -> anyhow::Result<(
     EndpointAddr,
     Endpoint,
@@ -6591,6 +6594,7 @@ async fn spawn_handler_server_with_draining_pool(
                 drained,
             }));
             deps.pool_recheck_interval = Some(recheck_interval);
+            deps.pool_min_remaining_deposit = pool_min_remaining_deposit;
         },
     )?;
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
@@ -6657,6 +6661,9 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
         U256::from(HARNESS_FLOOR_COST - 1),
         Arc::clone(&drained),
         Duration::ZERO,
+        // M = 0: the committed-ledger half of the stop condition alone is under
+        // test here; the `remaining > M` half has its single-lane twin below.
+        U256::ZERO,
     )
     .await?;
 
@@ -6739,6 +6746,119 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
     Ok(())
 }
 
+/// Mid-stream `PoolExhausted` with an EMPTY committed-floor ledger (ADR 003 §Pool
+/// solvency): one lane, no holder. Once the stream repays its own floor
+/// reservation the pool's committed credit reads zero, the covers-check holds
+/// vacuously, and only the `remaining > M` bound in `pool_funds_committed` stands
+/// between a funded pool and a drained one. The pool drains to EXACTLY `M`
+/// mid-stream, so the next voucher boundary (ZERO recheck interval) must stop the
+/// stream in-band with `PoolExhausted` rather than keep serving.
+///
+/// The twin above ([`mid_stream_pool_drain_stops_with_pool_exhausted`]) pins the
+/// committed-ledger half (a parked holder's floor outruns the drained budget);
+/// this one pins the floor-`M` half, which no committed credit amplifies.
+#[tokio::test(flavor = "multi_thread")]
+async fn drained_pool_stops_stream_after_its_floor_is_repaid() -> anyhow::Result<()> {
+    // 16 MiB = 4 intervals, so the decisive boundary is `!done` and the re-check
+    // runs there.
+    let payload = vec![0xC3u8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        U256::from(10_000_000u64),
+        0,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    // Nonzero floor-`M`, and the pool drains to EXACTLY `M` — the ADR 003 stop
+    // boundary. `high` covers admission with floors to spare.
+    let m = U256::from(HARNESS_FLOOR_COST);
+    let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (target, server_ep, server_task, metrics) = spawn_handler_server_with_draining_pool(
+        cache,
+        store_dyn,
+        m.saturating_add(U256::from(10_000u64)),
+        m,
+        Arc::clone(&drained),
+        Duration::ZERO,
+        m,
+    )
+    .await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    // Admit (reserves the one floor), take the opening window, park.
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    read_exact_chunks(&mut recv, HARNESS_FLOOR_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    // Pay interval 1 (the pool still reads `high`, so this boundary's re-check
+    // passes) and take the reopened window. One interval's payment prices UNDER
+    // the reserved floor (one interval plus the verify lag), so the stream's
+    // reservation is still live here.
+    pay_cumulative(&mut send, &signer, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    // Drain to exactly `M`, then pay through interval 2. Two intervals'
+    // cumulative payment covers the reserved floor, so the server releases this
+    // stream's reservation — the pool's committed ledger is now EMPTY — and only
+    // then runs the boundary re-check against `remaining = M`: delivery stops
+    // in-band.
+    drained.store(true, std::sync::atomic::Ordering::Relaxed);
+    pay_cumulative(&mut send, &signer, 2 * HARNESS_INTERVAL_BYTES).await?;
+
+    match tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut recv)).await?? {
+        ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
+            reason,
+            bundle,
+        }) => {
+            anyhow::ensure!(
+                reason == VoucherRejectReason::PoolExhausted,
+                "expected PoolExhausted, got {reason:?}"
+            );
+            anyhow::ensure!(bundle.is_none(), "PoolExhausted attaches no bundle");
+        }
+        other => anyhow::bail!("expected VoucherRejected {{ PoolExhausted }}, got {other:?}"),
+    }
+
+    // Clean in-band stop, not a QUIC reset: the next read hits the FIN, never
+    // another frame.
+    anyhow::ensure!(
+        tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv))
+            .await?
+            .is_err(),
+        "after PoolExhausted the server finishes the stream; no further frame is sent"
+    );
+    anyhow::ensure!(
+        counter(
+            &metrics,
+            "decdn_serve_stream_midstream_pool_exhausted_total"
+        )? == 1,
+        "the mid-stream stop must be counted"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// Live handles for the wall-clock recheck-cadence tests, produced by
 /// [`setup_recheck_holder_and_driven`]. `_send_a`/`_recv_a` keep the holder lane
 /// (A) open so it stays PARKED holding its floor reservation while a test drives B.
@@ -6798,6 +6918,8 @@ async fn setup_recheck_holder_and_driven(
         U256::from(HARNESS_FLOOR_COST - 1),
         Arc::clone(&drained),
         recheck_interval,
+        // M = 0: these cadence tests exercise the committed-ledger half only.
+        U256::ZERO,
     )
     .await?;
 

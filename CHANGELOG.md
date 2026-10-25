@@ -4863,6 +4863,13 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: the mid-stream pool-solvency re-check stops delivery whenever the
+  pool's remaining deposit falls to the refundable floor `M`, independent of
+  outstanding floor-credit accounting (GHSA-3742-7954-qjwq).** Both delivery
+  legs now gate the in-flight re-check on `pool_funds_committed`, which
+  requires `remaining > M` in addition to the committed-floor covers-check
+  (ADR 003 §Pool solvency). Admission and the direct-serve re-validation
+  carry a nonzero reserve in the covers-check and are unchanged.
 - **Node: a peer could pin up to 16 MiB per stream with an oversized frame
   (#2501).** Every frame read accepted a length prefix up to a global 16 MiB
   `MAX_MESSAGE_SIZE` and allocated the buffer before the payload arrived, though

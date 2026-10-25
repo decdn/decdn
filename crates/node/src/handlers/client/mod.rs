@@ -2329,11 +2329,12 @@ impl ClientHandler {
     /// (The recovery is not justified by the accumulator being "best-effort": it
     /// gates whether the node fronts upstream USDC.)
     ///
-    /// Deliberately the pool level ONLY, which is what makes it the right check for a
-    /// stream already in flight. The per-signer gates are ADMISSION controls; an
-    /// admitted stream's reservation is already counted in the pool total, so leaving
-    /// them out of the mid-stream re-check bounds nothing less.
-    /// [`Self::try_reserve_floor`] is where every gate applies.
+    /// Deliberately the pool level ONLY. The per-signer gates are ADMISSION controls;
+    /// an admitted stream's reservation is already counted in the pool total, so
+    /// leaving them out of the pool-level view bounds nothing less.
+    /// [`Self::try_reserve_floor`] is where every gate applies. The in-flight
+    /// re-check is [`Self::pool_funds_committed`], which wraps this covers-check and
+    /// adds the `remaining > M` bound a repaid (empty) ledger needs.
     pub(super) fn pool_budget_covers_reserve(
         &self,
         pool_id: B256,
@@ -2355,6 +2356,31 @@ impl ClientHandler {
             committed,
             new_reserve,
         )
+    }
+
+    /// Mid-stream pool-solvency stop condition: `true` while the pool still funds
+    /// the delivery in flight on it.
+    ///
+    /// Two bounds, both required:
+    /// 1. `remaining > M` — the pool's remaining deposit sits above the refundable
+    ///    floor (ADR 003 §Pool solvency: delivery stops once `remaining ≤ M`).
+    ///    Streams release their own floor reservation once it is repaid, so a pool
+    ///    whose streams have all repaid has an empty committed ledger, the
+    ///    covers-check below holds vacuously, and only this bound stops a drained
+    ///    pool.
+    /// 2. `remaining − M` covers the pool's already-committed LIVE floor credit
+    ///    ([`Self::pool_budget_covers_reserve`] with no new reserve).
+    ///
+    /// Admission ([`Self::try_reserve_floor`]) and the direct-serve re-validation
+    /// keep their own gates: admission passes its own floor as the NEW RESERVE, and
+    /// the re-validation runs while the stream's reservation is still live in
+    /// `committed`, so the covers-check's right-hand side is nonzero and alone
+    /// bounds them — for a billable stream, that is: `min_payment` prices a floor
+    /// at zero only at a zero `rate_per_mb`, where nothing billable is at stake.
+    /// This is the in-flight re-check only.
+    pub(super) fn pool_funds_committed(&self, pool_id: B256, remaining: U256) -> bool {
+        remaining > self.pool_min_remaining_deposit
+            && self.pool_budget_covers_reserve(pool_id, remaining, U256::ZERO)
     }
 
     /// Atomically check both floor gates and reserve one `floor` against the pool's

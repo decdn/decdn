@@ -624,15 +624,19 @@ impl ClientHandler {
 
             // Mid-stream pool-solvency re-check (ADR 003 §Pool solvency),
             // symmetric with the takedown re-check below: re-read the cached pool
-            // status and stop once `remaining − M` no longer covers the pool's
-            // already-committed floor credit. A pool drains mid-flight — other
-            // lanes redeem `remaining` down — so a long
-            // stream must catch that; the credit window bounds delivery ahead of
-            // the last COLLECTED voucher, not ahead of the last SOLVENCY-verified
-            // point, so nothing else notices a shared pool going unredeemable.
-            // `new_reserve = ZERO` asks exactly that: is the total ALREADY
-            // committed (this stream included) still within budget? On `false` the
-            // pool can no longer fund further credit, so stop IN-BAND with a clean
+            // status and stop once the pool can no longer fund the delivery in
+            // flight. A pool drains mid-flight — other lanes redeem `remaining`
+            // down — so a long stream must catch that; the credit window bounds
+            // delivery ahead of the last COLLECTED voucher, not ahead of the last
+            // SOLVENCY-verified point, so nothing else notices a shared pool going
+            // unredeemable. `pool_funds_committed` asks two things: `remaining`
+            // still sits above the refundable floor `M`, and `remaining − M` still
+            // covers the floor credit ALREADY committed across the pool (this
+            // stream included while its floor is un-repaid). A pool whose streams
+            // have all repaid has an empty committed ledger, so only the
+            // `remaining > M` bound then separates a funded pool from a drained
+            // one. On `false` the pool can no longer fund further delivery, so
+            // stop IN-BAND with a clean
             // `PoolExhausted` (not a QUIC reset, unlike a takedown) so the owner
             // learns to top up — `PoolExhausted` is post-auth, so naming the
             // condition leaks nothing an open-time refusal must hide, and it is not
@@ -652,11 +656,7 @@ impl ClientHandler {
             if collected_any && !done && last_pool_check.elapsed() >= pool_recheck_interval {
                 last_pool_check = std::time::Instant::now();
                 if let Some(status) = self.pool_view_status_cached(lane_key.pool_id).await
-                    && !self.pool_budget_covers_reserve(
-                        lane_key.pool_id,
-                        status.remaining,
-                        U256::ZERO,
-                    )
+                    && !self.pool_funds_committed(lane_key.pool_id, status.remaining)
                 {
                     self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
                         .await?;

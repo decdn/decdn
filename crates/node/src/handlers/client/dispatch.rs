@@ -1375,9 +1375,12 @@ impl ClientHandler {
         // already holds its reservation, so re-validate solvency against the pool's
         // already-committed LIVE floor reservation via
         // [`ClientHandler::pool_budget_covers_reserve`] with `new_reserve = 0` — the
-        // same stateful check the mid-stream gate applies, so a pool-wide live
-        // reservation that grew since this one was taken refuses here rather than
-        // serving a free interval.
+        // covers-check alone, so a pool-wide live reservation that grew since this
+        // one was taken refuses here rather than serving a free interval. Unlike
+        // the mid-stream gate (`pool_funds_committed`), the covers-check suffices
+        // here without a `remaining > M` bound: this stream's pre-fill reservation
+        // is still live and un-repaid, so `committed > 0` and covering it already
+        // forces `remaining > M`.
         //
         // `remaining` comes from the cached `getPool` view resolved above; a `None`
         // view fails open (the on-chain `redeem` is the backstop). Either way, refuse
