@@ -403,7 +403,7 @@ fn mode(
         file,
         chain_id,
     )?;
-    let pointers = Pointers::load(&root.join("pointers"))?;
+    let pointers = Pointers::load(&root.join("pointers"), chain_id, registry)?;
     Ok((
         SiteDomain::Public { origin },
         Some(Public {

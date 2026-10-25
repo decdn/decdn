@@ -137,9 +137,12 @@ whatever the held `seq`. A transfer away from a compromised key ends that
 key's hold with one `decdn publish point`.
 
 Pointers live in `<data-dir>/pointers/<ns>.json`, one file per namespace,
-with the signer each recovered to and the highest `seq` stored from each
-signer. The gateway reads them at start and fails to start on a damaged
-file. A restart changes no pointer.
+with the signer each recovered to, the highest `seq` stored from each
+signer, and the chain id and registry the owner was read on. The gateway
+reads them at start and fails to start on a damaged file, or on a file
+stored for another deployment: the same data dir on another chain or
+registry does not serve pointers nobody there signed. A restart changes no
+pointer.
 
 ## Ranges
 

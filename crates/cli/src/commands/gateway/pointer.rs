@@ -24,8 +24,11 @@
 //! Pointers live above the protocol ([ADR 002](https://github.com/decdn/decdn/blob/main/adr/002-content-addressing.md)):
 //! nodes, the wire and the contracts never see them. The store is one JSON
 //! file per namespace, `<dir>/<ns>.json`, holding the pointer, the signer it
-//! recovered to, and the highest `seq` stored from each signer; written whole
-//! through a temp file in the same directory, and read once at start.
+//! recovered to, the highest `seq` stored from each signer, and the
+//! deployment (chain id and registry) it was verified on; written whole
+//! through a temp file in the same directory, and read once at start. A
+//! store written for another deployment stops the gateway: the same data dir
+//! on another chain would otherwise serve pointers nobody there signed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -142,8 +145,9 @@ impl SignedPointer {
     }
 }
 
-/// A stored pointer: the record, the owner it recovered to, and the highest
-/// `seq` stored from each signer the namespace ever had.
+/// A stored pointer: the record, the owner it recovered to, the highest
+/// `seq` stored from each signer the namespace ever had, and the deployment
+/// the owner was verified on.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Record {
     #[serde(flatten)]
@@ -151,6 +155,10 @@ struct Record {
     signer: Address,
     /// The highest `seq` stored from each signer, holder and former holders.
     high_water: HashMap<Address, u64>,
+    /// The chain the owner was read on.
+    chain_id: u64,
+    /// The `PublisherRegistry` the owner was read from.
+    registry: Address,
 }
 
 /// Why a pointer was not stored.
@@ -167,23 +175,29 @@ pub(crate) enum SetError {
 }
 
 /// The pointers a gateway holds, by namespace, and the directory that keeps
-/// them across restarts.
+/// them across restarts, for one deployment.
+#[derive(Debug)]
 pub(crate) struct Pointers {
     dir: PathBuf,
+    chain_id: u64,
+    registry: Address,
     live: Mutex<HashMap<u64, Record>>,
 }
 
 impl Pointers {
-    /// The pointers in `dir`, created owner-only when missing. Every
-    /// `<ns>.json` in it is read; a file that does not parse, or whose name
-    /// is not its record's namespace, fails the load, so a damaged store
+    /// The pointers in `dir`, created owner-only when missing, for the
+    /// gateway on `chain_id` with the `PublisherRegistry` at `registry`.
+    /// Every `<ns>.json` in it is read; a file that does not parse, whose
+    /// name is not its record's namespace, or whose record was stored for
+    /// another deployment fails the load, so a damaged or foreign store
     /// stops the gateway instead of serving a stranger's bundle. Anything
     /// else in the directory (a temp file a crash left behind) is skipped.
     ///
     /// # Errors
     ///
-    /// The directory cannot be created or read, or a record is damaged.
-    pub(crate) fn load(dir: &Path) -> anyhow::Result<Self> {
+    /// The directory cannot be created or read, a record is damaged, or a
+    /// record belongs to another deployment.
+    pub(crate) fn load(dir: &Path, chain_id: u64, registry: Address) -> anyhow::Result<Self> {
         super::private_dir(dir)?;
         let mut live = HashMap::new();
         for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
@@ -207,10 +221,20 @@ impl Pointers {
                 path.display(),
                 record.pointer.namespace
             );
+            anyhow::ensure!(
+                record.chain_id == chain_id && record.registry == registry,
+                "{} was stored for chain {} and registry {}; this gateway runs chain {chain_id} \
+                 with registry {registry}: use another --data-dir, or remove the pointers",
+                path.display(),
+                record.chain_id,
+                record.registry
+            );
             live.insert(record.pointer.namespace, record);
         }
         Ok(Self {
             dir: dir.to_path_buf(),
+            chain_id,
+            registry,
             live: Mutex::new(live),
         })
     }
@@ -262,6 +286,8 @@ impl Pointers {
             pointer,
             signer,
             high_water,
+            chain_id: self.chain_id,
+            registry: self.registry,
         };
         self.write(&record).map_err(SetError::Io)?;
         live.insert(record.pointer.namespace, record);
