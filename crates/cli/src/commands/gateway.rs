@@ -156,6 +156,7 @@ use super::fetch::{
 use crate::known_chains;
 
 mod allowance;
+mod hf;
 mod metrics;
 pub(crate) mod pointer;
 mod rewrite;
@@ -1267,10 +1268,56 @@ impl Gateway {
             None => self.sites.site_host(&site),
         };
         let target = req.uri().path_and_query().map_or(path, |pq| pq.as_str());
-        if head {
-            return self.head_site(&site, path, pointer).await;
-        }
         let range = range_header(headers);
+        // A namespace host is an `HF_ENDPOINT`: a resolve path is the entry
+        // it names, byte for byte, with the hub's headers.
+        if pointer.is_some() && !path.starts_with("/_decdn/") {
+            match hf::resolve(path, &site.hash) {
+                hf::HfPath::NotResolve => {}
+                hf::HfPath::UnknownRevision => {
+                    let mut response = text(
+                        StatusCode::NOT_FOUND,
+                        "unknown revision: a namespace host serves `main` and the bundle's \
+                         commit\n",
+                    );
+                    hf::not_found(response.headers_mut(), hf::REVISION_NOT_FOUND, None);
+                    return response;
+                }
+                hf::HfPath::Entry { entry, main } => {
+                    // The metadata request names the bundle it answered for,
+                    // so the download that follows is that bundle's or 404.
+                    if head && main {
+                        return redirect(&hf::pinned(&entry, &site.hash));
+                    }
+                    let entry = format!("/{entry}");
+                    let mut response = if head {
+                        self.head_site(&site, &entry, pointer, Present::Download)
+                            .await
+                    } else {
+                        match site_uri(&site, &entry) {
+                            Ok(uri) => {
+                                self.paid(&page_host, pointer, &uri, Present::Download, range)
+                                    .await
+                            }
+                            Err(e) => text(StatusCode::NOT_FOUND, &e),
+                        }
+                    };
+                    if response.status().is_success() {
+                        hf::decorate(response.headers_mut(), &site.hash);
+                    } else if response.status() == StatusCode::NOT_FOUND {
+                        hf::not_found(
+                            response.headers_mut(),
+                            hf::ENTRY_NOT_FOUND,
+                            Some(&site.hash),
+                        );
+                    }
+                    return response;
+                }
+            }
+        }
+        if head {
+            return self.head_site(&site, path, pointer, Present::Site).await;
+        }
         if let Some(rest) = target.strip_prefix("/_decdn/") {
             let uri: DecdnUri = match format!("decdn:{rest}").parse() {
                 Ok(uri) => uri,
@@ -1295,15 +1342,9 @@ impl Gateway {
         }
         // The query belongs to the page's scripts; a directory serves its
         // `index.html`.
-        let entry = if path.len() > 1 && path.ends_with('/') {
-            format!("{path}index.html")
-        } else {
-            path.to_owned()
-        };
-        let hex = alloy::hex::encode(site.hash);
-        let uri = match format!("decdn:{hex}{entry}").parse::<DecdnUri>() {
-            Ok(uri) => DecdnUri::new(uri.hash, uri.target, site.namespace),
-            Err(e) => return text(StatusCode::NOT_FOUND, &format!("{e}\n")),
+        let uri = match site_uri(&site, &index_of(path)) {
+            Ok(uri) => uri,
+            Err(e) => return text(StatusCode::NOT_FOUND, &e),
         };
         self.paid(&page_host, pointer, &uri, Present::Site, range)
             .await
@@ -2073,6 +2114,7 @@ impl Gateway {
                     name.replace(['"', '\\'], "_")
                 ),
             )
+            .header(header::ETAG, format!("\"{}\"", alloy::hex::encode(hash)))
             .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
         if let Some(size) = size {
             response = response.header(header::CONTENT_LENGTH, size);
@@ -2113,26 +2155,23 @@ impl Gateway {
 
     /// `HEAD` on a public site: the entry's headers from the bundle manifest,
     /// which the gateway pulls once and caches, so the request costs no pull
-    /// of the entry. A directory answers for its `index.html`, and the root
-    /// for the bundle's; a response the gateway would rewrite has no length.
-    /// `pointer` is the namespace whose host the request is on, if any.
+    /// of the entry, as the `GET` presented as `present` would answer them.
+    /// On a site a directory answers for its `index.html`, the root for the
+    /// bundle's, and a response the gateway would rewrite has no length; a
+    /// download is the entry as it is. `pointer` is the namespace whose host
+    /// the request is on, if any.
     async fn head_site(
         self: &Arc<Self>,
         site: &Site,
         path: &str,
         pointer: Option<u64>,
+        present: Present,
     ) -> Response<Body> {
         // The same resolution as `GET`: a directory is its `index.html`, and
         // the path decodes as a `decdn:` URI's does.
-        let entry = if path.len() > 1 && path.ends_with('/') {
-            format!("{path}index.html")
-        } else {
-            path.to_owned()
-        };
-        let hex = alloy::hex::encode(site.hash);
-        let uri = match format!("decdn:{hex}{entry}").parse::<DecdnUri>() {
-            Ok(uri) => DecdnUri::new(uri.hash, uri.target, site.namespace),
-            Err(e) => return text(StatusCode::NOT_FOUND, &format!("{e}\n")),
+        let uri = match site_uri(site, &index_of(path)) {
+            Ok(uri) => uri,
+            Err(e) => return text(StatusCode::NOT_FOUND, &e),
         };
         // The manifest is a paid pull.
         if let Some(refused) = self.allowance_refusal(pointer, &uri) {
@@ -2158,7 +2197,7 @@ impl Gateway {
         };
         let Some(entry) = manifest.entries.iter().find(|e| e.path == path) else {
             let index = format!("{path}/index.html");
-            if manifest.entries.iter().any(|e| e.path == index) {
+            if present == Present::Site && manifest.entries.iter().any(|e| e.path == index) {
                 let link = entry_link(site.hash, path);
                 let last = link.rsplit('/').next().unwrap_or(&link);
                 return redirect(&format!("{last}/"));
@@ -2169,9 +2208,11 @@ impl Gateway {
             );
         };
         let name = path.rsplit('/').next().unwrap_or(path);
-        let content_type = site::content_type(name);
-        let essence = content_type.split(';').next().unwrap_or_default();
-        let length = entry.size.filter(|_| Rewrite::for_type(essence).is_none());
+        let content_type = match present {
+            Present::Site => site::content_type(name),
+            Present::Bare | Present::Download => content_type(name),
+        };
+        let length = entry.size.filter(|_| !rewrites(present, path));
         head_response(&content_type, length, entry.hash)
     }
 
@@ -2458,6 +2499,29 @@ fn over_manifest_cap(e: PullError, cap_mb: u64, raw: Option<&str>) -> PullError 
         }
         e => e,
     }
+}
+
+/// The request path a site resolves: a directory is its `index.html`.
+fn index_of(path: &str) -> String {
+    if path.len() > 1 && path.ends_with('/') {
+        format!("{path}index.html")
+    } else {
+        path.to_owned()
+    }
+}
+
+/// The `decdn:` URI of `entry` (a request path, with its leading `/`) in
+/// `site`'s bundle: the path decodes as a `decdn:` URI's does.
+///
+/// # Errors
+///
+/// Why the path is no entry path; the answer is 404 with it.
+fn site_uri(site: &Site, entry: &str) -> Result<DecdnUri, String> {
+    let hex = alloy::hex::encode(site.hash);
+    format!("decdn:{hex}{entry}")
+        .parse::<DecdnUri>()
+        .map(|uri| DecdnUri::new(uri.hash, uri.target, site.namespace))
+        .map_err(|e| format!("{e}\n"))
 }
 
 /// Entry `path` of bundle `hash` as a relative URL path, each segment

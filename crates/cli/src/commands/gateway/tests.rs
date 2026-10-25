@@ -1305,6 +1305,14 @@ const NOINDEX: [u8; 32] = [0xe9; 32];
 /// A blob whose pull never writes a byte, and never ends.
 const HELD: [u8; 32] = [0xea; 32];
 
+/// An HTML entry under an HF repo path, with a `decdn:` link a site rewrites.
+const REPORT: [u8; 32] = [0xeb; 32];
+
+/// The [`REPORT`] page's bytes.
+fn report_page() -> Vec<u8> {
+    format!("<a href=\"decdn:{}\">x</a>", alloy::hex::encode(OTHER)).into_bytes()
+}
+
 /// The [`NOINDEX`] bundle's manifest.
 fn noindex_manifest() -> Vec<u8> {
     serde_json::json!({"version": 1, "entries": [
@@ -1325,6 +1333,8 @@ fn public_manifest() -> Vec<u8> {
         {"path": "index.html", "hash": alloy::hex::encode(PAGE)},
         {"path": "empty.txt", "hash": alloy::hex::encode(EMPTY), "size": 0},
         {"path": "big.bin", "hash": alloy::hex::encode(BIG), "size": BIG_LEN},
+        {"path": "org/repo/w.bin", "hash": alloy::hex::encode(ENTRY), "size": 3},
+        {"path": "org/repo/report.html", "hash": alloy::hex::encode(REPORT), "size": report_page().len()},
     ]})
     .to_string()
     .into_bytes()
@@ -1354,6 +1364,7 @@ async fn public_gateway_for(allowance: Allowance) -> (Arc<Gateway>, Logs, String
         (PARTIAL, Reply::BytesThenTooLarge(b"partial".to_vec())),
         (NOINDEX, Reply::Bytes(noindex_manifest())),
         (HELD, Reply::Hold),
+        (REPORT, Reply::Bytes(report_page())),
     ]);
     let logs = Logs {
         caps: Arc::default(),
@@ -1477,6 +1488,169 @@ async fn a_known_signer_has_its_own_lookup_budget_per_namespace() {
         "{}",
         other_namespace.body
     );
+}
+
+/// On a namespace host, `/<a>/<b>/resolve/<rev>/<file>` is the entry
+/// `<a>/<b>/<file>` with the headers `huggingface_hub` reads, under `main`
+/// or the root's commit; another revision is 404. `HEAD` under `main`
+/// redirects to the commit path, so the client's `GET` names one bundle
+/// even if the pointer moves in between. A bundle's own site has no such
+/// shim: the path is a literal entry there.
+#[tokio::test]
+async fn a_namespace_host_resolves_hf_paths() {
+    let (gateway, _logs, host) = public_gateway().await;
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
+    let commit = alloy::hex::encode(BLOB)[..40].to_owned();
+    let etag = format!("\"{}\"", alloy::hex::encode(ENTRY));
+    for rev in ["main", commit.as_str()] {
+        let path = format!("/org/repo/resolve/{rev}/w.bin");
+        let got = request(&gateway, "7.decdn.test", &path, &[]).await;
+        assert_eq!(
+            (got.status, got.body.as_str()),
+            (StatusCode::OK, "abc"),
+            "{path}"
+        );
+        assert_eq!(
+            got.header(header::HeaderName::from_static("x-repo-commit")),
+            Some(commit.as_str())
+        );
+        assert_eq!(got.header(header::ETAG), Some(etag.as_str()));
+        assert_eq!(
+            got.header(header::HeaderName::from_static("x-linked-etag")),
+            Some(etag.as_str())
+        );
+        assert_eq!(
+            got.header(header::HeaderName::from_static("x-linked-size")),
+            Some("3")
+        );
+        assert_eq!(got.header(header::ACCEPT_RANGES), Some("bytes"));
+    }
+    // `HEAD` under `main` pins the client to the commit; under the commit it
+    // answers from the manifest.
+    let pinned = send(
+        &gateway,
+        Method::HEAD,
+        "7.decdn.test",
+        "/org/repo/resolve/main/w.bin",
+        &[],
+    )
+    .await;
+    assert_eq!(pinned.status, StatusCode::FOUND);
+    let location = format!("/org/repo/resolve/{commit}/w.bin");
+    assert_eq!(pinned.header(header::LOCATION), Some(location.as_str()));
+    let head = send(&gateway, Method::HEAD, "7.decdn.test", &location, &[]).await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(
+        head.header(header::HeaderName::from_static("x-repo-commit")),
+        Some(commit.as_str())
+    );
+    assert_eq!(head.header(header::ETAG), Some(etag.as_str()));
+    assert_eq!(
+        head.header(header::HeaderName::from_static("x-linked-size")),
+        Some("3")
+    );
+    assert_eq!(head.header(header::CONTENT_LENGTH), Some("3"));
+    // A range on the resolved entry is a range, and the linked size is the
+    // whole.
+    let ranged = request(
+        &gateway,
+        "7.decdn.test",
+        "/org/repo/resolve/main/w.bin",
+        &[("range", "bytes=1-1")],
+    )
+    .await;
+    assert_eq!(
+        (ranged.status, ranged.body.as_str()),
+        (StatusCode::PARTIAL_CONTENT, "b")
+    );
+    assert_eq!(
+        ranged.header(header::HeaderName::from_static("x-linked-size")),
+        Some("3")
+    );
+    let unknown = request(&gateway, "7.decdn.test", "/org/repo/resolve/v1/w.bin", &[]).await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    assert!(unknown.body.contains("revision"), "{}", unknown.body);
+    // The hub client tells a missing revision or file from a lost
+    // connection by `X-Error-Code` alone.
+    assert_eq!(
+        unknown.header(header::HeaderName::from_static("x-error-code")),
+        Some("RevisionNotFound")
+    );
+    for method in [Method::GET, Method::HEAD] {
+        let missing = send(
+            &gateway,
+            method.clone(),
+            "7.decdn.test",
+            &format!("/org/repo/resolve/{commit}/nope.bin"),
+            &[],
+        )
+        .await;
+        assert_eq!(missing.status, StatusCode::NOT_FOUND, "{method}");
+        assert_eq!(
+            missing.header(header::HeaderName::from_static("x-error-code")),
+            Some("EntryNotFound")
+        );
+        assert_eq!(
+            missing.header(header::HeaderName::from_static("x-repo-commit")),
+            Some(commit.as_str())
+        );
+    }
+    // The literal entry still serves, and the hash site knows no shim.
+    let literal = request(&gateway, "7.decdn.test", "/org/repo/w.bin", &[]).await;
+    assert_eq!(literal.status, StatusCode::OK);
+    assert!(
+        literal
+            .header(header::HeaderName::from_static("x-repo-commit"))
+            .is_none()
+    );
+    let on_site = request(&gateway, &host, "/org/repo/resolve/main/w.bin", &[]).await;
+    assert_eq!(on_site.status, StatusCode::NOT_FOUND);
+}
+
+/// A resolve path serves an entry byte-exact whatever its type: the hub
+/// client stores the body under the entry hash, so a page is not rewritten
+/// there and keeps its length on `HEAD` and `GET`; on the literal site path
+/// the same page is still rewritten.
+#[tokio::test]
+async fn a_resolved_page_is_served_byte_exact_with_its_length() {
+    let (gateway, _logs, _) = public_gateway().await;
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
+    let page = String::from_utf8(report_page()).unwrap();
+    let len = page.len().to_string();
+    let path = "/org/repo/resolve/main/report.html";
+    let got = request(&gateway, "7.decdn.test", path, &[]).await;
+    assert_eq!(
+        (got.status, got.body.as_str()),
+        (StatusCode::OK, page.as_str())
+    );
+    assert_eq!(got.header(header::CONTENT_LENGTH), Some(len.as_str()));
+    assert_eq!(
+        got.header(header::HeaderName::from_static("x-linked-size")),
+        Some(len.as_str())
+    );
+    assert_eq!(got.header(header::ACCEPT_RANGES), Some("bytes"));
+    let commit = alloy::hex::encode(BLOB)[..40].to_owned();
+    let pinned = format!("/org/repo/resolve/{commit}/report.html");
+    let head = send(&gateway, Method::HEAD, "7.decdn.test", &pinned, &[]).await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(head.header(header::CONTENT_LENGTH), Some(len.as_str()));
+    assert_eq!(
+        head.header(header::HeaderName::from_static("x-linked-size")),
+        Some(len.as_str())
+    );
+    assert_eq!(
+        head.header(header::CONTENT_TYPE),
+        got.header(header::CONTENT_TYPE)
+    );
+    let ranged = request(&gateway, "7.decdn.test", path, &[("range", "bytes=0-2")]).await;
+    assert_eq!(
+        (ranged.status, ranged.body.as_str()),
+        (StatusCode::PARTIAL_CONTENT, "<a ")
+    );
+    let literal = request(&gateway, "7.decdn.test", "/org/repo/report.html", &[]).await;
+    assert_eq!(literal.status, StatusCode::OK);
+    assert!(literal.body.contains("/_decdn/"), "{}", literal.body);
+    assert!(literal.header(header::CONTENT_LENGTH).is_none());
 }
 
 /// A namespace's own allowance pays for its own bundle and nothing else:

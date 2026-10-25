@@ -13,6 +13,9 @@
 //!      shared allowance, still serves.
 //!   4. The same `seq` again is `409`; a pointer signed by a key that does not
 //!      own the namespace is `403`.
+//!   5. `HEAD /models/demo/resolve/main/a.bin`, the `HF_ENDPOINT` form,
+//!      redirects to the commit path, which answers the entry's size and the
+//!      bundle's commit.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and built `decdn` and `decdn-node` binaries:
@@ -95,7 +98,10 @@ async fn run() -> anyhow::Result<()> {
     let hash_a_hex = blake3::hash(&a).to_hex().to_string();
     let manifest = serde_json::json!({
         "version": 1,
-        "entries": [{ "path": "a.bin", "hash": hash_a_hex, "size": a.len() }],
+        "entries": [
+            { "path": "a.bin", "hash": hash_a_hex, "size": a.len() },
+            { "path": "models/demo/a.bin", "hash": hash_a_hex, "size": a.len() },
+        ],
     })
     .to_string()
     .into_bytes();
@@ -324,6 +330,69 @@ async fn run() -> anyhow::Result<()> {
     );
     let stderr = String::from_utf8_lossy(&stranger.stderr);
     anyhow::ensure!(stderr.contains("403"), "stranger: {stderr}");
+
+    // ---- (5) The HF_ENDPOINT form, answered from the manifest ----
+    let pinned = http
+        .head(format!("{base}/models/demo/resolve/main/a.bin"))
+        .header("host", &ns_host)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        pinned.status() == StatusCode::FOUND,
+        "HEAD resolve main: {}",
+        pinned.status()
+    );
+    let location = pinned
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .context("HEAD under main names the commit path")?
+        .to_owned();
+    anyhow::ensure!(
+        location == format!("/models/demo/resolve/{}/a.bin", &hash_manifest[..40]),
+        "location: {location}"
+    );
+    let head = http
+        .head(format!("{base}{location}"))
+        .header("host", &ns_host)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        head.status() == StatusCode::OK,
+        "HEAD resolve: {}",
+        head.status()
+    );
+    let header = |name: &str| {
+        head.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    anyhow::ensure!(
+        header("x-repo-commit").as_deref() == Some(&hash_manifest[..40]),
+        "x-repo-commit: {:?}",
+        header("x-repo-commit")
+    );
+    anyhow::ensure!(
+        header("x-linked-size") == Some(a.len().to_string()),
+        "x-linked-size: {:?}",
+        header("x-linked-size")
+    );
+    anyhow::ensure!(
+        header("x-linked-etag") == Some(format!("\"{hash_a_hex}\"")),
+        "x-linked-etag: {:?}",
+        header("x-linked-etag")
+    );
+    let unknown = http
+        .head(format!("{base}/models/demo/resolve/v1/a.bin"))
+        .header("host", &ns_host)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        unknown.status() == StatusCode::NOT_FOUND,
+        "unknown revision: {}",
+        unknown.status()
+    );
 
     gateway.start_kill().context("stop the gateway")?;
     let _ = gateway.wait().await;
