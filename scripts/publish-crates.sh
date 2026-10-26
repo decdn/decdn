@@ -333,13 +333,18 @@ echo "==> Gateway dashboard"
 pnpm -C crates/cli/dashboard install --frozen-lockfile || die "the dashboard's install failed"
 pnpm -C crates/cli/dashboard build || die "the dashboard's build failed"
 .github/scripts/check-dashboard-packaged.sh || die "decdn-cli would ship without the dashboard"
+# cargo counts that gitignored build, which decdn-cli packages through
+# `include`, as uncommitted, so both publishes below take --allow-dirty. This
+# proves nothing else in the tag's worktree is.
+[ -z "$(git status --porcelain)" ] || die "the tag's worktree has changes beyond the dashboard build:
+$(git status --porcelain)"
 
 echo "==> Dry run"
 # On a re-run after a successful publish this is where cargo stops, because the
 # version already exists in the registry — so the message must not claim
 # nothing was uploaded. That claim is exactly the belief that leads someone to
 # retry a publish that already happened.
-cargo publish --workspace --locked --dry-run || die \
+cargo publish --workspace --locked --allow-dirty --dry-run || die \
   "the dry run failed.
 
 If it reports the version already exists, THE PUBLISH ALREADY SUCCEEDED — this
@@ -364,7 +369,7 @@ read -r -p "Type the version ($VERSION) to continue: " confirm < /dev/tty
 echo "==> Publishing"
 # --workspace resolves the dependency order itself and waits for each crate to
 # appear in the index before publishing its dependents.
-cargo publish --workspace --locked || die \
+cargo publish --workspace --locked --allow-dirty || die \
   "publishing failed partway. Crates uploaded before the failure ARE published
 and cannot be re-uploaded. Do NOT re-run this script — it would fail on the
 first already-published crate. Check which succeeded:

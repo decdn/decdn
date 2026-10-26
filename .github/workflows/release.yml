@@ -220,8 +220,17 @@ jobs:
       # verify build below then embeds it rather than the fallback page.
       - uses: ./.github/actions/dashboard-build
 
+      # --allow-dirty: cargo counts the dashboard's gitignored build, which
+      # decdn-cli packages through `include`, as uncommitted. The check before
+      # it proves nothing else is.
       - name: Verify every crate packages and builds standalone
-        run: cargo publish --workspace --dry-run --locked
+        run: |
+          [ -z "$(git status --porcelain)" ] || {
+            git status --porcelain
+            echo "::error::the checkout has changes beyond the dashboard build"
+            exit 1
+          }
+          cargo publish --workspace --dry-run --locked --allow-dirty
 
       - name: decdn-cli packages the dashboard build
         run: .github/scripts/check-dashboard-packaged.sh

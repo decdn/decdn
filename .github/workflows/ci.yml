@@ -1390,9 +1390,18 @@ jobs:
       - uses: ./.github/actions/dashboard-build
 
       # Must be --workspace: `cargo package -p decdn-cli` alone fails, because
-      # the internal path deps are not on crates.io yet.
+      # the internal path deps are not on crates.io yet. --allow-dirty: cargo
+      # counts the dashboard's gitignored build, which decdn-cli packages
+      # through `include`, as uncommitted. The check before it proves nothing
+      # else is.
       - name: Every crate still packages
-        run: cargo package --workspace --no-verify --locked
+        run: |
+          [ -z "$(git status --porcelain)" ] || {
+            git status --porcelain
+            echo "::error::the checkout has changes beyond the dashboard build"
+            exit 1
+          }
+          cargo package --workspace --no-verify --locked --allow-dirty
 
       - name: decdn-cli packages the dashboard build
         run: .github/scripts/check-dashboard-packaged.sh
