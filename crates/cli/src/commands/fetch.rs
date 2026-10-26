@@ -1221,7 +1221,11 @@ pub(crate) async fn fetch_on(
             if replaced.is_none()
                 && let Some(hints) = &rate_hints
             {
-                super::quote::print_estimate(claim.total_bytes, hints, common);
+                // A whole blob is one range, so its wire bytes follow from
+                // its size; an unencodable size prints no estimate.
+                if let Ok(wire) = decdn_client::quote::wire_bytes(claim.total_bytes) {
+                    super::quote::print_estimate((claim.total_bytes, wire), hints, common);
+                }
             }
             if streams {
                 return stream_out(

@@ -538,6 +538,10 @@ pub struct PlannedBlob {
     /// chunks it shares with a smaller entry, which that entry fetches. At
     /// most `size`, and `0` for a blob with no declared size.
     pub download: u64,
+    /// The wire bytes that download pays for: each range it fetches, with
+    /// the bao proof path from the blob's own tree, as the nodes meter it
+    /// (ADR 038 § Payment metering). `0` for a blob with no declared size.
+    pub wire: u64,
 }
 
 /// Each distinct blob of `entries`, in first-seen order, with the bytes a

@@ -969,14 +969,20 @@ async fn pull_manifest(
 
 /// Print the run's one-line cost estimate on stderr (#2600): the kept
 /// entries' planned download for a fresh pull (a file already on disk still
-/// counts) at the rates the run's nodes last signed, nearest first. Nothing
-/// prints when no node's rate is known yet.
+/// counts), paid as each blob's own wire bytes, at the rates the run's nodes
+/// last signed, nearest first. Nothing prints when no node's rate is known
+/// yet.
 fn print_estimate(puller: &BundlePuller, manifest: &BundleManifest, common: &ClientFetchArgs) {
-    let download = planned_downloads(&manifest.entries)
-        .iter()
-        .map(|b| b.download)
-        .fold(0u64, u64::saturating_add);
-    quote::print_estimate(download, &puller.rate_hints(), common);
+    let (download, wire) =
+        planned_downloads(&manifest.entries)
+            .iter()
+            .fold((0u64, 0u64), |(download, wire), b| {
+                (
+                    download.saturating_add(b.download),
+                    wire.saturating_add(b.wire),
+                )
+            });
+    quote::print_estimate((download, wire), &puller.rate_hints(), common);
 }
 
 /// `fetch`'s result, or [`Interrupted`] when the first Ctrl-C arrives first.
@@ -1252,9 +1258,9 @@ fn json_plan(out: &str, entries: &[ManifestEntry]) -> serde_json::Value {
 /// reports only the bundle and the output root, with `entries: null` and
 /// `quote: null` under `--json`, since the quote needs the manifest's sizes.
 /// A quote that fails prints a warning, and `quote: null` with its
-/// `quote_error` under `--json`, except a configuration fault (a malformed
-/// `--node-id` or `--provider-address`, or probe signatures that do not
-/// recover to their operators), which fails the dry run as it fails the real
+/// `quote_error` under `--json`, except a fault the real run fails on too (an
+/// invalid or malformed `--node-id`/`--provider-address`, or probe
+/// signatures that do not recover to their operators), which fails the dry
 /// run ([`quote::dry_run_quote`]).
 async fn dry_run(
     args: &GetArgs,

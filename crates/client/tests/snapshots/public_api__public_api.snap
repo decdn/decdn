@@ -116,6 +116,7 @@ pub fn decdn_client::bundle::NotAManifest::fmt(&self, &mut core::fmt::Formatter<
 pub decdn_client::bundle::PlannedBlob::download: u64
 pub decdn_client::bundle::PlannedBlob::hash: [u8; 32]
 pub decdn_client::bundle::PlannedBlob::size: core::option::Option<u64>
+pub decdn_client::bundle::PlannedBlob::wire: u64
 pub const decdn_client::bundle::STAGING_DIR: &str
 pub trait decdn_client::bundle::BundleObserver: core::marker::Send + core::marker::Sync
 pub fn decdn_client::bundle::BundleObserver::entry_landed(&self, &decdn_client::bundle::EntryLanded)

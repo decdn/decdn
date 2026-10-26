@@ -356,15 +356,16 @@ pub(crate) fn view(
     let (mut unanswered, mut rate_limited, mut unrated_blobs) = (0, 0, 0);
     let mut blob_size = None;
     for probed in &census.hashes {
-        let content = match plan {
+        // The blob's wire bytes: a blob URI's from the nearest holder's
+        // size, a bundle blob's from its planned download ranges.
+        let wire = match plan {
             Plan::Blob(_) => {
                 blob_size = probed.size_hint();
-                blob_size
+                blob_size.map(wire_bytes).transpose()?
             }
-            Plan::Bundle { blobs, .. } => blobs
-                .iter()
-                .find(|b| b.hash == probed.hash)
-                .map(|b| b.download),
+            Plan::Bundle { blobs, .. } => {
+                blobs.iter().find(|b| b.hash == probed.hash).map(|b| b.wire)
+            }
         };
         let order: Vec<u64> = probed
             .serve_order(ceiling, warming)
@@ -386,26 +387,31 @@ pub(crate) fn view(
                 above.insert(answer.candidate.node_id);
             }
         }
-        if let Some(content) = content {
-            priced.push(PricedBlob {
-                wire: wire_bytes(content)?,
-                rates: order,
-            });
+        if let Some(wire) = wire {
+            priced.push(PricedBlob { wire, rates: order });
         }
     }
-    let (content_bytes, unsampled_wire, sample, unsized_blobs) = match plan {
-        Plan::Blob(_) => (blob_size, 0, None, 0),
+    let (content_bytes, wire_total, unsampled_wire, sample, unsized_blobs) = match plan {
+        Plan::Blob(_) => (
+            blob_size,
+            blob_size.map(wire_bytes).transpose()?,
+            0,
+            None,
+            0,
+        ),
         Plan::Bundle { blobs, .. } => {
             let sampled: HashSet<[u8; 32]> = census.hashes.iter().map(|h| h.hash).collect();
             let mut unsampled = 0u64;
             let mut sampled_bytes = 0u64;
             let mut total = 0u64;
+            let mut wire = 0u64;
             for blob in blobs {
                 total = total.saturating_add(blob.download);
+                wire = wire.saturating_add(blob.wire);
                 if sampled.contains(&blob.hash) {
                     sampled_bytes = sampled_bytes.saturating_add(blob.download);
                 } else {
-                    unsampled = unsampled.saturating_add(wire_bytes(blob.download)?);
+                    unsampled = unsampled.saturating_add(blob.wire);
                 }
             }
             let sample = Sample {
@@ -414,14 +420,20 @@ pub(crate) fn view(
                 bytes: sampled_bytes,
             };
             let unsized_blobs = blobs.iter().filter(|b| b.size.is_none()).count();
-            (Some(total), unsampled, Some(sample), unsized_blobs)
+            (
+                Some(total),
+                Some(wire),
+                unsampled,
+                Some(sample),
+                unsized_blobs,
+            )
         }
     };
     let price = content_bytes.and_then(|_| price(&priced, unsampled_wire, max_sources));
     Ok(QuoteView {
         target: plan.target(),
         content_bytes,
-        wire_bytes: content_bytes.map(wire_bytes).transpose()?,
+        wire_bytes: wire_total,
         probed: census.probed,
         holders,
         unanswered,
@@ -577,11 +589,14 @@ pub(crate) fn json_quote(uri: &str, view: &QuoteView) -> serde_json::Value {
     })
 }
 
-/// The one-line estimate `decdn get` prints before it pulls `content` bytes
-/// from nodes at `rates`, in the order the pull draws from them, or `None`
-/// with no rate.
-pub(crate) fn estimate_line(content: u64, rates: &[u64], max_sources: usize) -> Option<String> {
-    let wire = wire_bytes(content).ok()?;
+/// The one-line estimate `decdn get` prints before it pulls `content` bytes,
+/// paid as `wire` bytes, from nodes at `rates`, in the order the pull draws
+/// from them, or `None` with no rate.
+pub(crate) fn estimate_line(
+    (content, wire): (u64, u64),
+    rates: &[u64],
+    max_sources: usize,
+) -> Option<String> {
     let priced = PricedBlob {
         wire,
         rates: rates.to_vec(),
@@ -606,12 +621,16 @@ pub(crate) fn estimate_line(content: u64, rates: &[u64], max_sources: usize) -> 
 }
 
 /// Print `decdn get`'s one-line estimate ([`estimate_line`]) on stderr for a
-/// pull of `content` bytes from the nodes of `hints`, in the order the pull
-/// draws from them, under `common`'s ceiling and `--max-sources`. Nothing
-/// prints when no hint has a usable rate.
-pub(crate) fn print_estimate(content: u64, hints: &[RateHint], common: &ClientFetchArgs) {
+/// pull of `content` bytes, paid as `wire` bytes, from the nodes of `hints`,
+/// in the order the pull draws from them, under `common`'s ceiling and
+/// `--max-sources`. Nothing prints when no hint has a usable rate.
+pub(crate) fn print_estimate(
+    (content, wire): (u64, u64),
+    hints: &[RateHint],
+    common: &ClientFetchArgs,
+) {
     let rates = hint_rates(hints, common.max_rate_per_mb);
-    if let Some(line) = estimate_line(content, &rates, common.max_sources) {
+    if let Some(line) = estimate_line((content, wire), &rates, common.max_sources) {
         eprintln!("{line}");
     }
 }
@@ -622,15 +641,19 @@ pub(crate) fn print_estimate(content: u64, hints: &[RateHint], common: &ClientFe
 ///
 /// # Errors
 ///
-/// A configuration fault the real run fails on the same way
-/// ([`ResolveConfigFault`]): a malformed `--node-id` or `--provider-address`,
-/// or nodes that answered but whose probe signatures did not recover to
-/// their operators, because the configured chain is not theirs.
+/// A fault the real run fails on the same way: a flag combination clap
+/// cannot express (a `--provider-address` without `--node-id`), a malformed
+/// `--node-id` or `--provider-address`, both checked before any chain is
+/// resolved, or nodes that answered but whose probe signatures did not
+/// recover to their operators ([`ResolveConfigFault`]), because the
+/// configured chain is not theirs.
 pub(crate) async fn dry_run_quote(
     common: &ClientFetchArgs,
     config_path: Option<&Path>,
     plan: &Plan,
 ) -> anyhow::Result<Result<QuoteView, String>> {
+    common.validate()?;
+    fetch::discovery_options(common)?;
     let quoted = async {
         let host = QuoteHost::open(common, config_path).await?;
         let view = host.price(common, plan).await;

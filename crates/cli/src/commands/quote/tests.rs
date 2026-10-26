@@ -3,6 +3,8 @@ use decdn_client::bundle::ManifestEntry;
 use decdn_client::discovery::NodeCandidate;
 use decdn_client::quote::{HashCensus, NodeAnswer};
 
+use clap::Parser as _;
+
 use super::*;
 
 const GB: u64 = 1_000_000_000;
@@ -204,6 +206,10 @@ fn a_bundle_quote_samples_its_largest_blobs() {
     assert_eq!(price.low, decdn_incentive::rate::min_payment(all, 10));
     assert_eq!(price.high, price.low);
     assert!(price.likely <= price.high && price.likely >= price.low);
+    // The wire total sums each blob's own wire bytes, not the content total
+    // encoded as one blob.
+    assert_eq!(view.wire_bytes, Some(all));
+    assert_ne!(view.wire_bytes, Some(wire(21)));
     let json = json_quote("decdn:b/", &view);
     assert_eq!(json["target"], "bundle");
     assert_eq!(json["entries"], 8);
@@ -359,14 +365,14 @@ fn the_json_quote_is_exact() {
 #[test]
 fn the_estimate_line_reads_one_figure_or_a_range() {
     assert_eq!(
-        estimate_line(29 * GB, &[10, 10], 4).unwrap(),
+        estimate_line((29 * GB, wire_bytes(29 * GB).unwrap()), &[10, 10], 4).unwrap(),
         "Estimate: 0.28 USDC (29.0 GB at 0.0095 USDC/GB)"
     );
     assert_eq!(
-        estimate_line(29 * GB, &[10, 12], 4).unwrap(),
+        estimate_line((29 * GB, wire_bytes(29 * GB).unwrap()), &[10, 12], 4).unwrap(),
         "Estimate: 0.28–0.33 USDC, likely 0.31 USDC (29.0 GB at 0.0095–0.0114 USDC/GB)"
     );
-    assert_eq!(estimate_line(GB, &[], 4), None);
+    assert_eq!(estimate_line((GB, GB), &[], 4), None);
 }
 
 /// Rates convert from micro-USDC per MiB to USDC per SI GB, rounded.
@@ -394,4 +400,43 @@ fn amounts_show_two_significant_figures_at_least() {
 fn shell_quote_escapes_single_quotes() {
     assert_eq!(shell_quote("decdn:ab/?ns=1"), "'decdn:ab/?ns=1'");
     assert_eq!(shell_quote("it's"), r"'it'\''s'");
+}
+
+/// A dry run rejects flags the real run rejects before any quote set-up,
+/// with or without a chain configured: a dangling `--provider-address`, and
+/// a malformed `--node-id`.
+#[tokio::test]
+async fn a_dry_run_quote_rejects_bad_pin_flags_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    let provider = "0x0000000000000000000000000000000000000001";
+    let parse = |extra: &[&str]| {
+        let argv = ["decdn", "quote", "decdn:00"]
+            .into_iter()
+            .chain(extra.iter().copied());
+        match decdn_common::cli::Cli::try_parse_from(argv)
+            .unwrap()
+            .command
+        {
+            decdn_common::cli::Command::Quote(quote) => quote.common,
+            other => panic!("parsed {other:?}"),
+        }
+    };
+    for (extra, want) in [
+        (
+            vec!["--provider-address", provider],
+            "--provider-address requires --node-id",
+        ),
+        (
+            vec!["--node-id", "garbage", "--provider-address", provider],
+            "invalid --node-id",
+        ),
+    ] {
+        let common = parse(&extra);
+        let err = dry_run_quote(&common, Some(&config), &Plan::Blob([1; 32]))
+            .await
+            .expect_err("a bad pin flag fails the dry run");
+        assert!(format!("{err:#}").contains(want), "{err:#}");
+    }
 }

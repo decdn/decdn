@@ -658,8 +658,35 @@ pub(super) fn planned_downloads(entries: &[ManifestEntry]) -> Vec<super::Planned
             hash: group.hash,
             size: group.entries.iter().find_map(|e| e.size),
             download: blob_download_reconstruct(group, &fetch_plan, &empty).0,
+            wire: blob_download_wire(group, &fetch_plan, &empty),
         })
         .collect()
+}
+
+/// The wire bytes a pull of one blob's **download** pays for under the run's
+/// [`FetchPlan`]: each drive range, chunk-group aligned, with the bao proof
+/// path from the blob's own tree (ADR 038 § Payment metering). A plain blob
+/// is one range over its whole size. `0` when the blob declares no size.
+fn blob_download_wire(
+    group: &HashGroup<'_>,
+    fetch_plan: &FetchPlan,
+    index: &HashMap<[u8; 32], MaterializedRange>,
+) -> u64 {
+    let Some(total) = group.entries.iter().find_map(|e| e.size) else {
+        return 0;
+    };
+    let range_wire = |(offset, len): (u64, u64)| {
+        decdn_bao_range::align_range_clamped(offset, len, total)
+            .map_or(len, |aligned| aligned.wire_len())
+    };
+    match group.entries.first().and_then(|e| hints_of(e)) {
+        Some(hints) => plan_reassembly(&hints, index, fetch_plan, group.hash, total)
+            .drive
+            .iter()
+            .map(|&range| range_wire(range))
+            .fold(0u64, u64::saturating_add),
+        None => range_wire((0, total)),
+    }
 }
 
 /// A group of manifest entries that all name the same blob `hash` — one file

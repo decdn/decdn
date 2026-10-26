@@ -2195,6 +2195,15 @@ fn planned_downloads_match_the_run_total() {
             ([0x0c; 32], None, 0),
         ]
     );
+    // Wire bytes carry each blob's own proof: the plain blob pays its whole
+    // tree; the blob that splices its shared chunk pays for its one range
+    // plus the proof path down its own tree, more than the range alone.
+    let whole = decdn_bao_range::align_range_clamped(0, 3 * GROUP, 3 * GROUP)
+        .unwrap()
+        .wire_len();
+    assert_eq!(planned[0].wire, whole);
+    assert!(planned[1].wire > planned[1].download, "{:?}", planned[1]);
+    assert_eq!(planned[2].wire, 0);
     let sum: u64 = planned.iter().map(|p| p.download).sum();
     assert_eq!(
         Some(sum),
