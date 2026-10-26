@@ -699,10 +699,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: changes
+    # Pull requests only: the pin moves only in a PR, so a push or dispatch
+    # run would test nothing new, and it would run another repository's code
+    # in the default branch's cache scope.
     if: >-
-      needs.changes.outputs.rust == 'true' ||
-      needs.changes.outputs.solidity == 'true' ||
-      github.event_name != 'pull_request'
+      github.event_name == 'pull_request' && (
+        needs.changes.outputs.rust == 'true' ||
+        needs.changes.outputs.solidity == 'true')
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
     steps:
@@ -733,8 +736,7 @@ jobs:
           version: v1.7.1
           cache: false
       # The journeys' cache (same RUSTFLAGS and targets), restored and never
-      # saved: the SDK's code runs in this job, so the job itself writes no
-      # cache for main-branch jobs to restore.
+      # saved: the SDK's code runs in this job, so it writes no cache.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: anvil-e2e-journeys
