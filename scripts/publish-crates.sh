@@ -58,9 +58,10 @@ fi
 # ---- preconditions -------------------------------------------------------
 
 # python3 is in here because it reads the crate list out of `cargo metadata`
-# below. Bare coreutils (sed, head, cat) are not: they are assumed the way bash
-# itself is.
-for tool in cargo gh gpg git curl python3; do
+# below, node and pnpm because decdn-cli's .crate carries the gateway
+# dashboard's build. Bare coreutils (sed, head, cat) are not: they are assumed
+# the way bash itself is.
+for tool in cargo gh gpg git curl python3 node pnpm; do
   command -v "$tool" >/dev/null || die "$tool not found on PATH"
 done
 
@@ -325,6 +326,13 @@ if (( ${#NEW_CRATES[@]} > PUBLISH_NEW_BURST )); then
 elif (( ${#NEW_CRATES[@]} > 0 )); then
   echo "    ${#NEW_CRATES[@]} new, ${#CRATES[@]} total (within the burst of $PUBLISH_NEW_BURST)"
 fi
+
+echo "==> Gateway dashboard"
+# dashboard/dist/ is gitignored, so the tag's worktree has none: without this
+# build, decdn-cli's .crate would embed the page that says how to build it.
+pnpm -C crates/cli/dashboard install --frozen-lockfile || die "the dashboard's install failed"
+pnpm -C crates/cli/dashboard build || die "the dashboard's build failed"
+.github/scripts/check-dashboard-packaged.sh || die "decdn-cli would ship without the dashboard"
 
 echo "==> Dry run"
 # On a re-run after a successful publish this is where cargo stops, because the

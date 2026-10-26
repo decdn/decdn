@@ -231,6 +231,7 @@ jobs:
       markdown: ${{ steps.filter.outputs.markdown }}
       scripts: ${{ steps.filter.outputs.scripts }}
       docker: ${{ steps.filter.outputs.docker }}
+      dashboard: ${{ steps.filter.outputs.dashboard }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -309,6 +310,12 @@ jobs:
               - '.github/scripts/**'
               - 'scripts/**'
               - 'docker/**'
+              - '.github/workflows/ci.yml'
+            dashboard:
+              # Gates `dashboard`: the gateway's Vite app and the action
+              # that builds it.
+              - 'crates/cli/dashboard/**'
+              - '.github/actions/dashboard-build/**'
               - '.github/workflows/ci.yml'
             docker:
               # Gates `docker-build`. Must live in THIS filter, not the
@@ -1279,6 +1286,39 @@ jobs:
           python3 -m pip install 'pytest==8.*' 'pyyaml==6.*'
           python3 -m pytest .github/scripts/tests scripts/tests -q
 
+  # The gateway dashboard (crates/cli/dashboard): lint, types, tests, and a
+  # build whose output is exactly the three files `crates/cli/build.rs`
+  # embeds. Rust jobs build `decdn-cli` without Node on purpose: they embed
+  # the fallback page, and no Rust test asserts on the dashboard's content.
+  dashboard:
+    name: dashboard
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.dashboard == 'true' || github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/dashboard-build
+        with:
+          checks: 'true'
+      # The gateway serves three fixed paths under a policy with no inline
+      # script: a fourth file, or a script in the page, would not load.
+      - name: The build is the three files the gateway embeds
+        working-directory: crates/cli/dashboard/dist
+        run: |
+          [ "$(find . -type f | sort | tr '\n' ' ')" = "./app.css ./app.js ./index.html " ] || {
+            echo "::error::dist/ must hold exactly index.html, app.js and app.css:"
+            find . -type f
+            exit 1
+          }
+          grep -q 'src="/_dashboard/app.js"' index.html || {
+            echo "::error::index.html does not load /_dashboard/app.js"
+            exit 1
+          }
+          if grep -Eq '<script>|<script [^>]*>[^<]' index.html; then
+            echo "::error::index.html has an inline script; the dashboard's CSP blocks it"
+            exit 1
+          fi
+
   # Guards what `cargo publish` will do on release day. Both checks exist
   # because a crates.io version can never be replaced: by the time the real
   # publish runs, the release is signed and its dependency crates are already
@@ -1345,10 +1385,17 @@ jobs:
       # those are otherwise green until release day, when the version is
       # already tagged and a crates.io failure has no clean recovery.
       #
+      # decdn-cli's .crate carries the dashboard's gitignored build through
+      # its `include` list; without the build it would ship the fallback page.
+      - uses: ./.github/actions/dashboard-build
+
       # Must be --workspace: `cargo package -p decdn-cli` alone fails, because
       # the internal path deps are not on crates.io yet.
       - name: Every crate still packages
         run: cargo package --workspace --no-verify --locked
+
+      - name: decdn-cli packages the dashboard build
+        run: .github/scripts/check-dashboard-packaged.sh
 
   # Nothing validated the Dockerfile until a release tag was cut, which is how
   # `EXPOSE 4433 9090  # comment` — a hard parse error, since Dockerfile `#`
@@ -1474,7 +1521,7 @@ jobs:
             pr-title, anvil-e2e-settlement, anvil-e2e-journeys, anvil-e2e-sponsord, installers,
             solidity-fmt, solidity-build-test, solidity-coverage,
             solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors,
-            docker-build, packaging]
+            docker-build, packaging, dashboard]
     steps:
       - uses: re-actors/alls-green@release/v1
         with:
@@ -1482,8 +1529,9 @@ jobs:
           # Rust jobs are gated on `needs.changes.outputs.rust`,
           # adr-book-list on `needs.changes.outputs.adr`, markdownlint on
           # `needs.changes.outputs.markdown`, the solidity-* jobs on
-          # `needs.changes.outputs.solidity`, and docker-build on
-          # `needs.changes.outputs.docker`; each skips when its paths are
+          # `needs.changes.outputs.solidity`, docker-build on
+          # `needs.changes.outputs.docker`, and dashboard on
+          # `needs.changes.outputs.dashboard`; each skips when its paths are
           # untouched. alls-green treats `skipped` as failure unless listed
           # here. `changes` and `packaging` are intentionally omitted — both
           # always run, so a skip from either signals a misconfiguration that
@@ -1493,4 +1541,4 @@ jobs:
                          anvil-e2e-settlement, anvil-e2e-journeys, anvil-e2e-sponsord, installers,
                          solidity-fmt, solidity-build-test, solidity-coverage,
                          solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors,
-                         docker-build
+                         docker-build, dashboard

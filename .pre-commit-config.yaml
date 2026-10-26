@@ -82,6 +82,16 @@ repos:
         files: '^crates/.*\.(rs|toml|sh|ps1|html|json)$'
         pass_filenames: false
 
+      # The gateway dashboard's eslint and prettier, only when its files
+      # change, so a Rust-only contributor never needs Node. Needs pnpm on
+      # PATH (`corepack enable`) and `pnpm -C crates/cli/dashboard install`.
+      - id: dashboard-lint
+        name: gateway dashboard lint
+        entry: pnpm -C crates/cli/dashboard lint
+        language: system
+        files: '^crates/cli/dashboard/'
+        pass_filenames: false
+
       # The CLI embeds a deployment manifest, but `include_str!` cannot escape
       # the package, so crates/cli/deployments/ mirrors contracts/deployments/.
       # Drift means `decdn config init` bakes stale contract addresses.
