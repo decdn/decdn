@@ -1127,6 +1127,26 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Client: a pull pinned to one node takes its size from a probe, not
+  from a stream it drops unread (#2619).** A fetch pinned with `--node-id`
+  (`decdn get` of a blob or a bundle, or `decdn gateway`) read its first
+  size claim from the header of a whole-blob paid open, then dropped that
+  stream; `decdn get` of a bundle did so only for the manifest and entries
+  the manifest gives no size. The node wrote up to a credit window into
+  it first, 1 to 2 MiB per pull in the gateway e2e, and counted it in
+  `decdn_bytes_served_total`; there the node wrote 1.36 times the wire bytes
+  of the pulls. A known size is now the first claim: a manifest's entry
+  size, which the gateway also uses for the entries it serves. With no known
+  size, the fetch probes the pinned node once on `cdn/probe/v1` (2 s
+  timeout, no backoff on a shed probe, no wait for a direct path) and takes
+  the size it reports as the hint. The header open stays only for a probe that fails, does not
+  verify, or gives no size, such as a node that does not hold the blob yet.
+  A rediscovery of a pinned node probes nothing. The gateway e2e checks that
+  the node writes the wire bytes of its pulls and no more. The
+  observability registry names `decdn_bytes_served_total` as bao wire
+  bytes, the unit payment uses (content plus about 0.4% proof), including
+  frames a requester never pays for; the gateway appendix says how it
+  differs from `decdn_gateway_bytes_served_total`.
 - **Node: `decdn node lanes` / `admin_v1_lanes` report what each lane is owed
   (#2337).** `LaneSnapshot.outstanding_micro_usdc` was the cumulative of the
   last signed voucher only. A hash-chain lane pays with preimages, which move
@@ -2218,7 +2238,7 @@ since project inception and will roll into the first tagged release.
     does not plot `decdn_cache_bytes_returned_total` ("served to callers"). That
     counter is scoped to `CacheEngine::get`, and the serve path never calls
     `get`, so the line held at zero. "served on the wire"
-    (`decdn_bytes_served_total`) is the delivered-bytes series.
+    (`decdn_bytes_served_total`, bao wire bytes) is the delivered-bytes series.
   - The overview's "Pull success rate" reads over a trailing `[1h]` window.
     `decdn_node_pull_{attempts,success}_total` step only when a pull starts or
     ends, so a `$__rate_interval` window read NaN during one long pull. "Pull
@@ -4563,7 +4583,7 @@ since project inception and will roll into the first tagged release.
     so the pair reads as a populated permanent 0% rather than an empty series, so the fleet dashboard's hit-ratio panel read a permanent
     0% and its throughput panel plotted a flat-zero series as "served". The
     registry rows for the `get`-scoped counters now say so, and the panels read
-    `decdn_bytes_served_total` for delivered bytes.
+    `decdn_bytes_served_total` (bao wire bytes) for delivered bytes.
   - `decdn_serve_cache_partial_hit_total` is counted apart from the plain hit so
     the payoff of partial-holder advertisement (ADR 038) stays legible; both are
     hits for hit-rate purposes.

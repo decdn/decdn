@@ -105,7 +105,7 @@ use crate::stop::Halted;
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
     ProbeRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
-    pinned_targets, probe_and_order,
+    pinned_targets, probe_and_order, probe_pinned,
 };
 use crate::{
     ClientRangedStore, Connections, CredentialSlot, DownloadTarget, Downloader, FundingNeeded,
@@ -1756,26 +1756,46 @@ impl<P: Provider + Clone> PullCtx<P> {
         stop: &StopPolicy,
     ) -> anyhow::Result<bool> {
         slot.ensure().await?;
-        let targets = self.entry_targets(hash).await?;
+        let targets = self.entry_targets(hash, total).await?;
         self.acquire_entry(&targets, hash, staging, total, None, progress, stop)
             .await
     }
 
-    /// One entry's holders: the pinned node, or a fresh probe of the
+    /// One entry's holders: the pinned node, probed for the blob's size when
+    /// `total` (the manifest's size) gives none, or a fresh probe of the
     /// entry's own registry sample (proxy-warming non-holders first when they
     /// help, then holders nearest RTT first). An entry resolves them once and
     /// every fetch of the entry reuses them. A resolution that fails for any
     /// reason but the configuration ([`holders_or_none`]) starts the
     /// entry with no holder, and its acquire loop discovers them.
-    async fn entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
-        holders_or_none(self.resolve_entry_targets(hash).await)
+    async fn entry_targets(
+        &self,
+        hash: [u8; 32],
+        total: Option<u64>,
+    ) -> anyhow::Result<ResolvedTargets> {
+        holders_or_none(self.resolve_entry_targets(hash, total).await)
     }
 
     /// [`Self::entry_targets`] before a failure is sorted into a configuration
     /// fault or an empty start.
-    async fn resolve_entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
+    async fn resolve_entry_targets(
+        &self,
+        hash: [u8; 32],
+        total: Option<u64>,
+    ) -> anyhow::Result<ResolvedTargets> {
         match &self.nodes.selection {
-            Selection::Pinned(pinned) => Ok(pinned_targets(pinned.node_id, pinned.provider)),
+            Selection::Pinned(pinned) if total.is_some() => {
+                Ok(pinned_targets(pinned.node_id, pinned.provider))
+            }
+            Selection::Pinned(pinned) => Ok(probe_pinned(
+                &self.endpoint,
+                &self.chain,
+                self.relays.first().cloned(),
+                *pinned,
+                hash,
+                None,
+            )
+            .await),
             Selection::Registry(registry) => {
                 // The entry's round streams: its fetch starts at the first
                 // verified holder, and the holders that answer later join it.
@@ -2078,9 +2098,9 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// means a manifest fetch runs the same acquire loop, under the same
     /// health table and progress clock, as every entry. A manifest has no
     /// manifest size, so the fetch takes the first size claim (the probe hint,
-    /// or a header-only open when there is none). The staging
-    /// file is removed once read back — a manifest fetch has nothing further
-    /// to resume once its bytes are safely in memory.
+    /// a pinned node's included, or a header-only open when there is none).
+    /// The staging file is removed once read back — a manifest fetch has
+    /// nothing further to resume once its bytes are safely in memory.
     async fn fetch_to_memory(&self, hash: [u8; 32], out_root: &Path) -> anyhow::Result<Vec<u8>> {
         let staging = staging_path(out_root, hash)?;
         // The manifest blob fetch is silent (no bar): `progress` is disabled here
@@ -2515,7 +2535,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // Resolve the entry's holders ONCE and reuse them across every drive
         // below (complement, donor re-fetch, whole-blob re-drive), so the entry
         // probes exactly once.
-        let targets = self.entry_targets(hash).await?;
+        let targets = self.entry_targets(hash, Some(total)).await?;
         let driver = AcquireRangeDriver {
             ctx: self,
             targets: &targets,

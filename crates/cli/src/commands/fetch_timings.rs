@@ -19,7 +19,8 @@ pub(crate) enum Mark {
     /// The iroh endpoint is bound.
     Endpoint,
     /// Discovery starts its probe round. Absent when the peer store's fresh
-    /// latencies or `--node-id` choose the holders without a probe.
+    /// latencies choose the holders without a probe, or when a `--node-id`
+    /// fetch knows the blob's size.
     ProbeStart,
     /// The first holder set is resolved.
     Resolved,

@@ -52,6 +52,12 @@ use decdn_protocol::client::CHUNK_BYTES;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const KEYSTORE_PASSWORD: &str = "bundle-pool-e2e-password";
+/// The bao wire bytes the node wrote on `cdn/client/v1`.
+const SERVED: &str = "decdn_bytes_served_total";
+/// What the node may write past the wire bytes of the pulls: the parent nodes
+/// a pull's later legs repeat. Below the 64 KiB first frame a stream opened
+/// and dropped unread costs on each entry here.
+const SERVED_SLACK: u64 = 16 * 1024;
 /// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
@@ -166,6 +172,7 @@ async fn run() -> anyhow::Result<()> {
     // The node serves the freshly-opened pool once its `getPool` view resolves it
     // (right after `openPool` mines), so the first run can race that resolution.
     // Retry until it lands, exactly as the fetch e2e does.
+    let served_before = node.scrape_metric(SERVED).await?;
     run_bundle_get_until_ready(client_dir.path(), &args).await?;
 
     // Both entries landed with the served bytes.
@@ -223,6 +230,20 @@ async fn run() -> anyhow::Result<()> {
         progress.last_amount > U256::ZERO,
         "a paid bundle must carry a positive cumulative amount, got {}",
         progress.last_amount
+    );
+
+    // The node wrote the wire bytes of the three pulls and no more. The
+    // manifest gives no entry a size, so each pull takes its size from a
+    // probe of the pinned node, not from a stream it opens and drops unread
+    // (#2619). For each entry such a stream costs at least the 64 KiB first
+    // frame; for the small manifest, its whole wire size, inside the slack.
+    let served = node
+        .scrape_metric(SERVED)
+        .await?
+        .saturating_sub(served_before);
+    anyhow::ensure!(
+        (aggregate_wire..=aggregate_wire + SERVED_SLACK).contains(&served),
+        "the node wrote {served} bytes for the bundle's {aggregate_wire} wire bytes"
     );
 
     // `NodeFixture` tears the daemon down on drop; there is nothing to await.

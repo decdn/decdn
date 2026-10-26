@@ -16,7 +16,10 @@
 //!   4. The entry no longer fits the day's allowance: `402` naming its
 //!      `decdn:` URI, before any pull.
 //!   5. An unknown `Host` gets `403`.
-//!   6. The metrics listener on loopback counts what the gateway served.
+//!   6. The metrics listener on loopback counts what the gateway served, and
+//!      the node wrote the wire bytes of those pulls and no more: no pull of
+//!      a.bin or b opens a stream it drops unread (#2619). Every pull reaches
+//!      the node, since the gateway keeps no blob bodies.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and built `decdn` and `decdn-node` binaries:
@@ -60,6 +63,13 @@ const KEYSTORE_PASSWORD: &str = "gateway-public-e2e-password";
 const DOMAIN: &str = "decdn.test";
 /// The node's count of paying streams it stopped over a rejected voucher.
 const VOUCHER_REJECTED: &str = "decdn_serve_stream_voucher_rejected_total";
+/// The bao wire bytes the node wrote on `cdn/client/v1`.
+const SERVED: &str = "decdn_bytes_served_total";
+/// What the node may write past the wire bytes of the pulls: the parent
+/// nodes a pull's later legs repeat, a few hundred bytes here. For the 4 MiB
+/// blobs here, below the 64 KiB first frame that a stream opened and dropped
+/// unread costs at the least.
+const LEG_OVERHEAD_SLACK: u64 = 16 * 1024;
 /// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
@@ -86,6 +96,7 @@ async fn a_public_gateway_serves_anyone_from_its_own_pool() -> anyhow::Result<()
 
 #[allow(
     clippy::too_many_lines,
+    clippy::cognitive_complexity,
     reason = "one sequential journey: node, operator, gateway, then the requests that depend on \
               all three"
 )]
@@ -168,6 +179,7 @@ async fn run() -> anyhow::Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     wait_for_gateway(&http, &base).await?;
+    let served_before = node.scrape_metric(SERVED).await?;
     let get = |host: &str, path: &str| {
         let request = http.get(format!("{base}{path}")).header("host", host);
         async move {
@@ -374,6 +386,19 @@ async fn run() -> anyhow::Result<()> {
         counter("decdn_gateway_bytes_served_total")? >= 6 * a.len() as u64,
         "bytes served: {exposition}"
     );
+    // a.bin three times, b three times, the range and the manifest.
+    let pulled = 3 * wire_bytes(0, 0, a.len())?
+        + 3 * wire_bytes(0, 0, b.len())?
+        + wire_bytes(first, last - first + 1, a.len())?
+        + wire_bytes(0, 0, manifest.len())?;
+    let served = node
+        .scrape_metric(SERVED)
+        .await?
+        .saturating_sub(served_before);
+    anyhow::ensure!(
+        (pulled..=pulled + LEG_OVERHEAD_SLACK).contains(&served),
+        "the node wrote {served} bytes for {pulled} wire bytes of pulls"
+    );
     anyhow::ensure!(
         counter("decdn_gateway_requests_allowance_exhausted_total")? == 1,
         "402s: {exposition}"
@@ -391,6 +416,13 @@ async fn run() -> anyhow::Result<()> {
     let _ = gateway.wait().await;
     drop(node);
     Ok(())
+}
+
+/// The bytes a pull of `len` bytes at `offset` of a `total`-byte blob puts on
+/// the wire: its chunk-group aligned content and the interleaved bao proof
+/// nodes. `(0, 0)` is the whole blob.
+fn wire_bytes(offset: usize, len: usize, total: usize) -> anyhow::Result<u64> {
+    Ok(decdn_bao_range::align_range_clamped(offset as u64, len as u64, total as u64)?.wire_len())
 }
 
 fn strs(items: &[&str]) -> Vec<String> {

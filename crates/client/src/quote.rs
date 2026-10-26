@@ -17,12 +17,12 @@ use alloy::primitives::{Address, U256};
 use decdn_incentive::rate::min_payment;
 use decdn_incentive::slash_judge_domain;
 use futures_util::StreamExt as _;
-use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
+use iroh::{Endpoint, PublicKey, RelayUrl};
 
 use crate::discovery::{self, NodeCandidate};
-use crate::session::{ChainConfig, DiscoveryOptions, PinnedNode, ProxyWarmingParams, PullSite};
+use crate::session::{ChainConfig, DiscoveryOptions, ProxyWarmingParams, PullSite};
 use crate::targets::{
-    ProbeOutcome, classify_probe, failover_order, micros_now, no_serve_target_error,
+    ProbeOutcome, classify_probe, failover_order, micros_now, no_serve_target_error, pinned_target,
     probe_candidate, probe_target, select_up_to, spawn_harvest,
 };
 
@@ -253,22 +253,6 @@ pub(crate) fn unanswered(census: &Census) -> Option<anyhow::Error> {
         first.rate_limited,
         first.unverifiable,
     ))
-}
-
-/// The pinned node as a probe candidate and its dial target, with its
-/// `--addr` as a direct address when given.
-fn pinned_target(pinned: PinnedNode, relay: Option<RelayUrl>) -> (NodeCandidate, EndpointAddr) {
-    let cand = NodeCandidate {
-        node_id: pinned.node_id,
-        eth_address: pinned.provider,
-        region_hint: None,
-        multiaddrs: alloy::primitives::Bytes::new(),
-    };
-    let mut target = probe_target(&cand, relay);
-    if let Some(addr) = pinned.addr {
-        target = target.with_ip_addr(addr);
-    }
-    (cand, target)
 }
 
 /// Sort `outcomes`, each tagged with the index of its hash in `hashes`, into

@@ -195,7 +195,7 @@ start.
 
 | Series | Type | Counts |
 |--------|------|--------|
-| `decdn_gateway_bytes_served_total` | counter | Content bytes handed to responses. |
+| `decdn_gateway_bytes_served_total` | counter | Content bytes handed to responses. A node counts bao wire bytes in `decdn_bytes_served_total`, for every requester. For one whole-blob pull, the node counts about 0.4% more than this counter. For a range, the node counts the wire bytes of the chunk-group-aligned span. The node also counts manifest pulls. |
 | `decdn_gateway_requests_ok_total` | counter | Answers with success or a redirect. |
 | `decdn_gateway_requests_not_found_total` | counter | Answers 404. |
 | `decdn_gateway_requests_refused_total` | counter | Answers refused before a pull: an unknown host, a bad URI, a method, a range past the end. |
