@@ -681,12 +681,19 @@ jobs:
       - name: Run cross-layer e2e journeys
         run: cargo nextest run -p decdn-e2e --features anvil-e2e --test-threads 2
 
-  # The TypeScript SDK's contract suite (decdn/sdk-typescript, checked out at
-  # its `main`) against a real `decdn gateway`, public and loopback
-  # (`crates/e2e/tests/gateway_sdk.rs`), so a drift between the SDK's fake
-  # gateway and the binary fails here. A gateway change the SDK can observe
-  # lands with a matching sdk-typescript PR. A missing `node`, checkout or
-  # `node_modules` fails the test rather than skipping it.
+  # The TypeScript SDK's contract suite against a real `decdn gateway`, public
+  # and loopback (`crates/e2e/tests/gateway_sdk.rs`), so a drift between the
+  # SDK's fake gateway and the binary fails here. The SDK is
+  # decdn/sdk-typescript at the commit `.github/sdk-typescript.sha` pins: new
+  # SDK code runs here only once a decdn PR moves the pin, and an SDK commit
+  # never turns decdn's `main` red on its own. A gateway change the SDK can
+  # observe lands its sdk-typescript PR first, then moves the pin in the same
+  # decdn PR. The test fails, never skips, without `node`, the checkout or
+  # `node_modules`, on a skipped or todo test, and when the suite did not reach
+  # this gateway.
+  #
+  # ~10m observed; 30m clears a cold build plus two runs at the 600s heavy
+  # tier, `--test-threads 2`.
   anvil-e2e-sdk:
     name: anvil e2e (sdk contract)
     runs-on: ubuntu-latest
@@ -725,20 +732,24 @@ jobs:
         with:
           version: v1.7.1
           cache: false
+      # The journeys' cache (same RUSTFLAGS and targets), restored and never
+      # saved: the SDK's code runs in this job, so the job itself writes no
+      # cache for main-branch jobs to restore.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: anvil-e2e-sdk
-          # The SDK's code runs in this job, so nothing it could touch is
-          # saved for main-branch jobs to restore.
+          shared-key: anvil-e2e-journeys
           save-if: false
       - uses: taiki-e/install-action@v2.87.29
         with:
           tool: cargo-nextest
+      - name: Read the pinned TypeScript SDK commit
+        id: sdk
+        run: echo "sha=$(tr -d '[:space:]' < .github/sdk-typescript.sha)" >> "$GITHUB_OUTPUT"
       - name: Check out the TypeScript SDK
         uses: actions/checkout@v7
         with:
           repository: decdn/sdk-typescript
-          ref: main
+          ref: ${{ steps.sdk.outputs.sha }}
           path: sdk-typescript
           persist-credentials: false
       - uses: pnpm/action-setup@v6.1.0
@@ -760,7 +771,7 @@ jobs:
           DECDN_SDK_DIR: ${{ github.workspace }}/sdk-typescript
         run: >
           cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e
-          --test gateway_sdk --test-threads 2
+          --test gateway_sdk --test-threads 2 --no-tests=fail
 
   # ----- Solidity contracts ----------------------------------------------
   # The contracts pipeline mirrors the Rust split (one concern per job).
@@ -1564,10 +1575,8 @@ jobs:
           # Rust jobs are gated on `needs.changes.outputs.rust`,
           # adr-book-list on `needs.changes.outputs.adr`, markdownlint on
           # `needs.changes.outputs.markdown`, the solidity-* jobs on
-          # `needs.changes.outputs.solidity`, docker-build on
-          # `needs.changes.outputs.docker`, and anvil-e2e-sdk on `rust` or
-          # `solidity`;
-          # each skips when its paths are
+          # `needs.changes.outputs.solidity`, and docker-build on
+          # `needs.changes.outputs.docker`; each skips when its paths are
           # untouched. alls-green treats `skipped` as failure unless listed
           # here. `changes` and `packaging` are intentionally omitted — both
           # always run, so a skip from either signals a misconfiguration that

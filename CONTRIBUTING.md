@@ -121,7 +121,8 @@ CARGO_BUILD_WARNINGS=deny cargo clippy -p decdn-incentive --no-default-features 
 
 The `--all-features` run is the only one that reaches anything behind an off-by-default feature —
 the `anvil-e2e` targets (journeys, the two `decdn-node` anvil tests, and sponsord's `chain_pool`
-and `binary_anvil`), `public-api-test`, the sponsord `test-support` fakes. Run it before pushing
+and `binary_anvil`), the `anvil-e2e` + `sdk-e2e` `gateway_sdk` target, `public-api-test`, the
+sponsord `test-support` fakes. Run it before pushing
 a change that touches gated code, or the first thing that tells you is a red CI.
 
 The sponsord crates (`crates/sponsord*`, [`docs/sponsord/`](docs/sponsord/README.md)) have two
@@ -200,22 +201,29 @@ The TypeScript SDK, `@decdn/client`, lives in
 [decdn/sdk-typescript](https://github.com/decdn/sdk-typescript). Its fake
 gateway mirrors this gateway's HTTP contract
 ([appendix-gateway](adr/appendix-gateway.md)), and its contract suite runs
-here against the real binary, in the `anvil-e2e-sdk` CI job, which checks out
-that repository's `main`:
+here against the real binary, in the `anvil-e2e-sdk` CI job, at the commit
+`.github/sdk-typescript.sha` pins. Locally, with `anvil` and `forge` on `PATH`
+(as for the journeys):
 
 ```bash
 git clone https://github.com/decdn/sdk-typescript ../sdk-typescript
-pnpm -C ../sdk-typescript install --frozen-lockfile
+git -C ../sdk-typescript checkout "$(cat .github/sdk-typescript.sha)"
+pnpm -C ../sdk-typescript install --frozen-lockfile --ignore-scripts
 cargo build -p decdn-cli -p decdn-node
 DECDN_SDK_DIR="$PWD/../sdk-typescript" \
   cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e --test gateway_sdk
 ```
 
-The target has its own `sdk-e2e` feature, so the `anvil-e2e` journeys never
-build it, and it fails, rather than skips, without `DECDN_SDK_DIR`, `node` or
-the SDK's `node_modules`. A gateway change the SDK can observe needs a
-matching sdk-typescript PR that updates its fake gateway; `anvil-e2e-sdk`
-fails until that PR lands.
+`--ignore-scripts` matches CI: the run needs no install scripts. The target
+has its own `sdk-e2e` feature, so the `anvil-e2e` journeys never build it.
+It fails, rather than skips, without `DECDN_SDK_DIR`, `node` or the SDK's
+`node_modules`, on a skipped or todo contract test, and when the suite did
+not reach this gateway.
+
+A gateway change the SDK can observe goes in this order: the sdk-typescript
+PR that updates its fake gateway and contract suite lands first, then the
+decdn PR moves `.github/sdk-typescript.sha` to it in the same change as the
+gateway. A new SDK commit runs here only when a decdn PR moves the pin.
 
 ## Solidity development
 
