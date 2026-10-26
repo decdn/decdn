@@ -13,7 +13,7 @@ each packaged crate, but it costs a full rebuild of the workspace. That runs in
 release.yml, before the draft is created. This is the cheap PR-time signal that
 stops the mistake from ever reaching a tag.
 
-Two deliberate calibrations:
+Three deliberate calibrations:
 
 * Sites under `#[cfg(test)]` are *warnings*, not errors — the verify build does
   not enable `cfg(test)`, so they do not block publishing. They are still real
@@ -23,6 +23,11 @@ Two deliberate calibrations:
 * An embedded path that is inside the crate but *not tracked by git* is an
   error: `cargo package` ships tracked files, so a gitignored target is just as
   absent from the `.crate` as one outside the directory.
+* An embed under `OUT_DIR` (`concat!(env!("OUT_DIR"), "…")`) is accepted only
+  from a crate with a tracked `build.rs`: the build script writes the file on
+  every build, so the `.crate` needs the script, not the file. Whatever the
+  script reads must reach the `.crate` too, and `cargo package --list` checks
+  that in CI.
 
 Crates with `publish = false` are exempt: they are never packaged, so reaching
 out to workspace fixtures is legitimate for them.
@@ -61,6 +66,9 @@ PATH_ATTR = re.compile(r"#\s*\[\s*path\s*=\s*r?\"([^\"\\]*)\"\s*\]")
 LITERAL = re.compile(r'^r?"([^"\\]*)"$')
 MANIFEST_DIR = re.compile(
     r'^concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*r?"([^"\\]*)"\s*,?\s*\)$'
+)
+OUT_DIR = re.compile(
+    r'^concat!\s*\(\s*env!\s*\(\s*"OUT_DIR"\s*\)\s*,\s*r?"([^"\\]*)"\s*,?\s*\)$'
 )
 CFG_TEST = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
 
@@ -240,6 +248,13 @@ def scan_source(
             report(m.start(), (src_path.parent / lit.group(1)).resolve())
         elif md := MANIFEST_DIR.match(arg):
             report(m.start(), (crate_root / md.group(1).lstrip("/")).resolve())
+        elif OUT_DIR.match(arg):
+            if (crate_root / "build.rs").resolve() not in tracked:
+                report(
+                    m.start(),
+                    None,
+                    "embeds a file under OUT_DIR but the crate has no tracked build.rs",
+                )
         else:
             report(
                 m.start(),

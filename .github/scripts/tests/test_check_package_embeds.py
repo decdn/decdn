@@ -27,11 +27,14 @@ _spec.loader.exec_module(cpe)
 # --- helpers ---------------------------------------------------------------
 
 
-def build_crate(tmp_path: Path, source: str, *, outside: bool = True) -> tuple[Path, Path, set[Path]]:
+def build_crate(
+    tmp_path: Path, source: str, *, outside: bool = True, build_script: bool = False
+) -> tuple[Path, Path, set[Path]]:
     """A crate at <tmp>/crates/demo with `source` as src/lib.rs.
 
     Also drops a fixture at the workspace root (outside the crate) and one
     inside it, so a test can embed either. Everything is reported as tracked.
+    With `build_script`, the crate also has a tracked `build.rs`.
     """
     crate_root = tmp_path / "crates" / "demo"
     (crate_root / "src").mkdir(parents=True)
@@ -46,6 +49,9 @@ def build_crate(tmp_path: Path, source: str, *, outside: bool = True) -> tuple[P
     }
     if not outside:
         tracked.discard((tmp_path / "OUTSIDE.md").resolve())
+    if build_script:
+        (crate_root / "build.rs").write_text("fn main() {}\n")
+        tracked.add((crate_root / "build.rs").resolve())
     return crate_root, src, tracked
 
 
@@ -94,6 +100,28 @@ def test_embed_inside_the_crate_but_untracked_is_an_error(tmp_path):
     errors, _ = cpe.scan_source(src, crate_root, tmp_path, tracked)
     assert len(errors) == 1
     assert "not tracked by git" in errors[0]
+
+
+OUT_DIR_EMBED = 'const X: &str = include_str!(concat!(env!("OUT_DIR"), "/dashboard/index.html"));\n'
+
+
+def test_out_dir_embed_from_a_crate_with_a_build_script_is_accepted(tmp_path):
+    crate_root, src, tracked = build_crate(tmp_path, OUT_DIR_EMBED, build_script=True)
+    assert cpe.scan_source(src, crate_root, tmp_path, tracked) == ([], [])
+
+
+def test_out_dir_embed_without_a_build_script_is_an_error(tmp_path):
+    errors, warnings = scan(tmp_path, OUT_DIR_EMBED)
+    assert len(errors) == 1, errors
+    assert "embeds a file under OUT_DIR but the crate has no tracked build.rs" in errors[0]
+    assert warnings == []
+
+
+def test_out_dir_embed_with_an_untracked_build_script_is_an_error(tmp_path):
+    crate_root, src, tracked = build_crate(tmp_path, OUT_DIR_EMBED, build_script=True)
+    tracked.discard((crate_root / "build.rs").resolve())
+    errors, _ = cpe.scan_source(src, crate_root, tmp_path, tracked)
+    assert len(errors) == 1, errors
 
 
 def test_unresolvable_argument_is_an_error_not_a_pass(tmp_path):
