@@ -44,6 +44,7 @@ use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
+use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::session::{
     ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, ProxyWarmingParams,
     PullSite,
@@ -536,11 +537,12 @@ pub(crate) async fn fetch(
     output: &Path,
     uri: &DecdnUri,
     config_path: Option<&Path>,
+    evidence: &Arc<ReceiptEvidence>,
 ) -> anyhow::Result<()> {
     let timings = FetchTimings::start();
     let (host, grant) = FetchHost::open(&args.common, config_path, false).await?;
     timings.mark(Mark::Endpoint);
-    let payer = Payer::keystore(grant);
+    let payer = Payer::keystore(grant).with_receipt(Arc::clone(evidence));
     // A Ctrl-C drops the fetch mid-transfer: each drive's drop guard queues
     // what it paid for recording, and the `.partial` is the next run's resume
     // prefix. The handle outlives the fetch, so an `openPool` or `topUp` that a
@@ -881,6 +883,9 @@ pub(crate) struct Payer {
     funding: Option<Arc<RunFunding>>,
     recovery: Arc<RecoveryGate>,
     open_lock: tokio::sync::Mutex<()>,
+    /// Where every lane keeps the signed messages a pull receipt holds, and
+    /// every fetch records the blob it landed; `None` keeps nothing.
+    evidence: Option<Arc<ReceiptEvidence>>,
 }
 
 enum PayerKey {
@@ -930,7 +935,15 @@ impl Payer {
             funding: None,
             recovery: Arc::new(RecoveryGate::new()),
             open_lock: tokio::sync::Mutex::new(()),
+            evidence: None,
         }
+    }
+
+    /// This payer, with every fetch it pays for keeping its receipt evidence
+    /// in `evidence`.
+    pub(crate) fn with_receipt(mut self, evidence: Arc<ReceiptEvidence>) -> Self {
+        self.evidence = Some(evidence);
+        self
     }
 
     /// The fetches of a gateway paying from the keystore's own pool, under
@@ -1013,6 +1026,7 @@ impl Payer {
             funding: None,
             recovery: Arc::new(RecoveryGate::new()),
             open_lock: tokio::sync::Mutex::new(()),
+            evidence: None,
         })
     }
 
@@ -1193,6 +1207,7 @@ pub(crate) async fn fetch_on(
             writes,
             funding: &funding,
             marks: Some(timings),
+            evidence: payer.evidence.as_deref(),
         };
         // The fetch's lanes build concurrently and every one opens or reuses the
         // one pool on-chain, so the open-or-reuse runs one lane at a time across
@@ -1227,35 +1242,47 @@ pub(crate) async fn fetch_on(
                     super::quote::print_estimate((claim.total_bytes, wire), hints, common);
                 }
             }
-            if streams {
-                return stream_out(
+            let total_bytes = claim.total_bytes;
+            let landed = if streams {
+                stream_out(
                     &deps,
                     &sources,
                     claim.holders,
                     Arc::clone(health),
                     hash,
-                    claim.total_bytes,
+                    total_bytes,
                     stop.clone(),
                     (common.max_sources, args.read_ahead, args.range, timings),
                     &mut *sink,
                 )
-                .await;
+                .await
+            } else {
+                download_to_file(
+                    &deps,
+                    &sources,
+                    claim.holders,
+                    Arc::clone(health),
+                    DownloadTarget {
+                        hash,
+                        total_bytes,
+                        dest: &args.output,
+                        ranges: None,
+                    },
+                    &stop,
+                    (common.max_sources, timings),
+                )
+                .await
+            };
+            // A whole blob that landed verified against its hash, whose
+            // length the hash commits to, is a receipt entry; a byte window is
+            // not the blob.
+            if landed.is_ok()
+                && args.range.is_none()
+                && let Some(evidence) = &payer.evidence
+            {
+                evidence.note_landed(hash, total_bytes);
             }
-            download_to_file(
-                &deps,
-                &sources,
-                claim.holders,
-                Arc::clone(health),
-                DownloadTarget {
-                    hash,
-                    total_bytes: claim.total_bytes,
-                    dest: &args.output,
-                    ranges: None,
-                },
-                &stop,
-                (common.max_sources, timings),
-            )
-            .await
+            landed
         }
         .await;
         on_drop.disarm();

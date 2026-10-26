@@ -7,6 +7,7 @@
 //! one provider never serialize their payments behind each other's round trips.
 
 use std::future::Future;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use alloy::primitives::{B256, U256};
@@ -14,6 +15,8 @@ use decdn_incentive::chain::{CHUNK_BYTES, MAX_CHAIN_LENGTH};
 use decdn_protocol::MB_BYTES;
 use decdn_protocol::client::WatermarkBundle;
 use tokio::sync::Mutex;
+
+use crate::receipt::LaneEvidence;
 
 /// A lane's cumulative voucher state: the absolute totals carried by the most
 /// recent voucher. Both advance monotonically over the lane's lifetime. There
@@ -245,10 +248,11 @@ struct Pipeline {
     /// and this lets the rest see that it did, so they leave alone the chain
     /// the healed lane opened next.
     healed_from: Option<Cumulative>,
-    /// The lane claim, in bytes, that this ledger's own proofs grow from: the
-    /// seed's bytes, moved by every reseed and rebase ([`Pipeline::heal`]).
-    /// [`PoolLedger::paid_bytes`] is the committed claim above it.
-    baseline: U256,
+    /// The lane claim that this ledger's own proofs grow from: the seed, moved
+    /// by every reseed and rebase ([`Pipeline::heal`]). [`PoolLedger::paid_bytes`]
+    /// is the committed claim above it in bytes, and a pull receipt's prior
+    /// watermark is this ([`PoolLedger::proved_frontier`]).
+    baseline: Cumulative,
 }
 
 impl Pipeline {
@@ -263,12 +267,20 @@ impl Pipeline {
     /// claims between the two were never collected either: this ledger signs
     /// them again, and they count as its payment, so the baseline falls to
     /// the watermark.
+    ///
+    /// The two axes move by the same rule, each on its own.
     fn heal(&mut self, cum: Cumulative) {
-        let from = self.committed.plus(self.accrued).bytes;
-        self.baseline = if cum.bytes >= from {
-            self.baseline.saturating_add(cum.bytes.saturating_sub(from))
-        } else {
-            self.baseline.min(cum.bytes)
+        let from = self.committed.plus(self.accrued);
+        let moved = |baseline: U256, from: U256, to: U256| {
+            if to >= from {
+                baseline.saturating_add(to.saturating_sub(from))
+            } else {
+                baseline.min(to)
+            }
+        };
+        self.baseline = Cumulative {
+            bytes: moved(self.baseline.bytes, from.bytes, cum.bytes),
+            amount: moved(self.baseline.amount, from.amount, cum.amount),
         };
         self.overwrite(cum);
         self.healed_from = Some(cum);
@@ -529,6 +541,27 @@ pub struct PoolLedger {
     /// credit-window loss, at most one credit window per lane, as for any
     /// client that ends mid-stream.
     unpaid: std::sync::Mutex<Vec<([u8; 32], u64, u64)>>,
+    /// The signed messages a pull receipt keeps for this lane, once a
+    /// [`crate::receipt::ReceiptEvidence`] collector attaches it. Empty on a
+    /// lane nothing collects for, which keeps a long-lived ledger (a node's
+    /// upstream lane, a gateway's shared payer) from holding every response it
+    /// ever read.
+    evidence: OnceLock<Arc<LaneEvidence>>,
+}
+
+/// What a lane can prove it was paid: the signed anchor its vouchers last
+/// committed, the deepest preimage released under the live chain, and the
+/// claim this ledger's own proofs grew from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProvedFrontier {
+    /// The cumulative the lane's committed anchor states.
+    pub(crate) anchor: Cumulative,
+    /// The claim the ledger started from, moved by every heal: what the lane
+    /// held before this ledger paid anything ([`Pipeline::baseline`]).
+    pub(crate) baseline: Cumulative,
+    /// The deepest reveal on the live chain, or `None` when the lane meters no
+    /// chain or has released nothing under it.
+    pub(crate) reveal: Option<Released>,
 }
 
 /// Default ceiling on one voucher send (see [`PoolLedger::send_deadline`]). A
@@ -581,12 +614,60 @@ impl PoolLedger {
                 generation: 0,
                 unsaved_rebase: None,
                 healed_from: None,
-                baseline: seed.bytes,
+                baseline: seed,
             }),
             epoch: std::sync::Mutex::new(None),
             retired: std::sync::Mutex::new(Displaced::Nothing),
             send_deadline: VOUCHER_SEND_DEADLINE,
             unpaid: std::sync::Mutex::new(Vec::new()),
+            evidence: OnceLock::new(),
+        }
+    }
+
+    /// The lane's receipt evidence, or `None` when no collector attached one.
+    pub(crate) fn evidence(&self) -> Option<&LaneEvidence> {
+        self.evidence.get().map(AsRef::as_ref)
+    }
+
+    /// The lane's receipt evidence, attaching an empty one first if none is
+    /// attached yet.
+    pub(crate) fn attach_evidence(&self) -> Arc<LaneEvidence> {
+        Arc::clone(self.evidence.get_or_init(Arc::default))
+    }
+
+    /// The frontier this lane can prove: its committed anchor, the deepest
+    /// preimage released under the live chain, and its baseline. Read under
+    /// the issuance lock, so no voucher or reveal lands between the reads.
+    ///
+    /// The anchor is the last voucher whose send succeeded (presumed accepted),
+    /// one a rejection rewound to, the node watermark a reseed or rebase moved
+    /// to, or the seed when nothing was sent. Only the first two carry a
+    /// signature of this ledger. A reveal counts only under the live chain: a
+    /// chain an unconfirmed rollover displaced keeps its reveals in the armed
+    /// voucher's fold, which nothing has confirmed, so they prove nothing here.
+    pub(crate) async fn proved_frontier(&self) -> ProvedFrontier {
+        let _issuing = self.issuance.lock().await;
+        let (anchor, baseline) = {
+            let pipeline = self.pipeline();
+            (pipeline.committed, pipeline.baseline)
+        };
+        let reveal = self.epoch().as_ref().and_then(|live| {
+            let index = live.released;
+            if index == 0 {
+                return None;
+            }
+            live.preimages
+                .get(usize::from(index))
+                .map(|&preimage| Released {
+                    preimage,
+                    index,
+                    chain_root: live.root(),
+                })
+        });
+        ProvedFrontier {
+            anchor,
+            baseline,
+            reveal,
         }
     }
 
@@ -690,7 +771,7 @@ impl PoolLedger {
             .committed
             .plus(pipeline.accrued)
             .bytes
-            .saturating_sub(pipeline.baseline)
+            .saturating_sub(pipeline.baseline.bytes)
     }
 
     /// The cumulative a cancelled pull must PERSIST — the drop-path counterpart of

@@ -14,6 +14,10 @@
 //!
 //! The URI's `ns` is the namespace hint of either route.
 //!
+//! Every route that paid ends with the run's pull receipt (`receipt`): the
+//! block names what landed, the nodes that served it and what they were paid,
+//! and `--receipt` writes the signed evidence to a file.
+//!
 //! Without `-o`, the destination follows the target: `./<hash>` for a blob,
 //! `.` for a bundle, and `./<name>` for an entry, where `<name>` is the last
 //! segment of the entry's path. The command then writes the absolute
@@ -28,8 +32,10 @@
 //! from.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context as _;
+use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::GetArgs;
 
@@ -50,11 +56,17 @@ pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<(
     if args.dry_run && uri.target == UriTarget::Blob {
         return super::quote::dry_run_blob(args, &dest.path, &uri, config_path).await;
     }
+    if let Some(path) = &args.receipt {
+        super::receipt::check_receipt_path(path)?;
+    }
+    let started = super::receipt::unix_now();
+    let evidence = Arc::new(ReceiptEvidence::new());
     let result = if streams_one_blob(args, &uri) {
-        super::fetch::fetch(args, &dest.path, &uri, config_path).await
+        super::fetch::fetch(args, &dest.path, &uri, config_path, &evidence).await
     } else {
-        super::bundle_pull::bundle_pull(args, &dest, &uri, config_path).await
+        super::bundle_pull::bundle_pull(args, &dest, &uri, config_path, &evidence).await
     };
+    let result = super::receipt::finish_get(args, &uri, &evidence, started, result).await;
     with_resume_hint(args, result)
 }
 

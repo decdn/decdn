@@ -25,6 +25,7 @@ use decdn_client::bundle::{
 };
 use decdn_client::buyer_pool::UnconfirmedEscrows;
 use decdn_client::endpoint as client_endpoint;
+use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::get::{DEFAULT_JOBS, DEFAULT_MAX_LANE_STREAMS};
 use decdn_common::cli::{ClientFetchArgs, GetArgs};
@@ -645,6 +646,7 @@ pub(crate) async fn bundle_pull(
     dest: &Destination,
     uri: &DecdnUri,
     config_path: Option<&Path>,
+    evidence: &Arc<ReceiptEvidence>,
 ) -> anyhow::Result<()> {
     // `-o -` is stdout, which a pull cannot write a tree to; the blob fetch
     // takes every `-o -` run. Fail rather than create a directory named `-`.
@@ -727,6 +729,7 @@ pub(crate) async fn bundle_pull(
         &endpoint,
         &relays,
         (&filter, filters_given),
+        evidence,
     )
     .await;
     endpoint.close().await;
@@ -736,7 +739,7 @@ pub(crate) async fn bundle_pull(
 /// The part of [`bundle_pull`] that runs over its open `endpoint`: resolve the
 /// providers and the buyer signer, build the puller, obtain the manifest, and
 /// pull it. `filter` is the compiled entry selection and whether `--include` or
-/// `--exclude` was given.
+/// `--exclude` was given. Every lane keeps its receipt evidence in `evidence`.
 #[allow(clippy::too_many_arguments)]
 async fn pull_over(
     args: &GetArgs,
@@ -748,6 +751,7 @@ async fn pull_over(
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     (filter, filters_given): (&EntryFilter, bool),
+    evidence: &Arc<ReceiptEvidence>,
 ) -> anyhow::Result<()> {
     let observer = Arc::new(PullObserver::new(args.json, run_label(out)));
     // Outlives the puller's passes, so an `openPool` or `topUp` that a Ctrl-C
@@ -764,7 +768,10 @@ async fn pull_over(
         (endpoint, relays),
         uri.namespace,
         lanes,
-        Arc::clone(&observer) as Arc<dyn BundleObserver>,
+        (
+            Arc::clone(&observer) as Arc<dyn BundleObserver>,
+            Some(Arc::clone(evidence)),
+        ),
         &escrows,
     )
     .await?;
@@ -796,8 +803,9 @@ async fn pull_over(
 }
 
 /// The run's puller: its node selection, its buyer key and funding, and
-/// its pull settings, with `observer` and `escrows` attached. `lanes` is the
-/// `--jobs` and `--max-lane-streams` pair.
+/// its pull settings, with `observer`, the receipt `evidence` when there is
+/// one, and `escrows` attached. `lanes` is the `--jobs` and
+/// `--max-lane-streams` pair.
 async fn open_puller(
     common: &ClientFetchArgs,
     (chain, grant, store): (
@@ -808,7 +816,7 @@ async fn open_puller(
     (endpoint, relays): (&Endpoint, &[RelayUrl]),
     namespace: Option<u64>,
     (jobs, max_lane_streams): (usize, usize),
-    observer: Arc<dyn BundleObserver>,
+    (observer, evidence): (Arc<dyn BundleObserver>, Option<Arc<ReceiptEvidence>>),
     escrows: &UnconfirmedEscrows,
 ) -> anyhow::Result<BundlePuller> {
     // The node selection is resolved BEFORE the keystore prompt, so a failed
@@ -828,7 +836,7 @@ async fn open_puller(
             slot: fetch::delegated_slot(grant, signer)?,
         },
     };
-    BundlePuller::builder(
+    let builder = BundlePuller::builder(
         chain.config.clone(),
         chain.site.clone(),
         endpoint.clone(),
@@ -836,19 +844,24 @@ async fn open_puller(
         funding,
         discovery,
         nodes,
-    )
-    .relays(relays.to_vec())
-    .namespace(namespace)
-    .jobs(jobs)
-    .max_lane_streams(max_lane_streams)
-    .max_rate_per_mb(common.max_rate_per_mb)
-    .max_blob_bytes(common.max_blob_mb.saturating_mul(1024 * 1024))
-    .stop(std::io::stderr().is_terminal(), common.give_up_after())
-    .observer(observer)
-    .fault_hints(Arc::new(CliFaultHints))
-    .unconfirmed_escrows(escrows.clone())
-    .build()
-    .await
+    );
+    let builder = match evidence {
+        Some(evidence) => builder.receipt_evidence(evidence),
+        None => builder,
+    };
+    builder
+        .relays(relays.to_vec())
+        .namespace(namespace)
+        .jobs(jobs)
+        .max_lane_streams(max_lane_streams)
+        .max_rate_per_mb(common.max_rate_per_mb)
+        .max_blob_bytes(common.max_blob_mb.saturating_mul(1024 * 1024))
+        .stop(std::io::stderr().is_terminal(), common.give_up_after())
+        .observer(observer)
+        .fault_hints(Arc::new(CliFaultHints))
+        .unconfirmed_escrows(escrows.clone())
+        .build()
+        .await
 }
 
 /// The manifest of the bundle `uri` names, read from `out`'s manifest cache
@@ -878,7 +891,7 @@ pub(crate) async fn fetch_manifest_paid(
         (endpoint, relays),
         uri.namespace,
         (1, usize::from(DEFAULT_MAX_LANE_STREAMS)),
-        observer,
+        (observer, None),
         &escrows,
     )
     .await?;

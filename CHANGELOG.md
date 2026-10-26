@@ -4096,6 +4096,33 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: `decdn get` ends with a pull receipt, and `decdn receipt
+  {verify,settle}` checks and settles it (#2599).** Every `get` that paid
+  prints a receipt block: the hash, the bytes verified and paid, each node
+  and the bytes it was paid for, the USDC and pool, and the start and end
+  times. `--receipt <FILE>` writes the receipt as JSON (`decdn-receipt/1`):
+  per `(pool, signer, provider)` lane, the node's first signed
+  `StreamResponse` for each hash it served and a `proof` of the lane's claim
+  (the voucher that signs its anchor and the deepest revealed chain
+  preimage). The path is checked before the pull pays anything. A run that
+  pays nothing writes no receipt, says so, and removes the file an earlier
+  run left at that path. A pull that fails after paying still gets a receipt,
+  marked incomplete, that lists the started blobs that did not land. A
+  lane's prior watermark moves with every jump to a node's watermark, so a
+  jump never counts as the pull's payment. `decdn receipt verify <FILE>`
+  re-checks every signature offline against the receipt's chain id,
+  `PaymentPool` and `SlashJudge` (and, on a chain the build knows, that those
+  are its contracts; on any other chain it says they are unchecked), and
+  exits non-zero on any fault. `decdn receipt settle <FILE>` verifies the
+  receipt first, then scans `PaymentPool.PoolRedeemed` from an hour before
+  the receipt's start and records, per lane, the redemption that covers its
+  claim or the highest one short of it. The block goes to stderr when stdout
+  carries data (`-o -`) or JSON (`--json`). The SDK side is
+  `decdn_client::receipt` (`ReceiptEvidence`, `PullReceipt`) and
+  `BundlePullerBuilder::receipt_evidence`. What a receipt proves, and that it
+  adds no slashing offense or evidence path, is in
+  `adr/appendix-pull-receipts.md`. The date parser behind it also backs
+  `decdn node earnings --since`, which refuses a signed year (`+202-10-25`).
 - **CLI: `decdn quote <URI>` prices a pull from the nodes' signed probe
   rates, before any paid byte (#2600).** One unpaid `cdn/probe/v1` round
   reaches every node a pull can draw from (the peer store's or the registry's

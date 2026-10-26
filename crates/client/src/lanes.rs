@@ -23,6 +23,7 @@ use crate::buyer_pool::{OwnedPayer, ProgressWrite, WatermarkRow};
 use crate::discovery::{self, NodeCandidate};
 use crate::funding::{LaneKeys, RunFunding, build_ctx_for_fetch};
 use crate::ordered_writes::OrderedWrites;
+use crate::receipt::ReceiptEvidence;
 use crate::session::{ChainConfig, DepositPolicy, FetchMarks, PullSite};
 use crate::{
     Connections, CredentialSlot, Cumulative, LaneHandle, LaneLedgers, PeerSource, PoolContext,
@@ -190,6 +191,9 @@ pub struct LaneDeps<'a, P> {
     /// Where each built lane is reported for a time-to-first-byte log; `None`
     /// reports nothing.
     pub marks: Option<&'a dyn FetchMarks>,
+    /// Where each built lane keeps the signed messages a pull receipt holds;
+    /// `None` keeps nothing.
+    pub evidence: Option<&'a ReceiptEvidence>,
 }
 
 impl<P> std::fmt::Debug for LaneDeps<'_, P> {
@@ -358,6 +362,9 @@ where
     // from zero is rejected as a regression) — from the run registry when
     // `ledgers` is `Some`, else a fresh pair.
     let (ledger, ctx) = lane_ledger(ledgers, lane, ctx);
+    if let Some(evidence) = deps.evidence {
+        evidence.attach(deps.chain, lane, &ledger);
+    }
     // The run's view of the pool's spend counts this lane through its ledger
     // from now on, whether or not the acquire loop ever starts it. A delegated
     // lane draws on a pool this caller does not own, and joins nothing.

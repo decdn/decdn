@@ -59,6 +59,17 @@ pub struct GetArgs {
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
+    /// Write the run's pull receipt to this file as JSON (atomically: temp in
+    /// the same directory, then rename). The receipt holds each node's first
+    /// signed answer for each hash it served, and the voucher each lane's
+    /// claim rests on; `decdn receipt verify <PATH>` re-checks them offline,
+    /// and `decdn receipt settle <PATH>` adds the on-chain redemptions once
+    /// nodes redeem. The path is checked before the pull pays anything. A run
+    /// that paid nothing writes no receipt and removes a file an earlier run
+    /// left at the path.
+    #[arg(long, value_name = "PATH")]
+    pub receipt: Option<PathBuf>,
+
     /// Bundle only: maximum concurrent entry fetches across the whole run
     /// [default: 4]. Each distinct blob is one unit of work holding one slot:
     /// a plain whole-file entry, or a range-dedup entry across its complement

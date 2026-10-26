@@ -473,6 +473,7 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
     let funding = crate::funding::RunFunding::default();
     let deps = LaneDeps {
         marks: None,
+        evidence: None,
         endpoint: &ep,
         store: &store,
         contract: &contract,

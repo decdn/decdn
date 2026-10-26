@@ -256,6 +256,8 @@ pub mod recovery;
 mod scheduler;
 // Docs live in `quote.rs` as `//!`, for the same reason as `sink` below.
 pub mod quote;
+// Docs live in `receipt.rs` as `//!`, for the same reason as `sink` below.
+pub mod receipt;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (ADR 039 § Dynamic segmentation and tail-stealing): no I/O, no async.
 mod segment;
@@ -3244,6 +3246,11 @@ async fn open_progressive_pull_impl(
         if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
             return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
         }
+        // The node accepted at a rate this pull pays: its signed answer is
+        // receipt evidence for the lane (#2599).
+        if let Some(evidence) = ledger.evidence() {
+            evidence.note_response(&resp);
+        }
         let rate_per_mb = resp.body.rate_per_mb;
         // Wire-byte bound (bao-encoded size of the aligned range), not content bytes:
         // the window path forwards this stream verbatim and pays the upstream in wire
@@ -3967,7 +3974,7 @@ async fn send_voucher(
         .issue_stamped(delta_bytes, rate_per_mb, epoch, |next, chain| {
             attempted = Some(next.amount);
             signed_root = chain.chain_root;
-            sign_and_write_voucher(send, ctx, next, chain)
+            sign_and_write_voucher(send, ctx, ledger.evidence(), next, chain)
         })
         .await;
     issued
@@ -4011,9 +4018,16 @@ impl std::error::Error for UnconfirmedVoucher {}
 /// Sign one voucher over `next`/`chain` with the pool context's key and write it
 /// to `send` — the body both [`send_voucher`] and [`PoolLedger::reanchor`] hand to
 /// the ledger, so the two differ only in which cumulative the ledger hands back.
+///
+/// The signed voucher goes into the lane's receipt `evidence` before the write:
+/// a voucher whose write fails can still become the lane's anchor once a
+/// `StreamEnd` confirms it, and the receipt keeps only the voucher that signs
+/// the anchor the ledger ends on
+/// (`receipt::tests::an_unsent_voucher_proves_only_once_a_stream_end_confirms_it`).
 async fn sign_and_write_voucher(
     send: &mut SendStream,
     ctx: &PoolContext,
+    evidence: Option<&receipt::LaneEvidence>,
     next: Cumulative,
     chain: ChainCommit,
 ) -> anyhow::Result<()> {
@@ -4030,6 +4044,9 @@ async fn sign_and_write_voucher(
     .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}").context(LocalPullFault))?;
     let wire_voucher = signed_to_wire_voucher(&signed)
         .map_err(|e| anyhow::anyhow!("voucher exceeds wire width: {e}").context(LocalPullFault))?;
+    if let Some(evidence) = evidence {
+        evidence.note_voucher(&wire_voucher);
+    }
     write_message(send, &ClientMessage::Voucher(wire_voucher)).await
 }
 
@@ -4105,7 +4122,9 @@ impl StreamMeter {
             // and storing a stale root would leave this stream re-anchoring on
             // every chunk.
             self.anchored_root = ledger
-                .reanchor(|anchor, chain| sign_and_write_voucher(send, ctx, anchor, chain))
+                .reanchor(|anchor, chain| {
+                    sign_and_write_voucher(send, ctx, ledger.evidence(), anchor, chain)
+                })
                 .await?;
         }
         Ok(())

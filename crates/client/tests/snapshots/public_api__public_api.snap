@@ -54,6 +54,7 @@ pub const fn decdn_client::bundle::BundlePullerBuilder::max_lane_streams(self, u
 pub const fn decdn_client::bundle::BundlePullerBuilder::max_rate_per_mb(self, u64) -> Self
 pub const fn decdn_client::bundle::BundlePullerBuilder::namespace(self, core::option::Option<u64>) -> Self
 pub fn decdn_client::bundle::BundlePullerBuilder::observer(self, alloc::sync::Arc<dyn decdn_client::bundle::BundleObserver>) -> Self
+pub fn decdn_client::bundle::BundlePullerBuilder::receipt_evidence(self, alloc::sync::Arc<decdn_client::receipt::ReceiptEvidence>) -> Self
 pub fn decdn_client::bundle::BundlePullerBuilder::relays(self, alloc::vec::Vec<iroh_base::relay_url::RelayUrl>) -> Self
 pub const fn decdn_client::bundle::BundlePullerBuilder::stop(self, bool, core::option::Option<core::time::Duration>) -> Self
 pub fn decdn_client::bundle::BundlePullerBuilder::unconfirmed_escrows(self, decdn_client::buyer_pool::UnconfirmedEscrows) -> Self
@@ -390,6 +391,141 @@ pub const decdn_client::quote::CENSUS_ENTRY_SAMPLE: usize
 pub async fn decdn_client::quote::census(&iroh::endpoint::Endpoint, (&decdn_client::session::ChainConfig, &decdn_client::session::PullSite), &[iroh_base::relay_url::RelayUrl], &decdn_client::session::DiscoveryOptions, &[[u8; 32]]) -> anyhow::Result<decdn_client::quote::Census>
 pub fn decdn_client::quote::price(&[decdn_client::quote::PricedBlob], u64, usize) -> core::option::Option<decdn_client::quote::PriceRange>
 pub fn decdn_client::quote::wire_bytes(u64) -> anyhow::Result<u64>
+pub mod decdn_client::receipt
+pub enum decdn_client::receipt::ContentKind
+pub decdn_client::receipt::ContentKind::Blob
+pub decdn_client::receipt::ContentKind::Bundle
+#[non_exhaustive] pub enum decdn_client::receipt::ReceiptFault
+pub decdn_client::receipt::ReceiptFault::Claim
+pub decdn_client::receipt::ReceiptFault::Claim::proved: core::option::Option<decdn_client::receipt::ReceiptAmount>
+pub decdn_client::receipt::ReceiptFault::Claim::provider: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptFault::Claim::stated: decdn_client::receipt::ReceiptAmount
+pub decdn_client::receipt::ReceiptFault::ClaimBelowPrior
+pub decdn_client::receipt::ReceiptFault::ClaimBelowPrior::provider: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptFault::EntrySize
+pub decdn_client::receipt::ReceiptFault::EntrySize::hash: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptFault::EntrySize::signed: u64
+pub decdn_client::receipt::ReceiptFault::EntrySize::stated: u64
+pub decdn_client::receipt::ReceiptFault::ResponseHash
+pub decdn_client::receipt::ReceiptFault::ResponseHash::hash: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptFault::ResponseHash::provider: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptFault::ResponseMalformed
+pub decdn_client::receipt::ReceiptFault::ResponseMalformed::hash: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptFault::ResponseMalformed::provider: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptFault::ResponseMalformed::reason: alloc::string::String
+pub decdn_client::receipt::ReceiptFault::ResponsePool
+pub decdn_client::receipt::ReceiptFault::ResponsePool::hash: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptFault::ResponsePool::provider: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptFault::ResponseRefused
+pub decdn_client::receipt::ReceiptFault::ResponseRefused::hash: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptFault::ResponseRefused::provider: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptFault::ResponseSignature
+pub decdn_client::receipt::ReceiptFault::ResponseSignature::hash: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptFault::ResponseSignature::provider: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptFault::Reveal
+pub decdn_client::receipt::ReceiptFault::Reveal::provider: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptFault::Unlanded
+pub decdn_client::receipt::ReceiptFault::Unlanded::hash: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptFault::VoucherMalformed
+pub decdn_client::receipt::ReceiptFault::VoucherMalformed::provider: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptFault::VoucherMalformed::reason: alloc::string::String
+pub decdn_client::receipt::ReceiptFault::VoucherSignature
+pub decdn_client::receipt::ReceiptFault::VoucherSignature::provider: alloy_primitives::bits::address::Address
+impl core::fmt::Display for decdn_client::receipt::ReceiptFault
+pub fn decdn_client::receipt::ReceiptFault::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum decdn_client::receipt::ReceiptFormat
+pub decdn_client::receipt::ReceiptFormat::V1
+pub struct decdn_client::receipt::PullReceipt
+pub decdn_client::receipt::PullReceipt::chain: decdn_client::receipt::ReceiptChain
+pub decdn_client::receipt::PullReceipt::content: decdn_client::receipt::ReceiptContent
+pub decdn_client::receipt::PullReceipt::format: decdn_client::receipt::ReceiptFormat
+pub decdn_client::receipt::PullReceipt::lanes: alloc::vec::Vec<decdn_client::receipt::ReceiptLane>
+pub decdn_client::receipt::PullReceipt::window: decdn_client::receipt::ReceiptWindow
+impl decdn_client::receipt::PullReceipt
+pub const fn decdn_client::receipt::PullReceipt::new(decdn_client::receipt::ReceiptChain, decdn_client::receipt::ReceiptContent, decdn_client::receipt::ReceiptWindow, alloc::vec::Vec<decdn_client::receipt::ReceiptLane>) -> Self
+pub fn decdn_client::receipt::PullReceipt::summary(&self) -> decdn_client::receipt::ReceiptSummary
+pub fn decdn_client::receipt::PullReceipt::verify(&self) -> alloc::vec::Vec<decdn_client::receipt::ReceiptFault>
+pub struct decdn_client::receipt::ReceiptAmount
+pub decdn_client::receipt::ReceiptAmount::amount: u64
+pub decdn_client::receipt::ReceiptAmount::bytes: u64
+impl core::convert::TryFrom<decdn_client::Cumulative> for decdn_client::receipt::ReceiptAmount
+pub type decdn_client::receipt::ReceiptAmount::Error = ruint::from::FromUintError<u64>
+pub fn decdn_client::receipt::ReceiptAmount::try_from(decdn_client::Cumulative) -> core::result::Result<Self, Self::Error>
+pub struct decdn_client::receipt::ReceiptChain
+pub decdn_client::receipt::ReceiptChain::chain_id: u64
+pub decdn_client::receipt::ReceiptChain::payment_pool: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptChain::slash_judge: alloy_primitives::bits::address::Address
+pub struct decdn_client::receipt::ReceiptContent
+pub decdn_client::receipt::ReceiptContent::complete: bool
+pub decdn_client::receipt::ReceiptContent::entries: alloc::vec::Vec<decdn_client::receipt::ReceiptEntry>
+pub decdn_client::receipt::ReceiptContent::hash: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptContent::kind: decdn_client::receipt::ContentKind
+pub decdn_client::receipt::ReceiptContent::namespace: core::option::Option<u64>
+pub decdn_client::receipt::ReceiptContent::unlanded: alloc::vec::Vec<alloy_primitives::aliases::B256>
+pub struct decdn_client::receipt::ReceiptEntry
+pub decdn_client::receipt::ReceiptEntry::hash: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptEntry::size: u64
+pub struct decdn_client::receipt::ReceiptEvidence
+impl decdn_client::receipt::ReceiptEvidence
+pub async fn decdn_client::receipt::ReceiptEvidence::lanes(&self) -> alloc::vec::Vec<decdn_client::receipt::ReceiptLane>
+pub fn decdn_client::receipt::ReceiptEvidence::new() -> Self
+pub fn decdn_client::receipt::ReceiptEvidence::note_landed(&self, [u8; 32], u64)
+pub async fn decdn_client::receipt::ReceiptEvidence::receipt(&self, [u8; 32], decdn_client::receipt::ContentKind, core::option::Option<u64>, bool, decdn_client::receipt::ReceiptWindow) -> core::option::Option<decdn_client::receipt::PullReceipt>
+pub struct decdn_client::receipt::ReceiptLane
+pub decdn_client::receipt::ReceiptLane::pool_id: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptLane::prior: decdn_client::receipt::ReceiptAmount
+pub decdn_client::receipt::ReceiptLane::proof: core::option::Option<decdn_client::receipt::ReceiptProof>
+pub decdn_client::receipt::ReceiptLane::provider: alloy_primitives::bits::address::Address
+pub decdn_client::receipt::ReceiptLane::responses: alloc::vec::Vec<decdn_client::receipt::ReceiptResponse>
+pub decdn_client::receipt::ReceiptLane::settlement: core::option::Option<decdn_client::receipt::ReceiptSettlement>
+pub decdn_client::receipt::ReceiptLane::signer: alloy_primitives::bits::address::Address
+impl decdn_client::receipt::ReceiptLane
+pub const fn decdn_client::receipt::ReceiptLane::is_settled(&self) -> bool
+pub const fn decdn_client::receipt::ReceiptLane::key(&self) -> decdn_incentive::lane::LaneKey
+pub fn decdn_client::receipt::ReceiptLane::paid(&self) -> decdn_client::receipt::ReceiptAmount
+pub struct decdn_client::receipt::ReceiptProof
+pub decdn_client::receipt::ReceiptProof::claim: decdn_client::receipt::ReceiptAmount
+pub decdn_client::receipt::ReceiptProof::reveal: core::option::Option<decdn_client::receipt::ReceiptReveal>
+pub decdn_client::receipt::ReceiptProof::voucher: decdn_client::receipt::ReceiptVoucher
+pub struct decdn_client::receipt::ReceiptResponse
+pub decdn_client::receipt::ReceiptResponse::hash: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptResponse::ok: bool
+pub decdn_client::receipt::ReceiptResponse::pool_id: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptResponse::rate_per_mb: u64
+pub decdn_client::receipt::ReceiptResponse::slash_sig: alloy_primitives::bytes_::Bytes
+pub decdn_client::receipt::ReceiptResponse::timestamp_us: u64
+pub decdn_client::receipt::ReceiptResponse::total_bytes: u64
+impl core::convert::From<&decdn_protocol::client::StreamResponse> for decdn_client::receipt::ReceiptResponse
+pub fn decdn_client::receipt::ReceiptResponse::from(&decdn_protocol::client::StreamResponse) -> Self
+pub struct decdn_client::receipt::ReceiptReveal
+pub decdn_client::receipt::ReceiptReveal::index: u8
+pub decdn_client::receipt::ReceiptReveal::preimage: alloy_primitives::aliases::B256
+pub struct decdn_client::receipt::ReceiptSettlement
+pub decdn_client::receipt::ReceiptSettlement::block: u64
+pub decdn_client::receipt::ReceiptSettlement::new_paid_cumulative: u64
+pub decdn_client::receipt::ReceiptSettlement::tx_hash: alloy_primitives::aliases::B256
+pub struct decdn_client::receipt::ReceiptSummary
+pub decdn_client::receipt::ReceiptSummary::landed_bytes: u64
+pub decdn_client::receipt::ReceiptSummary::node_signatures: usize
+pub decdn_client::receipt::ReceiptSummary::paid: decdn_client::receipt::ReceiptAmount
+pub decdn_client::receipt::ReceiptSummary::payer_signatures: usize
+pub decdn_client::receipt::ReceiptSummary::per_provider: alloc::vec::Vec<(alloy_primitives::bits::address::Address, decdn_client::receipt::ReceiptAmount)>
+pub decdn_client::receipt::ReceiptSummary::pools: alloc::vec::Vec<alloy_primitives::aliases::B256>
+pub decdn_client::receipt::ReceiptSummary::settled_lanes: usize
+pub decdn_client::receipt::ReceiptSummary::unproved_lanes: usize
+pub struct decdn_client::receipt::ReceiptVoucher
+pub decdn_client::receipt::ReceiptVoucher::amount: u64
+pub decdn_client::receipt::ReceiptVoucher::bytes_delivered: u64
+pub decdn_client::receipt::ReceiptVoucher::chain_root: alloy_primitives::aliases::B256
+pub decdn_client::receipt::ReceiptVoucher::chunk_price: u64
+pub decdn_client::receipt::ReceiptVoucher::signature: alloy_primitives::bytes_::Bytes
+impl decdn_client::receipt::ReceiptVoucher
+pub fn decdn_client::receipt::ReceiptVoucher::claim(&self, u8) -> core::option::Option<decdn_client::receipt::ReceiptAmount>
+impl core::convert::From<&decdn_protocol::client::Voucher> for decdn_client::receipt::ReceiptVoucher
+pub fn decdn_client::receipt::ReceiptVoucher::from(&decdn_protocol::client::Voucher) -> Self
+pub struct decdn_client::receipt::ReceiptWindow
+pub decdn_client::receipt::ReceiptWindow::finished: alloc::string::String
+pub decdn_client::receipt::ReceiptWindow::started: alloc::string::String
 pub mod decdn_client::recovery
 pub struct decdn_client::recovery::RecoveryGate
 impl decdn_client::recovery::RecoveryGate
@@ -679,6 +815,9 @@ pub decdn_client::Cumulative::amount: alloy_primitives::aliases::U256
 pub decdn_client::Cumulative::bytes: alloy_primitives::aliases::U256
 impl core::convert::From<&decdn_protocol::client::WatermarkBundle> for decdn_client::Cumulative
 pub fn decdn_client::Cumulative::from(&decdn_protocol::client::WatermarkBundle) -> Self
+impl core::convert::TryFrom<decdn_client::Cumulative> for decdn_client::receipt::ReceiptAmount
+pub type decdn_client::receipt::ReceiptAmount::Error = ruint::from::FromUintError<u64>
+pub fn decdn_client::receipt::ReceiptAmount::try_from(decdn_client::Cumulative) -> core::result::Result<Self, Self::Error>
 pub struct decdn_client::DownloadTarget<'a>
 pub decdn_client::DownloadTarget::dest: &'a std::path::Path
 pub decdn_client::DownloadTarget::hash: [u8; 32]

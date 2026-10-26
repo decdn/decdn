@@ -225,6 +225,7 @@ async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()
     let entry_deps = || -> anyhow::Result<LaneDeps<'_, _>> {
         Ok(LaneDeps {
             marks: None,
+            evidence: None,
             endpoint: &ep,
             store: &store,
             contract: &contract,
@@ -679,6 +680,7 @@ async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result
     let funding = RunFunding::default();
     let deps = LaneDeps {
         marks: None,
+        evidence: None,
         endpoint: &ep,
         store: &store,
         contract: &contract,
