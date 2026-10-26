@@ -1810,6 +1810,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bao-tree"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50d0e17303b78c9bb240014f3f401ecae5c0460438ace49a171e5f97e3ae57ba"
+dependencies = [
+ "blake3",
+ "bytes",
+ "futures-lite",
+ "genawaiter",
+ "iroh-io",
+ "positioned-io",
+ "range-collections",
+ "self_cell",
+ "serde",
+ "smallvec",
+]
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2833,7 +2851,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 name = "decdn-bao-range"
 version = "0.2.0"
 dependencies = [
- "bao-tree",
+ "bao-tree 0.17.0",
  "bytes",
  "positioned-io",
  "thiserror 2.0.21",
@@ -2853,7 +2871,7 @@ dependencies = [
  "aws-smithy-mocks",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
- "bao-tree",
+ "bao-tree 0.17.0",
  "bytes",
  "chacha20poly1305",
  "dashmap",
@@ -2944,7 +2962,7 @@ dependencies = [
  "alloy",
  "alloy-json-rpc",
  "anyhow",
- "bao-tree",
+ "bao-tree 0.17.0",
  "blake3",
  "bytes",
  "cap-std",
@@ -3008,7 +3026,7 @@ version = "0.2.0"
 dependencies = [
  "alloy",
  "anyhow",
- "bao-tree",
+ "bao-tree 0.17.0",
  "blake3",
  "decdn-bao-range",
  "decdn-cache",
@@ -3072,7 +3090,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
- "bao-tree",
+ "bao-tree 0.17.0",
  "bytes",
  "clap",
  "crossbeam-queue",
@@ -4697,7 +4715,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3148ad01585eb6b7cfb641e4100564f4f56db644f4cbed8c10ab2478663161f"
 dependencies = [
  "arrayvec",
- "bao-tree",
+ "bao-tree 0.16.1",
  "bytes",
  "cfg_aliases",
  "chrono",

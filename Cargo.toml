@@ -109,7 +109,7 @@ noq-proto = { version = "1", default-features = false }
 # encoding the cache produces is byte-identical to what `import_bao_bytes`
 # consumes — ADR 038 treats this codec as part of the protocol contract, so the
 # pin is deliberate. `positioned-io` is bao-tree's `ReadAt` data-source trait.
-bao-tree = "0.16"
+bao-tree = "0.17"
 positioned-io = "0.3"
 # `AsyncStreamReader` — the reader trait `bao-tree`'s INCREMENTAL decoder
 # (`io::fsm::ResponseDecoder`, behind its `tokio_fsm` feature) drives. Needed
