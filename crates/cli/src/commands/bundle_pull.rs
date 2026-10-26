@@ -251,6 +251,28 @@ impl EntryFilter {
 ///
 /// When an entry path of `manifest` under `out` holds a file, directory or
 /// link that [`decdn_client::bundle::foreign_paths`] names.
+/// Refuse a `--receipt` path that an entry of `manifest` lands at: the
+/// receipt would replace the entry, and a run that paid nothing would remove
+/// it. Checked once the manifest names the entries, before any entry is
+/// fetched.
+fn refuse_receipt_collision(
+    args: &GetArgs,
+    out: &Path,
+    manifest: &BundleManifest,
+) -> anyhow::Result<()> {
+    let Some(receipt) = &args.receipt else {
+        return Ok(());
+    };
+    for entry in &manifest.entries {
+        super::receipt::refuse_collision(
+            receipt,
+            &out.join(&entry.path),
+            &format!("entry {:?} lands", entry.path),
+        )?;
+    }
+    Ok(())
+}
+
 fn refuse_foreign(args: &GetArgs, out: &Path, manifest: &BundleManifest) -> anyhow::Result<()> {
     if args.output.is_some() || args.overwrite {
         return Ok(());
@@ -937,6 +959,7 @@ async fn pull_manifest(
         let kept = maybe_select(args, out, uri, kept)?;
         if let Some(Kept { manifest, .. }) = &kept {
             refuse_foreign(args, out, manifest)?;
+            refuse_receipt_collision(args, out, manifest)?;
         }
         anyhow::Ok(kept)
     }

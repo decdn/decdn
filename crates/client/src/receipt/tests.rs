@@ -510,18 +510,20 @@ async fn an_unconfirmed_rollover_claims_only_the_old_anchor() {
 async fn two_ledgers_on_one_lane_merge() {
     let keys = Keys::new();
     let collector = ReceiptEvidence::new();
-    let (low, high) = (
-        Arc::new(PoolLedger::new(cumulative(10, 10))),
-        Arc::new(PoolLedger::new(cumulative(50, 50))),
-    );
-    collector.attach(&chain_config(), keys.key(), &low);
-    collector.attach(&chain_config(), keys.key(), &high);
-    low.attach_evidence()
+    // The manifest fetch's ledger, then the entry fetch's, seeded from the
+    // watermark the first one persisted.
+    let first = Arc::new(PoolLedger::new(cumulative(10, 10)));
+    collector.attach(&chain_config(), keys.key(), &first);
+    first
+        .attach_evidence()
         .note_response(&keys.response(B256::repeat_byte(1), 1));
-    high.attach_evidence()
+    let mid = issue(&first, &keys, CHUNK_BYTES, EpochAction::Keep).await;
+    let second = Arc::new(PoolLedger::new(mid));
+    collector.attach(&chain_config(), keys.key(), &second);
+    second
+        .attach_evidence()
         .note_response(&keys.response(B256::repeat_byte(2), 2));
-    issue(&low, &keys, CHUNK_BYTES, EpochAction::Keep).await;
-    let top = issue(&high, &keys, CHUNK_BYTES, EpochAction::Keep).await;
+    let top = issue(&second, &keys, CHUNK_BYTES, EpochAction::Keep).await;
     let lane = only_lane(&collector).await;
     assert_eq!(proof(&lane).claim, ReceiptAmount::try_from(top).unwrap());
     assert_eq!(
@@ -531,7 +533,31 @@ async fn two_ledgers_on_one_lane_merge() {
             bytes: 10
         }
     );
+    assert_eq!(lane.paid().amount, 2 * RATE);
     assert_eq!(lane.responses.len(), 2);
+}
+
+#[tokio::test]
+async fn a_merge_does_not_count_the_second_ledgers_reseed() {
+    let keys = Keys::new();
+    let collector = ReceiptEvidence::new();
+    let first = Arc::new(PoolLedger::new(Cumulative::default()));
+    collector.attach(&chain_config(), keys.key(), &first);
+    let mid = issue(&first, &keys, CHUNK_BYTES, EpochAction::Keep).await;
+    let second = Arc::new(PoolLedger::new(mid));
+    collector.attach(&chain_config(), keys.key(), &second);
+    assert!(second.reseed(cumulative(10_000, 20 * CHUNK_BYTES)));
+    issue(&second, &keys, CHUNK_BYTES, EpochAction::Keep).await;
+    let lane = only_lane(&collector).await;
+    assert_eq!(
+        lane.paid(),
+        ReceiptAmount {
+            amount: 2 * RATE,
+            bytes: 2 * CHUNK_BYTES,
+        },
+        "the jump to 10 000 is the node's watermark, not this pull's payment"
+    );
+    assert_eq!(receipt_of(vec![lane], B256::ZERO, 0).verify(), Vec::new());
 }
 
 #[test]
@@ -795,6 +821,24 @@ async fn an_incomplete_receipt_lists_what_did_not_land_and_verifies() {
         complete.verify(),
         vec![ReceiptFault::Unlanded { hash: started }]
     );
+}
+
+#[tokio::test]
+async fn an_interrupted_blob_pull_lists_its_blob_as_unlanded() {
+    let keys = Keys::new();
+    let (collector, ledger) = collected(&keys, Cumulative::default());
+    let hash = B256::repeat_byte(0x44);
+    ledger
+        .attach_evidence()
+        .note_response(&keys.response(hash, 4 * CHUNK_BYTES));
+    issue(&ledger, &keys, CHUNK_BYTES, EpochAction::Keep).await;
+    let receipt = collector
+        .receipt(hash.into(), ContentKind::Blob, None, false, window())
+        .await
+        .unwrap();
+    assert!(receipt.content.entries.is_empty());
+    assert_eq!(receipt.content.unlanded, vec![hash]);
+    assert_eq!(receipt.verify(), Vec::new());
 }
 
 #[tokio::test]

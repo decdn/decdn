@@ -243,9 +243,24 @@ fn a_run_that_paid_nothing_writes_no_receipt_and_removes_a_stale_one() {
     finish_with(None, Some(&path), Ok(()), &mut out).unwrap();
     assert!(out.is_empty(), "no block");
     assert!(!path.exists(), "the stale receipt is removed");
-    // The pull's own error passes through unchanged.
-    let err = finish_with(None, None, Err(anyhow::anyhow!("boom")), &mut out).unwrap_err();
+    // The pull's own error passes through unchanged, and a failed run leaves
+    // the file alone.
+    std::fs::write(&path, "an earlier run's receipt").unwrap();
+    let err = finish_with(None, Some(&path), Err(anyhow::anyhow!("boom")), &mut out).unwrap_err();
     assert_eq!(err.to_string(), "boom");
+    assert!(path.exists(), "a failed run removes nothing");
+}
+
+#[test]
+fn a_receipt_may_not_name_the_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("blob.bin");
+    assert!(refuse_collision(&blob, &blob, "the blob lands").is_err());
+    std::fs::write(&blob, b"x").unwrap();
+    let dotted = dir.path().join(".").join("blob.bin");
+    let err = refuse_collision(&dotted, &blob, "the blob lands").unwrap_err();
+    assert!(err.to_string().contains("is where the blob lands"), "{err}");
+    refuse_collision(&dir.path().join("r.json"), &blob, "the blob lands").unwrap();
 }
 
 #[test]
@@ -420,14 +435,31 @@ fn the_first_covering_redemption_settles_a_lane() {
     );
     assert_eq!(receipt.summary().settled_lanes, 1);
 
-    // A later scan that finds the rest settles the partial lane and keeps the
-    // settled one.
+    // A rescan rebuilds every settlement from the events it read: one it no
+    // longer sees (a reorganization, or a hand-written one) is gone.
     apply_redemptions(&mut receipt, &[redemption(20, PROVIDER_B, SIGNER, 98_000)]);
-    assert_eq!(receipt.summary().settled_lanes, 2);
+    assert_eq!(receipt.summary().settled_lanes, 1);
+    assert_eq!(settlement_of(&receipt, PROVIDER_A), None);
     assert_eq!(
-        settlement_of(&receipt, PROVIDER_A).map(|s| s.block),
-        Some(14)
+        settlement_of(&receipt, PROVIDER_B).map(|s| s.block),
+        Some(20)
     );
+}
+
+#[test]
+fn a_settlement_the_scan_does_not_find_is_dropped() {
+    let mut receipt = bundle_receipt(31_337);
+    if let Some(lane) = receipt.lanes.first_mut() {
+        lane.settlement = Some(ReceiptSettlement {
+            tx_hash: B256::repeat_byte(0xee),
+            block: 99,
+            new_paid_cumulative: u64::MAX,
+        });
+    }
+    assert_eq!(receipt.summary().settled_lanes, 1);
+    apply_redemptions(&mut receipt, &[]);
+    assert_eq!(receipt.summary().settled_lanes, 0);
+    assert!(receipt.lanes.iter().all(|l| l.settlement.is_none()));
 }
 
 #[test]

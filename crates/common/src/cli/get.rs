@@ -64,9 +64,10 @@ pub struct GetArgs {
     /// signed answer for each hash it served, and the voucher each lane's
     /// claim rests on; `decdn receipt verify <PATH>` re-checks them offline,
     /// and `decdn receipt settle <PATH>` adds the on-chain redemptions once
-    /// nodes redeem. The path is checked before the pull pays anything. A run
-    /// that paid nothing writes no receipt and removes a file an earlier run
-    /// left at the path.
+    /// nodes redeem. The path is checked before the pull pays anything, and
+    /// may not name the blob's destination or a bundle entry's. A run that
+    /// succeeds without paying writes no receipt and removes a file an earlier
+    /// run left at the path; a failed run and a `--dry-run` leave it alone.
     #[arg(long, value_name = "PATH")]
     pub receipt: Option<PathBuf>,
 

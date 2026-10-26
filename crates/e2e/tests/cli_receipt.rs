@@ -235,6 +235,35 @@ async fn run() -> anyhow::Result<()> {
     )
     .await?;
 
+    // ---- A dry run previews and writes nothing: the receipt stays.
+    let mut dry = args.clone();
+    dry.push("--dry-run".into());
+    run_ok(home, "get", &dry).await?;
+    anyhow::ensure!(
+        load(&bundle_receipt)? == bundle,
+        "a dry run must leave the receipt as it is"
+    );
+
+    // ---- A receipt path an entry lands at is refused before any entry is
+    // fetched, and the entry stays.
+    let entry_path = home.join("bundle").join("a.bin");
+    let mut colliding = args.clone();
+    let at = colliding
+        .iter()
+        .position(|a| a == "--receipt")
+        .context("no --receipt")?;
+    colliding[at + 1] = entry_path.display().to_string();
+    let output = spawn(home, "get", &colliding).await?;
+    let stderr = text(&output.stderr)?;
+    anyhow::ensure!(
+        !output.status.success() && stderr.contains("is where entry"),
+        "a receipt over an entry must be refused; stderr:\n{stderr}"
+    );
+    anyhow::ensure!(
+        std::fs::read(&entry_path)? == entry_a,
+        "the refused run left the entry alone"
+    );
+
     // ---- A repeat of the bundle pull pays nothing: no receipt, and the
     // earlier file is gone so nothing verifies it by mistake.
     let output = run_until_ok(home, "get", &args).await?;
@@ -242,6 +271,26 @@ async fn run() -> anyhow::Result<()> {
     anyhow::ensure!(
         !bundle_receipt.exists() && stderr.contains("no receipt: this run paid nothing"),
         "a run that paid nothing must say so and remove the earlier receipt; stderr:\n{stderr}"
+    );
+
+    // ---- A receipt path that names the blob's own destination is refused
+    // before anything is paid.
+    let mut colliding = vec![
+        format!("decdn:{}", hash.to_hex()),
+        "-o".into(),
+        home.join("blob.bin").display().to_string(),
+        "--receipt".into(),
+        home.join(".").join("blob.bin").display().to_string(),
+    ];
+    colliding.extend(chain_args(&chain, &node, home, &keystore));
+    let output = spawn(home, "get", &colliding).await?;
+    anyhow::ensure!(
+        !output.status.success() && text(&output.stderr)?.contains("is where the blob lands"),
+        "a receipt over the blob must be refused"
+    );
+    anyhow::ensure!(
+        std::fs::read(home.join("blob.bin"))? == blob,
+        "the refused run left the blob alone"
     );
 
     // ---- `-o -`: stdout carries exactly the bytes; the block goes to stderr.

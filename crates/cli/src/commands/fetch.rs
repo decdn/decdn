@@ -1273,16 +1273,16 @@ pub(crate) async fn fetch_on(
                 )
                 .await
             };
-            // A whole blob that landed verified against its hash, whose
-            // length the hash commits to, is a receipt entry; a byte window is
-            // not the blob.
-            if landed.is_ok()
+            // A whole blob that landed verified against its hash is a receipt
+            // entry, at the length it verified to (the first claim is only a
+            // hint); a byte window is not the blob.
+            if let Ok(verified) = landed
                 && args.range.is_none()
                 && let Some(evidence) = &payer.evidence
             {
-                evidence.note_landed(hash, total_bytes);
+                evidence.note_landed(hash, verified);
             }
-            landed
+            landed.map(drop)
         }
         .await;
         on_drop.disarm();
@@ -1513,6 +1513,7 @@ where
 /// `max_sources` is the front lane cap. For stdout, progress draws on stderr,
 /// only when stderr is a terminal; stdout carries nothing but the verified
 /// bytes. The caller persists each lane's voucher watermark after the stream.
+/// Returns the verified bytes streamed.
 #[allow(clippy::too_many_arguments)]
 async fn stream_out<P>(
     deps: &LaneDeps<'_, P>,
@@ -1529,7 +1530,7 @@ async fn stream_out<P>(
         &FetchTimings,
     ),
     sink: &mut Sink,
-) -> anyhow::Result<()>
+) -> anyhow::Result<u64>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -1622,7 +1623,7 @@ where
     // as it fails a fetch to a file.
     drive.finish().await?;
     tracing::info!("streamed {copied} verified bytes");
-    Ok(())
+    Ok(copied)
 }
 
 /// The error a failed stdout stream ends with: the fetch's own typed error when
@@ -1638,7 +1639,8 @@ fn stream_error(read_err: anyhow::Error, fetch_err: Option<anyhow::Error>) -> an
 /// holder discovery adds later can take a free lane), and print the summary
 /// line. The `.partial` beside `output` stays in place on a failure for a
 /// later resume. The caller persists each lane's voucher watermark after the
-/// fetch.
+/// fetch. Returns the size of the finished file, which the verified bytes
+/// prove.
 async fn download_to_file<P>(
     deps: &LaneDeps<'_, P>,
     sources: &LaneSources<'_, P>,
@@ -1647,7 +1649,7 @@ async fn download_to_file<P>(
     target: DownloadTarget<'_>,
     stop: &StopPolicy,
     (max_sources, timings): (usize, &FetchTimings),
-) -> anyhow::Result<()>
+) -> anyhow::Result<u64>
 where
     P: alloy::providers::Provider + Clone,
 {
@@ -1677,7 +1679,7 @@ where
         .await
         .map_or(target.total_bytes, |m| m.len());
     print_fetch_summary(proven, &meter, target.dest);
-    Ok(())
+    Ok(proven)
 }
 
 /// Whether `--output` names the stdout stream rather than a file. Exactly a

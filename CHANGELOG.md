@@ -4104,9 +4104,10 @@ since project inception and will roll into the first tagged release.
   per `(pool, signer, provider)` lane, the node's first signed
   `StreamResponse` for each hash it served and a `proof` of the lane's claim
   (the voucher that signs its anchor and the deepest revealed chain
-  preimage). The path is checked before the pull pays anything. A run that
-  pays nothing writes no receipt, says so, and removes the file an earlier
-  run left at that path. A pull that fails after paying still gets a receipt,
+  preimage). The path is checked before the pull pays anything, and may not
+  name the blob's destination or a bundle entry's. A run that succeeds
+  without paying writes no receipt, says so, and removes the file an earlier
+  run left at that path; a failed run and a `--dry-run` leave it alone. A pull that fails after paying still gets a receipt,
   marked incomplete, that lists the started blobs that did not land. A
   lane's prior watermark moves with every jump to a node's watermark, so a
   jump never counts as the pull's payment. `decdn receipt verify <FILE>`
@@ -4115,8 +4116,9 @@ since project inception and will roll into the first tagged release.
   are its contracts; on any other chain it says they are unchecked), and
   exits non-zero on any fault. `decdn receipt settle <FILE>` verifies the
   receipt first, then scans `PaymentPool.PoolRedeemed` from an hour before
-  the receipt's start and records, per lane, the redemption that covers its
-  claim or the highest one short of it. The block goes to stderr when stdout
+  the receipt's start and rebuilds each lane's settlement from the events it
+  reads: the redemption that covers its claim, or the highest one short of
+  it. The block goes to stderr when stdout
   carries data (`-o -`) or JSON (`--json`). The SDK side is
   `decdn_client::receipt` (`ReceiptEvidence`, `PullReceipt`) and
   `BundlePullerBuilder::receipt_evidence`. What a receipt proves, and that it

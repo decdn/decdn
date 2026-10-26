@@ -56,8 +56,14 @@ pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<(
     if args.dry_run && uri.target == UriTarget::Blob {
         return super::quote::dry_run_blob(args, &dest.path, &uri, config_path).await;
     }
-    if let Some(path) = &args.receipt {
+    // A dry run pays nothing and writes nothing: no receipt either way, and a
+    // file at `--receipt` stays as it is.
+    let receipt = args.receipt.as_deref().filter(|_| !args.dry_run);
+    if let Some(path) = receipt {
         super::receipt::check_receipt_path(path)?;
+        if streams_one_blob(args, &uri) && !is_stdout(args) {
+            super::receipt::refuse_collision(path, &dest.path, "the blob lands")?;
+        }
     }
     let started = super::receipt::unix_now();
     let evidence = Arc::new(ReceiptEvidence::new());
@@ -66,7 +72,11 @@ pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<(
     } else {
         super::bundle_pull::bundle_pull(args, &dest, &uri, config_path, &evidence).await
     };
-    let result = super::receipt::finish_get(args, &uri, &evidence, started, result).await;
+    let result = if args.dry_run {
+        result
+    } else {
+        super::receipt::finish_get(args, &uri, &evidence, started, result).await
+    };
     with_resume_hint(args, result)
 }
 

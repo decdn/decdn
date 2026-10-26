@@ -75,7 +75,8 @@ node's and the payer's, and the receipt already holds them.
 
 `verify` does not check the settlement. A reader checks it against the chain.
 `decdn receipt settle` reads the chain only for a receipt that passes these
-checks.
+checks. Each run of `settle` replaces every settlement with the events that
+it reads, so a settlement that the chain does not show stays out.
 
 ## What a Receipt Proves
 

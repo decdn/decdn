@@ -189,8 +189,8 @@ impl ReceiptEvidence {
     ///
     /// A lane that paid but kept no voucher signing its anchor (the voucher
     /// left the kept history) appears with no proof. Two ledgers on one lane
-    /// key merge: the higher claim wins, the lower prior stays, and the
-    /// responses join.
+    /// key merge: the higher claim's proof wins, the responses join, and the
+    /// merged lane pays the sum of what each ledger paid itself.
     pub async fn lanes(&self) -> Vec<ReceiptLane> {
         let collected = self
             .lanes
@@ -240,7 +240,7 @@ impl ReceiptEvidence {
 
     /// The receipt of a pull of `hash` that ran over `window`: every lane that
     /// paid, every blob [`Self::note_landed`] recorded, and as `unlanded` every
-    /// other hash a node accepted. `None` when no lane was built, so nothing
+    /// hash a node accepted that did not land, the requested one included. `None` when no lane was built, so nothing
     /// was paid and no deployment is known.
     pub async fn receipt(
         &self,
@@ -260,10 +260,7 @@ impl ReceiptEvidence {
         let hash = B256::from(hash);
         let mut unlanded: Vec<B256> = Vec::new();
         for r in lanes.iter().flat_map(|l| &l.responses) {
-            if r.hash != hash
-                && entries.iter().all(|e| e.hash != r.hash)
-                && !unlanded.contains(&r.hash)
-            {
+            if entries.iter().all(|e| e.hash != r.hash) && !unlanded.contains(&r.hash) {
                 unlanded.push(r.hash);
             }
         }
@@ -280,7 +277,13 @@ impl ReceiptEvidence {
 }
 
 /// Add `lane` to `out`, merging it into a lane already there under the same
-/// key: the higher claim wins, the lower prior stays, and responses join.
+/// key: the higher claim's proof wins, responses join, and the prior is set
+/// so that the merged lane pays what the two ledgers paid between them.
+///
+/// Each ledger's prior is its own baseline, which already leaves out the
+/// jumps that ledger healed across. Taking the lower prior under the higher
+/// claim would count a jump the second ledger took as payment, so the prior
+/// is the winning claim less the sum of both ledgers' own payments.
 fn merge_lane(out: &mut Vec<ReceiptLane>, lane: ReceiptLane) {
     let Some(kept) = out.iter_mut().find(|l| l.key() == lane.key()) else {
         out.push(lane);
@@ -288,7 +291,12 @@ fn merge_lane(out: &mut Vec<ReceiptLane>, lane: ReceiptLane) {
     };
     // A lane with no proof ranks below every lane with one.
     let claim_of = |l: &ReceiptLane| l.proof.as_ref().map(|p| p.claim.amount);
-    let prior = if lane.prior.amount < kept.prior.amount {
+    let (kept_paid, lane_paid) = (kept.paid(), lane.paid());
+    let paid = ReceiptAmount {
+        amount: kept_paid.amount.saturating_add(lane_paid.amount),
+        bytes: kept_paid.bytes.saturating_add(lane_paid.bytes),
+    };
+    let lowest = if lane.prior.amount < kept.prior.amount {
         lane.prior
     } else {
         kept.prior
@@ -302,7 +310,10 @@ fn merge_lane(out: &mut Vec<ReceiptLane>, lane: ReceiptLane) {
     if claim_of(&lane) > claim_of(kept) {
         *kept = lane;
     }
-    kept.prior = prior;
+    kept.prior = kept.proof.as_ref().map_or(lowest, |proof| ReceiptAmount {
+        amount: proof.claim.amount.saturating_sub(paid.amount),
+        bytes: proof.claim.bytes.saturating_sub(paid.bytes),
+    });
     kept.responses = responses;
 }
 
@@ -358,8 +369,9 @@ pub struct ReceiptContent {
     /// blob pull that failed, or that fetched a byte window, lists none. Sizes
     /// are client-stated; a response for the same hash signs its size.
     pub entries: Vec<ReceiptEntry>,
-    /// The hashes a node accepted on a lane of the pull that did not land:
-    /// entries a failed or interrupted pull had started. Empty when `complete`.
+    /// The hashes a node accepted on a lane of the pull that did not land: a
+    /// blob, a manifest or entries that a failed or interrupted pull had
+    /// started. Empty when `complete`.
     pub unlanded: Vec<B256>,
     /// `false` when the pull ended with an error: a blob that did not land, or
     /// a bundle with entries it did not land.

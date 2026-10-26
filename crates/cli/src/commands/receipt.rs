@@ -97,6 +97,34 @@ pub(crate) fn check_receipt_path(path: &Path) -> anyhow::Result<()> {
         })
 }
 
+/// Whether `a` and `b` name one file: the same file on disk when both exist,
+/// else the same absolute path.
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => match (std::path::absolute(a), std::path::absolute(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        },
+    }
+}
+
+/// Refuse a `--receipt` path that names `output`, the file `what` describes
+/// (for example "the blob lands"): the receipt would replace it, and a run
+/// that paid nothing would remove it.
+///
+/// # Errors
+///
+/// `receipt` and `output` name one file.
+pub(crate) fn refuse_collision(receipt: &Path, output: &Path, what: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !same_path(receipt, output),
+        "--receipt {} is where {what}; name another file",
+        receipt.display()
+    );
+    Ok(())
+}
+
 /// End a `decdn get` run that started at `started`: build its receipt from
 /// `evidence`, print the receipt block, and write `--receipt` ([`finish_with`]).
 ///
@@ -146,10 +174,12 @@ pub(crate) async fn finish_get(
 /// Print `receipt`'s block to `out` and write it to `path`.
 ///
 /// A run that paid nothing has no receipt and prints no block. With `path`,
-/// it says on stderr that no receipt was written, and removes a file an
-/// earlier run left at `path`, so that a script that verifies `path` next does
-/// not verify the earlier run. A run that failed still has a receipt for what
-/// it paid, marked incomplete.
+/// a run that succeeded says on stderr that no receipt was written, and
+/// removes a file an earlier run left at `path`, so that a script that
+/// verifies `path` next does not verify the earlier run; a run that failed
+/// leaves the file alone, since no script goes on to verify it. A run that
+/// failed after paying still has a receipt for what it paid, marked
+/// incomplete.
 ///
 /// # Errors
 ///
@@ -164,7 +194,7 @@ pub(crate) fn finish_with(
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
     let Some(receipt) = receipt else {
-        if let Some(path) = path {
+        if let Some(path) = path.filter(|_| result.is_ok()) {
             let removed = path.is_file() && std::fs::remove_file(path).is_ok();
             eprintln!(
                 "no receipt: this run paid nothing, so {} was not written{}",
@@ -609,12 +639,15 @@ pub(crate) fn decode_redemptions(logs: &[Log]) -> anyhow::Result<Vec<Redemption>
     Ok(out)
 }
 
-/// Record on each lane with a proof the first of `redemptions` (chain order)
-/// whose paid cumulative for the lane's signer reaches the claim, or else the
-/// highest one past the lane's prior watermark. A lane already settled keeps
-/// its settlement.
+/// Replace each lane's settlement with what `redemptions` show: for a lane
+/// with a proof, the first of them (chain order) whose paid cumulative for the
+/// lane's signer reaches the claim, or else the highest one past the lane's
+/// prior watermark; for any other lane, none. A settlement already in the
+/// file is not kept: nothing signs it, so only the chain the scan read can
+/// state it, and a reorganization can have removed it.
 pub(crate) fn apply_redemptions(receipt: &mut PullReceipt, redemptions: &[Redemption]) {
     for lane in &mut receipt.lanes {
+        lane.settlement = None;
         if lane.proof.is_none() {
             continue;
         }

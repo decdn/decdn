@@ -52,7 +52,9 @@ pub struct ReceiptVerifyArgs {
 /// scans `PaymentPool.PoolRedeemed` for each lane's pool and node, from an
 /// hour before the receipt's start (or `--from-block`) to the chain head, and
 /// records for each lane the first redemption that covers its claim, or the
-/// highest one short of it. A node redeems in its own sweep, so a lane can
+/// highest one short of it. Each run rebuilds every lane's settlement from the
+/// events it reads, so a settlement the file held and the scan does not find
+/// is dropped. A node redeems in its own sweep, so a lane can
 /// stay unsettled for a while after the pull. The file is rewritten in place
 /// (atomically: temp in the same directory, then rename).
 #[derive(Args, Debug)]
