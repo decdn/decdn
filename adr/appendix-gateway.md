@@ -189,12 +189,12 @@ header to content, and it cannot read content.
 ## Metrics
 
 Every gateway counts what it serves, the loopback gateway too.
-`--metrics-listen <loopback address>` serves four routes, with no token:
+`--metrics-listen <loopback address>` serves four routes:
 
 | Route | Answers |
 |-------|---------|
 | `GET /metrics` | Prometheus text. |
-| `GET /_status` | The state of the gateway as one JSON document (see [Dashboard](#dashboard)). |
+| `GET /_status` | The state of the gateway as one JSON document (see [Dashboard](#dashboard)). A public gateway needs no token here. A loopback gateway needs its gateway token, as on its own host. |
 | `GET /` | The dashboard. |
 | `GET /_dashboard/app.js`, `GET /_dashboard/app.css` | The dashboard's script and style. |
 
@@ -226,13 +226,16 @@ address only.
 ## Dashboard
 
 The dashboard is a web page for the operator. It reads `GET /_status` every
-2 seconds while the page is visible. A publisher who wants to see how a site
+2 seconds while the page is visible. The counters do not count the requests
+of the dashboard: its page, its two files and `/_status` on a loopback
+gateway's own host. A publisher who wants to see how a site
 is served runs a loopback gateway and opens its dashboard.
 
 | Gateway | Where the dashboard and `/_status` answer |
 |---------|-------------------------------------------|
 | Loopback | On the gateway's own host. `/_status` needs the gateway token in `x-decdn-token`, as `GET /_capability` does. |
-| Any, with `--metrics-listen` | On that listener, with no token. |
+| Public, with `--metrics-listen` | On that listener, with no token. |
+| Loopback, with `--metrics-listen` | On that listener too. `/_status` needs the gateway token there. The capabilities are the token holder's data. |
 | Public | Not on the public host. `/_status` and `/_dashboard/*` answer 404 there, and `/` keeps its short page. |
 
 `/_status` holds these fields:

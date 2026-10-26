@@ -98,7 +98,9 @@
 //! its own host, `/_status` behind the token; a public gateway answers
 //! neither on its public host. `--metrics-listen` serves `GET /metrics`
 //! (Prometheus text), `/_status` and the dashboard on a loopback address,
-//! with no token, for the operator.
+//! for the operator: a public gateway's `/_status` there takes no token, a
+//! loopback gateway's takes its token. The dashboard's own requests are not
+//! counted.
 //!
 //! **Pointers.** `PUT /_pointer` on the bare host takes a namespace pointer
 //! (`pointer`): an EIP-712 record, signed by the namespace's owner on the
@@ -350,8 +352,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     if let Some(metrics) = args.public.metrics_listen {
         anyhow::ensure!(
             metrics.ip().is_loopback(),
-            "--metrics-listen must be a loopback address: it serves the operator, with no token, \
-             not the public"
+            "--metrics-listen must be a loopback address: it serves the operator, not the public"
         );
         let listener = TcpListener::bind(metrics)
             .await
@@ -487,8 +488,10 @@ fn registry_address(
 
 /// Serve the operator's routes on `listener`, a loopback address, for as
 /// long as the gateway runs: `GET /metrics` answers Prometheus text, and
-/// `/_status` and the dashboard answer as on a loopback gateway but with no
-/// token. A `Host` other than the listener's own loopback names is refused,
+/// `/_status` and the dashboard answer as on a loopback gateway's host. A
+/// public gateway's `/_status` takes no token here; a loopback gateway's
+/// takes its token, as on its host. A `Host` other than the listener's own
+/// loopback names is refused,
 /// so a page whose name was rebound to this address reads nothing.
 async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
     let hosts = Arc::new(listener.local_addr().map(allowed_hosts).unwrap_or_default());
@@ -501,6 +504,9 @@ async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
         tokio::spawn(async move {
             let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                 let gateway = Arc::clone(&gateway);
+                // The capabilities a loopback gateway lists are the token
+                // holder's: its listener asks for the token, as its host does.
+                let authorized = gateway.public() || gateway.authorized(req.headers());
                 let known = req
                     .headers()
                     .get(header::HOST)
@@ -517,7 +523,7 @@ async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
                             "text/plain; version=0.0.4; charset=utf-8",
                         ),
                         (&Method::GET, path) => {
-                            gateway.operator(path, true).await.unwrap_or_else(|| {
+                            gateway.operator(path, authorized).await.unwrap_or_else(|| {
                                 text(StatusCode::NOT_FOUND, "GET /, /_status, /metrics\n")
                             })
                         }
@@ -893,8 +899,9 @@ fn may_mint(delegates: &HashMap<Address, Delegate>, site: Option<&str>) -> Resul
 }
 
 /// One registered capability as `GET /_capability` and `/_status` list it.
-/// The fields are in key order: the TypeScript SDK reads this body, and it
-/// stays the one `serde_json`'s sorted maps wrote before it had a type.
+/// The fields are declared in sorted key order, which is the body's key
+/// order: the TypeScript SDK reads this body, and its shape is a contract
+/// (`the_capability_list_keeps_its_shape`).
 #[derive(serde::Serialize)]
 struct Capability {
     /// The spending cap, in micro-USDC.
@@ -1136,17 +1143,21 @@ impl Gateway {
         self.public.is_some()
     }
 
-    /// Answer `req` and count the answer. On a public gateway, make it
-    /// readable by every origin ([`readable_anywhere`]).
+    /// Answer `req` and count the answer, unless it is the dashboard's own
+    /// ([`Self::operator_request`]). On a public gateway, make it readable by
+    /// every origin ([`readable_anywhere`]).
     async fn handle<B>(self: Arc<Self>, req: Request<B>) -> Response<Body>
     where
         B: HttpBody<Data = Bytes>,
         B::Error: std::error::Error + Send + Sync + 'static,
     {
         let public = self.public.is_some();
+        let counted = !self.operator_request(&req);
         let gateway = Arc::clone(&self);
         let response = self.answer(req).await;
-        gateway.metrics.request(response.status());
+        if counted {
+            gateway.metrics.request(response.status());
+        }
         if public {
             return readable_anywhere(response);
         }
@@ -1339,6 +1350,22 @@ impl Gateway {
             (&Method::HEAD, _) => self.head_bare(target.trim_start_matches('/')),
             _ => return Err(Box::new(req)),
         })
+    }
+
+    /// Whether `req` is for the dashboard or `/_status` on a loopback
+    /// gateway's own host: the dashboard's page, assets and polls, which
+    /// the counters it shows leave out.
+    fn operator_request<B>(&self, req: &Request<B>) -> bool {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        let path = req.uri().path();
+        !self.public()
+            && req.method() == Method::GET
+            && self.hosts.iter().any(|allowed| allowed == host)
+            && (matches!(path, "/" | "/_status") || dashboard::asset(path).is_some())
     }
 
     /// The operator's routes at `path`: the dashboard, its assets, and

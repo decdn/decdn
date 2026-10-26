@@ -80,8 +80,9 @@ pub struct PublicArgs {
 
     /// Serve the gateway's metrics (Prometheus text, `GET /metrics`), its
     /// state (`GET /_status`) and the dashboard (`GET /`) on this loopback
-    /// address, for the operator. Takes no token. Nothing is served without
-    /// it.
+    /// address, for the operator. A public gateway's `/_status` there takes
+    /// no token; a loopback gateway's takes the gateway token. Nothing is
+    /// served without it.
     #[arg(long, value_name = "ADDR")]
     pub metrics_listen: Option<SocketAddr>,
 }

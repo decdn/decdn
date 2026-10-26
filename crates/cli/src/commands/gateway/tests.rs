@@ -2430,7 +2430,7 @@ fn metrics(gateway: &Gateway) -> String {
 #[tokio::test]
 async fn a_loopback_gateway_counts_its_requests() {
     let gateway = test_gateway().await;
-    call(&gateway, Method::GET, "/", &[], "").await;
+    call(&gateway, Method::GET, "/nope", &[], "").await;
     call(&gateway, Method::DELETE, "/", &[], "").await;
     let c = gateway.metrics.snapshot();
     let answered = c.requests_ok
@@ -2826,11 +2826,8 @@ async fn status_needs_the_token_on_loopback() {
     assert!(status["pointers"].is_null(), "{status}");
     assert!(status["pool_error"].is_null(), "{status}");
     assert!(status["pools"].is_object(), "{status}");
-    // The status request itself is not counted yet when it is answered.
-    assert_eq!(
-        status["counters"]["requests_refused"], 1,
-        "the 401 before it"
-    );
+    // The 401 before it is the dashboard's own request, and not counted.
+    assert_eq!(status["counters"]["requests_refused"], 0, "{status}");
     let listed = loopback_get(&gateway, "/_capability", true).await;
     let listed: serde_json::Value = serde_json::from_str(&listed.body).unwrap();
     assert_eq!(status["capabilities"], listed);
@@ -2986,4 +2983,59 @@ async fn status_reports_a_pool_snapshot_failure() {
     let error = status["pool_error"].as_str().unwrap();
     assert!(error.contains("unreadable"), "{error}");
     assert!(!error.contains("secret"), "{error}");
+}
+
+/// A loopback gateway's metrics listener asks for the token before it lists
+/// the capabilities, as the gateway's own host does: the token-free state is
+/// for a public gateway's operator alone.
+#[tokio::test]
+async fn a_loopback_metrics_listener_needs_the_token_for_status() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let gateway = test_gateway().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_metrics(Arc::clone(&gateway), listener));
+    let fetch = |path: &'static str, token: bool| async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let header = if token {
+            format!("{TOKEN_HEADER}: {TEST_TOKEN}\r\n")
+        } else {
+            String::new()
+        };
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{header}Connection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).await.unwrap();
+        out
+    };
+    let refused = fetch("/_status", false).await;
+    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+    let status = fetch("/_status", true).await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let metrics = fetch("/metrics", false).await;
+    assert!(metrics.starts_with("HTTP/1.1 200"), "{metrics}");
+}
+
+/// The dashboard's own requests are not what the gateway served: its page,
+/// its assets and each poll of `/_status`, refused or answered, leave the
+/// counters alone.
+#[tokio::test]
+async fn the_dashboard_does_not_count_itself() {
+    let gateway = test_gateway().await;
+    for (path, token) in [
+        ("/", false),
+        ("/_dashboard/app.js", false),
+        ("/_dashboard/app.css", false),
+        ("/_status", false),
+        ("/_status", true),
+        ("/_status", true),
+    ] {
+        loopback_get(&gateway, path, token).await;
+    }
+    assert_eq!(gateway.metrics.snapshot(), metrics::Counters::default());
 }

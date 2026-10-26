@@ -4153,7 +4153,8 @@ since project inception and will roll into the first tagged release.
   answers it on its own host behind the gateway token, and serves a
   dashboard at `/` that polls it; `decdn gateway` prints a
   `dashboard: http://<listen>/#token=<token>` link that hands the page the
-  token. `--metrics-listen` serves both with no token. A public gateway's
+  token. `--metrics-listen` serves both too, with no token on a public
+  gateway and behind the token on a loopback one. A public gateway's
   public host answers neither. The page is a Vite app in
   `crates/cli/dashboard/`, embedded by `decdn-cli`'s build script; a build
   with no Node toolchain embeds a page that says how to build it, and no
