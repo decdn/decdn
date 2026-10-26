@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 use crate::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use crate::funding::RunFunding;
 use crate::ordered_writes::OrderedWrites;
+use crate::receipt::ReceiptEvidence;
 use crate::session::{
     ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, PullSite,
 };
@@ -814,6 +815,7 @@ pub struct BundlePullerBuilder {
     observer: Option<Arc<dyn BundleObserver>>,
     hints: Option<Arc<dyn FaultHints>>,
     escrows: UnconfirmedEscrows,
+    evidence: Option<Arc<ReceiptEvidence>>,
 }
 
 impl std::fmt::Debug for BundlePullerBuilder {
@@ -860,6 +862,7 @@ impl BundlePuller {
             observer: None,
             hints: None,
             escrows: UnconfirmedEscrows::default(),
+            evidence: None,
         }
     }
 
@@ -1015,6 +1018,13 @@ impl BundlePullerBuilder {
         self
     }
 
+    /// Where every lane of the run keeps the signed messages a pull receipt
+    /// holds ([`ReceiptEvidence::lanes`]). Nothing is kept by default.
+    pub fn receipt_evidence(mut self, evidence: Arc<ReceiptEvidence>) -> Self {
+        self.evidence = Some(evidence);
+        self
+    }
+
     /// What explains a failed fetch to the caller's user.
     #[doc(hidden)]
     pub fn fault_hints(mut self, hints: Arc<dyn FaultHints>) -> Self {
@@ -1099,6 +1109,7 @@ impl BundlePullerBuilder {
             demand: Arc::new(RunDemand::default()),
             observer: self.observer,
             hints: self.hints,
+            evidence: self.evidence,
             rate_samples: std::sync::Mutex::default(),
         };
         Ok(BundlePuller { ctx })

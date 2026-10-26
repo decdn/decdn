@@ -33,7 +33,7 @@ use crate::commands::bundle_pull::human_bytes;
 use crate::commands::chain_ctx;
 use crate::commands::civil_time;
 
-mod earnings_chain;
+pub(crate) mod earnings_chain;
 
 /// Partial deserializer for the TOML config — only the path
 /// `observability.admin_port` is interesting to the `node` admin

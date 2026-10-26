@@ -98,6 +98,7 @@ use crate::funding::RunFunding;
 use crate::lane_sources::LaneSources;
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
+use crate::receipt::ReceiptEvidence;
 use crate::scheduler::{BUILD_DRAIN, fold_late_escrow};
 use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PullSite};
 use crate::stop::Halted;
@@ -1695,6 +1696,9 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     /// What explains a failed fetch to the caller's user; `None` leaves every
     /// error as the fetch returned it.
     pub(super) hints: Option<Arc<dyn FaultHints>>,
+    /// Where every lane keeps the signed messages a pull receipt holds;
+    /// `None` keeps nothing.
+    pub(super) evidence: Option<Arc<ReceiptEvidence>>,
     /// `(rtt_ms, rate_per_mb)` of each node the run's probe rounds heard
     /// from, at its lowest RTT ([`super::BundlePuller::rate_hints`]).
     pub(super) rate_samples: std::sync::Mutex<HashMap<PublicKey, (f64, u64)>>,
@@ -1732,6 +1736,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             connections: &self.connections,
             writes: &self.writes,
             funding: &self.funding,
+            evidence: self.evidence.as_deref(),
         })
     }
 
@@ -1948,6 +1953,9 @@ impl<P: Provider + Clone> PullCtx<P> {
                 .map_err(manifest_fetch_error)?;
             if let Some(warning) = manifest_cache::store(out_root, hash, &fetched) {
                 self.warn(&warning);
+            }
+            if let Some(evidence) = &self.evidence {
+                evidence.note_landed(hash, u64::try_from(fetched.len()).unwrap_or(u64::MAX));
             }
             fetched
         };
@@ -2330,33 +2338,52 @@ impl<P: Provider + Clone> PullCtx<P> {
         let started = std::time::Instant::now();
         self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file, slot)
             .await
-            .inspect(|&bytes| self.report_landed(hash, staging, bytes, started.elapsed()))
+            .inspect(|&bytes| self.report_landed(hash, total, staging, bytes, started.elapsed()))
     }
 
     /// Report a landed entry to the observer: its size in `staging`, the time
     /// the whole entry took, and the bytes it paid for, spliced and resumed.
-    /// A staging file it cannot stat reports its size as 0, after a debug line
-    /// naming the path and the error.
+    /// A staging file it cannot stat reports the manifest's size `total`, or 0
+    /// without one, after a debug line naming the path and the error. The
+    /// receipt evidence, when the run keeps one, records the entry with its
+    /// size; an entry whose size neither source knows stays out of the receipt,
+    /// with a warning, rather than going in as 0 against the size a node
+    /// signed.
     fn report_landed(
         &self,
         hash: [u8; 32],
+        total: Option<u64>,
         staging: &Path,
         bytes: EntryBytes,
         elapsed: std::time::Duration,
     ) {
-        let Some(observer) = &self.observer else {
+        if self.observer.is_none() && self.evidence.is_none() {
             return;
-        };
+        }
         let size = std::fs::metadata(staging).map_or_else(
             |e| {
                 tracing::debug!(
                     "could not stat {} for its entry line: {e}",
                     staging.display()
                 );
-                0
+                total
             },
-            |m| m.len(),
+            |m| Some(m.len()),
         );
+        if let Some(evidence) = &self.evidence {
+            if let Some(size) = size {
+                evidence.note_landed(hash, size);
+            } else {
+                tracing::warn!(
+                    "{} landed but its size is unknown; the receipt leaves it out",
+                    blake3::Hash::from_bytes(hash).to_hex()
+                );
+            }
+        }
+        let size = size.unwrap_or(0);
+        let Some(observer) = &self.observer else {
+            return;
+        };
         observer.entry_landed(&EntryLanded {
             hash,
             size,

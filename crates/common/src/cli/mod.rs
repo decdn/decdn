@@ -20,6 +20,7 @@ pub mod pool;
 pub mod probe;
 pub mod publish;
 pub mod quote;
+pub mod receipt;
 pub mod run;
 pub mod self_update;
 pub mod setup;
@@ -53,6 +54,7 @@ pub use publish::{
     PublishChainArgs, PublishCommand, RevokeArgs,
 };
 pub use quote::QuoteArgs;
+pub use receipt::{ReceiptArgs, ReceiptCommand, ReceiptSettleArgs, ReceiptVerifyArgs};
 pub use run::RunArgs;
 pub use self_update::SelfUpdateArgs;
 pub use setup::SetupArgs;
@@ -131,6 +133,9 @@ pub enum Command {
     /// Price a pull of what a `decdn:` URI names from the rates the nodes
     /// sign in their probe answers, before any paid byte.
     Quote(Box<QuoteArgs>),
+    /// Check a pull receipt `decdn get --receipt` wrote (`verify`), or add the
+    /// on-chain redemptions that settle it (`settle`).
+    Receipt(ReceiptArgs),
     /// Guided node onboarding (ADR 019 Phases 1–2): pre-flight checks,
     /// key generation, bond, and on-chain registration, with a final
     /// readiness summary. Thin orchestration over `key-gen` / `node bond` /

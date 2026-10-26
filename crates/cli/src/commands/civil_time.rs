@@ -60,6 +60,13 @@ pub(crate) fn format_utc_token(unix: u64) -> String {
     format!("{}T{hour:02}:{minute:02}Z", format_date(unix))
 }
 
+/// `YYYY-MM-DDTHH:MM:SSZ` of a Unix time: RFC 3339 in UTC, to the second.
+pub(crate) fn format_rfc3339(unix: u64) -> String {
+    let (hour, minute) = hour_minute(unix);
+    let second = unix % 60;
+    format!("{}T{hour:02}:{minute:02}:{second:02}Z", format_date(unix))
+}
+
 /// The earliest Unix time `parse_since` accepts as a bare integer:
 /// 2000-01-01. A smaller integer is a date typed without its dashes
 /// (`20261001`), not a time anyone means.
@@ -97,6 +104,35 @@ pub(crate) fn parse_since(value: &str) -> anyhow::Result<u64> {
         .map_err(|_| anyhow::anyhow!("--since: `{value}` is before 1970-01-01"))
 }
 
+/// The Unix time of a `YYYY-MM-DDTHH:MM:SSZ` string, the shape
+/// [`format_rfc3339`] writes; `None` for any other shape or a time before
+/// 1970-01-01.
+pub(crate) fn parse_rfc3339(value: &str) -> Option<u64> {
+    let (date, time) = value.strip_suffix('Z')?.split_once('T')?;
+    let (year, month, day) = parse_ymd(date)?;
+    let days = days_from_civil(year, month, day);
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
+    let parts: Vec<&str> = time.split(':').collect();
+    let [h, m, sec] = parts.as_slice() else {
+        return None;
+    };
+    // Two ASCII digits each: `parse` alone takes a sign, so `-1` would pass.
+    if [h, m, sec]
+        .iter()
+        .any(|p| p.len() != 2 || !p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let (hour, minute, second): (i64, i64, i64) =
+        (h.parse().ok()?, m.parse().ok()?, sec.parse().ok()?);
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    u64::try_from(days * DAY_SECS + hour * 3_600 + minute * 60 + second).ok()
+}
+
 /// `(year, month, day)` of a `YYYY-MM-DD` string whose month is 1 to 12 and
 /// whose day is 1 to 31; `None` for any other shape. Whether the day exists
 /// in that month is the caller's check.
@@ -105,7 +141,8 @@ fn parse_ymd(value: &str) -> Option<(i64, i64, i64)> {
     let [y, m, d] = parts.as_slice() else {
         return None;
     };
-    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+    let digits = |p: &str, len: usize| p.len() == len && p.bytes().all(|b| b.is_ascii_digit());
+    if !digits(y, 4) || !digits(m, 2) || !digits(d, 2) {
         return None;
     }
     let (year, month, day) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);

@@ -30,6 +30,7 @@ pub mod probe;
 pub mod publish;
 pub mod pull_progress;
 pub mod quote;
+pub mod receipt;
 pub mod register;
 pub mod rotate_key;
 pub mod self_update;

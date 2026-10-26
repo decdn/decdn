@@ -556,6 +556,7 @@ async fn dry_run_still_rejects_a_dangling_provider_address() {
         &Destination::of(&args, &uri),
         &uri,
         Some(&offline_config()),
+        &Arc::new(ReceiptEvidence::new()),
     )
     .await
     .expect_err("a dangling --provider-address must be rejected even for --dry-run");
@@ -598,6 +599,7 @@ async fn dry_run_reads_a_cached_manifest() {
             &Destination::of(&args, &uri),
             &uri,
             Some(&offline_config()),
+            &Arc::new(ReceiptEvidence::new()),
         )
         .await
         .unwrap_or_else(|e| panic!("overwrite={overwrite}: {e:#}"));
@@ -608,6 +610,7 @@ async fn dry_run_reads_a_cached_manifest() {
             &Destination::of(&args, &uri),
             &uri,
             Some(&offline_config()),
+            &Arc::new(ReceiptEvidence::new()),
         )
         .await
         .expect_err("the cached manifest has no such entry");
@@ -630,6 +633,7 @@ async fn dry_run_has_no_manifest_for_an_uncached_hash() {
         &Destination::of(&args, &uri),
         &uri,
         Some(&offline_config()),
+        &Arc::new(ReceiptEvidence::new()),
     )
     .await
     .unwrap();
@@ -652,6 +656,7 @@ async fn dry_run_fails_on_a_cached_manifest_that_does_not_parse() {
         &Destination::of(&args, &uri),
         &uri,
         Some(&offline_config()),
+        &Arc::new(ReceiptEvidence::new()),
     )
     .await
     .expect_err("a cached non-v1 manifest fails the dry run");
@@ -682,6 +687,7 @@ async fn dry_run_fails_on_a_cached_manifest_with_a_malformed_hash() {
             &Destination::of(&args, &parsed),
             &parsed,
             Some(&offline_config()),
+            &Arc::new(ReceiptEvidence::new()),
         )
         .await
         .expect_err("a malformed cached manifest fails the dry run");
@@ -746,6 +752,7 @@ async fn dry_run_fails_naming_an_unreadable_cached_manifest() {
         &Destination::of(&args, &uri),
         &uri,
         Some(&offline_config()),
+        &Arc::new(ReceiptEvidence::new()),
     )
     .await
     .expect_err("an unreadable cached manifest fails the dry run");
@@ -774,6 +781,7 @@ async fn dry_run_fails_naming_a_cached_manifest_that_fails_its_hash_check() {
         &Destination::of(&args, &uri),
         &uri,
         Some(&offline_config()),
+        &Arc::new(ReceiptEvidence::new()),
     )
     .await
     .expect_err("a tampered cached manifest fails the dry run");
@@ -1154,26 +1162,50 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
     let mut dest = Destination::of(&args, &parsed);
     assert_eq!(dest.entry_name.as_deref(), Some("c.bin"));
     dest.path = out.to_path_buf();
-    super::bundle_pull(&args, &dest, &parsed, Some(&offline_config()))
-        .await
-        .unwrap();
+    super::bundle_pull(
+        &args,
+        &dest,
+        &parsed,
+        Some(&offline_config()),
+        &Arc::new(ReceiptEvidence::new()),
+    )
+    .await
+    .unwrap();
 
     std::fs::write(out.join("c.bin"), b"mine").unwrap();
-    let err = super::bundle_pull(&args, &dest, &parsed, Some(&offline_config()))
-        .await
-        .expect_err("an unrecorded c.bin must be refused");
+    let err = super::bundle_pull(
+        &args,
+        &dest,
+        &parsed,
+        Some(&offline_config()),
+        &Arc::new(ReceiptEvidence::new()),
+    )
+    .await
+    .expect_err("an unrecorded c.bin must be refused");
     assert!(format!("{err:#}").contains("c.bin"), "{err:#}");
 
     // A record from this entry vouches for c.bin; one from another entry
     // with other bytes does not, and the refusal names that entry.
     record_pull(out, "c.bin", [0xbb; 32], &hash, "models/v1/c.bin");
-    super::bundle_pull(&args, &dest, &parsed, Some(&offline_config()))
-        .await
-        .unwrap();
+    super::bundle_pull(
+        &args,
+        &dest,
+        &parsed,
+        Some(&offline_config()),
+        &Arc::new(ReceiptEvidence::new()),
+    )
+    .await
+    .unwrap();
     record_pull(out, "c.bin", [0xbb; 32], &hash, "models/v2/c.bin");
-    let err = super::bundle_pull(&args, &dest, &parsed, Some(&offline_config()))
-        .await
-        .expect_err("a c.bin another entry wrote must be refused");
+    let err = super::bundle_pull(
+        &args,
+        &dest,
+        &parsed,
+        Some(&offline_config()),
+        &Arc::new(ReceiptEvidence::new()),
+    )
+    .await
+    .expect_err("a c.bin another entry wrote must be refused");
     assert!(
         format!("{err:#}").contains(&format!("wrote it from decdn:{hash}/models/v2/c.bin")),
         "{err:#}"
@@ -1186,6 +1218,7 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
         &Destination::of(&args, &parsed),
         &parsed,
         Some(&offline_config()),
+        &Arc::new(ReceiptEvidence::new()),
     )
     .await
     .unwrap();

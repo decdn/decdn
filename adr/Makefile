@@ -84,6 +84,7 @@ BOOK_SRCS := \
   appendix-poc-production-seams.md appendix-binaries.md \
   appendix-local-admin-http.md appendix-operator-key-rotation.md \
   appendix-operator-upgrade-path.md appendix-gateway.md \
+  appendix-pull-receipts.md \
   glossary.md
 
 DENSITY_CFG := _build/book-density.typ _build/book-margins.yaml _build/table-autofit.lua

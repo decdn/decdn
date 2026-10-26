@@ -46,7 +46,7 @@ const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Await `call` for at most [`RPC_CALL_TIMEOUT`]; an elapsed deadline is an
 /// error naming `what`.
-async fn bounded<T, E>(
+pub(crate) async fn bounded<T, E>(
     what: &str,
     call: impl IntoFuture<Output = Result<T, E>>,
 ) -> anyhow::Result<T>
@@ -330,7 +330,7 @@ fn settled_scan_progress() -> impl FnMut(ScanEvent) {
 /// does not know is retried like a transient fault and then fails here, so
 /// the span is the first thing to try; `--from-block` resumes, but the table
 /// then covers only the blocks from there.
-fn scan_failed(event: &str, span: NonZeroU64) -> String {
+pub(crate) fn scan_failed(event: &str, span: NonZeroU64) -> String {
     format!(
         "scanning {event} (windows of {span} blocks); if the provider caps eth_getLogs \
          windows, lower blockchain.get_logs_max_block_span in the config file; \
@@ -348,7 +348,7 @@ fn shares_scan_progress(event: &ScanEvent) {
 /// The stderr line for a retried window: which window, why it failed, which
 /// retry this is and how long the pause before it is, so a user watching a
 /// stalled scan knows what the provider said.
-fn print_retry(event: &ScanEvent) {
+pub(crate) fn print_retry(event: &ScanEvent) {
     if let ScanEvent::Retry {
         start,
         end,
@@ -507,7 +507,7 @@ async fn block_timestamp<P: Provider>(provider: &P, block: u64) -> anyhow::Resul
 /// The lowest block in `[lo, hi]` whose timestamp is at or after
 /// `target_unix`, by binary search over block headers; `hi + 1` when even
 /// `hi` is earlier (an empty period). About `log2(hi − lo)` header reads.
-pub(super) async fn block_at_or_after<P: Provider>(
+pub(crate) async fn block_at_or_after<P: Provider>(
     provider: &P,
     target_unix: u64,
     lo: u64,
