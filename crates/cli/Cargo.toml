@@ -14,16 +14,19 @@ categories.workspace = true
 # dashboard's Vite build (`dashboard/dist/`), which `build.rs` embeds. It
 # replaces cargo's default file set, so every other shipped file is listed
 # too; CI's `cargo package --list` check fails when the build is missing.
+# The patterns match as `.gitignore` lines do: a name with no `/` before its
+# end matches at any depth (every README under `dashboard/node_modules/`), so
+# the root files are anchored with a leading `/`.
 include = [
-  "src/**",
-  "tests/**",
-  "deployments/**",
-  "build.rs",
-  "README.md",
-  "TERMS.md",
-  "TERMS_README.md",
-  "minisign-thiras.pub",
-  "dashboard/dist/**",
+  "/src/**",
+  "/tests/**",
+  "/deployments/**",
+  "/build.rs",
+  "/README.md",
+  "/TERMS.md",
+  "/TERMS_README.md",
+  "/minisign-thiras.pub",
+  "/dashboard/dist/**",
 ]
 
 [[bin]]

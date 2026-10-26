@@ -1,0 +1,92 @@
+import type { DelegateLanes, Lane } from "../api";
+import { formatBytes, formatUsdc, shortHex } from "../format";
+import type { PoolRow } from "../view";
+import { Cell, Empty, Gauge, Panel, Table } from "./Panel";
+
+function Lanes(props: { lanes: Lane[] }) {
+  return (
+    <Table head={["Signer", "Node", "Paid", "Bytes"]}>
+      {props.lanes.map((l) => (
+        <tr key={`${l.voucher_signer}-${l.provider}`}>
+          <Cell mono title={l.voucher_signer}>
+            {shortHex(l.voucher_signer)}
+          </Cell>
+          <Cell mono title={l.provider}>
+            {shortHex(l.provider)}
+          </Cell>
+          <Cell>{formatUsdc(l.last_amount_micro_usdc)} USDC</Cell>
+          <Cell>{formatBytes(l.last_bytes_delivered)}</Cell>
+        </tr>
+      ))}
+    </Table>
+  );
+}
+
+export function Pools(props: {
+  rows: PoolRow[];
+  delegates: DelegateLanes[];
+  skipped: string[];
+  error: string | null;
+}) {
+  const delegates = props.delegates.filter((d) => d.lanes.length > 0);
+  return (
+    <Panel
+      title="Pools and lanes"
+      note="From the buyer store; a pull in flight records its lanes as it ends"
+    >
+      {props.error ? (
+        <p role="alert" className="mb-3 text-sm text-critical-ink">
+          ⛔ The store could not be read: {props.error}
+        </p>
+      ) : null}
+      {props.skipped.length > 0 ? (
+        <p role="alert" className="mb-3 text-sm text-critical-ink">
+          ⚠ {props.skipped.length} pool record(s) would not decode; their
+          deposits stay escrowed but untracked:{" "}
+          {props.skipped.map(shortHex).join(", ")}
+        </p>
+      ) : null}
+      {props.rows.length === 0 && delegates.length === 0 && !props.error ? (
+        <Empty>No pool or lane is recorded yet.</Empty>
+      ) : null}
+      <div className="flex flex-col gap-4">
+        {props.rows.map((p) => (
+          <article key={p.id} className="flex flex-col gap-2">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div>
+                <h3 className="font-mono text-sm" title={p.id}>
+                  Pool {shortHex(p.id)}
+                </h3>
+                <p className="text-sm text-ink-2">
+                  {formatUsdc(p.headroom)} USDC left of {formatUsdc(p.deposit)}{" "}
+                  · spent {formatUsdc(p.spent)}
+                </p>
+              </div>
+              <div className="w-full sm:w-64">
+                <Gauge
+                  used={p.used}
+                  severity={p.severity}
+                  label={`Spend of pool ${shortHex(p.id)}`}
+                />
+              </div>
+            </div>
+            {p.lanes.length > 0 ? <Lanes lanes={p.lanes} /> : null}
+          </article>
+        ))}
+        {delegates.map((d) => (
+          <article
+            key={`${d.signer}-${d.pool_id}`}
+            className="flex flex-col gap-2"
+          >
+            <h3 className="text-sm">
+              Lanes of key{" "}
+              <span className="font-mono">{shortHex(d.signer)}</span> on pool{" "}
+              <span className="font-mono">{shortHex(d.pool_id)}</span>
+            </h3>
+            <Lanes lanes={d.lanes} />
+          </article>
+        ))}
+      </div>
+    </Panel>
+  );
+}
