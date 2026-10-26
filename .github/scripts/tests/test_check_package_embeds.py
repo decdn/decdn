@@ -235,3 +235,40 @@ def test_workspace_members_are_discovered_from_the_manifest():
     assert {"cli", "node", "protocol", "e2e"} <= names
     for m in members:
         assert (m / "Cargo.toml").is_file()
+
+
+# --- [package].include -----------------------------------------------------
+# A crate with an `include` list ships only what it matches, tracked or not,
+# so an embed of a tracked file the list leaves out is as absent from the
+# .crate as one outside the package.
+
+INSIDE_EMBED = 'const X: &str = include_str!("../INSIDE.md");\n'
+
+
+def test_an_embed_the_include_list_leaves_out_is_an_error(tmp_path):
+    crate_root, src, tracked = build_crate(tmp_path, INSIDE_EMBED)
+    errors, _ = cpe.scan_source(src, crate_root, tmp_path, tracked, include=["/src/**"])
+    assert len(errors) == 1, errors
+    assert "include" in errors[0] and "INSIDE.md" in errors[0]
+
+
+def test_an_embed_the_include_list_names_is_accepted(tmp_path):
+    crate_root, src, tracked = build_crate(tmp_path, INSIDE_EMBED)
+    for include in (["/src/**", "/INSIDE.md"], ["/src/**", "*.md"], ["/**"]):
+        assert cpe.scan_source(src, crate_root, tmp_path, tracked, include=include) == ([], []), include
+
+
+def test_an_out_dir_embed_needs_the_build_script_included(tmp_path):
+    crate_root, src, tracked = build_crate(tmp_path, OUT_DIR_EMBED, build_script=True)
+    errors, _ = cpe.scan_source(src, crate_root, tmp_path, tracked, include=["/src/**"])
+    assert len(errors) == 1, errors
+    ok = cpe.scan_source(src, crate_root, tmp_path, tracked, include=["/src/**", "/build.rs"])
+    assert ok == ([], [])
+
+
+def test_include_patterns_match_as_cargo_reads_them():
+    assert cpe.included("deployments/421614.json", ["/deployments/**"])
+    assert not cpe.included("src/deployments/421614.json", ["/deployments/**"])
+    # Unanchored, a name matches at any depth, as in .gitignore.
+    assert cpe.included("dashboard/node_modules/x/README.md", ["README.md"])
+    assert not cpe.included("dashboard/node_modules/x/README.md", ["/README.md"])

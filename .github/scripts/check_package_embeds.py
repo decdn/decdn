@@ -28,6 +28,9 @@ Three deliberate calibrations:
   every build, so the `.crate` needs the script, not the file. Whatever the
   script reads must reach the `.crate` too, and `cargo package --list` checks
   that in CI.
+* A crate with a `[package].include` list ships only the files the list
+  matches, so every embed, and an `OUT_DIR` embed's `build.rs`, must also
+  match one of its patterns.
 
 Crates with `publish = false` are exempt: they are never packaged, so reaching
 out to workspace fixtures is legitimate for them.
@@ -35,6 +38,7 @@ out to workspace fixtures is legitimate for them.
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import subprocess
 import sys
@@ -196,6 +200,35 @@ def is_publishable(crate_root: Path) -> bool:
     return manifest.get("package", {}).get("publish") is not False
 
 
+def package_include(crate_root: Path) -> list[str] | None:
+    """The crate's `[package].include` patterns, or None when it has none."""
+    manifest = tomllib.loads((crate_root / "Cargo.toml").read_text())
+    return manifest.get("package", {}).get("include")
+
+
+def included(rel: str, patterns: list[str]) -> bool:
+    """Whether `rel` (relative to the crate root) matches an `include` pattern.
+
+    Cargo reads the patterns as `.gitignore` lines: one with a `/` before its
+    end is anchored to the crate root, one without matches a name at any
+    depth, and a trailing `/**` takes everything under a directory.
+    """
+    for pattern in patterns:
+        anchored = "/" in pattern.rstrip("/")
+        p = pattern.lstrip("/")
+        if p.endswith("/**"):
+            if rel.startswith(p[:-2]):
+                return True
+        elif p == "**":
+            return True
+        elif anchored:
+            if fnmatch.fnmatchcase(rel, p):
+                return True
+        elif fnmatch.fnmatchcase(rel.rsplit("/", 1)[-1], p):
+            return True
+    return False
+
+
 def tracked_files(repo_root: Path) -> set[Path]:
     out = subprocess.run(
         ["git", "-C", str(repo_root), "ls-files", "-z"],
@@ -207,9 +240,16 @@ def tracked_files(repo_root: Path) -> set[Path]:
 
 
 def scan_source(
-    src_path: Path, crate_root: Path, repo_root: Path, tracked: set[Path]
+    src_path: Path,
+    crate_root: Path,
+    repo_root: Path,
+    tracked: set[Path],
+    include: list[str] | None = None,
 ) -> tuple[list[str], list[tuple[str, str]]]:
-    """Returns (errors, warnings); warnings are (rel_src, rel_target) pairs."""
+    """Returns (errors, warnings); warnings are (rel_src, rel_target) pairs.
+
+    `include` is the crate's `[package].include`, when it has one.
+    """
     text = src_path.read_text(encoding="utf-8", errors="replace")
     masked = mask(text)
     regions = cfg_test_regions(masked)
@@ -229,9 +269,15 @@ def scan_source(
         except ValueError:
             rel_target = str(target)
         if target.is_relative_to(crate_root.resolve()):
-            if target.resolve() in tracked:
+            rel_crate = target.resolve().relative_to(crate_root.resolve()).as_posix()
+            if include is not None and not included(rel_crate, include):
+                detail = (
+                    f"embeds {rel_target}, which [package].include leaves out of the .crate"
+                )
+            elif target.resolve() in tracked:
                 return
-            detail = f"embeds {rel_target}, which is inside the crate but not tracked by git"
+            else:
+                detail = f"embeds {rel_target}, which is inside the crate but not tracked by git"
         else:
             detail = f"embeds {rel_target}, outside {crate_root.relative_to(repo_root)}/"
         if is_test:
@@ -254,6 +300,12 @@ def scan_source(
                     m.start(),
                     None,
                     "embeds a file under OUT_DIR but the crate has no tracked build.rs",
+                )
+            elif include is not None and not included("build.rs", include):
+                report(
+                    m.start(),
+                    None,
+                    "embeds a file under OUT_DIR but [package].include leaves out build.rs",
                 )
         else:
             report(
@@ -305,7 +357,9 @@ def main() -> int:
         for src_path in sorted(
             p for p in tracked if p.suffix == ".rs" and p.is_relative_to(crate_root.resolve())
         ):
-            e, w = scan_source(src_path, crate_root, repo_root, tracked)
+            e, w = scan_source(
+                src_path, crate_root, repo_root, tracked, package_include(crate_root)
+            )
             errors.extend(e)
             warnings.extend(w)
 
