@@ -2509,11 +2509,11 @@ async fn the_metrics_listener_serves_the_exposition() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(serve_metrics(Arc::clone(&gateway), listener));
-    let fetch = |path: &'static str| async move {
+    let fetch_as = |host: String, path: &'static str| async move {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(
-                format!("GET {path} HTTP/1.1\r\nHost: metrics\r\nConnection: close\r\n\r\n")
+                format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
                     .as_bytes(),
             )
             .await
@@ -2522,6 +2522,7 @@ async fn the_metrics_listener_serves_the_exposition() {
         stream.read_to_string(&mut out).await.unwrap();
         out
     };
+    let fetch = |path: &'static str| fetch_as(addr.to_string(), path);
     let exposition = fetch("/metrics").await;
     assert!(exposition.starts_with("HTTP/1.1 200"), "{exposition}");
     assert!(
@@ -2546,6 +2547,13 @@ async fn the_metrics_listener_serves_the_exposition() {
     assert!(status["allowance"].is_array(), "{status}");
     let other = fetch("/nope").await;
     assert!(other.starts_with("HTTP/1.1 404"), "{other}");
+    // A page whose name was rebound to the listener's address reads nothing.
+    for path in ["/_status", "/metrics", "/"] {
+        let rebound = fetch_as(format!("evil.example:{}", addr.port()), path).await;
+        assert!(rebound.starts_with("HTTP/1.1 403"), "{path}: {rebound}");
+    }
+    let named = fetch_as(format!("localhost:{}", addr.port()), "/metrics").await;
+    assert!(named.starts_with("HTTP/1.1 200"), "{named}");
 }
 
 /// The headers a cross-origin page may read from a public gateway.

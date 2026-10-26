@@ -485,19 +485,31 @@ fn registry_address(
     )
 }
 
-/// Serve the metrics exposition on `listener`, a loopback address, for as
-/// long as the gateway runs: `GET /metrics` answers Prometheus text, every
-/// other request 404.
+/// Serve the operator's routes on `listener`, a loopback address, for as
+/// long as the gateway runs: `GET /metrics` answers Prometheus text, and
+/// `/_status` and the dashboard answer as on a loopback gateway but with no
+/// token. A `Host` other than the listener's own loopback names is refused,
+/// so a page whose name was rebound to this address reads nothing.
 async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
+    let hosts = Arc::new(listener.local_addr().map(allowed_hosts).unwrap_or_default());
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
         let gateway = Arc::clone(&gateway);
+        let hosts = Arc::clone(&hosts);
         tokio::spawn(async move {
             let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                 let gateway = Arc::clone(&gateway);
+                let known = req
+                    .headers()
+                    .get(header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .is_some_and(|host| hosts.iter().any(|allowed| allowed == host));
                 async move {
+                    if !known {
+                        return Ok(text(StatusCode::FORBIDDEN, "unknown Host\n"));
+                    }
                     let response = match (req.method(), req.uri().path()) {
                         (&Method::GET, "/metrics") => typed(
                             StatusCode::OK,
