@@ -7,7 +7,7 @@
 
 **Date:** 2026-10-24 — **Status:** Accepted (`decdn gateway --public-url`
 ships). **Touches:** `decdn` CLI (`gateway`, `publish point`), `decdn-client`
-(byte windows).
+(byte windows), `decdn-incentive` (the buyer-pool snapshot).
 
 ## Context
 
@@ -38,6 +38,7 @@ cookies, only when `<host>` is a public suffix. The operator registers the
 host on the Public Suffix List.
 
 The API of the loopback gateway (`/_delegate`, `/_capability`) answers 404.
+`/_status` and the [dashboard](#dashboard) answer 404 too.
 The browser's `Sec-Fetch-*` headers decide nothing: the operator pays, within
 the allowance. A `/_decdn/` request with no `Sec-Fetch-Mode` is a navigation.
 
@@ -187,8 +188,22 @@ header to content, and it cannot read content.
 
 ## Metrics
 
-`--metrics-listen <loopback address>` serves Prometheus text at
-`GET /metrics`. The series follow
+Every gateway counts what it serves, the loopback gateway too.
+`--metrics-listen <loopback address>` serves four routes, with no token:
+
+| Route | Answers |
+|-------|---------|
+| `GET /metrics` | Prometheus text. |
+| `GET /_status` | The state of the gateway as one JSON document (see [Dashboard](#dashboard)). |
+| `GET /` | The dashboard. |
+| `GET /_dashboard/app.js`, `GET /_dashboard/app.css` | The dashboard's script and style. |
+
+The listener answers only its own loopback names in `Host`
+(`<listen address>`, `localhost:<port>`, `127.0.0.1:<port>`, `[::1]:<port>`).
+It refuses every other `Host` with 403. Thus a web page that rebinds its name
+to the loopback address cannot read `/_status`.
+
+The series follow
 [Observability and Metrics](appendix-observability.md#appendix-observability-and-metrics):
 one unlabeled sibling counter per outcome, every series exported from the
 start.
@@ -208,6 +223,64 @@ start.
 The exposition is for the operator's scraper. The listener takes a loopback
 address only.
 
+## Dashboard
+
+The dashboard is a web page for the operator. It reads `GET /_status` every
+2 seconds while the page is visible. A publisher who wants to see how a site
+is served runs a loopback gateway and opens its dashboard.
+
+| Gateway | Where the dashboard and `/_status` answer |
+|---------|-------------------------------------------|
+| Loopback | On the gateway's own host. `/_status` needs the gateway token in `x-decdn-token`, as `GET /_capability` does. |
+| Any, with `--metrics-listen` | On that listener, with no token. |
+| Public | Not on the public host. `/_status` and `/_dashboard/*` answer 404 there, and `/` keeps its short page. |
+
+`/_status` holds these fields:
+
+| Field | Holds |
+|-------|-------|
+| `mode` | `loopback` or `public`. |
+| `version`, `dashboard_built` | The `decdn` version. `true` when the binary embeds the dashboard's build. |
+| `started_unix`, `uptime_secs`, `listen` | When the gateway started, and its main listen address. |
+| `chain_id`, `payment_pool` | The deployment the gateway pays on. |
+| `counters` | The [metrics](#metrics) series, each by its name without the `decdn_gateway_` prefix and the `_total` suffix. |
+| `active_pulls` | Each pull in flight: blob hash, namespace, byte window, payer, age, bytes delivered. |
+| `capabilities` | The registered capabilities, in the shape of `GET /_capability`. A public gateway holds none. |
+| `allowance` | A public gateway's buckets: the shared bucket first, then each namespace. Each has its bytes per day (`null` for no bound), the bytes delivered today, the bytes left (`null` for no bound) and the seconds until the UTC day turns. `null` on loopback. |
+| `pointers` | A public gateway's namespace pointers: namespace, root, `seq`, signer. `null` on loopback. |
+| `pools` | The buyer-pool store: each pool with its deposit, its spend and its lanes, and the lanes of each registered capability's key. |
+| `pool_error` | Why `pools` is `null`. The text has its secrets removed. |
+
+The pool spend is the pool's spend as the store knows it: the lanes of the
+store plus the spend that other signers redeemed. The deposit less the spend
+is what all signers of the pool can still spend. A loopback gateway pays with
+capabilities. The store keeps their lanes apart from the pool rows, so
+`pools` lists them per key.
+
+The pull worker owns the store and reads it. The store holds what each pull
+wrote when it ended. Thus `pools` lags the pulls in flight. A read that takes
+more than 5 seconds fills `pool_error`.
+
+The gateway token reaches the page in the fragment of the link that
+`decdn gateway` prints: `http://<listen>/#token=<token>`. A browser does not
+send a fragment to the server. The page moves the token to session storage
+and removes the fragment from the address. A site origin of the gateway is a
+different origin and cannot read that storage. A cross-origin page cannot
+send the token header: the preflight of `/_status` answers 403.
+
+The page loads its script and its style from the gateway only. It holds no
+inline script and no inline style. Its content security policy is
+`default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self';
+img-src 'self' data:; base-uri 'none'; form-action 'none';
+frame-ancestors 'none'`.
+
+The page is a Vite app in `crates/cli/dashboard/`. Its build is three files:
+`index.html`, `app.js` and `app.css`. The build script of `decdn-cli` embeds
+them in the binary. A build with no Node toolchain embeds a short page that
+tells how to build the dashboard. Thus `cargo build` works without Node. A
+release never ships that page: the release workflow builds the dashboard
+first and refuses a `decdn` binary that holds it.
+
 ## Non-goals
 
 - A name on chain. A namespace pointer is a gateway-local record above the
@@ -217,3 +290,5 @@ address only.
 - A token or capability on the public gateway. The operator pays.
 - A bucket per client-supplied namespace hint. The hint is not a trust
   anchor.
+- A dashboard on the public origin. The state of the gateway is for its
+  operator.

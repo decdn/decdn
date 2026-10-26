@@ -8,7 +8,8 @@ The user-facing `decdn` binary: `get`, `probe`, `node` administration, `key-gen`
 `config`, `pool`, `publish`, `origin`, `appeal`, `gateway` and `self-update`
 subcommands. `gateway` serves `decdn:` URIs over HTTP: to a browser from
 loopback, or with `--public-url` to anyone at a public origin, paid from the
-gateway's own pool within a daily allowance; `publish point` gives a namespace
+gateway's own pool within a daily allowance, with a dashboard of what it
+serves on loopback; `publish point` gives a namespace
 a stable host on such a gateway by signing a pointer to a bundle. `self-update` replaces the binary with the latest release whose
 `SHA256SUMS.minisig` verifies against one of the maintainers' minisign keys
 embedded from the

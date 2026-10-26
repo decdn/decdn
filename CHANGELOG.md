@@ -28,6 +28,15 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Admin wire: `BuyerPoolSnapshot` carries `spent_micro_usdc`.** The field
+  is the pool's spend as the store knows it (every tracked lane plus the
+  spend other signers redeemed), so deposit less spend is the headroom left
+  for every signer on the pool. The field is required, so a `decdn` CLI at
+  this release reads `admin_v1_pools` only from a daemon at this release.
+  `decdn node pools` and `decdn pool list` gain a `SPENT` column between
+  `DEPOSIT` and `LANES`, which moves `LANES`.
+  - Why: the gateway dashboard shows each pool's headroom, which the deposit
+    alone overstates on a shared pool.
 - **Admin wire: `LaneSnapshot` carries `unredeemed_micro_usdc` (#2598).** The
   field is required, so a `decdn` CLI at this release reads `admin_v1_lanes`
   only from a daemon at this release (`decdn node lanes` fails with "missing
@@ -3554,6 +3563,13 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Gateway: `--metrics-listen` works on every gateway, and serves the
+  dashboard and `/_status` beside `/metrics`.** A loopback gateway counts
+  its requests too, and the flag no longer needs `--public-url`. The
+  listener answers only its own loopback names in `Host` and refuses any
+  other with 403, `/metrics` included, so a scraper addresses it by
+  `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` or the listen
+  address.
 - **Gateway: a public gateway answers every origin (#2628).** `decdn gateway
   --public-url` adds `Access-Control-Allow-Origin: *` and exposes
   `Content-Length`, `Content-Range`, `Accept-Ranges`, `Content-Type`,
@@ -4130,6 +4146,19 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Gateway: a dashboard and `GET /_status`.** `/_status` is one JSON
+  document of what the gateway holds and did: its counters, the pulls in
+  flight, the capabilities, a public gateway's allowance buckets and
+  pointers, and the buyer-pool store's pools and lanes. A loopback gateway
+  answers it on its own host behind the gateway token, and serves a
+  dashboard at `/` that polls it; `decdn gateway` prints a
+  `dashboard: http://<listen>/#token=<token>` link that hands the page the
+  token. `--metrics-listen` serves both with no token. A public gateway's
+  public host answers neither. The page is a Vite app in
+  `crates/cli/dashboard/`, embedded by `decdn-cli`'s build script; a build
+  with no Node toolchain embeds a page that says how to build it, and no
+  release ships that page. See
+  [`adr/appendix-gateway.md` § Dashboard](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#dashboard).
 - **CLI: `decdn get` ends with a pull receipt, and `decdn receipt
   {verify,settle}` checks and settles it (#2599).** Every `get` that paid
   prints a receipt block: the hash, the bytes verified and paid, each node
