@@ -1706,6 +1706,7 @@ async fn the_public_gateway_api_is_closed() {
         (Method::PUT, "/_capability"),
         (Method::GET, "/_capability"),
         (Method::OPTIONS, "/_delegate"),
+        (Method::OPTIONS, "/_capability"),
     ] {
         for origin in ["decdn.test", host.as_str()] {
             let answer = send(&gateway, method.clone(), origin, path, &[]).await;
@@ -2534,14 +2535,14 @@ async fn a_public_preflight_admits_ranged_reads_from_any_origin() {
         ("access-control-request-headers", "range"),
     ];
     let other = format!("/{}", alloy::hex::encode(OTHER));
-    for (origin, path) in [
+    for (on, path) in [
         ("decdn.test", other.as_str()),
         (host.as_str(), "/a.txt"),
         ("7.decdn.test", "/a.txt"),
     ] {
-        let answer = send(&gateway, Method::OPTIONS, origin, path, &preflight).await;
-        assert_eq!(answer.status, StatusCode::NO_CONTENT, "{origin}{path}");
-        assert!(readable_anywhere(&answer), "{origin}{path}");
+        let answer = send(&gateway, Method::OPTIONS, on, path, &preflight).await;
+        assert_eq!(answer.status, StatusCode::NO_CONTENT, "{on}{path}");
+        assert!(readable_anywhere(&answer), "{on}{path}");
         assert_eq!(
             answer.header(header::ACCESS_CONTROL_ALLOW_METHODS),
             Some("GET, HEAD")
@@ -2560,10 +2561,12 @@ async fn a_public_preflight_admits_ranged_reads_from_any_origin() {
     );
 }
 
-/// A browser publisher may `PUT /_pointer` with a JSON body from any origin.
+/// A browser publisher may `PUT /_pointer` with a JSON body from any origin,
+/// on the bare host, where the gateway takes it. A site or namespace host
+/// answers the `PUT` with 404, and so its preflight too.
 #[tokio::test]
-async fn a_public_pointer_preflight_admits_a_json_put() {
-    let (gateway, _logs, _) = public_gateway().await;
+async fn a_public_pointer_preflight_admits_a_json_put_on_the_bare_host() {
+    let (gateway, _logs, host) = public_gateway().await;
     let answer = send(&gateway, Method::OPTIONS, "decdn.test", "/_pointer", &[]).await;
     assert_eq!(answer.status, StatusCode::NO_CONTENT);
     assert!(readable_anywhere(&answer));
@@ -2575,13 +2578,20 @@ async fn a_public_pointer_preflight_admits_a_json_put() {
         answer.header(header::ACCESS_CONTROL_ALLOW_HEADERS),
         Some("content-type")
     );
+    assert_eq!(answer.header(header::ACCESS_CONTROL_MAX_AGE), Some("600"));
+    for off in [host.as_str(), "7.decdn.test"] {
+        let answer = send(&gateway, Method::OPTIONS, off, "/_pointer", &[]).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{off}");
+        assert!(readable_anywhere(&answer), "{off}");
+    }
     let refused = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", "{}").await;
     assert!(refused.status.is_client_error(), "{}", refused.status);
     assert!(readable_anywhere(&refused), "a refused PUT is readable too");
 }
 
-/// Every answer of a public gateway is readable cross-origin: content, a
-/// window, and every refusal the SDK maps to an error.
+/// Every answer of a public gateway is readable cross-origin: content on the
+/// bare, site and namespace hosts, a window, `HEAD`, a redirect, and the
+/// 402, 416, 503 and 404 refusals.
 #[tokio::test]
 async fn every_public_answer_is_readable_by_any_origin() {
     let allowance = u64::try_from(public_manifest().len()).unwrap() + 3;
@@ -2590,7 +2600,10 @@ async fn every_public_answer_is_readable_by_any_origin() {
     let ok = request(&gateway, &host, "/a.txt", &origin).await;
     let spent = request(&gateway, &host, "/a.txt", &origin).await;
     let (gateway, _logs, host) = public_gateway().await;
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
     let unfunded = format!("/{}", alloy::hex::encode(UNFUNDED));
+    let blob = format!("/{}", alloy::hex::encode(OTHER));
+    let bundle = format!("/{}/", alloy::hex::encode(BLOB));
     let window = [("origin", "https://app.example"), ("range", "bytes=1-2")];
     let past = [("origin", "https://app.example"), ("range", "bytes=3-")];
     let answers = [
@@ -2601,6 +2614,10 @@ async fn every_public_answer_is_readable_by_any_origin() {
         request(&gateway, "decdn.test", &unfunded, &origin).await,
         request(&gateway, &host, "/missing.txt", &origin).await,
         send(&gateway, Method::HEAD, &host, "/a.txt", &origin).await,
+        send(&gateway, Method::HEAD, "decdn.test", &blob, &origin).await,
+        request(&gateway, "decdn.test", &bundle, &origin).await,
+        request(&gateway, "7.decdn.test", "/a.txt", &origin).await,
+        request(&gateway, "8.decdn.test", "/a.txt", &origin).await,
     ];
     let statuses: Vec<_> = answers.iter().map(|a| a.status).collect();
     assert_eq!(
@@ -2613,6 +2630,10 @@ async fn every_public_answer_is_readable_by_any_origin() {
             StatusCode::SERVICE_UNAVAILABLE,
             StatusCode::NOT_FOUND,
             StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::FOUND,
+            StatusCode::OK,
+            StatusCode::NOT_FOUND,
         ]
     );
     for answer in &answers {
@@ -2621,9 +2642,9 @@ async fn every_public_answer_is_readable_by_any_origin() {
     }
 }
 
-/// A loopback gateway keeps content same-origin: no CORS header on its
-/// answers and no preflight outside its API, so the token never becomes
-/// sendable cross-origin.
+/// A loopback gateway keeps content same-origin: no CORS header on content
+/// and no preflight outside its API, so no page on another origin can send
+/// the token header to content.
 #[tokio::test]
 async fn a_loopback_gateway_answers_content_to_no_other_origin() {
     let (gateway, host) = site_gateway().await;

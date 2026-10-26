@@ -60,9 +60,11 @@ download, a BEP 19 webseed `url-list`): the response is `206` over exactly that 
 paid for by the chunk-group-aligned span around it.
 
 Every answer is readable from any origin (`Access-Control-Allow-Origin: *`), so a web page
-or the [TypeScript SDK](https://github.com/decdn/sdk-typescript) in a browser fetches straight from the gateway, and `OPTIONS` is a
-preflight that admits `Range`. Let the proxy pass `OPTIONS` and the gateway's CORS headers
-through unchanged. See
+or the [TypeScript SDK](https://github.com/decdn/sdk-typescript) in a browser fetches
+straight from the gateway. `OPTIONS` is a preflight that admits `Range` on content and a
+JSON `PUT /_pointer` on the bare host. Let the proxy pass `OPTIONS` and the gateway's CORS
+headers through unchanged, and add none of its own: a second `Access-Control-Allow-Origin`
+makes a browser refuse the answer. See
 [`adr/appendix-gateway.md`](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#cross-origin-reads).
 
 A namespace is a stable host, `https://<ns>.decdn.link/`, once its owner points it at a

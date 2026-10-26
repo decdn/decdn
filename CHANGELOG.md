@@ -3534,15 +3534,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
-- **Gateway: a public gateway answers every origin.** `decdn gateway
+- **Gateway: a public gateway answers every origin (#2628).** `decdn gateway
   --public-url` adds `Access-Control-Allow-Origin: *` and exposes
   `Content-Length`, `Content-Range`, `Accept-Ranges`, `Content-Type`,
   `Content-Disposition`, `ETag`, `Retry-After` and `Link` on every answer,
   and `OPTIONS` is a 204 preflight that admits `GET`/`HEAD` with `Range` on
-  content, and `PUT` with `content-type` on `/_pointer`. This is a behaviour
-  change of the public gateway: `OPTIONS` answered 404 before. A proxy in
-  front must pass `OPTIONS` and these headers through. A loopback gateway is
-  unchanged.
+  content, and `PUT` with `content-type` on the bare host's `/_pointer`. This
+  is a behaviour change of the public gateway: `OPTIONS` answered 404 on the
+  bare host and 405 on a site host before. A proxy in front must pass
+  `OPTIONS` and these headers through, and add no CORS headers of its own. A
+  loopback gateway is unchanged.
   - Why: a web page, and the TypeScript SDK
     ([decdn/sdk-typescript](https://github.com/decdn/sdk-typescript)) in a
     browser, read content and the 402/503 fallback URI straight from a public
