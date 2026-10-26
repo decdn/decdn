@@ -1,0 +1,123 @@
+name: SDK contract
+
+# The TypeScript SDK's contract suite against real gateways, on pull requests
+# only. It runs decdn/sdk-typescript's code (at the commit
+# `.github/sdk-typescript.sha` pins), so it never runs in the default branch's
+# context: a pull request's caches cannot reach the ones `main` restores. The
+# pin moves only in a pull request, so a push or schedule run would test
+# nothing new. Its own workflow, not a `ci.yml` job, because `ci.yml` also
+# runs on push and dispatch; so it is not part of `CI success`, and it blocks
+# a merge only as a required check in the branch ruleset.
+on:
+  pull_request:
+    branches: [main]
+    # What the run depends on: the gateway and fixtures (Rust), the contracts
+    # the fixtures deploy, the pin, and this file.
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'contracts/**'
+      - '.gitmodules'
+      - '.config/nextest.toml'
+      - '.github/sdk-typescript.sha'
+      - '.github/workflows/sdk-contract.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The TypeScript SDK's contract suite against a real `decdn gateway`, public
+  # and loopback (`crates/e2e/tests/gateway_sdk.rs`), so a drift between the
+  # SDK's fake gateway and the binary fails here. The SDK is
+  # decdn/sdk-typescript at the commit `.github/sdk-typescript.sha` pins: new
+  # SDK code runs here only once a decdn PR moves the pin, and an SDK commit
+  # never turns decdn's `main` red on its own. A gateway change the SDK can
+  # observe lands its sdk-typescript PR first, then moves the pin in the same
+  # decdn PR. The test fails, never skips, without `node`, the checkout or
+  # `node_modules`, on a skipped or todo test, and when the suite did not reach
+  # this gateway.
+  #
+  # ~10m observed; 30m clears a cold build plus two runs at the 600s heavy
+  # tier, `--test-threads 2`.
+  anvil-e2e-sdk:
+    name: anvil e2e (sdk contract)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
+    steps:
+      # submodules: recursive — the in-test `forge build` needs the forge-std +
+      # openzeppelin-contracts submodules under contracts/lib/.
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache/CodeQL \
+                      /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+        with:
+          make-default: false
+      # foundry-toolchain directly, not ./.github/actions/foundry-setup: that
+      # action saves the shared solc cache, and the SDK's code runs here.
+      - uses: foundry-rs/foundry-toolchain@v1.9.1
+        with:
+          version: v1.7.1
+          cache: false
+      # The journeys' cache (same RUSTFLAGS and targets), restored and never
+      # saved: the SDK's code runs in this job, so it writes no cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: anvil-e2e-journeys
+          save-if: false
+      - uses: taiki-e/install-action@v2.87.29
+        with:
+          tool: cargo-nextest
+      - name: Read the pinned TypeScript SDK commit
+        id: sdk
+        run: echo "sha=$(tr -d '[:space:]' < .github/sdk-typescript.sha)" >> "$GITHUB_OUTPUT"
+      - name: Check out the TypeScript SDK
+        uses: actions/checkout@v7
+        with:
+          repository: decdn/sdk-typescript
+          ref: ${{ steps.sdk.outputs.sha }}
+          path: sdk-typescript
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          package_json_file: sdk-typescript/package.json
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '24'
+      - name: Install the SDK's dependencies
+        # No install scripts: the contract run needs none.
+        run: pnpm -C sdk-typescript install --frozen-lockfile --ignore-scripts
+      - name: Build contracts once (hoisted from the fixtures)
+        working-directory: contracts
+        run: forge build
+      - name: Build daemon + CLI for the fixtures
+        run: cargo build -p decdn-node -p decdn-cli
+      - name: Run the SDK contract suite against real gateways
+        env:
+          DECDN_SDK_DIR: ${{ github.workspace }}/sdk-typescript
+        run: >
+          cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e
+          --test gateway_sdk --test-threads 2 --no-tests=fail

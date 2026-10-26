@@ -119,3 +119,24 @@ fn malformed_signature_bytes_fail_reconstruction() {
         Err(GrantOwnerError::Decode(GrantError::BadSignature))
     );
 }
+
+/// The token of a fixed grant, byte for byte. The TypeScript SDK's
+/// `parseCapability` decodes this same string
+/// (<https://github.com/decdn/sdk-typescript/blob/main/test/fixtures/capability.json>),
+/// so a codec change on either side fails here or there.
+#[test]
+fn a_fixed_grant_encodes_to_a_pinned_token() {
+    let grant = CapabilityGrant {
+        pool_id: b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
+        signer: address!("00000000000000000000000000000000000000a1"),
+        spending_cap: 10_000_000,
+        expiry: 1_900_000_000,
+        owner_signature: (0u8..65).collect(),
+    };
+    assert_eq!(
+        grant.to_token(),
+        "dcap1:IBEiM0RVZneImQCqu8zd7v8AESIzRFVmd4iZqrvM3e7_FAAAAAAAAA\
+         AAAAAAAAAAAAAAAAChgK3iBIDm_okHQQABAgMEBQYHCAkKCwwNDg8QERITFB\
+         UWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9A"
+    );
+}

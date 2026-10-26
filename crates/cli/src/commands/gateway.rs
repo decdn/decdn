@@ -49,9 +49,9 @@
 //! the token holder. A restart drops every key, and with it every capability
 //! issued to one.
 //!
-//! **Boundaries.** Only `/_delegate` and `/_capability` answer cross-origin;
-//! content never does, so a page can neither read a response nor set the
-//! token or host headers itself. The token lives in `<data-dir>/token`,
+//! **Boundaries.** On a loopback gateway only `/_delegate` and `/_capability`
+//! answer cross-origin; content never does, so a page can neither read a
+//! response nor set the token or host headers itself. The token lives in `<data-dir>/token`,
 //! owner-only. The gateway listens on loopback only and checks `Host` against
 //! DNS rebinding: it answers its own loopback names and well-formed site
 //! names on its port, nothing else.
@@ -80,7 +80,9 @@
 //! `curl -r`, a resumed download and a BEP 19 webseed all work. `HEAD` is answered from
 //! the bundle manifest, at no pull of the entry. The API paths answer `404`,
 //! and a site's `Sec-Fetch-*` headers decide nothing: the operator pays,
-//! within the allowance. A pull runs a small read-ahead
+//! within the allowance. Every answer is readable by every origin
+//! (`readable_anywhere`), and `OPTIONS` is a preflight
+//! (`public_preflight`). A pull runs a small read-ahead
 //! (`PUBLIC_READ_AHEAD_BYTES`), and a response that does not end cleanly (a
 //! client that drops it, a cut, a fault) is charged what the pull may have
 //! paid past the frames it delivered (`DROP_PENALTY_BYTES`), so a client
@@ -1055,7 +1057,8 @@ impl Gateway {
         self.public.is_some()
     }
 
-    /// Answer `req`, and count the answer on a public gateway.
+    /// Answer `req`. On a public gateway, count the answer and make it
+    /// readable by every origin ([`readable_anywhere`]).
     async fn handle<B>(self: Arc<Self>, req: Request<B>) -> Response<Body>
     where
         B: HttpBody<Data = Bytes>,
@@ -1066,6 +1069,7 @@ impl Gateway {
         let response = self.answer(req).await;
         if public && let Some(public) = &gateway.public {
             public.metrics.request(response.status());
+            return readable_anywhere(response);
         }
         response
     }
@@ -1133,7 +1137,17 @@ impl Gateway {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
         let gateway = Arc::clone(&self);
-        match self.sites.route(host) {
+        let route = self.sites.route(host);
+        if route.is_none() && !self.hosts.iter().any(|allowed| allowed == host) {
+            return text(StatusCode::FORBIDDEN, "unknown Host\n");
+        }
+        if self.public() && req.method() == Method::OPTIONS {
+            return public_preflight(
+                req.uri().path(),
+                !matches!(route, Some(Route::Site(_) | Route::Namespace(_))),
+            );
+        }
+        match route {
             Some(Route::Site(site)) => {
                 let response = self.site(req, site, None).await;
                 return gateway.with_policy(response);
@@ -1152,9 +1166,7 @@ impl Gateway {
                 let response = self.site(req, site, Some(ns)).await;
                 return gateway.with_policy(response);
             }
-            Some(Route::Bare) => {}
-            None if self.hosts.iter().any(|allowed| allowed == host) => {}
-            None => return text(StatusCode::FORBIDDEN, "unknown Host\n"),
+            Some(Route::Bare) | None => {}
         }
         let origin = req
             .headers()
@@ -1171,7 +1183,7 @@ impl Gateway {
             .to_owned();
         if self.public() {
             match (&method, path.as_str()) {
-                (&Method::OPTIONS, _) | (_, "/_delegate" | "/_capability") => {
+                (_, "/_delegate" | "/_capability") => {
                     return text(StatusCode::NOT_FOUND, "a public gateway has no API\n");
                 }
                 (&Method::PUT, "/_pointer") => return self.put_pointer(req).await,
@@ -2512,6 +2524,64 @@ fn preflight(origin: Option<&str>) -> Response<Body> {
         "access-control-allow-private-network",
         header::HeaderValue::from_static("true"),
     );
+    response
+}
+
+/// The response headers a page on another origin may read from a public
+/// gateway: the body's length and type, the hash (`ETag`), the window
+/// (`Content-Range`, `Accept-Ranges`) and, on a 402 or 503, when to retry and
+/// where to fetch instead (`Retry-After`, `Link`).
+const PUBLIC_EXPOSED: header::HeaderValue = header::HeaderValue::from_static(
+    "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, ETag, \
+     Retry-After, Link",
+);
+
+/// The origins that may read a public gateway's answers: all of them.
+const ANY_ORIGIN: header::HeaderValue = header::HeaderValue::from_static("*");
+
+/// The preflight answer of a public gateway for `path`, `bare` when on its
+/// own host rather than a site or namespace host. The gateway asks for no
+/// credentials and holds no token, so any origin may read its content, with a
+/// `Range`, and `PUT /_pointer` on the bare host with a JSON body. The API
+/// paths answer 404 on every other host, and `/_delegate` and `/_capability`
+/// on the bare host too. It sets no `Access-Control-Allow-Origin`:
+/// [`readable_anywhere`] does, in [`Gateway::handle`].
+fn public_preflight(path: &str, bare: bool) -> Response<Body> {
+    let (methods, headers) = match path {
+        "/_delegate" | "/_capability" | "/_pointer" if !bare => {
+            return text(
+                StatusCode::NOT_FOUND,
+                "the gateway API answers on the gateway origin only\n",
+            );
+        }
+        "/_delegate" | "/_capability" => {
+            return text(StatusCode::NOT_FOUND, "a public gateway has no API\n");
+        }
+        "/_pointer" => ("PUT", "content-type"),
+        _ => ("GET, HEAD", "range"),
+    };
+    let mut response = text(StatusCode::NO_CONTENT, "");
+    let fields = response.headers_mut();
+    fields.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        header::HeaderValue::from_static(methods),
+    );
+    fields.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        header::HeaderValue::from_static(headers),
+    );
+    fields.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        header::HeaderValue::from_static("600"),
+    );
+    response
+}
+
+/// `response` of a public gateway, readable by every origin.
+fn readable_anywhere(mut response: Response<Body>) -> Response<Body> {
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, ANY_ORIGIN);
+    headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, PUBLIC_EXPOSED);
     response
 }
 

@@ -18,7 +18,7 @@ deCDN builds with a native toolchain and works with any editor. Install the prer
 
 Pre-commit covers Solidity too: `forge fmt` and `solhint` run on every commit that touches `contracts/` (solhint needs no local install — pre-commit builds its own node sandbox), `forge build` and `forge test` run on push. The `slither` and `aderyn` static-analysis hooks are manual-stage and need their own installs — see [Solidity development](#solidity-development).
 
-Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`).
+Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`). The [TypeScript SDK contract run](#typescript-sdk-contract-run) needs Node.js 20.19+ and pnpm.
 
 ### Clone and Build
 
@@ -121,7 +121,8 @@ CARGO_BUILD_WARNINGS=deny cargo clippy -p decdn-incentive --no-default-features 
 
 The `--all-features` run is the only one that reaches anything behind an off-by-default feature —
 the `anvil-e2e` targets (journeys, the two `decdn-node` anvil tests, and sponsord's `chain_pool`
-and `binary_anvil`), `public-api-test`, the sponsord `test-support` fakes. Run it before pushing
+and `binary_anvil`), the `anvil-e2e` + `sdk-e2e` `gateway_sdk` target, `public-api-test`, the
+sponsord `test-support` fakes. Run it before pushing
 a change that touches gated code, or the first thing that tells you is a red CI.
 
 The sponsord crates (`crates/sponsord*`, [`docs/sponsord/`](docs/sponsord/README.md)) have two
@@ -193,6 +194,37 @@ cargo insta review
 
 [issue #304]: https://github.com/decdn/decdn/issues/304
 [issue #1150]: https://github.com/decdn/decdn/issues/1150
+
+### TypeScript SDK contract run
+
+The TypeScript SDK, `@decdn/client`, lives in
+[decdn/sdk-typescript](https://github.com/decdn/sdk-typescript). Its fake
+gateway mirrors this gateway's HTTP contract
+([appendix-gateway](adr/appendix-gateway.md)), and its contract suite runs
+here against the real binary, in the `SDK contract` workflow
+(`.github/workflows/sdk-contract.yml`, pull requests only), at the commit
+`.github/sdk-typescript.sha` pins. Locally, with `anvil` and `forge` on `PATH`
+(as for the journeys):
+
+```bash
+git clone https://github.com/decdn/sdk-typescript ../sdk-typescript
+git -C ../sdk-typescript checkout "$(cat .github/sdk-typescript.sha)"
+pnpm -C ../sdk-typescript install --frozen-lockfile --ignore-scripts
+cargo build -p decdn-cli -p decdn-node
+DECDN_SDK_DIR="$PWD/../sdk-typescript" \
+  cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e --test gateway_sdk
+```
+
+`--ignore-scripts` matches CI: the run needs no install scripts. The target
+has its own `sdk-e2e` feature, so the `anvil-e2e` journeys never build it.
+It fails, rather than skips, without `DECDN_SDK_DIR`, `node` or the SDK's
+`node_modules`, on a skipped or todo contract test, and when the suite did
+not reach this gateway.
+
+A gateway change the SDK can observe goes in this order: the sdk-typescript
+PR that updates its fake gateway and contract suite lands first, then the
+decdn PR moves `.github/sdk-typescript.sha` to it in the same change as the
+gateway. A new SDK commit runs here only when a decdn PR moves the pin.
 
 ## Solidity development
 

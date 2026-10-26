@@ -158,6 +158,33 @@ webseed is a plain URL with ranges, so it needs nothing more.
 `HEAD` on an entry answers from the bundle manifest: the entry's length and
 hash, at no pull of the entry.
 
+## Cross-origin reads
+
+A public gateway asks for no credentials. It holds no token. Thus every
+origin can read it. A page on any origin fetches a blob from `<host>` or an
+entry from a site host, and reads the answer.
+
+Every answer carries `Access-Control-Allow-Origin: *`.
+`Access-Control-Expose-Headers` names `Content-Length`, `Content-Range`,
+`Accept-Ranges`, `Content-Type`, `Content-Disposition`, `ETag`, `Retry-After`
+and `Link`. A page can also read a refusal. A 402 or 503 answer names the
+`decdn:` URI to fetch elsewhere, in its body and in `Link`.
+
+`OPTIONS` on a known host is a preflight. A preflight pulls nothing. It
+counts as an ok answer in the metrics. On a content path the answer is 204,
+with `Access-Control-Allow-Methods: GET, HEAD` and
+`Access-Control-Allow-Headers: range`. On `/_pointer` of the bare host the
+answer is 204, with `Access-Control-Allow-Methods: PUT` and
+`Access-Control-Allow-Headers: content-type`. Thus a page can sign a pointer
+with a wallet and send it. Both answers carry `Access-Control-Max-Age: 600`.
+A preflight on `/_delegate` or `/_capability`, or on `/_pointer` of a site or
+namespace host, answers 404.
+
+A site page has the policy `connect-src 'self'`. A page on another origin can
+read a site. A site page cannot read another origin. A loopback gateway sends
+CORS headers on its API only. A page on another origin cannot send the token
+header to content, and it cannot read content.
+
 ## Metrics
 
 `--metrics-listen <loopback address>` serves Prometheus text at

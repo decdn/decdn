@@ -275,3 +275,30 @@ fn the_pointer_dir_is_created_owner_only() {
         .collect();
     assert_eq!(entries, ["7.json"], "no temp file is left behind");
 }
+
+/// A fixed key, deployment and pointer sign to one signing hash and one
+/// signature. The TypeScript SDK signs the same pointer to the same bytes
+/// (<https://github.com/decdn/sdk-typescript/blob/main/test/fixtures/pointer.json>),
+/// so an EIP-712 change on either side fails here or there.
+#[test]
+fn a_fixed_pointer_signs_to_a_pinned_signature() {
+    let owner: PrivateKeySigner =
+        "2222222222222222222222222222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+    let pointer = signed(&owner, 7, 3);
+    let hash = signing_hash(7, B256::from(ROOT), 3, &domain());
+    assert_eq!(
+        owner.address().to_string(),
+        "0x1563915e194D8CfBA1943570603F7606A3115508"
+    );
+    assert_eq!(
+        hash.to_string(),
+        "0x8e666115641460cf638ebfc48f3b7e4bc63feb1261bc2527e154ff1dbdb117ad"
+    );
+    assert_eq!(
+        pointer.signature.to_string(),
+        "0x894aab743dc77773b0778901f124fee5f684942eb34981dc7d26bc181ac96f9a\
+         1cdf2927f9b868f71603a7d2cde6adc70cf9e0deb790b38117c2fbe74daccc0d1b"
+    );
+}
