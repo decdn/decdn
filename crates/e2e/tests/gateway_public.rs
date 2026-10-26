@@ -19,7 +19,9 @@
 //!   6. The metrics listener on loopback counts what the gateway served, and
 //!      the node wrote the wire bytes of those pulls and no more: no pull of
 //!      a.bin or b opens a stream it drops unread (#2619). Every pull reaches
-//!      the node, since the gateway keeps no blob bodies.
+//!      the node, since the gateway keeps no blob bodies. Its `/_status`
+//!      agrees with the exposition and shows the pool's lane and the spent
+//!      allowance, and its `/` is the dashboard.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and built `decdn` and `decdn-node` binaries:
@@ -410,6 +412,58 @@ async fn run() -> anyhow::Result<()> {
     anyhow::ensure!(
         counter("decdn_gateway_pulls_active")? == 0,
         "pulls in flight: {exposition}"
+    );
+
+    // The same counters, and what the store holds, as `/_status` has them.
+    let status: serde_json::Value = serde_json::from_str(
+        &http
+            .get(format!("http://{metrics}/_status"))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?,
+    )?;
+    anyhow::ensure!(status["mode"] == "public", "mode: {status}");
+    let counters = &status["counters"];
+    anyhow::ensure!(
+        counters["bytes_served"].as_u64() == Some(counter("decdn_gateway_bytes_served_total")?),
+        "bytes served disagree: {counters} vs {exposition}"
+    );
+    anyhow::ensure!(
+        counters["requests_allowance_exhausted"] == 1 && counters["pulls_active"] == 0,
+        "counters: {counters}"
+    );
+    let pools = status["pools"]["pools"]["pools"]
+        .as_array()
+        .with_context(|| format!("pools: {status}"))?;
+    anyhow::ensure!(pools.len() == 1, "one pool: {status}");
+    let lanes = pools[0]["lanes"].as_array().context("lanes")?;
+    anyhow::ensure!(
+        lanes
+            .iter()
+            .any(|l| l["last_bytes_delivered"].as_u64().is_some_and(|b| b > 0)),
+        "a lane that delivered: {status}"
+    );
+    anyhow::ensure!(
+        status["allowance"][0]["used"]
+            .as_u64()
+            .is_some_and(|u| u > 0),
+        "the shared bucket spent: {status}"
+    );
+    let page = http.get(format!("http://{metrics}/")).send().await?;
+    anyhow::ensure!(
+        page.status() == StatusCode::OK,
+        "dashboard: {}",
+        page.status()
+    );
+    anyhow::ensure!(
+        page.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|t| t.starts_with("text/html")),
+        "dashboard type: {:?}",
+        page.headers()
     );
 
     gateway.start_kill().context("stop the gateway")?;
