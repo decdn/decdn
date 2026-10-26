@@ -704,6 +704,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+          persist-credentials: false
       - name: Free disk space
         run: |
           sudo rm -rf /opt/hostedtoolcache/CodeQL \
@@ -718,13 +719,18 @@ jobs:
         uses: rui314/setup-mold@v1
         with:
           make-default: false
-      - uses: ./.github/actions/foundry-setup
+      # foundry-toolchain directly, not ./.github/actions/foundry-setup: that
+      # action saves the shared solc cache, and the SDK's code runs here.
+      - uses: foundry-rs/foundry-toolchain@v1.9.1
         with:
-          cache-profile: none
+          version: v1.7.1
+          cache: false
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: anvil-e2e-sdk
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # The SDK's code runs in this job, so nothing it could touch is
+          # saved for main-branch jobs to restore.
+          save-if: false
       - uses: taiki-e/install-action@v2.87.29
         with:
           tool: cargo-nextest
@@ -734,16 +740,16 @@ jobs:
           repository: decdn/sdk-typescript
           ref: main
           path: sdk-typescript
+          persist-credentials: false
       - uses: pnpm/action-setup@v6.1.0
         with:
           package_json_file: sdk-typescript/package.json
       - uses: actions/setup-node@v7.1.0
         with:
           node-version: '24'
-          cache: 'pnpm'
-          cache-dependency-path: sdk-typescript/pnpm-lock.yaml
       - name: Install the SDK's dependencies
-        run: pnpm -C sdk-typescript install --frozen-lockfile
+        # No install scripts: the contract run needs none.
+        run: pnpm -C sdk-typescript install --frozen-lockfile --ignore-scripts
       - name: Build contracts once (hoisted from the fixtures)
         working-directory: contracts
         run: forge build
