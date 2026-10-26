@@ -62,7 +62,7 @@ pre-commit run --all-files        # run all hooks manually
 
 Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo deny`, adr-book-list, adr-ref-hygiene, package-embeds, dashboard-lint, deployment-manifest-mirror, toolchain-pin, workspace-manifests, crate-edges, forge-fmt, solhint, forge-build, forge-test, slither, aderyn.
 
-dashboard-lint runs the dashboard's `eslint` and `prettier` only when a file under `crates/cli/dashboard/` changes, so it needs pnpm and an installed `node_modules` only for those commits.
+dashboard-lint runs the dashboard's `eslint` and `prettier` only when a file under `crates/cli/dashboard/` changes, so it needs Node 24 and an installed `node_modules` only for those commits; it runs pnpm from `PATH`, else through `corepack`.
 
 The repo-shape hooks (package-embeds, toolchain-pin, workspace-manifests, crate-edges) are stdlib-Python guards under `.github/scripts/`, each with a thin `.sh` wrapper and a pytest suite under `.github/scripts/tests/`; deployment-manifest-mirror is plain bash. They mirror the `packaging` CI job, which is authoritative. The pytest suites run in the `CI tooling tests` job, which is not part of the `CI success` gate, so a failing guard test does not block a merge — the guards themselves do. A new guard follows the same shape: a `check(...)` function the tests can drive on a fixture, a module docstring saying what breaks silently without it, a `repo: local` hook with a scoped `files:` regex, and a named step in `packaging`.
 

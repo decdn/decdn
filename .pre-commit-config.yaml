@@ -83,11 +83,11 @@ repos:
         pass_filenames: false
 
       # The gateway dashboard's eslint and prettier, only when its files
-      # change, so a Rust-only contributor never needs Node. Needs pnpm on
-      # PATH (`corepack enable`) and `pnpm -C crates/cli/dashboard install`.
+      # change, so a Rust-only contributor never needs Node. Needs Node 24
+      # and `pnpm -C crates/cli/dashboard install`.
       - id: dashboard-lint
         name: gateway dashboard lint
-        entry: pnpm -C crates/cli/dashboard lint
+        entry: .github/scripts/dashboard-lint.sh
         language: system
         files: '^crates/cli/dashboard/'
         pass_filenames: false
