@@ -112,6 +112,11 @@ pub struct decdn_client::bundle::NotAManifest(_)
 impl core::error::Error for decdn_client::bundle::NotAManifest
 impl core::fmt::Display for decdn_client::bundle::NotAManifest
 pub fn decdn_client::bundle::NotAManifest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct decdn_client::bundle::PlannedBlob
+pub decdn_client::bundle::PlannedBlob::download: u64
+pub decdn_client::bundle::PlannedBlob::hash: [u8; 32]
+pub decdn_client::bundle::PlannedBlob::size: core::option::Option<u64>
+pub decdn_client::bundle::PlannedBlob::wire: u64
 pub const decdn_client::bundle::STAGING_DIR: &str
 pub trait decdn_client::bundle::BundleObserver: core::marker::Send + core::marker::Sync
 pub fn decdn_client::bundle::BundleObserver::entry_landed(&self, &decdn_client::bundle::EntryLanded)
@@ -129,6 +134,7 @@ pub fn decdn_client::bundle::FileObserver::reconstructing(&self)
 pub fn decdn_client::bundle::foreign_paths(&decdn_client::bundle::BundleManifest, &std::path::Path) -> alloc::vec::Vec<decdn_client::bundle::ForeignPath>
 pub fn decdn_client::bundle::format_hash([u8; 32]) -> alloc::string::String
 pub fn decdn_client::bundle::parse_hash(&str) -> anyhow::Result<[u8; 32]>
+pub fn decdn_client::bundle::planned_downloads(&[decdn_client::bundle::ManifestEntry]) -> alloc::vec::Vec<decdn_client::bundle::PlannedBlob>
 pub async fn decdn_client::bundle::select_nodes(&decdn_client::session::ChainConfig, &decdn_client::session::PullSite, &decdn_client::session::DiscoveryOptions) -> anyhow::Result<decdn_client::bundle::NodeSelection>
 pub mod decdn_client::buyer_pool
 pub enum decdn_client::buyer_pool::EscrowUnconfirmed
@@ -350,6 +356,40 @@ pub fn decdn_client::probe::verify_probe_response(&decdn_protocol::message::Prob
 pub mod decdn_client::provider
 pub fn decdn_client::provider::build_provider(&str, &alloy_signer_local::PrivateKeySigner) -> anyhow::Result<impl alloy_provider::provider::trait::Provider + core::clone::Clone + use<>>
 pub fn decdn_client::provider::build_read_provider(&str) -> anyhow::Result<impl alloy_provider::provider::trait::Provider + core::clone::Clone + use<>>
+pub mod decdn_client::quote
+#[non_exhaustive] pub struct decdn_client::quote::Census
+pub decdn_client::quote::Census::hashes: alloc::vec::Vec<decdn_client::quote::HashCensus>
+pub decdn_client::quote::Census::outage_fallback: bool
+pub decdn_client::quote::Census::probed: usize
+#[non_exhaustive] pub struct decdn_client::quote::HashCensus
+pub decdn_client::quote::HashCensus::answers: alloc::vec::Vec<decdn_client::quote::NodeAnswer>
+pub decdn_client::quote::HashCensus::hash: [u8; 32]
+pub decdn_client::quote::HashCensus::rate_limited: usize
+pub decdn_client::quote::HashCensus::unreachable: usize
+pub decdn_client::quote::HashCensus::unusable: usize
+pub decdn_client::quote::HashCensus::unverifiable: usize
+impl decdn_client::quote::HashCensus
+pub fn decdn_client::quote::HashCensus::holders(&self) -> usize
+pub fn decdn_client::quote::HashCensus::serve_order(&self, u64, decdn_client::session::ProxyWarmingParams) -> alloc::vec::Vec<&decdn_client::quote::NodeAnswer>
+pub fn decdn_client::quote::HashCensus::size_hint(&self) -> core::option::Option<u64>
+#[non_exhaustive] pub struct decdn_client::quote::NodeAnswer
+pub decdn_client::quote::NodeAnswer::candidate: decdn_client::discovery::NodeCandidate
+pub decdn_client::quote::NodeAnswer::coverage: decdn_protocol::coverage::Coverage
+pub decdn_client::quote::NodeAnswer::has_blob: bool
+pub decdn_client::quote::NodeAnswer::rate_per_mb: u64
+pub decdn_client::quote::NodeAnswer::rtt_ms: f64
+pub decdn_client::quote::NodeAnswer::total_bytes: core::option::Option<u64>
+#[non_exhaustive] pub struct decdn_client::quote::PriceRange
+pub decdn_client::quote::PriceRange::high: alloy_primitives::aliases::U256
+pub decdn_client::quote::PriceRange::likely: alloy_primitives::aliases::U256
+pub decdn_client::quote::PriceRange::low: alloy_primitives::aliases::U256
+pub struct decdn_client::quote::PricedBlob
+pub decdn_client::quote::PricedBlob::rates: alloc::vec::Vec<u64>
+pub decdn_client::quote::PricedBlob::wire: u64
+pub const decdn_client::quote::CENSUS_ENTRY_SAMPLE: usize
+pub async fn decdn_client::quote::census(&iroh::endpoint::Endpoint, (&decdn_client::session::ChainConfig, &decdn_client::session::PullSite), &[iroh_base::relay_url::RelayUrl], &decdn_client::session::DiscoveryOptions, &[[u8; 32]]) -> anyhow::Result<decdn_client::quote::Census>
+pub fn decdn_client::quote::price(&[decdn_client::quote::PricedBlob], u64, usize) -> core::option::Option<decdn_client::quote::PriceRange>
+pub fn decdn_client::quote::wire_bytes(u64) -> anyhow::Result<u64>
 pub mod decdn_client::recovery
 pub struct decdn_client::recovery::RecoveryGate
 impl decdn_client::recovery::RecoveryGate

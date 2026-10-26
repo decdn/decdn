@@ -513,6 +513,46 @@ pub async fn select_nodes(
     })
 }
 
+/// The unpinned run's candidate list of [`select_nodes`], and whether it is
+/// the registry-outage fallback, which the region allowlist leaves alone.
+pub(crate) async fn registry_nodes(
+    chain: &ChainConfig,
+    site: &PullSite,
+    discovery: &DiscoveryOptions,
+) -> anyhow::Result<(Vec<crate::discovery::NodeCandidate>, bool)> {
+    let registry = engine::discover_candidates(chain, site, discovery).await?;
+    Ok((registry.nodes, registry.outage_fallback))
+}
+
+/// One distinct blob of a manifest and the content bytes a fresh pull of
+/// it pays for ([`planned_downloads`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PlannedBlob {
+    /// The blob's hash.
+    pub hash: [u8; 32],
+    /// The blob's size as its manifest entries declare it; `None` when none
+    /// does.
+    pub size: Option<u64>,
+    /// The content bytes a pull fetches for it: its whole size, less the
+    /// chunks it shares with a smaller entry, which that entry fetches. At
+    /// most `size`, and `0` for a blob with no declared size.
+    pub download: u64,
+    /// The wire bytes that download pays for: each range it fetches, with
+    /// the bao proof path from the blob's own tree, as the nodes meter it
+    /// (ADR 038 § Payment metering). `0` for a blob with no declared size.
+    pub wire: u64,
+}
+
+/// Each distinct blob of `entries`, in first-seen order, with the bytes a
+/// fresh pull of them all pays for. A blob two paths name counts once, and
+/// so does a chunk two blobs share, under the plan a pull runs
+/// ([`BundleObserver::run_started`] reports the same total).
+#[must_use]
+pub fn planned_downloads(entries: &[ManifestEntry]) -> Vec<PlannedBlob> {
+    engine::planned_downloads(entries)
+}
+
 /// Where a bundle pull reports its progress. Every method has a default
 /// that does nothing. The pull calls them from the task that awaits it.
 pub trait BundleObserver: Send + Sync {
@@ -883,6 +923,16 @@ impl BundlePuller {
         self.ctx.funding.escrows()
     }
 
+    /// The rates the run's nodes signed, nearest first: from the probes this
+    /// puller's fetches ran, else from the peer store. A node with neither is
+    /// left out. `decdn get` prints its estimate from these before the pull
+    /// starts (#2600).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn rate_hints(&self) -> Vec<crate::quote::RateHint> {
+        self.ctx.rate_hints()
+    }
+
     /// Wait for every queued peer-record and watermark write to land. Call it
     /// before the process exits, after a cancelled pull too, so the next run
     /// resumes each lane from what it paid.
@@ -1049,6 +1099,7 @@ impl BundlePullerBuilder {
             demand: Arc::new(RunDemand::default()),
             observer: self.observer,
             hints: self.hints,
+            rate_samples: std::sync::Mutex::default(),
         };
         Ok(BundlePuller { ctx })
     }

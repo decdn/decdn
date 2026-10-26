@@ -155,6 +155,7 @@ fn send_paid(
     worker
         .pull(Job {
             blob: BlobFetch {
+                estimate: false,
                 hash: [kind; 32],
                 namespace: None,
                 output: PathBuf::from("-"),
@@ -419,6 +420,7 @@ async fn a_job_refused_at_its_slot_pulls_nothing() {
     worker
         .pull(Job {
             blob: BlobFetch {
+                estimate: false,
                 hash: [HELLO; 32],
                 namespace: None,
                 output: PathBuf::from("-"),

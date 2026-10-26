@@ -21,13 +21,13 @@ use decdn_client::PoolReplaced;
 use decdn_client::bundle::{
     BundleEnd, BundleManifest, BundleObserver, BundlePuller, BundleReport, EntryLanded,
     FaultContext, FaultHints, FileObserver, ForeignReason, Funding, MalformedManifest,
-    ManifestEntry, NotAManifest, STAGING_DIR, format_hash, select_nodes,
+    ManifestEntry, NotAManifest, STAGING_DIR, format_hash, planned_downloads, select_nodes,
 };
 use decdn_client::buyer_pool::UnconfirmedEscrows;
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::uri::{DecdnUri, UriTarget};
-use decdn_common::cli::GetArgs;
 use decdn_common::cli::get::{DEFAULT_JOBS, DEFAULT_MAX_LANE_STREAMS};
+use decdn_common::cli::{ClientFetchArgs, GetArgs};
 use decdn_common::config::load_file_config;
 use decdn_incentive::CapabilityGrant;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
@@ -42,6 +42,7 @@ use super::get::Destination;
 use super::interrupt::{Interrupt, Interrupted, name_held_escrows};
 use super::manifest::build_glob_set;
 use super::pull_progress::{self, PullProgress};
+use super::quote;
 
 /// A manifest cut down to the entries this run pulls, and how many entries
 /// the `--include`/`--exclude` filter and the `--select` editor dropped.
@@ -676,9 +677,19 @@ pub(crate) async fn bundle_pull(
     // rather than after paying to fetch the manifest.
     check_select_flags(args)?;
 
-    // Dry-run short-circuits before any network/chain/keystore activity.
+    // Dry-run short-circuits before any payment, transaction or keystore
+    // prompt.
     if args.dry_run {
-        return dry_run(args, out, uri, &filter, filters_given);
+        // Boxed: the quote's probe round would otherwise grow every pull's
+        // future past the `large_futures` limit.
+        return Box::pin(dry_run(
+            args,
+            out,
+            uri,
+            (&filter, filters_given),
+            config_path,
+        ))
+        .await;
     }
 
     let common = &args.common;
@@ -738,52 +749,24 @@ async fn pull_over(
     relays: &[RelayUrl],
     (filter, filters_given): (&EntryFilter, bool),
 ) -> anyhow::Result<()> {
-    let common = &args.common;
-    // The node selection is resolved BEFORE the keystore prompt, so a failed
-    // discovery never prompts. A registry read is bounded by `--timeout-ms`
-    // (#1349), inside the read so a timeout still falls through to the peer
-    // store. No sampling or probing happens here: each entry samples and
-    // probes its own candidates.
-    let discovery = fetch::discovery_options(common)?;
-    let nodes = select_nodes(&chain.config, &chain.site, &discovery).await?;
-    let signer = load_buyer_signer(chain)?;
-    let funding = match &grant {
-        None => Funding::SelfOwned {
-            owner: signer,
-            deposit: chain.deposit_policy(false)?,
-        },
-        Some(grant) => Funding::Delegated {
-            slot: fetch::delegated_slot(grant, signer)?,
-        },
-    };
-
     let observer = Arc::new(PullObserver::new(args.json, run_label(out)));
     // Outlives the puller's passes, so an `openPool` or `topUp` that a Ctrl-C
     // or a fault dropped before its record committed is still named, and so is
     // one that escrowed untracked in an entry the pull dropped.
     let escrows = UnconfirmedEscrows::default();
-    let mut puller = BundlePuller::builder(
-        chain.config.clone(),
-        chain.site.clone(),
-        endpoint.clone(),
-        Arc::clone(store),
-        funding,
-        discovery,
-        nodes,
+    let lanes = (
+        args.jobs.unwrap_or(DEFAULT_JOBS),
+        usize::from(args.max_lane_streams.unwrap_or(DEFAULT_MAX_LANE_STREAMS)),
+    );
+    let mut puller = open_puller(
+        &args.common,
+        (chain, grant.as_ref(), store),
+        (endpoint, relays),
+        uri.namespace,
+        lanes,
+        Arc::clone(&observer) as Arc<dyn BundleObserver>,
+        &escrows,
     )
-    .relays(relays.to_vec())
-    .namespace(uri.namespace)
-    .jobs(args.jobs.unwrap_or(DEFAULT_JOBS))
-    .max_lane_streams(usize::from(
-        args.max_lane_streams.unwrap_or(DEFAULT_MAX_LANE_STREAMS),
-    ))
-    .max_rate_per_mb(common.max_rate_per_mb)
-    .max_blob_bytes(common.max_blob_mb.saturating_mul(1024 * 1024))
-    .stop(std::io::stderr().is_terminal(), common.give_up_after())
-    .observer(Arc::clone(&observer) as Arc<dyn BundleObserver>)
-    .fault_hints(Arc::new(CliFaultHints))
-    .unconfirmed_escrows(escrows.clone())
-    .build()
     .await?;
 
     // Watched from before the manifest: the manifest fetch is paid, so it can
@@ -808,6 +791,105 @@ async fn pull_over(
     let result = name_held_escrows(result, &escrows);
     // On every exit, a Ctrl-C's included: what the entries queued is durable
     // before the command returns.
+    puller.finish().await;
+    result
+}
+
+/// The run's puller: its node selection, its buyer key and funding, and
+/// its pull settings, with `observer` and `escrows` attached. `lanes` is the
+/// `--jobs` and `--max-lane-streams` pair.
+async fn open_puller(
+    common: &ClientFetchArgs,
+    (chain, grant, store): (
+        &fetch::ResolvedChain,
+        Option<&CapabilityGrant>,
+        &Arc<dyn BuyerPoolStore>,
+    ),
+    (endpoint, relays): (&Endpoint, &[RelayUrl]),
+    namespace: Option<u64>,
+    (jobs, max_lane_streams): (usize, usize),
+    observer: Arc<dyn BundleObserver>,
+    escrows: &UnconfirmedEscrows,
+) -> anyhow::Result<BundlePuller> {
+    // The node selection is resolved BEFORE the keystore prompt, so a failed
+    // discovery never prompts. A registry read is bounded by `--timeout-ms`
+    // (#1349), inside the read so a timeout still falls through to the peer
+    // store. No sampling or probing happens here: each entry samples and
+    // probes its own candidates.
+    let discovery = fetch::discovery_options(common)?;
+    let nodes = select_nodes(&chain.config, &chain.site, &discovery).await?;
+    let signer = load_buyer_signer(chain)?;
+    let funding = match grant {
+        None => Funding::SelfOwned {
+            owner: signer,
+            deposit: chain.deposit_policy(false)?,
+        },
+        Some(grant) => Funding::Delegated {
+            slot: fetch::delegated_slot(grant, signer)?,
+        },
+    };
+    BundlePuller::builder(
+        chain.config.clone(),
+        chain.site.clone(),
+        endpoint.clone(),
+        Arc::clone(store),
+        funding,
+        discovery,
+        nodes,
+    )
+    .relays(relays.to_vec())
+    .namespace(namespace)
+    .jobs(jobs)
+    .max_lane_streams(max_lane_streams)
+    .max_rate_per_mb(common.max_rate_per_mb)
+    .max_blob_bytes(common.max_blob_mb.saturating_mul(1024 * 1024))
+    .stop(std::io::stderr().is_terminal(), common.give_up_after())
+    .observer(observer)
+    .fault_hints(Arc::new(CliFaultHints))
+    .unconfirmed_escrows(escrows.clone())
+    .build()
+    .await
+}
+
+/// The manifest of the bundle `uri` names, read from `out`'s manifest cache
+/// or fetched and cached there: a paid pull from the caller's pool, which it
+/// opens or tops up as `decdn get` does. `decdn quote` calls it for a bundle
+/// with no cached manifest. A Ctrl-C ends the fetch [`Interrupted`].
+pub(crate) async fn fetch_manifest_paid(
+    common: &ClientFetchArgs,
+    out: &Path,
+    uri: &DecdnUri,
+    chain: &mut fetch::ResolvedChain,
+    (endpoint, relays): (&Endpoint, &[RelayUrl]),
+) -> anyhow::Result<BundleManifest> {
+    let grant = fetch::resolve_delegation_grant(common, chain)?;
+    let store: Arc<dyn BuyerPoolStore> = Arc::new(open_client_store_for_buy(
+        &chain.site.data_dir,
+        chain.data_dir_source,
+        "pull",
+    )?);
+    let escrows = UnconfirmedEscrows::default();
+    // No bars: a manifest fetch reports no run totals. Warnings and pool
+    // notes still print.
+    let observer = Arc::new(PullObserver::new(true, run_label(out)));
+    let puller = open_puller(
+        common,
+        (chain, grant.as_ref(), &store),
+        (endpoint, relays),
+        uri.namespace,
+        (1, usize::from(DEFAULT_MAX_LANE_STREAMS)),
+        observer,
+        &escrows,
+    )
+    .await?;
+    let mut interrupt = Interrupt::watch(escrows.clone());
+    let fetched = puller.fetch_manifest(uri.hash, out, true);
+    let result = until_interrupted(fetched, &mut interrupt)
+        .await
+        .map_err(not_a_manifest_hint);
+    fetch::print_reclaim_notes(&puller.replacements());
+    let result = name_held_escrows(result, &escrows);
+    warn_shortfall(&puller);
     puller.finish().await;
     result
 }
@@ -854,6 +936,10 @@ async fn pull_manifest(
         return Ok(());
     };
 
+    if !args.json {
+        print_estimate(puller, &manifest, &args.common);
+    }
+
     // The first Ctrl-C cancels the pull, which stops every fetch where it is
     // and still reports what landed.
     let cancel = CancellationToken::new();
@@ -879,6 +965,24 @@ async fn pull_manifest(
         BundleEnd::FundingNeeded { error, .. } | BundleEnd::Stopped(error) => Err(error),
         _ => reported,
     }
+}
+
+/// Print the run's one-line cost estimate on stderr (#2600): the kept
+/// entries' planned download for a fresh pull (a file already on disk still
+/// counts), paid as each blob's own wire bytes, at the rates the run's nodes
+/// last signed, nearest first. Nothing prints when no node's rate is known
+/// yet.
+fn print_estimate(puller: &BundlePuller, manifest: &BundleManifest, common: &ClientFetchArgs) {
+    let (download, wire) =
+        planned_downloads(&manifest.entries)
+            .iter()
+            .fold((0u64, 0u64), |(download, wire), b| {
+                (
+                    download.saturating_add(b.download),
+                    wire.saturating_add(b.wire),
+                )
+            });
+    quote::print_estimate((download, wire), &puller.rate_hints(), common);
 }
 
 /// `fetch`'s result, or [`Interrupted`] when the first Ctrl-C arrives first.
@@ -1136,25 +1240,34 @@ fn json_plan(out: &str, entries: &[ManifestEntry]) -> serde_json::Value {
     })
 }
 
-/// Print the would-fetch plan and exit (no network/chain/keystore activity).
-/// The plan lists the entries of the bundle's manifest as cached in the output
-/// root by an earlier pull. The cache is read even under `--overwrite`, which
-/// makes a real pull fetch the manifest again: the cache is content-addressed,
-/// so its bytes are exactly what that fetch returns. The entry selection
-/// `filter` applies to those entries, so the plan is the entry set a real run
-/// starts from and the unmatched-pattern warnings are the ones it prints. A real
-/// run then skips files already present in the output root (unless
-/// `--overwrite`) and warns on leftover partials; the dry run does neither. It
-/// does refuse a default destination that holds a file the pull may replace
+/// Print the would-fetch plan and its quote, and exit. Nothing is paid, no
+/// transaction is sent and no keystore is opened. The quote reads the node
+/// registry when the peer store cannot supply it, and sends one unpaid probe
+/// round, whose samples it records in the peer store. The plan lists the
+/// entries of the bundle's manifest as cached in the output root by an
+/// earlier pull or `decdn quote`. The cache is read even under `--overwrite`,
+/// which makes a real pull fetch the manifest again: the cache is
+/// content-addressed, so its bytes are exactly what that fetch returns. The
+/// entry selection `filter` applies to those entries, so the plan is the
+/// entry set a real run starts from and the unmatched-pattern warnings are
+/// the ones it prints. A real run then skips files already present in the
+/// output root (unless `--overwrite`) and warns on leftover partials; the dry
+/// run does neither, and its quote prices a fresh pull. It does refuse a
+/// default destination that holds a file the pull may replace
 /// ([`refuse_foreign`]), as a real run does. A bundle with no cached manifest
-/// reports only the bundle and the output root, with `entries: null` under
-/// `--json`.
-fn dry_run(
+/// reports only the bundle and the output root, with `entries: null` and
+/// `quote: null` under `--json`, since the quote needs the manifest's sizes.
+/// A quote that fails prints a warning, and `quote: null` with its
+/// `quote_error` under `--json`, except a fault the real run fails on too (an
+/// invalid or malformed `--node-id`/`--provider-address`, or probe
+/// signatures that do not recover to their operators), which fails the dry
+/// run ([`quote::dry_run_quote`]).
+async fn dry_run(
     args: &GetArgs,
     output: &Path,
     uri: &DecdnUri,
-    filter: &EntryFilter,
-    filters_given: bool,
+    (filter, filters_given): (&EntryFilter, bool),
+    config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let out = output.display();
     let cached = BundleManifest::cached(output, uri.hash).map_err(not_a_manifest_hint)?;
@@ -1166,6 +1279,8 @@ fn dry_run(
                 "hash": h.as_str(),
                 "count": null,
                 "entries": null,
+                "quote": null,
+                "quote_error": "no cached manifest",
             });
             println!("{plan}");
             return Ok(());
@@ -1180,17 +1295,37 @@ fn dry_run(
              (no cached manifest: entries are listed once a pull into this directory \
              caches it{filter_note})"
         );
+        let out_flag = args.output.as_ref().map_or_else(String::new, |o| {
+            format!(" -o {}", quote::shell_quote(&o.display().to_string()))
+        });
+        println!(
+            "run `decdn quote {}{out_flag}` to price it (a small paid pull fetches the manifest)",
+            quote::shell_quote(&args.uri)
+        );
         return Ok(());
     };
     let raw_empty = manifest.entries.is_empty();
     manifest.entries = filter.apply_and_warn(manifest.entries)?.0;
     refuse_foreign(args, output, &manifest)?;
+    let quoted = if manifest.entries.is_empty() {
+        None
+    } else {
+        let plan = quote::Plan::of_target(&manifest, &uri.target)?;
+        Some(quote::dry_run_quote(&args.common, config_path, &plan).await?)
+    };
+    if let Some(Err(warning)) = &quoted {
+        eprintln!("warning: {warning}");
+    }
     if args.json {
         // The `--json` plan stays machine-readable — an empty set is
         // `count: 0` with an empty `entries` array, no prose line. A bundle
         // with no cached manifest gives `count`/`entries` of `null`.
-        println!("{}", json_plan(&out.to_string(), &manifest.entries));
-    } else if manifest.entries.is_empty() {
+        let plan = json_plan(&out.to_string(), &manifest.entries);
+        println!("{}", with_quote(plan, quoted.as_ref(), &args.uri));
+        return Ok(());
+    }
+    let view = quoted.and_then(Result::ok);
+    if manifest.entries.is_empty() {
         // Match the real run's empty-result message rather than printing a
         // "would fetch 0 entr(ies)" plan, so `--dry-run` and a live pull
         // agree on what an emptied set looks like.
@@ -1211,8 +1346,31 @@ fn dry_run(
                 None => println!("  {}{}", e.path, chunks),
             }
         }
+        if let Some(view) = view {
+            let mut stdout = std::io::stdout().lock();
+            quote::write_quote(&mut stdout, &view)?;
+        }
     }
     Ok(())
+}
+
+/// The dry run's `--json` `plan` with its `quote` and `quote_error` keys:
+/// the quote and `null`, or `null` and why there is no quote.
+fn with_quote(
+    mut plan: serde_json::Value,
+    quoted: Option<&Result<quote::QuoteView, String>>,
+    uri: &str,
+) -> serde_json::Value {
+    let (quoted, error) = match quoted {
+        Some(Ok(view)) => (Some(quote::json_quote(uri, view)), None),
+        Some(Err(error)) => (None, Some(error.clone())),
+        None => (None, Some("nothing to fetch".to_owned())),
+    };
+    if let Some(fields) = plan.as_object_mut() {
+        fields.insert("quote".to_owned(), quoted.into());
+        fields.insert("quote_error".to_owned(), error.into());
+    }
+    plan
 }
 
 /// Summarize the run; return an error if any entry failed (after reporting

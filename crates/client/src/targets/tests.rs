@@ -835,3 +835,28 @@ fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result
     );
     Ok(())
 }
+
+/// A candidate's rate hint is its probe sample from this resolve, else the
+/// peer store's last rate; a candidate with neither is left out, and the
+/// order stays the failover order.
+#[test]
+fn rate_hints_prefer_the_probe_then_the_store() -> anyhow::Result<()> {
+    let (mut targets, node_a, node_b) = tests_support::two_holder_targets();
+    let dir = tempfile::tempdir()?;
+    let store = crate::PeerStore::open(dir.path());
+    let cfg = crate::StoreConfig::default();
+    // The store knows b at 40; a's probe sample (1) wins over its store rate.
+    store.record_sample(&node_a.node_id, 10.0, 99, now_secs(), &cfg)?;
+    store.record_sample(&node_b.node_id, 20.0, 40, now_secs(), &cfg)?;
+    targets.probed_samples = vec![(node_a.node_id, 10.0, 1)];
+    let hints = targets.rate_hints(&store);
+    let got: Vec<_> = hints.iter().map(|h| (h.provider, h.rate_per_mb)).collect();
+    assert_eq!(got, vec![(node_a.eth_address, 1), (node_b.eth_address, 40)]);
+
+    // A node neither probed nor recorded gives no hint.
+    let empty = tempfile::tempdir()?;
+    let hints = targets.rate_hints(&crate::PeerStore::open(empty.path()));
+    let got: Vec<_> = hints.iter().map(|h| (h.provider, h.rate_per_mb)).collect();
+    assert_eq!(got, vec![(node_a.eth_address, 1)]);
+    Ok(())
+}

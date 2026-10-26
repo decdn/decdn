@@ -443,11 +443,15 @@ The rules below apply to every pull:
   `-o`, `--json` and `--dry-run`, the command writes the absolute
   destination to stderr before the pull starts. A blob URI without `-o`
   writes the blob to `./<hash>`, in lowercase hex.
-- **`--dry-run`** reports the plan without any network/chain activity.
-  The plan lists entries only when an earlier pull into the same output
+- **`--dry-run`** reports the plan and its price, and pays nothing. It
+  sends no transaction and opens no keystore. It reads the node registry
+  when the peer store cannot supply it, and it sends one unpaid
+  `cdn/probe/v1` round, which `decdn quote` also runs. The plan lists
+  entries only when an earlier pull or `decdn quote` into the same output
   directory cached the bundle manifest under `.decdn-bundles/`. Without
   that cache, the dry run prints only the bundle hash and the output
-  directory. A cache file that the dry run cannot read, or that fails its
+  directory, and names the `decdn quote` command that gets the price. On a
+  blob URI, the dry run prints the destination and the price. A cache file that the dry run cannot read, or that fails its
   hash check, fails the dry run. A pull caches each manifest it fetches, keyed by its hash.
   A later pull of the same bundle into the same directory reads the
   cache. `--overwrite` makes a real pull fetch the manifest again.

@@ -98,6 +98,7 @@ async fn run() -> anyhow::Result<()> {
         Command::Probe(args) => commands::probe::probe(&args, config_path.as_deref()).await,
         Command::Gateway(args) => commands::gateway::gateway(&args, config_path.as_deref()).await,
         Command::Get(args) => commands::get::get(&args, config_path.as_deref()).await,
+        Command::Quote(args) => commands::quote::quote(&args, config_path.as_deref()).await,
         Command::Setup(args) => commands::setup::run(&args, config_path.as_deref()).await,
         Command::Node(args) => commands::node::node_dispatch(&args, config_path.as_deref()).await,
         // `origin` is offline, config-free local filesystem work — it never

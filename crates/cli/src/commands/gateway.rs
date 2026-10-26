@@ -2213,6 +2213,7 @@ impl Gateway {
         self.pulls
             .pull(Job {
                 blob: BlobFetch {
+                    estimate: false,
                     hash,
                     output: PathBuf::from("-"),
                     namespace,
