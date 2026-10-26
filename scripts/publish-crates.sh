@@ -58,10 +58,10 @@ fi
 # ---- preconditions -------------------------------------------------------
 
 # python3 is in here because it reads the crate list out of `cargo metadata`
-# below, node and pnpm because decdn-cli's .crate carries the gateway
-# dashboard's build. Bare coreutils (sed, head, cat) are not: they are assumed
-# the way bash itself is.
-for tool in cargo gh gpg git curl python3 node pnpm; do
+# below, node because decdn-cli's .crate carries the gateway dashboard's build
+# (pnpm comes from PATH or corepack, through .github/scripts/pnpm.sh). Bare
+# coreutils (sed, head, cat) are not: they are assumed the way bash itself is.
+for tool in cargo gh gpg git curl python3 node; do
   command -v "$tool" >/dev/null || die "$tool not found on PATH"
 done
 
@@ -330,8 +330,9 @@ fi
 echo "==> Gateway dashboard"
 # dashboard/dist/ is gitignored, so the tag's worktree has none: without this
 # build, decdn-cli's .crate would embed the page that says how to build it.
-pnpm -C crates/cli/dashboard install --frozen-lockfile || die "the dashboard's install failed"
-pnpm -C crates/cli/dashboard build || die "the dashboard's build failed"
+.github/scripts/pnpm.sh -C crates/cli/dashboard install --frozen-lockfile ||
+  die "the dashboard's install failed"
+.github/scripts/pnpm.sh -C crates/cli/dashboard build || die "the dashboard's build failed"
 .github/scripts/check-dashboard-packaged.sh || die "decdn-cli would ship without the dashboard"
 # cargo counts that gitignored build, which decdn-cli packages through
 # `include`, as uncommitted, so both publishes below take --allow-dirty. This

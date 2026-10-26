@@ -337,7 +337,9 @@ rather than resolved to whichever key sorts first.
 
 It then checks out the tag into a detached worktree and publishes from there,
 not from your working copy, so uncommitted edits or a different branch cannot
-leak into the upload. `cargo publish --workspace` resolves the order itself and
+leak into the upload. There it builds the gateway dashboard, which
+`decdn-cli`'s crate carries, so the script needs Node 24; it runs pnpm from
+`PATH`, else through `corepack`. `cargo publish --workspace` resolves the order itself and
 waits for each crate to reach the index before publishing its dependents. After
 a dry run it prints the crate list and asks you to type the version to confirm.
 
