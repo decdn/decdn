@@ -201,7 +201,8 @@ The TypeScript SDK, `@decdn/client`, lives in
 [decdn/sdk-typescript](https://github.com/decdn/sdk-typescript). Its fake
 gateway mirrors this gateway's HTTP contract
 ([appendix-gateway](adr/appendix-gateway.md)), and its contract suite runs
-here against the real binary, in the `anvil-e2e-sdk` CI job, at the commit
+here against the real binary, in the `SDK contract` workflow
+(`.github/workflows/sdk-contract.yml`, pull requests only), at the commit
 `.github/sdk-typescript.sha` pins. Locally, with `anvil` and `forge` on `PATH`
 (as for the journeys):
 
