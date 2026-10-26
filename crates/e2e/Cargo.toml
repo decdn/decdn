@@ -33,9 +33,9 @@ default = []
 # `decdn-incentive/buyer-store-core`. `redb` is not gated out here either — it
 # arrives transitively via `decdn-node`.
 anvil-e2e = ["decdn-incentive/redb"]
-# The TypeScript SDK's contract run (`tests/gateway_sdk.rs`) on top of
-# `anvil-e2e`: it also needs `node` and a decdn/sdk-typescript checkout with
-# its `node_modules` (`DECDN_SDK_DIR`), so it is its own gate and the
+# The TypeScript SDK's contract run (`tests/gateway_sdk.rs`), enabled together
+# with `anvil-e2e`: it also needs `node` and a decdn/sdk-typescript checkout
+# with its `node_modules` (`DECDN_SDK_DIR`), so it is its own gate and the
 # `anvil-e2e` journeys never build it.
 sdk-e2e = []
 

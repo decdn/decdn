@@ -4,35 +4,30 @@
 //!
 //! The SDK's contract suite (`test/contract/*.test.ts` in that repository)
 //! runs against its fake gateway in the SDK's own CI. Here the same files run
-//! against the binary, so a drift between the fake and the gateway fails:
+//! against the binary, so a drift between the fake and the gateway fails.
+//! The harness sets up what each file needs; what they check is theirs:
 //!
 //!   1. Public: a node serves a blob and a bundle (a text entry, a page that
 //!      links the blob, a 256 KiB entry), a publisher owns a namespace, and a
-//!      public gateway pinned to the node runs as a subprocess. The suite
-//!      fetches and verifies blobs and entries, ranges, `HEAD`, the manifest,
-//!      CORS answers, and sets a pointer.
-//!   2. Loopback: an owner opens a pool, the gateway mints a delegate and the
-//!      owner issues it a capability (`decdn pool assign`). The suite is
-//!      refused before it registers the capability, registers and lists it,
-//!      then fetches and verifies content with the token.
+//!      public gateway pinned to the node runs as a subprocess.
+//!   2. Loopback: an owner opens a pool, the gateway mints a delegate, and the
+//!      owner issues it a capability (`decdn pool assign`) that the suite
+//!      registers.
 //!
 //! The harness writes what the suite needs (URLs, token, hashes, bytes, the
 //! namespace key) to a JSON file named by `DECDN_CONTRACT` and runs vitest
-//! with `node`. Every request the suite sends goes to the gateway's loopback
-//! listener with the URL's host as `Host`, as behind a TLS proxy.
+//! with `node`. The suite connects every request to the gateway's listener and
+//! sends the URL's host as `Host`; on the public run this stands in for the
+//! TLS proxy in front of `http://decdn.test`. A run passes only when every
+//! collected test passed, and when the gateway holds what only the suite's
+//! own requests create (the namespace pointer, the registered capability), so
+//! neither a skipped suite nor one that fell back to the fake passes.
 //!
 //! Gated behind the `anvil-e2e` and `sdk-e2e` features (off by default).
 //! Requires `anvil` + `forge` + `node` on `PATH`, built `decdn` and
 //! `decdn-node` binaries, and `DECDN_SDK_DIR` naming, by absolute path, a
-//! checkout of decdn/sdk-typescript with its dependencies installed:
-//!
-//! ```bash
-//! git clone https://github.com/decdn/sdk-typescript ../sdk-typescript
-//! pnpm -C ../sdk-typescript install --frozen-lockfile
-//! cargo build -p decdn-cli -p decdn-node
-//! DECDN_SDK_DIR="$PWD/../sdk-typescript" \
-//!   cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e --test gateway_sdk
-//! ```
+//! checkout of decdn/sdk-typescript with its dependencies installed. The
+//! commands are in CONTRIBUTING.md § TypeScript SDK contract run.
 
 #![cfg(all(feature = "anvil-e2e", feature = "sdk-e2e"))]
 // Test scaffolding legitimately uses unwrap/expect/panic; the workspace
@@ -68,8 +63,12 @@ const KEYSTORE_PASSWORD: &str = "gateway-sdk-e2e-password";
 const DOMAIN: &str = "decdn.test";
 /// The page host whose capability pays on the loopback gateway.
 const PAGE_HOST: &str = "example.com";
-/// Heavy journey tier: a 90s warm-up and a 60s start-up ladder, then a
-/// vitest run (see [`decdn_e2e::timeout`] for the tier rule).
+/// The longest one harness request may take: a stuck request fails here, not
+/// at the overall timeout.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Heavy journey tier (see [`decdn_e2e::timeout`] for the tier rule): the
+/// loopback run polls up to 90s (the owner's warm-up) and 60s (the token),
+/// the public run up to 90s (the first pull), and each then runs vitest.
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 
 /// Deterministic pseudo-random bytes (xorshift32), distinct per `seed`.
@@ -124,12 +123,20 @@ impl Content {
         }
     }
 
-    /// Every blob the node serves, the manifest last.
+    /// The content's blobs, the manifest last.
     fn blobs(&self) -> Vec<&[u8]> {
         let mut out: Vec<&[u8]> = vec![self.blob.as_slice()];
         out.extend(self.files.iter().map(|(_, b)| b.as_slice()));
         out.push(self.manifest.as_slice());
         out
+    }
+
+    /// The bytes of the bundle file at `path`.
+    fn file(&self, path: &str) -> Option<&[u8]> {
+        self.files
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, b)| b.as_slice())
     }
 
     /// The fixture fields that name the content, hex-encoded.
@@ -256,11 +263,12 @@ async fn public() -> anyhow::Result<()> {
             .spawn()
             .context("spawn decdn gateway")?;
     let base = format!("http://{listen}");
-    let http = reqwest::Client::new();
+    let http = http_client()?;
     // The gateway's first pull opens its pool, and the node serves it once
     // its chain watcher has seen the pool: the suite starts after that.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
+        still_running(&mut gateway, "start-up")?;
         let status = http
             .get(format!("{base}/{}", blob_hash.to_hex()))
             .header("host", DOMAIN)
@@ -287,9 +295,23 @@ async fn public() -> anyhow::Result<()> {
         "namespace": namespace.to_string(),
         "privateKey": format!("{}", publisher.to_bytes()),
     });
-    let result = run_suite(&sdk, "test/contract/public.test.ts", &fixture).await;
-    let _ = gateway.kill().await;
-    result
+    run_suite(&sdk, "test/contract/public.test.ts", &fixture).await?;
+
+    // Only the suite's own `pointer.set` gives the namespace host a bundle.
+    let page = http
+        .get(format!("{base}/a.txt"))
+        .header("host", format!("{namespace}.{DOMAIN}"))
+        .send()
+        .await
+        .context("read the namespace host the suite pointed")?;
+    let status = page.status();
+    let body = page.bytes().await?;
+    anyhow::ensure!(
+        status == StatusCode::OK && content.file("a.txt") == Some(body.as_ref()),
+        "the namespace host does not serve the bundle ({status}): the suite never set the \
+         pointer on this gateway"
+    );
+    stop(gateway).await
 }
 
 #[allow(
@@ -362,15 +384,23 @@ async fn loopback() -> anyhow::Result<()> {
         .spawn()
         .context("spawn decdn gateway")?;
     let base = format!("http://{listen}");
-    let token = wait_for_token(&gateway_dir.path().join("token"), &base).await?;
+    let http = http_client()?;
+    let token = wait_for_token(
+        &mut gateway,
+        &http,
+        &gateway_dir.path().join("token"),
+        &base,
+    )
+    .await?;
 
     // ---- A delegate the gateway holds, and a capability the owner issues it ----
-    let minted: serde_json::Value = reqwest::Client::new()
+    let minted: serde_json::Value = http
         .get(format!("{base}/_delegate"))
         .header("x-decdn-token", &token)
         .send()
-        .await?
-        .error_for_status()?
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .context("mint a delegate with the gateway token")?
         .json()
         .await?;
     let delegate = minted["address"]
@@ -408,12 +438,35 @@ async fn loopback() -> anyhow::Result<()> {
     fixture["mode"] = "loopback".into();
     fixture["gatewayUrl"] = base.clone().into();
     fixture["connect"] = listen.clone().into();
-    fixture["token"] = token.into();
+    fixture["token"] = token.clone().into();
     fixture["host"] = PAGE_HOST.into();
     fixture["capability"] = capability.into();
-    let result = run_suite(&sdk, "test/contract/loopback.test.ts", &fixture).await;
-    let _ = gateway.kill().await;
-    result
+    run_suite(&sdk, "test/contract/loopback.test.ts", &fixture).await?;
+
+    // Only the suite's own `registerCapability` gives the delegate a scope.
+    let held: serde_json::Value = http
+        .get(format!("{base}/_capability"))
+        .header("x-decdn-token", &token)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .context("list the gateway's capabilities")?
+        .json()
+        .await?;
+    let registered = held.as_array().is_some_and(|held| {
+        held.iter().any(|c| {
+            c["signer"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&delegate))
+                && c["scope"] == PAGE_HOST
+        })
+    });
+    anyhow::ensure!(
+        registered,
+        "the gateway holds no capability for {delegate} on {PAGE_HOST}: the suite never \
+         registered it on this gateway ({held})"
+    );
+    stop(gateway).await
 }
 
 /// The SDK checkout `DECDN_SDK_DIR` names, with its dependencies installed. A
@@ -449,11 +502,13 @@ fn sdk_dir() -> anyhow::Result<PathBuf> {
     Ok(sdk)
 }
 
-/// Run the contract suite `file` in `sdk` against `fixture`, requiring it to
-/// pass. Its output goes to this test's.
+/// Run the contract suite `file` in `sdk` against `fixture`, requiring every
+/// test it collects to pass: a skipped or todo test proves nothing about the
+/// gateway. Its output goes to this test's.
 async fn run_suite(sdk: &Path, file: &str, fixture: &serde_json::Value) -> anyhow::Result<()> {
     let dir = tempfile::tempdir().context("fixture tempdir")?;
     let path = dir.path().join("contract.json");
+    let report = dir.path().join("report.json");
     std::fs::write(&path, serde_json::to_vec_pretty(fixture)?).context("write the fixture")?;
     let status = tokio::process::Command::new("node")
         .current_dir(sdk)
@@ -462,14 +517,58 @@ async fn run_suite(sdk: &Path, file: &str, fixture: &serde_json::Value) -> anyho
             "run",
             "--project",
             "contract",
+            "--reporter=default",
+            "--reporter=json",
+            &format!("--outputFile.json={}", report.display()),
             file,
         ])
         .env("DECDN_CONTRACT", &path)
-        .status()
+        // Without the fixture the suite fails instead of testing its fake.
+        .env("DECDN_CONTRACT_REQUIRED", "1")
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawn node vitest")?
+        .wait()
         .await
-        .context("spawn node vitest")?;
+        .context("wait for node vitest")?;
     anyhow::ensure!(status.success(), "the SDK contract suite failed: {status}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).context("read the vitest JSON report")?)
+            .context("parse the vitest JSON report")?;
+    let total = report["numTotalTests"]
+        .as_u64()
+        .context("numTotalTests in the vitest report")?;
+    let passed = report["numPassedTests"]
+        .as_u64()
+        .context("numPassedTests in the vitest report")?;
+    anyhow::ensure!(
+        total > 0 && passed == total,
+        "{file}: {passed} of {total} contract tests passed; a skipped or todo test proves nothing"
+    );
     Ok(())
+}
+
+/// An HTTP client whose every request gives up after [`REQUEST_TIMEOUT`].
+fn http_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("build the HTTP client")
+}
+
+/// Fail when `gateway` has exited, naming `when` and its exit status.
+fn still_running(gateway: &mut tokio::process::Child, when: &str) -> anyhow::Result<()> {
+    if let Some(status) = gateway.try_wait().context("poll the gateway")? {
+        anyhow::bail!("decdn gateway exited during {when}: {status}");
+    }
+    Ok(())
+}
+
+/// Stop `gateway` after the suite, failing if it had already exited: a
+/// gateway that crashed under the suite fails the run.
+async fn stop(mut gateway: tokio::process::Child) -> anyhow::Result<()> {
+    still_running(&mut gateway, "the suite")?;
+    gateway.kill().await.context("stop the gateway")
 }
 
 fn strs(items: &[&str]) -> Vec<String> {
@@ -589,14 +688,24 @@ async fn warm_up(
     }
 }
 
-/// The gateway token, once the gateway has written it and answers on `base`.
-async fn wait_for_token(path: &Path, base: &str) -> anyhow::Result<String> {
+/// The gateway token, once the gateway has written all of it and answers on
+/// `base`.
+async fn wait_for_token(
+    gateway: &mut tokio::process::Child,
+    http: &reqwest::Client,
+    path: &Path,
+    base: &str,
+) -> anyhow::Result<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        if let Ok(token) = std::fs::read_to_string(path)
-            && reqwest::get(format!("{base}/_capability")).await.is_ok()
+        still_running(gateway, "start-up")?;
+        let token = std::fs::read_to_string(path).unwrap_or_default();
+        let token = token.trim();
+        if token.len() == 64
+            && token.bytes().all(|b| b.is_ascii_hexdigit())
+            && http.get(format!("{base}/_capability")).send().await.is_ok()
         {
-            return Ok(token.trim().to_owned());
+            return Ok(token.to_owned());
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
