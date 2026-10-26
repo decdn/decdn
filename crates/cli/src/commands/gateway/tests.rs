@@ -1697,7 +1697,7 @@ async fn a_public_site_serves_to_anyone() {
 }
 
 /// A public gateway has no delegates and no capabilities: its API paths
-/// answer 404 on every origin, and nothing answers cross-origin.
+/// answer 404 on every origin, a preflight included.
 #[tokio::test]
 async fn the_public_gateway_api_is_closed() {
     let (gateway, logs, host) = public_gateway().await;
@@ -2511,4 +2511,140 @@ async fn the_metrics_listener_serves_the_exposition() {
     );
     let other = fetch("/").await;
     assert!(other.starts_with("HTTP/1.1 404"), "{other}");
+}
+
+/// The headers a cross-origin page may read from a public gateway.
+const READABLE: &str = "Content-Length, Content-Range, Accept-Ranges, Content-Type, \
+                        Content-Disposition, ETag, Retry-After, Link";
+
+/// Whether `answer` is readable by any origin.
+fn readable_anywhere(answer: &Answer) -> bool {
+    answer.header(header::ACCESS_CONTROL_ALLOW_ORIGIN) == Some("*")
+        && answer.header(header::ACCESS_CONTROL_EXPOSE_HEADERS) == Some(READABLE)
+}
+
+/// A public gateway answers a content preflight on every content host: a
+/// page on any origin may `GET` or `HEAD` with a `Range`.
+#[tokio::test]
+async fn a_public_preflight_admits_ranged_reads_from_any_origin() {
+    let (gateway, logs, host) = public_gateway().await;
+    let preflight = [
+        ("origin", "https://app.example"),
+        ("access-control-request-method", "GET"),
+        ("access-control-request-headers", "range"),
+    ];
+    let other = format!("/{}", alloy::hex::encode(OTHER));
+    for (origin, path) in [
+        ("decdn.test", other.as_str()),
+        (host.as_str(), "/a.txt"),
+        ("7.decdn.test", "/a.txt"),
+    ] {
+        let answer = send(&gateway, Method::OPTIONS, origin, path, &preflight).await;
+        assert_eq!(answer.status, StatusCode::NO_CONTENT, "{origin}{path}");
+        assert!(readable_anywhere(&answer), "{origin}{path}");
+        assert_eq!(
+            answer.header(header::ACCESS_CONTROL_ALLOW_METHODS),
+            Some("GET, HEAD")
+        );
+        assert_eq!(
+            answer.header(header::ACCESS_CONTROL_ALLOW_HEADERS),
+            Some("range")
+        );
+        assert_eq!(answer.header(header::ACCESS_CONTROL_MAX_AGE), Some("600"));
+    }
+    let unknown = send(&gateway, Method::OPTIONS, "evil.test", "/", &preflight).await;
+    assert_eq!(unknown.status, StatusCode::FORBIDDEN);
+    assert!(
+        logs.caps.lock().unwrap().is_empty(),
+        "a preflight pulls nothing"
+    );
+}
+
+/// A browser publisher may `PUT /_pointer` with a JSON body from any origin.
+#[tokio::test]
+async fn a_public_pointer_preflight_admits_a_json_put() {
+    let (gateway, _logs, _) = public_gateway().await;
+    let answer = send(&gateway, Method::OPTIONS, "decdn.test", "/_pointer", &[]).await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT);
+    assert!(readable_anywhere(&answer));
+    assert_eq!(
+        answer.header(header::ACCESS_CONTROL_ALLOW_METHODS),
+        Some("PUT")
+    );
+    assert_eq!(
+        answer.header(header::ACCESS_CONTROL_ALLOW_HEADERS),
+        Some("content-type")
+    );
+    let refused = send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", "{}").await;
+    assert!(refused.status.is_client_error(), "{}", refused.status);
+    assert!(readable_anywhere(&refused), "a refused PUT is readable too");
+}
+
+/// Every answer of a public gateway is readable cross-origin: content, a
+/// window, and every refusal the SDK maps to an error.
+#[tokio::test]
+async fn every_public_answer_is_readable_by_any_origin() {
+    let allowance = u64::try_from(public_manifest().len()).unwrap() + 3;
+    let (gateway, _logs, host) = public_gateway_with(allowance).await;
+    let origin = [("origin", "https://app.example")];
+    let ok = request(&gateway, &host, "/a.txt", &origin).await;
+    let spent = request(&gateway, &host, "/a.txt", &origin).await;
+    let (gateway, _logs, host) = public_gateway().await;
+    let unfunded = format!("/{}", alloy::hex::encode(UNFUNDED));
+    let window = [("origin", "https://app.example"), ("range", "bytes=1-2")];
+    let past = [("origin", "https://app.example"), ("range", "bytes=3-")];
+    let answers = [
+        ok,
+        spent,
+        request(&gateway, &host, "/a.txt", &window).await,
+        request(&gateway, &host, "/a.txt", &past).await,
+        request(&gateway, "decdn.test", &unfunded, &origin).await,
+        request(&gateway, &host, "/missing.txt", &origin).await,
+        send(&gateway, Method::HEAD, &host, "/a.txt", &origin).await,
+    ];
+    let statuses: Vec<_> = answers.iter().map(|a| a.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            StatusCode::OK,
+            StatusCode::PAYMENT_REQUIRED,
+            StatusCode::PARTIAL_CONTENT,
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::NOT_FOUND,
+            StatusCode::OK,
+        ]
+    );
+    for answer in &answers {
+        assert!(readable_anywhere(answer), "{}", answer.status);
+        assert_eq!(answer.header(header::VARY), None, "`*` needs no Vary");
+    }
+}
+
+/// A loopback gateway keeps content same-origin: no CORS header on its
+/// answers and no preflight outside its API, so the token never becomes
+/// sendable cross-origin.
+#[tokio::test]
+async fn a_loopback_gateway_answers_content_to_no_other_origin() {
+    let (gateway, host) = site_gateway().await;
+    let mut headers = SAME_ORIGIN.to_vec();
+    headers.push(("origin", "https://app.example"));
+    let site = request(&gateway, &host, "/css/site.css", &headers).await;
+    assert_eq!(site.status, StatusCode::OK);
+    assert_eq!(site.header(header::ACCESS_CONTROL_ALLOW_ORIGIN), None);
+    let preflight = [
+        ("origin", "https://app.example"),
+        ("access-control-request-headers", "range"),
+    ];
+    let other = format!("/{}", alloy::hex::encode(OTHER));
+    let bare = send(
+        &gateway,
+        Method::OPTIONS,
+        "127.0.0.1:8484",
+        &other,
+        &preflight,
+    )
+    .await;
+    assert_eq!(bare.status, StatusCode::FORBIDDEN);
+    assert_eq!(bare.header(header::ACCESS_CONTROL_ALLOW_ORIGIN), None);
 }

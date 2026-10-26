@@ -59,6 +59,12 @@ A bundle entry with a size in its manifest takes one `Range` (`curl -r`, a resum
 download, a BEP 19 webseed `url-list`): the response is `206` over exactly that window,
 paid for by the chunk-group-aligned span around it.
 
+Every answer is readable from any origin (`Access-Control-Allow-Origin: *`), so a web page
+or the [TypeScript SDK](https://github.com/decdn/sdk-typescript) in a browser fetches straight from the gateway, and `OPTIONS` is a
+preflight that admits `Range`. Let the proxy pass `OPTIONS` and the gateway's CORS headers
+through unchanged. See
+[`adr/appendix-gateway.md`](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#cross-origin-reads).
+
 A namespace is a stable host, `https://<ns>.decdn.link/`, once its owner points it at a
 bundle: `decdn publish point <ns> decdn:<hash>/ --gateway https://decdn.link` signs a
 pointer with the namespace owner's keystore and `PUT`s it; the gateway checks the

@@ -1066,6 +1066,7 @@ impl Gateway {
         let response = self.answer(req).await;
         if public && let Some(public) = &gateway.public {
             public.metrics.request(response.status());
+            return readable_anywhere(response);
         }
         response
     }
@@ -1133,7 +1134,14 @@ impl Gateway {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
         let gateway = Arc::clone(&self);
-        match self.sites.route(host) {
+        let route = self.sites.route(host);
+        if route.is_none() && !self.hosts.iter().any(|allowed| allowed == host) {
+            return text(StatusCode::FORBIDDEN, "unknown Host\n");
+        }
+        if self.public() && req.method() == Method::OPTIONS {
+            return public_preflight(req.uri().path());
+        }
+        match route {
             Some(Route::Site(site)) => {
                 let response = self.site(req, site, None).await;
                 return gateway.with_policy(response);
@@ -1152,9 +1160,7 @@ impl Gateway {
                 let response = self.site(req, site, Some(ns)).await;
                 return gateway.with_policy(response);
             }
-            Some(Route::Bare) => {}
-            None if self.hosts.iter().any(|allowed| allowed == host) => {}
-            None => return text(StatusCode::FORBIDDEN, "unknown Host\n"),
+            Some(Route::Bare) | None => {}
         }
         let origin = req
             .headers()
@@ -1171,7 +1177,7 @@ impl Gateway {
             .to_owned();
         if self.public() {
             match (&method, path.as_str()) {
-                (&Method::OPTIONS, _) | (_, "/_delegate" | "/_capability") => {
+                (_, "/_delegate" | "/_capability") => {
                     return text(StatusCode::NOT_FOUND, "a public gateway has no API\n");
                 }
                 (&Method::PUT, "/_pointer") => return self.put_pointer(req).await,
@@ -2511,6 +2517,54 @@ fn preflight(origin: Option<&str>) -> Response<Body> {
     headers.insert(
         "access-control-allow-private-network",
         header::HeaderValue::from_static("true"),
+    );
+    response
+}
+
+/// The response headers a page on another origin may read from a public
+/// gateway: what the SDK needs to verify, page through and price content.
+const PUBLIC_EXPOSED: &str = "Content-Length, Content-Range, Accept-Ranges, Content-Type, \
+                              Content-Disposition, ETag, Retry-After, Link";
+
+/// The preflight answer of a public gateway for `path` on any of its hosts. A
+/// public gateway sends no credentials and holds no token, so any origin may
+/// read its content, with a `Range`, and `PUT /_pointer` with a JSON body. It
+/// has no API, so `/_delegate` and `/_capability` stay not found.
+fn public_preflight(path: &str) -> Response<Body> {
+    let (methods, headers) = match path {
+        "/_delegate" | "/_capability" => {
+            return text(StatusCode::NOT_FOUND, "a public gateway has no API\n");
+        }
+        "/_pointer" => ("PUT", "content-type"),
+        _ => ("GET, HEAD", "range"),
+    };
+    let mut response = text(StatusCode::NO_CONTENT, "");
+    let fields = response.headers_mut();
+    fields.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        header::HeaderValue::from_static(methods),
+    );
+    fields.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        header::HeaderValue::from_static(headers),
+    );
+    fields.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        header::HeaderValue::from_static("600"),
+    );
+    response
+}
+
+/// `response` of a public gateway, readable by every origin.
+fn readable_anywhere(mut response: Response<Body>) -> Response<Body> {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        header::HeaderValue::from_static(PUBLIC_EXPOSED),
     );
     response
 }

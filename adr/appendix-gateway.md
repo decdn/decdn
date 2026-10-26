@@ -158,6 +158,26 @@ webseed is a plain URL with ranges, so it needs nothing more.
 `HEAD` on an entry answers from the bundle manifest: the entry's length and
 hash, at no pull of the entry.
 
+## Cross-origin reads
+
+A public gateway sends no credentials and holds no token, so every origin may
+read it. A page on any origin fetches a blob from `<host>` or an entry from a
+site host, and reads the answer. Every answer carries
+`Access-Control-Allow-Origin: *` and exposes `Content-Length`,
+`Content-Range`, `Accept-Ranges`, `Content-Type`, `Content-Disposition`,
+`ETag`, `Retry-After` and `Link`. A page reads a refusal too: the 402 or 503
+body names the `decdn:` URI to fetch elsewhere.
+
+`OPTIONS` on a known host is a preflight and pulls nothing. On a content path
+the answer is 204 with `Access-Control-Allow-Methods: GET, HEAD` and
+`Access-Control-Allow-Headers: range`. On `/_pointer` it is 204 with `PUT`
+and `content-type`, so a page sets a pointer with a wallet. Both carry
+`Access-Control-Max-Age: 600`. `/_delegate` and `/_capability` stay 404.
+
+The site policy keeps `connect-src 'self'`: a page on another origin reads
+the gateway, not a site that reads another site. A loopback gateway sends no
+CORS header outside its API, so its token never travels cross-origin.
+
 ## Metrics
 
 `--metrics-listen <loopback address>` serves Prometheus text at
