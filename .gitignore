@@ -42,3 +42,7 @@ mermaid-filter.err
 __pycache__/
 *.py[cod]
 *$py.class
+
+# The gateway dashboard's Vite build and dependencies (crates/cli/dashboard/).
+/crates/cli/dashboard/dist/
+/crates/cli/dashboard/node_modules/

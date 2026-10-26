@@ -10,6 +10,21 @@ homepage.workspace = true
 readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
+# `include` is the only way a gitignored file reaches the `.crate`: the
+# dashboard's Vite build (`dashboard/dist/`), which `build.rs` embeds. It
+# replaces cargo's default file set, so every other shipped file is listed
+# too; CI's `cargo package --list` check fails when the build is missing.
+include = [
+  "src/**",
+  "tests/**",
+  "deployments/**",
+  "build.rs",
+  "README.md",
+  "TERMS.md",
+  "TERMS_README.md",
+  "minisign-thiras.pub",
+  "dashboard/dist/**",
+]
 
 [[bin]]
 name = "decdn"
