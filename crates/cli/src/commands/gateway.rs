@@ -89,8 +89,16 @@
 //! that connects and drops spends no more than it is charged. An upstream
 //! failure answers a bare `502`, with the detail in the log. The buyer store
 //! lives in `<data-dir>/store`, so the pool and its lanes survive a restart.
-//! `--metrics-listen` serves what the gateway served, refused and failed as
-//! Prometheus text on a loopback address (`metrics`).
+//!
+//! **State.** Every gateway counts what it served, refused and failed
+//! (`metrics`). `GET /_status` returns that, the pulls in flight, the
+//! capabilities, a public gateway's allowance and pointers, and what the
+//! buyer-pool store holds, as one JSON document (`status`). The dashboard
+//! (`dashboard`) is a page that polls it. A loopback gateway answers both on
+//! its own host, `/_status` behind the token; a public gateway answers
+//! neither on its public host. `--metrics-listen` serves `GET /metrics`
+//! (Prometheus text), `/_status` and the dashboard on a loopback address,
+//! with no token, for the operator.
 //!
 //! **Pointers.** `PUT /_pointer` on the bare host takes a namespace pointer
 //! (`pointer`): an EIP-712 record, signed by the namespace's owner on the
@@ -124,6 +132,7 @@ use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
@@ -158,10 +167,12 @@ use super::fetch::{
 use crate::known_chains;
 
 mod allowance;
+mod dashboard;
 mod metrics;
 pub(crate) mod pointer;
 mod rewrite;
 mod site;
+mod status;
 mod worker;
 
 use allowance::Allowance;
@@ -328,37 +339,57 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         hosts: allowed_hosts(args.listen),
         sites,
         metrics: Metrics::default(),
+        active: std::sync::Mutex::new(HashMap::new()),
+        next_pull: AtomicU64::new(0),
+        started: Instant::now(),
+        started_unix: now_secs(),
+        listen: args.listen,
         public,
     });
 
     if let Some(metrics) = args.public.metrics_listen {
         anyhow::ensure!(
             metrics.ip().is_loopback(),
-            "--metrics-listen must be a loopback address: the exposition is for the operator's \
-             scraper, not the public"
+            "--metrics-listen must be a loopback address: it serves the operator, with no token, \
+             not the public"
         );
         let listener = TcpListener::bind(metrics)
             .await
             .with_context(|| format!("listen for metrics on {metrics}"))?;
         tokio::spawn(serve_metrics(Arc::clone(&gateway), listener));
     }
-    match (&gateway.sites, &gateway.token) {
-        (SiteDomain::Public { origin }, _) => println!(
-            "decdn gateway serving {origin} on {} (Ctrl-C to stop)",
-            args.listen
-        ),
-        (SiteDomain::Loopback { .. }, token) => println!(
-            "decdn gateway on http://{}/ (Ctrl-C to stop)\ngateway token: {} (also in {})",
-            args.listen,
-            token.as_deref().unwrap_or_default(),
-            root.join("token").display()
-        ),
-    }
+    announce(&gateway, &root);
     let served = serve(&gateway, &listener).await;
     // The worker's queued lane writes land before the store dir is removed.
     gateway.pulls.stop().await;
     drop(temp_store);
     served
+}
+
+/// Print where the gateway serves, and on loopback its token and the
+/// dashboard link that hands the token to the page.
+fn announce(gateway: &Gateway, root: &Path) {
+    match (&gateway.sites, &gateway.token) {
+        (SiteDomain::Public { origin }, _) => println!(
+            "decdn gateway serving {origin} on {} (Ctrl-C to stop)",
+            gateway.listen
+        ),
+        (SiteDomain::Loopback { .. }, token) => {
+            let token = token.as_deref().unwrap_or_default();
+            println!(
+                "decdn gateway on http://{}/ (Ctrl-C to stop)\ngateway token: {token} (also in \
+                 {})\ndashboard: http://{}/#token={token}",
+                gateway.listen,
+                root.join("token").display(),
+                gateway.listen,
+            );
+            if !dashboard::built() {
+                println!(
+                    "this binary has no dashboard built in; the page at / says how to build it"
+                );
+            }
+        }
+    }
 }
 
 /// Where the buyer store lives, created owner-only. A public gateway's pool
@@ -473,7 +504,12 @@ async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
                             gateway.metrics.render(),
                             "text/plain; version=0.0.4; charset=utf-8",
                         ),
-                        _ => text(StatusCode::NOT_FOUND, "GET /metrics\n"),
+                        (&Method::GET, path) => {
+                            gateway.operator(path, true).await.unwrap_or_else(|| {
+                                text(StatusCode::NOT_FOUND, "GET /, /_status, /metrics\n")
+                            })
+                        }
+                        _ => text(StatusCode::NOT_FOUND, "GET /, /_status, /metrics\n"),
                     };
                     Ok::<_, Infallible>(response)
                 }
@@ -844,6 +880,27 @@ fn may_mint(delegates: &HashMap<Address, Delegate>, site: Option<&str>) -> Resul
     Ok(())
 }
 
+/// One registered capability as `GET /_capability` and `/_status` list it.
+/// The fields are in key order: the TypeScript SDK reads this body, and it
+/// stays the one `serde_json`'s sorted maps wrote before it had a type.
+#[derive(serde::Serialize)]
+struct Capability {
+    /// The spending cap, in micro-USDC.
+    cap: u64,
+    /// The capability's expiry, Unix seconds.
+    expiry: u64,
+    /// The origin that registered it, or `None` for the token holder.
+    origin: Option<String>,
+    /// The pool it spends, `0x` hex.
+    pool: String,
+    /// The hosts it pays for.
+    scope: String,
+    /// The delegate key, EIP-55 hex.
+    signer: String,
+    /// Whether a pull ran out of its cap.
+    spent: bool,
+}
+
 struct Registered {
     grant: CapabilityGrant,
     scope: Scope,
@@ -896,6 +953,15 @@ struct Gateway {
     /// What it served, refused and failed, for `/_status` and
     /// `--metrics-listen`.
     metrics: Metrics,
+    /// The pulls in flight, by the id their guard took from `next_pull`.
+    active: std::sync::Mutex<HashMap<u64, ActivePull>>,
+    next_pull: AtomicU64,
+    /// When the gateway started, for its uptime.
+    started: Instant,
+    /// When the gateway started, Unix seconds.
+    started_unix: u64,
+    /// The address its main listener is bound to.
+    listen: SocketAddr,
     /// What a public gateway holds beyond a loopback one; `None` on loopback.
     public: Option<Public>,
 }
@@ -1182,16 +1248,15 @@ impl Gateway {
             .path_and_query()
             .map_or("/", |pq| pq.as_str())
             .to_owned();
-        if self.public() {
-            match (&method, path.as_str()) {
-                (_, "/_delegate" | "/_capability") => {
-                    return text(StatusCode::NOT_FOUND, "a public gateway has no API\n");
-                }
-                (&Method::PUT, "/_pointer") => return self.put_pointer(req).await,
-                (&Method::HEAD, "/" | "/favicon.ico") => return text(StatusCode::OK, ""),
-                (&Method::HEAD, _) => return self.head_bare(target.trim_start_matches('/')),
-                _ => {}
-            }
+        let req = match self.public_bare(req, &path, &target).await {
+            Ok(response) => return response,
+            Err(req) => *req,
+        };
+        if !self.public()
+            && method == Method::GET
+            && let Some(response) = self.operator(&path, authorized).await
+        {
+            return response;
         }
         match (method, path.as_str()) {
             (Method::OPTIONS, "/_delegate" | "/_capability") => preflight(origin.as_deref()),
@@ -1232,6 +1297,49 @@ impl Gateway {
         }
     }
 
+    /// What a public gateway answers on its bare host before the routes it
+    /// shares with a loopback one: no API but `PUT /_pointer`, no dashboard,
+    /// and `HEAD` of content. `Err(req)` when the request is not one of those,
+    /// and on a loopback gateway.
+    async fn public_bare<B>(
+        &self,
+        req: Request<B>,
+        path: &str,
+        target: &str,
+    ) -> Result<Response<Body>, Box<Request<B>>>
+    where
+        B: HttpBody<Data = Bytes>,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        if !self.public() {
+            return Err(Box::new(req));
+        }
+        Ok(match (req.method(), path) {
+            (_, "/_delegate" | "/_capability" | "/_status") => {
+                text(StatusCode::NOT_FOUND, "a public gateway has no API\n")
+            }
+            (_, p) if p.starts_with("/_dashboard/") => text(
+                StatusCode::NOT_FOUND,
+                "the dashboard is on --metrics-listen\n",
+            ),
+            (&Method::PUT, "/_pointer") => self.put_pointer(req).await,
+            (&Method::HEAD, "/" | "/favicon.ico") => text(StatusCode::OK, ""),
+            (&Method::HEAD, _) => self.head_bare(target.trim_start_matches('/')),
+            _ => return Err(Box::new(req)),
+        })
+    }
+
+    /// The operator's routes at `path`: the dashboard, its assets, and
+    /// `/_status` when `authorized`. `None` for any other path.
+    async fn operator(&self, path: &str, authorized: bool) -> Option<Response<Body>> {
+        match path {
+            "/_status" if authorized => Some(json(StatusCode::OK, &self.status().await)),
+            "/_status" => Some(text(StatusCode::UNAUTHORIZED, "token required\n")),
+            "/" => Some(dashboard::page()),
+            _ => dashboard::asset(path),
+        }
+    }
+
     /// The site policy on `response`.
     fn with_policy(&self, mut response: Response<Body>) -> Response<Body> {
         let policy = site::content_security_policy(&self.sites);
@@ -1254,7 +1362,10 @@ impl Gateway {
         pointer: Option<u64>,
     ) -> Response<Body> {
         let path = req.uri().path();
-        if matches!(path, "/_delegate" | "/_capability" | "/_pointer") {
+        if matches!(
+            path,
+            "/_delegate" | "/_capability" | "/_pointer" | "/_status"
+        ) {
             return text(
                 StatusCode::NOT_FOUND,
                 "the gateway API answers on the gateway origin only\n",
@@ -1576,24 +1687,26 @@ impl Gateway {
     }
 
     async fn list(&self) -> Response<Body> {
+        json(StatusCode::OK, &self.capabilities().await)
+    }
+
+    /// Every capability registered and not yet expired.
+    async fn capabilities(&self) -> Vec<Capability> {
         let mut delegates = self.delegates.lock().await;
         Self::prune(&mut delegates);
-        let list: Vec<_> = delegates
+        delegates
             .values()
             .filter_map(|d| d.capability.as_ref())
-            .map(|r| {
-                serde_json::json!({
-                    "signer": r.grant.signer.to_string(),
-                    "pool": r.grant.pool_id.to_string(),
-                    "scope": r.scope.to_string(),
-                    "origin": r.origin,
-                    "cap": r.grant.spending_cap,
-                    "expiry": r.grant.expiry,
-                    "spent": r.spent,
-                })
+            .map(|r| Capability {
+                cap: r.grant.spending_cap,
+                expiry: r.grant.expiry,
+                origin: r.origin.clone(),
+                pool: r.grant.pool_id.to_string(),
+                scope: r.scope.to_string(),
+                signer: r.grant.signer.to_string(),
+                spent: r.spent,
             })
-            .collect();
-        json(StatusCode::OK, &serde_json::Value::Array(list))
+            .collect()
     }
 
     /// The owner of namespace `ns` on this deployment's registry, read
@@ -2216,7 +2329,14 @@ impl Gateway {
         // Armed before the worker has the job: a request dropped while it
         // waits for its first byte still charges the pull's read-ahead.
         let bucket = paying.bucket();
-        let mut guard = PullGuard::new(Arc::clone(self), bucket);
+        let mut guard = PullGuard::new(
+            Arc::clone(self),
+            bucket,
+            hash,
+            namespace,
+            range,
+            PayerLabel::of(paying),
+        );
         // Asked once the pull has its slot: the allowance the requests before
         // it spent while it waited refuses it before any paid work.
         let admit = self.public().then(|| {
@@ -2312,6 +2432,7 @@ async fn next_frame(
     s.delivered = s
         .delivered
         .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+    s.guard.delivered.store(s.delivered, Ordering::Relaxed);
     s.cut = !gateway.charge(s.guard.bucket, chunk.len());
     gateway.metrics.bytes(chunk.len());
     if s.cut {
@@ -2361,6 +2482,80 @@ impl Drop for Streaming {
     }
 }
 
+/// Who pays for a pull, as `/_status` lists it.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PayerLabel {
+    /// The gateway's own pool.
+    Pool,
+    /// A held capability, by its delegate key.
+    Capability {
+        /// The delegate key.
+        signer: Address,
+    },
+}
+
+impl PayerLabel {
+    fn of(paying: &Payment) -> Self {
+        match paying {
+            Payment::Held(credential) => Self::Capability {
+                signer: credential.signer.address(),
+            },
+            Payment::Pool { .. } => Self::Pool,
+        }
+    }
+}
+
+/// A pull in flight, held by its [`PullGuard`].
+struct ActivePull {
+    hash: [u8; 32],
+    namespace: Option<u64>,
+    range: Option<(u64, u64)>,
+    payer: PayerLabel,
+    since: Instant,
+    /// Content bytes its response delivered so far.
+    delivered: Arc<AtomicU64>,
+}
+
+/// One pull in flight as `/_status` lists it.
+#[derive(Debug, serde::Serialize)]
+struct ActivePullView {
+    /// The blob, hex.
+    hash: String,
+    /// The namespace the request named, if any.
+    namespace: Option<u64>,
+    /// The byte window, `[offset, length]`, of a ranged pull.
+    range: Option<(u64, u64)>,
+    payer: PayerLabel,
+    /// Seconds since the pull started.
+    since_secs: u64,
+    /// Content bytes its response delivered so far.
+    delivered_bytes: u64,
+}
+
+impl Gateway {
+    /// The pulls in flight, oldest first.
+    fn active_pulls(&self) -> Vec<ActivePullView> {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pulls: Vec<_> = active.iter().collect();
+        pulls.sort_by_key(|(id, pull)| (pull.since, **id));
+        pulls
+            .into_iter()
+            .map(|(_, pull)| ActivePullView {
+                hash: alloy::hex::encode(pull.hash),
+                namespace: pull.namespace,
+                range: pull.range,
+                payer: pull.payer,
+                since_secs: pull.since.elapsed().as_secs(),
+                delivered_bytes: pull.delivered.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+}
+
 /// What a pull in flight owes the public allowance if it ends short of
 /// whole: the bound of what it may have paid past the frames its response
 /// delivered ([`DROP_PENALTY_BYTES`]). Armed from before the job reaches the
@@ -2372,18 +2567,49 @@ struct PullGuard {
     armed: bool,
     /// The allowance bucket the pull spends.
     bucket: Option<u64>,
+    /// The pull's entry in [`Gateway::active`].
+    id: u64,
+    /// Content bytes its response delivered so far, shared with that entry.
+    delivered: Arc<AtomicU64>,
 }
 
 impl PullGuard {
     /// A guard for a pull `gateway` is about to start against `bucket`:
-    /// armed on a public gateway, and counted among its pulls in flight.
-    fn new(gateway: Arc<Gateway>, bucket: Option<u64>) -> Self {
+    /// armed on a public gateway, counted among its pulls in flight, and
+    /// listed in [`Gateway::active`] until it drops.
+    fn new(
+        gateway: Arc<Gateway>,
+        bucket: Option<u64>,
+        hash: [u8; 32],
+        namespace: Option<u64>,
+        range: Option<(u64, u64)>,
+        payer: PayerLabel,
+    ) -> Self {
         gateway.metrics.pull_started();
         let armed = gateway.public();
+        let id = gateway.next_pull.fetch_add(1, Ordering::Relaxed);
+        let delivered = Arc::new(AtomicU64::new(0));
+        gateway
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id,
+                ActivePull {
+                    hash,
+                    namespace,
+                    range,
+                    payer,
+                    since: Instant::now(),
+                    delivered: Arc::clone(&delivered),
+                },
+            );
         Self {
             gateway,
             armed,
             bucket,
+            id,
+            delivered,
         }
     }
 
@@ -2395,6 +2621,11 @@ impl PullGuard {
 impl Drop for PullGuard {
     fn drop(&mut self) {
         self.gateway.metrics.pull_ended();
+        self.gateway
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
         if self.armed {
             self.gateway.charge_drop(self.bucket);
         }
@@ -2543,13 +2774,13 @@ const ANY_ORIGIN: header::HeaderValue = header::HeaderValue::from_static("*");
 /// [`readable_anywhere`] does, in [`Gateway::handle`].
 fn public_preflight(path: &str, bare: bool) -> Response<Body> {
     let (methods, headers) = match path {
-        "/_delegate" | "/_capability" | "/_pointer" if !bare => {
+        "/_delegate" | "/_capability" | "/_pointer" | "/_status" if !bare => {
             return text(
                 StatusCode::NOT_FOUND,
                 "the gateway API answers on the gateway origin only\n",
             );
         }
-        "/_delegate" | "/_capability" => {
+        "/_delegate" | "/_capability" | "/_status" => {
             return text(StatusCode::NOT_FOUND, "a public gateway has no API\n");
         }
         "/_pointer" => ("PUT", "content-type"),
@@ -2924,8 +3155,9 @@ fn text(status: StatusCode, body: &str) -> Response<Body> {
     typed(status, body.to_owned(), "text/plain; charset=utf-8")
 }
 
-fn json(status: StatusCode, value: &serde_json::Value) -> Response<Body> {
-    typed(status, value.to_string(), "application/json")
+fn json<T: serde::Serialize + ?Sized>(status: StatusCode, value: &T) -> Response<Body> {
+    let body = serde_json::to_string(value).unwrap_or_else(|_| "null".into());
+    typed(status, body, "application/json")
 }
 
 fn html(status: StatusCode, body: &str) -> Response<Body> {

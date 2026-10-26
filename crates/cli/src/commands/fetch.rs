@@ -857,6 +857,16 @@ impl FetchHost {
         Ok((host, grant))
     }
 
+    /// The buyer-pool store every fetch on this host records into.
+    pub(crate) fn store(&self) -> Arc<dyn BuyerPoolStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// The chain and `PaymentPool` this host pays on.
+    pub(crate) const fn deployment(&self) -> decdn_incentive::Deployment {
+        self.chain.config.deployment()
+    }
+
     /// Wait for every queued peer-record and watermark write to land, then
     /// close the endpoint, so its open connections end cleanly instead of
     /// being aborted on drop.

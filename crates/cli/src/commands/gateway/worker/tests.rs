@@ -2,14 +2,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser as _;
 use decdn_common::cli::ClientFetchArgs;
 use decdn_incentive::CapabilityGrant;
+use decdn_incentive::lane::PoolId;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, oneshot};
 
-use super::{Backend, Job, Payment, PullWorker};
+use super::{Backend, DelegateLanes, Job, Payment, PoolSnapshot, PullWorker};
 use crate::commands::fetch::{BlobFetch, Credential, Sink};
 
 /// The blob a [`Fake`] pull stalls on: it writes more than the pipe holds.
@@ -86,6 +88,24 @@ impl Backend for Fake {
             _ => writer.write_all(b"hello").await?,
         }
         Ok(())
+    }
+
+    async fn pools(
+        &self,
+        (): &(),
+        delegates: &[(PoolId, Address)],
+    ) -> anyhow::Result<PoolSnapshot> {
+        Ok(PoolSnapshot {
+            delegate_lanes: delegates
+                .iter()
+                .map(|&(pool_id, signer)| DelegateLanes {
+                    signer,
+                    pool_id,
+                    lanes: Vec::new(),
+                })
+                .collect(),
+            ..PoolSnapshot::default()
+        })
     }
 
     async fn close(&self, (): ()) {
@@ -443,4 +463,36 @@ async fn a_job_refused_at_its_slot_pulls_nothing() {
     assert!(read_all(reader).await.is_empty());
     worker.stop().await;
     assert!(log.lock().unwrap().pulled_under.is_empty(), "no pull ran");
+}
+
+/// A pools query is answered while pulls run: it does not wait for a slot
+/// or for the pulls to end.
+#[tokio::test]
+async fn a_pools_query_is_answered_beside_running_pulls() {
+    let (worker, _log, release) = start(1).await;
+    let signer = Arc::new(PrivateKeySigner::random());
+    let (_held, held_done) = send(&worker, HOLD, &signer, 1024);
+    let delegate = (PoolId::repeat_byte(7), signer.address());
+    let snapshot = tokio::time::timeout(Duration::from_secs(10), worker.pools(vec![delegate]))
+        .await
+        .expect("the query is answered while the only slot is held")
+        .expect("the fake answers");
+    assert_eq!(snapshot.delegate_lanes.len(), 1);
+    assert_eq!(snapshot.delegate_lanes[0].pool_id, delegate.0);
+    assert_eq!(snapshot.delegate_lanes[0].signer, delegate.1);
+    release.notify_one();
+    held_done.await.unwrap().unwrap();
+    worker.stop().await;
+}
+
+/// A query after the worker stopped fails instead of hanging.
+#[tokio::test]
+async fn a_pools_query_after_stop_fails() {
+    let (worker, _log, _release) = start(1).await;
+    worker.stop().await;
+    let err = tokio::time::timeout(Duration::from_secs(10), worker.pools(Vec::new()))
+        .await
+        .expect("the query does not hang")
+        .expect_err("a stopped worker answers nothing");
+    assert!(err.to_string().contains("shutting down"), "{err:#}");
 }

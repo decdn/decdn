@@ -414,6 +414,11 @@ async fn test_gateway_in(
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
         sites,
         metrics: Metrics::default(),
+        active: std::sync::Mutex::new(HashMap::new()),
+        next_pull: AtomicU64::new(0),
+        started: Instant::now(),
+        started_unix: now_secs(),
+        listen: "127.0.0.1:8484".parse().unwrap(),
         public,
     })
 }
@@ -2527,7 +2532,19 @@ async fn the_metrics_listener_serves_the_exposition() {
         exposition.contains("decdn_gateway_bytes_served_total 0"),
         "{exposition}"
     );
-    let other = fetch("/").await;
+    // The dashboard and the state answer here, with no token.
+    let page = fetch("/").await;
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(page.contains("text/html"), "{page}");
+    let asset = fetch("/_dashboard/app.js").await;
+    assert!(asset.starts_with("HTTP/1.1 200"), "{asset}");
+    let status = fetch("/_status").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let body = status.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+    let status: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(status["mode"], "public");
+    assert!(status["allowance"].is_array(), "{status}");
+    let other = fetch("/nope").await;
     assert!(other.starts_with("HTTP/1.1 404"), "{other}");
 }
 
@@ -2685,4 +2702,280 @@ async fn a_loopback_gateway_answers_content_to_no_other_origin() {
     .await;
     assert_eq!(bare.status, StatusCode::FORBIDDEN);
     assert_eq!(bare.header(header::ACCESS_CONTROL_ALLOW_ORIGIN), None);
+}
+
+/// `GET /_capability` answers this exact body for one registered capability:
+/// the TypeScript SDK reads it, so its keys and spelling are the contract.
+#[tokio::test]
+async fn the_capability_list_keeps_its_shape() {
+    let gateway = test_gateway().await;
+    let mut held = registered("decdn.org", Some("https://decdn.org"), Instant::now());
+    held.grant.signer = Address::repeat_byte(0xab);
+    held.grant.pool_id = alloy::primitives::B256::repeat_byte(0x01);
+    held.grant.spending_cap = 5_000;
+    held.grant.expiry = 1_900_000_000;
+    held.spent = true;
+    insert(
+        &mut *gateway.delegates.lock().await,
+        delegate(None, Some(held)),
+    );
+    let answer = send(
+        &gateway,
+        Method::GET,
+        "127.0.0.1:8484",
+        "/_capability",
+        &[(TOKEN_HEADER, TEST_TOKEN)],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(
+        answer.body,
+        format!(
+            "[{{\"cap\":5000,\"expiry\":1900000000,\"origin\":\"https://decdn.org\",\"pool\":\
+             \"0x{}\",\"scope\":\"decdn.org\",\"signer\":\"{}\",\"spent\":true}}]",
+            "01".repeat(32),
+            Address::repeat_byte(0xab)
+        )
+    );
+}
+
+/// A pull in flight is listed with its hash and payer, and leaves the list
+/// when its request ends.
+#[tokio::test]
+async fn an_active_pull_is_listed_while_it_streams() {
+    let (gateway, _, _) = public_gateway().await;
+    assert!(gateway.active_pulls().is_empty());
+    let held = alloy::hex::encode(HELD);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{held}"))
+        .header(header::HOST, "decdn.test")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let pending = tokio::spawn(Arc::clone(&gateway).handle(req));
+    let listed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let active = gateway.active_pulls();
+            if !active.is_empty() {
+                return active;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the pull is listed while it runs");
+    assert_eq!(listed.len(), 1);
+    let pull = &listed[0];
+    assert_eq!(pull.hash, held);
+    assert_eq!(pull.namespace, None);
+    assert_eq!(pull.range, None);
+    assert!(matches!(pull.payer, PayerLabel::Pool), "{:?}", pull.payer);
+    assert_eq!(pull.delivered_bytes, 0);
+    pending.abort();
+    let _ = pending.await;
+    assert!(
+        gateway.active_pulls().is_empty(),
+        "the dropped request's pull leaves the list"
+    );
+    assert_eq!(gateway.metrics.snapshot().pulls_active, 0);
+}
+
+/// `GET path` on the loopback host, with the token when `token`.
+async fn loopback_get(gateway: &Arc<Gateway>, path: &str, token: bool) -> Answer {
+    let headers: &[(&str, &str)] = if token {
+        &[(TOKEN_HEADER, TEST_TOKEN)]
+    } else {
+        &[]
+    };
+    send(gateway, Method::GET, "127.0.0.1:8484", path, headers).await
+}
+
+/// `/_status` on a loopback gateway takes the token, as `/_capability` does,
+/// and lists the same capabilities. A loopback gateway has no allowance and
+/// no pointers, so both are null.
+#[tokio::test]
+async fn status_needs_the_token_on_loopback() {
+    let gateway = test_gateway().await;
+    insert(
+        &mut *gateway.delegates.lock().await,
+        delegate(None, Some(registered("*", None, Instant::now()))),
+    );
+    let refused = loopback_get(&gateway, "/_status", false).await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+    let answer = loopback_get(&gateway, "/_status", true).await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(
+        answer.header(header::CONTENT_TYPE),
+        Some("application/json")
+    );
+    let status: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+    assert_eq!(status["mode"], "loopback");
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(status["dashboard_built"], dashboard::built());
+    assert_eq!(status["listen"], "127.0.0.1:8484");
+    assert_eq!(status["chain_id"], 421_614);
+    assert!(status["allowance"].is_null(), "{status}");
+    assert!(status["pointers"].is_null(), "{status}");
+    assert!(status["pool_error"].is_null(), "{status}");
+    assert!(status["pools"].is_object(), "{status}");
+    // The status request itself is not counted yet when it is answered.
+    assert_eq!(
+        status["counters"]["requests_refused"], 1,
+        "the 401 before it"
+    );
+    let listed = loopback_get(&gateway, "/_capability", true).await;
+    let listed: serde_json::Value = serde_json::from_str(&listed.body).unwrap();
+    assert_eq!(status["capabilities"], listed);
+    // A page cannot send the token header cross-origin: no preflight passes.
+    let preflight = send(
+        &gateway,
+        Method::OPTIONS,
+        "127.0.0.1:8484",
+        "/_status",
+        &[(header::ORIGIN.as_str(), "https://evil.example")],
+    )
+    .await;
+    assert_eq!(preflight.status, StatusCode::FORBIDDEN);
+}
+
+/// The dashboard page and its assets answer on the loopback host, with no
+/// token: the page asks for it.
+#[tokio::test]
+async fn the_dashboard_is_served_at_the_root_of_a_loopback_gateway() {
+    let gateway = test_gateway().await;
+    let page = loopback_get(&gateway, "/", false).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(
+        page.header(header::CONTENT_TYPE),
+        Some("text/html; charset=utf-8")
+    );
+    assert!(
+        page.header(header::CONTENT_SECURITY_POLICY)
+            .is_some_and(|csp| csp.contains("script-src 'self'")),
+        "{:?}",
+        page.headers
+    );
+    for (path, kind) in [
+        ("/_dashboard/app.js", "text/javascript; charset=utf-8"),
+        ("/_dashboard/app.css", "text/css; charset=utf-8"),
+    ] {
+        let asset = loopback_get(&gateway, path, false).await;
+        assert_eq!(asset.status, StatusCode::OK, "{path}");
+        assert_eq!(asset.header(header::CONTENT_TYPE), Some(kind), "{path}");
+    }
+}
+
+/// A public gateway serves no state and no dashboard on its public host:
+/// both live on the metrics listener. `/` keeps its stub.
+#[tokio::test]
+async fn status_and_dashboard_are_404_on_a_public_bare_host() {
+    let (gateway, _logs, host) = public_gateway().await;
+    for path in ["/_status", "/_dashboard/app.js", "/_dashboard/app.css"] {
+        let answer = request(&gateway, "decdn.test", path, &[]).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    let preflight = send(&gateway, Method::OPTIONS, "decdn.test", "/_status", &[]).await;
+    assert_eq!(preflight.status, StatusCode::NOT_FOUND);
+    let site = request(&gateway, &host, "/_status", &[]).await;
+    assert_eq!(site.status, StatusCode::NOT_FOUND);
+    let root = request(&gateway, "decdn.test", "/", &[]).await;
+    assert_eq!(root.status, StatusCode::OK);
+    assert!(
+        !root.body.contains("decdn-dashboard-fallback"),
+        "{}",
+        root.body
+    );
+    assert!(root.header(header::CONTENT_SECURITY_POLICY).is_none());
+}
+
+/// A public gateway's status lists each allowance bucket and each pointer
+/// it holds.
+#[tokio::test]
+async fn status_lists_a_stored_pointer_and_its_bucket() {
+    let (gateway, _logs, _) =
+        public_gateway_for(Allowance::with_namespaces(1_000, [(7, 500)])).await;
+    let owner = Address::repeat_byte(0x77);
+    hold(&gateway, unsigned_pointer(7, BLOB, 3), owner);
+    let status = serde_json::to_value(gateway.status().await).unwrap();
+    assert_eq!(status["mode"], "public");
+    let buckets = status["allowance"].as_array().unwrap();
+    assert_eq!(buckets.len(), 2);
+    assert!(buckets[0]["namespace"].is_null());
+    assert_eq!(buckets[0]["per_day"], 1_000);
+    assert_eq!(buckets[1]["namespace"], 7);
+    assert_eq!(buckets[1]["per_day"], 500);
+    let pointers = status["pointers"].as_array().unwrap();
+    assert_eq!(pointers.len(), 1);
+    assert_eq!(pointers[0]["namespace"], 7);
+    assert_eq!(pointers[0]["seq"], 3);
+    assert_eq!(
+        pointers[0]["root"],
+        format!("0x{}", alloy::hex::encode(BLOB))
+    );
+    assert_eq!(pointers[0]["signer"], owner.to_string());
+}
+
+/// A backend whose pools query answers one pool, or fails.
+struct Pools {
+    fail: bool,
+}
+
+impl worker::Backend for Pools {
+    type Host = ();
+    type Payer = ();
+
+    async fn open(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn payer(&self, _credential: Credential) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn pull(
+        &self,
+        (): &(),
+        (): &(),
+        _blob: &BlobFetch,
+        _sink: &mut super::super::fetch::Sink,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("these tests start no pull")
+    }
+
+    async fn pools(
+        &self,
+        (): &(),
+        _delegates: &[(PoolId, Address)],
+    ) -> anyhow::Result<worker::PoolSnapshot> {
+        anyhow::ensure!(
+            !self.fail,
+            "the store at http://user:secret@host is unreadable"
+        );
+        let mut snapshot = worker::PoolSnapshot::default();
+        snapshot.pools.skipped.push("0x44".to_owned());
+        Ok(snapshot)
+    }
+
+    async fn close(&self, (): ()) {}
+}
+
+/// The status carries what the worker read from its store.
+#[tokio::test]
+async fn status_reports_the_pool_snapshot_from_the_worker() {
+    let gateway = test_gateway_with(Pools { fail: false }, flags(&[])).await;
+    let status = serde_json::to_value(gateway.status().await).unwrap();
+    assert_eq!(status["pools"]["pools"]["skipped"][0], "0x44");
+    assert!(status["pool_error"].is_null(), "{status}");
+}
+
+/// A store that cannot be read leaves `pools` null and says why, with the
+/// error's secrets stripped.
+#[tokio::test]
+async fn status_reports_a_pool_snapshot_failure() {
+    let gateway = test_gateway_with(Pools { fail: true }, flags(&[])).await;
+    let status = serde_json::to_value(gateway.status().await).unwrap();
+    assert!(status["pools"].is_null(), "{status}");
+    let error = status["pool_error"].as_str().unwrap();
+    assert!(error.contains("unreadable"), "{error}");
+    assert!(!error.contains("secret"), "{error}");
 }

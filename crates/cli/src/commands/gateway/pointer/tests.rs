@@ -302,3 +302,26 @@ fn a_fixed_pointer_signs_to_a_pinned_signature() {
          1cdf2927f9b868f71603a7d2cde6adc70cf9e0deb790b38117c2fbe74daccc0d1b"
     );
 }
+
+/// Every held pointer, by namespace, with the signer it recovered to.
+#[test]
+fn all_lists_held_pointers_by_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let pointers = Pointers::load(dir.path(), 421_614, REGISTRY).unwrap();
+    assert!(pointers.all().is_empty());
+    let owner = PrivateKeySigner::random();
+    pointers.set(signed(&owner, 9, 4), owner.address()).unwrap();
+    pointers.set(signed(&owner, 2, 1), owner.address()).unwrap();
+    let held: Vec<_> = pointers
+        .all()
+        .into_iter()
+        .map(|h| (h.namespace, h.root, h.seq, h.signer))
+        .collect();
+    assert_eq!(
+        held,
+        vec![
+            (2, B256::from(ROOT), 1, owner.address()),
+            (9, B256::from(ROOT), 4, owner.address()),
+        ]
+    );
+}

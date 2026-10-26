@@ -174,6 +174,19 @@ pub(crate) enum SetError {
     Io(anyhow::Error),
 }
 
+/// One held pointer as `/_status` reports it.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct Held {
+    /// The namespace it serves `<ns>.<host>` for.
+    pub(crate) namespace: u64,
+    /// The bundle manifest it points at.
+    pub(crate) root: B256,
+    /// Its place in the namespace's sequence.
+    pub(crate) seq: u64,
+    /// The owner it recovered to.
+    pub(crate) signer: Address,
+}
+
 /// The pointers a gateway holds, by namespace, and the directory that keeps
 /// them across restarts, for one deployment.
 #[derive(Debug)]
@@ -246,6 +259,24 @@ impl Pointers {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&namespace)
             .map(|r| r.pointer.root.0)
+    }
+
+    /// Every pointer held, by namespace.
+    pub(crate) fn all(&self) -> Vec<Held> {
+        let mut held: Vec<_> = self
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(|r| Held {
+                namespace: r.pointer.namespace,
+                root: r.pointer.root,
+                seq: r.pointer.seq,
+                signer: r.signer,
+            })
+            .collect();
+        held.sort_by_key(|h| h.namespace);
+        held
     }
 
     /// The highest `seq` ever stored for `namespace` from `signer`, holder or

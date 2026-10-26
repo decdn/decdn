@@ -672,7 +672,7 @@ pub struct BuyerPoolSnapshot {
 /// This is the only way to read `buyer.redb` on a running node: `redb` holds a
 /// process-exclusive lock on that file for the daemon's lifetime, so no CLI can
 /// open it — not even read-only — while the node is up.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BuyerPoolsResponse {
     /// One entry per tracked pool, ordered by `pool_id` so the output is stable
     /// across calls regardless of the store's internal key order.
