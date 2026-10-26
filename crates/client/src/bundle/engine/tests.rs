@@ -2125,6 +2125,83 @@ fn download_bytes_counts_shared_chunks_once() {
     );
 }
 
+/// A run's rate hints take this run's probe sample over the peer store,
+/// fall back to the store, sort nearest first with an unknown RTT last, and
+/// leave out a node with no known rate.
+#[test]
+fn rate_hints_of_prefer_the_run_then_the_store() -> anyhow::Result<()> {
+    let key = |seed: u8| iroh::SecretKey::from_bytes(&[seed; 32]).public();
+    let addr = Address::repeat_byte;
+    let dir = tempfile::tempdir()?;
+    let store = crate::PeerStore::open(dir.path());
+    let cfg = crate::StoreConfig::default();
+    let now = crate::targets::now_secs();
+    // Node 1: the store says 99 at 1 ms, the run saw 4 at 50 ms.
+    store.record_sample(&key(1), 1.0, 99, now, &cfg)?;
+    // Node 2: the store alone, at 20 ms.
+    store.record_sample(&key(2), 20.0, 6, now, &cfg)?;
+    // Node 3: no rate anywhere. Node 4: only an open, so no latency.
+    store.upsert_identity(
+        &NodeCandidate {
+            node_id: key(4),
+            eth_address: addr(4),
+            region_hint: None,
+            multiaddrs: alloy::primitives::Bytes::new(),
+        },
+        now,
+    )?;
+    store.record_open(&key(4), 8)?;
+    let nodes = [
+        (key(1), addr(1)),
+        (key(2), addr(2)),
+        (key(3), addr(3)),
+        (key(4), addr(4)),
+    ];
+    let samples = HashMap::from([(key(1), (50.0, 4))]);
+    let hints = rate_hints_of(&nodes, &samples, &store, now);
+    let got: Vec<_> = hints.iter().map(|h| (h.provider, h.rate_per_mb)).collect();
+    assert_eq!(got, vec![(addr(2), 6), (addr(1), 4), (addr(4), 8)]);
+    Ok(())
+}
+
+/// The planned downloads list each distinct blob once, in first-seen order,
+/// with a shared chunk under its assigned holder alone, and sum to the run's
+/// download total.
+#[test]
+fn planned_downloads_match_the_run_total() {
+    let a = mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]);
+    let total_b = 3 * GROUP + 50_000;
+    let b = mentry(0x0b, total_b, &[(3 * GROUP, 0x01), (50_000, 0x02)]);
+    let mut a_again = a.clone();
+    a_again.path = "again".into();
+    let unsized_blob = ManifestEntry {
+        path: "unsized".into(),
+        hash: [0x0c; 32],
+        size: None,
+        chunks: None,
+        landed_from: None,
+    };
+    let entries = [a.clone(), b.clone(), a_again, unsized_blob];
+    let planned = planned_downloads(&entries);
+    let rows: Vec<_> = planned
+        .iter()
+        .map(|p| (p.hash, p.size, p.download))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (a.hash, Some(3 * GROUP), 3 * GROUP),
+            (b.hash, Some(total_b), 50_000),
+            ([0x0c; 32], None, 0),
+        ]
+    );
+    let sum: u64 = planned.iter().map(|p| p.download).sum();
+    assert_eq!(
+        Some(sum),
+        download_bytes(&entries, &build_fetch_plan(&entries))
+    );
+}
+
 /// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` opens
 /// the entry's ranged store the way the real drive does (`open_or_create`, so
 /// a `.partial` without its `.ranges` record is truncated exactly as in

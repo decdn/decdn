@@ -254,6 +254,8 @@ pub(crate) mod rate_limited;
 /// recovery): the per-fetch [`recovery::RecoveryGate`] and its progress rule.
 pub mod recovery;
 mod scheduler;
+// Docs live in `quote.rs` as `//!`, for the same reason as `sink` below.
+pub mod quote;
 /// Pure segmentation and tail-steal helpers for the multi-source scheduler
 /// (ADR 039 § Dynamic segmentation and tail-stealing): no I/O, no async.
 mod segment;

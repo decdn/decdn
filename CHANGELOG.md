@@ -136,8 +136,9 @@ since project inception and will roll into the first tagged release.
     (`origin import` writes it) and pull it by hash.
   - The bundle flags (`--include`, `--exclude`, `--select`, `--jobs`,
     `--max-lane-streams`, `--overwrite`, `--dry-run`, `--json`) are an error
-    on a blob URI and on an entry URI with `-o -`, and the entry filters are
-    an error on an entry URI.
+    on an entry URI with `-o -`, and the entry filters are an error on an
+    entry URI. On a blob URI they are an error too, except `--dry-run`, and
+    `--json` with `--dry-run`.
   - `decdn:H/` on a blob that is not a manifest fails with a hint to drop the
     trailing `/`. `decdn_client::bundle::BundleManifest::parse` returns a
     typed `NotAManifest` for that case.
@@ -4095,6 +4096,35 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: `decdn quote <URI>` prices a pull from the nodes' signed probe
+  rates, before any paid byte (#2600).** One unpaid `cdn/probe/v1` round
+  reaches every node a pull can draw from (the peer store's or the registry's
+  list, narrowed by the region allowlist, not sampled down) and verifies each
+  answer's signed rate against its operator. The quote prints the size, how
+  many nodes hold the content (and how many did not answer or rate-limited
+  the probe), their rate range in USDC per GB, the `--max-rate-per-mb`
+  ceiling, and the cost: every byte at the cheapest rate, at the most
+  expensive, and the likely cost split evenly over the first `--max-sources`
+  nodes in the order a pull that probed every node would try them, one node
+  per operator. Costs are on bao wire bytes, as the nodes meter them, for a
+  fresh pull: files already on disk still count. A blob's size is the nearest
+  holder's report. A bundle's size is its manifest's planned download, with a
+  duplicate blob and a shared chunk counted once; the quote probes the 4
+  largest blobs and prices the rest, and any probed blob with no usable rate,
+  at their mean rate, because the reference node signs one rate for every
+  hash. The manifest comes from the output directory's cache, or from a small
+  paid pull that caches it for the `get` that follows. `--json` gives every
+  amount in micro-USDC. `decdn get --dry-run` prints the same block, on a blob
+  URI too, where `--json` also applies with `--dry-run`; it sends no
+  transaction and opens no keystore, but reads the registry when the peer
+  store cannot supply it, and probes. Its `--json` plan carries `quote` and
+  `quote_error`. Without a cached manifest it names the `decdn quote` command
+  to run. `get` prints a one-line `Estimate:` on stderr before the pull (not
+  under `--json`), from the rates its own probe round and the peer store
+  hold. In `decdn-client`: the `quote` module (`census`,
+  `HashCensus::serve_order`, `price`, `wire_bytes`) and
+  `bundle::planned_downloads`.
+
 - **CLI: `decdn node earnings` prints settled and owed USDC per period
   (#2598).** The table has one row per period (the last 24 hours, the last
   7 days, and since the node's settlement ledger started) with the USDC the
@@ -4340,8 +4370,8 @@ since project inception and will roll into the first tagged release.
   on each `--include`/`--exclude` pattern that matches no entry, as
   `-i --dry-run` does. The dry run reads the cache even under `--overwrite`.
   With no cached manifest, it prints the bundle hash and output directory it
-  would pull into; under `--json` it prints `count` and `entries` as `null`.
-  A malformed `--hash` fails the dry run, as it fails a real pull.
+  would pull into; under `--json` it prints `count`, `entries` and `quote`
+  as `null`. A malformed `--hash` fails the dry run, as it fails a real pull.
 - **`bundle pull --hash` names a cached manifest it cannot use (#2361).** A
   cache file under `.decdn-bundles/` that cannot be read, or whose bytes fail
   the hash check, fails `--dry-run` with the file path and the reason. A real

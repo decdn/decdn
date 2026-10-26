@@ -81,7 +81,7 @@ use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;
 use futures_util::StreamExt as _;
-use iroh::{Endpoint, RelayUrl};
+use iroh::{Endpoint, PublicKey, RelayUrl};
 use tokio_util::sync::CancellationToken;
 
 use super::landing::Landing;
@@ -646,6 +646,22 @@ fn download_bytes(entries: &[ManifestEntry], fetch_plan: &FetchPlan) -> Option<u
     any.then_some(sum)
 }
 
+/// Each distinct blob of `entries` with its planned fresh-pull download,
+/// under the same plan as [`download_bytes`], whose sum it matches.
+pub(super) fn planned_downloads(entries: &[ManifestEntry]) -> Vec<super::PlannedBlob> {
+    let refs: Vec<&ManifestEntry> = entries.iter().collect();
+    let fetch_plan = build_fetch_plan(entries);
+    let empty = HashMap::new();
+    group_by_hash(&refs)
+        .iter()
+        .map(|group| super::PlannedBlob {
+            hash: group.hash,
+            size: group.entries.iter().find_map(|e| e.size),
+            download: blob_download_reconstruct(group, &fetch_plan, &empty).0,
+        })
+        .collect()
+}
+
 /// A group of manifest entries that all name the same blob `hash` — one file
 /// published at two (or more) bundle paths. Non-empty by construction; every
 /// member's `hash` equals `hash`.
@@ -887,18 +903,58 @@ impl Registry {
     /// extra probe, because each entry probes its own candidates, and a node
     /// that one draw leaves out can still reach other entries.
     pub(super) fn entry_candidates(&self, site: &PullSite) -> Vec<NodeCandidate> {
+        self.allowed(site, discovery::SELECT_K)
+    }
+
+    /// At most `k` of the list, same-region nodes first, kept to
+    /// `site.region_allowlist` with the widening rule
+    /// ([`crate::targets::select_up_to`]); a cached-outage list ignores the
+    /// allowlist.
+    pub(super) fn allowed(&self, site: &PullSite, k: usize) -> Vec<NodeCandidate> {
         let allow: &[decdn_protocol::Region] = if self.outage_fallback {
             &[]
         } else {
             site.region_allowlist.as_slice()
         };
-        crate::targets::select_with_widening(
+        crate::targets::select_up_to(
             self.nodes.clone(),
             site.region.as_deref(),
             allow,
             &crate::StoreConfig::default(),
+            k,
         )
     }
+}
+
+/// The rates of `nodes`, nearest first: each node's `(rtt_ms, rate_per_mb)`
+/// sample from this run, else its peer-store rate and latency
+/// ([`crate::quote::store_rate`]). A node with no known rate, or whose last
+/// failure still suppresses it, is left out; one with no known RTT sorts
+/// last.
+pub(super) fn rate_hints_of(
+    nodes: &[(PublicKey, Address)],
+    samples: &HashMap<PublicKey, (f64, u64)>,
+    store: &crate::PeerStore,
+    now_secs: u64,
+) -> Vec<crate::quote::RateHint> {
+    let mut known: Vec<(f64, crate::quote::RateHint)> = nodes
+        .iter()
+        .filter_map(|&(node_id, provider)| {
+            let (rtt_ms, rate_per_mb) = samples
+                .get(&node_id)
+                .copied()
+                .or_else(|| crate::quote::store_rate(store, &node_id, now_secs))?;
+            Some((
+                rtt_ms,
+                crate::quote::RateHint {
+                    provider,
+                    rate_per_mb,
+                },
+            ))
+        })
+        .collect();
+    known.sort_by(|a, b| a.0.total_cmp(&b.0));
+    known.into_iter().map(|(_, hint)| hint).collect()
 }
 
 /// The run's [`Registry`]. The peer store's identity-fresh records serve as
@@ -1612,6 +1668,9 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     /// What explains a failed fetch to the caller's user; `None` leaves every
     /// error as the fetch returned it.
     pub(super) hints: Option<Arc<dyn FaultHints>>,
+    /// `(rtt_ms, rate_per_mb)` of each node the run's probe rounds heard
+    /// from, at its lowest RTT ([`super::BundlePuller::rate_hints`]).
+    pub(super) rate_samples: std::sync::Mutex<HashMap<PublicKey, (f64, u64)>>,
 }
 
 impl<P: Provider + Clone> PullCtx<P> {
@@ -1689,7 +1748,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 // The entry's round streams: its fetch starts at the first
                 // verified holder, and the holders that answer later join it.
                 let candidates = registry.entry_candidates(&self.site);
-                probe_and_order(
+                let targets = probe_and_order(
                     &self.endpoint,
                     &candidates,
                     self.relays.first(),
@@ -1698,9 +1757,41 @@ impl<P: Provider + Clone> PullCtx<P> {
                     &self.slash_dom,
                     ProbeRound::Stream,
                 )
-                .await
+                .await?;
+                self.record_rates(&targets.probed_samples);
+                Ok(targets)
             }
         }
+    }
+
+    /// Keep each `(node_id, rtt_ms, rate_per_mb)` sample, at the lowest RTT
+    /// a node answered at.
+    fn record_rates(&self, samples: &[(PublicKey, f64, u64)]) {
+        let mut kept = self
+            .rate_samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::quote::keep_nearest(&mut kept, samples.iter().copied());
+    }
+
+    /// The rates of the run's nodes, nearest first ([`rate_hints_of`]): the
+    /// pinned node, or every registry node the region allowlist keeps.
+    pub(super) fn rate_hints(&self) -> Vec<crate::quote::RateHint> {
+        let nodes: Vec<(PublicKey, Address)> = match &self.nodes.selection {
+            Selection::Pinned(pinned) => vec![(pinned.node_id, pinned.provider)],
+            Selection::Registry(registry) => registry
+                .allowed(&self.site, usize::MAX)
+                .iter()
+                .map(|c| (c.node_id, c.eth_address))
+                .collect(),
+        };
+        let samples = self
+            .rate_samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let store = crate::PeerStore::open(&self.site.data_dir);
+        rate_hints_of(&nodes, &samples, &store, now_secs())
     }
 
     /// Fill `ranges` of blob `hash` (`None` is the whole blob) into the ranged

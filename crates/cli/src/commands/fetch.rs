@@ -53,7 +53,7 @@ use decdn_client::targets::{
 };
 use decdn_client::{
     Connections, CredentialSlot, DownloadTarget, Downloader, Holder, LaneLedgers,
-    NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PoolContext, PoolReplaced,
+    NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PeerStore, PoolContext, PoolReplaced,
     ProgressClock, PullConfig, PullDeadlines, RecoveryGate, StopPolicy, Streamer, UpstreamRefused,
     UpstreamVoucherRejected,
 };
@@ -577,6 +577,7 @@ async fn fetch_target(
     timings: &FetchTimings,
 ) -> anyhow::Result<()> {
     let blob = |hash| BlobFetch {
+        estimate: true,
         read_ahead: None,
         size_cap: None,
         range: None,
@@ -616,6 +617,7 @@ async fn fetch_entry_hash(
     let mut common = args.common.clone();
     common.max_blob_mb = manifest_cap_mb(common.max_blob_mb);
     let manifest = BlobFetch {
+        estimate: false,
         read_ahead: None,
         size_cap: None,
         range: None,
@@ -726,6 +728,10 @@ pub(crate) struct BlobFetch {
     /// blob. Read only when the fetch streams: a window cannot be downloaded
     /// to a file.
     pub(crate) range: Option<(u64, u64)>,
+    /// Print the fetch's one-line cost estimate on stderr before the first
+    /// paid byte (#2600): set for the blob a user asked for, and not for a
+    /// manifest or a gateway response.
+    pub(crate) estimate: bool,
 }
 
 /// A delegate credential held in memory: the key that signs vouchers and the
@@ -1080,6 +1086,11 @@ pub(crate) async fn fetch_on(
         .await,
     )?;
     timings.mark(Mark::Resolved);
+    // Read before the pass loop: the holders' rates as this resolve and the
+    // peer store know them, for the estimate the first pass prints.
+    let rate_hints = args
+        .estimate
+        .then(|| resolved.rate_hints(&PeerStore::open(&chain.site.data_dir)));
 
     // Buyer key: the held delegate key, else the keystore, loaded after holder
     // resolution so a configuration fault never prompts for a keystore
@@ -1207,6 +1218,11 @@ pub(crate) async fn fetch_on(
         let result = async {
             // The first size claim: the probe's hint, or a header-only open.
             let claim = sources.first_claim(hash, holders, health, &stop).await?;
+            if replaced.is_none()
+                && let Some(hints) = &rate_hints
+            {
+                super::quote::print_estimate(claim.total_bytes, hints, common);
+            }
             if streams {
                 return stream_out(
                     &deps,

@@ -4,7 +4,8 @@
 //! The command parses the URI with [`decdn_client::uri::DecdnUri`], checks the
 //! flags against the URI's target, and runs the route for that target:
 //!
-//! - `decdn:<hash>` runs the blob fetch, `fetch::fetch`.
+//! - `decdn:<hash>` runs the blob fetch, `fetch::fetch`. With `--dry-run` it
+//!   prints the blob's quote instead (`quote::dry_run_blob`).
 //! - `decdn:<hash>/` runs the bundle pull, `bundle_pull::bundle_pull`, over
 //!   every entry.
 //! - `decdn:<hash>/<path>` runs the bundle pull for exactly that entry. With
@@ -45,6 +46,9 @@ pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<(
         let shown = dest.shown();
         let shown = std::path::absolute(&shown).unwrap_or(shown);
         eprintln!("Downloading to {}", shown.display());
+    }
+    if args.dry_run && uri.target == UriTarget::Blob {
+        return super::quote::dry_run_blob(args, &dest.path, &uri, config_path).await;
     }
     let result = if streams_one_blob(args, &uri) {
         super::fetch::fetch(args, &dest.path, &uri, config_path).await
@@ -145,7 +149,8 @@ fn is_stdout(args: &GetArgs) -> bool {
 }
 
 /// The URI `args` names, once its flags are checked against its target. Rejects
-/// a flag that does not apply: any bundle flag on a blob URI, or on an entry
+/// a flag that does not apply: a bundle flag other than `--dry-run` on a blob
+/// URI, and `--json` there without `--dry-run`; any bundle flag on an entry
 /// URI to stdout; an entry filter on an entry URI; and `-o -` on a whole
 /// bundle.
 fn parse_and_check(args: &GetArgs) -> anyhow::Result<DecdnUri> {
@@ -155,11 +160,18 @@ fn parse_and_check(args: &GetArgs) -> anyhow::Result<DecdnUri> {
         .with_context(|| format!("parse URI {:?}", args.uri))?;
     match &uri.target {
         UriTarget::Blob => {
-            let given = bundle_flags_given(args);
+            let given: Vec<_> = bundle_flags_given(args)
+                .into_iter()
+                .filter(|flag| !matches!(*flag, "--dry-run" | "--json"))
+                .collect();
             anyhow::ensure!(
                 given.is_empty(),
                 "{} only apply to a bundle URI (`decdn:<hash>/`), not a blob URI",
                 given.join(", ")
+            );
+            anyhow::ensure!(
+                !args.json || args.dry_run,
+                "--json applies to a blob URI only with --dry-run"
             );
             return Ok(uri);
         }

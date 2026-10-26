@@ -33,8 +33,9 @@ pub const DEFAULT_MAX_LANE_STREAMS: u16 = 4;
 ///
 /// A `?ns=<id>` in the URI is the namespace routing hint (ADR 002) for every
 /// request of the run: the manifest blob and each entry. The bundle-only flags
-/// are an error on a blob URI, and the entry filters (`--include`,
-/// `--exclude`, `--select`) are an error on an entry URI.
+/// are an error on a blob URI, except `--dry-run`, and `--json` with
+/// `--dry-run`. The entry filters (`--include`, `--exclude`, `--select`) are
+/// an error on an entry URI.
 #[derive(Args, Debug)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -127,15 +128,21 @@ pub struct GetArgs {
     #[arg(long)]
     pub overwrite: bool,
 
-    /// Bundle only: print the entries the run would pull (paths + sizes, after
-    /// the entry filters; files already present are still listed) and exit
-    /// without any network or chain activity. Entries are listed only when an
-    /// earlier pull into the same output directory cached the bundle manifest.
+    /// Print what the run would pull and its price, then exit. Nothing is
+    /// paid, no keystore is opened and no transaction is sent; the price
+    /// comes from one unpaid probe round of the nodes (`decdn quote`), and the
+    /// node registry is read when the peer store cannot supply it. For a
+    /// bundle, the plan lists the entries (paths + sizes, after the entry
+    /// filters; files already present are still listed) and the price only
+    /// when an earlier pull or `decdn quote` into the same output directory
+    /// cached the bundle manifest; otherwise it names the `decdn quote`
+    /// command to run.
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Bundle only: emit a one-line JSON summary instead of human-readable
-    /// output.
+    /// Emit one line of JSON instead of human-readable output: the run's
+    /// summary for a bundle, or the plan with its quote under `--dry-run`.
+    /// A blob URI takes it only with `--dry-run`.
     #[arg(long)]
     pub json: bool,
 

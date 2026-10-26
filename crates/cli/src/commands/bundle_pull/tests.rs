@@ -551,9 +551,14 @@ async fn dry_run_still_rejects_a_dangling_provider_address() {
         &uri,
         &["-o", "out", "--dry-run", "--provider-address", addr],
     );
-    let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
-        .await
-        .expect_err("a dangling --provider-address must be rejected even for --dry-run");
+    let err = super::bundle_pull(
+        &args,
+        &Destination::of(&args, &uri),
+        &uri,
+        Some(&offline_config()),
+    )
+    .await
+    .expect_err("a dangling --provider-address must be rejected even for --dry-run");
     assert!(
         format!("{err:#}").contains("--provider-address requires --node-id"),
         "expected the validate() guard error, got: {err:#}"
@@ -588,14 +593,24 @@ async fn dry_run_reads_a_cached_manifest() {
             &format!("decdn:{hash}/openai-gpt-oss-20b/config.json"),
             &extra,
         );
-        super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
-            .await
-            .unwrap_or_else(|e| panic!("overwrite={overwrite}: {e:#}"));
+        super::bundle_pull(
+            &args,
+            &Destination::of(&args, &uri),
+            &uri,
+            Some(&offline_config()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("overwrite={overwrite}: {e:#}"));
 
         let (args, uri) = get_args(&format!("decdn:{hash}/openai-gpt-oss-20b/no.json"), &extra);
-        let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
-            .await
-            .expect_err("the cached manifest has no such entry");
+        let err = super::bundle_pull(
+            &args,
+            &Destination::of(&args, &uri),
+            &uri,
+            Some(&offline_config()),
+        )
+        .await
+        .expect_err("the cached manifest has no such entry");
         assert!(format!("{err:#}").contains("no entry"), "{err:#}");
     }
 }
@@ -610,9 +625,14 @@ async fn dry_run_has_no_manifest_for_an_uncached_hash() {
         &format!("decdn:{}/", "ab".repeat(32)),
         &["-o", out, "--dry-run"],
     );
-    super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
-        .await
-        .unwrap();
+    super::bundle_pull(
+        &args,
+        &Destination::of(&args, &uri),
+        &uri,
+        Some(&offline_config()),
+    )
+    .await
+    .unwrap();
 }
 
 /// The full dry run reads the cached manifest: a cached blob that hashes to
@@ -627,9 +647,14 @@ async fn dry_run_fails_on_a_cached_manifest_that_does_not_parse() {
         &serde_json::json!({"version": 2, "entries": []}),
     );
     let (args, uri) = get_args(&format!("decdn:{hash}/"), &["-o", out, "--dry-run"]);
-    let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
-        .await
-        .expect_err("a cached non-v1 manifest fails the dry run");
+    let err = super::bundle_pull(
+        &args,
+        &Destination::of(&args, &uri),
+        &uri,
+        Some(&offline_config()),
+    )
+    .await
+    .expect_err("a cached non-v1 manifest fails the dry run");
     let msg = format!("{err:#}");
     assert!(msg.contains("unsupported bundle version 2"), "{msg}");
     assert!(msg.contains(".decdn-bundles"), "{msg}");
@@ -652,9 +677,14 @@ async fn dry_run_fails_on_a_cached_manifest_with_a_malformed_hash() {
     );
     for uri in [format!("decdn:{hash}/"), format!("decdn:{hash}/ok.bin")] {
         let (args, parsed) = get_args(&uri, &["-o", out, "--dry-run"]);
-        let err = super::bundle_pull(&args, &Destination::of(&args, &parsed), &parsed, None)
-            .await
-            .expect_err("a malformed cached manifest fails the dry run");
+        let err = super::bundle_pull(
+            &args,
+            &Destination::of(&args, &parsed),
+            &parsed,
+            Some(&offline_config()),
+        )
+        .await
+        .expect_err("a malformed cached manifest fails the dry run");
         let msg = format!("{err:#}");
         assert!(
             msg.contains(r#"bundle entry "bad.bin" has a malformed hash"#),
@@ -711,9 +741,14 @@ async fn dry_run_fails_naming_an_unreadable_cached_manifest() {
     // A directory at the cache path is unreadable as a file, even as root.
     std::fs::create_dir_all(BundleManifest::cache_path(tmp.path(), raw)).expect("mkdir");
     let (args, uri) = get_args(&format!("decdn:{hex}/"), &["-o", out, "--dry-run"]);
-    let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
-        .await
-        .expect_err("an unreadable cached manifest fails the dry run");
+    let err = super::bundle_pull(
+        &args,
+        &Destination::of(&args, &uri),
+        &uri,
+        Some(&offline_config()),
+    )
+    .await
+    .expect_err("an unreadable cached manifest fails the dry run");
     let msg = format!("{err:#}");
     assert!(msg.contains(".decdn-bundles"), "{msg}");
     assert!(msg.contains(hex.as_str()), "{msg}");
@@ -734,9 +769,14 @@ async fn dry_run_fails_naming_a_cached_manifest_that_fails_its_hash_check() {
     let raw = decdn_client::bundle::parse_hash(&hash).expect("hash");
     std::fs::write(BundleManifest::cache_path(tmp.path(), raw), b"tampered").expect("tamper");
     let (args, uri) = get_args(&format!("decdn:{hash}/"), &["-o", out, "--dry-run"]);
-    let err = super::bundle_pull(&args, &Destination::of(&args, &uri), &uri, None)
-        .await
-        .expect_err("a tampered cached manifest fails the dry run");
+    let err = super::bundle_pull(
+        &args,
+        &Destination::of(&args, &uri),
+        &uri,
+        Some(&offline_config()),
+    )
+    .await
+    .expect_err("a tampered cached manifest fails the dry run");
     let msg = format!("{err:#}");
     assert!(msg.contains("does not hash to the bundle"), "{msg}");
     assert!(msg.contains(".decdn-bundles"), "{msg}");
@@ -1114,12 +1154,12 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
     let mut dest = Destination::of(&args, &parsed);
     assert_eq!(dest.entry_name.as_deref(), Some("c.bin"));
     dest.path = out.to_path_buf();
-    super::bundle_pull(&args, &dest, &parsed, None)
+    super::bundle_pull(&args, &dest, &parsed, Some(&offline_config()))
         .await
         .unwrap();
 
     std::fs::write(out.join("c.bin"), b"mine").unwrap();
-    let err = super::bundle_pull(&args, &dest, &parsed, None)
+    let err = super::bundle_pull(&args, &dest, &parsed, Some(&offline_config()))
         .await
         .expect_err("an unrecorded c.bin must be refused");
     assert!(format!("{err:#}").contains("c.bin"), "{err:#}");
@@ -1127,11 +1167,11 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
     // A record from this entry vouches for c.bin; one from another entry
     // with other bytes does not, and the refusal names that entry.
     record_pull(out, "c.bin", [0xbb; 32], &hash, "models/v1/c.bin");
-    super::bundle_pull(&args, &dest, &parsed, None)
+    super::bundle_pull(&args, &dest, &parsed, Some(&offline_config()))
         .await
         .unwrap();
     record_pull(out, "c.bin", [0xbb; 32], &hash, "models/v2/c.bin");
-    let err = super::bundle_pull(&args, &dest, &parsed, None)
+    let err = super::bundle_pull(&args, &dest, &parsed, Some(&offline_config()))
         .await
         .expect_err("a c.bin another entry wrote must be refused");
     assert!(
@@ -1141,9 +1181,14 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
 
     let out_s = out.to_str().unwrap();
     let (args, parsed) = get_args(&uri, &["--dry-run", "-o", out_s]);
-    super::bundle_pull(&args, &Destination::of(&args, &parsed), &parsed, None)
-        .await
-        .unwrap();
+    super::bundle_pull(
+        &args,
+        &Destination::of(&args, &parsed),
+        &parsed,
+        Some(&offline_config()),
+    )
+    .await
+    .unwrap();
 }
 
 /// A guard whose drop sets `flag`: it stands in for the fetch's lanes, whose
@@ -1190,4 +1235,34 @@ async fn the_manifest_fetch_wins_when_nothing_fires() {
         .await
         .unwrap();
     assert_eq!(got, 7);
+}
+
+/// The dry run's JSON always carries `quote` and `quote_error`: a failed
+/// quote gives its reason, and an empty plan says there is nothing to fetch.
+#[test]
+fn a_dry_run_plan_always_names_its_quote() {
+    let plan = || serde_json::json!({"output": "o", "count": 0});
+    let failed = with_quote(
+        plan(),
+        Some(&Err("quote unavailable: x".to_owned())),
+        "decdn:a/",
+    );
+    assert_eq!(failed["quote"], serde_json::Value::Null);
+    assert_eq!(failed["quote_error"], "quote unavailable: x");
+    assert_eq!(failed["output"], "o");
+    let empty = with_quote(plan(), None, "decdn:a/");
+    assert_eq!(empty["quote"], serde_json::Value::Null);
+    assert_eq!(empty["quote_error"], "nothing to fetch");
+}
+
+/// An empty config file: a dry run's quote then resolves no chain and probes
+/// nothing, whatever config the machine running the tests has.
+fn offline_config() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::write(dir.path().join("config.toml"), "").expect("write config");
+        dir
+    });
+    dir.path().join("config.toml")
 }

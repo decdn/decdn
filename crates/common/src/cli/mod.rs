@@ -19,6 +19,7 @@ pub mod origin;
 pub mod pool;
 pub mod probe;
 pub mod publish;
+pub mod quote;
 pub mod run;
 pub mod self_update;
 pub mod setup;
@@ -51,6 +52,7 @@ pub use publish::{
     AssignArgs, NamespaceArgs, NamespaceCommand, NamespaceCreateArgs, PointArgs, PublishArgs,
     PublishChainArgs, PublishCommand, RevokeArgs,
 };
+pub use quote::QuoteArgs;
 pub use run::RunArgs;
 pub use self_update::SelfUpdateArgs;
 pub use setup::SetupArgs;
@@ -126,6 +128,9 @@ pub enum Command {
     /// (`decdn:<hash>/`), or one bundle entry (`decdn:<hash>/<path>`), over the
     /// paid `cdn/client/v1` path, paying per-MB from a `PaymentPool`.
     Get(Box<GetArgs>),
+    /// Price a pull of what a `decdn:` URI names from the rates the nodes
+    /// sign in their probe answers, before any paid byte.
+    Quote(Box<QuoteArgs>),
     /// Guided node onboarding (ADR 019 Phases 1–2): pre-flight checks,
     /// key generation, bond, and on-chain registration, with a final
     /// readiness summary. Thin orchestration over `key-gen` / `node bond` /

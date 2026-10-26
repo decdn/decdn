@@ -186,8 +186,13 @@ USDC.
 ```bash
 decdn config init --client --output ~/.decdn/client.toml
 decdn key-gen --output-dir ~/.decdn/client
+decdn --config ~/.decdn/client.toml quote decdn:<blake3-hash>
 decdn --config ~/.decdn/client.toml get decdn:<blake3-hash> -o ./blob.bin
 ```
+
+`quote` prices the pull from the rates the nodes sign in their probe answers, and pays
+nothing for a blob; a bundle with no cached manifest costs one small paid pull for it.
+`get` prints the same estimate on one line before it starts.
 
 `get` pays each node it uses from a pool you own. It reuses your existing pool or opens one with a 10 USDC working deposit, and it tops the
 pool up on-chain without prompting when the balance runs low. Fund the wallet with only
@@ -354,6 +359,7 @@ daemon and its onramp are two more ([`docs/sponsord/`](docs/sponsord/README.md))
 | `node {…}` | Admin of a running daemon (`health`, `status`, `lanes`, `pools`, `top`, `evict`, `reload`, `drain`, `slashes`); the on-chain lifecycle (`bond`, `unbond`, `register`, `deregister`, `rotate-key`, `update-multiaddrs`, `update-region`); diagnostics (`doctor`, `lookup`) |
 | `probe` | Probe a node over `cdn/probe/v1` |
 | `get` | Paid pull over `cdn/client/v1` of what a `decdn:` URI names: a blob, a directory bundle, or one file of a bundle ([appendix](adr/appendix-bundles.md)) |
+| `quote` | Price a pull of a `decdn:` URI from the rates the nodes sign in their probe answers, before any paid byte |
 | `pool {…}` | Client payment-pool lifecycle: `list`, `open`, `top-up`, `close`, `reclaim`, `assign` |
 | `publish {…}` | Publisher control plane: `namespace create`; seat and unseat authorized origins with `assign` and `revoke` |
 | `origin {import}` | Write local content into a local filesystem origin store, offline and config-free |

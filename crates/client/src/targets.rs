@@ -49,7 +49,7 @@ pub(crate) fn micros_now() -> u64 {
 /// each of the other three separately. Reached only when there is neither a
 /// cache holder nor a reachable non-holder to pull through — a `has_blob:false`
 /// answer is a serve target, not a failure, so it never lands here.
-fn no_serve_target_error(
+pub(crate) fn no_serve_target_error(
     probe_count: usize,
     unreachable: usize,
     rate_limited: usize,
@@ -92,7 +92,7 @@ const PROBE_SHED_BACKOFFS_MS: [u64; 3] = [250, 500, 1000];
 /// Probe one candidate, probing it again after each [`PROBE_SHED_BACKOFFS_MS`]
 /// wait while it sheds the probe. Any other result — an answer, a timeout, a
 /// transport failure — returns at once.
-async fn probe_candidate(
+pub(crate) async fn probe_candidate(
     endpoint: &Endpoint,
     target: EndpointAddr,
     hash: [u8; 32],
@@ -407,7 +407,7 @@ impl ProbeTally {
 /// before it can influence the order (ADR 014 §1). A failure is requester-local
 /// policy, with no reputation effect, because an unrecovered signature
 /// attributes nothing to anyone.
-fn classify_probe(
+pub(crate) fn classify_probe(
     cand: &NodeCandidate,
     res: anyhow::Result<(
         decdn_protocol::message::ProbeResponse,
@@ -659,12 +659,12 @@ fn nearest_size_hint(holders: &[discovery::Probed]) -> Option<u64> {
 /// The ordered provider-failover list plus, when a proxy leads it, that proxy's
 /// identity for the operator log line. Split from [`probe_and_order`] as a pure
 /// function so the ordering is unit-tested without live probing.
-struct FailoverOrder {
+pub(crate) struct FailoverOrder {
     /// The candidates to try in turn: proxy-warming non-holders first (nearest
     /// RTT first) when warming engages, then the holders nearest RTT first — or,
     /// when no holder answered, the reachable non-holders nearest RTT first as
     /// pull-through serve targets (#1911).
-    order: Vec<NodeCandidate>,
+    pub(crate) order: Vec<NodeCandidate>,
     /// `Some((proxy_node_id, proxy_rtt_ms, best_holder_rtt_ms))` when a warming
     /// proxy is prepended; `None` when the list is just the holders.
     warming_lead: Option<(PublicKey, f64, f64)>,
@@ -698,7 +698,7 @@ struct FailoverOrder {
 /// content, not a latency optimization — so it applies whether warming is on or
 /// off. `warming_lead` and `coverage_by_node` are both empty here,
 /// since no holder answered.
-fn failover_order(
+pub(crate) fn failover_order(
     mut holders: Vec<discovery::Probed>,
     non_holders: &[discovery::WarmingCandidate],
     warming: ProxyWarmingParams,
@@ -1004,16 +1004,28 @@ pub(crate) fn select_with_widening(
     allow: &[decdn_protocol::Region],
     cfg: &crate::StoreConfig,
 ) -> Vec<NodeCandidate> {
+    select_up_to(candidates, region, allow, cfg, discovery::SELECT_K)
+}
+
+/// [`select_with_widening`] capped at `k` candidates instead of
+/// [`discovery::SELECT_K`]. A price census ([`crate::quote::census`]) passes
+/// `usize::MAX`, so it keeps every node the allowlist keeps.
+pub(crate) fn select_up_to(
+    candidates: Vec<NodeCandidate>,
+    region: Option<&str>,
+    allow: &[decdn_protocol::Region],
+    cfg: &crate::StoreConfig,
+    k: usize,
+) -> Vec<NodeCandidate> {
     // Only a non-empty allowlist can trigger the widening re-run, so keep the
     // unfiltered copy only in that case — the common empty-allowlist path (no
     // filtering, no widening possible) does no extra allocation.
     let widen_fallback = (!allow.is_empty()).then(|| candidates.clone());
-    let selected =
-        discovery::select_candidates_filtered(candidates, region, discovery::SELECT_K, allow);
+    let selected = discovery::select_candidates_filtered(candidates, region, k, allow);
     if let Some(widened) = widen_fallback
         && selected.len() < cfg.min_fresh_candidates
     {
-        return discovery::select_candidates_filtered(widened, region, discovery::SELECT_K, &[]);
+        return discovery::select_candidates_filtered(widened, region, k, &[]);
     }
     selected
 }
@@ -1179,6 +1191,35 @@ impl std::fmt::Debug for ResolvedTargets {
     }
 }
 
+impl ResolvedTargets {
+    /// Each candidate's signed per-MiB rate, in failover order: the rate its
+    /// probe in this resolve signed, else the rate the peer store last
+    /// recorded for it ([`crate::quote::store_rate`]). A candidate with
+    /// neither is left out. `decdn get` prints its estimate from these
+    /// before the pull starts (#2600).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn rate_hints(&self, store: &crate::PeerStore) -> Vec<crate::quote::RateHint> {
+        self.candidates
+            .iter()
+            .filter_map(|c| {
+                let probed = self
+                    .probed_samples
+                    .iter()
+                    .find(|(node_id, _, _)| *node_id == c.node_id)
+                    .map(|&(_, _, rate)| rate);
+                let rate_per_mb = probed.or_else(|| {
+                    crate::quote::store_rate(store, &c.node_id, now_secs()).map(|(_, rate)| rate)
+                })?;
+                Some(crate::quote::RateHint {
+                    provider: c.eth_address,
+                    rate_per_mb,
+                })
+            })
+            .collect()
+    }
+}
+
 /// The one holder of a pinned `--node-id` at `provider`. Nothing was probed,
 /// so it carries no size hint.
 pub(crate) fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedTargets {
@@ -1299,7 +1340,7 @@ fn short_address(addr: &Address) -> String {
 /// Build a probe target for a discovered candidate: its `node_id`, an optional
 /// relay hint, and its registry multiaddrs as direct-address hints (ADR 001 §
 /// Node Discovery). See [`crate::lanes::lane_target`] for why both ride the first packet.
-fn probe_target(cand: &NodeCandidate, relay: Option<RelayUrl>) -> EndpointAddr {
+pub(crate) fn probe_target(cand: &NodeCandidate, relay: Option<RelayUrl>) -> EndpointAddr {
     let mut target = EndpointAddr::new(cand.node_id);
     if let Some(url) = relay {
         target = target.with_relay_url(url);

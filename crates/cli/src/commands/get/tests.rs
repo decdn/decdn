@@ -75,9 +75,27 @@ fn shared_flags_reach_the_args() {
 #[test]
 fn bundle_flags_rejected_on_blob_uri() {
     let uri = format!("decdn:{HEX}");
-    let err = err_of(&[&uri, "-o", "x", "--jobs", "2", "--json"]);
-    assert!(err.contains("--jobs, --json"), "{err}");
+    let err = err_of(&[&uri, "-o", "x", "--jobs", "2", "--overwrite"]);
+    assert!(err.contains("--jobs, --overwrite"), "{err}");
     assert!(err.contains("bundle URI"), "{err}");
+}
+
+/// A blob URI takes `--dry-run`, which prints its quote, and `--json` with it.
+#[test]
+fn blob_uri_takes_a_dry_run() {
+    let uri = format!("decdn:{HEX}");
+    for argv in [
+        vec![uri.as_str(), "--dry-run"],
+        vec![&uri, "--dry-run", "--json"],
+    ] {
+        let parsed = parse_and_check(&get_args(&argv)).unwrap();
+        assert_eq!(parsed.target, UriTarget::Blob);
+    }
+    let err = err_of(&[&uri, "--json"]);
+    assert!(err.contains("only with --dry-run"), "{err}");
+    // `--dry-run` exempts only itself and `--json`.
+    let err = err_of(&[&uri, "--dry-run", "--jobs", "2"]);
+    assert!(err.contains("--jobs only apply to a bundle URI"), "{err}");
 }
 
 #[test]
