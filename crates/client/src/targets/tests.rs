@@ -322,6 +322,93 @@ async fn probe_candidate_does_not_retry_a_failure_that_is_not_a_shed() {
     server.close().await;
 }
 
+/// A pinned node that sheds its size probe stays the fetch's only holder,
+/// with no size hint (#2619). It is probed once, at its `--addr`, and a shed
+/// probe is not retried: the hint is worth no backoff.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pinned_node_that_sheds_its_probe_stays_the_holder_with_no_hint() {
+    let (server, target, seen) = closing_probe_server(decdn_protocol::APP_ERR_RATE_LIMITED).await;
+    let client = client_endpoint().await;
+    let provider = Address::repeat_byte(0x42);
+    let pinned = PinnedNode {
+        node_id: server.id(),
+        provider,
+        addr: target.ip_addrs().next().copied(),
+    };
+    let targets = probe_pinned(&client, &offline_chain(), None, pinned, [7; 32], None).await;
+
+    assert!(targets.pinned);
+    assert!(targets.size_hint.is_none());
+    assert_eq!(
+        targets
+            .candidates
+            .iter()
+            .map(|c| (c.node_id, c.eth_address))
+            .collect::<Vec<_>>(),
+        vec![(server.id(), provider)]
+    );
+    // One probe: a shed one is not retried.
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    client.close().await;
+    server.close().await;
+}
+
+/// A pinned fetch that knows the blob's size (a gateway's manifest entry)
+/// takes it as the first size claim and probes nothing (#2619).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
+    let (server, target, seen) = closing_probe_server(0).await;
+    let client = client_endpoint().await;
+    let site_dir = tempfile::tempdir().unwrap();
+    let opts = DiscoveryOptions {
+        pinned: Some(PinnedNode {
+            node_id: server.id(),
+            provider: Address::repeat_byte(0x42),
+            addr: target.ip_addrs().next().copied(),
+        }),
+        ..DiscoveryOptions::default()
+    };
+    let site = PullSite {
+        data_dir: site_dir.path().to_path_buf(),
+        region: None,
+        region_allowlist: Vec::new(),
+    };
+    let probe = ProbeOpts {
+        marks: None,
+        round: ProbeRound::Stream,
+        known_size: Some(4096),
+    };
+
+    let targets = resolve_target_node(
+        &opts,
+        (&offline_chain(), &site),
+        &client,
+        &[],
+        [7; 32],
+        probe,
+    )
+    .await
+    .unwrap();
+
+    assert!(targets.pinned);
+    assert_eq!(targets.size_hint, Some(4096));
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+    client.close().await;
+    server.close().await;
+}
+
+/// A chain no test reaches: the pinned probe verifies answers against its
+/// slash domain and reads nothing else from it.
+fn offline_chain() -> ChainConfig {
+    ChainConfig {
+        rpc_url: "http://127.0.0.1:1".to_owned(),
+        chain_id: 31_337,
+        payment_pool: Address::repeat_byte(0x01),
+        slash_judge: Address::repeat_byte(0x02),
+        capacity_bond: None,
+    }
+}
+
 /// A node key for the harvest tests. `spawn_harvest` is `pub(crate)`, so
 /// they live in-crate rather than in an integration test. They await the
 /// returned `JoinHandle`, which the fetch path never does, for determinism.
@@ -433,8 +520,8 @@ fn identity_fresh_candidates_gathers_latency_stale_peers() -> anyhow::Result<()>
     Ok(())
 }
 
-/// A pinned `--node-id` is one probed-as-holder candidate with no size
-/// hint (#2218): its first claim comes from a header-only open.
+/// A pinned `--node-id` is one probed-as-holder candidate. It carries no size
+/// hint of its own (#2218): a blob fetch takes its probe's ([`probe_pinned`]).
 #[test]
 fn a_pinned_node_resolves_with_no_size_hint() {
     let provider = Address::repeat_byte(0x42);
@@ -446,6 +533,39 @@ fn a_pinned_node_resolves_with_no_size_hint() {
         targets.candidates.first().map(|c| c.eth_address),
         Some(provider)
     );
+}
+
+/// A pinned node's probe gives the first size claim only when it verifies as
+/// a holder that names a size (#2619). Any other outcome leaves the claim to a
+/// header-only open.
+#[test]
+fn a_pinned_probe_hints_only_a_verified_holder_size() {
+    let sample = (harvest_key(7), 5.0, 1);
+    let sized = holder(7, 5.0);
+    let size = sized.total_bytes;
+    assert!(size.is_some());
+    assert_eq!(probed_size_hint(&ProbeOutcome::Holder(sized, sample)), size);
+    let mut unsized_holder = holder(7, 5.0);
+    unsized_holder.total_bytes = None;
+    assert_eq!(
+        probed_size_hint(&ProbeOutcome::Holder(unsized_holder, sample)),
+        None
+    );
+    let non_holder = discovery::WarmingCandidate {
+        node_id: harvest_key(7),
+        eth_address: Address::repeat_byte(7),
+        rtt_ms: 5.0,
+        multiaddrs: Bytes::new(),
+    };
+    for outcome in [
+        ProbeOutcome::NonHolder(non_holder, sample),
+        ProbeOutcome::Unreachable,
+        ProbeOutcome::RateLimited,
+        ProbeOutcome::Unverifiable,
+        ProbeOutcome::Unusable,
+    ] {
+        assert_eq!(probed_size_hint(&outcome), None);
+    }
 }
 
 /// `store_fast_path` ranks selectable records by latency and excludes a

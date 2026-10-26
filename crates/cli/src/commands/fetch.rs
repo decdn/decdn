@@ -1084,9 +1084,12 @@ pub(crate) async fn fetch_on(
     // first open discovers them. The round streams: the fetch starts at the
     // first verified holder, and the holders that answer later join it.
     let discovery = discovery_options(common)?;
+    // A known size (a gateway's manifest entry) is the first size claim, and
+    // a pinned node is not probed for it.
     let probe = ProbeOpts {
         marks: Some(timings),
         round: ProbeRound::Stream,
+        known_size: args.size_cap,
     };
     let resolved = holders_or_none(
         resolve_target_node(

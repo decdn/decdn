@@ -2192,8 +2192,12 @@ pub struct DecdnMetrics {
     /// [`INBOUND_FAILURE_REASONS`], so `inbound` minus their sum is zero. A
     /// positive residual is a failure no reason claims, which is a bug.
     streams_failed: Family<StreamLabels, Counter>,
-    /// `decdn_bytes_served_total`: payload bytes this node wrote to clients and
-    /// downstream nodes on `cdn/client/v1`, counted per frame as it is written.
+    /// `decdn_bytes_served_total`: bao wire bytes this node wrote to clients and
+    /// downstream nodes on `cdn/client/v1` (content plus interleaved proof
+    /// nodes, over chunk-group-aligned ranges), the unit payment meters (ADR
+    /// 038 § Payment metering). Counted per frame when the send stream accepts
+    /// it, so it includes frames written past the requester's last payment,
+    /// such as when it stops the stream.
     pub bytes_served: Counter,
     /// `decdn_bytes_received_total`: payload bytes this node admitted from
     /// upstream nodes in paid node-to-node pulls, counted per verified range

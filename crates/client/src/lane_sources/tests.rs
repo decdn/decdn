@@ -336,8 +336,9 @@ async fn the_first_claim_comes_from_the_probe_hint_without_a_whole_blob_open() -
     Ok(())
 }
 
-/// A pinned `--node-id` was never probed, so it has no hint and opens one
-/// pull for the header's size.
+/// A pinned `--node-id` whose probe gave no size, or a pinned bundle entry with
+/// a size from neither its manifest nor a probe, opens one pull for the
+/// header's size.
 #[tokio::test]
 async fn a_pinned_node_without_a_hint_opens_for_the_header() -> anyhow::Result<()> {
     let (mut targets, _, _) = crate::targets::tests_support::two_holder_targets();

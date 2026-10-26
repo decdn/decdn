@@ -28,7 +28,7 @@ use crate::session::{DiscoveryOptions, ProxyWarmingParams};
 use crate::source::{SourceFuture, SourceStream};
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
-    LateProbes, ProbeOpts, ProbeOutcome, ProbeRound, ResolvedTargets, now_secs,
+    LateProbes, ProbeOpts, ProbeOutcome, ProbeRound, ResolvedTargets, now_secs, pinned_targets,
     resolve_target_node, spawn_harvest,
 };
 use crate::{
@@ -294,9 +294,9 @@ where
 
     /// The fetch's first size claim (#2218): the probe's size hint when a
     /// probe gave one ([`Self::holders_from`]), with no open at all. Without a
-    /// hint (a pinned `--node-id`, the peer-store fast path), a header-only
-    /// open of one of `holders` learns the size one holder signs
-    /// ([`first_open`]), with the acquire loop's recovery: a holder that
+    /// hint (the peer-store fast path, or a pinned `--node-id` whose probe gave
+    /// no size), a header-only open of one of `holders` learns the size one
+    /// holder signs ([`first_open`]), with the acquire loop's recovery: a holder that
     /// faults cools and another is tried until one answers, a fault only the
     /// user can fix ends it, and `stop` gives up. The open's pull is dropped
     /// once its header is read. The lane that answered is parked for the
@@ -589,6 +589,11 @@ where
 
     fn discover(&self, hash: [u8; 32]) -> SourceFuture<'_, Vec<Holder>> {
         Box::pin(async move {
+            // A pinned node is the only holder a rediscovery can find, and only
+            // the first size claim reads a probe's hint, so it probes nothing.
+            if let Some(pinned) = self.discovery.pinned {
+                return Ok(self.holders_from(&pinned_targets(pinned.node_id, pinned.provider)));
+            }
             // A fresh look: skip the peer store's fast path. A rediscovery
             // settles its round and drops the tail.
             let mut opts = self.discovery.clone();
@@ -596,6 +601,7 @@ where
             let probe = ProbeOpts {
                 marks: None,
                 round: ProbeRound::Settle,
+                known_size: None,
             };
             let targets = resolve_target_node(
                 &opts,
