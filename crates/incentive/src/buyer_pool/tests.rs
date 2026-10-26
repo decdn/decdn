@@ -481,3 +481,129 @@ fn a_lane_seeded_after_a_reconcile_counts_once() -> Result<(), BuyerProgressErro
     assert_eq!(state.pool_spend(), U256::from(3_000u64));
     Ok(())
 }
+
+/// A deposit beyond `u64::MAX` micro-USDC saturates rather than wrapping.
+/// Unreachable for a real pool, but the narrowing must not silently report
+/// a tiny deposit for a huge one.
+#[test]
+fn pools_response_saturates_oversized_deposit() {
+    let pool = BuyerPoolState::new(
+        PoolId::repeat_byte(0x01),
+        DEPLOYMENT,
+        Address::repeat_byte(0x11),
+        Address::repeat_byte(0xcd),
+        U256::MAX,
+    );
+    let resp = BuyerPoolsResponse::from(BuyerLoad {
+        pools: vec![pool],
+        skipped: Vec::new(),
+    });
+    assert_eq!(
+        resp.pools.first().map(|p| p.deposit_micro_usdc),
+        Some(u64::MAX)
+    );
+}
+
+/// An empty `pools` beside a non-empty `skipped` is a real state and must
+/// survive to the wire: the escrowed deposit behind an undecodable row is
+/// exactly what an operator is looking for.
+#[test]
+fn pools_response_keeps_skipped_when_no_pool_decodes() {
+    let resp = BuyerPoolsResponse::from(BuyerLoad {
+        pools: Vec::new(),
+        skipped: vec![PoolId::repeat_byte(0x44), PoolId::repeat_byte(0x22)],
+    });
+    assert!(resp.pools.is_empty());
+    assert_eq!(
+        resp.skipped,
+        vec![
+            format!("{:#x}", PoolId::repeat_byte(0x22)),
+            format!("{:#x}", PoolId::repeat_byte(0x44)),
+        ],
+        "skipped ids sort for stable output"
+    );
+}
+
+/// Every id this response carries must parse back as a `PoolId`.
+///
+/// The CLI matches these ids against the chain's own enumeration to decide
+/// which pools the node tracks (`decdn pool list --all`). A spelling it
+/// cannot parse means a pool the daemon is paying from renders as
+/// untracked, which reads as a stranded deposit to recover. Nothing else
+/// compares the two sides of this format, so it is pinned where the
+/// spelling is produced.
+#[test]
+fn pools_response_ids_parse_back() {
+    use std::str::FromStr as _;
+
+    let tracked = PoolId::repeat_byte(0x01);
+    let skipped = PoolId::repeat_byte(0x02);
+    let resp = BuyerPoolsResponse::from(BuyerLoad {
+        pools: vec![BuyerPoolState::new(
+            tracked,
+            DEPLOYMENT,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0xcd),
+            U256::from(1u64),
+        )],
+        skipped: vec![skipped],
+    });
+
+    let id = resp
+        .pools
+        .first()
+        .map(|p| p.pool_id.clone())
+        .unwrap_or_default();
+    assert_eq!(PoolId::from_str(&id).ok(), Some(tracked));
+    let id = resp.skipped.first().cloned().unwrap_or_default();
+    assert_eq!(PoolId::from_str(&id).ok(), Some(skipped));
+}
+
+/// Pools sort by id and lanes by `(signer, provider)`, whatever order the
+/// store returned them in.
+#[test]
+fn pools_response_sorts_pools_and_lanes() {
+    let mut low = sample(0x01);
+    let first = only_lane(&low);
+    let later = LaneKey {
+        provider: Address::repeat_byte(0xff),
+        ..first
+    };
+    let _ = low.advance_lane(later, U256::from(1u64), U256::from(1u64));
+    let resp = BuyerPoolsResponse::from(BuyerLoad {
+        pools: vec![sample(0x02), low],
+        skipped: Vec::new(),
+    });
+    let ids: Vec<_> = resp.pools.iter().map(|p| p.pool_id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            format!("{:#x}", sample(0x01).pool_id),
+            format!("{:#x}", sample(0x02).pool_id)
+        ]
+    );
+    let providers: Vec<_> = resp
+        .pools
+        .first()
+        .map(|p| p.lanes.iter().map(|l| l.provider.clone()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        providers,
+        vec![first.provider.to_string(), later.provider.to_string()]
+    );
+}
+
+/// `spent_micro_usdc` is the pool's whole spend as the row knows it: its own
+/// lanes plus what other signers redeemed, so deposit less spent is the
+/// headroom left for everyone sharing the pool.
+#[test]
+fn pools_response_reports_the_pool_spend() {
+    let mut pool = sample(0x03);
+    // The one lane has committed 1_234; chain says 5_000 was redeemed.
+    pool.reconcile_with_chain(pool.deposit, U256::from(5_000u64));
+    let resp = BuyerPoolsResponse::from(BuyerLoad {
+        pools: vec![pool],
+        skipped: Vec::new(),
+    });
+    assert_eq!(resp.pools.first().map(|p| p.spent_micro_usdc), Some(5_000));
+}

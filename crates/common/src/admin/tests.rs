@@ -87,6 +87,7 @@ fn buyer_pools_response_round_trips() {
             owner: "0x52908400098527886E0F7030069857D2E4169EE7".to_string(),
             token: "0x00cc".to_string(),
             deposit_micro_usdc: 10_000_000,
+            spent_micro_usdc: 191_205,
             lanes: vec![BuyerLaneSnapshot {
                 voucher_signer: "0x00aa".to_string(),
                 provider: "0x00bb".to_string(),

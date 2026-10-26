@@ -653,6 +653,14 @@ pub struct BuyerPoolSnapshot {
     /// `U256`-derived field on [`BuyerLaneSnapshot`], including
     /// `last_bytes_delivered`.
     pub deposit_micro_usdc: u64,
+    /// What the pool has spent as far as the store knows, in micro-USDC: every
+    /// tracked lane's cumulative amount plus the redeemed spend that no
+    /// tracked lane accounts for (another signer sharing the pool).
+    ///
+    /// A lower bound: a voucher another signer issued and no provider has
+    /// redeemed yet is in neither. `deposit_micro_usdc - spent_micro_usdc` is
+    /// the headroom left for every signer on the pool.
+    pub spent_micro_usdc: u64,
     /// Every lane funded from this pool, ordered by `(signer, provider)`. One
     /// pool fans out to every provider the owner pays (ADR 003), so this is
     /// where the pool's spend is actually visible.

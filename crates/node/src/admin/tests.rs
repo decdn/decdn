@@ -1,5 +1,6 @@
 use super::*;
 use decdn_cache::{Hash, Origin};
+use decdn_incentive::buyer_pool::BuyerPoolState;
 
 /// The RPC message carries the store fault's whole cause chain, so an
 /// operator running `decdn node evict` sees why the store failed.
@@ -1314,78 +1315,6 @@ async fn pools_rpc_reports_seeded_store() -> anyhow::Result<()> {
     assert_eq!(lane.last_amount_micro_usdc, 1_000);
     assert_eq!(lane.last_bytes_delivered, 10_000);
     Ok(())
-}
-
-/// A deposit beyond `u64::MAX` micro-USDC saturates rather than wrapping.
-/// Unreachable for a real pool, but the narrowing must not silently report
-/// a tiny deposit for a huge one.
-#[test]
-fn build_buyer_pools_response_saturates_oversized_deposit() {
-    let pool = BuyerPoolState::new(
-        B256::repeat_byte(0x01),
-        BUYER_DEPLOYMENT,
-        Address::repeat_byte(0x11),
-        Address::repeat_byte(0xcd),
-        U256::MAX,
-    );
-    let resp = build_buyer_pools_response(vec![pool], &[]);
-    assert_eq!(
-        resp.pools.first().expect("pool").deposit_micro_usdc,
-        u64::MAX
-    );
-}
-
-/// An empty `pools` beside a non-empty `skipped` is a real state and must
-/// survive to the wire: the escrowed deposit behind an undecodable row is
-/// exactly what an operator is looking for.
-#[test]
-fn build_buyer_pools_response_keeps_skipped_when_no_pool_decodes() {
-    let resp = build_buyer_pools_response(
-        Vec::new(),
-        &[B256::repeat_byte(0x44), B256::repeat_byte(0x22)],
-    );
-    assert!(resp.pools.is_empty());
-    assert_eq!(
-        resp.skipped,
-        vec![
-            format!("{:#x}", B256::repeat_byte(0x22)),
-            format!("{:#x}", B256::repeat_byte(0x44)),
-        ],
-        "skipped ids sort for stable output"
-    );
-}
-
-/// Every id this response carries must parse back as a `PoolId`.
-///
-/// The CLI matches these ids against the chain's own enumeration to decide
-/// which pools the node tracks (`decdn pool list --all`). A spelling it
-/// cannot parse means a pool the daemon is paying from renders as
-/// untracked, which reads as a stranded deposit to recover. Nothing else
-/// compares the two sides of this format, so it is pinned where the
-/// spelling is produced.
-#[test]
-fn build_buyer_pools_response_ids_parse_back() {
-    use std::str::FromStr as _;
-
-    let tracked = B256::repeat_byte(0x01);
-    let skipped = B256::repeat_byte(0x02);
-    let resp = build_buyer_pools_response(
-        vec![BuyerPoolState::new(
-            tracked,
-            BUYER_DEPLOYMENT,
-            Address::repeat_byte(0x11),
-            Address::repeat_byte(0xcd),
-            U256::from(1u64),
-        )],
-        &[skipped],
-    );
-
-    let parsed = B256::from_str(&resp.pools.first().expect("pool").pool_id)
-        .expect("a tracked pool id must parse back");
-    assert_eq!(parsed, tracked);
-    let parsed = B256::from_str(resp.skipped.first().expect("skipped"))
-        .expect("a skipped pool id must parse back");
-    assert_eq!(parsed, skipped);
 }
 
 /// Reader wiring guard (issue #1733): the RPC reads last-voucher ages off

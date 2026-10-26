@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use alloy::primitives::{Address, U256};
+use decdn_common::admin::{BuyerLaneSnapshot, BuyerPoolSnapshot, BuyerPoolsResponse};
 
 use crate::deployment::Deployment;
 use crate::lane::{LaneKey, PoolId};
@@ -435,6 +436,61 @@ pub struct BuyerLoad {
     /// Pool ids whose persisted rows could not be decoded. Their deposits
     /// remain escrowed but untracked until the rows are repaired.
     pub skipped: Vec<PoolId>,
+}
+
+/// The wire [`BuyerPoolsResponse`] for a hydrated store: what
+/// `admin_v1_pools` and the gateway's `/_status` report.
+///
+/// Both lists are sorted — pools by `pool_id`, lanes by `(signer, provider)` —
+/// because the store's iteration order is a redb implementation detail and an
+/// operator diffing two calls should see a change only when the state changed.
+/// `U256` amounts narrow to `u64` micro-USDC via `try_from(..).unwrap_or(u64::MAX)`;
+/// a real pool is bounded by its on-chain deposit, so the saturation arm is
+/// unreachable.
+impl From<BuyerLoad> for BuyerPoolsResponse {
+    fn from(load: BuyerLoad) -> Self {
+        let BuyerLoad { mut pools, skipped } = load;
+        pools.sort_by_key(|p| p.pool_id);
+        let pools = pools
+            .iter()
+            .map(|p| {
+                let mut lanes: Vec<_> = p.lanes().collect();
+                lanes.sort_by_key(|(lane, _)| (lane.signer, lane.provider));
+                BuyerPoolSnapshot {
+                    pool_id: format!("{:#x}", p.pool_id),
+                    chain_id: p.deployment.chain_id,
+                    payment_pool: p.deployment.payment_pool.to_string(),
+                    owner: p.owner.to_string(),
+                    token: p.token.to_string(),
+                    deposit_micro_usdc: narrow(p.deposit),
+                    spent_micro_usdc: narrow(p.pool_spend()),
+                    lanes: lanes
+                        .into_iter()
+                        .map(|(lane, progress)| lane_snapshot(lane, progress))
+                        .collect(),
+                }
+            })
+            .collect();
+        let mut skipped: Vec<_> = skipped.iter().map(|p| format!("{p:#x}")).collect();
+        skipped.sort();
+        Self { pools, skipped }
+    }
+}
+
+/// The wire row for one stored lane.
+#[must_use]
+pub fn lane_snapshot(lane: LaneKey, progress: BuyerLaneProgress) -> BuyerLaneSnapshot {
+    BuyerLaneSnapshot {
+        voucher_signer: lane.signer.to_string(),
+        provider: lane.provider.to_string(),
+        last_amount_micro_usdc: narrow(progress.last_amount),
+        last_bytes_delivered: narrow(progress.last_bytes),
+    }
+}
+
+/// Narrow a stored `U256` to the wire's `u64`, saturating.
+fn narrow(value: U256) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 /// Outcome of an atomic lane write: [`BuyerPoolStore::advance_progress`],

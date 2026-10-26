@@ -345,14 +345,14 @@ fn an_undecodable_row_is_unknown_not_untracked() {
 /// unknown. Dropping it silently renders the pool `no`, which tells an
 /// operator to close a pool the daemon may be paying from right now.
 ///
-/// The other half of the drift guard is in `decdn-node`, where the wire
-/// spelling is produced: `build_buyer_pools_response_ids_parse_back`.
+/// The other half of the drift guard is in `decdn-incentive`, where the wire
+/// spelling is produced: `pools_response_ids_parse_back`.
 #[test]
 fn a_wire_response_round_trips_and_an_unparseable_id_is_not_a_no() {
     let decoded = B256::repeat_byte(0x11);
     let corrupt = B256::repeat_byte(0x22);
-    // The `{:#x}` spelling the daemon emits; `decdn-node`'s
-    // `build_buyer_pools_response_ids_parse_back` pins that it still does.
+    // The `{:#x}` spelling the daemon emits; `decdn-incentive`'s
+    // `pools_response_ids_parse_back` pins that it still does.
     let resp = BuyerPoolsResponse {
         pools: vec![decdn_common::admin::BuyerPoolSnapshot {
             pool_id: format!("{decoded:#x}"),
@@ -361,6 +361,7 @@ fn a_wire_response_round_trips_and_an_unparseable_id_is_not_a_no() {
             owner: format!("{:?}", Address::repeat_byte(0x11)),
             token: format!("{:?}", Address::repeat_byte(0xcd)),
             deposit_micro_usdc: 1,
+            spent_micro_usdc: 0,
             lanes: Vec::new(),
         }],
         skipped: vec![format!("{corrupt:#x}")],
@@ -465,6 +466,7 @@ fn write_buyer_pools_matches_the_client_table_shape() {
                 owner: "0x1111111111111111".to_string(),
                 token: "0x2222222222222222".to_string(),
                 deposit_micro_usdc: 1_500_000,
+                spent_micro_usdc: 250_000,
                 lanes: Vec::new(),
             }],
             skipped: vec!["0x4444".to_string()],
@@ -473,6 +475,8 @@ fn write_buyer_pools_matches_the_client_table_shape() {
     .unwrap();
     let out = String::from_utf8(buf).unwrap();
     assert!(out.contains("1.500000"), "{out}");
+    assert!(out.contains("SPENT"), "{out}");
+    assert!(out.contains("0.250000"), "{out}");
     assert!(out.contains("pools=1"), "{out}");
     assert!(
         !out.contains("0x4444"),
@@ -497,12 +501,15 @@ fn write_pools_empty_emits_sentinel() {
 }
 
 #[test]
-fn write_pools_renders_deposit_and_lane_count() {
-    let state = mk_state(1, 1_500_000);
+fn write_pools_renders_deposit_spend_and_lane_count() {
+    let mut state = mk_state(1, 1_500_000);
+    state.reconcile_with_chain(state.deposit, U256::from(250_000u64));
     let mut buf = Vec::new();
     write_pools(&mut buf, std::slice::from_ref(&state), &[]).unwrap();
     let out = String::from_utf8(buf).unwrap();
     assert!(out.contains("1.500000"), "{out}");
+    assert!(out.contains("SPENT"), "{out}");
+    assert!(out.contains("0.250000"), "{out}");
     assert!(
         out.contains(" 0\n") || out.trim_end().ends_with(" 0"),
         "{out}"

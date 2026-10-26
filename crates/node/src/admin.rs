@@ -19,15 +19,14 @@ use alloy::primitives::{Address, B256, U256};
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
     AdminRpcServer, BUYER_POOL_STORE_ERROR_CODE, BUYER_POOL_UNAVAILABLE_CODE, BucketStat,
-    BuyerLaneSnapshot, BuyerPoolSnapshot, BuyerPoolsResponse, CACHE_ERROR_CODE,
-    CONFIG_PATH_UNSET_CODE, DHT_POISONED_CODE, DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse,
-    EARNINGS_UNAVAILABLE_CODE, EarningsRequest, EarningsResponse, EvictPreview, EvictRequest,
-    EvictResponse, HealthResponse, LaneSnapshot, LanesResponse, POOL_STORE_ERROR_CODE,
-    PendingRedeem, RELOAD_ERROR_CODE, RecordStoreHealth, ReloadResponse, RepublishHealth,
-    RoutingHealth, SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse,
-    StatusResponse, parse_hash_arg,
+    BuyerPoolsResponse, CACHE_ERROR_CODE, CONFIG_PATH_UNSET_CODE, DHT_POISONED_CODE,
+    DHT_UNAVAILABLE_CODE, DrainRequest, DrainResponse, EARNINGS_UNAVAILABLE_CODE, EarningsRequest,
+    EarningsResponse, EvictPreview, EvictRequest, EvictResponse, HealthResponse, LaneSnapshot,
+    LanesResponse, POOL_STORE_ERROR_CODE, PendingRedeem, RELOAD_ERROR_CODE, RecordStoreHealth,
+    ReloadResponse, RepublishHealth, RoutingHealth, SLASH_DETECTION_UNAVAILABLE_CODE,
+    SlashRecordDto, SlashesResponse, StatusResponse, parse_hash_arg,
 };
-use decdn_incentive::buyer_pool::{BuyerPoolState, BuyerPoolStore};
+use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::earnings::{last_settlement, sum_period};
 use decdn_incentive::{LaneKey, LaneState, PoolStateStore, SettlementLedger, SettlementRecord};
 
@@ -974,7 +973,7 @@ impl AdminRpcServer for AdminRpcImpl {
                 )
             })?;
 
-        Ok(build_buyer_pools_response(load.pools, &load.skipped))
+        Ok(load.into())
     }
 
     async fn earnings(&self, req: EarningsRequest) -> RpcResult<EarningsResponse> {
@@ -1113,52 +1112,6 @@ fn pending_redeem(
         }
     }
     pending
-}
-
-/// Build the wire [`BuyerPoolsResponse`] from loaded buyer pool states and the
-/// `pool_id`s whose rows would not decode. Pure (no I/O) so the shape and the
-/// ordering are unit-testable without a store or an async runtime.
-///
-/// Both lists are sorted — pools by `pool_id`, lanes by `(signer, provider)` —
-/// because the store's iteration order is a redb implementation detail and an
-/// operator diffing two calls should see a change only when the state changed.
-/// `U256` amounts narrow to `u64` micro-USDC via `try_from(..).unwrap_or(u64::MAX)`;
-/// a real pool is bounded by its on-chain deposit, so the saturation arm is
-/// unreachable.
-fn build_buyer_pools_response(
-    mut pools: Vec<BuyerPoolState>,
-    skipped: &[decdn_incentive::lane::PoolId],
-) -> BuyerPoolsResponse {
-    pools.sort_by_key(|p| p.pool_id);
-    let pools = pools
-        .iter()
-        .map(|p| {
-            let mut lanes: Vec<_> = p.lanes().collect();
-            lanes.sort_by_key(|(lane, _)| (lane.signer, lane.provider));
-            BuyerPoolSnapshot {
-                pool_id: format!("{:#x}", p.pool_id),
-                chain_id: p.deployment.chain_id,
-                payment_pool: p.deployment.payment_pool.to_string(),
-                owner: p.owner.to_string(),
-                token: p.token.to_string(),
-                deposit_micro_usdc: u64::try_from(p.deposit).unwrap_or(u64::MAX),
-                lanes: lanes
-                    .into_iter()
-                    .map(|(lane, progress)| BuyerLaneSnapshot {
-                        voucher_signer: lane.signer.to_string(),
-                        provider: lane.provider.to_string(),
-                        last_amount_micro_usdc: u64::try_from(progress.last_amount)
-                            .unwrap_or(u64::MAX),
-                        last_bytes_delivered: u64::try_from(progress.last_bytes)
-                            .unwrap_or(u64::MAX),
-                    })
-                    .collect(),
-            }
-        })
-        .collect();
-    let mut skipped: Vec<_> = skipped.iter().map(|p| format!("{p:#x}")).collect();
-    skipped.sort();
-    BuyerPoolsResponse { pools, skipped }
 }
 
 /// Build the wire `LaneSnapshot` list from loaded lane states (each reported

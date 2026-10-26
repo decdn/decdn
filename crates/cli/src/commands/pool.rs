@@ -2490,17 +2490,18 @@ fn write_pools(
     }
     writeln!(
         w,
-        "{:<14} {:<14} {:<14} {:>14} {:>8}",
-        "POOL", "OWNER", "TOKEN", "DEPOSIT", "LANES"
+        "{:<14} {:<14} {:<14} {:>14} {:>14} {:>8}",
+        "POOL", "OWNER", "TOKEN", "DEPOSIT", "SPENT", "LANES"
     )?;
     for p in pools {
         writeln!(
             w,
-            "{:<14} {:<14} {:<14} {:>14} {:>8}",
+            "{:<14} {:<14} {:<14} {:>14} {:>14} {:>8}",
             short_hex(&format!("{:#x}", p.pool_id)),
             short_hex(&format!("{:#x}", p.owner)),
             short_hex(&format!("{:#x}", p.token)),
             format_usdc_u256(p.deposit),
+            format_usdc_u256(p.pool_spend()),
             p.lane_count(),
         )?;
     }
@@ -2534,17 +2535,18 @@ pub(crate) fn write_buyer_pools(
     }
     writeln!(
         w,
-        "{:<14} {:<14} {:<14} {:>14} {:>8}",
-        "POOL", "OWNER", "TOKEN", "DEPOSIT", "LANES"
+        "{:<14} {:<14} {:<14} {:>14} {:>14} {:>8}",
+        "POOL", "OWNER", "TOKEN", "DEPOSIT", "SPENT", "LANES"
     )?;
     for p in &resp.pools {
         writeln!(
             w,
-            "{:<14} {:<14} {:<14} {:>14} {:>8}",
+            "{:<14} {:<14} {:<14} {:>14} {:>14} {:>8}",
             short_hex(&p.pool_id),
             short_hex(&p.owner),
             short_hex(&p.token),
             format_usdc_u256(U256::from(p.deposit_micro_usdc)),
+            format_usdc_u256(U256::from(p.spent_micro_usdc)),
             p.lanes.len(),
         )?;
     }
