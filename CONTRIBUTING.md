@@ -18,7 +18,7 @@ deCDN builds with a native toolchain and works with any editor. Install the prer
 
 Pre-commit covers Solidity too: `forge fmt` and `solhint` run on every commit that touches `contracts/` (solhint needs no local install — pre-commit builds its own node sandbox), `forge build` and `forge test` run on push. The `slither` and `aderyn` static-analysis hooks are manual-stage and need their own installs — see [Solidity development](#solidity-development).
 
-Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`).
+Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`). The [TypeScript SDK contract run](#typescript-sdk-contract-run) needs Node.js 20.19+ and pnpm.
 
 ### Clone and Build
 
@@ -193,6 +193,29 @@ cargo insta review
 
 [issue #304]: https://github.com/decdn/decdn/issues/304
 [issue #1150]: https://github.com/decdn/decdn/issues/1150
+
+### TypeScript SDK contract run
+
+The TypeScript SDK, `@decdn/client`, lives in
+[decdn/sdk-typescript](https://github.com/decdn/sdk-typescript). Its fake
+gateway mirrors this gateway's HTTP contract
+([appendix-gateway](adr/appendix-gateway.md)), and its contract suite runs
+here against the real binary, in the `anvil-e2e-sdk` CI job, which checks out
+that repository's `main`:
+
+```bash
+git clone https://github.com/decdn/sdk-typescript ../sdk-typescript
+pnpm -C ../sdk-typescript install --frozen-lockfile
+cargo build -p decdn-cli -p decdn-node
+DECDN_SDK_DIR="$PWD/../sdk-typescript" \
+  cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e --test gateway_sdk
+```
+
+The target has its own `sdk-e2e` feature, so the `anvil-e2e` journeys never
+build it, and it fails, rather than skips, without `DECDN_SDK_DIR`, `node` or
+the SDK's `node_modules`. A gateway change the SDK can observe needs a
+matching sdk-typescript PR that updates its fake gateway; `anvil-e2e-sdk`
+fails until that PR lands.
 
 ## Solidity development
 
