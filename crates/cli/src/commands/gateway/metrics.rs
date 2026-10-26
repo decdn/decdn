@@ -1,6 +1,7 @@
-//! The public gateway's metrics: Prometheus text exposition of what it
-//! served, refused and failed, hand-rolled as `sponsord`'s are (a registry
-//! crate would add a shape of its own for nine series).
+//! The gateway's metrics: what it served, refused and failed, as Prometheus
+//! text exposition and as the `counters` of `/_status`. Hand-rolled as
+//! `sponsord`'s are (a registry crate would add a shape of its own for nine
+//! series).
 //!
 //! One unlabeled sibling counter per outcome, as `adr/appendix-observability.md`
 //! § Reason splits prefers: each outcome has its own operator remedy (a
@@ -11,6 +12,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hyper::StatusCode;
+use serde::Serialize;
 
 /// What the gateway counted since it started.
 #[derive(Debug, Default)]
@@ -24,6 +26,30 @@ pub(super) struct Metrics {
     pull_failures_other: AtomicU64,
     pulls_active: AtomicU64,
     pointer_updates: AtomicU64,
+}
+
+/// One read of every counter in [`Metrics`]. Each field has the name of its
+/// series without the `decdn_gateway_` prefix and the `_total` suffix.
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Counters {
+    /// Content bytes handed to responses.
+    pub(super) bytes_served: u64,
+    /// Requests answered with success or a redirect.
+    pub(super) requests_ok: u64,
+    /// Requests for a path, entry or manifest that does not exist.
+    pub(super) requests_not_found: u64,
+    /// Requests refused before any pull.
+    pub(super) requests_refused: u64,
+    /// Requests answered 402.
+    pub(super) requests_allowance_exhausted: u64,
+    /// Requests answered 503.
+    pub(super) pull_failures_funding: u64,
+    /// Requests answered 502.
+    pub(super) pull_failures_other: u64,
+    /// Pulls handed to the worker and not yet ended.
+    pub(super) pulls_active: u64,
+    /// Namespace pointers stored.
+    pub(super) pointer_updates: u64,
 }
 
 impl Metrics {
@@ -66,70 +92,88 @@ impl Metrics {
         self.pointer_updates.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The Prometheus text exposition.
+    /// Read every counter.
+    pub(super) fn snapshot(&self) -> Counters {
+        let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        Counters {
+            bytes_served: read(&self.bytes_served),
+            requests_ok: read(&self.requests_ok),
+            requests_not_found: read(&self.requests_not_found),
+            requests_refused: read(&self.requests_refused),
+            requests_allowance_exhausted: read(&self.requests_allowance_exhausted),
+            pull_failures_funding: read(&self.pull_failures_funding),
+            pull_failures_other: read(&self.pull_failures_other),
+            pulls_active: read(&self.pulls_active),
+            pointer_updates: read(&self.pointer_updates),
+        }
+    }
+
+    /// The Prometheus text exposition, read through [`Self::snapshot`] so it
+    /// and `/_status` cannot disagree.
     pub(super) fn render(&self) -> String {
-        let series: [(&str, &str, &str, &AtomicU64); 9] = [
+        let c = self.snapshot();
+        let series: [(&str, &str, &str, u64); 9] = [
             (
                 "decdn_gateway_bytes_served_total",
                 "counter",
                 "Content bytes handed to responses.",
-                &self.bytes_served,
+                c.bytes_served,
             ),
             (
                 "decdn_gateway_requests_ok_total",
                 "counter",
                 "Requests answered with success or a redirect.",
-                &self.requests_ok,
+                c.requests_ok,
             ),
             (
                 "decdn_gateway_requests_not_found_total",
                 "counter",
                 "Requests for a path, entry or manifest that does not exist.",
-                &self.requests_not_found,
+                c.requests_not_found,
             ),
             (
                 "decdn_gateway_requests_refused_total",
                 "counter",
                 "Requests refused before any pull: an unknown host, a bad URI, a method, a range \
                  past the end.",
-                &self.requests_refused,
+                c.requests_refused,
             ),
             (
                 "decdn_gateway_requests_allowance_exhausted_total",
                 "counter",
                 "Requests answered 402: the day's allowance is spent.",
-                &self.requests_allowance_exhausted,
+                c.requests_allowance_exhausted,
             ),
             (
                 "decdn_gateway_pull_failures_funding_total",
                 "counter",
                 "Requests answered 503: the gateway's pool cannot pay.",
-                &self.pull_failures_funding,
+                c.pull_failures_funding,
             ),
             (
                 "decdn_gateway_pull_failures_other_total",
                 "counter",
                 "Requests answered 502: the upstream pull failed.",
-                &self.pull_failures_other,
+                c.pull_failures_other,
             ),
             (
                 "decdn_gateway_pulls_active",
                 "gauge",
                 "Pulls handed to the worker and not yet ended.",
-                &self.pulls_active,
+                c.pulls_active,
             ),
             (
                 "decdn_gateway_pointer_updates_total",
                 "counter",
                 "Namespace pointers stored through PUT /_pointer.",
-                &self.pointer_updates,
+                c.pointer_updates,
             ),
         ];
         let mut out = String::new();
         for (name, kind, help, value) in series {
             let _ = writeln!(out, "# HELP {name} {help}");
             let _ = writeln!(out, "# TYPE {name} {kind}");
-            let _ = writeln!(out, "{name} {}", value.load(Ordering::Relaxed));
+            let _ = writeln!(out, "{name} {value}");
         }
         out
     }

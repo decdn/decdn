@@ -327,6 +327,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts(args.listen),
         sites,
+        metrics: Metrics::default(),
         public,
     });
 
@@ -413,7 +414,6 @@ fn mode(
                 args.public.allowance_bytes_per_day,
                 args.public.allowance.iter().copied(),
             ),
-            metrics: Metrics::default(),
             pointers,
             registry,
             lookups: std::sync::Mutex::new(Budgets::default()),
@@ -467,10 +467,10 @@ async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
             let service = service_fn(move |req: Request<hyper::body::Incoming>| {
                 let gateway = Arc::clone(&gateway);
                 async move {
-                    let response = match (req.method(), req.uri().path(), &gateway.public) {
-                        (&Method::GET, "/metrics", Some(public)) => typed(
+                    let response = match (req.method(), req.uri().path()) {
+                        (&Method::GET, "/metrics") => typed(
                             StatusCode::OK,
-                            public.metrics.render(),
+                            gateway.metrics.render(),
                             "text/plain; version=0.0.4; charset=utf-8",
                         ),
                         _ => text(StatusCode::NOT_FOUND, "GET /metrics\n"),
@@ -893,6 +893,9 @@ struct Gateway {
     hosts: Vec<String>,
     /// Where site origins live, and what a `Host` names.
     sites: SiteDomain,
+    /// What it served, refused and failed, for `/_status` and
+    /// `--metrics-listen`.
+    metrics: Metrics,
     /// What a public gateway holds beyond a loopback one; `None` on loopback.
     public: Option<Public>,
 }
@@ -901,8 +904,6 @@ struct Gateway {
 struct Public {
     /// The bytes the gateway delivers per day from its pool.
     allowance: Allowance,
-    /// What it served, refused and failed, for `--metrics-listen`.
-    metrics: Metrics,
     /// The namespace pointers it serves `<ns>.<host>` from.
     pointers: Pointers,
     /// The `PublisherRegistry` a pointer's signer must own its namespace on.
@@ -1057,7 +1058,7 @@ impl Gateway {
         self.public.is_some()
     }
 
-    /// Answer `req`. On a public gateway, count the answer and make it
+    /// Answer `req` and count the answer. On a public gateway, make it
     /// readable by every origin ([`readable_anywhere`]).
     async fn handle<B>(self: Arc<Self>, req: Request<B>) -> Response<Body>
     where
@@ -1067,8 +1068,8 @@ impl Gateway {
         let public = self.public.is_some();
         let gateway = Arc::clone(&self);
         let response = self.answer(req).await;
-        if public && let Some(public) = &gateway.public {
-            public.metrics.request(response.status());
+        gateway.metrics.request(response.status());
+        if public {
             return readable_anywhere(response);
         }
         response
@@ -1405,7 +1406,7 @@ impl Gateway {
                 );
             }
         }
-        public.metrics.pointer_updated();
+        self.metrics.pointer_updated();
         tracing::info!(namespace = ns, root = %root, seq, "a namespace pointer was stored");
         json(
             StatusCode::CREATED,
@@ -2312,9 +2313,7 @@ async fn next_frame(
         .delivered
         .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
     s.cut = !gateway.charge(s.guard.bucket, chunk.len());
-    if let Some(public) = &gateway.public {
-        public.metrics.bytes(chunk.len());
-    }
+    gateway.metrics.bytes(chunk.len());
     if s.cut {
         tracing::info!("the allowance is reached; this stream ends with its current frame");
     }
@@ -2379,9 +2378,7 @@ impl PullGuard {
     /// A guard for a pull `gateway` is about to start against `bucket`:
     /// armed on a public gateway, and counted among its pulls in flight.
     fn new(gateway: Arc<Gateway>, bucket: Option<u64>) -> Self {
-        if let Some(public) = &gateway.public {
-            public.metrics.pull_started();
-        }
+        gateway.metrics.pull_started();
         let armed = gateway.public();
         Self {
             gateway,
@@ -2397,9 +2394,7 @@ impl PullGuard {
 
 impl Drop for PullGuard {
     fn drop(&mut self) {
-        if let Some(public) = &self.gateway.public {
-            public.metrics.pull_ended();
-        }
+        self.gateway.metrics.pull_ended();
         if self.armed {
             self.gateway.charge_drop(self.bucket);
         }

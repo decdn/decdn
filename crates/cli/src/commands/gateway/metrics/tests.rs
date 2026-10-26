@@ -64,3 +64,52 @@ fn outcomes_count_under_their_siblings() {
         assert!(text.contains(&format!("\n{line}\n")), "{line}: {text}");
     }
 }
+
+/// The JSON snapshot and the exposition read the same counters: each
+/// snapshot field equals the series of the same name.
+#[test]
+fn snapshot_and_exposition_agree() {
+    let metrics = Metrics::default();
+    for status in [
+        StatusCode::OK,
+        StatusCode::NOT_FOUND,
+        StatusCode::NOT_FOUND,
+        StatusCode::PAYMENT_REQUIRED,
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::BAD_GATEWAY,
+        StatusCode::FORBIDDEN,
+    ] {
+        metrics.request(status);
+    }
+    metrics.bytes(4_096);
+    metrics.pull_started();
+    metrics.pointer_updated();
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot,
+        Counters {
+            bytes_served: 4_096,
+            requests_ok: 1,
+            requests_not_found: 2,
+            requests_refused: 1,
+            requests_allowance_exhausted: 1,
+            pull_failures_funding: 1,
+            pull_failures_other: 1,
+            pulls_active: 1,
+            pointer_updates: 1,
+        }
+    );
+    let json = serde_json::to_value(snapshot).unwrap_or_default();
+    let text = metrics.render();
+    for line in text.lines().filter(|l| !l.starts_with('#')) {
+        let (name, value) = line.split_once(' ').unwrap_or_default();
+        let field = name
+            .trim_start_matches("decdn_gateway_")
+            .trim_end_matches("_total");
+        assert_eq!(
+            json.get(field).map(ToString::to_string).as_deref(),
+            Some(value),
+            "{name}"
+        );
+    }
+}

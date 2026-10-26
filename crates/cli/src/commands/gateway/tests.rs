@@ -377,7 +377,6 @@ const REGISTRY: Address = Address::repeat_byte(3);
 fn public_with(allowance: Allowance, pointers_dir: &Path) -> Public {
     Public {
         allowance,
-        metrics: Metrics::default(),
         pointers: Pointers::load(pointers_dir, 421_614, REGISTRY).unwrap(),
         registry: REGISTRY,
         lookups: std::sync::Mutex::new(Budgets::default()),
@@ -414,6 +413,7 @@ async fn test_gateway_in(
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
         sites,
+        metrics: Metrics::default(),
         public,
     })
 }
@@ -2415,9 +2415,26 @@ async fn a_range_is_charged_by_its_aligned_span() {
     assert_eq!(left(&gateway), allowance - manifest - 3 * group);
 }
 
-/// The metrics of the public gateway under test.
+/// The metrics of the gateway under test.
 fn metrics(gateway: &Gateway) -> String {
-    gateway.public.as_ref().unwrap().metrics.render()
+    gateway.metrics.render()
+}
+
+/// A loopback gateway counts its requests too: `/_status` and the
+/// dashboard read the same counters on every gateway.
+#[tokio::test]
+async fn a_loopback_gateway_counts_its_requests() {
+    let gateway = test_gateway().await;
+    call(&gateway, Method::GET, "/", &[], "").await;
+    call(&gateway, Method::DELETE, "/", &[], "").await;
+    let c = gateway.metrics.snapshot();
+    let answered = c.requests_ok
+        + c.requests_not_found
+        + c.requests_refused
+        + c.requests_allowance_exhausted
+        + c.pull_failures_funding
+        + c.pull_failures_other;
+    assert_eq!(answered, 2, "{c:?}");
 }
 
 /// Every answer counts under the sibling its outcome names, and the bytes a

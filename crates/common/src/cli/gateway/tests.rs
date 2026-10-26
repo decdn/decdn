@@ -53,7 +53,7 @@ fn a_malformed_public_url_or_allowance_is_refused() {
 }
 
 #[test]
-fn a_metrics_listener_needs_the_public_url() {
+fn metrics_listen_parses_with_a_public_url() {
     let args = parse(&[
         "--public-url",
         "https://decdn.link",
@@ -66,7 +66,16 @@ fn a_metrics_listener_needs_the_public_url() {
         Some("127.0.0.1:9100".to_owned())
     );
     assert!(parse(&[]).unwrap().public.metrics_listen.is_none());
-    assert!(parse(&["--metrics-listen", "127.0.0.1:9100"]).is_err());
+}
+
+/// A loopback gateway takes `--metrics-listen` too: every gateway counts.
+#[test]
+fn metrics_listen_parses_without_public_url() {
+    let args = parse(&["--metrics-listen", "127.0.0.1:9100"]).unwrap();
+    assert_eq!(
+        args.public.metrics_listen.map(|a| a.to_string()),
+        Some("127.0.0.1:9100".to_owned())
+    );
 }
 
 #[test]

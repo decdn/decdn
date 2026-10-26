@@ -78,10 +78,11 @@ pub struct PublicArgs {
     #[arg(long, value_name = "ADDR", requires = "public_url")]
     pub publisher_registry_address: Option<String>,
 
-    /// Serve the gateway's metrics (Prometheus text) at `GET /metrics` on
-    /// this loopback address, for the operator's scraper. Nothing is served
-    /// without it.
-    #[arg(long, value_name = "ADDR", requires = "public_url")]
+    /// Serve the gateway's metrics (Prometheus text, `GET /metrics`), its
+    /// state (`GET /_status`) and the dashboard (`GET /`) on this loopback
+    /// address, for the operator. Takes no token. Nothing is served without
+    /// it.
+    #[arg(long, value_name = "ADDR")]
     pub metrics_listen: Option<SocketAddr>,
 }
 
