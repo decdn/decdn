@@ -55,7 +55,9 @@
 //!   everything we pull is later reclaimed by GC. Healthy nodes sit
 //!   near `0.0`. Use a window at least `2 * cache.gc_interval_sec`
 //!   wide: byte attribution lags one sweep cycle (see
-//!   `gc_bytes_reclaimed`).
+//!   `gc_bytes_reclaimed`). The counter reads low, so the ratio reads
+//!   low by up to roughly the walk-to-mark window over
+//!   `cache.gc_interval_sec`, as a fraction of its value.
 //!
 //! Hit/miss accounting (#418): on `Ok` and on the cache-domain error
 //! returns (`NoOrigin`, evicted `NotFound`, origin `NotFound`,
@@ -166,12 +168,13 @@ pub struct CacheMetrics {
     pub gc_runs: Counter,
     /// Bytes reclaimed by the iroh-blobs GC, attributed across cycles
     /// (#518). Computed as the pre-sweep blob-set diff between the
-    /// previous cycle and the current cycle: hashes that vanish across
-    /// that window are exactly what the previous sweep deleted (the
-    /// cache crate has no other public delete path). Sustained nonzero
-    /// rate against zero `rate(pull_through_bytes)` is a red flag —
-    /// either the pull path is failing to promote named tags on
-    /// success, or a hostile origin is amplifying disk usage via
+    /// previous cycle and the current cycle: a hash that is in the
+    /// earlier snapshot and gone from the later one was deleted by a
+    /// sweep between the two snapshots (the cache crate has no other
+    /// public delete path).
+    /// Sustained nonzero rate against zero `rate(pull_through_bytes)` is
+    /// a red flag — either the pull path is failing to promote named
+    /// tags on success, or a hostile origin is amplifying disk usage via
     /// repeated mid-stream errors.
     ///
     /// **Attribution lags one sweep cycle.** The first cycle records a
@@ -179,6 +182,19 @@ pub struct CacheMetrics {
     /// reflects the previous sweep's reclaim. For an alert window
     /// shorter than `2 * cache.gc_interval_sec` the reading will be
     /// noisy.
+    ///
+    /// **The counter reads low.** A deletion counts only when some
+    /// snapshot held the blob. A blob that a pass's snapshot walk misses
+    /// (created after the walk passed its place in the listing, or after
+    /// the walk ended), and that loses its last tag before that pass's
+    /// mark, is deleted by that sweep and appears in no snapshot. Its
+    /// bytes are never counted. The window is the snapshot walk plus the
+    /// gap to the mark phase, so it grows with store size. As a share of
+    /// reclaim it is roughly that window over `cache.gc_interval_sec`, so
+    /// a larger store or a shorter interval reads lower. The counter
+    /// reads high only for a partial whose `observe()` fails with no
+    /// earlier count, because the snapshot then records `status()`'s full
+    /// size.
     ///
     /// Field name omits `_total`: the `OpenMetrics` encoder appends it
     /// automatically, so the emitted name is

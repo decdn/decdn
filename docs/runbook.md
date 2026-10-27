@@ -35,8 +35,10 @@ new content cannot be admitted.
 - In-node, `decdn_cache_bytes` (current on-disk footprint) against
   `decdn_cache_size_limit_bytes` (the configured `cache.cache_size_mb`
   ceiling) shows headroom, and `decdn_cache_gc_bytes_reclaimed_total` shows
-  eviction keeping up. A footprint pinned at the ceiling with reclaim flat
-  means eviction is starved — confirm `cache.gc_interval_sec` is non-zero.
+  eviction keeping up. That counter reads low: it misses blobs created and
+  swept within one GC pass. A footprint pinned at the ceiling with reclaim
+  flat means eviction is starved — confirm `cache.gc_interval_sec` is
+  non-zero.
 - Existing alert `DecdnServeInternalErrorRate` will fire downstream once
   origin writes start to fail, but it is not capacity-specific.
 
