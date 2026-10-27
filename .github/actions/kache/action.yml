@@ -1,0 +1,51 @@
+name: kache
+description: >-
+  Run rustc behind kache (https://github.com/kunobi-ninja/kache) against the shared
+  S3-compatible store, so a job restores every crate another job or an earlier
+  `main` run already compiled with the same inputs.
+  Only `main` writes the store; every other run reads it. A caller runs this
+  only when the workflow's `REMOTE_BUILD_CACHE` is `true`, and keeps
+  Swatinem/rust-cache for the cargo registry, with `cache-targets` off.
+
+inputs:
+  s3-bucket:
+    description: The store's bucket (`vars.KACHE_S3_BUCKET`).
+    required: true
+  s3-endpoint:
+    description: >-
+      The S3-compatible endpoint (`vars.KACHE_S3_ENDPOINT`), for example
+      `https://<account>.r2.cloudflarestorage.com`. Empty for AWS S3.
+    required: false
+    default: ""
+  s3-region:
+    description: The store's region (`vars.KACHE_S3_REGION`). R2 takes `auto`.
+    required: false
+    default: auto
+  s3-access-key-id:
+    description: The store's access key ID (`secrets.KACHE_S3_ACCESS_KEY_ID`).
+    required: true
+  s3-secret-access-key:
+    description: The store's secret key (`secrets.KACHE_S3_SECRET_ACCESS_KEY`).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # SHA-pinned (v1): the action receives the store's write credentials.
+    - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed
+      with:
+        version: 1.2.2
+        s3-bucket: ${{ inputs.s3-bucket }}
+        s3-endpoint: ${{ inputs.s3-endpoint }}
+        s3-region: ${{ inputs.s3-region }}
+        s3-access-key-id: ${{ inputs.s3-access-key-id }}
+        s3-secret-access-key: ${{ inputs.s3-secret-access-key }}
+        # Each job builds its own flags and features, so each keeps its own
+        # prefetch manifest. The content-addressed entries are still shared.
+        manifest-key: ${{ github.job }}
+        # Read-only off `main`, as Swatinem/rust-cache's `save-if` is.
+        save-cache: ${{ github.ref == 'refs/heads/main' }}
+        github-cache: false
+        # A PR comment needs `pull-requests: write`; the job summary carries
+        # the same stats.
+        pr-comment: false
