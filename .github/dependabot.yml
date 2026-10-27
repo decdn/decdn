@@ -31,6 +31,10 @@ updates:
     ignore:
       # iroh ecosystem is pinned per ADR 001; upgrades require manual coordination
       - dependency-name: "iroh*"
+      # iroh's QUIC crates (noq, noq-proto, noq-udp) share iroh's pin: ADR 000
+      # records their baseline, and noq-proto 1.4 closes client pulls mid-leg
+      # ("too many gaps in stream buffer", #2585) until upstream ports the fix.
+      - dependency-name: "noq*"
 
   # Bumps the Dockerfile's pinned base-image digest. This only works because
   # the FROM line carries an explicit `@sha256:` — Dependabot updates a tag only
