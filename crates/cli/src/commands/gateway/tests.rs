@@ -57,6 +57,40 @@ fn manifest_cache_reinsert_replaces_without_double_counting() {
 }
 
 #[test]
+fn not_manifests_evict_the_least_recently_used_past_the_count() {
+    let verdict = || NotManifest::Plain("no".into());
+    let mut known = NotManifests::default();
+    for n in 0..MAX_NOT_MANIFESTS {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&n.to_le_bytes());
+        known.insert(h, verdict());
+    }
+    // Reading the oldest makes it the newest, so the next insert evicts 1.
+    assert!(known.get(&[0; 32]).is_some());
+    known.insert(hash(0xff), verdict());
+    assert_eq!(known.entries.len(), MAX_NOT_MANIFESTS);
+    assert!(known.get(&[0; 32]).is_some());
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    assert!(known.get(&one).is_none());
+    // A repeat insert replaces, not duplicates.
+    known.insert(hash(0xff), verdict());
+    assert_eq!(known.entries.len(), MAX_NOT_MANIFESTS);
+}
+
+#[test]
+fn verdict_text_is_clipped_on_a_character_boundary() {
+    assert_eq!(clip("short".to_owned()), "short");
+    let exact = "x".repeat(MAX_VERDICT_TEXT);
+    assert_eq!(clip(exact.clone()), exact);
+    // A multi-byte character straddles the cut.
+    let long = format!("{}é{}", "x".repeat(MAX_VERDICT_TEXT - 4), "y".repeat(100));
+    let clipped = clip(long);
+    assert!(clipped.len() <= MAX_VERDICT_TEXT, "{}", clipped.len());
+    assert!(clipped.ends_with('…'));
+}
+
+#[test]
 fn scope_parses_any_domain_and_host() {
     assert_eq!(Scope::parse("*").unwrap(), Scope::Any);
     assert_eq!(
@@ -392,6 +426,7 @@ async fn test_gateway_in(
         delegates: Mutex::new(HashMap::new()),
         pulls: PullWorker::start(backend, 1).await.unwrap(),
         manifests: std::sync::Mutex::new(ManifestCache::default()),
+        not_manifests: std::sync::Mutex::new(NotManifests::default()),
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
         sites,
@@ -646,9 +681,15 @@ async fn a_manifest_pull_is_capped_and_an_oversize_blob_is_not_found() {
         body.contains(&format!("fetch `/{blob}?ns=7` for the raw blob")),
         "the gateway serves the raw blob past the manifest cap: {body}"
     );
-    let (status, _) = get(&gateway, &format!("/{blob}/a.bin")).await;
+    // The verdict is remembered: the next request pulls nothing, and its
+    // hint names its own namespace.
+    let (status, body) = get(&gateway, &format!("/{blob}/a.bin?ns=9")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB, MAX_MANIFEST_MB]);
+    assert!(
+        body.contains(&format!("fetch `/{blob}?ns=9` for the raw blob")),
+        "{body}"
+    );
+    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB]);
 
     let (gateway, caps) = recording_gateway(Reply::TooLarge, &["--max-blob-mb", "10"]).await;
     let (status, body) = get(&gateway, &format!("/{blob}/")).await;
@@ -665,9 +706,16 @@ async fn a_manifest_pull_is_capped_and_an_oversize_blob_is_not_found() {
 #[tokio::test]
 async fn a_cap_stop_after_the_first_bytes_is_not_found() {
     let reply = Reply::BytesThenTooLarge(b"{\"version\": 1, ".to_vec());
-    let (gateway, _) = recording_gateway(reply, &["--max-blob-mb", "10"]).await;
-    let (status, body) = get(&gateway, &format!("/{}/", alloy::hex::encode(BLOB))).await;
+    let (gateway, caps) = recording_gateway(reply, &["--max-blob-mb", "10"]).await;
+    let path = format!("/{}/", alloy::hex::encode(BLOB));
+    let (status, body) = get(&gateway, &path).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, again) = get(&gateway, &path).await;
+    assert_eq!(
+        (status, again.as_str()),
+        (StatusCode::NOT_FOUND, body.as_str())
+    );
+    assert_eq!(*caps.lock().unwrap(), [10], "the cap stop is remembered");
 }
 
 #[tokio::test]
@@ -681,14 +729,36 @@ async fn a_raw_blob_pull_keeps_the_gateway_cap() {
 
 #[tokio::test]
 async fn a_blob_that_is_not_a_manifest_is_not_found() {
-    let (gateway, _) = recording_gateway(Reply::Bytes(b"not json".to_vec()), &[]).await;
+    let (gateway, caps) = recording_gateway(Reply::Bytes(b"not json".to_vec()), &[]).await;
     let blob = alloy::hex::encode(BLOB);
-    let (status, body) = get(&gateway, &format!("/{blob}/")).await;
+    let (status, first) = get(&gateway, &format!("/{blob}/")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(
-        body.contains(&format!("fetch `/{blob}` for the raw blob")),
-        "{body}"
+        first.contains(&format!("fetch `/{blob}` for the raw blob")),
+        "{first}"
     );
+    // The repeat request pays for no second pull, and its hint names its
+    // own namespace.
+    let (status, again) = get(&gateway, &format!("/{blob}/?ns=9")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        again,
+        first.replace(&format!("`/{blob}`"), &format!("`/{blob}?ns=9`"))
+    );
+    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB]);
+}
+
+/// A pull that failed upstream says nothing of the blob, so the next request
+/// pulls again.
+#[tokio::test]
+async fn a_failed_manifest_pull_is_not_remembered() {
+    let (gateway, caps) = recording_gateway_of(HashMap::new(), &[]).await;
+    let blob = alloy::hex::encode(BLOB);
+    for _ in 0..2 {
+        let (status, body) = get(&gateway, &format!("/{blob}/")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    }
+    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB; 2]);
 }
 
 /// A bundle reads its manifest under the manifest cap, once, and serves its
@@ -748,9 +818,35 @@ async fn a_malformed_entry_hash_makes_the_bundle_not_found() {
     }
     assert_eq!(
         *caps.lock().unwrap(),
-        [MAX_MANIFEST_MB; 3],
-        "each request pulls only the manifest"
+        [MAX_MANIFEST_MB],
+        "the first request pulls only the manifest, and the rest none"
     );
+}
+
+/// A malformed manifest quotes its publisher's path and hash string, so the
+/// remembered verdict, and the 404 that carries it, keep only the first
+/// [`MAX_VERDICT_TEXT`] bytes.
+#[tokio::test]
+async fn a_malformed_manifest_with_huge_fields_is_remembered_clipped() {
+    let path = "p".repeat(100 << 10);
+    let manifest = serde_json::json!({"version": 1, "entries": [
+        {"path": path, "hash": "z".repeat(100 << 10), "size": 3},
+    ]});
+    let (gateway, caps) =
+        recording_gateway(Reply::Bytes(manifest.to_string().into_bytes()), &[]).await;
+    let blob = alloy::hex::encode(BLOB);
+    for _ in 0..2 {
+        let (status, body) = get(&gateway, &format!("/{blob}/")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.starts_with(MALFORMED_MANIFEST), "{}", &body[..80]);
+        assert!(body.len() <= MAX_VERDICT_TEXT + 1, "{}", body.len());
+    }
+    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB]);
+    let kept = gateway.not_manifests.lock().unwrap();
+    let NotManifest::Plain(text) = &kept.entries[0].1 else {
+        panic!("a malformed manifest is a plain verdict");
+    };
+    assert!(text.len() <= MAX_VERDICT_TEXT);
 }
 
 /// A response's status, headers and body as text.
@@ -1088,16 +1184,16 @@ fn only_a_cap_stop_marks_a_manifest_pull_not_a_manifest() {
         })
     };
     assert!(matches!(
-        over_manifest_cap(PullError::Other(too_large()), 64, None),
-        PullError::NotManifest(_)
+        over_manifest_cap(PullError::Other(too_large()).into()),
+        ManifestStop::Not(NotManifest::OverCap(_))
     ));
     assert!(matches!(
-        over_manifest_cap(PullError::Other(anyhow::anyhow!("no node")), 64, None),
-        PullError::Other(_)
+        over_manifest_cap(PullError::Other(anyhow::anyhow!("no node")).into()),
+        ManifestStop::Pull(PullError::Other(_))
     ));
     assert!(matches!(
-        over_manifest_cap(PullError::Funding(too_large()), 64, None),
-        PullError::Funding(_)
+        over_manifest_cap(PullError::Funding(too_large()).into()),
+        ManifestStop::Pull(PullError::Funding(_))
     ));
 }
 
@@ -1968,6 +2064,43 @@ async fn a_pool_that_cannot_pay_answers_503() {
     );
     let body: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
     assert_eq!(body["uri"], format!("decdn:{unfunded}"));
+}
+
+/// A manifest pull the pool cannot pay for says nothing of the blob, so the
+/// next request pulls again.
+#[tokio::test]
+async fn a_manifest_pull_stopped_for_funding_is_not_remembered() {
+    let (gateway, logs, _) = public_gateway().await;
+    let host = gateway.sites.site_host(&Site {
+        hash: UNFUNDED,
+        namespace: None,
+    });
+    for _ in 0..2 {
+        let answer = request(&gateway, &host, "/", &[]).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            answer.body
+        );
+    }
+    assert_eq!(*logs.caps.lock().unwrap(), [MAX_MANIFEST_MB; 2]);
+}
+
+/// A manifest read that one namespace's allowance stopped says nothing of
+/// the blob: the same bundle on the shared allowance still serves.
+#[tokio::test]
+async fn a_manifest_read_stopped_by_the_allowance_is_not_remembered() {
+    let (gateway, _logs, host) =
+        public_gateway_for(Allowance::with_namespaces(u64::MAX, [(7, 1)])).await;
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
+    let refused = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
+    assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
+    let served = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!(
+        (served.status, served.body.as_str()),
+        (StatusCode::OK, "abc")
+    );
 }
 
 /// What the public allowance has left right now.
@@ -3035,12 +3168,7 @@ async fn status_spells_addresses_eip55_and_hashes_bare() {
     let payer = serde_json::to_value(PayerLabel::Capability { signer: mixed }).unwrap();
     assert_eq!(payer["signer"], mixed.to_string());
     let pool = alloy::primitives::B256::repeat_byte(0x01);
-    let lanes = serde_json::to_value(worker::DelegateLanes {
-        signer: mixed,
-        pool_id: pool,
-        lanes: Vec::new(),
-    })
-    .unwrap();
+    let lanes = serde_json::to_value(worker::DelegateLanes::new(mixed, pool, Vec::new())).unwrap();
     assert_eq!(lanes["signer"], mixed.to_string());
     assert_eq!(lanes["pool_id"], format!("{pool:#x}"));
     let (gateway, _logs, _) = public_gateway().await;

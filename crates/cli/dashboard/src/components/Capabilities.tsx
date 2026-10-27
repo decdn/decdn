@@ -42,6 +42,12 @@ export function Capabilities(props: { rows: CapabilityRow[] }) {
                     <span>
                       {formatUsdc(c.spentMicro)} of {formatUsdc(c.cap)} USDC
                     </span>
+                    {c.inFlight > 0 ? (
+                      <span className="text-xs text-ink-3">
+                        Live: {c.inFlight} {c.inFlight === 1 ? "pull" : "pulls"}{" "}
+                        in flight
+                      </span>
+                    ) : null}
                     <Gauge
                       used={c.used}
                       severity={c.severity}

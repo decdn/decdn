@@ -16,16 +16,19 @@
 //!
 //! The worker also answers what the store holds ([`PullWorker::pools`]): the
 //! store is open on the worker's host, and redb refuses a second open of it
-//! in the same process. Each pull persists its lanes' watermarks before it
-//! ends, so the answer lags the pulls' in-memory ledgers by at most the pulls
-//! in flight.
+//! in the same process. Each pull persists its lanes' watermarks only when it
+//! ends, so the store lags the pulls in flight; each capability key's spend
+//! in the answer ([`DelegateLanes`]) also counts what the live ledgers of its
+//! payers committed.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
+use decdn_client::Cumulative;
 use decdn_common::admin::{BuyerLaneSnapshot, BuyerPoolsResponse};
 use decdn_common::cli::ClientFetchArgs;
 use decdn_incentive::CapabilityGrant;
@@ -97,11 +100,68 @@ pub(super) struct PoolSnapshot {
 pub(super) struct DelegateLanes {
     /// The delegate key.
     #[serde(serialize_with = "super::eip55")]
-    pub(super) signer: Address,
+    signer: Address,
     /// The pool the capability spends.
-    pub(super) pool_id: PoolId,
-    /// Its lanes, by provider.
-    pub(super) lanes: Vec<BuyerLaneSnapshot>,
+    pool_id: PoolId,
+    /// Its lanes, by provider, as the store holds them.
+    lanes: Vec<BuyerLaneSnapshot>,
+    /// What the key signed for, in micro-USDC, summed over its lanes: each
+    /// lane's stored watermark, or its live ledger when that is ahead.
+    spent_micro_usdc: u64,
+    /// The lane bytes paid for, taken per lane the same way.
+    bytes_delivered: u64,
+}
+
+impl DelegateLanes {
+    /// The lanes `signer` signs on in `pool_id`, as the store holds them,
+    /// with their stored spend and bytes summed.
+    pub(super) fn new(signer: Address, pool_id: PoolId, lanes: Vec<BuyerLaneSnapshot>) -> Self {
+        let mut delegate = Self {
+            signer,
+            pool_id,
+            lanes,
+            spent_micro_usdc: 0,
+            bytes_delivered: 0,
+        };
+        delegate.include_live(&HashMap::new());
+        delegate
+    }
+
+    /// Sum the key's spend and bytes again, with each of its lanes in `live`
+    /// at the larger of its stored watermark and its live ledger. A live
+    /// ledger starts from the stored watermark and a pull moves it on, so the
+    /// larger is the lane's spend and the two are never added. A ledger that
+    /// a rebase moved back below the store leaves the stored value. A lane
+    /// only `live` knows counts in full.
+    fn include_live(&mut self, live: &HashMap<LaneKey, Cumulative>) {
+        let mut lanes: HashMap<String, (u64, u64)> = self
+            .lanes
+            .iter()
+            .map(|l| {
+                let stored = (l.last_amount_micro_usdc, l.last_bytes_delivered);
+                (l.provider.clone(), stored)
+            })
+            .collect();
+        let mine = live
+            .iter()
+            .filter(|(lane, _)| lane.pool_id == self.pool_id && lane.signer == self.signer);
+        for (lane, committed) in mine {
+            // The store spells a provider as `lane_snapshot` does.
+            let (amount, bytes) = lanes.entry(lane.provider.to_string()).or_default();
+            *amount = (*amount).max(narrow(committed.amount));
+            *bytes = (*bytes).max(narrow(committed.bytes));
+        }
+        let (spent, bytes) = lanes.values().fold((0u64, 0u64), |(spent, bytes), (a, b)| {
+            (spent.saturating_add(*a), bytes.saturating_add(*b))
+        });
+        self.spent_micro_usdc = spent;
+        self.bytes_delivered = bytes;
+    }
+}
+
+/// Narrow a ledger's `U256` to the snapshot's `u64`, saturating.
+fn narrow(value: U256) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 /// What the gateway sends the worker.
@@ -167,6 +227,13 @@ pub(super) trait Backend: Send + 'static {
     ) -> anyhow::Result<PoolSnapshot> {
         let _ = (host, delegates);
         Ok(PoolSnapshot::default())
+    }
+
+    /// Each lane `payer`'s pulls share a live ledger on, with what it has
+    /// committed so far. A backend without ledgers has none.
+    fn live_lanes(&self, payer: &Self::Payer) -> Vec<(LaneKey, Cumulative)> {
+        let _ = payer;
+        Vec::new()
     }
 
     /// Shut the host down once every pull has ended.
@@ -237,6 +304,10 @@ impl Backend for FetchBackend {
             .await?
     }
 
+    fn live_lanes(&self, payer: &Payer) -> Vec<(LaneKey, Cumulative)> {
+        payer.committed_lanes()
+    }
+
     async fn close(&self, (host, _): Self::Host) {
         host.close().await;
     }
@@ -285,11 +356,7 @@ pub(super) fn read_pools(
                     lane_snapshot(lane, progress)
                 })
                 .collect();
-            Ok(DelegateLanes {
-                signer,
-                pool_id,
-                lanes,
-            })
+            Ok(DelegateLanes::new(signer, pool_id, lanes))
         })
         .collect::<anyhow::Result<_>>()?;
     Ok(PoolSnapshot {
@@ -467,8 +534,19 @@ async fn run<B: Backend>(
                 Some(Request::Pools { delegates, reply }) => {
                     let backend = Rc::clone(&backend);
                     let host = Rc::clone(&host);
+                    let payers = Rc::clone(&payers);
                     tasks.spawn_local(async move {
-                        let _ = reply.send(backend.pools(&host, &delegates).await);
+                        // The ledgers are read before the store: a pull that
+                        // ends during the store read is already counted live,
+                        // and one that ended before it persisted first.
+                        let live = live_lanes(backend.as_ref(), &payers);
+                        let snapshot = backend.pools(&host, &delegates).await.map(|mut s| {
+                            for delegate in &mut s.delegate_lanes {
+                                delegate.include_live(&live);
+                            }
+                            s
+                        });
+                        let _ = reply.send(snapshot);
                     });
                 }
                 None => break,
@@ -561,6 +639,28 @@ fn payer_for<B: Backend>(
     let payer = Rc::new(backend.payer(credential)?);
     payers.insert(id, Rc::clone(&payer));
     Ok(payer)
+}
+
+/// Each lane a live payer holds a ledger on, with the most any payer
+/// committed on it. A held payer lives while its pulls run; the pool payer
+/// lives for the run.
+fn live_lanes<B: Backend>(backend: &B, payers: &Payers<B::Payer>) -> HashMap<LaneKey, Cumulative> {
+    let mut live = HashMap::new();
+    for payer in payers.borrow().values() {
+        for (lane, committed) in backend.live_lanes(payer) {
+            match live.entry(lane) {
+                Entry::Vacant(e) => {
+                    e.insert(committed);
+                }
+                Entry::Occupied(mut e) => {
+                    let seen: &mut Cumulative = e.get_mut();
+                    seen.amount = seen.amount.max(committed.amount);
+                    seen.bytes = seen.bytes.max(committed.bytes);
+                }
+            }
+        }
+    }
+    live
 }
 
 /// Drop `payer` from the map when no pull but the caller's holds it.

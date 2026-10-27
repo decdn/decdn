@@ -799,6 +799,61 @@ pub(crate) struct FetchHost {
     pub(crate) escrows: UnconfirmedEscrows,
     /// The pool's settlement token, `PaymentPool.usdc()`, read once.
     token: tokio::sync::OnceCell<alloy::primitives::Address>,
+    /// The sizes of blobs fetches on this host verified whole, up to
+    /// [`MAX_SIZE_HINTS`].
+    sizes: Mutex<SizeHints>,
+}
+
+/// The most blob sizes a [`FetchHost`] remembers.
+const MAX_SIZE_HINTS: usize = 4096;
+
+/// Blob sizes by hash, each one a whole fetch verified, oldest first out
+/// within [`MAX_SIZE_HINTS`] entries. A hash fixes its blob's size, so a hit
+/// is a later fetch's first size claim, and a pinned node is not probed for
+/// it (ADR 005 § Probe rate limiting bounds those probes per peer).
+#[derive(Default)]
+pub(crate) struct SizeHints {
+    sizes: std::collections::HashMap<[u8; 32], u64>,
+    /// Insertion order, oldest first.
+    order: std::collections::VecDeque<[u8; 32]>,
+}
+
+impl SizeHints {
+    /// The size a fetch verified for `hash`, if one did.
+    pub(crate) fn get(&self, hash: &[u8; 32]) -> Option<u64> {
+        self.sizes.get(hash).copied()
+    }
+
+    /// Remember that `hash`'s blob verified to `size` bytes. A hash fixes its
+    /// blob's size, so a hash already known keeps its size and its place.
+    pub(crate) fn insert(&mut self, hash: [u8; 32], size: u64) {
+        let std::collections::hash_map::Entry::Vacant(entry) = self.sizes.entry(hash) else {
+            return;
+        };
+        entry.insert(size);
+        self.order.push_back(hash);
+        while self.order.len() > MAX_SIZE_HINTS {
+            if let Some(evicted) = self.order.pop_front() {
+                self.sizes.remove(&evicted);
+            }
+        }
+    }
+}
+
+/// The size a fetch of `hash` starts from: `size_cap`, the caller's declared
+/// size (a bundle manifest's entry size), else one an earlier fetch on the
+/// host verified. Only the declared size caps the fetch ([`held_cap`]).
+pub(crate) fn known_size(
+    hash: &[u8; 32],
+    size_cap: Option<u64>,
+    sizes: &Mutex<SizeHints>,
+) -> Option<u64> {
+    size_cap.or_else(|| {
+        sizes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(hash)
+    })
 }
 
 impl FetchHost {
@@ -865,6 +920,7 @@ impl FetchHost {
             writes: OrderedWrites::default(),
             escrows: UnconfirmedEscrows::default(),
             token: tokio::sync::OnceCell::new(),
+            sizes: Mutex::new(SizeHints::default()),
         };
         Ok((host, grant))
     }
@@ -1052,6 +1108,17 @@ impl Payer {
         })
     }
 
+    /// Each lane the payer's fetches share a ledger on, with what it has
+    /// committed so far; nothing for a keystore payer, whose lanes live only
+    /// as long as each fetch.
+    pub(crate) fn committed_lanes(
+        &self,
+    ) -> Vec<(decdn_incentive::LaneKey, decdn_client::Cumulative)> {
+        self.ledgers
+            .as_ref()
+            .map_or_else(Vec::new, LaneLedgers::committed_lanes)
+    }
+
     /// Whether the fetch pays from a pool another owner funds.
     const fn delegated(&self) -> bool {
         match &self.key {
@@ -1093,6 +1160,7 @@ pub(crate) async fn fetch_on(
         writes,
         escrows,
         token,
+        sizes,
     } = host;
     let hash = args.hash;
     let common = &args.common;
@@ -1106,12 +1174,13 @@ pub(crate) async fn fetch_on(
     // first open discovers them. The round streams: the fetch starts at the
     // first verified holder, and the holders that answer later join it.
     let discovery = discovery_options(common)?;
-    // A known size (a gateway's manifest entry) is the first size claim, and
-    // a pinned node is not probed for it.
+    // A known size (a gateway's manifest entry, or a size an earlier fetch
+    // on the host verified) is the first size claim, and a pinned node is not
+    // probed for it.
     let probe = ProbeOpts {
         marks: Some(timings),
         round: ProbeRound::Stream,
-        known_size: args.size_cap,
+        known_size: known_size(&hash, args.size_cap, sizes),
     };
     let resolved = holders_or_none(
         resolve_target_node(
@@ -1300,13 +1369,19 @@ pub(crate) async fn fetch_on(
                 .await
             };
             // A whole blob that landed verified against its hash is a receipt
-            // entry, at the length it verified to (the first claim is only a
-            // hint); a byte window is not the blob.
+            // entry, and the size a later fetch of it starts from, at the
+            // length it verified to (the first claim is only a hint); a byte
+            // window is not the blob.
             if let Ok(verified) = landed
                 && args.range.is_none()
-                && let Some(evidence) = &payer.evidence
             {
-                evidence.note_landed(hash, verified);
+                sizes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(hash, verified);
+                if let Some(evidence) = &payer.evidence {
+                    evidence.note_landed(hash, verified);
+                }
             }
             landed.map(drop)
         }

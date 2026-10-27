@@ -164,11 +164,11 @@ fn a_loopback_status_keeps_its_shape() {
         }],
         pools: Some(PoolSnapshot {
             pools: BuyerPoolsResponse::default(),
-            delegate_lanes: vec![DelegateLanes {
-                signer: DELEGATE,
-                pool_id: pool,
-                lanes: vec![lane(DELEGATE, 1_250_000, 18_000_000_000)],
-            }],
+            delegate_lanes: vec![DelegateLanes::new(
+                DELEGATE,
+                pool,
+                vec![lane(DELEGATE, 1_250_000, 18_000_000_000)],
+            )],
         }),
         pool_error: None,
         ..base(Mode::Loopback)

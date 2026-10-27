@@ -70,10 +70,15 @@ export interface CapabilityRow {
   cap: number;
   expiry: number;
   exhausted: boolean;
-  /** What its key signed for, summed over its lanes; null when unknown. */
+  /**
+   * What its key signed for, the pulls in flight included; null when
+   * unknown.
+   */
   spentMicro: number | null;
   bytes: number | null;
   used: number | null;
+  /** The pulls in flight its key pays for, whose spend may still grow. */
+  inFlight: number;
   severity: Severity;
 }
 
@@ -81,14 +86,16 @@ export interface CapabilityRow {
 export function capabilities(status: GatewayStatus): CapabilityRow[] {
   const delegates = status.pools?.delegate_lanes;
   return status.capabilities.map((c) => {
-    const lanes = delegates
-      ?.filter((d) => same(d.signer, c.signer) && same(d.pool_id, c.pool))
-      .flatMap((d) => d.lanes);
+    const mine = delegates?.filter(
+      (d) => same(d.signer, c.signer) && same(d.pool_id, c.pool),
+    );
     const spentMicro =
-      lanes?.reduce((sum, l) => sum + l.last_amount_micro_usdc, 0) ?? null;
-    const bytes =
-      lanes?.reduce((sum, l) => sum + l.last_bytes_delivered, 0) ?? null;
+      mine?.reduce((sum, d) => sum + d.spent_micro_usdc, 0) ?? null;
+    const bytes = mine?.reduce((sum, d) => sum + d.bytes_delivered, 0) ?? null;
     const used = spentMicro === null ? null : share(spentMicro, c.cap);
+    const inFlight = status.active_pulls.filter(
+      (p) => p.payer.kind === "capability" && same(p.payer.signer, c.signer),
+    ).length;
     return {
       signer: c.signer,
       pool: c.pool,
@@ -100,6 +107,7 @@ export function capabilities(status: GatewayStatus): CapabilityRow[] {
       spentMicro,
       bytes,
       used,
+      inFlight,
       severity: c.spent ? "critical" : severity(used),
     };
   });

@@ -14,7 +14,7 @@ use alloy::primitives::U256;
 use decdn_incentive::LaneKey;
 
 use crate::PoolContext;
-use crate::ledger::PoolLedger;
+use crate::ledger::{Cumulative, PoolLedger};
 
 /// A lane's shared live state: the one voucher ledger and one pool context every
 /// concurrent fetch on the lane draws on.
@@ -81,6 +81,25 @@ impl LaneLedgers {
         map.values()
             .map(|h| h.ledger.committed().amount)
             .fold(U256::ZERO, U256::saturating_add)
+    }
+
+    /// Each registered lane with its committed cumulative
+    /// ([`PoolLedger::committed`]): what a pull on it would persist if it
+    /// ended now. The handles are cloned out under the map lock, which is
+    /// released before any ledger is read.
+    #[must_use]
+    pub fn committed_lanes(&self) -> Vec<(LaneKey, Cumulative)> {
+        let handles: Vec<(LaneKey, LaneHandle)> = {
+            let map = self
+                .map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.iter().map(|(lane, h)| (*lane, h.clone())).collect()
+        };
+        handles
+            .into_iter()
+            .map(|(lane, h)| (lane, h.ledger.committed()))
+            .collect()
     }
 
     /// Σ over every registered lane of the bytes its ledger paid for since its

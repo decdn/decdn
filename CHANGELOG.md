@@ -1137,6 +1137,30 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Gateway: a blob that is no bundle manifest is pulled once (#2478).** A
+  `/<hash>/` or `/<hash>/<path>` request for a blob over the manifest cap,
+  one whose bytes do not parse, or a malformed manifest answered 404 but
+  pulled, and paid for up to the manifest cap, again on every request. The
+  gateway now keeps up to 1024 such hashes for its run, and a repeat request
+  answers the same 404 with no pull; its raw-blob hint names the asker's
+  namespace. Each kept verdict holds at most 1 KiB of text, since a parse
+  error quotes the publisher's paths and hash strings. A pull that failed
+  upstream, on funding or on the allowance is not kept.
+- **Gateway: a repeat bare-hash pull on a pinned gateway sends no probe
+  (#2632).** A `decdn gateway` pinned with `--node-id` probed the node for
+  the size of every bare-hash pull, and above about 5 pulls per second the
+  node's per-peer probe bucket shed them, so those pulls fell back to the
+  header-only open. The fetch host now keeps the verified size of up to
+  4096 blobs it pulled whole, and a repeat pull takes it as the first size
+  claim. The gateway e2e checks that repeat pulls of verified blobs probe
+  nothing.
+- **Gateway: `/_status` counts a capability's pulls in flight (#2640).**
+  Each `pools.delegate_lanes` row gains `spent_micro_usdc` and
+  `bytes_delivered`: per lane, the larger of the stored watermark and the
+  live voucher ledger of a pull in flight, read before the store so a pull
+  that ends during the read is not lost. `decdn dashboard`'s "Spent of
+  cap" reads them and marks a capability with pulls in flight as live, so
+  a long pull no longer reads as nothing spent until it ends.
 - **Client: a pull pinned to one node takes its size from a probe, not
   from a stream it drops unread (#2619).** A fetch pinned with `--node-id`
   (`decdn get` of a blob or a bundle, or `decdn gateway`) read its first

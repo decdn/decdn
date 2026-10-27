@@ -76,7 +76,12 @@ export interface Pool {
 export interface DelegateLanes {
   signer: string;
   pool_id: string;
+  /** As the store holds them: each pull writes its lanes when it ends. */
   lanes: Lane[];
+  /** What the key signed for, counting the pulls in flight. */
+  spent_micro_usdc: number;
+  /** The lane bytes the same vouchers paid for. */
+  bytes_delivered: number;
 }
 
 export interface PoolSnapshot {

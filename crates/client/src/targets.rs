@@ -317,8 +317,8 @@ pub struct ProbeOpts<'a> {
     /// How the probe round ends.
     pub round: ProbeRound,
     /// The blob's size as the caller knows it (a bundle manifest's entry
-    /// size): the fetch's first size claim, in place of any probe's hint. A
-    /// pinned node is not probed for it.
+    /// size, or one an earlier fetch verified): the fetch's first size claim,
+    /// in place of any probe's hint. A pinned node is not probed for it.
     pub known_size: Option<u64>,
 }
 

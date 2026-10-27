@@ -67,6 +67,13 @@ write, so it spends the shared bucket. The gateway counts:
 An entry's pull is capped at the size its manifest declares. A manifest
 cannot make the gateway pay for more than it says.
 
+A blob that is not a manifest does not become one. Its hash fixes its bytes.
+The manifest cap stops a pull only on verified bytes or a proven size. The
+gateway keeps up to 1024 such hashes. It drops the least recently used hash
+first. A repeat request for a kept hash as a bundle answers 404 and starts no
+pull. The gateway does not keep a pull that fails upstream, on funding or on
+the allowance.
+
 The answers:
 
 | Status | When | Carries |
@@ -251,7 +258,7 @@ wants to see how a site is served runs a loopback gateway and
 | `capabilities` | The registered capabilities, in the shape of `GET /_capability`. A public gateway holds none. |
 | `allowance` | A public gateway's buckets: the shared bucket first, then each namespace. Each has its bytes per day (`null` for no bound), the bytes delivered today, the bytes left (`null` for no bound) and the seconds until the UTC day turns. `null` on loopback. |
 | `pointers` | A public gateway's namespace pointers: namespace, root, `seq`, signer. `null` on loopback. |
-| `pools` | The buyer-pool store: each pool with its deposit, its spend and its lanes, and the lanes of each registered capability's key. |
+| `pools` | The buyer-pool store: each pool with its deposit, its spend and its lanes, and the lanes of each registered capability's key. Each key also has its spend and its bytes. These include the pulls in flight. |
 | `pool_error` | Why `pools` is `null`. The text has its secrets removed. |
 
 Each kind of value has one spelling. An address is EIP-55 checksummed hex, as
@@ -267,8 +274,12 @@ gateway pays with capabilities. The store keeps their lanes apart from the pool 
 `pools` lists them per key.
 
 The pull worker owns the store and reads it. The store holds what each pull
-wrote when it ended. Thus `pools` lags the pulls in flight. A read that takes
-more than 5 seconds fills `pool_error`.
+wrote when it ended. Thus the lanes and the pool rows in `pools` lag the
+pulls in flight. A key's spend and bytes include the pulls in flight. For
+each lane, the gateway uses the larger of two values: the stored value, and
+the value in the live voucher ledger of a pull in flight. The gateway reads
+the live ledgers before the store, so a pull that ends during the read is
+not lost. A read that takes more than 5 seconds fills `pool_error`.
 
 `/_status` grants no cross-origin read. A cross-origin page cannot send the
 token header: the preflight of `/_status` answers 403. `decdn dashboard`

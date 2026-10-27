@@ -151,6 +151,8 @@ const DELEGATE: Keys<DelegateLanes> = {
   signer: true,
   pool_id: true,
   lanes: true,
+  spent_micro_usdc: true,
+  bytes_delivered: true,
 };
 const SNAPSHOT: Keys<PoolSnapshot> = { pools: true, delegate_lanes: true };
 
