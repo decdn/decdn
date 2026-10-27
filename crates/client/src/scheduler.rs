@@ -2560,12 +2560,26 @@ where
             // free the lane and pick again.
             None | Some(UnitOutcome::Completed) => {
                 let split = unit.stop_at.load(Ordering::Acquire);
-                if split < r_start.saturating_add(r_len) {
+                let end = r_start.saturating_add(r_len);
+                if split < end {
                     tracing::debug!(
                         %provider,
                         start = r_start,
                         split,
                         "a lane stopped its stream at a steal split"
+                    );
+                }
+                // Attribute the delivery: faults name their provider, and this
+                // is the one line that says who served the bytes (#2332). An
+                // idle pick that landed nothing is noise, so it logs nothing.
+                if landed > 0 {
+                    tracing::info!(
+                        %provider,
+                        hash = %blake3::Hash::from_bytes(hash).to_hex(),
+                        offset = r_start,
+                        len = split.min(end).saturating_sub(r_start),
+                        landed,
+                        "a lane completed its range"
                     );
                 }
                 // A retired lane keeps its range for the loop top, which

@@ -30,6 +30,36 @@ fn blob(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
+/// A `tracing_subscriber::fmt` writer that keeps every line it is handed.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    /// Everything written so far.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A shared handle to a healthy buyer context (huge deposit so the pacer never
 /// tops up) paying the given `provider`.
 fn ctx_for(provider: u8) -> Arc<Mutex<PoolContext>> {
@@ -1565,6 +1595,93 @@ async fn a_slow_victim_is_stolen_from_once() -> anyhow::Result<()> {
         delivered <= total + 2 * MIB,
         "no byte is fetched twice: delivered {delivered} of {total}"
     );
+    Ok(())
+}
+
+/// Every completed range logs, at info, the provider that served it, the
+/// blob, and the extent it completed (#2332). The slow victim of a steal
+/// logs the range up to the split, not its pick, so the extents tile the
+/// blob and the thief's range starts where the victim's ends.
+#[tokio::test(start_paused = true)]
+async fn a_completed_range_logs_its_provider_and_extent() -> anyhow::Result<()> {
+    let data = blob(128 * MIB as usize);
+    let total = data.len() as u64;
+    let ledger_fast = Arc::new(PoolLedger::new(Cumulative::default()));
+    let ledger_slow = Arc::new(PoolLedger::new(Cumulative::default()));
+    let fast = ScriptedSource::new(data.clone())?
+        .throttled(Duration::from_millis(1))
+        .paying(Arc::clone(&ledger_fast));
+    let slow = ScriptedSource::new(data)?
+        .throttled(Duration::from_millis(4))
+        .paying(Arc::clone(&ledger_slow));
+    let root = fast.root();
+    let (store, _dir) = fresh_store(root, total);
+    let provider = StaticSources::new(vec![
+        candidate(fast.clone(), ledger_fast, 0xA1, None),
+        candidate(slow.clone(), ledger_slow, 0xB2, None),
+    ])?;
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
+    let log = CapturedLog::default();
+    let sink = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    // Thread-local: the current-thread runtime runs every worker here.
+    let guard = tracing::subscriber::set_default(subscriber);
+    tokio::time::timeout(
+        Duration::from_mins(5),
+        run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the fetch stalled"))??;
+    drop(guard);
+    assert_eq!(
+        slow.stopped_pulls(),
+        1,
+        "the slow source stops at the split"
+    );
+
+    let text = log.text();
+    let field = |line: &str, key: &str| -> Option<String> {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_owned)
+    };
+    let num = |line: &str, key: &str| -> anyhow::Result<u64> {
+        field(line, key)
+            .ok_or_else(|| anyhow::anyhow!("no {key} in {line}"))?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{key} in {line}: {e}"))
+    };
+    let hash = blake3::Hash::from_bytes(root).to_hex().to_string();
+    let mut completed = Vec::new();
+    for line in text
+        .lines()
+        .filter(|l| l.contains("a lane completed its range"))
+    {
+        assert!(line.contains(" INFO "), "{text}");
+        assert_eq!(field(line, "hash"), Some(hash.clone()), "{text}");
+        assert!(num(line, "landed")? > 0, "{text}");
+        let from = field(line, "provider").unwrap_or_default().to_lowercase();
+        completed.push((from, num(line, "offset")?, num(line, "len")?));
+    }
+    let slow_addr = Address::repeat_byte(0xB2).to_string().to_lowercase();
+    let fast_addr = Address::repeat_byte(0xA1).to_string().to_lowercase();
+    let by = |addr: &str| completed.iter().filter(|(p, ..)| p == addr).count();
+    assert_eq!(
+        (by(&fast_addr), by(&slow_addr)),
+        (2, 1),
+        "the fast source completes its half and the steal, the slow one its trimmed range: {text}"
+    );
+    completed.sort_by_key(|&(_, offset, _)| offset);
+    let mut at = 0;
+    for (_, offset, len) in &completed {
+        assert_eq!(*offset, at, "the completed extents tile the blob: {text}");
+        at = offset.saturating_add(*len);
+    }
+    assert_eq!(at, total, "the completed extents tile the blob: {text}");
     Ok(())
 }
 
@@ -7535,20 +7652,6 @@ async fn a_capability_refused_with_headroom_left_reads_as_revoked() -> anyhow::R
 /// lane build's chain error names the RPC URL, which may carry a key.
 #[test]
 fn extra_stream_fault_level_follows_landed_and_class() {
-    #[derive(Clone, Default)]
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     let range = |landed| crate::source_set::LaneRange {
         offset: 0,
         len: 1024,
@@ -7575,12 +7678,7 @@ fn extra_stream_fault_level_follows_landed_and_class() {
         )));
         super::log_extra_fault(Address::ZERO, [0; 32], range(1), &retry);
     });
-    let text = String::from_utf8_lossy(
-        &log.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
-    .into_owned();
+    let text = log.text();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 4, "{text}");
     let level = |i: usize| lines.get(i).copied().unwrap_or_default();
