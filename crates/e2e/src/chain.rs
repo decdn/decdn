@@ -2045,9 +2045,15 @@ pub async fn build_contracts() -> anyhow::Result<PathBuf> {
     Ok(contracts)
 }
 
-/// `crates/e2e/ → ../../contracts`.
+/// `crates/<package>/ → ../../contracts`, from the running test's package
+/// directory. `CARGO_MANIFEST_DIR` is read at run time, where cargo and nextest
+/// set it for every test process, not with `env!`: a compile-time read embeds
+/// the checkout path in this library, so a compiler cache rebuilds it, and every
+/// test binary that links it, in each new worktree.
 fn contracts_dir() -> anyhow::Result<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    let package_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .context("CARGO_MANIFEST_DIR is unset: run the test under cargo or nextest")?;
+    Path::new(&package_dir)
         .join("../../contracts")
         .canonicalize()
         .context("resolve contracts dir")

@@ -148,6 +148,42 @@ one (a doc comment on a wire type is its OpenAPI description) regenerate them:
 UPDATE_OPENAPI=1 cargo test -p sponsord-api --test openapi
 ```
 
+### Compiler cache
+
+[kache](https://github.com/kunobi-ninja/kache) caches compiler output by content, so a new
+worktree or a fresh `target/` restores most crates instead of compiling them. It is optional and
+set per machine; the repository config does not name it. Measured on 16 cores, a full
+`cargo build --workspace --all-targets` in a new worktree takes 54s with a warm cache, against
+204s without one.
+
+```bash
+cargo install --locked kache
+```
+
+Then add the wrapper to `~/.cargo/config.toml`:
+
+```toml
+[build]
+rustc-wrapper = "kache"
+```
+
+And turn on adaptive incremental compilation in `~/.config/kache/config.toml`:
+
+```toml
+[cache]
+adaptive_incremental = true
+```
+
+The second setting is required. By default kache turns incremental compilation off, and a rebuild
+after a one-line `decdn-protocol` edit then takes 125s instead of 44s. `kache init` also edits
+your shell profile and installs a test runner; the setup above uses only the wrapper.
+`kache stats` shows the hit rate, and `kache explain` names why the last build missed.
+
+A library crate that reads a path with `env!` (for example `CARGO_MANIFEST_DIR`) embeds the
+checkout path. It misses the cache in each new worktree, and so does every crate that links it.
+Read such a value at run time with `std::env::var_os`; cargo and nextest set `CARGO_MANIFEST_DIR`
+for every test process.
+
 ### Unit test placement
 
 Every unit-test module lives in its own file. Declare it in the source file and put the body in a
