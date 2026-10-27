@@ -32,7 +32,7 @@ export function Pools(props: {
   return (
     <Panel
       title="Pools and lanes"
-      note="From the buyer store; a pull in flight records its lanes as it ends"
+      note="From the buyer store. Spend counts what nodes redeemed and this gateway signed; another signer's unredeemed vouchers and the pulls in flight are not in it yet"
     >
       {props.error ? (
         <p role="alert" className="mb-3 text-sm text-critical-ink">
@@ -58,8 +58,8 @@ export function Pools(props: {
                   Pool {shortHex(p.id)}
                 </h3>
                 <p className="text-sm text-ink-2">
-                  {formatUsdc(p.headroom)} USDC left of {formatUsdc(p.deposit)}{" "}
-                  · spent {formatUsdc(p.spent)}
+                  Up to {formatUsdc(p.headroom)} USDC left of{" "}
+                  {formatUsdc(p.deposit)} · spent {formatUsdc(p.spent)} or more
                 </p>
               </div>
               <div className="w-full sm:w-64">

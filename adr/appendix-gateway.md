@@ -262,9 +262,9 @@ hex, as a gateway URL carries it.
 The pool spend is the pool's spend as the store knows it: the lanes of the
 store plus the spend that other signers redeemed. The spend is a lower bound.
 A voucher that another signer issued and that no provider redeemed is not in
-it. Thus the deposit less the spend is at most what all signers of the pool
-can still spend. A loopback gateway pays with
-capabilities. The store keeps their lanes apart from the pool rows, so
+it. Thus all signers of the pool can still spend at most the deposit less
+the spend. The dashboard shows that value as an upper bound. A loopback
+gateway pays with capabilities. The store keeps their lanes apart from the pool rows, so
 `pools` lists them per key.
 
 The pull worker owns the store and reads it. The store holds what each pull

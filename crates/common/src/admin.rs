@@ -659,8 +659,8 @@ pub struct BuyerPoolSnapshot {
     ///
     /// A lower bound: a voucher another signer issued and no provider has
     /// redeemed yet is in neither. So
-    /// `deposit_micro_usdc.saturating_sub(spent_micro_usdc)` is at most the
-    /// headroom left for every signer on the pool.
+    /// `deposit_micro_usdc.saturating_sub(spent_micro_usdc)` is an upper
+    /// bound: every signer on the pool together can spend at most that much.
     pub spent_micro_usdc: u64,
     /// Every lane funded from this pool, ordered by `(signer, provider)`. One
     /// pool fans out to every provider the owner pays (ADR 003), so this is

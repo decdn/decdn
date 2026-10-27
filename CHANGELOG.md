@@ -31,7 +31,8 @@ since project inception and will roll into the first tagged release.
 - **Admin wire: `BuyerPoolSnapshot` carries `spent_micro_usdc`.** The field
   is the pool's spend as the store knows it (every tracked lane plus the
   spend other signers redeemed). It is a lower bound, so deposit less spend
-  is at most the headroom left for every signer on the pool. The field is required, so a `decdn` CLI at
+  is an upper bound on what every signer on the pool can still spend. The
+  field is required, so a `decdn` CLI at
   this release reads `admin_v1_pools` only from a daemon at this release.
   `decdn node pools` and `decdn pool list` gain a `SPENT` column between
   `DEPOSIT` and `LANES`, which moves `LANES`.
