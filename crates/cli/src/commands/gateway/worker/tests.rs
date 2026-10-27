@@ -11,7 +11,9 @@ use decdn_incentive::lane::PoolId;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, oneshot};
 
-use super::{Backend, DelegateLanes, Job, Payment, PoolSnapshot, PullWorker};
+use super::{
+    Backend, DelegateLanes, Job, Payment, PoolSnapshot, PullWorker, lane_queries, read_pools,
+};
 use crate::commands::fetch::{BlobFetch, Credential, Sink};
 
 /// The blob a [`Fake`] pull stalls on: it writes more than the pipe holds.
@@ -495,4 +497,88 @@ async fn a_pools_query_after_stop_fails() {
         .expect("the query does not hang")
         .expect_err("a stopped worker answers nothing");
     assert!(err.to_string().contains("shutting down"), "{err:#}");
+}
+
+const DEPLOYMENT: decdn_incentive::Deployment = decdn_incentive::Deployment {
+    chain_id: 421_614,
+    payment_pool: Address::repeat_byte(0x9c),
+};
+
+/// A delegate lane of `signer` on `pool`, to node `0xb2`, at `amount`.
+fn seed_delegate_lane(
+    store: &decdn_incentive::MemoryBuyerPoolStore,
+    pool: PoolId,
+    signer: Address,
+    amount: u64,
+) {
+    use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerLaneProgress, BuyerPoolStore as _};
+    let outcome = store
+        .advance_delegate_progress(
+            DEPLOYMENT,
+            decdn_incentive::lane::LaneKey {
+                pool_id: pool,
+                signer,
+                provider: Address::repeat_byte(0xb2),
+            },
+            BuyerLaneProgress {
+                last_amount: alloy::primitives::U256::from(amount),
+                last_bytes: alloy::primitives::U256::from(amount * 10),
+            },
+        )
+        .unwrap();
+    assert_eq!(outcome, AdvanceOutcome::Advanced);
+}
+
+/// The store read lists each queried key's delegate lanes on its pool: a
+/// capability a page registered, and the `--capability` grant a public
+/// gateway pays under, whose lanes are delegate lanes too.
+#[test]
+fn the_store_read_lists_every_queried_keys_lanes() {
+    let store = decdn_incentive::MemoryBuyerPoolStore::new();
+    let registered = (PoolId::repeat_byte(1), Address::repeat_byte(0x11));
+    let granted = (PoolId::repeat_byte(2), Address::repeat_byte(0x22));
+    seed_delegate_lane(&store, registered.0, registered.1, 100);
+    seed_delegate_lane(&store, granted.0, granted.1, 250);
+    let grant = CapabilityGrant {
+        pool_id: granted.0,
+        signer: granted.1,
+        spending_cap: 1_000,
+        expiry: u64::MAX,
+        owner_signature: vec![0; 65],
+    };
+    let queries = lane_queries(Some(&grant), &[registered]);
+    let snapshot = read_pools(&store, DEPLOYMENT, &queries).unwrap();
+    let mut listed: Vec<_> = snapshot
+        .delegate_lanes
+        .iter()
+        .map(|d| {
+            let paid: u64 = d.lanes.iter().map(|l| l.last_amount_micro_usdc).sum();
+            (d.pool_id, d.signer, paid)
+        })
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![
+            (registered.0, registered.1, 100),
+            (granted.0, granted.1, 250)
+        ]
+    );
+    assert!(snapshot.pools.pools.is_empty());
+}
+
+/// The grant's key is asked once, even when a capability names it too.
+#[test]
+fn lane_queries_add_the_grant_once() {
+    let key = (PoolId::repeat_byte(3), Address::repeat_byte(0x33));
+    let grant = CapabilityGrant {
+        pool_id: key.0,
+        signer: key.1,
+        spending_cap: 1,
+        expiry: u64::MAX,
+        owner_signature: vec![0; 65],
+    };
+    assert_eq!(lane_queries(Some(&grant), &[key]), vec![key]);
+    assert_eq!(lane_queries(None, &[key]), vec![key]);
+    assert_eq!(lane_queries(Some(&grant), &[]), vec![key]);
 }

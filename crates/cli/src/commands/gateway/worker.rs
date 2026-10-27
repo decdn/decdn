@@ -29,7 +29,8 @@ use alloy::primitives::Address;
 use decdn_common::admin::{BuyerLaneSnapshot, BuyerPoolsResponse};
 use decdn_common::cli::ClientFetchArgs;
 use decdn_incentive::CapabilityGrant;
-use decdn_incentive::buyer_pool::lane_snapshot;
+use decdn_incentive::Deployment;
+use decdn_incentive::buyer_pool::{BuyerPoolStore, lane_snapshot};
 use decdn_incentive::lane::{LaneKey, PoolId};
 use serde::Serialize;
 use tokio::io::DuplexStream;
@@ -221,50 +222,80 @@ impl Backend for FetchBackend {
     }
 
     /// Read off the async thread, so a slow store read never stalls the
-    /// pulls running on it.
+    /// pulls running on it. The `--capability` grant a public gateway pays
+    /// under signs delegate lanes too, so its key is read beside the
+    /// registered capabilities'.
     async fn pools(
         &self,
-        (host, _): &Self::Host,
+        (host, grant): &Self::Host,
         delegates: &[(PoolId, Address)],
     ) -> anyhow::Result<PoolSnapshot> {
         let store = host.store();
         let deployment = host.deployment();
-        let delegates = delegates.to_vec();
-        tokio::task::spawn_blocking(move || {
-            let pools = BuyerPoolsResponse::from(store.load_all()?);
-            let delegate_lanes = delegates
-                .into_iter()
-                .map(|(pool_id, signer)| {
-                    let lanes = store
-                        .delegate_lanes(deployment, pool_id, signer)?
-                        .into_iter()
-                        .map(|(provider, progress)| {
-                            let lane = LaneKey {
-                                pool_id,
-                                signer,
-                                provider,
-                            };
-                            lane_snapshot(lane, progress)
-                        })
-                        .collect();
-                    Ok(DelegateLanes {
-                        signer,
-                        pool_id,
-                        lanes,
-                    })
-                })
-                .collect::<anyhow::Result<_>>()?;
-            Ok(PoolSnapshot {
-                pools,
-                delegate_lanes,
-            })
-        })
-        .await?
+        let queries = lane_queries(grant.as_ref(), delegates);
+        tokio::task::spawn_blocking(move || read_pools(store.as_ref(), deployment, &queries))
+            .await?
     }
 
     async fn close(&self, (host, _): Self::Host) {
         host.close().await;
     }
+}
+
+/// The `(pool, signer)` keys whose delegate lanes a store read lists: each
+/// registered capability's, and the `--capability` grant's when the gateway
+/// pays under one, once.
+pub(super) fn lane_queries(
+    grant: Option<&CapabilityGrant>,
+    delegates: &[(PoolId, Address)],
+) -> Vec<(PoolId, Address)> {
+    let mut queries = delegates.to_vec();
+    if let Some(grant) = grant
+        && !queries.contains(&(grant.pool_id, grant.signer))
+    {
+        queries.push((grant.pool_id, grant.signer));
+    }
+    queries
+}
+
+/// What `store` holds on `deployment`: its pool rows, and the delegate lanes
+/// of each `(pool, signer)` in `queries`.
+///
+/// # Errors
+///
+/// The store cannot be read, or a record does not decode.
+pub(super) fn read_pools(
+    store: &dyn BuyerPoolStore,
+    deployment: Deployment,
+    queries: &[(PoolId, Address)],
+) -> anyhow::Result<PoolSnapshot> {
+    let pools = BuyerPoolsResponse::from(store.load_all()?);
+    let delegate_lanes = queries
+        .iter()
+        .map(|&(pool_id, signer)| {
+            let lanes = store
+                .delegate_lanes(deployment, pool_id, signer)?
+                .into_iter()
+                .map(|(provider, progress)| {
+                    let lane = LaneKey {
+                        pool_id,
+                        signer,
+                        provider,
+                    };
+                    lane_snapshot(lane, progress)
+                })
+                .collect();
+            Ok(DelegateLanes {
+                signer,
+                pool_id,
+                lanes,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(PoolSnapshot {
+        pools,
+        delegate_lanes,
+    })
 }
 
 /// The handle the gateway holds on its worker thread.
