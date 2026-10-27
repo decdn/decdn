@@ -1326,7 +1326,15 @@ async fn the_observer_feeds_the_runs_record() {
     let record = records.first().unwrap();
     assert_eq!(record.expected_bytes, Some(100));
     assert_eq!(record.received_bytes, 40);
-    assert_eq!(record.files_started, 1);
-    let counts = record.bundle.unwrap();
+    let crate::commands::activity::PullKind::Bundle {
+        files_started,
+        counts,
+        ..
+    } = record.kind
+    else {
+        unreachable!("a bundle run records a bundle: {:?}", record.kind);
+    };
+    assert_eq!(files_started, 1);
+    let counts = counts.unwrap();
     assert_eq!((counts.fetched, counts.excluded), (1, 2));
 }

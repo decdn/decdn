@@ -108,7 +108,7 @@ export interface GatewayStatus {
 
 // The `decdn get` runs this host recorded.
 
-export type PullKind = "blob" | "bundle" | "entry";
+export type PullKind = PullTarget["kind"];
 
 export interface Paid {
   amount_micro_usdc: number;
@@ -134,10 +134,26 @@ export interface BundleCounts {
   reused_bytes: number;
 }
 
-/** What every run's record carries, whatever its state. */
-export interface PullFields {
+/**
+ * What a run pulls. A bundle run carries its file progress and, once it
+ * ended, its counts; a blob or entry run carries neither.
+ */
+export type PullTarget =
+  | { kind: "blob" }
+  | { kind: "entry" }
+  | {
+      kind: "bundle";
+      /** Distinct blobs the run started. */
+      files_started: number;
+      /** Blobs the run landed. */
+      files_landed: number;
+      /** Set once the run ended. */
+      counts: BundleCounts | null;
+    };
+
+/** What every run's record carries, whatever its kind and state. */
+export type PullFields = PullTarget & {
   uri: string;
-  kind: PullKind;
   /** A file, a directory, or `-` for stdout. */
   output: string;
   pid: number;
@@ -147,15 +163,11 @@ export interface PullFields {
   received_bytes: number;
   /** Null until the run knows what it fetches. */
   expected_bytes: number | null;
-  files_started: number;
-  files_landed: number;
   paid: Paid;
   nodes: NodePaid[];
-  /** Set once a bundle run ended. */
-  bundle: BundleCounts | null;
   /** Says `running`, but its heartbeat stopped: it exited without a summary. */
   stale: boolean;
-}
+};
 
 /** A run whose record says it is live. */
 export type RunningPull = PullFields & { state: "running" };

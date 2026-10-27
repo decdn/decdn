@@ -20,11 +20,8 @@ fn record(started: u64, updated: u64, state: PullState) -> PullRecord {
         state,
         received_bytes: 0,
         expected_bytes: None,
-        files_started: 0,
-        files_landed: 0,
         paid: Paid::default(),
         nodes: Vec::new(),
-        bundle: None,
     }
 }
 
