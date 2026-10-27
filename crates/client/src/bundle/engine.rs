@@ -1854,7 +1854,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// gives one. The fetch grows or shrinks it as bytes land, so a manifest
     /// size that differs from the blob never fails the entry. With no manifest
     /// size (the manifest blob itself, or an unsized entry), the first claim
-    /// comes from the probe's size hint, or else from a header-only first open.
+    /// comes from the probe's size hint, or else from a whole-blob first open.
     ///
     /// A holder that faults cools in the command-wide [`PeerHealth`] and
     /// returns inside the same loop, so a holder that fails one entry is
@@ -1907,7 +1907,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
             // The manifest's size is the entry's first claim; without one, the
-            // probe's hint or a header-only open gives it.
+            // probe's hint or a whole-blob open's header gives it.
             let (total_bytes, holders) = if let Some(total) = total {
                 (total, holders)
             } else {
@@ -2098,7 +2098,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// means a manifest fetch runs the same acquire loop, under the same
     /// health table and progress clock, as every entry. A manifest has no
     /// manifest size, so the fetch takes the first size claim (the probe hint,
-    /// a pinned node's included, or a header-only open when there is none).
+    /// a pinned node's included, or a whole-blob open when there is none).
     /// The staging file is removed once read back — a manifest fetch has
     /// nothing further to resume once its bytes are safely in memory.
     async fn fetch_to_memory(&self, hash: [u8; 32], out_root: &Path) -> anyhow::Result<Vec<u8>> {

@@ -4,8 +4,8 @@
 //! Turnkey paying sibling of [`super::probe`]: dial a node by explicit
 //! `--node-id`/`--addr`/`--relay-url` (or auto-discover the holders, #936),
 //! **auto-open-or-reuse** the caller's own `PaymentPool` deposit, take the
-//! first size claim (the probe hint, or a header-only open when there is
-//! none), and fetch it through the acquire loop
+//! first size claim (the probe hint, or the header of a whole-blob open
+//! when there is none), and fetch it through the acquire loop
 //! ([`decdn_client::acquire`]) across one [`decdn_client::PeerSource`] lane
 //! per holder (signing cumulative vouchers, resuming each lane's persisted
 //! watermark, verifying the `slash_sig` recovers to the provider, ADR 014 §1).
@@ -935,6 +935,11 @@ impl FetchHost {
         self.chain.config.deployment()
     }
 
+    /// The size of `hash` a whole fetch on this host verified, if one did.
+    pub(crate) fn verified_size(&self, hash: &[u8; 32]) -> Option<u64> {
+        known_size(hash, None, &self.sizes)
+    }
+
     /// Wait for every queued peer-record and watermark write to land, then
     /// close the endpoint, so its open connections end cleanly instead of
     /// being aborted on drop.
@@ -1130,7 +1135,7 @@ impl Payer {
 
 /// Fetch the blob `args` names on `host`, paid by `payer`, with its verified
 /// bytes going to `sink`: resolve the holders, take the first size claim (the
-/// probe hint, or a header-only open when there is none), then fetch it
+/// probe hint, or the header of a whole-blob open when there is none), then fetch it
 /// through the acquire loop. `--output` names the destination only for
 /// [`Sink::Output`]. The fetch ends on done, a fault only the user can fix,
 /// or the stop policy: a terminal waits for Ctrl-C, a script gives up after
@@ -1325,7 +1330,8 @@ pub(crate) async fn fetch_on(
         // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
-            // The first size claim: the probe's hint, or a header-only open.
+            // The first size claim: the probe's hint, or a whole-blob open's
+            // header.
             let claim = sources.first_claim(hash, holders, health, &stop).await?;
             if replaced.is_none()
                 && let Some(hints) = &rate_hints

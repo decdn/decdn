@@ -93,6 +93,11 @@ impl Backend for Fake {
         Ok(Some(id))
     }
 
+    /// [`HELLO`]'s five bytes; nothing else has a size.
+    fn size(&self, (): &(), hash: [u8; 32]) -> Option<u64> {
+        (hash[0] == HELLO).then_some(5)
+    }
+
     async fn pull(
         &self,
         (): &(),
@@ -299,6 +304,23 @@ async fn pulls_past_the_bound_wait_for_a_slot() {
     assert_eq!(read_all(reader).await, b"hello");
     done.await.unwrap().unwrap();
     worker.stop().await;
+}
+
+/// A size lookup takes no pull slot: it is answered while every slot is
+/// held. Once the worker stops, nothing has a size.
+#[tokio::test]
+async fn a_size_lookup_is_answered_beside_the_pulls() {
+    let (worker, _log, release) = start(1).await;
+    let signer = Arc::new(PrivateKeySigner::random());
+    let (_held, held_done) = send(&worker, HOLD, &signer, 1024);
+    let size = tokio::time::timeout(Duration::from_secs(10), worker.size([HELLO; 32]))
+        .await
+        .expect("the lookup needs no slot");
+    assert_eq!(size, Some(5));
+    release.notify_one();
+    held_done.await.unwrap().unwrap();
+    worker.stop().await;
+    assert_eq!(worker.size([HELLO; 32]).await, None);
 }
 
 /// The host is built once for the worker's run, and closed when it stops.

@@ -5,8 +5,9 @@
 //! wallet. It is metered on the bytes the gateway delivers, in memory: the
 //! pool's balance is the hard stop, so a restart that forgives at most one
 //! day's allowance costs nothing worth a store. A request whose size is known
-//! and does not fit is refused before any pull; a stream whose size nobody
-//! knew is cut once the bound is reached, so the gateway never delivers more
+//! (an entry's declared size, or a raw blob's size a pull verified) and
+//! does not fit is refused before any pull; a stream whose size nobody knew
+//! is cut once the bound is reached, so the gateway never delivers more
 //! than the allowance plus the frames in flight. The next request is refused
 //! until the day turns.
 //!

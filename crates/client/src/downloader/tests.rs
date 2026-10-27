@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use super::DownloadTarget;
 use super::Downloader;
-use crate::source::{BlobSource, FakeFunder, Recovery, ScriptedSource};
+use crate::source::{BlobSource, FakeFunder, PrimedSource, Recovery, ScriptedSource};
 use crate::{
     ClientRangedStore, Cumulative, GaveUp, PoolContext, PoolLedger, ProgressClock, StaticSources,
     StopPolicy, StreamCandidate,
@@ -139,6 +139,40 @@ async fn fetch_to_dir_writes_a_blake3_identical_file() -> anyhow::Result<()> {
             == Some(blake3::Hash::from_bytes(root).to_hex().as_str()),
         "file is named by its content-address hex"
     );
+    Ok(())
+}
+
+/// A lane's whole-blob pull opened for the first size claim and primed on
+/// it (`LaneSources::first_claim`) is the download's first leg: the drive
+/// adopts it, so the source sees no open but the priming one (#2633).
+#[tokio::test]
+async fn a_primed_whole_blob_pull_is_the_downloads_first_leg() -> anyhow::Result<()> {
+    for len in [1234, 1_500_000] {
+        let blob = payload(len);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
+        let (root, total) = (source.root(), source.total_bytes());
+        let probe = source.clone();
+        let primed = PrimedSource::new(source);
+        let range = decdn_bao_range::align_range(0, 0, total)?;
+        let (header, reader) = primed.inner().open(root, range.clone()).await?;
+        primed.prime_next(root, range, header, reader, tokio::time::Instant::now());
+
+        let downloader = downloader(vec![candidate(primed, ledger, 0xA1)])?;
+        let dir = tempfile::tempdir()?;
+        let paths = downloader
+            .fetch_to_dir(&[(root, total)], dir.path(), None)
+            .await?;
+        let path = paths
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no path returned"))?;
+        anyhow::ensure!(std::fs::read(path)? == blob, "{len}: the file is the blob");
+        anyhow::ensure!(
+            probe.opened_ranges() == vec![(0, total)],
+            "{len}: only the priming open reached the source, got {:?}",
+            probe.opened_ranges()
+        );
+    }
     Ok(())
 }
 

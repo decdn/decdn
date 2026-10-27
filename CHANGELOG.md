@@ -1137,6 +1137,32 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Gateway: a raw blob the gateway pulled whole answers with its length,
+  `HEAD` and `Range` (part of #2616).** `GET /<hash>` on the bare host and
+  `/_decdn/<hash>` on a site streamed with no `Content-Length` and ignored
+  `Range`, and a `HEAD` had no length, even for a blob the gateway had
+  already verified. A raw blob that a whole pull on the gateway verified now
+  gets `Content-Length` and `Accept-Ranges`, takes one `Range` (206, or 416
+  past the end), and is refused with 402 before its pull when it does not
+  fit the allowance, as an entry is; its pull is capped at that size. The
+  first request for a blob still streams with no length: a node's size
+  claim is not used, since a claim below the real size would end a short
+  pull as a whole response (#2645 tracks a proven size for the first
+  request). `HEAD /_decdn/<hash>` on a site answered 404; it
+  now answers as the bare host does, and `HEAD` of a bundle or an entry
+  under `/_decdn/` redirects to its site.
+- **Client: a download adopts the stream it opened for the blob's size
+  (#2633).** A fetch with no size hint (the peer-store fast path, or a
+  pinned node whose probe gave no size) opened the whole blob to read its
+  signed size, then dropped the stream unread, after the node had already
+  written up to a credit window into it. The stream is now kept on its lane
+  for up to 2 seconds, and a download whose first leg is the whole blob
+  adopts it. Any other first leg (a resumed download's gap, a streamed
+  fetch's window) closes the kept stream before it opens its own, so the
+  node never holds the floor it reserved for both at once (#2644 tracks
+  streamed fetches). The peer-store e2e checks that
+  a fast-path download makes the holders write the blob's wire bytes once
+  and probe nothing.
 - **Gateway: a blob that is no bundle manifest is pulled once (#2478).** A
   `/<hash>/` or `/<hash>/<path>` request for a blob over the manifest cap,
   one whose bytes do not parse, or a malformed manifest answered 404 but

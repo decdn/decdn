@@ -71,14 +71,21 @@
 //! allowance runs out; a pool that cannot pay answers `503` as a `402` does.
 //! An entry's pull is capped at the size its manifest declares, so a manifest
 //! cannot make the gateway pay for more than it says, and a declared size is
-//! what `Content-Length` and the allowance count on. A sized entry takes one
+//! what `Content-Length` and the allowance count on. A raw blob's size is
+//! the one a whole pull here verified: its first request streams with no
+//! length, and a repeat request has its size, as an entry does. No node's
+//! size claim gives a response its length, since the server stops reading a
+//! body at its length and a short pull would then end as a whole file. A
+//! sized response takes one
 //! `Range`: the response is `206` over exactly that window, the pull pays
 //! only for the chunk-group-aligned span around it (ADR 038), the allowance
 //! admits and charges the request by that span, and a window past the end is
 //! `416`; a range the gateway cannot honour (several, a
-//! rewritten page, a blob of unknown size) is ignored, as HTTP allows, so a
-//! `curl -r`, a resumed download and a BEP 19 webseed all work. `HEAD` is answered from
-//! the bundle manifest, at no pull of the entry. The API paths answer `404`,
+//! rewritten page, a blob no pull here verified) is ignored, as HTTP
+//! allows, so a `curl -r`, a resumed download and a BEP 19 webseed all work.
+//! `HEAD` on an entry is answered from the bundle manifest, at no pull of the
+//! entry, and on a raw blob from its verified size, at no pull at all. The
+//! API paths answer `404`,
 //! and a site's `Sec-Fetch-*` headers decide nothing: the operator pays,
 //! within the allowance. Every answer is readable by every origin
 //! (`readable_anywhere`), and `OPTIONS` is a preflight
@@ -1249,12 +1256,12 @@ impl Gateway {
             Err(retry_after) => (0, retry_after),
         };
         (size > left).then(|| {
-            tracing::info!(%uri, size, left, "the entry does not fit today's allowance");
+            tracing::info!(%uri, size, left, "the response does not fit today's allowance");
             pay_elsewhere(
                 StatusCode::PAYMENT_REQUIRED,
                 uri,
                 retry_after,
-                "the entry does not fit what is left of the gateway's allowance today",
+                "the response does not fit what is left of the gateway's allowance today",
             )
         })
     }
@@ -1383,7 +1390,10 @@ impl Gateway {
             }
             (&Method::PUT, "/_pointer") => self.put_pointer(req).await,
             (&Method::HEAD, "/" | "/favicon.ico") => text(StatusCode::OK, ""),
-            (&Method::HEAD, _) => self.head_bare(target.trim_start_matches('/')),
+            (&Method::HEAD, _) => {
+                self.head_blob(target.trim_start_matches('/'), Present::Bare)
+                    .await
+            }
             _ => return Err(Box::new(req)),
         })
     }
@@ -1461,7 +1471,10 @@ impl Gateway {
         };
         let target = req.uri().path_and_query().map_or(path, |pq| pq.as_str());
         if head {
-            return self.head_site(&site, path, pointer).await;
+            return match target.strip_prefix("/_decdn/") {
+                Some(rest) => self.head_blob(rest, Present::Site).await,
+                None => self.head_site(&site, path, pointer).await,
+            };
         }
         let range = range_header(headers);
         if let Some(rest) = target.strip_prefix("/_decdn/") {
@@ -1951,7 +1964,8 @@ impl Gateway {
     }
 
     /// Serve what `uri` names, as `present` says, paid by `paying`; `range` is
-    /// the request's `Range` header, honoured on a sized entry.
+    /// the request's `Range` header, honoured on a blob or entry of known
+    /// size.
     async fn serve(
         self: &Arc<Self>,
         uri: &DecdnUri,
@@ -1960,19 +1974,7 @@ impl Gateway {
         range: Option<&str>,
     ) -> Result<Response<Body>, PullError> {
         match &uri.target {
-            UriTarget::Blob => {
-                // A blob's size is nobody's to declare, so a range on it is
-                // ignored.
-                self.stream(
-                    uri.hash,
-                    uri.namespace,
-                    paying,
-                    None,
-                    Extent::UNSIZED,
-                    present,
-                )
-                .await
-            }
+            UriTarget::Blob => self.blob(uri, paying, present, range).await,
             UriTarget::BundleEntry(path) => {
                 self.entry(uri.hash, uri.namespace, path, paying, present, range)
                     .await
@@ -1983,6 +1985,45 @@ impl Gateway {
             }
             _ => Ok(text(StatusCode::BAD_REQUEST, "unsupported URI target\n")),
         }
+    }
+
+    /// A blob by its hash. The size a pull here verified
+    /// ([`Self::blob_size`]) gives the response its length, admits the
+    /// request against the allowance, caps the pull and lets one `Range`
+    /// through, as an entry's declared size does. A blob no pull verified
+    /// streams whole, with no length.
+    async fn blob(
+        self: &Arc<Self>,
+        uri: &DecdnUri,
+        paying: &Payment,
+        present: Present,
+        range: Option<&str>,
+    ) -> Result<Response<Body>, PullError> {
+        let size = self.blob_size(uri.hash).await;
+        let name = alloy::hex::encode(uri.hash);
+        let extent = match Extent::of(size, range, rewrites(present, &name)) {
+            Ok(extent) => extent,
+            Err(size) => return Ok(not_satisfiable(size)),
+        };
+        if let Some(refused) = self.too_large(paying.bucket(), uri, extent.billable()) {
+            return Ok(refused);
+        }
+        if size == Some(0) {
+            return Ok(empty_entry(&name, uri.hash, present));
+        }
+        self.stream(uri.hash, uri.namespace, paying, None, extent, present)
+            .await
+    }
+
+    /// The size of the blob `hash` as a whole pull here verified it
+    /// ([`PullWorker::size`]); the empty root's is zero. A node's size claim
+    /// never counts: the server stops reading a body at its length, so a
+    /// claim below the real size would end a short pull as a whole file.
+    async fn blob_size(&self, hash: [u8; 32]) -> Option<u64> {
+        if hash == decdn_protocol::EMPTY_ROOT {
+            return Some(0);
+        }
+        self.pulls.size(hash).await
     }
 
     /// One bundle entry, by its literal manifest path. A path the manifest
@@ -2249,8 +2290,8 @@ impl Gateway {
                 (content_type, rewrite)
             }
         };
-        // The pull holds no more than the size the manifest declares, and
-        // takes only the window a range asked for.
+        // The pull holds no more than the size the manifest declares or a
+        // pull verified, and takes only the window a range asked for.
         let (first, reader, done, guard) = self
             .start_pull(
                 hash,
@@ -2322,17 +2363,25 @@ impl Gateway {
             .map_err(|e| PullError::Other(e.into()))
     }
 
-    /// `HEAD` on the public bare host: a blob's headers with no pull and no
-    /// length (nothing knows its size before a pull); a bundle or an entry
-    /// redirects to its site, as `GET` does.
-    fn head_bare(&self, rest: &str) -> Response<Body> {
+    /// `HEAD` on the public bare host, or under a site's `/_decdn/`: a blob's
+    /// headers with no pull, and its length when a pull here verified it
+    /// ([`Self::blob_size`]); a bundle or an entry redirects to its site, at
+    /// no pull, where `GET` under `/_decdn/` would serve a page's request for
+    /// it inline.
+    async fn head_blob(&self, rest: &str, present: Present) -> Response<Body> {
         let uri: DecdnUri = match format!("decdn:{rest}").parse() {
             Ok(uri) => uri,
             Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
         match uri.target {
             UriTarget::Blob => {
-                head_response(&content_type(&alloy::hex::encode(uri.hash)), None, uri.hash)
+                let name = alloy::hex::encode(uri.hash);
+                let content_type = match present {
+                    Present::Bare | Present::Download => content_type(&name),
+                    Present::Site => site::content_type(&name),
+                };
+                let size = self.blob_size(uri.hash).await;
+                head_response(&content_type, size, uri.hash)
             }
             UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
             _ => text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
@@ -2951,9 +3000,10 @@ fn content_type(name: &str) -> String {
     }
 }
 
-/// An entry its manifest declares empty: its headers and an empty body, with
-/// no pull. There is nothing to deliver, and a declared size of zero must not
-/// become an uncapped pull of whatever the hash really names.
+/// An entry its manifest declares empty, or the empty root: its headers and
+/// an empty body, with no pull. There is nothing to deliver, and a declared
+/// size of zero must not become an uncapped pull of whatever the hash really
+/// names.
 fn empty_entry(path: &str, hash: [u8; 32], present: Present) -> Response<Body> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let content_type = match present {
@@ -2963,12 +3013,13 @@ fn empty_entry(path: &str, hash: [u8; 32], present: Present) -> Response<Body> {
     head_response(&content_type, Some(0), hash)
 }
 
-/// What a response delivers of a blob: the size its manifest declares, when
-/// one does, the byte window a `Range` asked for within it, and whether the
-/// response has a fixed length at all (a rewritten page does not).
+/// What a response delivers of a blob: its size, when the manifest declares
+/// it or a pull verified it, the byte window a `Range`
+/// asked for within it, and whether the response has a fixed length at all
+/// (a rewritten page does not).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Extent {
-    /// The blob's size as the manifest declares it.
+    /// The blob's size, as the manifest declares it or a pull verified it.
     size: Option<u64>,
     /// The `(offset, len)` window served, or the whole blob.
     window: Option<(u64, u64)>,
@@ -2979,21 +3030,14 @@ struct Extent {
 }
 
 impl Extent {
-    /// A blob whose size nothing declares: whole, with no fixed length.
-    const UNSIZED: Self = Self {
-        size: None,
-        window: None,
-        fixed: false,
-    };
-
-    /// The extent of an entry of `size` for a request with the `Range`
-    /// header `range`, `rewritten` as it streams. A range on a sized entry
-    /// that is not rewritten is honoured; one past the end is refused with
-    /// the size; any other is ignored.
+    /// The extent of a blob of `size` for a request with the `Range` header
+    /// `range`, `rewritten` as it streams. A range on a sized blob that is
+    /// not rewritten is honoured; one past the end is refused with the size;
+    /// any other is ignored.
     ///
     /// # Errors
     ///
-    /// The entry's size, when the range is unsatisfiable.
+    /// The blob's size, when the range is unsatisfiable.
     fn of(size: Option<u64>, range: Option<&str>, rewritten: bool) -> Result<Self, u64> {
         let Some(declared) = size.filter(|_| !rewritten) else {
             return Ok(Self {

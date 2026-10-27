@@ -681,6 +681,9 @@ struct Primed<R> {
     header: UpstreamPullHeader,
     reader: R,
     at: tokio::time::Instant,
+    /// Only the next open may take it: an open of another range closes it
+    /// first ([`PrimedSource::prime_next`]).
+    next_only: bool,
 }
 
 /// A [`BlobSource`] that hands one already-open pull to the drive (#2063).
@@ -699,7 +702,10 @@ struct Primed<R> {
 /// pull's [`finish`](BlobSource::finish) drains and pays to its stream end, so a
 /// longer pull in place of a shorter leg would pay for bytes the leg never asked
 /// for. Call [`clear`](Self::clear) once the drive returns, so a pull no open
-/// took is closed at once rather than left idle.
+/// took is closed at once rather than left idle. A pull parked with
+/// [`prime_next`](Self::prime_next) is the next open's alone: an open of another
+/// range closes it before the wrapped source opens, so the peer never holds it
+/// beside the leg that replaces it.
 #[doc(hidden)]
 pub struct PrimedSource<S: BlobSource> {
     inner: S,
@@ -746,13 +752,41 @@ impl<S: BlobSource> PrimedSource<S> {
         reader: S::Reader,
         opened_at: tokio::time::Instant,
     ) {
-        let parked = Primed {
+        self.park(Primed {
             hash,
             range,
             header,
             reader,
             at: opened_at,
-        };
+            next_only: false,
+        });
+    }
+
+    /// [`prime`](Self::prime) for the next open alone: an open of exactly
+    /// `range` of `hash` adopts the pull, and any other open closes it before
+    /// it reaches the wrapped source. For a pull whose stream the peer holds
+    /// funds against: a leg that does not adopt it then never opens beside it,
+    /// so the peer releases what the pull held before it admits the leg.
+    pub fn prime_next(
+        &self,
+        hash: [u8; 32],
+        range: AlignedRange,
+        header: UpstreamPullHeader,
+        reader: S::Reader,
+        opened_at: tokio::time::Instant,
+    ) {
+        self.park(Primed {
+            hash,
+            range,
+            header,
+            reader,
+            at: opened_at,
+            next_only: true,
+        });
+    }
+
+    /// Park `parked`, closing any pull still parked.
+    fn park(&self, parked: Primed<S::Reader>) {
         let replaced = self.slot().replace(parked);
         if replaced.is_some() {
             tracing::debug!("a primed pull no open took is replaced and closed");
@@ -773,7 +807,8 @@ impl<S: BlobSource> PrimedSource<S> {
 
     /// Take the parked pull if it answers an open of `range` of `hash`. A stale
     /// parked pull is dropped here whatever the open asks for; a fresh one for
-    /// another range stays parked.
+    /// another range stays parked, unless it was parked for the next open
+    /// alone ([`prime_next`](Self::prime_next)), which drops it.
     fn take(
         &self,
         hash: [u8; 32],
@@ -787,6 +822,10 @@ impl<S: BlobSource> PrimedSource<S> {
         }
         if parked.hash == hash && parked.range == *range {
             return Some((parked.header, parked.reader));
+        }
+        if parked.next_only {
+            tracing::debug!("a primed pull the next open did not take is closed");
+            return None;
         }
         *slot = Some(parked);
         None
