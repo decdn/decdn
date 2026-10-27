@@ -46,3 +46,26 @@ export function formatCount(n: number): string {
 export function shortHex(hex: string): string {
   return hex.length <= 14 ? hex : `${hex.slice(0, 6)}…${hex.slice(-4)}`;
 }
+
+/** Bytes per second: `2.0 MiB/s`. */
+export function formatRate(bytesPerSec: number): string {
+  return `${formatBytes(Math.max(0, Math.round(bytesPerSec)))}/s`;
+}
+
+/** A share of one as a whole percent: `90%`. */
+export function formatShare(share: number): string {
+  return `${Math.round(share * 100)}%`;
+}
+
+/** Unix seconds as this browser's local date and time. */
+export function formatWhen(unix: number): string {
+  return new Date(unix * 1000).toLocaleString();
+}
+
+/** A `decdn:` URI with its 64-hex hash as head and tail: `decdn:af1349…3262/a`. */
+export function shortUri(uri: string): string {
+  return uri.replace(
+    /[0-9a-f]{64}/i,
+    (hash) => `${hash.slice(0, 6)}…${hash.slice(-4)}`,
+  );
+}

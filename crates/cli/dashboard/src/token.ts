@@ -1,10 +1,11 @@
-// The gateway token's hand-off: `decdn gateway` prints a link whose
-// fragment carries the token. The fragment never reaches the server or a
-// log; the page moves it to session storage and strips it from the address.
+// The dashboard token's hand-off: `decdn dashboard` prints a link whose
+// fragment carries the token (also in ~/.decdn/dashboard/token). The
+// fragment never reaches the server or a log; the page moves it to session
+// storage and strips it from the address.
 // Where the browser blocks storage, the page keeps the token in memory until
 // it reloads, and says so.
 
-export const TOKEN_KEY = "decdn-gateway-token";
+export const TOKEN_KEY = "decdn-dashboard-token";
 
 interface Place {
   hash: string;

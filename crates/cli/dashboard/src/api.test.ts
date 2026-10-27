@@ -14,7 +14,7 @@ function respond(status: number, body: string, seen: Seen = {}): typeof fetch {
   }) as typeof fetch;
 }
 
-const status = JSON.stringify({ mode: "loopback", counters: {} });
+const status = JSON.stringify({ version: "0.3.0", pulls: {}, node: {} });
 
 describe("fetchStatus", () => {
   it("reads /_status with the token, uncached, and returns the body", async () => {
@@ -48,7 +48,15 @@ describe("fetchStatus", () => {
     expect((await fetchStatus(null, respond(200, "null"))).kind).toBe("error");
   });
 
-  it("gives up on a gateway that does not answer", async () => {
+  it("takes the gateway's own status as an error: the page reads the dashboard", async () => {
+    const gateway = JSON.stringify({ mode: "loopback", counters: {} });
+    expect(await fetchStatus(null, respond(200, gateway))).toEqual({
+      kind: "error",
+      message: "the dashboard's answer is not its status",
+    });
+  });
+
+  it("gives up on a dashboard that does not answer", async () => {
     const hang = ((_: string, init?: RequestInit) =>
       new Promise((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () =>

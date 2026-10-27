@@ -1,4 +1,4 @@
-//! Embed the gateway's dashboard. When `dashboard/dist/` holds the Vite
+//! Embed the page `decdn dashboard` serves. When `dashboard/dist/` holds the Vite
 //! build (`index.html`, `app.js`, `app.css`), copy it into `OUT_DIR`;
 //! otherwise write a page there that says how to build it, so a build with
 //! no Node toolchain still succeeds. `DECDN_DASHBOARD_BUILT` tells the crate
@@ -22,12 +22,12 @@ const FALLBACK: &str = "<!doctype html>
 <head>
 <meta charset=\"utf-8\">
 <meta name=\"viewport\" content=\"width=device-width\">
-<title>decdn gateway</title>
+<title>decdn dashboard</title>
 </head>
 <body>
-<h1>decdn gateway</h1>
-<p>This <code>decdn</code> binary was built without its dashboard. The gateway runs, and
-its state is at <code>GET /_status</code>.</p>
+<h1>decdn dashboard</h1>
+<p>This <code>decdn</code> binary was built without its dashboard page. The dashboard runs, and
+what it reads is at <code>GET /_status</code>.</p>
 <p>To build the dashboard, run from the repository root (Node 24 and pnpm 10):</p>
 <pre>pnpm -C crates/cli/dashboard install --frozen-lockfile
 pnpm -C crates/cli/dashboard build

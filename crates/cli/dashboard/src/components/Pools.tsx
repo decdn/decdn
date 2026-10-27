@@ -3,7 +3,7 @@ import { formatBytes, formatUsdc, shortHex } from "../format";
 import type { PoolRow } from "../view";
 import { Cell, Empty, Gauge, Panel, Table } from "./Panel";
 
-function Lanes(props: { lanes: Lane[] }) {
+export function Lanes(props: { lanes: Lane[] }) {
   return (
     <Table head={["Signer", "Node", "Paid", "Bytes"]}>
       {props.lanes.map((l) => (
@@ -22,7 +22,12 @@ function Lanes(props: { lanes: Lane[] }) {
   );
 }
 
+const GATEWAY_NOTE =
+  "From the buyer store. Spend counts what nodes redeemed and this gateway signed; another signer's unredeemed vouchers and the pulls in flight are not in it yet";
+
 export function Pools(props: {
+  title?: string;
+  note?: string;
   rows: PoolRow[];
   delegates: DelegateLanes[];
   skipped: string[];
@@ -31,8 +36,8 @@ export function Pools(props: {
   const delegates = props.delegates.filter((d) => d.lanes.length > 0);
   return (
     <Panel
-      title="Pools and lanes"
-      note="From the buyer store. Spend counts what nodes redeemed and this gateway signed; another signer's unredeemed vouchers and the pulls in flight are not in it yet"
+      title={props.title ?? "Pools and lanes"}
+      note={props.note ?? GATEWAY_NOTE}
     >
       {props.error ? (
         <p role="alert" className="mb-3 text-sm text-critical-ink">
@@ -54,9 +59,9 @@ export function Pools(props: {
           <article key={p.id} className="flex flex-col gap-2">
             <div className="flex flex-wrap items-end justify-between gap-3">
               <div>
-                <h3 className="font-mono text-sm" title={p.id}>
+                <h4 className="font-mono text-sm" title={p.id}>
                   Pool {shortHex(p.id)}
-                </h3>
+                </h4>
                 <p className="text-sm text-ink-2">
                   Up to {formatUsdc(p.headroom)} USDC left of{" "}
                   {formatUsdc(p.deposit)} · spent {formatUsdc(p.spent)} or more
@@ -78,11 +83,11 @@ export function Pools(props: {
             key={`${d.signer}-${d.pool_id}`}
             className="flex flex-col gap-2"
           >
-            <h3 className="text-sm">
+            <h4 className="text-sm">
               Lanes of key{" "}
               <span className="font-mono">{shortHex(d.signer)}</span> on pool{" "}
               <span className="font-mono">{shortHex(d.pool_id)}</span>
-            </h3>
+            </h4>
             <Lanes lanes={d.lanes} />
           </article>
         ))}

@@ -1,5 +1,6 @@
 use super::*;
 use crate::commands::fetch::{MALFORMED_MANIFEST, MAX_MANIFEST_MB};
+use http_body_util::Full;
 
 fn manifest() -> Arc<BundleManifest> {
     Arc::new(BundleManifest::new([0; 32], Vec::new()))
@@ -53,25 +54,6 @@ fn manifest_cache_reinsert_replaces_without_double_counting() {
     cache.insert(hash(1), manifest(), 30);
     assert_eq!(cache.entries.len(), 1);
     assert_eq!(cache.bytes, 30);
-}
-
-#[test]
-fn allowed_hosts_name_the_listen_port_under_every_loopback_name() {
-    let hosts = allowed_hosts("127.0.0.1:8484".parse().unwrap());
-    for host in ["127.0.0.1:8484", "localhost:8484", "[::1]:8484"] {
-        assert!(hosts.iter().any(|h| h == host), "{host}");
-    }
-    assert!(!hosts.iter().any(|h| h == "evil.example:8484"));
-    assert!(!hosts.iter().any(|h| h == "localhost:9999"));
-}
-
-#[test]
-fn token_matches_only_the_exact_token() {
-    let token = "ab".repeat(32);
-    assert!(token_matches(&token, &token));
-    assert!(!token_matches(&token, &"ac".repeat(32)));
-    assert!(!token_matches(&token, &token[..63]));
-    assert!(!token_matches(&token, ""));
 }
 
 #[test]
@@ -2425,8 +2407,8 @@ fn metrics(gateway: &Gateway) -> String {
     gateway.metrics.render()
 }
 
-/// A loopback gateway counts its requests too: `/_status` and the
-/// dashboard read the same counters on every gateway.
+/// A loopback gateway counts its requests too: `/_status` reads the same
+/// counters on every gateway.
 #[tokio::test]
 async fn a_loopback_gateway_counts_its_requests() {
     let gateway = test_gateway().await;
@@ -2533,12 +2515,11 @@ async fn the_metrics_listener_serves_the_exposition() {
         exposition.contains("decdn_gateway_bytes_served_total 0"),
         "{exposition}"
     );
-    // The dashboard and the state answer here, with no token.
-    let page = fetch("/").await;
-    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
-    assert!(page.contains("text/html"), "{page}");
-    let asset = fetch("/_dashboard/app.js").await;
-    assert!(asset.starts_with("HTTP/1.1 200"), "{asset}");
+    // The state answers here, with no token; no page does.
+    for path in ["/", "/_dashboard/app.js"] {
+        let page = fetch(path).await;
+        assert!(page.starts_with("HTTP/1.1 404"), "{path}: {page}");
+    }
     let status = fetch("/_status").await;
     assert!(status.starts_with("HTTP/1.1 200"), "{status}");
     let body = status.split_once("\r\n\r\n").map_or("", |(_, body)| body);
@@ -2556,7 +2537,7 @@ async fn the_metrics_listener_serves_the_exposition() {
     assert!(named.starts_with("HTTP/1.1 200"), "{named}");
     // A page the operator visits reaches this address with its own Host, so
     // only the missing CORS grant keeps it from reading the token-free state.
-    for path in ["/_status", "/", "/metrics"] {
+    for path in ["/_status", "/metrics"] {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream
             .write_all(
@@ -2844,7 +2825,7 @@ async fn status_needs_the_token_on_loopback() {
     let status: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
     assert_eq!(status["mode"], "loopback");
     assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(status["dashboard_built"], dashboard::built());
+    assert!(status.get("dashboard_built").is_none(), "{status}");
     assert_eq!(status["listen"], "127.0.0.1:8484");
     assert_eq!(status["chain_id"], 421_614);
     assert!(status["allowance"].is_null(), "{status}");
@@ -2868,42 +2849,28 @@ async fn status_needs_the_token_on_loopback() {
     assert_eq!(preflight.status, StatusCode::FORBIDDEN);
 }
 
-/// The dashboard page and its assets answer on the loopback host, with no
-/// token: the page asks for it.
+/// A loopback gateway serves no page: its `/` is the stub that names
+/// `decdn dashboard`, and the dashboard's asset paths are no route.
 #[tokio::test]
-async fn the_dashboard_is_served_at_the_root_of_a_loopback_gateway() {
+async fn a_loopback_gateway_serves_no_dashboard() {
     let gateway = test_gateway().await;
-    let page = loopback_get(&gateway, "/", false).await;
-    assert_eq!(page.status, StatusCode::OK);
-    assert_eq!(
-        page.header(header::CONTENT_TYPE),
-        Some("text/html; charset=utf-8")
-    );
-    assert!(
-        page.header(header::CONTENT_SECURITY_POLICY)
-            .is_some_and(|csp| csp.contains("script-src 'self'")),
-        "{:?}",
-        page.headers
-    );
-    for (path, kind) in [
-        ("/_dashboard/app.js", "text/javascript; charset=utf-8"),
-        ("/_dashboard/app.css", "text/css; charset=utf-8"),
-    ] {
+    let root = loopback_get(&gateway, "/", false).await;
+    assert_eq!(root.status, StatusCode::OK);
+    assert!(root.body.contains("decdn dashboard"), "{}", root.body);
+    assert!(root.header(header::CONTENT_SECURITY_POLICY).is_none());
+    for path in ["/_dashboard/app.js", "/_dashboard/app.css"] {
         let asset = loopback_get(&gateway, path, false).await;
-        assert_eq!(asset.status, StatusCode::OK, "{path}");
-        assert_eq!(asset.header(header::CONTENT_TYPE), Some(kind), "{path}");
+        assert_ne!(asset.status, StatusCode::OK, "{path}");
     }
 }
 
-/// A public gateway serves no state and no dashboard on its public host:
-/// both live on the metrics listener. `/` keeps its stub.
+/// A public gateway serves no state on its public host: it lives on the
+/// metrics listener. `/` keeps its stub.
 #[tokio::test]
-async fn status_and_dashboard_are_404_on_a_public_bare_host() {
+async fn status_is_404_on_a_public_bare_host() {
     let (gateway, _logs, host) = public_gateway().await;
-    for path in ["/_status", "/_dashboard/app.js", "/_dashboard/app.css"] {
-        let answer = request(&gateway, "decdn.test", path, &[]).await;
-        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
-    }
+    let answer = request(&gateway, "decdn.test", "/_status", &[]).await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
     let preflight = send(&gateway, Method::OPTIONS, "decdn.test", "/_status", &[]).await;
     assert_eq!(preflight.status, StatusCode::NOT_FOUND);
     let site = request(&gateway, &host, "/_status", &[]).await;
@@ -3043,20 +3010,12 @@ async fn a_loopback_metrics_listener_needs_the_token_for_status() {
     assert!(metrics.starts_with("HTTP/1.1 200"), "{metrics}");
 }
 
-/// The dashboard's own requests are not what the gateway served: its page,
-/// its assets and each poll of `/_status`, refused or answered, leave the
-/// counters alone.
+/// A dashboard's polls are not what the gateway served: each poll of
+/// `/_status`, refused or answered, leaves the counters alone.
 #[tokio::test]
 async fn the_dashboard_does_not_count_itself() {
     let gateway = test_gateway().await;
-    for (path, token) in [
-        ("/", false),
-        ("/_dashboard/app.js", false),
-        ("/_dashboard/app.css", false),
-        ("/_status", false),
-        ("/_status", true),
-        ("/_status", true),
-    ] {
+    for (path, token) in [("/_status", false), ("/_status", true), ("/_status", true)] {
         loopback_get(&gateway, path, token).await;
     }
     assert_eq!(gateway.metrics.snapshot(), metrics::Counters::default());

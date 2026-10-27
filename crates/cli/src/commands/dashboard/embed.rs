@@ -1,17 +1,16 @@
-//! The gateway's dashboard: a Vite app (`crates/cli/dashboard/`) that polls
+//! The dashboard's page: a Vite app (`crates/cli/dashboard/`) that polls
 //! `GET /_status`, embedded by `build.rs` as three fixed files. A build with
 //! no Vite output embeds a page that says how to make one ([`built`] tells
 //! the two apart).
 //!
-//! The page carries a policy that loads script and style from the gateway
-//! alone, and no inline script or style, so a page served beside site
-//! content can run nothing but the dashboard's own code.
+//! The page carries a policy that loads script, style and data from the
+//! dashboard's own origin alone, and no inline script or style.
 
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode, header};
 
-use super::{Body, text};
+use super::super::local_http::{Body, text};
 
 const INDEX_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/dashboard/index.html"));
 const APP_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/dashboard/app.js"));

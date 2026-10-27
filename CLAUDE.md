@@ -30,7 +30,7 @@ cargo nextest run                    # test (preferred over cargo test)
 cargo nextest run -p decdn-protocol  # single crate
 cargo fmt -- --check                 # check formatting
 cargo deny check                     # license + advisory audit
-pnpm -C crates/cli/dashboard install --frozen-lockfile && pnpm -C crates/cli/dashboard build  # optional: embed the gateway dashboard
+pnpm -C crates/cli/dashboard install --frozen-lockfile && pnpm -C crates/cli/dashboard build  # optional: embed the `decdn dashboard` page
 pre-commit run --all-files           # run all hooks
 # Contracts — mirror what CI runs.
 (cd contracts && forge fmt --check && FOUNDRY_PROFILE=ci forge build --sizes --deny warnings && forge test)
@@ -63,7 +63,7 @@ Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots
 ```
 crates/
   node/         — daemon binary `decdn-node`: runtime bring-up, handlers, admin RPC server, dispatch limiter
-  cli/          — user CLI binary `decdn`: every command a human types (see the Status note above for the group list); `dashboard/` is the gateway's Vite dashboard, which `build.rs` embeds (a fallback page without a Node build)
+  cli/          — user CLI binary `decdn`: every command a human types (see the Status note above for the group list); `dashboard/` is the Vite page `decdn dashboard` serves, which `build.rs` embeds (a fallback page without a Node build)
   common/       — shared types: config schema + resolver, identity loading, AdminRpc trait + DTOs
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
   config-types/ — config-vocabulary value types (RetryPolicy, DecompressMode, OriginUrl, OriginKind, Hash, PinnedHashes) shared by cache + common (leaf crate: serde + url + anyhow, no iroh-blobs / no AWS — #578)

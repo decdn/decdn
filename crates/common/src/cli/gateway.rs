@@ -23,12 +23,12 @@ pub struct GatewayArgs {
     #[command(flatten)]
     pub public: PublicArgs,
 
-    /// Also serve the gateway's metrics (Prometheus text, `GET /metrics`),
-    /// its state (`GET /_status`) and the dashboard (`GET /`) on this
-    /// loopback address, for the operator. A public gateway's `/_status`
-    /// there takes no token; a loopback gateway's takes the gateway token.
-    /// Without it no such listener runs; a loopback gateway still serves
-    /// `/_status` and the dashboard on its own host.
+    /// Also serve the gateway's metrics (Prometheus text, `GET /metrics`)
+    /// and its state (`GET /_status`, which `decdn dashboard --gateway`
+    /// shows) on this loopback address, for the operator. A public gateway's
+    /// `/_status` there takes no token; a loopback gateway's takes the
+    /// gateway token. Without it no such listener runs; a loopback gateway
+    /// still serves `/_status` on its own host.
     #[arg(long, value_name = "ADDR", value_parser = parse_loopback_addr)]
     pub metrics_listen: Option<SocketAddr>,
 
@@ -90,7 +90,7 @@ pub struct PublicArgs {
 
 /// Parse a socket address on a loopback interface: what `--metrics-listen`
 /// serves is the operator's, never the public's.
-fn parse_loopback_addr(s: &str) -> Result<SocketAddr, String> {
+pub(crate) fn parse_loopback_addr(s: &str) -> Result<SocketAddr, String> {
     let addr: SocketAddr = s.parse().map_err(|e| format!("{s:?}: {e}"))?;
     if addr.ip().is_loopback() {
         Ok(addr)

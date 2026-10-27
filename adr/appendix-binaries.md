@@ -30,7 +30,7 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
   easy to containerise, minimal supply-chain surface.
 - **`decdn`** (`crates/cli`, package `decdn-cli`) — single
   human-facing CLI. Carries every command anyone types: `probe`,
-  `get`, `origin import`, `publish`, `pool`, `appeal`,
+  `get`, `gateway`, `dashboard`, `origin import`, `publish`, `pool`, `appeal`,
   `setup`, `key-gen`, `config {init,validate}`, and the `node`
   admin/on-chain subcommands (health, status, lanes, evict, reload,
   drain, top, lookup, register, deregister, bond, unbond,
@@ -81,6 +81,73 @@ reviewer asking "shouldn't `decdn_*` be `decdn_node_*`?" should
 consult this appendix and the reference alert rules and dashboards in
 [`decdn/devops`](https://github.com/decdn/devops/tree/main/charts/decdn-node/files/monitoring) — those rules match `decdn_*`
 and would silently miss data on a prefix rename.
+
+## Dashboard
+
+`decdn dashboard` serves one web page on a loopback address. The default
+address is `127.0.0.1:8485`. The page shows what this host does with deCDN.
+It has three sections:
+
+| Section | Source | Shown |
+|---------|--------|-------|
+| Pulls | The record each `decdn get` run writes in `~/.decdn/activity/pulls/`. | Always. |
+| Gateway | `GET /_status` of the gateway at `--gateway` ([Gateway § State](appendix-gateway.md#state)). The default is `http://127.0.0.1:8484`. | When the gateway answers. |
+| Node | The admin RPC and `/metrics` of the node, found as `decdn node status` and `decdn node top` find them. | When the node answers. |
+
+The page reads nothing from another origin. The dashboard process reads
+every source. The page reads only the dashboard's own `GET /_status`. Thus
+the gateway grants no cross-origin read, and a browser never reaches the
+node's admin port, which has no authentication. A loopback gateway's
+`/_status` needs the gateway token. The dashboard reads it from
+`--gateway-token-file`, by default `~/.decdn/gateway/token`. A gateway on
+another host is read through a tunnel to its `--metrics-listen` address.
+The tunnel keeps the same port on both ends, because the listener refuses a
+`Host` that is not its own.
+
+The dashboard reads each source at a fixed rate, whatever the number of
+pages open. It reads the pull records every second and the gateway every 2
+seconds. It reads the node's health, status and `/metrics` every 2
+seconds. It reads the node's lanes, earnings, buyer pools and slashes every
+15 seconds, because `lanes` can read the chain and `earnings` reads the
+whole settlement ledger. Each node read has its own result. A read that the
+node does not support (no slash detection, no buyer pool, no settlement
+ledger, no DHT) shows as not configured, not as an error.
+
+Each `decdn get` run writes one JSON file for itself, named
+`<start in Unix ms>-<pid>.json`. The record holds the URI, the destination,
+the state, the bytes verified, what the run paid to each node and, at the
+end, the result. The run writes the whole file again every second, through a
+temporary file and a rename. Thus a reader never sees a partial record. The
+directory is the same for every `--data-dir`, so one page shows every run on
+the host. A run that cannot write its record continues the pull. A run that
+exits before its last write leaves a `running` record. The dashboard shows a
+`running` record that is older than 10 seconds as a run that stopped without
+a summary. Each run deletes the oldest records when it starts, and keeps 200.
+A `--dry-run` writes no record.
+
+The dashboard's `/_status` needs the dashboard's own token in
+`x-decdn-token`. The token is in `~/.decdn/dashboard/token`. The page shows
+earnings and pool balances, so another local user must not read it. The
+token reaches the page in the fragment of the link that `decdn dashboard`
+prints: `http://<listen>/#token=<token>`. A browser does not send a fragment
+to the server. The page moves the token to session storage and removes the
+fragment from the address. The dashboard answers only its own loopback
+names in `Host`, and refuses every other `Host` with 403. It answers only
+`GET`. It sends no CORS headers. The dashboard only reads: no route changes
+a source.
+
+The page loads its script and its style from the dashboard only. It holds
+no inline script and no inline style. Its content security policy is
+`default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self';
+img-src 'self' data:; base-uri 'none'; form-action 'none';
+frame-ancestors 'none'`.
+
+The page is a Vite app in `crates/cli/dashboard/`. Its build is three files:
+`index.html`, `app.js` and `app.css`. The build script of `decdn-cli` embeds
+them in the binary. A build with no Node toolchain embeds a short page that
+tells how to build the dashboard. Thus `cargo build` works without Node. A
+release never ships that page: the release workflow builds the dashboard
+first and refuses a `decdn` binary that holds it.
 
 ## Distribution
 

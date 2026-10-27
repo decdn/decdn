@@ -1,10 +1,6 @@
-import { formatBytes, formatUsdc, shortHex } from "../format";
+import { formatBytes, formatUsdc, formatWhen, shortHex } from "../format";
 import type { CapabilityRow } from "../view";
 import { Cell, Empty, Gauge, Panel, Table } from "./Panel";
-
-function expires(unix: number): string {
-  return new Date(unix * 1000).toLocaleString();
-}
 
 export function Capabilities(props: { rows: CapabilityRow[] }) {
   return (
@@ -60,7 +56,7 @@ export function Capabilities(props: { rows: CapabilityRow[] }) {
                 ) : null}
               </td>
               <Cell>{c.bytes === null ? "—" : formatBytes(c.bytes)}</Cell>
-              <Cell>{expires(c.expiry)}</Cell>
+              <Cell>{formatWhen(c.expiry)}</Cell>
             </tr>
           ))}
         </Table>

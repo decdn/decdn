@@ -2,8 +2,9 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
 
-// The gateway embeds exactly three files (crates/cli/build.rs) and serves
-// them at `/`, `/_dashboard/app.js` and `/_dashboard/app.css`, so the build
+// `decdn` embeds exactly three files (crates/cli/build.rs) and `decdn
+// dashboard` serves them at `/`, `/_dashboard/app.js` and
+// `/_dashboard/app.css`, so the build
 // emits one script and one stylesheet under fixed names, with every asset
 // inlined.
 export default defineConfig({
@@ -25,8 +26,8 @@ export default defineConfig({
     },
   },
   server: {
-    // `decdn gateway` on its default address answers the API.
-    proxy: { "/_status": "http://127.0.0.1:8484" },
+    // `decdn dashboard` on its default address answers the API.
+    proxy: { "/_status": "http://127.0.0.1:8485" },
   },
   test: {
     include: ["src/**/*.test.ts"],

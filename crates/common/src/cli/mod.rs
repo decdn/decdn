@@ -10,6 +10,7 @@ pub mod appeal;
 pub mod byte_size;
 pub mod common;
 pub mod config_cmd;
+pub mod dashboard;
 pub mod fetch;
 pub mod gateway;
 pub mod get;
@@ -33,6 +34,7 @@ pub use common::{
     default_data_dir,
 };
 pub use config_cmd::{ConfigArgs, ConfigCommand, ConfigInitArgs, ConfigValidateArgs};
+pub use dashboard::DashboardArgs;
 pub use fetch::ClientFetchArgs;
 pub use gateway::GatewayArgs;
 pub use get::GetArgs;
@@ -126,6 +128,9 @@ pub enum Command {
     /// or to anyone from a public gateway (`--public-url`) paid from its own
     /// pool within a daily allowance.
     Gateway(Box<GatewayArgs>),
+    /// Serve one page, on a loopback address, of this host's `decdn get`
+    /// pulls, its gateway when one answers, and its node when one runs.
+    Dashboard(Box<DashboardArgs>),
     /// Pull what a `decdn:` URI names: a blob (`decdn:<hash>`), a whole bundle
     /// (`decdn:<hash>/`), or one bundle entry (`decdn:<hash>/<path>`), over the
     /// paid `cdn/client/v1` path, paying per-MB from a `PaymentPool`.

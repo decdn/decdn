@@ -1,7 +1,6 @@
 {
   "mode": "public",
   "version": "0.0.0-fixture",
-  "dashboard_built": true,
   "started_unix": 1793000000,
   "uptime_secs": 93784,
   "listen": "127.0.0.1:8484",

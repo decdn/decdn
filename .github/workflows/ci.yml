@@ -1286,7 +1286,7 @@ jobs:
           python3 -m pip install 'pytest==8.*' 'pyyaml==6.*'
           python3 -m pytest .github/scripts/tests scripts/tests -q
 
-  # The gateway dashboard (crates/cli/dashboard): lint, types, tests, and a
+  # The `decdn dashboard` page (crates/cli/dashboard): lint, types, tests, and a
   # build whose output is exactly the three files `crates/cli/build.rs`
   # embeds. Rust jobs build `decdn-cli` without Node on purpose: they embed
   # the fallback page, and no Rust test asserts on the dashboard's content.

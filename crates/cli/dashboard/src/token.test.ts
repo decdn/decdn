@@ -54,6 +54,12 @@ describe("session", () => {
   });
 });
 
+describe("TOKEN_KEY", () => {
+  it("is the dashboard's own, apart from a gateway token stored before", () => {
+    expect(TOKEN_KEY).toBe("decdn-dashboard-token");
+  });
+});
+
 describe("adoptToken", () => {
   it("takes the fragment's token, stores it, and strips the fragment", () => {
     const storage = memory();

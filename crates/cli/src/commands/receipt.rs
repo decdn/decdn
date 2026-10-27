@@ -21,7 +21,7 @@ use alloy::sol_types::SolEvent;
 use anyhow::Context as _;
 use decdn_client::receipt::{
     ContentKind, PullReceipt, ReceiptChain, ReceiptEvidence, ReceiptLane, ReceiptSettlement,
-    ReceiptWindow,
+    ReceiptSummary, ReceiptWindow,
 };
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::{
@@ -127,20 +127,18 @@ pub(crate) fn refuse_collision(receipt: &Path, output: &Path, what: &str) -> any
 
 /// End a `decdn get` run that started at `started`: build its receipt from
 /// `evidence`, print the receipt block, and write `--receipt` ([`finish_with`]).
+/// Returns the run's result, as [`finish_with`] leaves it, beside the
+/// receipt's summary, `None` when the run paid nothing.
 ///
 /// The block goes to stdout after the run's summary, or to stderr when
 /// stdout carries the data (`-o -`) or the JSON summary (`--json`).
-///
-/// # Errors
-///
-/// As [`finish_with`].
 pub(crate) async fn finish_get(
     args: &GetArgs,
     uri: &DecdnUri,
     evidence: &ReceiptEvidence,
     started: u64,
     result: anyhow::Result<()>,
-) -> anyhow::Result<()> {
+) -> (anyhow::Result<()>, Option<ReceiptSummary>) {
     let kind = match uri.target {
         UriTarget::Blob => ContentKind::Blob,
         _ => ContentKind::Bundle,
@@ -154,7 +152,8 @@ pub(crate) async fn finish_get(
         .await
         .filter(|r| !r.lanes.is_empty());
     let path = args.receipt.as_deref();
-    if args.json || args.output.as_deref() == Some(Path::new("-")) {
+    let summary = receipt.as_ref().map(PullReceipt::summary);
+    let result = if args.json || args.output.as_deref() == Some(Path::new("-")) {
         finish_with(
             receipt.as_ref(),
             path,
@@ -168,7 +167,8 @@ pub(crate) async fn finish_get(
             result,
             &mut std::io::stdout().lock(),
         )
-    }
+    };
+    (result, summary)
 }
 
 /// Print `receipt`'s block to `out` and write it to `path`.

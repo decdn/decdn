@@ -76,9 +76,19 @@ export function tiles(c: Counters, publicMode: boolean): Tile[] {
 /** The counters since the gateway started, as a row of tiles. */
 export function StatTiles(props: { counters: Counters; publicMode: boolean }) {
   return (
-    <section aria-label="Counters since start">
+    <TileGrid
+      label="Gateway counters since start"
+      tiles={tiles(props.counters, props.publicMode)}
+    />
+  );
+}
+
+/** `tiles` as a grid, each with its hint on hover. */
+export function TileGrid(props: { label: string; tiles: Tile[] }) {
+  return (
+    <section aria-label={props.label}>
       <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-        {tiles(props.counters, props.publicMode).map((t) => (
+        {props.tiles.map((t) => (
           <div
             key={t.label}
             className="rounded-lg border border-line bg-surface p-3"

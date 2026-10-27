@@ -1,5 +1,23 @@
 import type { ReactNode } from "react";
-import type { Severity } from "../view";
+import type { Part } from "../api";
+import { partNote, type Severity } from "../view";
+
+/** One source's panels under its name: pulls, the gateway, the node. */
+export function Group(props: {
+  title: string;
+  note?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section aria-label={props.title} className="flex flex-col gap-4">
+      <header className="flex flex-wrap items-baseline justify-between gap-2 border-b border-line pb-1">
+        <h2 className="text-lg font-semibold">{props.title}</h2>
+        {props.note ? <p className="text-sm text-ink-2">{props.note}</p> : null}
+      </header>
+      {props.children}
+    </section>
+  );
+}
 
 /** A titled card. */
 export function Panel(props: {
@@ -10,7 +28,7 @@ export function Panel(props: {
   return (
     <section className="rounded-lg border border-line bg-surface p-4">
       <header className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
-        <h2 className="text-base font-semibold">{props.title}</h2>
+        <h3 className="text-base font-semibold">{props.title}</h3>
         {props.note ? <p className="text-sm text-ink-3">{props.note}</p> : null}
       </header>
       {props.children}
@@ -88,5 +106,55 @@ export function Gauge(props: {
         {Math.round(props.used * 100)}% used{flag ? ` · ${flag}` : ""}
       </span>
     </div>
+  );
+}
+
+/** How far a run is, as a meter; the text beside it says the same. */
+export function Progress(props: { done: number; label: string }) {
+  return (
+    <meter
+      className="gauge"
+      min={0}
+      max={1}
+      value={props.done}
+      aria-label={props.label}
+    />
+  );
+}
+
+/** What a node panel shows for a read it has no value for, if `what`. */
+export function PartLine(props: { part: Part<unknown>; what?: string }) {
+  const note = partNote(props.part);
+  if (!note) return null;
+  const what = props.what ? `${props.what}: ` : "";
+  return note.alert ? (
+    <p role="alert" className="text-sm text-critical-ink">
+      ⛔ {what}
+      {note.text}
+    </p>
+  ) : (
+    <Empty>
+      {what}
+      {note.text}
+    </Empty>
+  );
+}
+
+/** A panel over one node read: its body once the read has a value. */
+export function PartPanel<T>(props: {
+  title: string;
+  note?: ReactNode;
+  part: Part<T>;
+  children: (value: T) => ReactNode;
+}) {
+  const part = props.part;
+  return (
+    <Panel title={props.title} note={part.state === "ok" ? props.note : null}>
+      {part.state === "ok" ? (
+        props.children(part.value)
+      ) : (
+        <PartLine part={part} />
+      )}
+    </Panel>
   );
 }

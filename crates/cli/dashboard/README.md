@@ -1,9 +1,13 @@
-# decdn gateway dashboard
+# decdn dashboard
 
-The page `decdn gateway` serves at `/` on a loopback gateway, and on
-`--metrics-listen`. It polls `GET /_status` every two seconds while visible.
-`crates/cli/build.rs` embeds the build in the `decdn` binary; a build with no
-`dist/` embeds a page that says how to make one.
+The page `decdn dashboard` serves, on `127.0.0.1:8485` by default. It polls
+the dashboard's `GET /_status` every two seconds while visible, and shows
+three sources, each only as far as it answers: the `decdn get` runs on the
+host, the gateway at `--gateway`, and the node at `--admin-url` and
+`--metrics-url`. The dashboard reads every source itself, so the page reads
+nothing from another origin. `crates/cli/build.rs` embeds the build in the
+`decdn` binary; a build with no `dist/` embeds a page that says how to make
+one.
 
 Node 24 and pnpm 10 (`corepack enable` provides it):
 
@@ -13,18 +17,25 @@ pnpm -C crates/cli/dashboard build    # writes dist/index.html, app.js, app.css
 cargo build -p decdn-cli              # embeds dist/
 ```
 
-`pnpm dev` serves the page with hot reload and proxies `/_status` to a
-gateway on `127.0.0.1:8484`. Paste the gateway token into the page when it
-asks.
+`pnpm dev` serves the page with hot reload and proxies `/_status` to
+`decdn dashboard` on `127.0.0.1:8485`. Open the link it printed, or paste
+its token (in `~/.decdn/dashboard/token`) into the page when it asks.
 
-Rules the gateway's content security policy sets: no inline script, no
+Rules the dashboard's content security policy sets: no inline script, no
 inline style attribute, and nothing loaded from another origin. Every style
-lives in the stylesheet: `eslint` refuses a `style` prop. The build emits exactly three files with fixed names; CI
-checks that.
+lives in the stylesheet: `eslint` refuses a `style` prop. The build emits
+exactly three files with fixed names; CI checks that.
 
-`src/api.ts` mirrors the body of `/_status`. The Rust tests in
-`crates/cli/src/commands/gateway/status/tests.rs` pin that body to
-`src/fixtures/*.json`, and `src/contract.test.ts` checks `api.ts` against the
-same files. After a change to the body, rewrite them with
-`UPDATE_STATUS_FIXTURES=1 cargo nextest run -p decdn-cli gateway::status` and
-make `api.ts` match.
+`src/api.ts` mirrors two bodies, and `src/contract.test.ts` checks it
+against the fixtures the Rust tests pin:
+
+- the dashboard's `/_status`, in `src/fixtures/dashboard-*.json`, pinned by
+  `crates/cli/src/commands/dashboard/status/tests.rs`. Its `gateway.status`
+  there is a stand-in that names the gateway fixture to splice in;
+- the gateway's own `/_status`, which the dashboard passes through, in
+  `src/fixtures/status-*.json`, pinned by
+  `crates/cli/src/commands/gateway/status/tests.rs`.
+
+After a change to either body, rewrite both sets with
+`UPDATE_STATUS_FIXTURES=1 cargo nextest run -p decdn-cli status::` and make
+`api.ts` match.

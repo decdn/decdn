@@ -58,7 +58,7 @@ fi
 # ---- preconditions -------------------------------------------------------
 
 # python3 is in here because it reads the crate list out of `cargo metadata`
-# below, node because decdn-cli's .crate carries the gateway dashboard's build
+# below, node because decdn-cli's .crate carries the dashboard page's build
 # (pnpm comes from PATH or corepack, through .github/scripts/pnpm.sh). Bare
 # coreutils (sed, head, cat) are not: they are assumed the way bash itself is.
 for tool in cargo gh gpg git curl python3 node; do

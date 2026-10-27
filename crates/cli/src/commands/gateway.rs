@@ -93,14 +93,13 @@
 //! **State.** Every gateway counts what it served, refused and failed
 //! (`metrics`). `GET /_status` returns that, the pulls in flight, the
 //! capabilities, a public gateway's allowance and pointers, and what the
-//! buyer-pool store holds, as one JSON document (`status`). The dashboard
-//! (`dashboard`) is a page that polls it. A loopback gateway answers both on
-//! its own host, `/_status` behind the token; a public gateway answers
-//! neither on its public host. `--metrics-listen` serves `GET /metrics`
-//! (Prometheus text), `/_status` and the dashboard on a loopback address,
-//! for the operator: a public gateway's `/_status` there takes no token, a
-//! loopback gateway's takes its token. The dashboard's own requests are not
-//! counted.
+//! buyer-pool store holds, as one JSON document (`status`), which
+//! `decdn dashboard` polls. A loopback gateway answers it on its own host,
+//! behind the token; a public gateway does not answer it on its public host.
+//! `--metrics-listen` serves `GET /metrics` (Prometheus text) and `/_status`
+//! on a loopback address, for the operator: a public gateway's `/_status`
+//! there takes no token, a loopback gateway's takes its token. The
+//! dashboard's own polls are not counted.
 //!
 //! **Pointers.** `PUT /_pointer` on the bare host takes a namespace pointer
 //! (`pointer`): an EIP-712 record, signed by the namespace's owner on the
@@ -152,8 +151,7 @@ use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::publisher_registry::PublisherRegistry;
 use decdn_incentive::{CapabilityGrant, PoolId, voucher_domain};
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt as _, Full, Limited, StreamBody};
+use http_body_util::{BodyExt as _, Limited, StreamBody};
 use hyper::body::{Body as HttpBody, Frame};
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode, header};
@@ -166,10 +164,13 @@ use super::fetch::{
     BlobFetch, Credential, MAX_MANIFEST_BYTES, manifest_cap_mb, manifest_parse_context,
     resolve_chain,
 };
+use super::local_http::{
+    Body, allowed_hosts, carries_token, full, host_header, json, load_or_create_token, private_dir,
+    text, typed,
+};
 use crate::known_chains;
 
 mod allowance;
-mod dashboard;
 mod metrics;
 pub(crate) mod pointer;
 mod rewrite;
@@ -185,7 +186,7 @@ use site::{Route, Site, SiteDomain};
 use worker::{FetchBackend, Job, Payment, PullWorker};
 
 /// The request header carrying the gateway token.
-pub const TOKEN_HEADER: &str = "x-decdn-token";
+pub const TOKEN_HEADER: &str = super::local_http::TOKEN_HEADER;
 
 /// The request header naming the host of the page a content request serves.
 pub const HOST_HEADER: &str = "x-decdn-host";
@@ -261,8 +262,6 @@ const DROP_PENALTY_BYTES: u64 = {
     };
     window + PIPE_BYTES as u64 + CHUNK_BYTES as u64
 };
-
-type Body = BoxBody<Bytes, std::io::Error>;
 
 /// Run the gateway until Ctrl-C.
 ///
@@ -364,7 +363,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
 }
 
 /// Print where the gateway serves, and on loopback its token and the
-/// dashboard link that hands the token to the page.
+/// command that shows its state.
 fn announce(gateway: &Gateway, root: &Path) {
     match (&gateway.sites, &gateway.token) {
         (SiteDomain::Public { origin }, _) => println!(
@@ -375,16 +374,10 @@ fn announce(gateway: &Gateway, root: &Path) {
             let token = token.as_deref().unwrap_or_default();
             println!(
                 "decdn gateway on http://{}/ (Ctrl-C to stop)\ngateway token: {token} (also in \
-                 {})\ndashboard: http://{}/#token={token}",
+                 {})\nsee it with: decdn dashboard",
                 gateway.listen,
                 root.join("token").display(),
-                gateway.listen,
             );
-            if !dashboard::built() {
-                println!(
-                    "this binary has no dashboard built in; the page at / says how to build it"
-                );
-            }
         }
     }
 }
@@ -484,7 +477,7 @@ fn registry_address(
 
 /// Serve the operator's routes on `listener`, a loopback address, for as
 /// long as the gateway runs: `GET /metrics` answers Prometheus text, and
-/// `/_status` and the dashboard answer as on a loopback gateway's host. A
+/// `/_status` answers as on a loopback gateway's host. A
 /// public gateway's `/_status` takes no token here; a loopback gateway's
 /// takes its token, as on its host. A `Host` other than the listener's own
 /// loopback names is refused, so a page whose name was rebound to this
@@ -498,32 +491,33 @@ async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
         let gateway = Arc::clone(&gateway);
         let hosts = Arc::clone(&hosts);
         tokio::spawn(async move {
-            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
-                let gateway = Arc::clone(&gateway);
-                // The capabilities a loopback gateway lists are the token
-                // holder's: its listener asks for the token, as its host does.
-                let authorized = gateway.public() || gateway.authorized(req.headers());
-                let known = hosts
-                    .iter()
-                    .any(|allowed| allowed == host_header(req.headers()));
-                async move {
-                    if !known {
-                        return Ok(text(StatusCode::FORBIDDEN, "unknown Host\n"));
+            let service =
+                service_fn(move |req: Request<hyper::body::Incoming>| {
+                    let gateway = Arc::clone(&gateway);
+                    // The capabilities a loopback gateway lists are the token
+                    // holder's: its listener asks for the token, as its host does.
+                    let authorized = gateway.public() || gateway.authorized(req.headers());
+                    let known = hosts
+                        .iter()
+                        .any(|allowed| allowed == host_header(req.headers()));
+                    async move {
+                        if !known {
+                            return Ok(text(StatusCode::FORBIDDEN, "unknown Host\n"));
+                        }
+                        let response = match (req.method(), req.uri().path()) {
+                            (&Method::GET, "/metrics") => Some(typed(
+                                StatusCode::OK,
+                                gateway.metrics.render(),
+                                "text/plain; version=0.0.4; charset=utf-8",
+                            )),
+                            (&Method::GET, path) => gateway.operator(path, authorized).await,
+                            _ => None,
+                        };
+                        Ok::<_, Infallible>(response.unwrap_or_else(|| {
+                            text(StatusCode::NOT_FOUND, "GET /_status, /metrics\n")
+                        }))
                     }
-                    let response = match (req.method(), req.uri().path()) {
-                        (&Method::GET, "/metrics") => Some(typed(
-                            StatusCode::OK,
-                            gateway.metrics.render(),
-                            "text/plain; version=0.0.4; charset=utf-8",
-                        )),
-                        (&Method::GET, path) => gateway.operator(path, authorized).await,
-                        _ => None,
-                    };
-                    Ok::<_, Infallible>(response.unwrap_or_else(|| {
-                        text(StatusCode::NOT_FOUND, "GET /, /_status, /metrics\n")
-                    }))
-                }
-            });
+                });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(Duration::from_secs(10))
@@ -613,63 +607,6 @@ fn fill_chain_defaults(common: &mut ClientFetchArgs, file: &FileConfig) -> anyho
         common.capacity_bond_address = Some(addresses.capacity_bond);
     }
     Ok(())
-}
-
-/// The `Host` header values the gateway answers: its own loopback address
-/// under each name a browser may use. Anything else is a DNS-rebinding attempt.
-fn allowed_hosts(listen: SocketAddr) -> Vec<String> {
-    let port = listen.port();
-    vec![
-        listen.to_string(),
-        format!("localhost:{port}"),
-        format!("127.0.0.1:{port}"),
-        format!("[::1]:{port}"),
-    ]
-}
-
-/// Create `dir` owner-only.
-fn private_dir(dir: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restrict {}", dir.display()))?;
-    }
-    Ok(())
-}
-
-/// The gateway token in `path`, or a fresh random one written there
-/// owner-only.
-fn load_or_create_token(path: &Path) -> anyhow::Result<String> {
-    if let Ok(token) = std::fs::read_to_string(path) {
-        let token = token.trim().to_owned();
-        anyhow::ensure!(
-            token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()),
-            "{} is not a gateway token; delete it to make a new one",
-            path.display()
-        );
-        return Ok(token);
-    }
-    let token = alloy::hex::encode(rand::random::<[u8; 32]>());
-    std::fs::write(path, &token).with_context(|| format!("write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restrict {}", path.display()))?;
-    }
-    Ok(token)
-}
-
-/// Compare `given` with the token without leaking where they differ.
-fn token_matches(token: &str, given: &str) -> bool {
-    token.len() == given.len()
-        && token
-            .bytes()
-            .zip(given.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
 }
 
 fn now_secs() -> u64 {
@@ -1135,7 +1072,7 @@ impl Gateway {
         self.public.is_some()
     }
 
-    /// Answer `req` and count the answer, unless it is the dashboard's own
+    /// Answer `req` and count the answer, unless it is a dashboard's poll
     /// ([`Self::operator_request`]). On a public gateway, make it readable by
     /// every origin ([`readable_anywhere`]).
     async fn handle<B>(self: Arc<Self>, req: Request<B>) -> Response<Body>
@@ -1276,7 +1213,8 @@ impl Gateway {
                 StatusCode::OK,
                 "<h1>decdn gateway</h1><p>Running. Open a bundle as a website at \
                  <code>/&lt;hash&gt;/</code>. Connect the deCDN browser extension with the \
-                 token <code>decdn gateway</code> printed when it started.</p>",
+                 token <code>decdn gateway</code> printed when it started. Run \
+                 <code>decdn dashboard</code> to see what the gateway holds and did.</p>",
             ),
             (Method::GET, "/favicon.ico") => text(StatusCode::NOT_FOUND, ""),
             (Method::GET, "/_delegate") => {
@@ -1309,8 +1247,8 @@ impl Gateway {
     }
 
     /// What a public gateway answers on its bare host before the routes it
-    /// shares with a loopback one: no API but `PUT /_pointer`, no dashboard,
-    /// and `HEAD` of content. `Err(req)` when the request is not one of those,
+    /// shares with a loopback one: no API but `PUT /_pointer`, and `HEAD` of
+    /// content. `Err(req)` when the request is not one of those,
     /// and on a loopback gateway.
     async fn public_bare<B>(
         &self,
@@ -1329,10 +1267,6 @@ impl Gateway {
             (_, "/_delegate" | "/_capability" | "/_status") => {
                 text(StatusCode::NOT_FOUND, "a public gateway has no API\n")
             }
-            (_, p) if p.starts_with("/_dashboard/") => text(
-                StatusCode::NOT_FOUND,
-                "the dashboard is on --metrics-listen\n",
-            ),
             (&Method::PUT, "/_pointer") => self.put_pointer(req).await,
             (&Method::HEAD, "/" | "/favicon.ico") => text(StatusCode::OK, ""),
             (&Method::HEAD, _) => self.head_bare(target.trim_start_matches('/')),
@@ -1340,26 +1274,24 @@ impl Gateway {
         })
     }
 
-    /// Whether `req` is for the dashboard or `/_status` on a loopback
-    /// gateway's own host: the dashboard's page, assets and polls, which
-    /// the counters it shows leave out.
+    /// Whether `req` is for `/_status` on a loopback gateway's own host: the
+    /// dashboard's polls, which the counters it shows leave out.
     fn operator_request<B>(&self, req: &Request<B>) -> bool {
         let host = host_header(req.headers());
         let path = req.uri().path();
         !self.public()
             && req.method() == Method::GET
             && self.hosts.iter().any(|allowed| allowed == host)
-            && (matches!(path, "/" | "/_status") || dashboard::asset(path).is_some())
+            && path == "/_status"
     }
 
-    /// The operator's routes at `path`: the dashboard, its assets, and
-    /// `/_status` when `authorized`. `None` for any other path.
+    /// The operator's route at `path`: `/_status` when `authorized`. `None`
+    /// for any other path.
     async fn operator(&self, path: &str, authorized: bool) -> Option<Response<Body>> {
         match path {
             "/_status" if authorized => Some(json(StatusCode::OK, &self.status().await)),
             "/_status" => Some(text(StatusCode::UNAUTHORIZED, "token required\n")),
-            "/" => Some(dashboard::page()),
-            _ => dashboard::asset(path),
+            _ => None,
         }
     }
 
@@ -1574,10 +1506,7 @@ impl Gateway {
         let Some(token) = self.token.as_deref() else {
             return false;
         };
-        headers
-            .get(TOKEN_HEADER)
-            .and_then(|t| t.to_str().ok())
-            .is_some_and(|given| token_matches(token, given))
+        carries_token(headers, token)
     }
 
     /// Drop delegates that waited too long for a capability, and those whose
@@ -2363,6 +2292,7 @@ impl Gateway {
             .pull(Job {
                 blob: BlobFetch {
                     estimate: false,
+                    progress: None,
                     hash,
                     output: PathBuf::from("-"),
                     namespace,
@@ -2984,15 +2914,6 @@ fn rewrites(present: Present, path: &str) -> bool {
     Rewrite::for_type(essence).is_some()
 }
 
-/// The request's `Host` header, or `""` when it has none the gateway can
-/// read.
-fn host_header(headers: &HeaderMap) -> &str {
-    headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-}
-
 /// The request's `Range` header, when it has one the gateway can read.
 fn range_header(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::RANGE).and_then(|v| v.to_str().ok())
@@ -3183,21 +3104,6 @@ fn redirect(location: &str) -> Response<Body> {
     response
 }
 
-fn full(body: String) -> Body {
-    Full::new(Bytes::from(body))
-        .map_err(|never| match never {})
-        .boxed()
-}
-
-fn text(status: StatusCode, body: &str) -> Response<Body> {
-    typed(status, body.to_owned(), "text/plain; charset=utf-8")
-}
-
-fn json<T: serde::Serialize + ?Sized>(status: StatusCode, value: &T) -> Response<Body> {
-    let body = serde_json::to_string(value).unwrap_or_else(|_| "null".into());
-    typed(status, body, "application/json")
-}
-
 fn html(status: StatusCode, body: &str) -> Response<Body> {
     let page = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" \
@@ -3206,16 +3112,6 @@ fn html(status: StatusCode, body: &str) -> Response<Body> {
          .2rem 1rem .2rem 0}}</style></head><body>{body}</body></html>"
     );
     typed(status, page, "text/html; charset=utf-8")
-}
-
-fn typed(status: StatusCode, body: String, content_type: &'static str) -> Response<Body> {
-    let mut response = Response::new(full(body));
-    *response.status_mut() = status;
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static(content_type),
-    );
-    response
 }
 
 fn escape(s: &str) -> String {

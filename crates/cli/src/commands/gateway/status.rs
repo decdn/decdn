@@ -1,5 +1,5 @@
-//! `GET /_status`: one JSON read of what the gateway holds and did, for the
-//! dashboard and the operator. A loopback gateway answers it on its own host
+//! `GET /_status`: one JSON read of what the gateway holds and did, for
+//! `decdn dashboard` and the operator. A loopback gateway answers it on its own host
 //! behind the gateway token; any gateway answers it on `--metrics-listen`.
 
 use std::net::SocketAddr;
@@ -13,7 +13,7 @@ use super::allowance::BucketView;
 use super::metrics::Counters;
 use super::pointer::Held;
 use super::worker::PoolSnapshot;
-use super::{ActivePullView, Capability, Gateway, dashboard, now_secs};
+use super::{ActivePullView, Capability, Gateway, now_secs};
 
 /// How long `/_status` waits for the worker to read the store.
 const POOL_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,8 +34,6 @@ pub(super) struct Status {
     mode: Mode,
     /// The `decdn` version.
     version: &'static str,
-    /// Whether the binary embeds the dashboard's build, not its fallback.
-    dashboard_built: bool,
     /// When the gateway started, Unix seconds.
     started_unix: u64,
     uptime_secs: u64,
@@ -85,7 +83,6 @@ impl Gateway {
                 Mode::Loopback
             },
             version: env!("CARGO_PKG_VERSION"),
-            dashboard_built: dashboard::built(),
             started_unix: self.started_unix,
             uptime_secs: self.started.elapsed().as_secs(),
             listen: self.listen,

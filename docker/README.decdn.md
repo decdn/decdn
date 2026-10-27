@@ -47,7 +47,7 @@ docker run -d --name decdn-gateway -p 127.0.0.1:8080:8080 \
 ```
 
 `--metrics-listen` serves Prometheus text at `GET /metrics` on that loopback address, for
-your scraper, and the gateway's state at `GET /_status` and a dashboard at `GET /` for you;
+your scraper, and the gateway's state at `GET /_status` for `decdn dashboard --gateway`;
 it answers only a loopback `Host`. The series and the state are listed in
 [`adr/appendix-gateway.md`](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#metrics).
 

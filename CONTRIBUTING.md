@@ -18,7 +18,7 @@ deCDN builds with a native toolchain and works with any editor. Install the prer
 
 Pre-commit covers Solidity too: `forge fmt` and `solhint` run on every commit that touches `contracts/` (solhint needs no local install — pre-commit builds its own node sandbox), `forge build` and `forge test` run on push. The `slither` and `aderyn` static-analysis hooks are manual-stage and need their own installs — see [Solidity development](#solidity-development).
 
-Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`). The [TypeScript SDK contract run](#typescript-sdk-contract-run) needs Node.js 20.19+ and pnpm. The gateway dashboard (`crates/cli/dashboard/`) needs Node.js 24 and pnpm 10 (`corepack enable` provides it). Without them `cargo build` still succeeds and the `decdn` binary embeds a page that says how to build the dashboard:
+Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`). The [TypeScript SDK contract run](#typescript-sdk-contract-run) needs Node.js 20.19+ and pnpm. The `decdn dashboard` page (`crates/cli/dashboard/`) needs Node.js 24 and pnpm 10 (`corepack enable` provides it). Without them `cargo build` still succeeds and the `decdn` binary embeds a page that says how to build the dashboard:
 
 ```bash
 pnpm -C crates/cli/dashboard install --frozen-lockfile

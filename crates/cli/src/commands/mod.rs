@@ -5,6 +5,7 @@
 //! operations: generate a key, render or validate a config file, probe
 //! a remote node.
 
+pub(crate) mod activity;
 pub mod appeal;
 pub mod bond;
 pub mod bundle_pull;
@@ -13,6 +14,7 @@ pub mod chain_ctx;
 pub mod chunker;
 pub(crate) mod civil_time;
 pub mod config;
+pub mod dashboard;
 pub mod deregister;
 pub mod doctor;
 pub mod fetch;
@@ -21,6 +23,7 @@ pub mod gateway;
 pub mod get;
 pub mod interrupt;
 pub mod key_gen;
+pub(crate) mod local_http;
 pub mod manifest;
 pub mod node;
 pub mod node_top;

@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from "react";
 
-/** Asks for the gateway token a loopback gateway's `/_status` needs. */
+/** Asks for the dashboard token its `/_status` needs. */
 export function TokenForm(props: {
   rejected: boolean;
   onToken: (token: string) => void;
@@ -17,13 +17,13 @@ export function TokenForm(props: {
       className="flex max-w-xl flex-col gap-3 rounded-lg border border-line bg-surface p-4"
     >
       <label htmlFor="token" className="font-semibold">
-        Gateway token
+        Dashboard token
       </label>
       <p className="text-sm text-ink-2">
         {props.rejected ? "That token was not accepted. " : null}
-        Open the <code>dashboard:</code> link <code>decdn gateway</code> printed
-        when it started, or paste the token it printed (also in{" "}
-        <code>~/.decdn/gateway/token</code>).
+        Open the link <code>decdn dashboard</code> printed when it started, or
+        paste the token it printed (also in{" "}
+        <code>~/.decdn/dashboard/token</code>).
       </p>
       <input
         id="token"

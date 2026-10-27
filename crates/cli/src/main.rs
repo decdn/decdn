@@ -97,6 +97,9 @@ async fn run() -> anyhow::Result<()> {
         },
         Command::Probe(args) => commands::probe::probe(&args, config_path.as_deref()).await,
         Command::Gateway(args) => commands::gateway::gateway(&args, config_path.as_deref()).await,
+        Command::Dashboard(args) => {
+            commands::dashboard::dashboard(&args, config_path.as_deref()).await
+        }
         Command::Get(args) => commands::get::get(&args, config_path.as_deref()).await,
         Command::Quote(args) => commands::quote::quote(&args, config_path.as_deref()).await,
         Command::Receipt(args) => {

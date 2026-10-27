@@ -1,0 +1,338 @@
+{
+  "version": "0.3.0",
+  "dashboard_built": true,
+  "started_unix": 1793000000,
+  "pulls": {
+    "dir": "/home/me/.decdn/activity/pulls",
+    "updated_unix_ms": 1793000600000,
+    "active": [
+      {
+        "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262/",
+        "kind": "bundle",
+        "output": "/home/me/site",
+        "pid": 4242,
+        "started_unix_ms": 1793000570000,
+        "updated_unix_ms": 1793000570600,
+        "finished_unix_ms": null,
+        "state": "running",
+        "received_bytes": 734003200,
+        "expected_bytes": 1073741824,
+        "files_started": 12,
+        "files_landed": 9,
+        "paid": {
+          "amount_micro_usdc": 7340,
+          "bytes": 736100352
+        },
+        "nodes": [
+          {
+            "provider": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+            "amount_micro_usdc": 7340,
+            "bytes": 736100352
+          }
+        ],
+        "bundle": null,
+        "error": null,
+        "stale": false
+      },
+      {
+        "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "kind": "blob",
+        "output": "/home/me/site",
+        "pid": 4242,
+        "started_unix_ms": 1793000480000,
+        "updated_unix_ms": 1793000480600,
+        "finished_unix_ms": null,
+        "state": "running",
+        "received_bytes": 734003200,
+        "expected_bytes": 1073741824,
+        "files_started": 12,
+        "files_landed": 9,
+        "paid": {
+          "amount_micro_usdc": 7340,
+          "bytes": 736100352
+        },
+        "nodes": [
+          {
+            "provider": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+            "amount_micro_usdc": 7340,
+            "bytes": 736100352
+          }
+        ],
+        "bundle": null,
+        "error": null,
+        "stale": true
+      }
+    ],
+    "recent": [
+      {
+        "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262/",
+        "kind": "bundle",
+        "output": "/home/me/site",
+        "pid": 4242,
+        "started_unix_ms": 1793000300000,
+        "updated_unix_ms": 1793000342000,
+        "finished_unix_ms": 1793000342000,
+        "state": "done",
+        "received_bytes": 734003200,
+        "expected_bytes": 1073741824,
+        "files_started": 12,
+        "files_landed": 9,
+        "paid": {
+          "amount_micro_usdc": 7340,
+          "bytes": 736100352
+        },
+        "nodes": [
+          {
+            "provider": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+            "amount_micro_usdc": 7340,
+            "bytes": 736100352
+          }
+        ],
+        "bundle": {
+          "fetched": 9,
+          "linked": 1,
+          "skipped": 2,
+          "excluded": 0,
+          "failed": 0,
+          "not_run": 0,
+          "downloaded": 734003200,
+          "resumed_bytes": 0,
+          "reused_bytes": 4096
+        },
+        "error": null,
+        "stale": false
+      },
+      {
+        "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262/docs/index.html",
+        "kind": "entry",
+        "output": "/home/me/site",
+        "pid": 4242,
+        "started_unix_ms": 1793000200000,
+        "updated_unix_ms": 1793000242000,
+        "finished_unix_ms": 1793000242000,
+        "state": "interrupted",
+        "received_bytes": 734003200,
+        "expected_bytes": 1073741824,
+        "files_started": 12,
+        "files_landed": 9,
+        "paid": {
+          "amount_micro_usdc": 7340,
+          "bytes": 736100352
+        },
+        "nodes": [
+          {
+            "provider": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+            "amount_micro_usdc": 7340,
+            "bytes": 736100352
+          }
+        ],
+        "bundle": null,
+        "error": null,
+        "stale": false
+      },
+      {
+        "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "kind": "blob",
+        "output": "/home/me/site",
+        "pid": 4242,
+        "started_unix_ms": 1793000100000,
+        "updated_unix_ms": 1793000142000,
+        "finished_unix_ms": 1793000142000,
+        "state": "failed",
+        "received_bytes": 734003200,
+        "expected_bytes": 1073741824,
+        "files_started": 12,
+        "files_landed": 9,
+        "paid": {
+          "amount_micro_usdc": 7340,
+          "bytes": 736100352
+        },
+        "nodes": [
+          {
+            "provider": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+            "amount_micro_usdc": 7340,
+            "bytes": 736100352
+          }
+        ],
+        "bundle": null,
+        "error": "no node holds the blob",
+        "stale": false
+      }
+    ],
+    "unreadable": 1
+  },
+  "gateway": {
+    "url": "http://127.0.0.1:8484/",
+    "updated_unix_ms": 1793000600000,
+    "state": "up",
+    "status": {
+      "pinned_by": "status-loopback.json"
+    }
+  },
+  "node": {
+    "admin_url": "http://127.0.0.1:9191",
+    "metrics_url": "http://127.0.0.1:9090/metrics",
+    "state": "up",
+    "health": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "node_id": "5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+        "uptime_s": 86400,
+        "in_flight_streams": 3,
+        "binding": "bound",
+        "bound_node_id": "5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+        "registry_active": true
+      }
+    },
+    "status": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "node_id": "5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+        "routing": {
+          "total_peers": 7,
+          "non_empty_buckets": 2,
+          "buckets": [
+            {
+              "index": 250,
+              "fill": 3
+            },
+            {
+              "index": 255,
+              "fill": 4
+            }
+          ],
+          "bucket_capacity": 20,
+          "refresh_interval_s": 300,
+          "last_refresh_us": 1793000500000000
+        },
+        "known_stakers": 9,
+        "record_store": {
+          "records": 1204,
+          "capacity": 65536
+        },
+        "republish": {
+          "scheduled_records": 1204
+        },
+        "chain_denied_origins": 0,
+        "operator_address": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2"
+      }
+    },
+    "metrics": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "uptime_seconds": 86400,
+        "active_connections": 5,
+        "dispatch_in_flight": 2,
+        "cache_hits": 9000,
+        "cache_misses": 1000,
+        "cache_bytes_returned": 52428800000,
+        "unredeemed_usdc": 1250000,
+        "rpc_healthy": true,
+        "rates": {
+          "hits": 4.5,
+          "misses": 0.5,
+          "bytes": 2097152.0
+        },
+        "hit_rate": 0.9
+      }
+    },
+    "lanes": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "lanes": [
+          {
+            "pool_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "counterparty": "0xAbaBabaBABaBAbAbABABaBABAbabABAbAbaBabab",
+            "voucher_signer": "0xCdCdCdCDCdcDcDCdCdCDCdCDCdcdcDcDcdcDCDcd",
+            "last_nonce": 812,
+            "outstanding_micro_usdc": 3200,
+            "unredeemed_micro_usdc": 41000,
+            "deposit_micro_usdc": 5000000,
+            "seconds_since_last_voucher": 12,
+            "settlement_eligible": true
+          }
+        ],
+        "redeem_threshold_micro_usdc": 100000
+      }
+    },
+    "earnings": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "operator_address": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+        "ledger_since_unix": 1790000000,
+        "last_24h": {
+          "from_unix": 1792913600,
+          "net_micro_usdc": 120000,
+          "gross_micro_usdc": 133333,
+          "bytes_settled": 120000000,
+          "settlements": 3
+        },
+        "last_7d": {
+          "from_unix": 1792395200,
+          "net_micro_usdc": 910000,
+          "gross_micro_usdc": 1011111,
+          "bytes_settled": 910000000,
+          "settlements": 3
+        },
+        "since_ledger_start": {
+          "from_unix": 1790000000,
+          "net_micro_usdc": 4400000,
+          "gross_micro_usdc": 4888888,
+          "bytes_settled": 4400000000,
+          "settlements": 3
+        },
+        "since": null,
+        "last_settlement": {
+          "at_unix": 1792990000,
+          "tx_hash": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "block_number": 9876543,
+          "net_micro_usdc": 54000
+        },
+        "pending": {
+          "micro_usdc": 41000,
+          "lanes": 1,
+          "stranded_micro_usdc": 0,
+          "stranded_lanes": 0,
+          "last_sweep_at_unix": 1792999000,
+          "next_sweep_at_unix": 1793002600
+        }
+      }
+    },
+    "pools": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "pools": [
+          {
+            "pool_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "chain_id": 421614,
+            "payment_pool": "0x1111111111111111111111111111111111111111",
+            "owner": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+            "token": "0x2222222222222222222222222222222222222222",
+            "deposit_micro_usdc": 2000000,
+            "spent_micro_usdc": 310000,
+            "lanes": [
+              {
+                "voucher_signer": "0xCdCdCdCDCdcDcDCdCdCDCdCDCdcdcDcDcdcDCDcd",
+                "provider": "0x3333333333333333333333333333333333333333",
+                "last_amount_micro_usdc": 310000,
+                "last_bytes_delivered": 31000000000
+              }
+            ]
+          }
+        ],
+        "skipped": []
+      }
+    },
+    "slashes": {
+      "updated_unix_ms": 1793000600000,
+      "state": "unconfigured",
+      "message": "slash detection is not configured"
+    }
+  }
+}

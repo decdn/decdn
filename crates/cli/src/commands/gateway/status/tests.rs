@@ -71,7 +71,6 @@ fn base(mode: Mode) -> Status {
     Status {
         mode,
         version: "0.0.0-fixture",
-        dashboard_built: true,
         started_unix: 1_793_000_000,
         uptime_secs: 93_784,
         listen: "127.0.0.1:8484".parse().unwrap(),

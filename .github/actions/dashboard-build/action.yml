@@ -1,6 +1,6 @@
 name: Dashboard build
 description: >-
-  Build the gateway dashboard (crates/cli/dashboard) into `dist/`, where
+  Build the `decdn dashboard` page (crates/cli/dashboard) into `dist/`, where
   `crates/cli/build.rs` embeds it in the `decdn` binary. A build without it
   embeds a fallback page instead, which a release must never ship.
 

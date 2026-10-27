@@ -3,8 +3,12 @@ import {
   formatBytes,
   formatCount,
   formatDuration,
+  formatRate,
+  formatShare,
   formatUsdc,
+  formatWhen,
   shortHex,
+  shortUri,
 } from "./format";
 
 describe("formatBytes", () => {
@@ -47,5 +51,37 @@ describe("shortHex", () => {
   it("keeps the head and tail of a long hex string", () => {
     expect(shortHex("0x1234567890abcdef1234")).toBe("0x1234…1234");
     expect(shortHex("0x12")).toBe("0x12");
+  });
+});
+
+describe("formatRate", () => {
+  it("rounds to whole bytes per second, never below zero", () => {
+    expect(formatRate(2_097_152.4)).toBe("2.0 MiB/s");
+    expect(formatRate(511.6)).toBe("512 B/s");
+    expect(formatRate(-3)).toBe("0 B/s");
+  });
+});
+
+describe("formatShare", () => {
+  it("is a whole percent", () => {
+    expect(formatShare(0.9)).toBe("90%");
+    expect(formatShare(0.3125)).toBe("31%");
+  });
+});
+
+describe("formatWhen", () => {
+  it("reads Unix seconds, not milliseconds", () => {
+    expect(formatWhen(1_793_000_000)).toBe(
+      new Date(1_793_000_000_000).toLocaleString(),
+    );
+  });
+});
+
+describe("shortUri", () => {
+  it("shortens the hash and keeps the path", () => {
+    expect(shortUri(`decdn:${"af".repeat(32)}/docs/index.html`)).toBe(
+      "decdn:afafaf…afaf/docs/index.html",
+    );
+    expect(shortUri("decdn:short")).toBe("decdn:short");
   });
 });

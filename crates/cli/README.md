@@ -5,11 +5,11 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 > **Status: early implementation.** deCDN runs a public testnet on Arbitrum Sepolia and is pre-mainnet. Wire formats, APIs and on-chain interfaces change without compatibility shims until mainnet.
 
 The user-facing `decdn` binary: `get`, `probe`, `node` administration, `key-gen`,
-`config`, `pool`, `publish`, `origin`, `appeal`, `gateway` and `self-update`
-subcommands. `gateway` serves `decdn:` URIs over HTTP: to a browser from
+`config`, `pool`, `publish`, `origin`, `appeal`, `gateway`, `dashboard` and
+`self-update` subcommands. `gateway` serves `decdn:` URIs over HTTP: to a browser from
 loopback, or with `--public-url` to anyone at a public origin, paid from the
-gateway's own pool within a daily allowance, with a dashboard of what it
-serves on loopback; `publish point` gives a namespace
+gateway's own pool within a daily allowance; `dashboard` serves one local
+page of the host's `get` pulls, its gateway and its node; `publish point` gives a namespace
 a stable host on such a gateway by signing a pointer to a bundle. `self-update` replaces the binary with the latest release whose
 `SHA256SUMS.minisig` verifies against one of the maintainers' minisign keys
 embedded from the

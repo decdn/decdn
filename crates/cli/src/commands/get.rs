@@ -39,6 +39,8 @@ use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::GetArgs;
 
+use super::activity::ActivityRecorder;
+
 /// Run `decdn get`: parse the URI and run the route its target names.
 ///
 /// # Errors
@@ -67,15 +69,33 @@ pub async fn get(args: &GetArgs, config_path: Option<&Path>) -> anyhow::Result<(
     }
     let started = super::receipt::unix_now();
     let evidence = Arc::new(ReceiptEvidence::new());
+    // A dry run is no pull: it keeps no record for the dashboard.
+    let activity = (!args.dry_run)
+        .then(|| ActivityRecorder::start(&uri, &args.uri, &dest.path, &evidence))
+        .flatten();
     let result = if streams_one_blob(args, &uri) {
-        super::fetch::fetch(args, &dest.path, &uri, config_path, &evidence).await
+        super::fetch::fetch(
+            args,
+            &dest.path,
+            &uri,
+            config_path,
+            &evidence,
+            activity.as_ref(),
+        )
+        .await
     } else {
-        super::bundle_pull::bundle_pull(args, &dest, &uri, config_path, &evidence).await
+        let records = (&evidence, activity.as_ref());
+        super::bundle_pull::bundle_pull(args, &dest, &uri, config_path, records).await
     };
     let result = if args.dry_run {
         result
     } else {
-        super::receipt::finish_get(args, &uri, &evidence, started, result).await
+        let (result, summary) =
+            super::receipt::finish_get(args, &uri, &evidence, started, result).await;
+        if let Some(activity) = &activity {
+            activity.finish(&result, summary).await;
+        }
+        result
     };
     with_resume_hint(args, result)
 }
