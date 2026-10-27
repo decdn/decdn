@@ -4159,7 +4159,7 @@ since project inception and will roll into the first tagged release.
   node.** It serves a page on `127.0.0.1:8485` (`--listen`) that shows the
   `decdn get` runs on the host, live and finished; the gateway at
   `--gateway` (default `http://127.0.0.1:8484`), from its `/_status`, when
-  one answers; and the local node's health, `node top` metrics, lanes,
+  one answers, with the gateway token sent to a loopback address only; and the local node's health, `node top` metrics, lanes,
   earnings, buyer pools and slashes, from its admin RPC and `/metrics`, when
   one runs. The dashboard process reads every source and the page reads
   only the dashboard's own `/_status`, behind the dashboard's token
@@ -4173,8 +4173,9 @@ since project inception and will roll into the first tagged release.
   writes `~/.decdn/activity/pulls/<start-ms>-<pid>.json`, whatever its
   `--data-dir`, and rewrites it every second: the URI, the destination, the
   bytes verified, what each node was paid, and at the end the result. A run
-  that cannot write its record pulls on. Each run keeps the newest 200
-  records. `--dry-run` writes none.
+  that cannot write its record pulls on, and warns once. A run prunes the
+  directory to the newest 200 records when it starts. `--dry-run` writes
+  none.
 - **CLI: `decdn get` ends with a pull receipt, and `decdn receipt
   {verify,settle}` checks and settles it (#2599).** Every `get` that paid
   prints a receipt block: the hash, the bytes verified and paid, each node

@@ -4,7 +4,10 @@ import { partValue } from "../view";
 import { Cell, Empty, PartPanel, Table } from "./Panel";
 
 /** The lanes the node serves against, as it accrued them. */
-export function NodeLanes(props: { part: Part<LanesResponse> }) {
+export function NodeLanes(props: {
+  part: Part<LanesResponse>;
+  stale: number | null;
+}) {
   const read = partValue(props.part);
   return (
     <PartPanel
@@ -15,6 +18,7 @@ export function NodeLanes(props: { part: Part<LanesResponse> }) {
           : null
       }
       part={props.part}
+      stale={props.stale}
     >
       {(l) =>
         l.lanes.length === 0 ? (

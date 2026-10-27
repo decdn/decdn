@@ -312,7 +312,7 @@ jobs:
               - 'docker/**'
               - '.github/workflows/ci.yml'
             dashboard:
-              # Gates `dashboard`: the gateway's Vite app and the action
+              # Gates `dashboard`: the `decdn dashboard` Vite app and the action
               # that builds it.
               - 'crates/cli/dashboard/**'
               - '.github/actions/dashboard-build/**'

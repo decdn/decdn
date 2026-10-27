@@ -226,7 +226,7 @@ address only.
 `GET /_status` gives the state of the gateway as one JSON document. The
 operator reads it with `decdn dashboard`
 ([Binaries § Dashboard](appendix-binaries.md#dashboard)), which polls it
-every 2 seconds. The gateway serves no page itself. The counters do not
+every 2 seconds. The gateway serves no dashboard. The counters do not
 count `/_status` requests on a loopback gateway's own host. A publisher who
 wants to see how a site is served runs a loopback gateway and
 `decdn dashboard`.

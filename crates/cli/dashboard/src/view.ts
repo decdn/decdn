@@ -2,6 +2,7 @@
 import type {
   EarningsPeriod,
   EarningsResponse,
+  EndedPull,
   GatewaySection,
   GatewayStatus,
   Lane,
@@ -10,7 +11,6 @@ import type {
   Pool,
   PullKind,
   Pulls,
-  PullState,
 } from "./api";
 
 export type Severity = "ok" | "warning" | "critical";
@@ -181,8 +181,7 @@ export function livePulls(pulls: Pulls): LivePullRow[] {
 
 export type Tone = "ok" | "muted" | "critical";
 
-const OUTCOME: Record<PullState, { outcome: string; tone: Tone }> = {
-  running: { outcome: "Running", tone: "muted" },
+const OUTCOME: Record<EndedPull["state"], { outcome: string; tone: Tone }> = {
   done: { outcome: "✓ Done", tone: "ok" },
   failed: { outcome: "⛔ Failed", tone: "critical" },
   interrupted: { outcome: "Interrupted", tone: "muted" },
@@ -210,11 +209,10 @@ export function recentPulls(pulls: Pulls): RecentPullRow[] {
     uri: p.uri,
     output: p.output,
     received: p.received_bytes,
-    durationSecs:
-      ((p.finished_unix_ms ?? p.updated_unix_ms) - p.started_unix_ms) / 1000,
+    durationSecs: (p.finished_unix_ms - p.started_unix_ms) / 1000,
     paidMicro: p.paid.amount_micro_usdc,
     nodes: p.nodes.length,
-    error: p.error,
+    error: "error" in p ? p.error : null,
   }));
 }
 
@@ -234,20 +232,118 @@ export function gatewayLine(g: GatewaySection): string | null {
   }
 }
 
-/** What the node section says in place of its panels; null when up. */
-export function nodeLine(n: NodeSection): string | null {
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+/**
+ * What is wrong with the shape of a gateway's `/_status` body, which the
+ * dashboard passes through unchecked; null when the panels can read it.
+ * Checks the top level only: a deeper fault is the error boundary's.
+ */
+export function gatewayShapeProblem(body: unknown): string | null {
+  if (!isObject(body)) return "the body is not an object";
+  if (body.mode !== "loopback" && body.mode !== "public") {
+    return "it names no mode";
+  }
+  if (!isObject(body.counters)) return "it has no counters";
+  for (const key of ["active_pulls", "capabilities"]) {
+    if (!Array.isArray(body[key])) return `${key} is not a list`;
+  }
+  for (const key of ["allowance", "pointers"]) {
+    if (body[key] !== null && !Array.isArray(body[key])) {
+      return `${key} is not a list`;
+    }
+  }
+  const p = body.pools;
+  if (
+    p !== null &&
+    !(
+      isObject(p) &&
+      isObject(p.pools) &&
+      Array.isArray(p.pools.pools) &&
+      Array.isArray(p.pools.skipped) &&
+      Array.isArray(p.delegate_lanes)
+    )
+  ) {
+    return "pools is not a pool snapshot";
+  }
+  return null;
+}
+
+export interface NodeView {
+  /** What the section says above its panels, or in their place. */
+  line: string | null;
+  alert: boolean;
+  /** Whether the panels show: each from its own read. */
+  panels: boolean;
+}
+
+/**
+ * How the node section shows. A failed health read hides nothing: the
+ * other reads may have answered, so each panel shows its own.
+ */
+export function nodeView(n: NodeSection): NodeView {
   switch (n.state) {
     case "waiting":
-      return `Asking the node at ${n.admin_url}…`;
+      return {
+        line: `Asking the node at ${n.admin_url}…`,
+        alert: false,
+        panels: false,
+      };
     case "absent":
-      return `No node at ${n.admin_url}.`;
+      return {
+        line: `No node at ${n.admin_url}.`,
+        alert: false,
+        panels: false,
+      };
     case "error":
-      return `${n.admin_url} does not answer as a node${
-        n.health.state === "error" ? `: ${n.health.message}` : "."
-      }`;
+      return {
+        line: `The node's health read failed: ${n.message}`,
+        alert: true,
+        panels: true,
+      };
     case "up":
-      return null;
+      return { line: null, alert: false, panels: true };
   }
+}
+
+/** How often the dashboard reads each source, in milliseconds. */
+export const POLL_MS = {
+  pulls: 1_000,
+  gateway: 2_000,
+  /** The node's health, status and metrics. */
+  nodeFast: 2_000,
+  /** The node's lanes, earnings, pools and slashes. */
+  nodeSlow: 15_000,
+} as const;
+
+/** A read missed this many polls before the page calls it stale. */
+const STALE_POLLS = 3;
+
+/**
+ * Seconds since a source was last read, once that is past three of its
+ * polls; null while it is current, or before its first read.
+ */
+export function staleSecs(
+  updatedUnixMs: number | null,
+  nowUnixMs: number,
+  pollMs: number,
+): number | null {
+  if (updatedUnixMs === null) return null;
+  const age = nowUnixMs - updatedUnixMs;
+  return age > STALE_POLLS * pollMs ? age / 1000 : null;
+}
+
+/** The stalest of `parts`, read every `pollMs`; null when all are current. */
+export function stalestSecs(
+  parts: { updated_unix_ms: number | null }[],
+  nowUnixMs: number,
+  pollMs: number,
+): number | null {
+  const ages = parts
+    .map((p) => staleSecs(p.updated_unix_ms, nowUnixMs, pollMs))
+    .filter((a) => a !== null);
+  return ages.length === 0 ? null : Math.max(...ages);
 }
 
 export interface PartNote {

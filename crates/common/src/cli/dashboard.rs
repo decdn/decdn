@@ -22,8 +22,10 @@ pub struct DashboardArgs {
     pub gateway: Url,
 
     /// File holding the gateway token that a loopback gateway's `/_status`
-    /// asks for. Defaults to `~/.decdn/gateway/token`. No file sends no
-    /// token, as a public gateway's `/_status` takes none.
+    /// asks for, read before each ask. Defaults to `~/.decdn/gateway/token`,
+    /// where no file sends no token, as a public gateway's `/_status` takes
+    /// none; a named file that cannot be read is an error. The token goes to
+    /// a loopback `--gateway` only.
     #[arg(long, value_name = "PATH")]
     pub gateway_token_file: Option<PathBuf>,
 

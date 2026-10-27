@@ -36,6 +36,7 @@ import type {
   Pointer,
   Pool,
   PoolSnapshot,
+  PullFields,
   PullRecord,
   Pulls,
   RecordStoreHealth,
@@ -47,6 +48,7 @@ import type {
   StatusResponse,
 } from "./api";
 import alone from "./fixtures/dashboard-alone.json";
+import failing from "./fixtures/dashboard-failing.json";
 import full from "./fixtures/dashboard-full.json";
 import loopback from "./fixtures/status-loopback.json";
 import poolError from "./fixtures/status-pool-error.json";
@@ -56,8 +58,9 @@ import {
   capabilities,
   earningsRows,
   gatewayLine,
+  gatewayShapeProblem,
   livePulls,
-  nodeLine,
+  nodeView,
   partNote,
   poolRows,
   pools,
@@ -153,6 +156,7 @@ const SNAPSHOT: Keys<PoolSnapshot> = { pools: true, delegate_lanes: true };
 
 const DASHBOARD: Keys<Status> = {
   version: true,
+  now_unix_ms: true,
   dashboard_built: true,
   started_unix: true,
   pulls: true,
@@ -165,16 +169,15 @@ const PULLS: Keys<Pulls> = {
   active: true,
   recent: true,
   unreadable: true,
+  error: true,
 };
-const PULL_RECORD: Keys<PullRecord> = {
+const PULL_FIELDS: Keys<PullFields> = {
   uri: true,
   kind: true,
   output: true,
   pid: true,
   started_unix_ms: true,
   updated_unix_ms: true,
-  finished_unix_ms: true,
-  state: true,
   received_bytes: true,
   expected_bytes: true,
   files_started: true,
@@ -182,8 +185,14 @@ const PULL_RECORD: Keys<PullRecord> = {
   paid: true,
   nodes: true,
   bundle: true,
-  error: true,
   stale: true,
+};
+const PULL_RECORD: Variants<PullRecord> = {
+  running: { ...PULL_FIELDS, state: true },
+  done: { ...PULL_FIELDS, state: true, finished_unix_ms: true },
+  interrupted: { ...PULL_FIELDS, state: true, finished_unix_ms: true },
+  failed: { ...PULL_FIELDS, state: true, finished_unix_ms: true, error: true },
+  gave_up: { ...PULL_FIELDS, state: true, finished_unix_ms: true, error: true },
 };
 const PAID: Keys<Paid> = { amount_micro_usdc: true, bytes: true };
 const NODE_PAID: Keys<NodePaid> = {
@@ -210,7 +219,7 @@ const GATEWAY: Variants<GatewaySection> = {
   error: { ...GATEWAY_BASE, message: true },
   up: { ...GATEWAY_BASE, status: true },
 };
-const NODE: Keys<NodeSection> = {
+const NODE_BASE = {
   admin_url: true,
   metrics_url: true,
   state: true,
@@ -221,6 +230,12 @@ const NODE: Keys<NodeSection> = {
   earnings: true,
   pools: true,
   slashes: true,
+} as const;
+const NODE: Variants<NodeSection> = {
+  waiting: NODE_BASE,
+  absent: NODE_BASE,
+  up: NODE_BASE,
+  error: { ...NODE_BASE, message: true },
 };
 const PART_BASE = { updated_unix_ms: true, state: true } as const;
 const PART: Variants<Part<unknown>> = {
@@ -384,13 +399,12 @@ function expectStatus(raw: unknown) {
   return s;
 }
 
-function expectPull(raw: unknown, where: string) {
-  expectShape(raw, PULL_RECORD, where);
-  const p = raw as PullRecord;
+/** A run's record: the keys of its state's variant, and only those. */
+function expectPull(raw: PullRecord, where: string) {
+  expect(Object.keys(PULL_RECORD)).toContain(raw.state);
+  expectShape(raw, PULL_RECORD[raw.state], where);
+  const p = raw;
   expect(["blob", "bundle", "entry"]).toContain(p.kind);
-  expect(["running", "done", "failed", "interrupted", "gave_up"]).toContain(
-    p.state,
-  );
   expectShape(p.paid, PAID, `${where}.paid`);
   p.nodes.forEach((n) => expectShape(n, NODE_PAID, `${where}.nodes[]`));
   if (p.bundle) expectShape(p.bundle, BUNDLE_COUNTS, `${where}.bundle`);
@@ -404,8 +418,8 @@ function expectPart<T>(raw: Part<T>, where: string, check: (value: T) => void) {
 }
 
 function expectNode(n: NodeSection) {
-  expectShape(n, NODE, "node");
-  expect(["waiting", "absent", "up", "error"]).toContain(n.state);
+  expect(Object.keys(NODE)).toContain(n.state);
+  expectShape(n, NODE[n.state], "node");
   expectPart(n.health, "node.health", (h) => {
     expectShape(h, HEALTH, "health");
     expect(["bound", "mismatch", "unbound", "unknown"]).toContain(h.binding);
@@ -456,8 +470,16 @@ function expectDashboard(raw: unknown) {
   expectShape(raw, DASHBOARD, "dashboard");
   const s = raw as Status;
   expectShape(s.pulls, PULLS, "pulls");
-  s.pulls.active.forEach((p) => expectPull(p, "pulls.active[]"));
-  s.pulls.recent.forEach((p) => expectPull(p, "pulls.recent[]"));
+  for (const p of s.pulls.active) {
+    expectPull(p, "pulls.active[]");
+    expect(p.state, "an active run").toBe("running");
+    // Counts are set once a run ended.
+    expect(p.bundle).toBeNull();
+  }
+  for (const p of s.pulls.recent) {
+    expectPull(p, "pulls.recent[]");
+    expect(p.state, "a recent run").not.toBe("running");
+  }
   expect(Object.keys(GATEWAY)).toContain(s.gateway.state);
   expectShape(s.gateway, GATEWAY[s.gateway.state], "gateway");
   expectNode(s.node);
@@ -475,12 +497,15 @@ describe("the dashboard's /_status fixtures", () => {
       ["9 of 12 files", false],
       [null, true],
     ]);
-    expect(recentPulls(s.pulls).map((p) => p.outcome)).toEqual([
-      "✓ Done",
-      "Interrupted",
-      "⛔ Failed",
+    expect(
+      recentPulls(s.pulls).map((p) => [p.outcome, p.durationSecs, p.error]),
+    ).toEqual([
+      ["✓ Done", 42, null],
+      ["Interrupted", 42, null],
+      ["⛔ Failed", 42, "no node holds the blob"],
     ]);
-    expect(nodeLine(s.node)).toBeNull();
+    expect(s.pulls.error).toBeNull();
+    expect(nodeView(s.node).line).toBeNull();
     expect(partNote(s.node.slashes)).toEqual({
       text: "slash detection is not configured",
       alert: false,
@@ -499,9 +524,26 @@ describe("the dashboard's /_status fixtures", () => {
     expect(gatewayLine(s.gateway)).toBe(
       "No gateway at http://127.0.0.1:8484/.",
     );
-    expect(nodeLine(s.node)).toBe("No node at http://127.0.0.1:9191.");
+    expect(nodeView(s.node)).toMatchObject({
+      line: "No node at http://127.0.0.1:9191.",
+      panels: false,
+    });
     expect(livePulls(s.pulls)).toEqual([]);
     expect(recentPulls(s.pulls)[0]?.outcome).toBe("⚠ Gave up");
+  });
+
+  it("match api.ts with every source failing, and keep the node reads that answered", () => {
+    const s = expectDashboard(failing);
+    expect(s.pulls.error).toContain("Permission denied");
+    expect(s.pulls.active).toEqual([]);
+    expect(gatewayLine(s.gateway)).toContain("connection reset by peer");
+    expect(nodeView(s.node)).toEqual({
+      line: "The node's health read failed: admin at http://127.0.0.1:9191 did not respond within 3000ms",
+      alert: true,
+      panels: true,
+    });
+    expect(s.node.status.state).toBe("ok");
+    expect(s.node.metrics.state).toBe("ok");
   });
 
   it("carry a gateway body the gateway's own contract accepts", () => {
@@ -510,6 +552,9 @@ describe("the dashboard's /_status fixtures", () => {
     expect(
       s.gateway.state === "up" && expectStatus(s.gateway.status).mode,
     ).toBe("loopback");
+    for (const body of [loopback, publicStatus, poolError]) {
+      expect(gatewayShapeProblem(body)).toBeNull();
+    }
   });
 });
 

@@ -105,9 +105,6 @@ export interface GatewayStatus {
 
 export type PullKind = "blob" | "bundle" | "entry";
 
-export type PullState =
-  "running" | "done" | "failed" | "interrupted" | "gave_up";
-
 export interface Paid {
   amount_micro_usdc: number;
   /** The wire bytes the amount pays for. */
@@ -119,7 +116,7 @@ export interface NodePaid extends Paid {
   provider: string;
 }
 
-/** A finished bundle run's counts, as its summary prints them. */
+/** An ended bundle run's counts, as its summary prints them. */
 export interface BundleCounts {
   fetched: number;
   linked: number;
@@ -132,7 +129,8 @@ export interface BundleCounts {
   reused_bytes: number;
 }
 
-export interface PullRecord {
+/** What every run's record carries, whatever its state. */
+export interface PullFields {
   uri: string;
   kind: PullKind;
   /** A file, a directory, or `-` for stdout. */
@@ -141,8 +139,6 @@ export interface PullRecord {
   started_unix_ms: number;
   /** The run's heartbeat. */
   updated_unix_ms: number;
-  finished_unix_ms: number | null;
-  state: PullState;
   received_bytes: number;
   /** Null until the run knows what it fetches. */
   expected_bytes: number | null;
@@ -150,11 +146,27 @@ export interface PullRecord {
   files_landed: number;
   paid: Paid;
   nodes: NodePaid[];
+  /** Set once a bundle run ended. */
   bundle: BundleCounts | null;
-  error: string | null;
   /** Says `running`, but its heartbeat stopped: it exited without a summary. */
   stale: boolean;
 }
+
+/** A run whose record says it is live. */
+export type RunningPull = PullFields & { state: "running" };
+
+/** A run that ended: when, and for a failure or a give-up, why. */
+export type EndedPull = PullFields &
+  (
+    | { state: "done"; finished_unix_ms: number }
+    | { state: "interrupted"; finished_unix_ms: number }
+    | { state: "failed"; finished_unix_ms: number; error: string }
+    | { state: "gave_up"; finished_unix_ms: number; error: string }
+  );
+
+export type PullRecord = RunningPull | EndedPull;
+
+export type PullState = PullRecord["state"];
 
 export interface Pulls {
   /** The directory the records live in. */
@@ -162,11 +174,13 @@ export interface Pulls {
   /** Null before the first read. */
   updated_unix_ms: number | null;
   /** Newest first. */
-  active: PullRecord[];
+  active: RunningPull[];
   /** Newest first. */
-  recent: PullRecord[];
+  recent: EndedPull[];
   /** Files in `dir` that did not read as a record. */
   unreadable: number;
+  /** Why `dir` cannot be listed; the lists are then empty. */
+  error: string | null;
 }
 
 /** The gateway at `--gateway`, as the dashboard last asked it. */
@@ -360,13 +374,20 @@ export type Part<T> = { updated_unix_ms: number | null } & (
   | { state: "error"; message: string }
 );
 
-/** Whether a node answers at the admin URL: what its health read says. */
-export type NodeState = "waiting" | "absent" | "up" | "error";
+/**
+ * Whether a node answers at the admin URL: what its health read says.
+ * `error`: the health read failed other than by a refused connection, and
+ * the other reads may still have answered.
+ */
+export type NodeState =
+  | { state: "waiting" }
+  | { state: "absent" }
+  | { state: "up" }
+  | { state: "error"; message: string };
 
-export interface NodeSection {
+export type NodeSection = {
   admin_url: string;
   metrics_url: string;
-  state: NodeState;
   health: Part<HealthResponse>;
   status: Part<StatusResponse>;
   metrics: Part<NodeMetrics>;
@@ -374,11 +395,14 @@ export interface NodeSection {
   earnings: Part<EarningsResponse>;
   pools: Part<BuyerPoolsResponse>;
   slashes: Part<SlashesResponse>;
-}
+} & NodeState;
 
 /** The dashboard's `/_status` body. */
 export interface Status {
   version: string;
+  /** When the dashboard answered: the clock every `updated_unix_ms` is
+   * measured against. */
+  now_unix_ms: number;
   /** Whether the binary embeds the page's build. */
   dashboard_built: boolean;
   started_unix: number;

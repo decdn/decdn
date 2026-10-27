@@ -4,7 +4,10 @@ import { offense } from "../view";
 import { Cell, Empty, PartPanel, Table } from "./Panel";
 
 /** Slashes against the node's operator, each with its appeal window. */
-export function NodeSlashes(props: { part: Part<SlashesResponse> }) {
+export function NodeSlashes(props: {
+  part: Part<SlashesResponse>;
+  stale: number | null;
+}) {
   return (
     <PartPanel
       title="Slashes"
@@ -14,6 +17,7 @@ export function NodeSlashes(props: { part: Part<SlashesResponse> }) {
         </>
       }
       part={props.part}
+      stale={props.stale}
     >
       {(s) =>
         s.slashes.length === 0 ? (

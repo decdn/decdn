@@ -28,6 +28,7 @@ const GATEWAY_NOTE =
 export function Pools(props: {
   title?: string;
   note?: string;
+  stale?: number | null;
   rows: PoolRow[];
   delegates: DelegateLanes[];
   skipped: string[];
@@ -38,6 +39,7 @@ export function Pools(props: {
     <Panel
       title={props.title ?? "Pools and lanes"}
       note={props.note ?? GATEWAY_NOTE}
+      stale={props.stale}
     >
       {props.error ? (
         <p role="alert" className="mb-3 text-sm text-critical-ink">

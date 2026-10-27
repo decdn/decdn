@@ -15,6 +15,9 @@ use super::super::node_top::{Snapshot, SnapshotDelta};
 pub(super) struct Status {
     /// The `decdn` version.
     pub(super) version: &'static str,
+    /// When the dashboard answered, Unix milliseconds: the clock each
+    /// section's `updated_unix_ms` is measured against.
+    pub(super) now_unix_ms: u64,
     /// Whether the binary embeds the page's build, not its fallback.
     pub(super) dashboard_built: bool,
     /// When the dashboard started, Unix seconds.
@@ -38,6 +41,8 @@ pub(super) struct PullsSection {
     pub(super) recent: Vec<PullView>,
     /// Files in the directory that did not read as a record.
     pub(super) unreadable: usize,
+    /// Why the directory cannot be listed; the lists are then empty.
+    pub(super) error: Option<String>,
 }
 
 /// One run's record, as the page shows it.
@@ -86,6 +91,7 @@ pub(super) struct NodeSection {
     /// The node's metrics URL.
     pub(super) metrics_url: String,
     /// Whether a node answers: what its health call says.
+    #[serde(flatten)]
     pub(super) state: NodeState,
     pub(super) health: Part<HealthResponse>,
     pub(super) status: Part<StatusResponse>,
@@ -97,8 +103,8 @@ pub(super) struct NodeSection {
 }
 
 /// Whether a node answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub(super) enum NodeState {
     /// Not asked yet.
     Waiting,
@@ -106,8 +112,10 @@ pub(super) enum NodeState {
     Absent,
     /// The node answers.
     Up,
-    /// The admin URL answers, but not as a node does.
-    Error,
+    /// The health call failed other than by a refused connection: no answer
+    /// in time, or an answer that is not a node's. The other reads may still
+    /// have answered.
+    Error { message: String },
 }
 
 /// One of the node's reads, as the dashboard last made it.
@@ -115,9 +123,9 @@ pub(super) enum NodeState {
 pub(super) struct Part<T> {
     /// When the read was last made, Unix milliseconds; `None` before the
     /// first.
-    pub(super) updated_unix_ms: Option<u64>,
+    updated_unix_ms: Option<u64>,
     #[serde(flatten)]
-    pub(super) read: Read<T>,
+    read: Read<T>,
 }
 
 impl<T> Part<T> {
@@ -127,6 +135,19 @@ impl<T> Part<T> {
             updated_unix_ms: None,
             read: Read::Waiting,
         }
+    }
+
+    /// A read made now that gave `read`.
+    pub(super) fn now(read: Read<T>) -> Self {
+        Self {
+            updated_unix_ms: Some(super::super::activity::now_ms()),
+            read,
+        }
+    }
+
+    /// What the read gave.
+    pub(super) const fn read(&self) -> &Read<T> {
+        &self.read
     }
 }
 

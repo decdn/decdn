@@ -90,22 +90,23 @@ It has three sections:
 
 | Section | Source | Shown |
 |---------|--------|-------|
-| Pulls | The record each `decdn get` run writes in `~/.decdn/activity/pulls/`. | Always. |
+| Pulls | The record each `decdn get` run writes in `~/.decdn/activity/pulls/`. | When the home directory is known. |
 | Gateway | `GET /_status` of the gateway at `--gateway` ([Gateway § State](appendix-gateway.md#state)). The default is `http://127.0.0.1:8484`. | When the gateway answers. |
 | Node | The admin RPC and `/metrics` of the node, found as `decdn node status` and `decdn node top` find them. | When the node answers. |
 
-The page reads nothing from another origin. The dashboard process reads
-every source. The page reads only the dashboard's own `GET /_status`. Thus
-the gateway grants no cross-origin read, and a browser never reaches the
-node's admin port, which has no authentication. A loopback gateway's
-`/_status` needs the gateway token. The dashboard reads it from
-`--gateway-token-file`, by default `~/.decdn/gateway/token`. A gateway on
-another host is read through a tunnel to its `--metrics-listen` address.
-The tunnel keeps the same port on both ends, because the listener refuses a
-`Host` that is not its own.
+The gateway grants no cross-origin read. The node's admin port has no
+authentication. Thus the dashboard process reads every source, and the page
+reads only the dashboard's own `GET /_status`. A browser never reaches the
+node's admin port. A loopback gateway's `/_status` needs the gateway token.
+The dashboard reads it from `--gateway-token-file`, by default
+`~/.decdn/gateway/token`, before each read. The dashboard sends the token to
+a loopback address only, and it follows no redirect. To read a gateway on
+another host, open a tunnel to its `--metrics-listen` address. Use the same
+port on both ends, because the listener refuses a `Host` that is not its
+own.
 
-The dashboard reads each source at a fixed rate, whatever the number of
-pages open. It reads the pull records every second and the gateway every 2
+The dashboard reads each source at a fixed rate. The number of open pages
+does not change the rate. It reads the pull records every second and the gateway every 2
 seconds. It reads the node's health, status and `/metrics` every 2
 seconds. It reads the node's lanes, earnings, buyer pools and slashes every
 15 seconds, because `lanes` can read the chain and `earnings` reads the
@@ -119,15 +120,16 @@ the state, the bytes verified, what the run paid to each node and, at the
 end, the result. The run writes the whole file again every second, through a
 temporary file and a rename. Thus a reader never sees a partial record. The
 directory is the same for every `--data-dir`, so one page shows every run on
-the host. A run that cannot write its record continues the pull. A run that
-exits before its last write leaves a `running` record. The dashboard shows a
-`running` record that is older than 10 seconds as a run that stopped without
-a summary. Each run deletes the oldest records when it starts, and keeps 200.
-A `--dry-run` writes no record.
+the host. A run that cannot write its record continues the pull, and warns
+once. A run that exits before its last write leaves a `running` record. The
+dashboard shows a `running` record whose last write is more than 10 seconds
+old as a run that stopped without a summary. Each run deletes the oldest
+records when it starts, and keeps 200. A `--dry-run` writes no record.
 
 The dashboard's `/_status` needs the dashboard's own token in
-`x-decdn-token`. The token is in `~/.decdn/dashboard/token`. The page shows
-earnings and pool balances, so another local user must not read it. The
+`x-decdn-token`. The token is in `token` under `--data-dir`, by default
+`~/.decdn/dashboard/token`. The page shows earnings and pool balances, so
+another local user must not read `/_status`. The
 token reaches the page in the fragment of the link that `decdn dashboard`
 prints: `http://<listen>/#token=<token>`. A browser does not send a fragment
 to the server. The page moves the token to session storage and removes the

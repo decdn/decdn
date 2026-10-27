@@ -1299,3 +1299,34 @@ fn offline_config() -> std::path::PathBuf {
     });
     dir.path().join("config.toml")
 }
+
+/// A bundle run reports to its dashboard record through the observer: the
+/// planned download, each blob's position, and the counts at its end.
+#[tokio::test]
+async fn the_observer_feeds_the_runs_record() {
+    use std::str::FromStr as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let text = format!("decdn:{}/", "ab".repeat(32));
+    let uri = DecdnUri::from_str(&text).unwrap();
+    let evidence = Arc::new(ReceiptEvidence::new());
+    let activity =
+        ActivityRecorder::start_in(dir.path(), &uri, &text, Path::new("."), &evidence).unwrap();
+    let observer = PullObserver::new(true, "pull".to_owned(), Some(Arc::clone(&activity)));
+    observer.run_started(Some(100), Some(120));
+    observer
+        .file_started(&["a.bin".to_owned()], 60, 0)
+        .delivered(40, 60);
+    let mut report = BundleReport::default();
+    report.fetched = 1;
+    observer.record_counts(&report, 2);
+    activity.finish(&Ok(()), None).await;
+
+    let (records, _) = crate::commands::activity::read_records(dir.path()).unwrap();
+    let record = records.first().unwrap();
+    assert_eq!(record.expected_bytes, Some(100));
+    assert_eq!(record.received_bytes, 40);
+    assert_eq!(record.files_started, 1);
+    let counts = record.bundle.unwrap();
+    assert_eq!((counts.fetched, counts.excluded), (1, 2));
+}

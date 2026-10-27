@@ -41,12 +41,16 @@ function Last(props: { e: EarningsResponse }) {
 }
 
 /** What the node was paid, per period, and what it is still owed. */
-export function NodeEarnings(props: { part: Part<EarningsResponse> }) {
+export function NodeEarnings(props: {
+  part: Part<EarningsResponse>;
+  stale: number | null;
+}) {
   return (
     <PartPanel
       title="Earnings"
       note="Net of the fee split, from the node's settlement ledger"
       part={props.part}
+      stale={props.stale}
     >
       {(e) => (
         <div className="flex flex-col gap-3">

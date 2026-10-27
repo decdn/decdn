@@ -26,8 +26,11 @@ export default defineConfig({
     },
   },
   server: {
-    // `decdn dashboard` on its default address answers the API.
-    proxy: { "/_status": "http://127.0.0.1:8485" },
+    // `decdn dashboard` on its default address answers the API. It refuses
+    // a `Host` other than its own, so the proxy rewrites it.
+    proxy: {
+      "/_status": { target: "http://127.0.0.1:8485", changeOrigin: true },
+    },
   },
   test: {
     include: ["src/**/*.test.ts"],

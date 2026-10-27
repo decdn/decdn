@@ -1,17 +1,31 @@
 import type { ReactNode } from "react";
 import type { Part } from "../api";
+import { formatDuration } from "../format";
 import { partNote, type Severity } from "../view";
+
+/** Says a source was last read `secs` ago, when that is long; else nothing. */
+export function Stale(props: { secs: number | null | undefined }) {
+  if (props.secs === null || props.secs === undefined) return null;
+  return (
+    <span role="status" className="text-xs font-medium text-critical-ink">
+      ⚠ last read {formatDuration(props.secs)} ago
+    </span>
+  );
+}
 
 /** One source's panels under its name: pulls, the gateway, the node. */
 export function Group(props: {
   title: string;
   note?: ReactNode;
+  stale?: number | null;
   children: ReactNode;
 }) {
   return (
     <section aria-label={props.title} className="flex flex-col gap-4">
       <header className="flex flex-wrap items-baseline justify-between gap-2 border-b border-line pb-1">
-        <h2 className="text-lg font-semibold">{props.title}</h2>
+        <h2 className="flex items-baseline gap-2 text-lg font-semibold">
+          {props.title} <Stale secs={props.stale} />
+        </h2>
         {props.note ? <p className="text-sm text-ink-2">{props.note}</p> : null}
       </header>
       {props.children}
@@ -23,12 +37,15 @@ export function Group(props: {
 export function Panel(props: {
   title: string;
   note?: ReactNode;
+  stale?: number | null;
   children: ReactNode;
 }) {
   return (
     <section className="rounded-lg border border-line bg-surface p-4">
       <header className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
-        <h3 className="text-base font-semibold">{props.title}</h3>
+        <h3 className="flex items-baseline gap-2 text-base font-semibold">
+          {props.title} <Stale secs={props.stale} />
+        </h3>
         {props.note ? <p className="text-sm text-ink-3">{props.note}</p> : null}
       </header>
       {props.children}
@@ -144,12 +161,17 @@ export function PartLine(props: { part: Part<unknown>; what?: string }) {
 export function PartPanel<T>(props: {
   title: string;
   note?: ReactNode;
+  stale?: number | null;
   part: Part<T>;
   children: (value: T) => ReactNode;
 }) {
   const part = props.part;
   return (
-    <Panel title={props.title} note={part.state === "ok" ? props.note : null}>
+    <Panel
+      title={props.title}
+      note={part.state === "ok" ? props.note : null}
+      stale={props.stale}
+    >
       {part.state === "ok" ? (
         props.children(part.value)
       ) : (

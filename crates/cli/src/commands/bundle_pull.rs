@@ -1139,7 +1139,7 @@ impl BundleObserver for PullObserver {
             None => PullProgress::disabled().file_bar(&label, download_total, reconstruct_total),
         };
         match &self.activity {
-            Some(activity) => activity.file_started(Arc::new(bar)),
+            Some(activity) => activity.file_started(paths, Arc::new(bar)),
             None => Arc::new(bar),
         }
     }

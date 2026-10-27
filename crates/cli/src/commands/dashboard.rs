@@ -14,7 +14,8 @@
 //! nothing from another origin: the gateway grants no cross-origin read, and
 //! the node's unauthenticated admin port never meets a browser.
 //!
-//! `/_status` takes the dashboard's own token, in `~/.decdn/dashboard/token`:
+//! `/_status` takes the dashboard's own token, in `token` under `--data-dir`
+//! (by default `~/.decdn/dashboard/token`):
 //! the page shows node earnings and pool balances that another local user
 //! must not read. The link the command prints hands the token to the page in
 //! its fragment. A `Host` other than the listener's own loopback names is
@@ -51,8 +52,9 @@ use status::Status;
 ///
 /// # Errors
 ///
-/// The node's URLs cannot be resolved, the token cannot be read or made, or
-/// the listener cannot bind.
+/// The node's URLs cannot be resolved, the data dir or the token cannot be
+/// read or made, `/_status` cannot be joined to `--gateway`, a client cannot
+/// be built, or the listener cannot bind.
 pub async fn dashboard(args: &DashboardArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let config_path = args.config.as_deref().or(config_path);
     let admin_url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
@@ -74,6 +76,7 @@ pub async fn dashboard(args: &DashboardArgs, config_path: Option<&Path>) -> anyh
         pulls_dir: super::activity::pulls_dir(),
         gateway: args.gateway.clone(),
         gateway_token_file: token_file,
+        gateway_token_named: args.gateway_token_file.is_some(),
         admin_url,
         metrics_url,
     };
@@ -156,6 +159,7 @@ impl Dashboard {
     fn status(&self) -> Status {
         Status {
             version: env!("CARGO_PKG_VERSION"),
+            now_unix_ms: super::activity::now_ms(),
             dashboard_built: embed::built(),
             started_unix: self.started_unix,
             pulls: snapshot(&self.sources.pulls),
@@ -172,9 +176,19 @@ fn snapshot<T: Clone>(lock: &RwLock<T>) -> T {
 /// Accept connections on `listener` until Ctrl-C.
 async fn serve(dashboard: &Arc<Dashboard>, listener: &TcpListener) -> anyhow::Result<()> {
     loop {
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => accepted.context("accept a connection")?,
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
             _ = tokio::signal::ctrl_c() => return Ok(()),
+        };
+        // A failed accept (a full descriptor table) passes: the listener
+        // still serves the next connection.
+        let (stream, _) = match accepted {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::warn!("the dashboard did not accept a connection: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let dashboard = Arc::clone(dashboard);
         tokio::spawn(async move {

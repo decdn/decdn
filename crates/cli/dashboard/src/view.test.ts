@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 import type {
   EarningsPeriod,
   GatewayStatus,
+  EndedPull,
   NodeSection,
-  PullRecord,
+  NodeState,
+  PullFields,
   Pulls,
+  RunningPull,
 } from "./api";
 import {
   buckets,
@@ -12,13 +15,16 @@ import {
   earningsRows,
   gatewayLine,
   livePulls,
-  nodeLine,
+  gatewayShapeProblem,
+  nodeView,
   offense,
   partNote,
   partValue,
   pools,
   recentPulls,
   severity,
+  staleSecs,
+  stalestSecs,
 } from "./view";
 
 const signer = "0xAbCdEf0000000000000000000000000000000001";
@@ -222,7 +228,7 @@ describe("severity", () => {
   });
 });
 
-function record(overrides: Partial<PullRecord> = {}): PullRecord {
+function fields(overrides: Partial<PullFields> = {}): PullFields {
   return {
     uri: "decdn:aa",
     kind: "blob",
@@ -230,8 +236,6 @@ function record(overrides: Partial<PullRecord> = {}): PullRecord {
     pid: 7,
     started_unix_ms: 1_000_000,
     updated_unix_ms: 1_030_000,
-    finished_unix_ms: null,
-    state: "running",
     received_bytes: 0,
     expected_bytes: null,
     files_started: 0,
@@ -239,11 +243,15 @@ function record(overrides: Partial<PullRecord> = {}): PullRecord {
     paid: { amount_micro_usdc: 0, bytes: 0 },
     nodes: [],
     bundle: null,
-    error: null,
     stale: false,
     ...overrides,
   };
 }
+
+const record = (overrides: Partial<PullFields> = {}): RunningPull => ({
+  ...fields(overrides),
+  state: "running",
+});
 
 function pulls(overrides: Partial<Pulls> = {}): Pulls {
   return {
@@ -252,6 +260,7 @@ function pulls(overrides: Partial<Pulls> = {}): Pulls {
     active: [],
     recent: [],
     unreadable: 0,
+    error: null,
     ...overrides,
   };
 }
@@ -297,21 +306,30 @@ describe("recentPulls", () => {
     const rows = recentPulls(
       pulls({
         recent: [
-          record({ state: "done", finished_unix_ms: 1_042_000 }),
-          record({ state: "failed", error: "no node holds the blob" }),
-          record({ state: "gave_up" }),
-        ],
+          { ...fields(), state: "done", finished_unix_ms: 1_042_000 },
+          {
+            ...fields(),
+            state: "failed",
+            finished_unix_ms: 1_005_000,
+            error: "no node holds the blob",
+          },
+          {
+            ...fields(),
+            state: "gave_up",
+            finished_unix_ms: 1_090_000,
+            error: "no progress",
+          },
+          { ...fields(), state: "interrupted", finished_unix_ms: 1_001_000 },
+        ] satisfies EndedPull[],
       }),
     );
-    expect(rows.map((r) => [r.outcome, r.tone])).toEqual([
-      ["✓ Done", "ok"],
-      ["⛔ Failed", "critical"],
-      ["⚠ Gave up", "critical"],
+    expect(rows.map((r) => [r.outcome, r.tone, r.error])).toEqual([
+      ["✓ Done", "ok", null],
+      ["⛔ Failed", "critical", "no node holds the blob"],
+      ["⚠ Gave up", "critical", "no progress"],
+      ["Interrupted", "muted", null],
     ]);
-    expect(rows[0]?.durationSecs).toBe(42);
-    // No end recorded: the last heartbeat.
-    expect(rows[1]?.durationSecs).toBe(30);
-    expect(rows[1]?.error).toBe("no node holds the blob");
+    expect(rows.map((r) => r.durationSecs)).toEqual([42, 5, 90, 1]);
   });
 });
 
@@ -334,11 +352,14 @@ describe("gatewayLine", () => {
 
 const waiting = { updated_unix_ms: null, state: "waiting" } as const;
 
-function node(overrides: Partial<NodeSection> = {}): NodeSection {
+function node(
+  state: NodeState,
+  overrides: { health?: NodeSection["health"] } = {},
+): NodeSection {
   return {
     admin_url: "http://127.0.0.1:9191",
     metrics_url: "http://127.0.0.1:9090/metrics",
-    state: "waiting",
+    ...state,
     health: waiting,
     status: waiting,
     metrics: waiting,
@@ -350,20 +371,85 @@ function node(overrides: Partial<NodeSection> = {}): NodeSection {
   };
 }
 
-describe("nodeLine", () => {
-  it("says no node is there, or what the admin URL answered instead", () => {
-    expect(nodeLine(node({ state: "absent" }))).toBe(
-      "No node at http://127.0.0.1:9191.",
-    );
-    expect(
-      nodeLine(
-        node({
-          state: "error",
-          health: { updated_unix_ms: 1, state: "error", message: "404" },
-        }),
+describe("nodeView", () => {
+  it("shows no panels while no node answers", () => {
+    expect(nodeView(node({ state: "absent" }))).toEqual({
+      line: "No node at http://127.0.0.1:9191.",
+      alert: false,
+      panels: false,
+    });
+    expect(nodeView(node({ state: "waiting" })).panels).toBe(false);
+  });
+
+  it("keeps the panels on a failed health read, with its message above them", () => {
+    const view = nodeView(
+      node(
+        { state: "error", message: "did not respond within 3000ms" },
+        // Its own message, which the view does not read.
+        { health: { updated_unix_ms: 1, state: "error", message: "other" } },
       ),
-    ).toBe("http://127.0.0.1:9191 does not answer as a node: 404");
-    expect(nodeLine(node({ state: "up" }))).toBeNull();
+    );
+    expect(view).toEqual({
+      line: "The node's health read failed: did not respond within 3000ms",
+      alert: true,
+      panels: true,
+    });
+  });
+
+  it("says nothing above the panels of a node that answers", () => {
+    expect(nodeView(node({ state: "up" }))).toEqual({
+      line: null,
+      alert: false,
+      panels: true,
+    });
+  });
+});
+
+describe("staleSecs and stalestSecs", () => {
+  const now = 1_000_000;
+
+  it("flag a read older than three of its polls, in seconds", () => {
+    expect(staleSecs(now - 6_000, now, 2_000)).toBeNull();
+    expect(staleSecs(now - 6_001, now, 2_000)).toBe(6.001);
+    expect(staleSecs(now - 40_000, now, 15_000)).toBeNull();
+    expect(staleSecs(now - 50_000, now, 15_000)).toBe(50);
+  });
+
+  it("flag nothing before the first read", () => {
+    expect(staleSecs(null, now, 1_000)).toBeNull();
+  });
+
+  it("take the stalest of several reads", () => {
+    const at = (ms: number | null) => ({ updated_unix_ms: ms });
+    expect(stalestSecs([at(now), at(null)], now, 2_000)).toBeNull();
+    expect(
+      stalestSecs([at(now - 10_000), at(now - 20_000), at(now)], now, 2_000),
+    ).toBe(20);
+  });
+});
+
+describe("gatewayShapeProblem", () => {
+  it("passes a gateway body the panels can read", () => {
+    expect(gatewayShapeProblem(status())).toBeNull();
+  });
+
+  it("names what a body of another shape lacks", () => {
+    expect(gatewayShapeProblem("busy")).toBe("the body is not an object");
+    expect(gatewayShapeProblem({ ...status(), mode: "other" })).toBe(
+      "it names no mode",
+    );
+    expect(gatewayShapeProblem({ ...status(), counters: null })).toBe(
+      "it has no counters",
+    );
+    expect(gatewayShapeProblem({ ...status(), capabilities: undefined })).toBe(
+      "capabilities is not a list",
+    );
+    expect(gatewayShapeProblem({ ...status(), allowance: {} })).toBe(
+      "allowance is not a list",
+    );
+    expect(gatewayShapeProblem({ ...status(), pools: { pools: [] } })).toBe(
+      "pools is not a pool snapshot",
+    );
   });
 });
 

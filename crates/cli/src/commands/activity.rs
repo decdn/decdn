@@ -14,10 +14,11 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alloy::primitives::Address;
 use anyhow::Context as _;
 use decdn_client::GaveUp;
 use decdn_client::bundle::{BundleReport, FileObserver};
@@ -61,20 +62,62 @@ pub(crate) enum PullKind {
     Entry,
 }
 
-/// Where a run is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Where a run is. A run that ended carries when, and a run that failed or
+/// gave up carries why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum PullState {
     /// The run is live, or exited without its last write.
     Running,
     /// The run succeeded.
-    Done,
-    /// The run failed.
-    Failed,
+    Done {
+        /// When the run ended, Unix milliseconds.
+        finished_unix_ms: u64,
+    },
     /// Ctrl-C stopped the run.
-    Interrupted,
+    Interrupted {
+        /// When the run ended, Unix milliseconds.
+        finished_unix_ms: u64,
+    },
+    /// The run failed.
+    Failed {
+        /// When the run ended, Unix milliseconds.
+        finished_unix_ms: u64,
+        /// Why.
+        error: String,
+    },
     /// The run gave up after its no-progress limit.
-    GaveUp,
+    GaveUp {
+        /// When the run ended, Unix milliseconds.
+        finished_unix_ms: u64,
+        /// Why.
+        error: String,
+    },
+}
+
+impl PullState {
+    /// Whether the record says the run is live.
+    pub(crate) const fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    /// The state a run that ended at `finished_unix_ms` with `result` records.
+    fn ended(result: &anyhow::Result<()>, finished_unix_ms: u64) -> Self {
+        match result {
+            Ok(()) => Self::Done { finished_unix_ms },
+            Err(e) if e.downcast_ref::<Interrupted>().is_some() => {
+                Self::Interrupted { finished_unix_ms }
+            }
+            Err(e) if e.downcast_ref::<GaveUp>().is_some() => Self::GaveUp {
+                finished_unix_ms,
+                error: sanitize_err_chain(e),
+            },
+            Err(e) => Self::Failed {
+                finished_unix_ms,
+                error: sanitize_err_chain(e),
+            },
+        }
+    }
 }
 
 /// What a run paid, in total or to one node.
@@ -162,15 +205,14 @@ pub(crate) struct PullRecord {
     pub(crate) started_unix_ms: u64,
     /// The last write, Unix milliseconds: the run's heartbeat.
     pub(crate) updated_unix_ms: u64,
-    /// When the run ended, Unix milliseconds; `None` while it runs.
-    pub(crate) finished_unix_ms: Option<u64>,
     /// Where the run is.
+    #[serde(flatten)]
     pub(crate) state: PullState,
     /// Content bytes verified so far.
     pub(crate) received_bytes: u64,
     /// The content bytes the run plans to fetch; `None` until known.
     pub(crate) expected_bytes: Option<u64>,
-    /// Blobs a bundle run started.
+    /// Distinct blobs a bundle run started.
     pub(crate) files_started: u64,
     /// Blobs a bundle run landed.
     pub(crate) files_landed: u64,
@@ -178,18 +220,15 @@ pub(crate) struct PullRecord {
     pub(crate) paid: Paid,
     /// What each node was paid, merged per node.
     pub(crate) nodes: Vec<NodePaid>,
-    /// A finished bundle run's counts.
+    /// A bundle run's counts, once it ended.
     pub(crate) bundle: Option<BundleCounts>,
-    /// Why the run failed, gave up or stopped.
-    pub(crate) error: Option<String>,
 }
 
 impl PullRecord {
     /// Whether the record says `running` but its heartbeat stopped
     /// [`STALE_AFTER`] before `now_ms`.
     pub(crate) fn is_stale(&self, now_ms: u64) -> bool {
-        self.state == PullState::Running
-            && now_ms.saturating_sub(self.updated_unix_ms) > millis(STALE_AFTER)
+        self.state.is_running() && now_ms.saturating_sub(self.updated_unix_ms) > millis(STALE_AFTER)
     }
 }
 
@@ -199,24 +238,35 @@ pub(crate) struct ActivityRecorder {
     path: PathBuf,
     record: Mutex<PullRecord>,
     received: AtomicU64,
-    /// Each started blob's last reported position: a bundle blob reports its
-    /// whole position on every fetch, so positions replace, never add.
-    files: Mutex<HashMap<usize, u64>>,
+    /// Each started blob's last reported position, by the first path it
+    /// lands at. A bundle blob reports its whole position on every fetch, and
+    /// a second pass after a pool replacement starts it again, so positions
+    /// replace, never add.
+    files: Mutex<HashMap<String, u64>>,
+    /// A bundle run's counts, held until [`Self::finish`] writes them with
+    /// the run's end.
+    counts: Mutex<Option<BundleCounts>>,
     evidence: Arc<ReceiptEvidence>,
     ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Whether a heartbeat write failed already: the first failure warns, the
+    /// rest log quietly.
+    write_failed: AtomicBool,
 }
 
 impl ActivityRecorder {
     /// Start the record of a run of `uri` that writes to `output` and pays
-    /// through `evidence`, in [`pulls_dir`]. `None`, with a log line, when the
-    /// directory cannot be made.
+    /// through `evidence`, in [`pulls_dir`]. `None`, with a log line, when
+    /// there is no home directory or the record cannot be started.
     pub(crate) fn start(
         uri: &DecdnUri,
         uri_text: &str,
         output: &Path,
         evidence: &Arc<ReceiptEvidence>,
     ) -> Option<Arc<Self>> {
-        let dir = pulls_dir()?;
+        let Some(dir) = pulls_dir() else {
+            tracing::debug!("no dashboard record for this run: no home directory");
+            return None;
+        };
         Self::start_in(&dir, uri, uri_text, output, evidence)
             .inspect_err(|e| tracing::warn!("no dashboard record for this run: {e:#}"))
             .ok()
@@ -248,7 +298,6 @@ impl ActivityRecorder {
                 pid,
                 started_unix_ms: now,
                 updated_unix_ms: now,
-                finished_unix_ms: None,
                 state: PullState::Running,
                 received_bytes: 0,
                 expected_bytes: None,
@@ -257,12 +306,13 @@ impl ActivityRecorder {
                 paid: Paid::default(),
                 nodes: Vec::new(),
                 bundle: None,
-                error: None,
             }),
             received: AtomicU64::new(0),
             files: Mutex::new(HashMap::new()),
+            counts: Mutex::new(None),
             evidence: Arc::clone(evidence),
             ticker: Mutex::new(None),
+            write_failed: AtomicBool::new(false),
         });
         recorder.write()?;
         let ticking = Arc::clone(&recorder);
@@ -288,7 +338,14 @@ impl ActivityRecorder {
             }
             beat = beat.wrapping_add(1);
             if let Err(e) = self.write() {
-                tracing::debug!("dashboard record not written: {e:#}");
+                if self.write_failed.swap(true, Ordering::Relaxed) {
+                    tracing::debug!("dashboard record not written: {e:#}");
+                } else {
+                    tracing::warn!(
+                        "dashboard record not written, so the dashboard shows this run as \
+                         stopped: {e:#}"
+                    );
+                }
             }
         }
     }
@@ -304,20 +361,27 @@ impl ActivityRecorder {
         self.update(|r| r.expected_bytes = download_total);
     }
 
-    /// A bundle blob starts; the returned observer reports its position here
-    /// and to `inner`.
+    /// A bundle blob that lands at `paths` starts; the returned observer
+    /// reports its position here and to `inner`. A blob started again, in a
+    /// second pass, counts once.
     pub(crate) fn file_started(
         self: &Arc<Self>,
+        paths: &[String],
         inner: Arc<dyn FileObserver>,
     ) -> Arc<dyn FileObserver> {
-        let mut slot = 0;
-        self.update(|r| {
-            slot = usize::try_from(r.files_started).unwrap_or(usize::MAX);
-            r.files_started = r.files_started.saturating_add(1);
-        });
+        let key = paths.first().cloned().unwrap_or_default();
+        let first = self
+            .files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.clone(), 0)
+            .is_none();
+        if first {
+            self.update(|r| r.files_started = r.files_started.saturating_add(1));
+        }
         Arc::new(RecordedFile {
             recorder: Arc::clone(self),
-            slot,
+            key,
             inner,
         })
     }
@@ -327,14 +391,14 @@ impl ActivityRecorder {
         self.update(|r| r.files_landed = r.files_landed.saturating_add(1));
     }
 
-    /// A finished bundle run's counts.
+    /// A bundle run's counts, which [`Self::finish`] writes with its end.
     pub(crate) fn bundle_counts(&self, counts: BundleCounts) {
-        self.update(|r| r.bundle = Some(counts));
+        *self.counts.lock().unwrap_or_else(PoisonError::into_inner) = Some(counts);
     }
 
-    fn file_delivered(&self, slot: usize, received: u64) {
+    fn file_delivered(&self, key: &str, received: u64) {
         let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
-        files.insert(slot, received);
+        files.insert(key.to_owned(), received);
         let total = files.values().fold(0u64, |acc, n| acc.saturating_add(*n));
         self.received.store(total, Ordering::Relaxed);
     }
@@ -346,13 +410,16 @@ impl ActivityRecorder {
         result: &anyhow::Result<()>,
         summary: Option<ReceiptSummary>,
     ) {
-        if let Some(ticker) = self
+        // The ticker may be inside a write on another worker, which an abort
+        // does not stop: wait for it to end, so the last write is this one.
+        let ticker = self
             .ticker
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        if let Some(ticker) = ticker {
             ticker.abort();
+            let _ = ticker.await;
         }
         match summary {
             Some(summary) => self.update(|r| {
@@ -368,10 +435,15 @@ impl ActivityRecorder {
             }),
             None => self.set_paid_from_lanes(&self.evidence.lanes().await),
         }
+        let counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         let now = now_ms();
         self.update(|r| {
-            r.finished_unix_ms = Some(now);
-            (r.state, r.error) = outcome(result);
+            r.bundle = counts;
+            r.state = PullState::ended(result, now);
         });
         if let Err(e) = self.write() {
             tracing::warn!("dashboard record not written: {e:#}");
@@ -379,28 +451,7 @@ impl ActivityRecorder {
     }
 
     fn set_paid_from_lanes(&self, lanes: &[ReceiptLane]) {
-        let mut nodes: Vec<NodePaid> = Vec::new();
-        for lane in lanes {
-            let paid = lane.paid();
-            let provider = lane.provider.to_checksum(None);
-            match nodes.iter_mut().find(|n| n.provider == provider) {
-                Some(node) => {
-                    node.paid.amount_micro_usdc =
-                        node.paid.amount_micro_usdc.saturating_add(paid.amount);
-                    node.paid.bytes = node.paid.bytes.saturating_add(paid.bytes);
-                }
-                None => nodes.push(NodePaid {
-                    provider,
-                    paid: paid.into(),
-                }),
-            }
-        }
-        let total = nodes.iter().fold(Paid::default(), |acc, n| Paid {
-            amount_micro_usdc: acc
-                .amount_micro_usdc
-                .saturating_add(n.paid.amount_micro_usdc),
-            bytes: acc.bytes.saturating_add(n.paid.bytes),
-        });
+        let (total, nodes) = paid_per_node(lanes.iter().map(|l| (l.provider, l.paid())));
         self.update(|r| {
             r.paid = total;
             r.nodes = nodes;
@@ -430,29 +481,44 @@ impl ActivityRecorder {
     }
 }
 
-/// The state and error a finished run's `result` records.
-fn outcome(result: &anyhow::Result<()>) -> (PullState, Option<String>) {
-    match result {
-        Ok(()) => (PullState::Done, None),
-        Err(e) if e.downcast_ref::<Interrupted>().is_some() => (PullState::Interrupted, None),
-        Err(e) if e.downcast_ref::<GaveUp>().is_some() => {
-            (PullState::GaveUp, Some(sanitize_err_chain(e)))
+/// The total of what `paid` lists, and the list merged per node in first-seen
+/// order.
+fn paid_per_node(paid: impl Iterator<Item = (Address, ReceiptAmount)>) -> (Paid, Vec<NodePaid>) {
+    let mut nodes: Vec<NodePaid> = Vec::new();
+    for (provider, amount) in paid {
+        let provider = provider.to_checksum(None);
+        match nodes.iter_mut().find(|n| n.provider == provider) {
+            Some(node) => {
+                node.paid.amount_micro_usdc =
+                    node.paid.amount_micro_usdc.saturating_add(amount.amount);
+                node.paid.bytes = node.paid.bytes.saturating_add(amount.bytes);
+            }
+            None => nodes.push(NodePaid {
+                provider,
+                paid: amount.into(),
+            }),
         }
-        Err(e) => (PullState::Failed, Some(sanitize_err_chain(e))),
     }
+    let total = nodes.iter().fold(Paid::default(), |acc, n| Paid {
+        amount_micro_usdc: acc
+            .amount_micro_usdc
+            .saturating_add(n.paid.amount_micro_usdc),
+        bytes: acc.bytes.saturating_add(n.paid.bytes),
+    });
+    (total, nodes)
 }
 
 /// A bundle blob's observer that also reports its position to the run's
 /// record.
 struct RecordedFile {
     recorder: Arc<ActivityRecorder>,
-    slot: usize,
+    key: String,
     inner: Arc<dyn FileObserver>,
 }
 
 impl FileObserver for RecordedFile {
     fn delivered(&self, received: u64, expected: u64) {
-        self.recorder.file_delivered(self.slot, received);
+        self.recorder.file_delivered(&self.key, received);
         self.inner.delivered(received, expected);
     }
 
@@ -478,49 +544,64 @@ impl FileObserver for RecordedFile {
 }
 
 /// Every record in `dir`, newest first, and how many files there did not
-/// read as one.
-pub(crate) fn read_records(dir: &Path) -> (Vec<PullRecord>, usize) {
+/// read as one. A directory that does not exist holds none.
+///
+/// # Errors
+///
+/// The directory exists but cannot be listed.
+pub(crate) fn read_records(dir: &Path) -> std::io::Result<(Vec<PullRecord>, usize)> {
     let mut records = Vec::new();
     let mut unreadable = 0;
-    for path in record_files(dir) {
-        match std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PullRecord>(&bytes).ok())
-        {
-            Some(record) => records.push(record),
-            None => unreadable += 1,
+    for path in record_files(dir)? {
+        let read = std::fs::read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| Ok(serde_json::from_slice::<PullRecord>(&bytes)?));
+        match read {
+            Ok(record) => records.push(record),
+            Err(e) => {
+                tracing::debug!("{} is no pull record: {e:#}", path.display());
+                unreadable += 1;
+            }
         }
     }
     records.sort_by_key(|r| std::cmp::Reverse(r.started_unix_ms));
-    (records, unreadable)
+    Ok((records, unreadable))
 }
 
 /// The record files in `dir`: every `*.json`. A temp file a writer has not
-/// renamed yet has no such name.
-fn record_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// renamed yet has no such name. A directory that does not exist holds none.
+fn record_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
-    entries
+    Ok(entries
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
-        .collect()
+        .collect())
 }
 
 /// Delete all but the newest `keep` records in `dir`, by the start time
-/// their names begin with. A file that cannot be deleted stays.
+/// their names begin with. A file that cannot be deleted stays, with a
+/// warning.
 fn prune(dir: &Path, keep: usize) {
-    let mut files: Vec<(u64, PathBuf)> = record_files(dir)
-        .into_iter()
-        .map(|p| (started_of(&p), p))
-        .collect();
+    let mut files: Vec<(u64, PathBuf)> = match record_files(dir) {
+        Ok(files) => files.into_iter().map(|p| (started_of(&p), p)).collect(),
+        Err(e) => {
+            tracing::warn!("cannot list {} to prune it: {e}", dir.display());
+            return;
+        }
+    };
     if files.len() <= keep {
         return;
     }
     files.sort_by_key(|f| std::cmp::Reverse(f.0));
     for (_, path) in files.into_iter().skip(keep) {
-        let _ = std::fs::remove_file(path);
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!("cannot prune the dashboard record {}: {e}", path.display());
+        }
     }
 }
 

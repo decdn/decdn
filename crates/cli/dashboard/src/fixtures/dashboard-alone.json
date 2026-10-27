@@ -1,5 +1,6 @@
 {
   "version": "0.3.0",
+  "now_unix_ms": 1793000600000,
   "dashboard_built": true,
   "started_unix": 1793000000,
   "pulls": {
@@ -14,8 +15,9 @@
         "pid": 4242,
         "started_unix_ms": 1793000300000,
         "updated_unix_ms": 1793000342000,
-        "finished_unix_ms": 1793000342000,
         "state": "gave_up",
+        "finished_unix_ms": 1793000342000,
+        "error": "gave up: no verified byte for 2m",
         "received_bytes": 734003200,
         "expected_bytes": 1073741824,
         "files_started": 12,
@@ -32,11 +34,11 @@
           }
         ],
         "bundle": null,
-        "error": null,
         "stale": false
       }
     ],
-    "unreadable": 0
+    "unreadable": 0,
+    "error": null
   },
   "gateway": {
     "url": "http://127.0.0.1:8484/",

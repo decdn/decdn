@@ -18,8 +18,10 @@ cargo build -p decdn-cli              # embeds dist/
 ```
 
 `pnpm dev` serves the page with hot reload and proxies `/_status` to
-`decdn dashboard` on `127.0.0.1:8485`. Open the link it printed, or paste
-its token (in `~/.decdn/dashboard/token`) into the page when it asks.
+`decdn dashboard` on `127.0.0.1:8485`. Open the dev server's `/_dashboard/`
+with `#token=<token>` appended, the token `decdn dashboard` printed (also in
+`~/.decdn/dashboard/token`); the link it printed opens the embedded page on
+8485 instead.
 
 Rules the dashboard's content security policy sets: no inline script, no
 inline style attribute, and nothing loaded from another origin. Every style

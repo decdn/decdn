@@ -13,7 +13,7 @@ import {
   formatUsdc,
 } from "../format";
 import { partValue } from "../view";
-import { PartLine } from "./Panel";
+import { PartLine, Stale } from "./Panel";
 import { TileGrid, type Tile } from "./StatTiles";
 
 const BINDING: Record<BindingStatus, { value: string; hint: string }> = {
@@ -112,8 +112,11 @@ export function nodeTiles(
   return list;
 }
 
-/** The node's health, connections, cache and chain, as tiles. */
-export function NodeHealth(props: { node: NodeSection }) {
+/**
+ * The node's health, connections, cache and chain, as tiles. A failed
+ * health read is the node section's own line, so it is not repeated here.
+ */
+export function NodeHealth(props: { node: NodeSection; stale: number | null }) {
   const n = props.node;
   const shown = nodeTiles(
     partValue(n.health),
@@ -122,8 +125,8 @@ export function NodeHealth(props: { node: NodeSection }) {
   );
   return (
     <div className="flex flex-col gap-2">
+      <Stale secs={props.stale} />
       {shown.length > 0 ? <TileGrid label="Node health" tiles={shown} /> : null}
-      <PartLine what="Health" part={n.health} />
       <PartLine what={`Metrics at ${n.metrics_url}`} part={n.metrics} />
       <PartLine what="DHT status" part={n.status} />
     </div>

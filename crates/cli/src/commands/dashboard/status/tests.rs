@@ -64,8 +64,33 @@ fn period(from_unix: u64, net: u64) -> EarningsPeriod {
     }
 }
 
-fn pull(started: u64, kind: PullKind, state: PullState) -> PullView {
-    let finished = (state != PullState::Running).then_some(started + 42_000);
+/// How a fixture's run ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+    Running,
+    Done,
+    Interrupted,
+    Failed,
+    GaveUp,
+}
+
+fn pull(started: u64, kind: PullKind, end: End) -> PullView {
+    let finished_unix_ms = started + 42_000;
+    let error = "no node holds the blob".to_owned();
+    let state = match end {
+        End::Running => PullState::Running,
+        End::Done => PullState::Done { finished_unix_ms },
+        End::Interrupted => PullState::Interrupted { finished_unix_ms },
+        End::Failed => PullState::Failed {
+            finished_unix_ms,
+            error,
+        },
+        End::GaveUp => PullState::GaveUp {
+            finished_unix_ms,
+            error: "gave up: no verified byte for 2m".to_owned(),
+        },
+    };
+    let ended = end != End::Running;
     PullView {
         record: PullRecord {
             uri: match kind {
@@ -77,8 +102,11 @@ fn pull(started: u64, kind: PullKind, state: PullState) -> PullView {
             output: "/home/me/site".to_owned(),
             pid: 4242,
             started_unix_ms: started,
-            updated_unix_ms: finished.unwrap_or(started + 600),
-            finished_unix_ms: finished,
+            updated_unix_ms: if ended {
+                finished_unix_ms
+            } else {
+                started + 600
+            },
             state,
             received_bytes: 734_003_200,
             expected_bytes: Some(1_073_741_824),
@@ -95,7 +123,7 @@ fn pull(started: u64, kind: PullKind, state: PullState) -> PullView {
                     bytes: 736_100_352,
                 },
             }],
-            bundle: (kind == PullKind::Bundle && finished.is_some()).then_some(BundleCounts {
+            bundle: (kind == PullKind::Bundle && ended).then_some(BundleCounts {
                 fetched: 9,
                 linked: 1,
                 skipped: 2,
@@ -106,7 +134,6 @@ fn pull(started: u64, kind: PullKind, state: PullState) -> PullView {
                 resumed_bytes: 0,
                 reused_bytes: 4_096,
             }),
-            error: (state == PullState::Failed).then(|| "no node holds the blob".to_owned()),
         },
         stale: false,
     }
@@ -115,6 +142,7 @@ fn pull(started: u64, kind: PullKind, state: PullState) -> PullView {
 fn base(gateway: GatewayState, node: NodeSection) -> Status {
     Status {
         version: "0.3.0",
+        now_unix_ms: NOW_MS,
         dashboard_built: true,
         started_unix: STARTED,
         pulls: PullsSection {
@@ -123,6 +151,7 @@ fn base(gateway: GatewayState, node: NodeSection) -> Status {
             active: Vec::new(),
             recent: Vec::new(),
             unreadable: 0,
+            error: None,
         },
         gateway: GatewaySection {
             url: "http://127.0.0.1:8484/".to_owned(),
@@ -281,16 +310,16 @@ fn a_full_status_keeps_its_shape() {
     // fixtures; the page's tests splice those in here.
     let gateway = serde_json::json!({ "pinned_by": "status-loopback.json" });
     let mut status = base(GatewayState::Up { status: gateway }, node_up());
-    let mut stopped = pull(NOW_MS - 120_000, PullKind::Blob, PullState::Running);
+    let mut stopped = pull(NOW_MS - 120_000, PullKind::Blob, End::Running);
     stopped.stale = true;
     status.pulls.active = vec![
-        pull(NOW_MS - 30_000, PullKind::Bundle, PullState::Running),
+        pull(NOW_MS - 30_000, PullKind::Bundle, End::Running),
         stopped,
     ];
     status.pulls.recent = vec![
-        pull(NOW_MS - 300_000, PullKind::Bundle, PullState::Done),
-        pull(NOW_MS - 400_000, PullKind::Entry, PullState::Interrupted),
-        pull(NOW_MS - 500_000, PullKind::Blob, PullState::Failed),
+        pull(NOW_MS - 300_000, PullKind::Bundle, End::Done),
+        pull(NOW_MS - 400_000, PullKind::Entry, End::Interrupted),
+        pull(NOW_MS - 500_000, PullKind::Blob, End::Failed),
     ];
     status.pulls.unreadable = 1;
     pin("dashboard-full.json", &status);
@@ -306,8 +335,33 @@ fn a_status_with_nothing_running_keeps_its_shape() {
             message: "admin at http://127.0.0.1:9191 refused the connection".to_owned(),
         },
     };
-    status.pulls.recent = vec![pull(NOW_MS - 300_000, PullKind::Blob, PullState::GaveUp)];
+    status.pulls.recent = vec![pull(NOW_MS - 300_000, PullKind::Blob, End::GaveUp)];
     pin("dashboard-alone.json", &status);
+}
+
+/// A node whose health call timed out while its other reads answered, a
+/// gateway in error, and a pulls directory that cannot be listed.
+#[test]
+fn a_status_with_failing_sources_keeps_its_shape() {
+    let message = "admin at http://127.0.0.1:9191 did not respond within 3000ms".to_owned();
+    let mut node = node_up();
+    node.state = NodeState::Error {
+        message: message.clone(),
+    };
+    node.health = Part {
+        updated_unix_ms: Some(NOW_MS),
+        read: Read::Error { message },
+    };
+    let mut status = base(
+        GatewayState::Error {
+            message: "error sending request: connection reset by peer".to_owned(),
+        },
+        node,
+    );
+    status.pulls.error = Some(
+        "cannot list /home/me/.decdn/activity/pulls: Permission denied (os error 13)".to_owned(),
+    );
+    pin("dashboard-failing.json", &status);
 }
 
 /// The gateway section's other states, as the page reads them.

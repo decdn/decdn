@@ -8,9 +8,7 @@ import {
   type Pulls,
   type Status,
 } from "./api";
-import { ActivePulls } from "./components/ActivePulls";
-import { Allowance } from "./components/Allowance";
-import { Capabilities } from "./components/Capabilities";
+import { GatewayPanels } from "./components/GatewayPanels";
 import { Header } from "./components/Header";
 import { LivePulls } from "./components/LivePulls";
 import { NodeEarnings } from "./components/NodeEarnings";
@@ -19,10 +17,8 @@ import { NodeLanes } from "./components/NodeLanes";
 import { NodePools } from "./components/NodePools";
 import { NodeSlashes } from "./components/NodeSlashes";
 import { Empty, Group } from "./components/Panel";
-import { Pointers } from "./components/Pointers";
-import { Pools } from "./components/Pools";
 import { RecentPulls } from "./components/RecentPulls";
-import { StatTiles } from "./components/StatTiles";
+import { SectionBoundary } from "./components/SectionBoundary";
 import { TokenForm } from "./components/TokenForm";
 import { formatDuration, shortHex } from "./format";
 import {
@@ -33,14 +29,15 @@ import {
   type Adopted,
 } from "./token";
 import {
-  buckets,
-  capabilities,
   gatewayLine,
+  gatewayShapeProblem,
   livePulls,
-  nodeLine,
+  nodeView,
   partValue,
-  pools,
+  POLL_MS as SOURCE_POLL_MS,
   recentPulls,
+  staleSecs,
+  stalestSecs,
 } from "./view";
 
 const POLL_MS = 2_000;
@@ -126,23 +123,37 @@ export function App() {
 }
 
 function Dashboard(props: { status: Status }) {
+  const s = props.status;
+  const now = s.now_unix_ms;
   return (
     <>
-      <PullsGroup pulls={props.status.pulls} />
-      <GatewayGroup gateway={props.status.gateway} />
-      <NodeGroup node={props.status.node} />
+      <SectionBoundary title="Pulls" resetKey={now}>
+        <PullsGroup pulls={s.pulls} now={now} />
+      </SectionBoundary>
+      <SectionBoundary title="Gateway" resetKey={now}>
+        <GatewayGroup gateway={s.gateway} now={now} />
+      </SectionBoundary>
+      <SectionBoundary title="Node" resetKey={now}>
+        <NodeGroup node={s.node} now={now} />
+      </SectionBoundary>
     </>
   );
 }
 
-function PullsGroup(props: { pulls: Pulls }) {
+function PullsGroup(props: { pulls: Pulls; now: number }) {
   const p = props.pulls;
   return (
     <Group
       title="Pulls"
       note={<span className="font-mono text-xs">{p.dir}</span>}
+      stale={staleSecs(p.updated_unix_ms, props.now, SOURCE_POLL_MS.pulls)}
     >
       {p.updated_unix_ms === null ? <Empty>Reading the records…</Empty> : null}
+      {p.error ? (
+        <p role="alert" className="text-sm text-critical-ink">
+          ⛔ The records cannot be read: {p.error}
+        </p>
+      ) : null}
       {p.unreadable > 0 ? (
         <p role="alert" className="text-sm text-critical-ink">
           ⚠ {p.unreadable} file(s) in the directory did not read as a record.
@@ -154,24 +165,32 @@ function PullsGroup(props: { pulls: Pulls }) {
   );
 }
 
-function GatewayGroup(props: { gateway: GatewaySection }) {
+function GatewayGroup(props: { gateway: GatewaySection; now: number }) {
   const g = props.gateway;
-  if (g.state !== "up") {
-    return (
-      <Group title="Gateway">
-        <p
-          role={g.state === "error" ? "alert" : undefined}
-          className={`text-sm ${g.state === "error" ? "text-critical-ink" : "text-ink-3"}`}
-        >
-          {gatewayLine(g)}
-        </p>
-      </Group>
+  const stale = staleSecs(g.updated_unix_ms, props.now, SOURCE_POLL_MS.gateway);
+  const line = (text: string | null, alert: boolean) => (
+    <Group title="Gateway" stale={stale}>
+      <p
+        role={alert ? "alert" : undefined}
+        className={`text-sm ${alert ? "text-critical-ink" : "text-ink-3"}`}
+      >
+        {text}
+      </p>
+    </Group>
+  );
+  if (g.state !== "up") return line(gatewayLine(g), g.state === "error");
+  const problem = gatewayShapeProblem(g.status);
+  if (problem !== null) {
+    return line(
+      `The gateway at ${g.url} answered a status this page cannot read: ${problem}.`,
+      true,
     );
   }
-  const s = g.status;
+  const s: GatewayStatus = g.status;
   return (
     <Group
       title="Gateway"
+      stale={stale}
       note={
         <>
           {s.mode} · v{s.version} · {s.listen} · chain {s.chain_id} · pool
@@ -188,42 +207,25 @@ function GatewayGroup(props: { gateway: GatewaySection }) {
   );
 }
 
-function GatewayPanels(props: { status: GatewayStatus }) {
-  const s = props.status;
-  const publicMode = s.mode === "public";
-  return (
-    <>
-      <StatTiles counters={s.counters} publicMode={publicMode} />
-      <ActivePulls pulls={s.active_pulls} />
-      {publicMode ? null : <Capabilities rows={capabilities(s)} />}
-      <Pools
-        rows={pools(s)}
-        delegates={s.pools?.delegate_lanes ?? []}
-        skipped={s.pools?.pools.skipped ?? []}
-        error={s.pool_error}
-      />
-      {publicMode && s.allowance ? <Allowance rows={buckets(s)} /> : null}
-      {publicMode && s.pointers ? <Pointers pointers={s.pointers} /> : null}
-    </>
-  );
-}
-
-function NodeGroup(props: { node: NodeSection }) {
+function NodeGroup(props: { node: NodeSection; now: number }) {
   const n = props.node;
-  const line = nodeLine(n);
-  if (line !== null) {
-    return (
-      <Group title="Node">
-        <p
-          role={n.state === "error" ? "alert" : undefined}
-          className={`text-sm ${n.state === "error" ? "text-critical-ink" : "text-ink-3"}`}
-        >
-          {line}
-        </p>
-      </Group>
+  const view = nodeView(n);
+  const line =
+    view.line === null ? null : (
+      <p
+        role={view.alert ? "alert" : undefined}
+        className={`text-sm ${view.alert ? "text-critical-ink" : "text-ink-3"}`}
+      >
+        {view.alert ? "⛔ " : ""}
+        {view.line}
+      </p>
     );
+  if (!view.panels) {
+    return <Group title="Node">{line}</Group>;
   }
-  const id = partValue(n.health)?.node_id;
+  const slow = (part: { updated_unix_ms: number | null }) =>
+    staleSecs(part.updated_unix_ms, props.now, SOURCE_POLL_MS.nodeSlow);
+  const id = partValue(n.health)?.node_id ?? partValue(n.status)?.node_id;
   const operator = partValue(n.status)?.operator_address;
   return (
     <Group
@@ -252,11 +254,19 @@ function NodeGroup(props: { node: NodeSection }) {
         </>
       }
     >
-      <NodeHealth node={n} />
-      <NodeEarnings part={n.earnings} />
-      <NodeLanes part={n.lanes} />
-      <NodePools part={n.pools} />
-      <NodeSlashes part={n.slashes} />
+      {line}
+      <NodeHealth
+        node={n}
+        stale={stalestSecs(
+          [n.health, n.status, n.metrics],
+          props.now,
+          SOURCE_POLL_MS.nodeFast,
+        )}
+      />
+      <NodeEarnings part={n.earnings} stale={slow(n.earnings)} />
+      <NodeLanes part={n.lanes} stale={slow(n.lanes)} />
+      <NodePools part={n.pools} stale={slow(n.pools)} />
+      <NodeSlashes part={n.slashes} stale={slow(n.slashes)} />
     </Group>
   );
 }

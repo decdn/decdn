@@ -1,5 +1,6 @@
 {
   "version": "0.3.0",
+  "now_unix_ms": 1793000600000,
   "dashboard_built": true,
   "started_unix": 1793000000,
   "pulls": {
@@ -13,7 +14,6 @@
         "pid": 4242,
         "started_unix_ms": 1793000570000,
         "updated_unix_ms": 1793000570600,
-        "finished_unix_ms": null,
         "state": "running",
         "received_bytes": 734003200,
         "expected_bytes": 1073741824,
@@ -31,7 +31,6 @@
           }
         ],
         "bundle": null,
-        "error": null,
         "stale": false
       },
       {
@@ -41,7 +40,6 @@
         "pid": 4242,
         "started_unix_ms": 1793000480000,
         "updated_unix_ms": 1793000480600,
-        "finished_unix_ms": null,
         "state": "running",
         "received_bytes": 734003200,
         "expected_bytes": 1073741824,
@@ -59,7 +57,6 @@
           }
         ],
         "bundle": null,
-        "error": null,
         "stale": true
       }
     ],
@@ -71,8 +68,8 @@
         "pid": 4242,
         "started_unix_ms": 1793000300000,
         "updated_unix_ms": 1793000342000,
-        "finished_unix_ms": 1793000342000,
         "state": "done",
+        "finished_unix_ms": 1793000342000,
         "received_bytes": 734003200,
         "expected_bytes": 1073741824,
         "files_started": 12,
@@ -99,7 +96,6 @@
           "resumed_bytes": 0,
           "reused_bytes": 4096
         },
-        "error": null,
         "stale": false
       },
       {
@@ -109,8 +105,8 @@
         "pid": 4242,
         "started_unix_ms": 1793000200000,
         "updated_unix_ms": 1793000242000,
-        "finished_unix_ms": 1793000242000,
         "state": "interrupted",
+        "finished_unix_ms": 1793000242000,
         "received_bytes": 734003200,
         "expected_bytes": 1073741824,
         "files_started": 12,
@@ -127,7 +123,6 @@
           }
         ],
         "bundle": null,
-        "error": null,
         "stale": false
       },
       {
@@ -137,8 +132,9 @@
         "pid": 4242,
         "started_unix_ms": 1793000100000,
         "updated_unix_ms": 1793000142000,
-        "finished_unix_ms": 1793000142000,
         "state": "failed",
+        "finished_unix_ms": 1793000142000,
+        "error": "no node holds the blob",
         "received_bytes": 734003200,
         "expected_bytes": 1073741824,
         "files_started": 12,
@@ -155,11 +151,11 @@
           }
         ],
         "bundle": null,
-        "error": "no node holds the blob",
         "stale": false
       }
     ],
-    "unreadable": 1
+    "unreadable": 1,
+    "error": null
   },
   "gateway": {
     "url": "http://127.0.0.1:8484/",
