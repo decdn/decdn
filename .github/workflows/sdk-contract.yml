@@ -62,15 +62,6 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
-      - name: Free disk space
-        run: |
-          sudo rm -rf /opt/hostedtoolcache/CodeQL \
-                      /usr/local/lib/android \
-                      /usr/share/dotnet \
-                      /opt/ghc \
-                      /usr/local/.ghcup
-          sudo docker image prune --all --force || true
-          df -h /
       - uses: dtolnay/rust-toolchain@1.99.1
       - name: Install mold linker
         uses: rui314/setup-mold@v1
