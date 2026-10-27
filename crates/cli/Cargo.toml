@@ -27,6 +27,8 @@ include = [
   "/TERMS_README.md",
   "/minisign-thiras.pub",
   "/dashboard/dist/**",
+  # Read by the `/_status` contract tests in src/commands/gateway/status/.
+  "/dashboard/src/fixtures/**",
 ]
 
 [[bin]]
