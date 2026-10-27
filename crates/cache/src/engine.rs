@@ -1114,8 +1114,10 @@ const fn hex_digit(c: u8) -> Option<u8> {
 /// future refactor that wants to surface them should keep returning
 /// [`ProtectOutcome::Continue`] — `Abort` would skip the sweep itself,
 /// letting the disk-leak threat the GC was added to mitigate keep
-/// growing. The next cycle's snapshot recovers the count attribution as
-/// long as the store eventually services the list/status calls.
+/// growing. The next good snapshot re-establishes the baseline for later
+/// attribution, as long as the store eventually services the list/status
+/// calls. Bytes created after the last good snapshot and swept in the
+/// failed pass stay uncounted.
 ///
 /// **Engine-drop semantics:** `store_handle` is a [`Weak`] of the
 /// `Arc<OnceLock<FsStore>>` that lives in `Inner.gc_store_handle`.

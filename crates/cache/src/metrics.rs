@@ -55,7 +55,8 @@
 //!   everything we pull is later reclaimed by GC. Healthy nodes sit
 //!   near `0.0`. Use a window at least `2 * cache.gc_interval_sec`
 //!   wide: byte attribution lags one sweep cycle (see
-//!   `gc_bytes_reclaimed`).
+//!   `gc_bytes_reclaimed`). The counter is a lower bound, so the ratio
+//!   reads low by roughly snapshot-walk time over `cache.gc_interval_sec`.
 //!
 //! Hit/miss accounting (#418): on `Ok` and on the cache-domain error
 //! returns (`NoOrigin`, evicted `NotFound`, origin `NotFound`,
@@ -166,12 +167,12 @@ pub struct CacheMetrics {
     pub gc_runs: Counter,
     /// Bytes reclaimed by the iroh-blobs GC, attributed across cycles
     /// (#518). Computed as the pre-sweep blob-set diff between the
-    /// previous cycle and the current cycle: hashes that vanish across
-    /// that window are exactly what the previous sweep deleted (the
-    /// cache crate has no other public delete path). Sustained nonzero
-    /// rate against zero `rate(pull_through_bytes)` is a red flag —
-    /// either the pull path is failing to promote named tags on
-    /// success, or a hostile origin is amplifying disk usage via
+    /// previous cycle and the current cycle: a hash that is in the
+    /// earlier snapshot and gone from the later one was deleted by the
+    /// previous sweep (the cache crate has no other public delete path).
+    /// Sustained nonzero rate against zero `rate(pull_through_bytes)` is
+    /// a red flag — either the pull path is failing to promote named
+    /// tags on success, or a hostile origin is amplifying disk usage via
     /// repeated mid-stream errors.
     ///
     /// **Attribution lags one sweep cycle.** The first cycle records a
@@ -179,6 +180,14 @@ pub struct CacheMetrics {
     /// reflects the previous sweep's reclaim. For an alert window
     /// shorter than `2 * cache.gc_interval_sec` the reading will be
     /// noisy.
+    ///
+    /// **The counter is a lower bound; it never overcounts.** A deletion
+    /// counts only when some snapshot held the blob. A blob created
+    /// after a pass's snapshot walk reached it and swept in that same
+    /// pass is deleted but appears in no snapshot, so its bytes are never
+    /// counted. The window is the length of the snapshot walk plus the
+    /// gap to the mark phase, so the undercount grows with store size and
+    /// shrinks with a shorter `cache.gc_interval_sec`.
     ///
     /// Field name omits `_total`: the `OpenMetrics` encoder appends it
     /// automatically, so the emitted name is
