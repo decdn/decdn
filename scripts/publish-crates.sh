@@ -333,12 +333,12 @@ echo "==> Gateway dashboard"
 .github/scripts/pnpm.sh -C crates/cli/dashboard install --frozen-lockfile ||
   die "the dashboard's install failed"
 .github/scripts/pnpm.sh -C crates/cli/dashboard build || die "the dashboard's build failed"
-.github/scripts/check-dashboard-packaged.sh || die "decdn-cli would ship without the dashboard"
 # cargo counts that gitignored build, which decdn-cli packages through
 # `include`, as uncommitted, so both publishes below take --allow-dirty. This
-# proves nothing else in the tag's worktree is.
-[ -z "$(git status --porcelain)" ] || die "the tag's worktree has changes beyond the dashboard build:
-$(git status --porcelain)"
+# proves the tag's worktree is otherwise clean, and that decdn-cli's .crate
+# carries the build and no other untracked file.
+.github/scripts/check-dashboard-packaged.sh ||
+  die "decdn-cli would not package as released: see the errors above"
 
 echo "==> Dry run"
 # On a re-run after a successful publish this is where cargo stops, because the

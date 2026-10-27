@@ -1325,11 +1325,12 @@ jobs:
   # uploaded, so a packaging error found there has no clean recovery.
   #
   # Cheap by design — a toolchain for `cargo metadata` and `cargo package
-  # --no-verify`, but no build. The authoritative check is
-  # `cargo publish --workspace --dry-run` in release.yml, which verify-builds
-  # every packaged crate; that costs a full rebuild and belongs on tags, not on
-  # every PR. Unconditional (no `changes` gate) because it takes seconds, which
-  # also keeps it out of ci-success's allowed-skips.
+  # --no-verify`, and the dashboard's Vite build that decdn-cli packages, but
+  # no Rust build. The authoritative check is `cargo publish --workspace
+  # --dry-run` in release.yml, which verify-builds every packaged crate; that
+  # costs a full rebuild and belongs on tags, not on every PR. Unconditional
+  # (no `changes` gate) because it takes about a minute, which also keeps it
+  # out of ci-success's allowed-skips.
   packaging:
     name: packaging
     runs-on: ubuntu-latest
@@ -1376,6 +1377,16 @@ jobs:
       - name: Crate dependency direction matches CLAUDE.md
         run: .github/scripts/check-crate-edges.sh
 
+      # decdn-cli's .crate carries the dashboard's gitignored build through
+      # its `include` list; without the build it would ship the fallback page.
+      - uses: ./.github/actions/dashboard-build
+
+      # cargo counts that build as uncommitted, so the package step takes
+      # --allow-dirty. This proves the checkout is otherwise clean and that
+      # decdn-cli's .crate carries the build and no other untracked file.
+      - name: decdn-cli packages the dashboard build, and nothing else untracked
+        run: .github/scripts/check-dashboard-packaged.sh
+
       # The authoritative packaging check is `cargo publish --workspace
       # --dry-run` in release.yml, which verify-BUILDS every crate. This is the
       # cheap half: --no-verify skips the build, so it costs seconds, and it
@@ -1385,26 +1396,10 @@ jobs:
       # those are otherwise green until release day, when the version is
       # already tagged and a crates.io failure has no clean recovery.
       #
-      # decdn-cli's .crate carries the dashboard's gitignored build through
-      # its `include` list; without the build it would ship the fallback page.
-      - uses: ./.github/actions/dashboard-build
-
       # Must be --workspace: `cargo package -p decdn-cli` alone fails, because
-      # the internal path deps are not on crates.io yet. --allow-dirty: cargo
-      # counts the dashboard's gitignored build, which decdn-cli packages
-      # through `include`, as uncommitted. The check before it proves nothing
-      # else is.
+      # the internal path deps are not on crates.io yet.
       - name: Every crate still packages
-        run: |
-          [ -z "$(git status --porcelain)" ] || {
-            git status --porcelain
-            echo "::error::the checkout has changes beyond the dashboard build"
-            exit 1
-          }
-          cargo package --workspace --no-verify --locked --allow-dirty
-
-      - name: decdn-cli packages the dashboard build
-        run: .github/scripts/check-dashboard-packaged.sh
+        run: cargo package --workspace --no-verify --locked --allow-dirty
 
   # Nothing validated the Dockerfile until a release tag was cut, which is how
   # `EXPOSE 4433 9090  # comment` — a hard parse error, since Dockerfile `#`

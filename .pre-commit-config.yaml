@@ -82,9 +82,10 @@ repos:
         files: '^crates/.*\.(rs|toml|sh|ps1|html|json)$'
         pass_filenames: false
 
-      # The gateway dashboard's eslint and prettier, only when its files
-      # change, so a Rust-only contributor never needs Node. Needs Node 24
-      # and `pnpm -C crates/cli/dashboard install`.
+      # The gateway dashboard's eslint and prettier, when its files change.
+      # Without the app's node_modules it skips with a notice, so a
+      # contributor who never touches the app needs no Node; CI's `dashboard`
+      # job lints every change to it.
       - id: dashboard-lint
         name: gateway dashboard lint
         entry: .github/scripts/dashboard-lint.sh

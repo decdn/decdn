@@ -208,6 +208,17 @@ jobs:
           CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets
           cargo nextest run --workspace --no-tests=pass
 
+      # decdn-cli's .crate carries the dashboard's gitignored build; the
+      # verify build below then embeds it rather than the fallback page.
+      - uses: ./.github/actions/dashboard-build
+
+      # cargo counts that build as uncommitted, so the dry run takes
+      # --allow-dirty. This proves the checkout is otherwise clean (the tests
+      # above included) and that decdn-cli's .crate carries the build and no
+      # other untracked file.
+      - name: decdn-cli packages the dashboard build, and nothing else untracked
+        run: .github/scripts/check-dashboard-packaged.sh
+
       # publish-crates.sh uploads these to crates.io after the release is
       # signed, and a crates.io version can never be replaced. Packaging must
       # therefore be proven BEFORE the draft exists, not discovered mid-publish.
@@ -216,24 +227,8 @@ jobs:
       # .crate, which is the only thing that catches a file referenced from
       # outside the package (an `include_str!` reaching the workspace root
       # builds fine in-tree and fails for every `cargo install` user).
-      # decdn-cli's .crate carries the dashboard's gitignored build; the
-      # verify build below then embeds it rather than the fallback page.
-      - uses: ./.github/actions/dashboard-build
-
-      # --allow-dirty: cargo counts the dashboard's gitignored build, which
-      # decdn-cli packages through `include`, as uncommitted. The check before
-      # it proves nothing else is.
       - name: Verify every crate packages and builds standalone
-        run: |
-          [ -z "$(git status --porcelain)" ] || {
-            git status --porcelain
-            echo "::error::the checkout has changes beyond the dashboard build"
-            exit 1
-          }
-          cargo publish --workspace --dry-run --locked --allow-dirty
-
-      - name: decdn-cli packages the dashboard build
-        run: .github/scripts/check-dashboard-packaged.sh
+        run: cargo publish --workspace --dry-run --locked --allow-dirty
 
       # Baseline = the highest v* tag that does not point at HEAD, rather than
       # the crates.io registry baseline. Publishing is a manual post-signing
@@ -467,7 +462,8 @@ jobs:
           TARGET: ${{ matrix.target }}
 
       # A `decdn` built without the dashboard embeds a page that says how to
-      # build it, marked by this comment. A release never ships that.
+      # build it, marked by the HTML comment `decdn-dashboard-fallback`
+      # (crates/cli/build.rs). A release never ships that.
       - name: The CLI embeds the dashboard
         if: contains(matrix.builds, 'decdn-cli:decdn')
         shell: bash

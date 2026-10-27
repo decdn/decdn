@@ -13,7 +13,7 @@ each packaged crate, but it costs a full rebuild of the workspace. That runs in
 release.yml, before the draft is created. This is the cheap PR-time signal that
 stops the mistake from ever reaching a tag.
 
-Three deliberate calibrations:
+Four deliberate calibrations:
 
 * Sites under `#[cfg(test)]` are *warnings*, not errors — the verify build does
   not enable `cfg(test)`, so they do not block publishing. They are still real
@@ -21,13 +21,15 @@ Three deliberate calibrations:
   run), so every one must be listed in KNOWN_TEST_ONLY below. A new one fails.
   That keeps a permanent, unread warning from masking the next regression.
 * An embedded path that is inside the crate but *not tracked by git* is an
-  error: `cargo package` ships tracked files, so a gitignored target is just as
-  absent from the `.crate` as one outside the directory.
+  error. Without an `include` list, `cargo package` ships tracked files only,
+  so a gitignored target is as absent from the `.crate` as one outside the
+  directory. With one, a gitignored file ships only when it exists at package
+  time, which a fresh checkout does not promise.
 * An embed under `OUT_DIR` (`concat!(env!("OUT_DIR"), "…")`) is accepted only
   from a crate with a tracked `build.rs`: the build script writes the file on
   every build, so the `.crate` needs the script, not the file. Whatever the
-  script reads must reach the `.crate` too, and `cargo package --list` checks
-  that in CI.
+  script reads must reach the `.crate` too: for decdn-cli's dashboard,
+  check-dashboard-packaged.sh checks that in CI.
 * A crate with a `[package].include` list ships only the files the list
   matches, so every embed, and an `OUT_DIR` embed's `build.rs`, must also
   match one of its patterns.
