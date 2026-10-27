@@ -755,3 +755,37 @@ fn a_verified_size_is_the_next_fetchs_known_size() {
     assert_eq!(known_size(&[6; 32], None, &sizes), None);
     assert_eq!(known_size(&[5; 32], Some(10), &sizes), Some(10));
 }
+
+/// A size proof's fault ends its fetch only when the pull after the proof
+/// would reach it again: a funding stop, a pool replacement, a local fault
+/// (seen through the lane-build wrapper the scheduler adds), or a give-up.
+/// A source that declines or lacks the blob only leaves the size unproven,
+/// context or not.
+#[test]
+fn a_proof_ends_its_fetch_only_on_a_fault_its_pull_would_reach() {
+    let ends = [
+        anyhow::Error::new(decdn_client::FundingNeeded::PublisherPool { pool: B256::ZERO }),
+        anyhow::Error::new(PoolReplaced {
+            closed: B256::ZERO,
+            opened: B256::repeat_byte(1),
+        })
+        .context("the pass"),
+        anyhow::Error::new(decdn_client::LaneBuildFault(anyhow::Error::new(
+            decdn_client::LocalPullFault,
+        ))),
+        anyhow::Error::new(decdn_client::GaveUp {
+            idle: Duration::from_secs(1),
+        }),
+    ];
+    for err in &ends {
+        assert!(proof_ends_fetch(err), "{err:#}");
+    }
+    let unproven = [
+        anyhow::Error::new(decdn_client::NoNodeWillServe { reasons: vec![] }),
+        anyhow::Error::new(decdn_client::NoNodeWillServe { reasons: vec![] }).context("a leg"),
+        anyhow::anyhow!("a source failed"),
+    ];
+    for err in &unproven {
+        assert!(!proof_ends_fetch(err), "{err:#}");
+    }
+}

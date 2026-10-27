@@ -14,9 +14,9 @@
 //! with a pool replacement retires it, so the next pull's ledgers know only
 //! the new pool.
 //!
-//! The worker answers the size a pull on its host verified for a blob
-//! ([`PullWorker::size`]), with no pull slot, so the gateway can answer a
-//! repeat request for the blob with a length.
+//! The worker answers the size a pull or a size proof on its host verified
+//! for a blob ([`PullWorker::size`]), with no pull slot, so the gateway can
+//! answer the request for the blob with a length.
 //!
 //! The worker also answers what the store holds ([`PullWorker::pools`]): the
 //! store is open on the worker's host, and redb refuses a second open of it
@@ -226,8 +226,8 @@ pub(super) trait Backend: Send + 'static {
         sink: &mut Sink,
     ) -> anyhow::Result<()>;
 
-    /// The size a whole pull on `host` verified for `hash`, if one did. A
-    /// backend that keeps no sizes answers `None`.
+    /// The size a whole pull or a size proof on `host` verified for `hash`,
+    /// if one did. A backend that keeps no sizes answers `None`.
     fn size(&self, host: &Self::Host, hash: [u8; 32]) -> Option<u64> {
         let _ = (host, hash);
         None
@@ -462,10 +462,10 @@ impl PullWorker {
             .map_err(|_| anyhow::anyhow!("the gateway is shutting down"))?
     }
 
-    /// The size a whole pull on the worker's host verified for `hash`
-    /// ([`Backend::size`]). Answered beside the pulls in flight, with no pull
-    /// slot. `None` when no pull verified it, and once the worker has
-    /// stopped.
+    /// The size a whole pull or a size proof on the worker's host verified
+    /// for `hash` ([`Backend::size`]). Answered beside the pulls in flight,
+    /// with no pull slot. `None` when neither verified it, and once the
+    /// worker has stopped.
     pub(super) async fn size(&self, hash: [u8; 32]) -> Option<u64> {
         let (reply, answer) = oneshot::channel();
         self.jobs.send(Request::Size { hash, reply }).ok()?;

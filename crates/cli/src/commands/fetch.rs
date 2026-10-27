@@ -41,7 +41,7 @@ use alloy::primitives::U256;
 use anyhow::Context as _;
 use decdn_client::bundle::{BundleManifest, MalformedManifest};
 use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
-use decdn_client::funding::{RunFunding, cached_pool_token};
+use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token};
 use decdn_client::lane_sources::{FaultContext, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use decdn_client::receipt::ReceiptEvidence;
@@ -591,6 +591,7 @@ async fn fetch_target(
         read_ahead: None,
         size_cap: None,
         range: None,
+        prove: false,
         hash,
         namespace: uri.namespace,
         output: output.to_path_buf(),
@@ -632,6 +633,7 @@ async fn fetch_entry_hash(
         read_ahead: None,
         size_cap: None,
         range: None,
+        prove: false,
         hash: uri.hash,
         namespace: uri.namespace,
         output: PathBuf::from("-"),
@@ -739,6 +741,14 @@ pub(crate) struct BlobFetch {
     /// blob. Read only when the fetch streams: a window cannot be downloaded
     /// to a file.
     pub(crate) range: Option<(u64, u64)>,
+    /// Prove the blob's size and write no byte (#2645): the fetch pays for
+    /// the last chunk group under the first size claim, and a size its final
+    /// chunk verifies joins the host's verified sizes
+    /// ([`FetchHost::verified_size`]). A fetch that proves nothing still
+    /// succeeds; a fault before the proof (such as no holder) fails it, and
+    /// so does one the pull after it would reach again ([`proof_ends_fetch`]).
+    /// Never set with `range`.
+    pub(crate) prove: bool,
     /// Print the fetch's one-line cost estimate on stderr before the first
     /// paid byte (#2600): set for the blob a user asked for, and not for a
     /// manifest or a gateway response.
@@ -799,15 +809,16 @@ pub(crate) struct FetchHost {
     pub(crate) escrows: UnconfirmedEscrows,
     /// The pool's settlement token, `PaymentPool.usdc()`, read once.
     token: tokio::sync::OnceCell<alloy::primitives::Address>,
-    /// The sizes of blobs fetches on this host verified whole, up to
-    /// [`MAX_SIZE_HINTS`].
+    /// The sizes of blobs fetches on this host verified whole or proved, up
+    /// to [`MAX_SIZE_HINTS`].
     sizes: Mutex<SizeHints>,
 }
 
 /// The most blob sizes a [`FetchHost`] remembers.
 const MAX_SIZE_HINTS: usize = 4096;
 
-/// Blob sizes by hash, each one a whole fetch verified, oldest first out
+/// Blob sizes by hash, each one a whole fetch verified or a size proof
+/// proved ([`BlobFetch::prove`]), oldest first out
 /// within [`MAX_SIZE_HINTS`] entries. A hash fixes its blob's size, so a hit
 /// is a later fetch's first size claim, and a pinned node is not probed for
 /// it (ADR 005 § Probe rate limiting bounds those probes per peer).
@@ -935,7 +946,8 @@ impl FetchHost {
         self.chain.config.deployment()
     }
 
-    /// The size of `hash` a whole fetch on this host verified, if one did.
+    /// The size of `hash` a whole fetch on this host verified, or a size
+    /// proof on it proved, if one did.
     pub(crate) fn verified_size(&self, hash: &[u8; 32]) -> Option<u64> {
         known_size(hash, None, &self.sizes)
     }
@@ -1174,6 +1186,10 @@ pub(crate) async fn fetch_on(
         args.range.is_none() || streams,
         "a byte window streams; it cannot be downloaded to a file"
     );
+    anyhow::ensure!(
+        !(args.prove && args.range.is_some()),
+        "a size proof takes no byte window"
+    );
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
     // Only a configuration fault ends the fetch here; with no holder yet, the
     // first open discovers them. The round streams: the fetch starts at the
@@ -1343,6 +1359,41 @@ pub(crate) async fn fetch_on(
                 }
             }
             let total_bytes = claim.total_bytes;
+            if args.prove {
+                let proof = prove_size(
+                    &deps,
+                    &sources,
+                    claim.holders,
+                    Arc::clone(health),
+                    hash,
+                    total_bytes,
+                    stop.clone(),
+                )
+                .await;
+                let blob = blake3::Hash::from_bytes(hash).to_hex();
+                match proof {
+                    Ok(Some(size)) => {
+                        sizes
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(hash, size);
+                    }
+                    Ok(None) => tracing::info!(
+                        %blob,
+                        claim = total_bytes,
+                        "a size proof proved nothing: the claim's last chunk group is not the \
+                         blob's last"
+                    ),
+                    Err(err) if proof_ends_fetch(&err) => return Err(err),
+                    Err(err) => tracing::info!(
+                        %blob,
+                        claim = total_bytes,
+                        error = format!("{err:#}"),
+                        "a size proof failed"
+                    ),
+                }
+                return Ok(());
+            }
             let landed = if streams {
                 stream_out(
                     &deps,
@@ -1398,7 +1449,8 @@ pub(crate) async fn fetch_on(
             eprintln!("warning: {shortfall}");
         }
         let result = result.map_err(|err| annotate(err, &sources.fault_context()));
-        match next_pass(result, &mut replaced, streams) {
+        // A size proof writes no byte, so a replacement runs it again.
+        match next_pass(result, &mut replaced, streams && !args.prove) {
             Some(pass_result) => return pass_result,
             None => recovery.start_next_pass(),
         }
@@ -1426,9 +1478,10 @@ pub(crate) fn held_cap(max_blob_mb: u64, size_cap: Option<u64>) -> u64 {
 /// Only a pass that a [`PoolReplaced`] ended runs again, and at most once: a
 /// second replacement in one command ends it "funding needed". A replacement
 /// that an untracked escrow ended the pass over survives in `result` only as
-/// text, and runs nothing again. A stream (stdout or a writer) never runs
-/// again, because the bytes it already wrote cannot be taken back; its
-/// replacement ends the command with the new pool named. The command names
+/// text, and runs nothing again. A pass that `streams` its bytes (to stdout
+/// or a writer) never runs again, because the bytes it already wrote cannot
+/// be taken back; its replacement ends the command with the new pool named.
+/// A size proof writes none, so it does not count as one. The command names
 /// each closed pool as it ends, from the gate ([`print_reclaim_notes`]).
 fn next_pass(
     result: anyhow::Result<()>,
@@ -1610,6 +1663,67 @@ where
     Ok(drained)
 }
 
+/// Whether a size proof that failed with `err` ends its fetch with it: a
+/// fault fatal to the command (a funding stop, a pool replacement, an
+/// escrow no record credits, a local fault) or a give-up, which the pull
+/// after the proof would reach again. Any other fault is the proof failing
+/// on its own, and only leaves the size unproven.
+fn proof_ends_fetch(err: &anyhow::Error) -> bool {
+    matches!(
+        decdn_client::classify(err),
+        decdn_client::Fault::Fatal(decdn_client::FatalScope::Command)
+    ) || err.downcast_ref::<decdn_client::GaveUp>().is_some()
+}
+
+/// The scratch dir a stream's fill store lives in for the stream's lifetime:
+/// a streamed blob is not kept, so a temp dir (removed on drop) under the
+/// data dir is its natural home.
+fn stream_scratch<P>(deps: &LaneDeps<'_, P>) -> anyhow::Result<tempfile::TempDir> {
+    tempfile::tempdir_in(&deps.site.data_dir).context("open stream scratch dir")
+}
+
+/// A [`Streamer`] over `sources`, from `holders`, filling into `scratch`.
+fn streamer_over<'a, 'b, P>(
+    deps: &LaneDeps<'_, P>,
+    sources: &'a LaneSources<'b, P>,
+    holders: Vec<Holder>,
+    health: Arc<PeerHealth>,
+    scratch: &'a Path,
+) -> Streamer<'a, &'a LaneSources<'b, P>, PoolFunder<'a, P>>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let mut streamer = Streamer::new(sources, sources.funder(), scratch)
+        .holders(holders)
+        .health(health)
+        .recovery(Arc::clone(sources.recovery()))
+        .max_blob_bytes(deps.max_blob_bytes);
+    if let Some(slot) = sources.credentials() {
+        streamer = streamer.credentials(slot);
+    }
+    streamer
+}
+
+/// Prove the size of `hash` under the first claim `total_bytes`
+/// ([`Streamer::prove_size`]): `None` when no leg proved it.
+async fn prove_size<P>(
+    deps: &LaneDeps<'_, P>,
+    sources: &LaneSources<'_, P>,
+    holders: Vec<Holder>,
+    health: Arc<PeerHealth>,
+    hash: [u8; 32],
+    total_bytes: u64,
+    stop: StopPolicy,
+) -> anyhow::Result<Option<u64>>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let scratch = stream_scratch(deps)?;
+    streamer_over(deps, sources, holders, health, scratch.path())
+        .prove_size(hash, total_bytes, &PullConfig::new(), stop)
+        .await
+}
+
 /// Stream `hash`'s verified bytes in order to `sink` (stdout for
 /// [`Sink::Output`]) via the [`Streamer`] consumption face (#1848 4b). Only
 /// bao-verified bytes ever reach the pipe — safe to `| tar x` — the fetch is
@@ -1648,21 +1762,8 @@ where
         streamer_lane_cap: max_sources.max(1),
         read_ahead_bytes: read_ahead.unwrap_or(PullConfig::new().read_ahead_bytes),
     };
-    let funder = sources.funder();
-
-    // The fill store's `.partial` lives here for the stream's lifetime; a streamed
-    // blob is not kept, so a temp dir (removed on drop) under the data dir is its
-    // natural home.
-    let scratch = tempfile::tempdir_in(&deps.site.data_dir)
-        .map_err(|e| anyhow::anyhow!("open stream scratch dir: {e}"))?;
-    let mut streamer = Streamer::new(sources, funder, scratch.path())
-        .holders(holders)
-        .health(health)
-        .recovery(Arc::clone(sources.recovery()))
-        .max_blob_bytes(deps.max_blob_bytes);
-    if let Some(slot) = sources.credentials() {
-        streamer = streamer.credentials(slot);
-    }
+    let scratch = stream_scratch(deps)?;
+    let streamer = streamer_over(deps, sources, holders, health, scratch.path());
     // A window streams exactly its bytes, paid for by the aligned span around
     // them; the whole blob otherwise.
     let (mut reader, mut drive) = match range {

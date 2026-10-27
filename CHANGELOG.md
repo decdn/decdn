@@ -1137,6 +1137,24 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Gateway: the first request for a raw blob has its length, `HEAD` and
+  `Range` too (#2645, #2616).** A raw blob that no pull on the gateway had
+  verified streamed with no `Content-Length`, ignored `Range`, and its
+  `HEAD` had no length. Before it answers such a blob, the gateway now
+  proves its size: it pays for the last chunk group under the first node's
+  size claim, and only the true size verifies a final chunk (ADR 039). The
+  proven size gives the response its length, admits it against the
+  allowance (402 when it does not fit), caps its pull and lets one `Range`
+  through (206, or 416 past the end). A proof costs at least one chunk group
+  (16 KiB and its proof) per blob of unknown size, counted against a public
+  gateway's allowance, a request dropped mid-proof included. A cold `HEAD`
+  pays for its proof too: it now waits through discovery and a paid open,
+  and answers as its `GET` would when the proof cannot run (402 once the
+  allowance is spent, 502 when no node holds the blob, 503 when the pool
+  cannot pay). A blob whose proof proves nothing (a claim whose last chunk
+  group is not the blob's last, a claim past `--max-blob-mb`, or every
+  holder fails it) still streams with no length; a node's claim never gives
+  one. `decdn-client` gains `Streamer::prove_size`.
 - **Gateway: a raw blob the gateway pulled whole answers with its length,
   `HEAD` and `Range` (part of #2616).** `GET /<hash>` on the bare host and
   `/_decdn/<hash>` on a site streamed with no `Content-Length` and ignored
@@ -1144,11 +1162,11 @@ since project inception and will roll into the first tagged release.
   already verified. A raw blob that a whole pull on the gateway verified now
   gets `Content-Length` and `Accept-Ranges`, takes one `Range` (206, or 416
   past the end), and is refused with 402 before its pull when it does not
-  fit the allowance, as an entry is; its pull is capped at that size. The
-  first request for a blob still streams with no length: a node's size
-  claim is not used, since a claim below the real size would end a short
-  pull as a whole response (#2645 tracks a proven size for the first
-  request). `HEAD /_decdn/<hash>` on a site answered 404; it
+  fit the allowance, as an entry is; its pull is capped at that size. A
+  node's size claim is not used, since a claim below the real size would
+  end a short pull as a whole response; the size proof above (#2645) gives
+  the first request its length. `HEAD /_decdn/<hash>` on a site answered
+  404; it
   now answers as the bare host does, and `HEAD` of a bundle or an entry
   under `/_decdn/` redirects to its site.
 - **Client: a download adopts the stream it opened for the blob's size

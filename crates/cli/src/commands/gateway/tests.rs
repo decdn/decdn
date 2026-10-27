@@ -536,6 +536,8 @@ enum Reply {
     Funding,
     /// The pull writes nothing and never ends.
     Hold,
+    /// The size proof never ends, nor does the pull.
+    HoldProof,
     /// The pull writes these bytes, then ends at its cap, as a blob larger
     /// than the cap does once the cap's worth has landed.
     BytesThenTooLarge(Vec<u8>),
@@ -548,13 +550,19 @@ type Log<T> = Arc<std::sync::Mutex<Vec<T>>>;
 
 /// A pull backend that answers each blob by its hash and records the
 /// `--max-blob-mb` each pull runs with, the size cap it carries and its
-/// byte window. The sizes in `sizes` are the ones earlier pulls verified.
+/// byte window. The sizes in `sizes` are the ones earlier pulls verified. A
+/// size proof is logged in `proofs` apart from the pulls. A blob with no
+/// reply fails its proof with "no holder", and a `Funding` reply with a
+/// funding stop, as its pull would; otherwise the proof records the size
+/// `proves` holds for it, if any, as verified.
 struct Recording {
     caps: Log<u64>,
     size_caps: Log<Option<u64>>,
     ranges: Log<Option<(u64, u64)>>,
+    proofs: Log<[u8; 32]>,
     replies: HashMap<[u8; 32], Reply>,
-    sizes: HashMap<[u8; 32], u64>,
+    sizes: std::sync::Mutex<HashMap<[u8; 32], u64>>,
+    proves: HashMap<[u8; 32], u64>,
 }
 
 impl worker::Backend for Recording {
@@ -574,7 +582,7 @@ impl worker::Backend for Recording {
     }
 
     fn size(&self, (): &(), hash: [u8; 32]) -> Option<u64> {
-        self.sizes.get(&hash).copied()
+        self.sizes.lock().unwrap().get(&hash).copied()
     }
 
     async fn pull(
@@ -584,6 +592,25 @@ impl worker::Backend for Recording {
         blob: &BlobFetch,
         sink: &mut super::super::fetch::Sink,
     ) -> anyhow::Result<()> {
+        if blob.prove {
+            self.proofs.lock().unwrap().push(blob.hash);
+            match self.replies.get(&blob.hash) {
+                None => anyhow::bail!("no node holds the blob"),
+                Some(Reply::Funding) => {
+                    return Err(anyhow::Error::new(
+                        decdn_client::FundingNeeded::PublisherPool {
+                            pool: alloy::primitives::B256::ZERO,
+                        },
+                    ));
+                }
+                Some(Reply::HoldProof) => std::future::pending().await,
+                Some(_) => {}
+            }
+            if let Some(&size) = self.proves.get(&blob.hash) {
+                self.sizes.lock().unwrap().insert(blob.hash, size);
+            }
+            return Ok(());
+        }
         self.caps.lock().unwrap().push(blob.common.max_blob_mb);
         self.size_caps.lock().unwrap().push(blob.size_cap);
         self.ranges.lock().unwrap().push(blob.range);
@@ -604,7 +631,7 @@ impl worker::Backend for Recording {
                     pool: alloy::primitives::B256::ZERO,
                 },
             )),
-            Some(Reply::Hold) => std::future::pending().await,
+            Some(Reply::Hold | Reply::HoldProof) => std::future::pending().await,
             Some(Reply::BytesThenTooLarge(bytes)) => {
                 tokio::io::AsyncWriteExt::write_all(writer, bytes).await?;
                 Err(too_large())
@@ -645,20 +672,33 @@ async fn recording_gateway_of(
     replies: HashMap<[u8; 32], Reply>,
     args: &[&str],
 ) -> (Arc<Gateway>, Arc<std::sync::Mutex<Vec<u64>>>) {
-    let caps = Arc::default();
+    let (gateway, caps, _) = recording_gateway_proving(replies, HashMap::new(), args).await;
+    (gateway, caps)
+}
+
+/// [`recording_gateway_of`] whose size proofs prove the sizes in `proves`,
+/// and the blobs its proofs ran for.
+async fn recording_gateway_proving(
+    replies: HashMap<[u8; 32], Reply>,
+    proves: HashMap<[u8; 32], u64>,
+    args: &[&str],
+) -> (Arc<Gateway>, Log<u64>, Log<[u8; 32]>) {
+    let (caps, proofs) = (Arc::default(), Log::default());
     let backend = Recording {
         caps: Arc::clone(&caps),
         size_caps: Arc::default(),
         ranges: Arc::default(),
+        proofs: Arc::clone(&proofs),
         replies,
-        sizes: HashMap::new(),
+        sizes: std::sync::Mutex::default(),
+        proves,
     };
     let gateway = test_gateway_with(backend, flags(args)).await;
     insert(
         &mut *gateway.delegates.lock().await,
         delegate(None, Some(registered("*", None, Instant::now()))),
     );
-    (gateway, caps)
+    (gateway, caps, proofs)
 }
 
 /// A paid `GET path`: the status and the body as text.
@@ -1375,6 +1415,8 @@ struct Logs {
     size_caps: Log<Option<u64>>,
     /// The byte window of each pull.
     ranges: Log<Option<(u64, u64)>>,
+    /// The blob of each size proof.
+    proofs: Log<[u8; 32]>,
     /// Where the gateway keeps its pointers, for as long as the test runs.
     pointers_dir: tempfile::TempDir,
 }
@@ -1394,6 +1436,9 @@ const NOINDEX: [u8; 32] = [0xe9; 32];
 /// A blob whose pull never writes a byte, and never ends.
 const HELD: [u8; 32] = [0xea; 32];
 
+/// A blob whose size proof never ends.
+const HELD_PROOF: [u8; 32] = [0xeb; 32];
+
 /// The [`NOINDEX`] bundle's manifest.
 fn noindex_manifest() -> Vec<u8> {
     serde_json::json!({"version": 1, "entries": [
@@ -1403,6 +1448,9 @@ fn noindex_manifest() -> Vec<u8> {
     .into_bytes()
 }
 const BIG_LEN: usize = 600 * 1024;
+
+/// What a size proof spends of the allowance.
+const PROOF: u64 = PROOF_BYTES as u64;
 
 /// The empty entry of the public gateway's bundle.
 const EMPTY: [u8; 32] = [0xe8; 32];
@@ -1441,6 +1489,15 @@ async fn public_gateway_sized(
     allowance: Allowance,
     found: HashMap<[u8; 32], u64>,
 ) -> (Arc<Gateway>, Logs, String) {
+    public_gateway_proving(allowance, found, HashMap::new()).await
+}
+
+/// [`public_gateway_sized`] whose size proofs prove the sizes in `proves`.
+async fn public_gateway_proving(
+    allowance: Allowance,
+    found: HashMap<[u8; 32], u64>,
+    proves: HashMap<[u8; 32], u64>,
+) -> (Arc<Gateway>, Logs, String) {
     let replies = HashMap::from([
         (BLOB, Reply::Bytes(public_manifest())),
         (ENTRY, Reply::Bytes(b"abc".to_vec())),
@@ -1451,19 +1508,23 @@ async fn public_gateway_sized(
         (PARTIAL, Reply::BytesThenTooLarge(b"partial".to_vec())),
         (NOINDEX, Reply::Bytes(noindex_manifest())),
         (HELD, Reply::Hold),
+        (HELD_PROOF, Reply::HoldProof),
     ]);
     let logs = Logs {
         caps: Arc::default(),
         size_caps: Arc::default(),
         ranges: Arc::default(),
+        proofs: Arc::default(),
         pointers_dir: tempfile::tempdir().unwrap(),
     };
     let backend = Recording {
         caps: Arc::clone(&logs.caps),
         size_caps: Arc::clone(&logs.size_caps),
         ranges: Arc::clone(&logs.ranges),
+        proofs: Arc::clone(&logs.proofs),
         replies,
-        sizes: found,
+        sizes: std::sync::Mutex::new(found),
+        proves,
     };
     let sites = SiteDomain::Public {
         origin: "https://decdn.test".parse().unwrap(),
@@ -1847,7 +1908,8 @@ async fn the_public_bare_host_redirects_bundles_and_streams_blobs() {
 
 /// A public gateway answers `HEAD` from the bundle manifest: the entry's
 /// length and hash, with no pull of the entry itself. A raw blob's `HEAD`
-/// costs no pull either, and has no length until a pull verifies its size.
+/// pays only for its size proof, and has no length when the proof proves
+/// nothing.
 #[tokio::test]
 async fn a_public_head_is_answered_from_the_manifest() {
     let (gateway, logs, host) = public_gateway().await;
@@ -1892,11 +1954,16 @@ async fn a_public_head_is_answered_from_the_manifest() {
     )
     .await;
     assert_eq!(raw.status, StatusCode::OK);
-    assert_eq!(raw.header(header::CONTENT_LENGTH), None);
+    assert_eq!(
+        raw.header(header::CONTENT_LENGTH),
+        None,
+        "a size no proof proved gives no length"
+    );
+    assert_eq!(*logs.proofs.lock().unwrap(), [OTHER]);
     assert_eq!(
         logs.caps.lock().unwrap().len(),
         1,
-        "a raw blob's HEAD pulls nothing"
+        "a raw blob's HEAD pulls nothing but its size proof"
     );
 
     let missing = send(&gateway, Method::HEAD, &host, "/nope.txt", &[]).await;
@@ -1971,7 +2038,7 @@ async fn an_exhausted_allowance_answers_402_with_the_uri() {
 /// carries: the hint is the client's to set, so it buys no bucket of its own.
 #[tokio::test]
 async fn every_request_spends_the_one_allowance() {
-    let (gateway, _, _) = public_gateway_with(10).await;
+    let (gateway, _, _) = public_gateway_with(PROOF + 10).await;
     let other = alloy::hex::encode(OTHER);
     let first = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
     assert_eq!(first.status, StatusCode::OK);
@@ -2021,8 +2088,9 @@ async fn an_entry_that_does_not_fit_is_refused_before_its_pull() {
 #[tokio::test]
 async fn a_stream_is_cut_when_the_allowance_runs_out() {
     // A 600 KiB blob streams in three frames of 256 KiB; the second reaches
-    // a 300 KiB allowance and the third never goes out.
-    let (gateway, _, _) = public_gateway_with(300 * 1024).await;
+    // a 300 KiB allowance and the third never goes out. Each blob's size
+    // proof, which proves nothing here, spends `PROOF` first.
+    let (gateway, _, _) = public_gateway_with(PROOF + 300 * 1024).await;
     let big = alloy::hex::encode(BIG);
     let req = Request::builder()
         .method(Method::GET)
@@ -2042,7 +2110,7 @@ async fn a_stream_is_cut_when_the_allowance_runs_out() {
 
     // Eleven bytes against ten: the one frame reaches the bound and the body
     // still ends whole.
-    let (gateway, _, _) = public_gateway_with(10).await;
+    let (gateway, _, _) = public_gateway_with(PROOF + 10).await;
     let other = alloy::hex::encode(OTHER);
     let whole = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
     assert_eq!(
@@ -2054,7 +2122,7 @@ async fn a_stream_is_cut_when_the_allowance_runs_out() {
 /// `HEAD` reads the manifest, a paid pull, so it needs the allowance too.
 #[tokio::test]
 async fn a_public_head_needs_the_allowance() {
-    let (gateway, logs, host) = public_gateway_with(10).await;
+    let (gateway, logs, host) = public_gateway_with(PROOF + 10).await;
     let other = alloy::hex::encode(OTHER);
     let spend = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
     assert_eq!(spend.status, StatusCode::OK);
@@ -2181,14 +2249,17 @@ async fn a_dropped_response_is_charged_its_read_ahead() {
     let taken = first.data_ref().unwrap().len() as u64;
     assert!(taken > 0 && taken < BIG_LEN as u64);
     drop(body);
-    assert_eq!(left(&gateway), allowance - taken - DROP_PENALTY_BYTES);
+    assert_eq!(
+        left(&gateway),
+        allowance - PROOF - taken - DROP_PENALTY_BYTES
+    );
 
     let whole = request(&gateway, "decdn.test", &format!("/{big}"), &[]).await;
     assert_eq!(whole.status, StatusCode::OK);
     assert_eq!(whole.body.len(), BIG_LEN);
     assert_eq!(
         left(&gateway),
-        allowance - taken - DROP_PENALTY_BYTES - BIG_LEN as u64
+        allowance - 2 * PROOF - taken - DROP_PENALTY_BYTES - BIG_LEN as u64
     );
 }
 
@@ -2375,7 +2446,7 @@ async fn a_request_dropped_before_its_first_byte_is_charged() {
         dropped.is_err(),
         "the pull never answers, so the request is dropped"
     );
-    assert_eq!(left(&gateway), allowance - DROP_PENALTY_BYTES);
+    assert_eq!(left(&gateway), allowance - PROOF - DROP_PENALTY_BYTES);
 }
 
 /// `Range` → the byte window of a `size`-byte entry: one satisfiable range
@@ -2448,7 +2519,7 @@ async fn an_unsatisfiable_range_answers_416() {
 
 /// A range the gateway cannot honour is ignored, as HTTP allows: a malformed
 /// or multi-part range, a response that is rewritten (its length changes),
-/// and a blob whose size nothing knows all get the whole body as 200.
+/// and a blob whose size no proof proved all get the whole body as 200.
 #[tokio::test]
 async fn a_range_is_ignored_where_it_cannot_be_served() {
     let (gateway, logs, host) = public_gateway().await;
@@ -2588,6 +2659,10 @@ async fn a_raw_blob_of_known_size_answers_with_its_length() {
     assert_eq!(whole.header(header::CONTENT_LENGTH), Some("11"));
     assert_eq!(whole.header(header::ACCEPT_RANGES), Some("bytes"));
     assert_eq!(*logs.size_caps.lock().unwrap(), [Some(11)]);
+    assert!(
+        logs.proofs.lock().unwrap().is_empty(),
+        "a verified size needs no proof"
+    );
 }
 
 /// A raw blob of verified size takes one `Range`, as a sized entry does: 206
@@ -2687,6 +2762,165 @@ async fn the_empty_root_is_empty_with_no_pull() {
     .await;
     assert_eq!(head.status, StatusCode::OK);
     assert_eq!(head.header(header::CONTENT_LENGTH), Some("0"));
+    assert!(logs.caps.lock().unwrap().is_empty(), "nothing was pulled");
+    assert!(logs.proofs.lock().unwrap().is_empty(), "nothing was proved");
+}
+
+/// [`public_gateway_proving`] with `allowance` bytes per day, whose size
+/// proofs prove [`OTHER`] and [`BIG`] at their lengths.
+async fn proving_gateway_with(allowance: u64) -> (Arc<Gateway>, Logs, String) {
+    let proves = HashMap::from([(OTHER, 11), (BIG, u64::try_from(BIG_LEN).unwrap())]);
+    let allowance = Allowance::with_namespaces(allowance, []);
+    public_gateway_proving(allowance, HashMap::new(), proves).await
+}
+
+/// The first request for a raw blob proves its size before it answers, and
+/// answers with that length: one proof, then one pull capped at the size. A
+/// repeat request finds the size and proves nothing.
+#[tokio::test]
+async fn a_cold_raw_blob_answers_with_its_proven_length() {
+    let (gateway, logs, _) = proving_gateway_with(u64::MAX).await;
+    let other = alloy::hex::encode(OTHER);
+    for _ in 0..2 {
+        let whole = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
+        assert_eq!(
+            (whole.status, whole.body.as_str()),
+            (StatusCode::OK, "other bytes")
+        );
+        assert_eq!(whole.header(header::CONTENT_LENGTH), Some("11"));
+        assert_eq!(whole.header(header::ACCEPT_RANGES), Some("bytes"));
+    }
+    assert_eq!(*logs.proofs.lock().unwrap(), [OTHER]);
+    assert_eq!(*logs.size_caps.lock().unwrap(), [Some(11), Some(11)]);
+}
+
+/// A `Range` on a raw blob no pull verified is served once a proof proves
+/// its size: 206 over the window, and 416 for a window past the proven end,
+/// with no pull.
+#[tokio::test]
+async fn a_range_on_a_cold_raw_blob_answers_206() {
+    let (gateway, logs, _) = proving_gateway_with(u64::MAX).await;
+    let other = alloy::hex::encode(OTHER);
+    let window = request(
+        &gateway,
+        "decdn.test",
+        &format!("/{other}"),
+        &[("range", "bytes=6-9")],
+    )
+    .await;
+    assert_eq!(
+        (window.status, window.body.as_str()),
+        (StatusCode::PARTIAL_CONTENT, "byte")
+    );
+    assert_eq!(window.header(header::CONTENT_RANGE), Some("bytes 6-9/11"));
+    assert_eq!(*logs.ranges.lock().unwrap(), [Some((6, 4))]);
+
+    let (gateway, logs, _) = proving_gateway_with(u64::MAX).await;
+    let past = request(
+        &gateway,
+        "decdn.test",
+        &format!("/{other}"),
+        &[("range", "bytes=11-")],
+    )
+    .await;
+    assert_eq!(past.status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(past.header(header::CONTENT_RANGE), Some("bytes */11"));
+    assert_eq!(*logs.proofs.lock().unwrap(), [OTHER]);
+    assert!(logs.caps.lock().unwrap().is_empty(), "a 416 pulls nothing");
+}
+
+/// A raw blob whose proven size does not fit what is left of the allowance
+/// is refused before its pull; its proof spent `PROOF` of it.
+#[tokio::test]
+async fn a_cold_raw_blob_that_does_not_fit_is_refused_after_its_proof() {
+    let allowance = 300 * 1024;
+    let (gateway, logs, _) = proving_gateway_with(allowance).await;
+    let big = alloy::hex::encode(BIG);
+    let refused = request(&gateway, "decdn.test", &format!("/{big}"), &[]).await;
+    assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(*logs.proofs.lock().unwrap(), [BIG]);
+    assert!(logs.caps.lock().unwrap().is_empty(), "nothing was pulled");
+    assert_eq!(left(&gateway), allowance - PROOF);
+}
+
+/// `HEAD` of a raw blob no pull verified pays for its size proof, and
+/// answers with the proven length and no pull; at no allowance it is
+/// refused as its `GET` would be, with no proof. A site answers the same
+/// under `/_decdn/`.
+#[tokio::test]
+async fn a_cold_head_pays_for_its_size_proof() {
+    let allowance = 1 << 20;
+    let (gateway, logs, host) = proving_gateway_with(allowance).await;
+    let other = alloy::hex::encode(OTHER);
+    let head = send(
+        &gateway,
+        Method::HEAD,
+        "decdn.test",
+        &format!("/{other}"),
+        &[],
+    )
+    .await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(head.header(header::CONTENT_LENGTH), Some("11"));
+    assert_eq!(head.header(header::ACCEPT_RANGES), Some("bytes"));
+    assert_eq!(*logs.proofs.lock().unwrap(), [OTHER]);
+    assert!(logs.caps.lock().unwrap().is_empty(), "HEAD pulls nothing");
+    assert_eq!(left(&gateway), allowance - PROOF);
+
+    let big = alloy::hex::encode(BIG);
+    let site = send(
+        &gateway,
+        Method::HEAD,
+        &host,
+        &format!("/_decdn/{big}"),
+        &[],
+    )
+    .await;
+    assert_eq!(site.status, StatusCode::OK);
+    assert_eq!(
+        site.header(header::CONTENT_LENGTH),
+        Some(BIG_LEN.to_string().as_str())
+    );
+
+    let (gateway, logs, _) = proving_gateway_with(0).await;
+    let refused = send(
+        &gateway,
+        Method::HEAD,
+        "decdn.test",
+        &format!("/{other}"),
+        &[],
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
+    assert!(logs.proofs.lock().unwrap().is_empty(), "nothing was proved");
+}
+
+/// A blob no node holds answers as its pull would, after a proof that found
+/// no holder: no second attempt, and no allowance spent.
+#[tokio::test]
+async fn a_blob_no_node_holds_is_not_pulled_after_its_proof() {
+    let allowance = 1 << 20;
+    let (gateway, logs, _) = proving_gateway_with(allowance).await;
+    let missing = alloy::hex::encode([0x99; 32]);
+    let answer = request(&gateway, "decdn.test", &format!("/{missing}"), &[]).await;
+    assert_eq!(answer.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(*logs.proofs.lock().unwrap(), [[0x99; 32]]);
+    assert!(
+        logs.caps.lock().unwrap().is_empty(),
+        "no pull after the proof"
+    );
+    assert_eq!(left(&gateway), allowance);
+}
+
+/// A blob whose pull stops for funding stops at its proof, as its pull
+/// would: 503, and nothing pulled.
+#[tokio::test]
+async fn a_proof_that_cannot_be_paid_answers_503() {
+    let (gateway, logs, _) = proving_gateway_with(u64::MAX).await;
+    let unfunded = alloy::hex::encode(UNFUNDED);
+    let answer = request(&gateway, "decdn.test", &format!("/{unfunded}"), &[]).await;
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(*logs.proofs.lock().unwrap(), [UNFUNDED]);
     assert!(logs.caps.lock().unwrap().is_empty(), "nothing was pulled");
 }
 
@@ -3335,4 +3569,107 @@ async fn status_spells_addresses_eip55_and_hashes_bare() {
         status["payment_pool"],
         gateway.chain.payment_pool.to_string()
     );
+}
+
+/// A request dropped while its size proof runs is still charged the proof:
+/// the worker goes on paying for it.
+#[tokio::test]
+async fn a_request_dropped_during_its_proof_is_charged() {
+    let allowance = 1 << 20;
+    let (gateway, logs, _) = proving_gateway_with(allowance).await;
+    let held = alloy::hex::encode(HELD_PROOF);
+    let req = Request::builder()
+        .method(Method::HEAD)
+        .uri(format!("/{held}"))
+        .header(header::HOST, "decdn.test")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let dropped =
+        tokio::time::timeout(Duration::from_millis(200), Arc::clone(&gateway).handle(req)).await;
+    assert!(dropped.is_err(), "the proof never ends");
+    assert_eq!(*logs.proofs.lock().unwrap(), [HELD_PROOF]);
+    assert_eq!(left(&gateway), allowance - PROOF);
+}
+
+/// `HEAD` under `/_decdn/` on a namespace's host pays for a proof from the
+/// bucket its `GET` would spend: the namespace's own for its bundle's hash,
+/// the shared one for any other blob.
+#[tokio::test]
+async fn a_cold_head_under_decdn_spends_the_bucket_its_get_would() {
+    let allowance = Allowance::with_namespaces(u64::MAX, [(7, 1)]);
+    let proves = HashMap::from([(OTHER, 11)]);
+    let (gateway, logs, _) = public_gateway_proving(allowance, HashMap::new(), proves).await;
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
+    let own = format!("/_decdn/{}", alloy::hex::encode(BLOB));
+    let first = send(&gateway, Method::HEAD, "7.decdn.test", &own, &[]).await;
+    assert_eq!(first.status, StatusCode::OK);
+    let spent = send(&gateway, Method::HEAD, "7.decdn.test", &own, &[]).await;
+    assert_eq!(
+        spent.status,
+        StatusCode::PAYMENT_REQUIRED,
+        "the namespace's bucket paid for the first proof"
+    );
+    let other = format!("/_decdn/{}", alloy::hex::encode(OTHER));
+    let shared = send(&gateway, Method::HEAD, "7.decdn.test", &other, &[]).await;
+    assert_eq!(shared.status, StatusCode::OK);
+    assert_eq!(shared.header(header::CONTENT_LENGTH), Some("11"));
+    assert_eq!(*logs.proofs.lock().unwrap(), [BLOB, OTHER]);
+}
+
+/// A raw blob of known size whose pull stops for funding answers 503, as an
+/// entry's does: no proof, and the pull reached.
+#[tokio::test]
+async fn a_sized_raw_blob_whose_pull_cannot_be_paid_answers_503() {
+    let found = HashMap::from([(UNFUNDED, 5)]);
+    let allowance = Allowance::with_namespaces(u64::MAX, []);
+    let (gateway, logs, _) = public_gateway_sized(allowance, found).await;
+    let unfunded = alloy::hex::encode(UNFUNDED);
+    let answer = request(&gateway, "decdn.test", &format!("/{unfunded}"), &[]).await;
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        logs.proofs.lock().unwrap().is_empty(),
+        "a known size needs no proof"
+    );
+    assert_eq!(*logs.size_caps.lock().unwrap(), [Some(5)]);
+}
+
+/// A loopback gateway proves a raw blob's size too, on the capability that
+/// pays for the request, and answers with its length.
+#[tokio::test]
+async fn a_loopback_raw_blob_answers_with_its_proven_length() {
+    let replies = HashMap::from([(BLOB, Reply::Bytes(b"raw".to_vec()))]);
+    let (gateway, caps, proofs) =
+        recording_gateway_proving(replies, HashMap::from([(BLOB, 3)]), &[]).await;
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{}", alloy::hex::encode(BLOB)))
+        .header(header::HOST, "127.0.0.1:8484")
+        .header(TOKEN_HEADER, TEST_TOKEN)
+        .header(HOST_HEADER, "decdn.org")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = Arc::clone(&gateway).handle(req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("3")
+    );
+    assert_eq!(*proofs.lock().unwrap(), [BLOB]);
+    assert_eq!(caps.lock().unwrap().len(), 1);
+}
+
+/// A capability that runs out at a size proof is retired, as at a pull, and
+/// the request moves on: with no other capability, 402 and no pull.
+#[tokio::test]
+async fn a_capability_that_runs_out_at_a_proof_is_retired() {
+    let replies = HashMap::from([(BLOB, Reply::Funding)]);
+    let (gateway, caps, proofs) = recording_gateway_proving(replies, HashMap::new(), &[]).await;
+    let (status, body) = get(&gateway, &format!("/{}", alloy::hex::encode(BLOB))).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+    assert!(body.contains("no capability covers"), "{body}");
+    assert_eq!(*proofs.lock().unwrap(), [BLOB]);
+    assert!(caps.lock().unwrap().is_empty(), "nothing was pulled");
 }
