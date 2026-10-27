@@ -156,7 +156,7 @@ async fn a_primed_whole_blob_pull_is_the_downloads_first_leg() -> anyhow::Result
         let primed = PrimedSource::new(source);
         let range = decdn_bao_range::align_range(0, 0, total)?;
         let (header, reader) = primed.inner().open(root, range.clone()).await?;
-        primed.prime(root, range, header, reader, tokio::time::Instant::now());
+        primed.prime_next(root, range, header, reader, tokio::time::Instant::now());
 
         let downloader = downloader(vec![candidate(primed, ledger, 0xA1)])?;
         let dir = tempfile::tempdir()?;

@@ -463,6 +463,85 @@ async fn a_primed_first_leg_is_adopted_not_reopened() {
     );
 }
 
+/// A [`ScriptedSource`] that records, at each open, how many readers hold
+/// its gate: the source's own receiver plus every reader not yet read or
+/// dropped. A peer that reserves funds per open stream holds that many.
+struct CountedOpens {
+    inner: ScriptedSource,
+    gate: tokio::sync::watch::Sender<bool>,
+    live_at_open: Mutex<Vec<usize>>,
+}
+
+impl BlobSource for CountedOpens {
+    type Reader = <ScriptedSource as BlobSource>::Reader;
+
+    fn open(
+        &self,
+        hash: [u8; 32],
+        range: AlignedRange,
+    ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
+        self.live_at_open
+            .lock()
+            .expect("lock")
+            .push(self.gate.receiver_count());
+        self.inner.open(hash, range)
+    }
+
+    fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+        self.inner.finish(reader)
+    }
+
+    fn stop(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+        self.inner.stop(reader)
+    }
+
+    fn max_blob_size_bytes(&self) -> u64 {
+        self.inner.max_blob_size_bytes()
+    }
+}
+
+/// A pull primed for the next open alone is closed before an open of another
+/// range reaches the wrapped source, so a peer that reserves funds per open
+/// stream never holds it beside the leg that replaces it (#2633). A pull
+/// primed with `prime` stays open beside that leg.
+#[tokio::test]
+async fn a_pull_primed_for_the_next_open_closes_before_another_range_opens() {
+    let total = 4 * GROUP;
+    let (root, plaintext, _) = synth_blob(total as usize);
+    let whole = align_range(0, 0, total).expect("align");
+    let window = align_range(0, GROUP, total).expect("align");
+    for next_only in [true, false] {
+        let (gate, rx) = tokio::sync::watch::channel(true);
+        let source = PrimedSource::new(CountedOpens {
+            inner: ScriptedSource::new(plaintext.clone())
+                .expect("source")
+                .gated_on(rx),
+            gate,
+            live_at_open: Mutex::default(),
+        });
+        let (header, reader) = source
+            .inner()
+            .open(root, whole.clone())
+            .await
+            .expect("priming open");
+        let at = tokio::time::Instant::now();
+        if next_only {
+            source.prime_next(root, whole.clone(), header, reader, at);
+        } else {
+            source.prime(root, whole.clone(), header, reader, at);
+        }
+        let _leg = source.open(root, window.clone()).await.expect("leg open");
+        let live = source.inner().live_at_open.lock().expect("lock").clone();
+        // The source's own receiver, and the primed reader when still open.
+        let want = if next_only { 1 } else { 2 };
+        assert_eq!(
+            live.last().copied(),
+            Some(want),
+            "next_only={next_only}: readers live as the leg opened: {live:?}"
+        );
+    }
+}
+
 /// An open of another range goes to the wrapped source and leaves the
 /// primed pull parked; `clear` drops it; a stale one is never adopted.
 #[tokio::test(start_paused = true)]

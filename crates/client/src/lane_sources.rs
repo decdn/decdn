@@ -299,11 +299,12 @@ where
     /// holder signs from its header ([`first_open`]), with the acquire loop's
     /// recovery: a holder that faults cools and another is tried until one
     /// answers, a fault only the user can fix ends it, and `stop` gives up.
-    /// The open's pull is primed on the lane ([`PrimedSource`]) once its
-    /// header is read: a drive whose first leg on the lane is the whole blob
-    /// adopts it within two seconds of the open.
-    /// A pull no leg adopts closes when a later open on the lane finds it
-    /// stale, or when the lane drops at the end of the drive. The lane that
+    /// The open's pull is primed on the lane for its next open alone
+    /// ([`PrimedSource::prime_next`]) once its header is read: a first leg on
+    /// the lane that is the whole blob adopts it within two seconds of the
+    /// open, and any other first leg closes it before opening its own, so the
+    /// node never holds the floor it reserved for the pull beside the leg's.
+    /// A lane that opens nothing closes it when it drops. The lane that
     /// answered is parked for the
     /// fetch's `connect`, so the fetch reuses it; every other lane the open
     /// built drops, and with it any stream permit it held. Returns the claim
@@ -360,10 +361,13 @@ where
                 // The node has already written into the pull. A fresh
                 // download's first leg on this lane is the whole blob, so
                 // the pull is parked for that leg to adopt instead of dropped
-                // unread. `align_range(0, 0, n)` holds for every `n`; were it
-                // to fail, the drive opens its own pull.
+                // unread; another first leg closes it first. `align_range(0,
+                // 0, n)` holds for every `n`; were it to fail, the drive opens
+                // its own pull.
                 match decdn_bao_range::align_range(0, 0, total_bytes) {
-                    Ok(range) => lane.source.prime(hash, range, header, whole, opened_at),
+                    Ok(range) => lane
+                        .source
+                        .prime_next(hash, range, header, whole, opened_at),
                     Err(e) => {
                         tracing::debug!(error = %e, "the size open's pull is not primed");
                         drop((header, whole));

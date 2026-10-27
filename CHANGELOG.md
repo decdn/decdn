@@ -1158,8 +1158,9 @@ since project inception and will roll into the first tagged release.
   written up to a credit window into it. The stream is now kept on its lane
   for up to 2 seconds, and a download whose first leg is the whole blob
   adopts it. Any other first leg (a resumed download's gap, a streamed
-  fetch's window) opens its own stream, and the kept one closes when the
-  lane ends (#2644 tracks streamed fetches). The peer-store e2e checks that
+  fetch's window) closes the kept stream before it opens its own, so the
+  node never holds the floor it reserved for both at once (#2644 tracks
+  streamed fetches). The peer-store e2e checks that
   a fast-path download makes the holders write the blob's wire bytes once
   and probe nothing.
 - **Gateway: a blob that is no bundle manifest is pulled once (#2478).** A
