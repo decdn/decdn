@@ -23,6 +23,15 @@ pub struct GatewayArgs {
     #[command(flatten)]
     pub public: PublicArgs,
 
+    /// Also serve the gateway's metrics (Prometheus text, `GET /metrics`),
+    /// its state (`GET /_status`) and the dashboard (`GET /`) on this
+    /// loopback address, for the operator. A public gateway's `/_status`
+    /// there takes no token; a loopback gateway's takes the gateway token.
+    /// Without it no such listener runs; a loopback gateway still serves
+    /// `/_status` and the dashboard on its own host.
+    #[arg(long, value_name = "ADDR", value_parser = parse_loopback_addr)]
+    pub metrics_listen: Option<SocketAddr>,
+
     /// Discovery and chain flags, as `decdn get` takes them. A loopback
     /// gateway holds its own delegate keys and registered capabilities, so
     /// the keystore and capability flags do not apply to it; a public gateway
@@ -77,14 +86,19 @@ pub struct PublicArgs {
     /// in the config file, else the built-in testnet's on that chain.
     #[arg(long, value_name = "ADDR", requires = "public_url")]
     pub publisher_registry_address: Option<String>,
+}
 
-    /// Serve the gateway's metrics (Prometheus text, `GET /metrics`), its
-    /// state (`GET /_status`) and the dashboard (`GET /`) on this loopback
-    /// address, for the operator. A public gateway's `/_status` there takes
-    /// no token; a loopback gateway's takes the gateway token. Nothing is
-    /// served without it.
-    #[arg(long, value_name = "ADDR")]
-    pub metrics_listen: Option<SocketAddr>,
+/// Parse a socket address on a loopback interface: what `--metrics-listen`
+/// serves is the operator's, never the public's.
+fn parse_loopback_addr(s: &str) -> Result<SocketAddr, String> {
+    let addr: SocketAddr = s.parse().map_err(|e| format!("{s:?}: {e}"))?;
+    if addr.ip().is_loopback() {
+        Ok(addr)
+    } else {
+        Err(format!(
+            "{addr} is not a loopback address: the listener serves the operator, not the public"
+        ))
+    }
 }
 
 /// Parse `<ns>=<bytes>`: a canonical decimal namespace id (no leading zero,

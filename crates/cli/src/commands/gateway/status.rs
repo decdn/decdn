@@ -42,6 +42,7 @@ pub(super) struct Status {
     /// The main listener's address.
     listen: SocketAddr,
     chain_id: u64,
+    #[serde(serialize_with = "super::eip55")]
     payment_pool: Address,
     counters: Counters,
     /// The pulls in flight, oldest first.
@@ -100,3 +101,7 @@ impl Gateway {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests;

@@ -1,0 +1,89 @@
+{
+  "mode": "public",
+  "version": "0.0.0-fixture",
+  "dashboard_built": true,
+  "started_unix": 1793000000,
+  "uptime_secs": 93784,
+  "listen": "127.0.0.1:8484",
+  "chain_id": 421614,
+  "payment_pool": "0x3535353535353535353535353535353535353535",
+  "counters": {
+    "bytes_served": 48318382080,
+    "requests_ok": 128400,
+    "requests_not_found": 312,
+    "requests_refused": 41,
+    "requests_allowance_exhausted": 7,
+    "pull_failures_funding": 1,
+    "pull_failures_other": 3,
+    "pulls_active": 2,
+    "pointer_updates": 5
+  },
+  "active_pulls": [
+    {
+      "hash": "eaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaea",
+      "namespace": 7,
+      "range": [
+        1048576,
+        4194304
+      ],
+      "payer": {
+        "kind": "pool"
+      },
+      "since_secs": 12,
+      "delivered_bytes": 3400000
+    }
+  ],
+  "capabilities": [],
+  "allowance": [
+    {
+      "namespace": null,
+      "per_day": 21474836480,
+      "used": 17179869184,
+      "remaining": 4294967296,
+      "resets_in_secs": 30000
+    },
+    {
+      "namespace": 9,
+      "per_day": null,
+      "used": 0,
+      "remaining": null,
+      "resets_in_secs": 30000
+    }
+  ],
+  "pointers": [
+    {
+      "namespace": 7,
+      "root": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "seq": 12,
+      "signer": "0xABaBaBaBABabABabAbAbABAbABabababaBaBABaB"
+    }
+  ],
+  "pools": {
+    "pools": {
+      "pools": [
+        {
+          "pool_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
+          "chain_id": 421614,
+          "payment_pool": "0x3535353535353535353535353535353535353535",
+          "owner": "0xABaBaBaBABabABabAbAbABAbABabababaBaBABaB",
+          "token": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC",
+          "deposit_micro_usdc": 10000000,
+          "spent_micro_usdc": 3250000,
+          "lanes": [
+            {
+              "voucher_signer": "0xABaBaBaBABabABabAbAbABAbABabababaBaBABaB",
+              "provider": "0xb2b2b2b2b2B2b2B2B2b2b2B2B2b2B2B2b2b2b2b2",
+              "last_amount_micro_usdc": 3250000,
+              "last_bytes_delivered": 48000000000
+            }
+          ]
+        }
+      ],
+      "skipped": [
+        "0x4444444444444444444444444444444444444444444444444444444444444444"
+      ]
+    },
+    "delegate_lanes": []
+  },
+  "pool_error": null
+}

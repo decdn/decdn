@@ -30,8 +30,8 @@ since project inception and will roll into the first tagged release.
 
 - **Admin wire: `BuyerPoolSnapshot` carries `spent_micro_usdc`.** The field
   is the pool's spend as the store knows it (every tracked lane plus the
-  spend other signers redeemed), so deposit less spend is the headroom left
-  for every signer on the pool. The field is required, so a `decdn` CLI at
+  spend other signers redeemed). It is a lower bound, so deposit less spend
+  is at most the headroom left for every signer on the pool. The field is required, so a `decdn` CLI at
   this release reads `admin_v1_pools` only from a daemon at this release.
   `decdn node pools` and `decdn pool list` gain a `SPENT` column between
   `DEPOSIT` and `LANES`, which moves `LANES`.
@@ -3569,7 +3569,7 @@ since project inception and will roll into the first tagged release.
   listener answers only its own loopback names in `Host` and refuses any
   other with 403, `/metrics` included, so a scraper addresses it by
   `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` or the listen
-  address.
+  address. A non-loopback address is refused when the flag is parsed.
 - **Gateway: a public gateway answers every origin (#2628).** `decdn gateway
   --public-url` adds `Access-Control-Allow-Origin: *` and exposes
   `Content-Length`, `Content-Range`, `Accept-Ranges`, `Content-Type`,

@@ -2554,6 +2554,31 @@ async fn the_metrics_listener_serves_the_exposition() {
     }
     let named = fetch_as(format!("localhost:{}", addr.port()), "/metrics").await;
     assert!(named.starts_with("HTTP/1.1 200"), "{named}");
+    // A page the operator visits reaches this address with its own Host, so
+    // only the missing CORS grant keeps it from reading the token-free state.
+    for path in ["/_status", "/", "/metrics"] {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: https://evil.example\r\n\
+                     Connection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).await.unwrap();
+        assert!(out.starts_with("HTTP/1.1 200"), "{path}: {out}");
+        assert!(
+            !out.to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "{path} is readable cross-origin: {out}"
+        );
+    }
+    // The operator's own requests are not what the gateway served.
+    assert_eq!(gateway.metrics.snapshot(), metrics::Counters::default());
 }
 
 /// The headers a cross-origin page may read from a public gateway.
@@ -2913,10 +2938,7 @@ async fn status_lists_a_stored_pointer_and_its_bucket() {
     assert_eq!(pointers.len(), 1);
     assert_eq!(pointers[0]["namespace"], 7);
     assert_eq!(pointers[0]["seq"], 3);
-    assert_eq!(
-        pointers[0]["root"],
-        format!("0x{}", alloy::hex::encode(BLOB))
-    );
+    assert_eq!(pointers[0]["root"], alloy::hex::encode(BLOB));
     assert_eq!(pointers[0]["signer"], owner.to_string());
 }
 
@@ -3038,4 +3060,37 @@ async fn the_dashboard_does_not_count_itself() {
         loopback_get(&gateway, path, token).await;
     }
     assert_eq!(gateway.metrics.snapshot(), metrics::Counters::default());
+}
+
+/// One spelling per kind of value in `/_status`: an address is EIP-55, as
+/// `GET /_capability` and the pool rows write it, and a content hash is bare
+/// hex, as a gateway URL carries it.
+#[tokio::test]
+async fn status_spells_addresses_eip55_and_hashes_bare() {
+    let mixed = Address::repeat_byte(0xab);
+    assert_ne!(
+        mixed.to_string(),
+        format!("{mixed:#x}"),
+        "a mixed-case address"
+    );
+    let payer = serde_json::to_value(PayerLabel::Capability { signer: mixed }).unwrap();
+    assert_eq!(payer["signer"], mixed.to_string());
+    let pool = alloy::primitives::B256::repeat_byte(0x01);
+    let lanes = serde_json::to_value(worker::DelegateLanes {
+        signer: mixed,
+        pool_id: pool,
+        lanes: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(lanes["signer"], mixed.to_string());
+    assert_eq!(lanes["pool_id"], format!("{pool:#x}"));
+    let (gateway, _logs, _) = public_gateway().await;
+    hold(&gateway, unsigned_pointer(7, BLOB, 3), mixed);
+    let status = serde_json::to_value(gateway.status().await).unwrap();
+    assert_eq!(status["pointers"][0]["signer"], mixed.to_string());
+    assert_eq!(status["pointers"][0]["root"], alloy::hex::encode(BLOB));
+    assert_eq!(
+        status["payment_pool"],
+        gateway.chain.payment_pool.to_string()
+    );
 }

@@ -137,7 +137,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::Eip712Domain;
 use anyhow::Context as _;
@@ -349,11 +349,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         public,
     });
 
-    if let Some(metrics) = args.public.metrics_listen {
-        anyhow::ensure!(
-            metrics.ip().is_loopback(),
-            "--metrics-listen must be a loopback address: it serves the operator, not the public"
-        );
+    if let Some(metrics) = args.metrics_listen {
         let listener = TcpListener::bind(metrics)
             .await
             .with_context(|| format!("listen for metrics on {metrics}"))?;
@@ -2521,6 +2517,18 @@ impl Drop for Streaming {
     }
 }
 
+/// Serialize `address` EIP-55 checksummed: every address in `/_status` and
+/// `GET /_capability` has this one spelling.
+fn eip55<S: serde::Serializer>(address: &Address, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_str(address)
+}
+
+/// Serialize a content hash as bare lowercase hex, the spelling a gateway URL
+/// and a `decdn:` URI carry.
+fn bare_hex<S: serde::Serializer>(hash: &B256, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&alloy::hex::encode(hash))
+}
+
 /// Who pays for a pull, as `/_status` lists it.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -2530,6 +2538,7 @@ enum PayerLabel {
     /// A held capability, by its delegate key.
     Capability {
         /// The delegate key.
+        #[serde(serialize_with = "eip55")]
         signer: Address,
     },
 }

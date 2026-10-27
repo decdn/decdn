@@ -62,10 +62,10 @@ fn metrics_listen_parses_with_a_public_url() {
     ])
     .unwrap();
     assert_eq!(
-        args.public.metrics_listen.map(|a| a.to_string()),
+        args.metrics_listen.map(|a| a.to_string()),
         Some("127.0.0.1:9100".to_owned())
     );
-    assert!(parse(&[]).unwrap().public.metrics_listen.is_none());
+    assert!(parse(&[]).unwrap().metrics_listen.is_none());
 }
 
 /// A loopback gateway takes `--metrics-listen` too: every gateway counts.
@@ -73,7 +73,7 @@ fn metrics_listen_parses_with_a_public_url() {
 fn metrics_listen_parses_without_public_url() {
     let args = parse(&["--metrics-listen", "127.0.0.1:9100"]).unwrap();
     assert_eq!(
-        args.public.metrics_listen.map(|a| a.to_string()),
+        args.metrics_listen.map(|a| a.to_string()),
         Some("127.0.0.1:9100".to_owned())
     );
 }
@@ -133,4 +133,28 @@ fn the_publisher_registry_address_needs_the_public_url() {
         ])
         .is_err()
     );
+}
+
+/// The listener serves the operator with no token on a public gateway, so it
+/// takes a loopback address only, refused at parse time.
+#[test]
+fn metrics_listen_takes_a_loopback_address_only() {
+    for given in ["127.0.0.1:9100", "[::1]:9100", "127.0.0.2:9100"] {
+        let args = parse(&["--metrics-listen", given]).unwrap();
+        assert_eq!(
+            args.metrics_listen.map(|a| a.to_string()),
+            Some(given.to_owned())
+        );
+    }
+    for given in [
+        "0.0.0.0:9100",
+        "192.168.1.5:9100",
+        "[::]:9100",
+        "10.0.0.1:9100",
+    ] {
+        let Err(err) = parse(&["--metrics-listen", given]) else {
+            panic!("{given} parsed");
+        };
+        assert!(err.to_string().contains("loopback"), "{given}: {err}");
+    }
 }

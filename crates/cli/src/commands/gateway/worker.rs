@@ -95,6 +95,7 @@ pub(super) struct PoolSnapshot {
 #[derive(Serialize, Clone, Debug)]
 pub(super) struct DelegateLanes {
     /// The delegate key.
+    #[serde(serialize_with = "super::eip55")]
     pub(super) signer: Address,
     /// The pool the capability spends.
     pub(super) pool_id: PoolId,

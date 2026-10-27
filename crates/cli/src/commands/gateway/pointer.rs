@@ -180,10 +180,12 @@ pub(crate) struct Held {
     /// The namespace it serves `<ns>.<host>` for.
     pub(crate) namespace: u64,
     /// The bundle manifest it points at.
+    #[serde(serialize_with = "super::bare_hex")]
     pub(crate) root: B256,
     /// Its place in the namespace's sequence.
     pub(crate) seq: u64,
     /// The owner it recovered to.
+    #[serde(serialize_with = "super::eip55")]
     pub(crate) signer: Address,
 }
 

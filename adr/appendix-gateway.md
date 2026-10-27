@@ -38,7 +38,8 @@ cookies, only when `<host>` is a public suffix. The operator registers the
 host on the Public Suffix List.
 
 The API of the loopback gateway (`/_delegate`, `/_capability`) answers 404.
-`/_status` and the [dashboard](#dashboard) answer 404 too.
+`/_status` and the files of the [dashboard](#dashboard) (`/_dashboard/*`)
+answer 404 too. `/` keeps its short page.
 The browser's `Sec-Fetch-*` headers decide nothing: the operator pays, within
 the allowance. A `/_decdn/` request with no `Sec-Fetch-Mode` is a navigation.
 
@@ -213,8 +214,8 @@ start.
 | `decdn_gateway_bytes_served_total` | counter | Content bytes handed to responses. A node counts bao wire bytes in `decdn_bytes_served_total`, for every requester. For one whole-blob pull, the node counts about 0.4% more than this counter. For a range, the node counts the wire bytes of the chunk-group-aligned span. The node also counts manifest pulls. |
 | `decdn_gateway_requests_ok_total` | counter | Answers with success or a redirect. |
 | `decdn_gateway_requests_not_found_total` | counter | Answers 404. |
-| `decdn_gateway_requests_refused_total` | counter | Answers refused before a pull: an unknown host, a bad URI, a method, a range past the end. |
-| `decdn_gateway_requests_allowance_exhausted_total` | counter | Answers 402. |
+| `decdn_gateway_requests_refused_total` | counter | Answers refused before a pull: an unknown host, a missing token, a bad URI, a method, a range past the end. |
+| `decdn_gateway_requests_allowance_exhausted_total` | counter | Answers 402. On a public gateway, the allowance of the day is spent. On a loopback gateway, no capability covers the page. |
 | `decdn_gateway_pull_failures_funding_total` | counter | Answers 503. |
 | `decdn_gateway_pull_failures_other_total` | counter | Answers 502. |
 | `decdn_gateway_pulls_active` | gauge | Pulls handed to the worker and not yet ended. |
@@ -254,9 +255,15 @@ is served runs a loopback gateway and opens its dashboard.
 | `pools` | The buyer-pool store: each pool with its deposit, its spend and its lanes, and the lanes of each registered capability's key. |
 | `pool_error` | Why `pools` is `null`. The text has its secrets removed. |
 
+Each kind of value has one spelling. An address is EIP-55 checksummed hex, as
+`GET /_capability` writes it. A pool id is `0x` hex. A content hash is bare
+hex, as a gateway URL carries it.
+
 The pool spend is the pool's spend as the store knows it: the lanes of the
-store plus the spend that other signers redeemed. The deposit less the spend
-is what all signers of the pool can still spend. A loopback gateway pays with
+store plus the spend that other signers redeemed. The spend is a lower bound.
+A voucher that another signer issued and that no provider redeemed is not in
+it. Thus the deposit less the spend is at most what all signers of the pool
+can still spend. A loopback gateway pays with
 capabilities. The store keeps their lanes apart from the pool rows, so
 `pools` lists them per key.
 

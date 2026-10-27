@@ -5,8 +5,9 @@
 //!
 //! One unlabeled sibling counter per outcome, as `adr/appendix-observability.md`
 //! § Reason splits prefers: each outcome has its own operator remedy (a
-//! spent allowance, a pool that cannot pay, an upstream fault), so no alert
-//! spans the family. Every series exports from the start, at zero.
+//! spent allowance or a page no capability covers, a pool that cannot pay,
+//! an upstream fault), so no alert spans the family. Every series exports
+//! from the start, at zero.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,9 +39,10 @@ pub(super) struct Counters {
     pub(super) requests_ok: u64,
     /// Requests for a path, entry or manifest that does not exist.
     pub(super) requests_not_found: u64,
-    /// Requests refused before any pull.
+    /// Requests refused before any pull, a missing token's 401 among them.
     pub(super) requests_refused: u64,
-    /// Requests answered 402.
+    /// Requests answered 402: a spent allowance, or a page no capability
+    /// covers.
     pub(super) requests_allowance_exhausted: u64,
     /// Requests answered 503.
     pub(super) pull_failures_funding: u64,
@@ -54,9 +56,10 @@ pub(super) struct Counters {
 
 impl Metrics {
     /// Count a request answered with `status`: success and redirects as
-    /// served, 404 as not found, 402 as the allowance spent, 503 as a pool
-    /// that cannot pay, 502 as an upstream fault, every other status as
-    /// refused.
+    /// served, 404 as not found, 402 as payment required (a public gateway's
+    /// spent allowance, or a page no capability of a loopback gateway
+    /// covers), 503 as a pool that cannot pay, 502 as an upstream fault, every
+    /// other status (a missing token's 401 among them) as refused.
     pub(super) fn request(&self, status: StatusCode) {
         let counter = match status {
             s if s.is_success() || s.is_redirection() => &self.requests_ok,
@@ -134,14 +137,15 @@ impl Metrics {
             (
                 "decdn_gateway_requests_refused_total",
                 "counter",
-                "Requests refused before any pull: an unknown host, a bad URI, a method, a range \
-                 past the end.",
+                "Requests refused before any pull: an unknown host, a missing token, a bad URI, a \
+                 method, a range past the end.",
                 c.requests_refused,
             ),
             (
                 "decdn_gateway_requests_allowance_exhausted_total",
                 "counter",
-                "Requests answered 402: the day's allowance is spent.",
+                "Requests answered 402: on a public gateway the day's allowance is spent; on a \
+                 loopback gateway no capability covers the page.",
                 c.requests_allowance_exhausted,
             ),
             (
