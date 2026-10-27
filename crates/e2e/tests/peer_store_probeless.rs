@@ -32,13 +32,14 @@
 //!    fetch (same `data_dir`, no `--rediscover`) then has enough fresh
 //!    candidates for `store_fast_path` to engage, which — per its own doc
 //!    comment — "takes no `Endpoint`, so it structurally issues no network
-//!    probe": bytes still verify, without a probe round. There is no
-//!    probe-count metric on the wire or the admin surface to assert against
-//!    directly (checked: `decdn_common::admin` exposes no such counter), so
-//!    this journey backs the "no probe" half with `store_fast_path`'s own
-//!    unit tests plus the structural fact above, and asserts the
-//!    outcome that IS observable end to end: the second fetch succeeds and
-//!    delivers correct bytes without ever touching the registry.
+//!    probe": bytes still verify, without a probe round. The holders'
+//!    `decdn_probe_requests_total` shows it: fetch #2 probes none of them.
+//!    The fast path knows no size, so fetch #2 takes its first size claim
+//!    from a whole-blob open whose pull the download adopts as its first leg
+//!    (#2633): the holders write the blob's wire bytes once, not once for
+//!    the claim and again for the download. The lane that answered the open
+//!    connects with no network work, so it is the only lane in the batch
+//!    the download plans first, and that plan gives it the whole blob.
 //! 2. **Cross-process persistence.** The two `decdn get` invocations above
 //!    are separate OS processes sharing only `data_dir` on disk — a passing
 //!    fetch #2 that reused the store already demonstrates this, and this
@@ -109,9 +110,20 @@ const KEYSTORE_PASSWORD: &str = "peer-store-e2e-password";
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// Bytes per bao chunk group (matches `decdn_bao_range::IROH_BLOCK_SIZE`,
-/// chunk-log 4 == 16 KiB chunk groups). Kept well under the multi-source
-/// engagement floor so every fetch here stays single-source.
+/// chunk-log 4 == 16 KiB chunk groups).
 const CHUNK_GROUP: usize = 16 * 1024;
+/// The bao wire bytes a node wrote on `cdn/client/v1`.
+const SERVED: &str = "decdn_bytes_served_total";
+/// A node's count of `cdn/probe/v1` requests it answered.
+const PROBES: &str = "decdn_probe_requests_total";
+/// A node's count of probes its per-peer bucket shed, which [`PROBES`] does
+/// not count.
+const PROBES_SHED: &str = "decdn_probe_rate_limit_rejected_per_peer_total";
+/// What the holders may write past the wire bytes of the pull: a few parent
+/// nodes a later leg repeats. Far below the blob's own wire bytes, which a
+/// stream opened for the size and then dropped unread would cost at this
+/// size.
+const LEG_OVERHEAD_SLACK: u64 = 16 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_store_probeless_second_fetch_and_cross_process_persistence() -> anyhow::Result<()> {
@@ -267,7 +279,13 @@ async fn run() -> anyhow::Result<()> {
     // The output is removed first so a byte-for-byte re-verify is meaningful
     // (an untouched file passing the equality check would prove nothing).
     std::fs::remove_file(&out).context("remove output before fetch #2")?;
-    run_fetch_until_ready(client_dir.path(), &args).await?;
+    let holders = [&holder_a, &holder_b, &holder_c];
+    let served_before = sum_metric(&holders, SERVED).await?;
+    let probes_before =
+        sum_metric(&holders, PROBES).await? + sum_metric(&holders, PROBES_SHED).await?;
+    // The pool exists, so one attempt succeeds, and the counters cover it
+    // alone.
+    run_fetch_once(client_dir.path(), &args).await?;
 
     let got = std::fs::read(&out).context("read fetch #2 output")?;
     anyhow::ensure!(
@@ -275,6 +293,18 @@ async fn run() -> anyhow::Result<()> {
         "the probe-less second fetch produced {} bytes, expected {}",
         got.len(),
         blob.len()
+    );
+    let probes = (sum_metric(&holders, PROBES).await? + sum_metric(&holders, PROBES_SHED).await?)
+        .saturating_sub(probes_before);
+    anyhow::ensure!(probes == 0, "fetch #2 probed the holders {probes} time(s)");
+    let wire = decdn_bao_range::align_range_clamped(0, 0, blob.len() as u64)?.wire_len();
+    let served = sum_metric(&holders, SERVED)
+        .await?
+        .saturating_sub(served_before);
+    anyhow::ensure!(
+        (wire..=wire + LEG_OVERHEAD_SLACK).contains(&served),
+        "the holders wrote {served} bytes for a {wire}-byte pull: the first size claim's \
+         stream was not the download's first leg"
     );
 
     // ---- Journey 2 (persistence half): the peer records outlive both ----
@@ -308,6 +338,31 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// The sum of metric `name` over `nodes`.
+async fn sum_metric(nodes: &[&NodeFixture], name: &str) -> anyhow::Result<u64> {
+    let mut sum = 0;
+    for node in nodes {
+        sum += node.scrape_metric(name).await?;
+    }
+    Ok(sum)
+}
+
+/// Run `decdn get` once, and fail with its stderr unless it succeeds.
+async fn run_fetch_once(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
+    let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
+        .arg("get")
+        .args(args)
+        .output()
+        .await
+        .context("spawn decdn get")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "decdn get failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }
 
 /// Run `decdn get`, retrying until the node's chain watcher has observed the

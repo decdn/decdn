@@ -14,6 +14,10 @@
 //! with a pool replacement retires it, so the next pull's ledgers know only
 //! the new pool.
 //!
+//! The worker answers the size a pull on its host verified for a blob
+//! ([`PullWorker::size`]), with no pull slot, so the gateway can answer a
+//! repeat request for the blob with a length.
+//!
 //! The worker also answers what the store holds ([`PullWorker::pools`]): the
 //! store is open on the worker's host, and redb refuses a second open of it
 //! in the same process. Each pull persists its lanes' watermarks only when it
@@ -173,6 +177,11 @@ enum Request {
         delegates: Vec<(PoolId, Address)>,
         reply: oneshot::Sender<anyhow::Result<PoolSnapshot>>,
     },
+    /// The size a pull verified for a blob.
+    Size {
+        hash: [u8; 32],
+        reply: oneshot::Sender<Option<u64>>,
+    },
 }
 
 /// A job its [`Job::admit`] check refused at its slot.
@@ -216,6 +225,13 @@ pub(super) trait Backend: Send + 'static {
         blob: &BlobFetch,
         sink: &mut Sink,
     ) -> anyhow::Result<()>;
+
+    /// The size a whole pull on `host` verified for `hash`, if one did. A
+    /// backend that keeps no sizes answers `None`.
+    fn size(&self, host: &Self::Host, hash: [u8; 32]) -> Option<u64> {
+        let _ = (host, hash);
+        None
+    }
 
     /// What `host`'s store holds: its pools, and the lanes of each
     /// `(pool, signer)` in `delegates`. A backend without a store holds
@@ -286,6 +302,10 @@ impl Backend for FetchBackend {
         let result = fetch_on(host, payer, blob, sink, &timings).await;
         timings.log("writer", result.is_ok());
         result
+    }
+
+    fn size(&self, (host, _): &Self::Host, hash: [u8; 32]) -> Option<u64> {
+        host.verified_size(&hash)
     }
 
     /// Read off the async thread, so a slow store read never stalls the
@@ -442,6 +462,16 @@ impl PullWorker {
             .map_err(|_| anyhow::anyhow!("the gateway is shutting down"))?
     }
 
+    /// The size a whole pull on the worker's host verified for `hash`
+    /// ([`Backend::size`]). Answered beside the pulls in flight, with no pull
+    /// slot. `None` when no pull verified it, and once the worker has
+    /// stopped.
+    pub(super) async fn size(&self, hash: [u8; 32]) -> Option<u64> {
+        let (reply, answer) = oneshot::channel();
+        self.jobs.send(Request::Size { hash, reply }).ok()?;
+        answer.await.ok().flatten()
+    }
+
     /// Stop the worker: drop every pull in flight, which queues what each
     /// paid for recording, wait for the queued writes, and close the host.
     pub(super) async fn stop(&self) {
@@ -548,6 +578,9 @@ async fn run<B: Backend>(
                         });
                         let _ = reply.send(snapshot);
                     });
+                }
+                Some(Request::Size { hash, reply }) => {
+                    let _ = reply.send(backend.size(&host, hash));
                 }
                 None => break,
             },

@@ -58,14 +58,26 @@ namespace's. A `?ns=` query or a `<ns>.<hash32>.` label is anyone's to
 write, so it spends the shared bucket. The gateway counts:
 
 - every byte a pull lands, a manifest that does not parse included;
-- an entry's declared size before its pull, and refuses one that does not
-  fit;
+- an entry's declared size or a raw blob's verified size before its pull,
+  and refuses one that does not fit;
 - the chunk-group-aligned span of a range, not the window alone;
 - a bound of what a pull may have paid past the frames it delivered, when a
   response does not end whole.
 
 An entry's pull is capped at the size its manifest declares. A manifest
 cannot make the gateway pay for more than it says.
+
+A raw blob has no manifest. The gateway uses the size that a whole pull of
+the blob on this gateway verified. The gateway caps the pull of the blob at
+that size, as it caps the pull of an entry. The empty root has a size of
+zero and needs no pull. A blob that no pull verified streams whole, with no
+length. Thus the first request for a raw blob has no length, and a later
+request has one.
+
+The gateway does not use the size that a node reports. The server stops
+reading a body when the body reaches its `Content-Length`. If a node
+reported a size that is too small, a short pull would end as a whole
+response, and the client would keep a cut file.
 
 A blob that is not a manifest does not become one. Its hash fixes its bytes.
 The manifest cap stops a pull only on verified bytes or a proven size. The
@@ -154,17 +166,21 @@ pointer.
 
 ## Ranges
 
-An entry whose manifest declares its size takes one `Range`: `bytes=a-b`,
+A sized answer takes one `Range`: an entry whose manifest declares its size,
+or a raw blob whose size a pull verified. The forms are `bytes=a-b`,
 `bytes=a-` or `bytes=-n`. The answer is 206 over exactly that window, with
 `Content-Range`. The pull pays for the chunk-group-aligned span around the
 window ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)). A range past the end
 is 416. A range the gateway cannot honour is ignored: several ranges, another
-unit, a malformed range, a page rewritten as it streams, a blob of unknown
-size. A sized answer carries `Accept-Ranges: bytes`, on `HEAD` too. A BEP 19
+unit, a malformed range, a page rewritten as it streams, a blob that no pull
+verified. A sized answer carries `Accept-Ranges: bytes`, on `HEAD` too. A BEP 19
 webseed is a plain URL with ranges, so it needs nothing more.
 
 `HEAD` on an entry answers from the bundle manifest: the entry's length and
-hash, at no pull of the entry.
+hash, at no pull of the entry. `HEAD` on a raw blob, on the bare host or under
+a site's `/_decdn/`, answers from the verified size, at no pull. `HEAD` of a
+bundle or an entry under a site's `/_decdn/` redirects to the site of that
+bundle.
 
 ## Cross-origin reads
 

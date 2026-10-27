@@ -25,7 +25,7 @@ use crate::lanes::{
     FaceLaneHandle, LaneDeps, LanePayer, build_multi_lane, lane_target, queue_face_watermarks,
 };
 use crate::session::{DiscoveryOptions, ProxyWarmingParams};
-use crate::source::{SourceFuture, SourceStream};
+use crate::source::{PrimedSource, SourceFuture, SourceStream};
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
     LateProbes, ProbeOpts, ProbeOutcome, ProbeRound, ResolvedTargets, now_secs, pinned_targets,
@@ -47,7 +47,7 @@ pub struct FirstClaim {
 }
 
 /// `hint` as the first claim over `holders`, or, with no hint, what `open`
-/// learns from a header-only open. A hint needs no open.
+/// learns from the header of a whole-blob open. A hint needs no open.
 ///
 /// # Errors
 ///
@@ -116,7 +116,7 @@ pub struct LaneSources<'a, P> {
     handles: Mutex<Vec<FaceLaneHandle>>,
     /// The lane that answered the first open, handed to the fetch's first
     /// `connect` for its provider.
-    parked: Mutex<HashMap<Address, StreamCandidate<PeerSource<'a>>>>,
+    parked: Mutex<HashMap<Address, StreamCandidate<PrimedSource<PeerSource<'a>>>>>,
     /// The size hint of the last probe that gave one
     /// ([`ResolvedTargets::size_hint`]): the fetch's first claim.
     size_hint: Mutex<Option<u64>>,
@@ -295,11 +295,16 @@ where
     /// The fetch's first size claim (#2218): the probe's size hint when a
     /// probe gave one ([`Self::holders_from`]), with no open at all. Without a
     /// hint (the peer-store fast path, or a pinned `--node-id` whose probe gave
-    /// no size), a header-only open of one of `holders` learns the size one
-    /// holder signs ([`first_open`]), with the acquire loop's recovery: a holder that
-    /// faults cools and another is tried until one answers, a fault only the
-    /// user can fix ends it, and `stop` gives up. The open's pull is dropped
-    /// once its header is read. The lane that answered is parked for the
+    /// no size), a whole-blob open of one of `holders` learns the size one
+    /// holder signs from its header ([`first_open`]), with the acquire loop's
+    /// recovery: a holder that faults cools and another is tried until one
+    /// answers, a fault only the user can fix ends it, and `stop` gives up.
+    /// The open's pull is primed on the lane ([`PrimedSource`]) once its
+    /// header is read: a drive whose first leg on the lane is the whole blob
+    /// adopts it within two seconds of the open.
+    /// A pull no leg adopts closes when a later open on the lane finds it
+    /// stale, or when the lane drops at the end of the drive. The lane that
+    /// answered is parked for the
     /// fetch's `connect`, so the fetch reuses it; every other lane the open
     /// built drops, and with it any stream permit it held. Returns the claim
     /// and every holder known, those the open's discovery found included.
@@ -324,8 +329,8 @@ where
         .await
     }
 
-    /// The size one of `holders` signs, from a header-only open
-    /// ([`Self::first_claim`]).
+    /// The size one of `holders` signs, from the header of a whole-blob open
+    /// whose pull stays primed on its lane ([`Self::first_claim`]).
     async fn open_for_header(
         &self,
         hash: [u8; 32],
@@ -343,14 +348,28 @@ where
             self.recovery,
             credentials.as_ref(),
             |lane| async move {
-                let (header, _whole) = lane.source.open_whole(hash).await?;
+                let opened_at = tokio::time::Instant::now();
+                let (header, whole) = lane.source.inner().open_whole(hash).await?;
                 let provider = lane
                     .ctx
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .provider;
                 self.record_open(provider, header.rate_per_mb);
-                Ok(header.total_bytes)
+                let total_bytes = header.total_bytes;
+                // The node has already written into the pull. A fresh
+                // download's first leg on this lane is the whole blob, so
+                // the pull is parked for that leg to adopt instead of dropped
+                // unread. `align_range(0, 0, n)` holds for every `n`; were it
+                // to fail, the drive opens its own pull.
+                match decdn_bao_range::align_range(0, 0, total_bytes) {
+                    Ok(range) => lane.source.prime(hash, range, header, whole, opened_at),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "the size open's pull is not primed");
+                        drop((header, whole));
+                    }
+                }
+                Ok(total_bytes)
             },
         )
         .await;
@@ -471,7 +490,7 @@ where
         &self,
         holder: &Holder,
         ended: &CancellationToken,
-    ) -> anyhow::Result<StreamCandidate<PeerSource<'a>>> {
+    ) -> anyhow::Result<StreamCandidate<PrimedSource<PeerSource<'a>>>> {
         let parked = self
             .parked
             .lock()
@@ -499,7 +518,7 @@ where
         &self,
         holder: &Holder,
         ended: &CancellationToken,
-    ) -> anyhow::Result<StreamCandidate<PeerSource<'a>>> {
+    ) -> anyhow::Result<StreamCandidate<PrimedSource<PeerSource<'a>>>> {
         let candidate = self
             .lock_nodes()
             .get(&holder.provider)
@@ -534,7 +553,8 @@ where
                 ledger: Arc::clone(&lane.ledger),
                 ctx: Arc::clone(&lane.ctx),
             });
-        let mut candidate = StreamCandidate::new(lane.source, lane.ctx, lane.ledger);
+        let source = PrimedSource::new(lane.source);
+        let mut candidate = StreamCandidate::new(source, lane.ctx, lane.ledger);
         candidate.coverage.clone_from(&holder.coverage);
         Ok(candidate)
     }
@@ -585,7 +605,7 @@ impl<'a, P> SourceProvider for LaneSources<'a, P>
 where
     P: alloy::providers::Provider + Clone,
 {
-    type Source = PeerSource<'a>;
+    type Source = PrimedSource<PeerSource<'a>>;
 
     fn discover(&self, hash: [u8; 32]) -> SourceFuture<'_, Vec<Holder>> {
         Box::pin(async move {

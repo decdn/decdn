@@ -548,12 +548,13 @@ type Log<T> = Arc<std::sync::Mutex<Vec<T>>>;
 
 /// A pull backend that answers each blob by its hash and records the
 /// `--max-blob-mb` each pull runs with, the size cap it carries and its
-/// byte window.
+/// byte window. The sizes in `sizes` are the ones earlier pulls verified.
 struct Recording {
     caps: Log<u64>,
     size_caps: Log<Option<u64>>,
     ranges: Log<Option<(u64, u64)>>,
     replies: HashMap<[u8; 32], Reply>,
+    sizes: HashMap<[u8; 32], u64>,
 }
 
 impl worker::Backend for Recording {
@@ -570,6 +571,10 @@ impl worker::Backend for Recording {
 
     async fn pool_payer(&self, (): &()) -> anyhow::Result<Option<()>> {
         Ok(Some(()))
+    }
+
+    fn size(&self, (): &(), hash: [u8; 32]) -> Option<u64> {
+        self.sizes.get(&hash).copied()
     }
 
     async fn pull(
@@ -646,6 +651,7 @@ async fn recording_gateway_of(
         size_caps: Arc::default(),
         ranges: Arc::default(),
         replies,
+        sizes: HashMap::new(),
     };
     let gateway = test_gateway_with(backend, flags(args)).await;
     insert(
@@ -1427,6 +1433,14 @@ async fn public_gateway_with(allowance: u64) -> (Arc<Gateway>, Logs, String) {
 
 /// [`public_gateway`] with `allowance`.
 async fn public_gateway_for(allowance: Allowance) -> (Arc<Gateway>, Logs, String) {
+    public_gateway_sized(allowance, HashMap::new()).await
+}
+
+/// [`public_gateway_for`] whose earlier pulls verified the sizes in `found`.
+async fn public_gateway_sized(
+    allowance: Allowance,
+    found: HashMap<[u8; 32], u64>,
+) -> (Arc<Gateway>, Logs, String) {
     let replies = HashMap::from([
         (BLOB, Reply::Bytes(public_manifest())),
         (ENTRY, Reply::Bytes(b"abc".to_vec())),
@@ -1449,6 +1463,7 @@ async fn public_gateway_for(allowance: Allowance) -> (Arc<Gateway>, Logs, String
         size_caps: Arc::clone(&logs.size_caps),
         ranges: Arc::clone(&logs.ranges),
         replies,
+        sizes: found,
     };
     let sites = SiteDomain::Public {
         origin: "https://decdn.test".parse().unwrap(),
@@ -1832,7 +1847,7 @@ async fn the_public_bare_host_redirects_bundles_and_streams_blobs() {
 
 /// A public gateway answers `HEAD` from the bundle manifest: the entry's
 /// length and hash, with no pull of the entry itself. A raw blob's `HEAD`
-/// costs no pull either, and has no length to give.
+/// costs no pull either, and has no length until a pull verifies its size.
 #[tokio::test]
 async fn a_public_head_is_answered_from_the_manifest() {
     let (gateway, logs, host) = public_gateway().await;
@@ -2533,6 +2548,146 @@ async fn a_range_is_charged_by_its_aligned_span() {
         (StatusCode::PARTIAL_CONTENT, 2)
     );
     assert_eq!(left(&gateway), allowance - manifest - 3 * group);
+}
+
+/// [`public_gateway_sized`] with `allowance` bytes per day, whose earlier
+/// pulls verified [`OTHER`] and [`BIG`] at their lengths.
+async fn sized_gateway_with(allowance: u64) -> (Arc<Gateway>, Logs, String) {
+    let sizes = HashMap::from([(OTHER, 11), (BIG, u64::try_from(BIG_LEN).unwrap())]);
+    public_gateway_sized(Allowance::with_namespaces(allowance, []), sizes).await
+}
+
+/// A raw blob whose size a pull verified answers with its length, on `HEAD`
+/// with no pull and on `GET` with the pull capped at that size.
+#[tokio::test]
+async fn a_raw_blob_of_known_size_answers_with_its_length() {
+    let (gateway, logs, _) = sized_gateway_with(u64::MAX).await;
+    let other = alloy::hex::encode(OTHER);
+    let head = send(
+        &gateway,
+        Method::HEAD,
+        "decdn.test",
+        &format!("/{other}"),
+        &[],
+    )
+    .await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(head.header(header::CONTENT_LENGTH), Some("11"));
+    assert_eq!(head.header(header::ACCEPT_RANGES), Some("bytes"));
+    assert_eq!(
+        head.header(header::ETAG),
+        Some(format!("\"{other}\"").as_str())
+    );
+    assert!(logs.caps.lock().unwrap().is_empty(), "HEAD pulls nothing");
+
+    let whole = request(&gateway, "decdn.test", &format!("/{other}"), &[]).await;
+    assert_eq!(
+        (whole.status, whole.body.as_str()),
+        (StatusCode::OK, "other bytes")
+    );
+    assert_eq!(whole.header(header::CONTENT_LENGTH), Some("11"));
+    assert_eq!(whole.header(header::ACCEPT_RANGES), Some("bytes"));
+    assert_eq!(*logs.size_caps.lock().unwrap(), [Some(11)]);
+}
+
+/// A raw blob of verified size takes one `Range`, as a sized entry does: 206
+/// over the window, and 416 with the size for a window past the end, with
+/// no pull.
+#[tokio::test]
+async fn a_range_on_a_raw_blob_of_known_size_answers_206() {
+    let (gateway, logs, _) = sized_gateway_with(u64::MAX).await;
+    let other = alloy::hex::encode(OTHER);
+    let window = request(
+        &gateway,
+        "decdn.test",
+        &format!("/{other}"),
+        &[("range", "bytes=6-9")],
+    )
+    .await;
+    assert_eq!(
+        (window.status, window.body.as_str()),
+        (StatusCode::PARTIAL_CONTENT, "byte")
+    );
+    assert_eq!(window.header(header::CONTENT_RANGE), Some("bytes 6-9/11"));
+    assert_eq!(window.header(header::CONTENT_LENGTH), Some("4"));
+    assert_eq!(*logs.ranges.lock().unwrap(), [Some((6, 4))]);
+
+    let past = request(
+        &gateway,
+        "decdn.test",
+        &format!("/{other}"),
+        &[("range", "bytes=11-")],
+    )
+    .await;
+    assert_eq!(past.status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(past.header(header::CONTENT_RANGE), Some("bytes */11"));
+    assert_eq!(logs.ranges.lock().unwrap().len(), 1, "a 416 pulls nothing");
+}
+
+/// A raw blob whose size a pull verified, and that does not fit what is
+/// left of the allowance, is refused before its pull, as an entry is.
+#[tokio::test]
+async fn a_raw_blob_that_does_not_fit_is_refused_before_its_pull() {
+    let (gateway, logs, _) = sized_gateway_with(300 * 1024).await;
+    let big = alloy::hex::encode(BIG);
+    let refused = request(&gateway, "decdn.test", &format!("/{big}"), &[]).await;
+    assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        refused.header(header::LINK),
+        Some(format!("<decdn:{big}>; rel=\"alternate\"").as_str())
+    );
+    assert!(logs.caps.lock().unwrap().is_empty(), "nothing was pulled");
+}
+
+/// `HEAD` under a site's `/_decdn/` answers for a raw blob as the bare host
+/// does, and redirects a bundle entry to its site, instead of reading the
+/// path as one of the site's own entries.
+#[tokio::test]
+async fn a_site_answers_head_under_decdn() {
+    let (gateway, logs, host) = sized_gateway_with(u64::MAX).await;
+    let other = alloy::hex::encode(OTHER);
+    let raw = send(
+        &gateway,
+        Method::HEAD,
+        &host,
+        &format!("/_decdn/{other}"),
+        &[],
+    )
+    .await;
+    assert_eq!(raw.status, StatusCode::OK);
+    assert_eq!(raw.header(header::CONTENT_LENGTH), Some("11"));
+    let blob = alloy::hex::encode(BLOB);
+    let bundle = send(
+        &gateway,
+        Method::HEAD,
+        &host,
+        &format!("/_decdn/{blob}/a.txt"),
+        &[],
+    )
+    .await;
+    assert!(bundle.status.is_redirection(), "{:?}", bundle.status);
+    assert!(logs.caps.lock().unwrap().is_empty(), "HEAD pulls nothing");
+}
+
+/// The empty root is empty, with no pull, on `GET` and `HEAD`.
+#[tokio::test]
+async fn the_empty_root_is_empty_with_no_pull() {
+    let (gateway, logs, _) = public_gateway().await;
+    let empty = alloy::hex::encode(decdn_protocol::EMPTY_ROOT);
+    let answer = request(&gateway, "decdn.test", &format!("/{empty}"), &[]).await;
+    assert_eq!((answer.status, answer.body.as_str()), (StatusCode::OK, ""));
+    assert_eq!(answer.header(header::CONTENT_LENGTH), Some("0"));
+    let head = send(
+        &gateway,
+        Method::HEAD,
+        "decdn.test",
+        &format!("/{empty}"),
+        &[],
+    )
+    .await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(head.header(header::CONTENT_LENGTH), Some("0"));
+    assert!(logs.caps.lock().unwrap().is_empty(), "nothing was pulled");
 }
 
 /// The metrics of the gateway under test.

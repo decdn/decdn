@@ -10,7 +10,9 @@
 //!      206 over exactly that window, and a range past the end is 416. (That
 //!      the pull pays for the aligned span alone is the client's unit tests'
 //!      to pin down.)
-//!   2. The bare host streams a blob.
+//!   2. The bare host streams a blob, with no length, since no pull has
+//!      verified it. Once that pull has, a `HEAD` of the blob answers its
+//!      length, and a `Range` of it is 206 over exactly that window (#2616).
 //!   3. Four pulls run at once on the one pool payer, and the node rejects
 //!      none of their vouchers.
 //!   4. The entry no longer fits the day's allowance: `402` naming its
@@ -58,8 +60,8 @@ use reqwest::StatusCode;
 const MIB: usize = 1024 * 1024;
 /// The gateway's working deposit: 10 USDC.
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-/// The day's allowance: six 4 MiB pulls, a 1.5 MiB range and the manifest
-/// fit, a further 4 MiB entry does not.
+/// The day's allowance: six 4 MiB pulls, a 1.5 MiB range, a one-chunk-group
+/// range and the manifest fit, a further 4 MiB entry does not.
 const ALLOWANCE: &str = "27MiB";
 const KEYSTORE_PASSWORD: &str = "gateway-public-e2e-password";
 /// The public origin the gateway serves. Nothing resolves it: every request
@@ -313,9 +315,58 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- (2) A blob from the bare host ----
-    let (status, _, got) = get(DOMAIN, &format!("/{}", hash_b.to_hex())).await?;
+    let (status, headers, got) = get(DOMAIN, &format!("/{}", hash_b.to_hex())).await?;
     anyhow::ensure!(status == StatusCode::OK, "blob b: {status}");
     anyhow::ensure!(got == b, "blob b: got {} bytes", got.len());
+    // No pull here has verified b yet, and a node's size claim gives no
+    // length: the first response streams with none.
+    anyhow::ensure!(
+        headers.get("content-length").is_none() && headers.get("accept-ranges").is_none(),
+        "blob b's first response: {headers:?}"
+    );
+    let b_path = format!("/{}", hash_b.to_hex());
+    // The pull verified b whole, so a HEAD and a range on it take their size
+    // from it: a length, and a window of the raw blob.
+    let head = http
+        .head(format!("{base}{b_path}"))
+        .header("host", DOMAIN)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        head.status() == StatusCode::OK
+            && head
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                == Some(b.len().to_string().as_str()),
+        "HEAD b: {} content-length {:?}",
+        head.status(),
+        head.headers().get("content-length")
+    );
+    let (b_first, b_last) = (1_000usize, 2_999usize);
+    let ranged = http
+        .get(format!("{base}{b_path}"))
+        .header("host", DOMAIN)
+        .header("range", format!("bytes={b_first}-{b_last}"))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        ranged.status() == StatusCode::PARTIAL_CONTENT
+            && ranged
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                == Some(format!("bytes {b_first}-{b_last}/{}", b.len()).as_str()),
+        "range of b: {} content-range {:?}",
+        ranged.status(),
+        ranged.headers().get("content-range")
+    );
+    let window = ranged.bytes().await?;
+    anyhow::ensure!(
+        window.as_ref() == &b[b_first..=b_last],
+        "range of b: got {} bytes, expected the window byte-exact",
+        window.len()
+    );
 
     // ---- (3) Four pulls at once on the one pool payer ----
     let rejected_before = node.scrape_metric(VOUCHER_REJECTED).await?;
@@ -412,10 +463,11 @@ async fn run() -> anyhow::Result<()> {
         counter("decdn_gateway_bytes_served_total")? >= 6 * a.len() as u64,
         "bytes served: {exposition}"
     );
-    // a.bin three times, b three times, the range and the manifest.
+    // a.bin three times, b three times, the two ranges and the manifest.
     let pulled = 3 * wire_bytes(0, 0, a.len())?
         + 3 * wire_bytes(0, 0, b.len())?
         + wire_bytes(first, last - first + 1, a.len())?
+        + wire_bytes(b_first, b_last - b_first + 1, b.len())?
         + wire_bytes(0, 0, manifest.len())?;
     let served = node
         .scrape_metric(SERVED)
