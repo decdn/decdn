@@ -1545,7 +1545,9 @@ async fn forced_steal_does_not_double_fetch_the_stolen_tail() -> anyhow::Result<
 /// one by the two rates, so both finish together: the slow source is
 /// stolen from once, keeps its one stream, and stops that stream at the
 /// split. A midpoint split would leave the slow source enough for a second
-/// steal, and a third.
+/// steal, and a third. Each completed range logs, at info, the provider that
+/// served it and the extent it completed (#2332): the victim's extent ends
+/// where its stream stopped, so the logged extents tile the blob.
 #[tokio::test(start_paused = true)]
 async fn a_slow_victim_is_stolen_from_once() -> anyhow::Result<()> {
     let data = blob(128 * MIB as usize);
@@ -1565,12 +1567,22 @@ async fn a_slow_victim_is_stolen_from_once() -> anyhow::Result<()> {
         candidate(slow.clone(), ledger_slow, 0xB2, None),
     ])?;
     let (pacer, funder) = (BudgetPacer::new(), no_funding());
+    let log = CapturedLog::default();
+    let sink = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    // `set_default` is per-thread: `acquire` polls every worker on this one.
+    let guard = tracing::subscriber::set_default(subscriber);
     tokio::time::timeout(
         Duration::from_mins(5),
         run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None),
     )
     .await
     .map_err(|_| anyhow::anyhow!("the fetch stalled"))??;
+    drop(guard);
     store.finalize().await?;
     assert_eq!(std::fs::read(dir.path().join("b"))?, data);
 
@@ -1595,77 +1607,30 @@ async fn a_slow_victim_is_stolen_from_once() -> anyhow::Result<()> {
         delivered <= total + 2 * MIB,
         "no byte is fetched twice: delivered {delivered} of {total}"
     );
-    Ok(())
-}
-
-/// Every completed range logs, at info, the provider that served it, the
-/// blob, and the extent it completed (#2332). The slow victim of a steal
-/// logs the range up to the split, not its pick, so the extents tile the
-/// blob and the thief's range starts where the victim's ends.
-#[tokio::test(start_paused = true)]
-async fn a_completed_range_logs_its_provider_and_extent() -> anyhow::Result<()> {
-    let data = blob(128 * MIB as usize);
-    let total = data.len() as u64;
-    let ledger_fast = Arc::new(PoolLedger::new(Cumulative::default()));
-    let ledger_slow = Arc::new(PoolLedger::new(Cumulative::default()));
-    let fast = ScriptedSource::new(data.clone())?
-        .throttled(Duration::from_millis(1))
-        .paying(Arc::clone(&ledger_fast));
-    let slow = ScriptedSource::new(data)?
-        .throttled(Duration::from_millis(4))
-        .paying(Arc::clone(&ledger_slow));
-    let root = fast.root();
-    let (store, _dir) = fresh_store(root, total);
-    let provider = StaticSources::new(vec![
-        candidate(fast.clone(), ledger_fast, 0xA1, None),
-        candidate(slow.clone(), ledger_slow, 0xB2, None),
-    ])?;
-    let (pacer, funder) = (BudgetPacer::new(), no_funding());
-    let log = CapturedLog::default();
-    let sink = log.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(move || sink.clone())
-        .finish();
-    // Thread-local: the current-thread runtime runs every worker here.
-    let guard = tracing::subscriber::set_default(subscriber);
-    tokio::time::timeout(
-        Duration::from_mins(5),
-        run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("the fetch stalled"))??;
-    drop(guard);
-    assert_eq!(
-        slow.stopped_pulls(),
-        1,
-        "the slow source stops at the split"
-    );
 
     let text = log.text();
-    let field = |line: &str, key: &str| -> Option<String> {
-        line.split_whitespace()
+    let message = "a lane completed its range";
+    // The event's own fields follow its message; a span's precede it.
+    let field = |fields: &str, key: &str| -> Option<String> {
+        fields
+            .split_whitespace()
             .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
             .map(str::to_owned)
     };
-    let num = |line: &str, key: &str| -> anyhow::Result<u64> {
-        field(line, key)
-            .ok_or_else(|| anyhow::anyhow!("no {key} in {line}"))?
+    let num = |fields: &str, key: &str| -> anyhow::Result<u64> {
+        field(fields, key)
+            .ok_or_else(|| anyhow::anyhow!("no {key} in {fields}"))?
             .parse()
-            .map_err(|e| anyhow::anyhow!("{key} in {line}: {e}"))
+            .map_err(|e| anyhow::anyhow!("{key} in {fields}: {e}"))
     };
     let hash = blake3::Hash::from_bytes(root).to_hex().to_string();
     let mut completed = Vec::new();
-    for line in text
-        .lines()
-        .filter(|l| l.contains("a lane completed its range"))
-    {
-        assert!(line.contains(" INFO "), "{text}");
-        assert_eq!(field(line, "hash"), Some(hash.clone()), "{text}");
-        assert!(num(line, "landed")? > 0, "{text}");
-        let from = field(line, "provider").unwrap_or_default().to_lowercase();
-        completed.push((from, num(line, "offset")?, num(line, "len")?));
+    for (head, fields) in text.lines().filter_map(|l| l.split_once(message)) {
+        assert!(head.contains(" INFO "), "{text}");
+        assert_eq!(field(fields, "hash"), Some(hash.clone()), "{text}");
+        assert!(num(fields, "landed")? > 0, "{text}");
+        let from = field(fields, "provider").unwrap_or_default().to_lowercase();
+        completed.push((from, num(fields, "offset")?, num(fields, "len")?));
     }
     let slow_addr = Address::repeat_byte(0xB2).to_string().to_lowercase();
     let fast_addr = Address::repeat_byte(0xA1).to_string().to_lowercase();

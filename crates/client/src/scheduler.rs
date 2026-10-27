@@ -2569,15 +2569,18 @@ where
                         "a lane stopped its stream at a steal split"
                     );
                 }
-                // Attribute the delivery: faults name their provider, and this
-                // is the one line that says who served the bytes (#2332). An
-                // idle pick that landed nothing is noise, so it logs nothing.
+                // Info, so who served each completed range shows without debug
+                // logs (#2332). The extent ends at the verified prefix, not at
+                // `stop_at`: a steal that finds the victim past its split keeps
+                // the victim's end where the victim reached. A range that
+                // verified no byte served nothing, so it logs nothing.
                 if landed > 0 {
+                    let reached = unit.progress.frontier.load(Ordering::Acquire).min(end);
                     tracing::info!(
                         %provider,
                         hash = %blake3::Hash::from_bytes(hash).to_hex(),
                         offset = r_start,
-                        len = split.min(end).saturating_sub(r_start),
+                        len = reached.saturating_sub(r_start),
                         landed,
                         "a lane completed its range"
                     );
