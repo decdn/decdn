@@ -469,7 +469,20 @@ assert_is_empty = "allow"
 
 [profile.dev]
 opt-level = 0
-debug = true
+# Line tables only, and no debuginfo at all on dependencies (below). A panic
+# backtrace and a test failure still name `file:line`; a debugger shows no
+# locals. Full debuginfo dominates a dev build because every one of the ~100
+# integration-test binaries links it. Measured on a 16-core
+# `cargo build --workspace --all-targets`, full -> these two settings: clean
+# 329s -> 204s, rebuild after a one-line `decdn-protocol` edit 75s -> 44s,
+# `target/` 44 GB -> 11 GB. To step through a workspace crate, build with
+# `CARGO_PROFILE_DEV_DEBUG=true`.
+debug = "line-tables-only"
+
+# A dependency frame in a backtrace still shows its function name, from the
+# symbol table.
+[profile.dev.package."*"]
+debug = false
 
 # Keystore KDF at release speed in dev builds. `alloy`'s `signer-keystore`
 # runs scrypt on every keystore encrypt and decrypt, and unoptimized scrypt
