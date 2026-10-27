@@ -718,3 +718,39 @@ fn a_declared_size_caps_the_fetch_and_never_lifts_the_cap() {
     assert_eq!(held_cap(0, Some(0)), 1, "zero is a cap, not its absence");
     assert_eq!(held_cap(2, Some(0)), 1);
 }
+
+#[test]
+fn size_hints_forget_the_oldest_past_the_bound() {
+    let key = |n: usize| {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&n.to_le_bytes());
+        h
+    };
+    let mut sizes = SizeHints::default();
+    for n in 0..MAX_SIZE_HINTS {
+        sizes.insert(key(n), 7);
+    }
+    // A repeat insert neither duplicates nor refreshes the entry.
+    sizes.insert(key(0), 7);
+    assert_eq!(sizes.order.len(), MAX_SIZE_HINTS);
+    sizes.insert(key(MAX_SIZE_HINTS), 9);
+    assert_eq!(sizes.get(&key(0)), None, "the oldest is forgotten");
+    assert_eq!(sizes.get(&key(1)), Some(7));
+    assert_eq!(sizes.get(&key(MAX_SIZE_HINTS)), Some(9));
+    assert_eq!(
+        (sizes.sizes.len(), sizes.order.len()),
+        (MAX_SIZE_HINTS, MAX_SIZE_HINTS)
+    );
+}
+
+/// A blob an earlier fetch verified starts the next fetch at its size, so a
+/// pinned node is not probed for it; a declared size still comes first.
+#[test]
+fn a_verified_size_is_the_next_fetchs_known_size() {
+    let sizes = Mutex::new(SizeHints::default());
+    assert_eq!(known_size(&[5; 32], None, &sizes), None);
+    sizes.lock().unwrap().insert([5; 32], 4096);
+    assert_eq!(known_size(&[5; 32], None, &sizes), Some(4096));
+    assert_eq!(known_size(&[6; 32], None, &sizes), None);
+    assert_eq!(known_size(&[5; 32], Some(10), &sizes), Some(10));
+}

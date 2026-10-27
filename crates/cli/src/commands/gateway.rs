@@ -141,7 +141,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::Eip712Domain;
 use anyhow::Context as _;
 use bytes::Bytes;
-use decdn_client::bundle::BundleManifest;
+use decdn_client::bundle::{BundleManifest, MalformedManifest};
 use decdn_client::session::ChainConfig;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::address::parse_nonzero_address;
@@ -161,8 +161,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, oneshot};
 
 use super::fetch::{
-    BlobFetch, Credential, MAX_MANIFEST_BYTES, manifest_cap_mb, manifest_parse_context,
-    resolve_chain,
+    BlobFetch, Credential, MALFORMED_MANIFEST, MAX_MANIFEST_BYTES, manifest_cap_mb, resolve_chain,
 };
 use super::local_http::{
     Body, allowed_hosts, carries_token, full, host_header, json, load_or_create_token, private_dir,
@@ -237,6 +236,9 @@ const MAX_CACHED_MANIFESTS: usize = 16;
 /// The manifest bytes the cache keeps across all its entries. The newest
 /// entry stays even when it alone exceeds this.
 const MANIFEST_CACHE_BYTES: usize = 64 << 20;
+
+/// The most hashes the gateway remembers as no bundle manifest.
+const MAX_NOT_MANIFESTS: usize = 1024;
 
 /// The duplex buffer between a pull and its HTTP response.
 const PIPE_BYTES: usize = 1 << 20;
@@ -336,6 +338,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         delegates: Mutex::new(HashMap::new()),
         pulls,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
+        not_manifests: std::sync::Mutex::new(NotManifests::default()),
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts(args.listen),
         sites,
@@ -892,6 +895,9 @@ struct Gateway {
     /// Runs every pull, on one endpoint and one buyer-pool store.
     pulls: PullWorker,
     manifests: std::sync::Mutex<ManifestCache>,
+    /// Hashes a pull found to be no manifest, so a repeat request pays for
+    /// no second pull.
+    not_manifests: std::sync::Mutex<NotManifests>,
     /// Held while a missing manifest is pulled, so concurrent requests for it
     /// pull and pay once. Cache hits never wait on it.
     manifest_fill: Mutex<()>,
@@ -1036,6 +1042,96 @@ impl ManifestCache {
                 self.bytes = self.bytes.saturating_sub(evicted);
             }
         }
+    }
+}
+
+/// Why a blob is no bundle manifest. The bytes are content-addressed and a
+/// cap stop comes from verified bytes, so the verdict holds for the hash for
+/// the whole run. It holds no request's raw-blob hint: [`Self::error`] adds
+/// the asker's.
+#[derive(Clone, Debug)]
+enum NotManifest {
+    /// The manifest cap ended the pull: the cap stop's text.
+    OverCap(String),
+    /// The bytes do not parse as a manifest: the parse error's text.
+    Unparsed(String),
+    /// The whole text, which names no raw blob.
+    Plain(String),
+}
+
+impl NotManifest {
+    /// The verdict on bytes whose parse failed with `err`. A malformed
+    /// manifest names its publisher, not the raw blob, which is the same
+    /// broken JSON.
+    fn unparsed(err: anyhow::Error) -> Self {
+        if err.is::<MalformedManifest>() {
+            Self::Plain(format!("{:#}", err.context(MALFORMED_MANIFEST)))
+        } else {
+            Self::Unparsed(format!("{err:#}"))
+        }
+    }
+
+    /// The error a request gets for the verdict. `raw` is the request's hint
+    /// to fetch the raw blob; a cap stop names it only when `raw_past_cap`,
+    /// as the raw blob pulls under the gateway's own cap.
+    fn error(&self, cap_mb: u64, raw: &str, raw_past_cap: bool) -> anyhow::Error {
+        match self {
+            Self::OverCap(cause) => {
+                let hint = if raw_past_cap {
+                    format!("; {raw}")
+                } else {
+                    String::new()
+                };
+                anyhow::Error::msg(cause.clone()).context(format!(
+                    "the blob is larger than {cap_mb} MiB, the most this gateway reads as a \
+                     bundle manifest{hint}"
+                ))
+            }
+            Self::Unparsed(cause) => {
+                anyhow::Error::msg(cause.clone()).context(format!("not a bundle manifest; {raw}"))
+            }
+            Self::Plain(text) => anyhow::Error::msg(text.clone()),
+        }
+    }
+}
+
+/// Hashes found to be no bundle manifest, with their verdicts, least recently
+/// used first out, within [`MAX_NOT_MANIFESTS`] entries.
+#[derive(Default)]
+struct NotManifests {
+    /// Oldest first.
+    entries: std::collections::VecDeque<([u8; 32], NotManifest)>,
+}
+
+impl NotManifests {
+    fn get(&mut self, hash: &[u8; 32]) -> Option<NotManifest> {
+        let at = self.entries.iter().position(|(h, _)| h == hash)?;
+        let entry = self.entries.remove(at)?;
+        let verdict = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(verdict)
+    }
+
+    fn insert(&mut self, hash: [u8; 32], verdict: NotManifest) {
+        self.entries.retain(|(h, _)| *h != hash);
+        self.entries.push_back((hash, verdict));
+        while self.entries.len() > MAX_NOT_MANIFESTS {
+            self.entries.pop_front();
+        }
+    }
+}
+
+/// How a manifest pull ends short of a manifest.
+enum ManifestStop {
+    /// The blob is no manifest, for good.
+    Not(NotManifest),
+    /// The pull failed; a later request may pull again.
+    Pull(PullError),
+}
+
+impl From<PullError> for ManifestStop {
+    fn from(e: PullError) -> Self {
+        Self::Pull(e)
     }
 }
 
@@ -1988,48 +2084,90 @@ impl Gateway {
         Ok(html(StatusCode::OK, &page))
     }
 
-    fn cached_manifest(&self, hash: &[u8; 32]) -> Option<Arc<BundleManifest>> {
-        self.manifests
+    /// What the gateway knows of `hash` as a manifest: the parsed manifest,
+    /// or why it is none.
+    fn cached_manifest(&self, hash: &[u8; 32]) -> Option<Result<Arc<BundleManifest>, NotManifest>> {
+        let manifest = self
+            .manifests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(hash);
+        if let Some(manifest) = manifest {
+            return Some(Ok(manifest));
+        }
+        self.not_manifests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(hash)
+            .map(Err)
     }
 
     /// The bundle manifest `hash`, from the cache or pulled. The pull requests,
-    /// and so pays for, at most the manifest cap. Only a blob that parses as a
-    /// manifest is cached: a blob that does not is pulled, and paid for, again
-    /// on every request.
+    /// and so pays for, at most the manifest cap. A blob that is no manifest
+    /// is remembered as such, so a repeat request answers without a pull; a
+    /// pull that failed upstream is not.
     async fn manifest(
         self: &Arc<Self>,
         hash: [u8; 32],
         namespace: Option<u64>,
         paying: &Payment,
     ) -> Result<Arc<BundleManifest>, PullError> {
-        if let Some(manifest) = self.cached_manifest(&hash) {
-            return Ok(manifest);
-        }
-        let _fill = self.manifest_fill.lock().await;
-        // A request that waited on the fill lock finds what the one before it
-        // pulled.
-        if let Some(manifest) = self.cached_manifest(&hash) {
-            return Ok(manifest);
-        }
         let cap_mb = manifest_cap_mb(self.common.max_blob_mb);
         let raw = raw_blob_hint(hash, namespace);
         // The raw blob pulls under the gateway's own cap, so it is a way past
         // the manifest cap only when that cap is higher.
-        let raw_past_cap = (self.common.max_blob_mb == 0 || cap_mb < self.common.max_blob_mb)
-            .then_some(raw.as_str());
+        let raw_past_cap = self.common.max_blob_mb == 0 || cap_mb < self.common.max_blob_mb;
+        let not_manifest = |verdict: &NotManifest| {
+            PullError::NotManifest(verdict.error(cap_mb, &raw, raw_past_cap))
+        };
+        if let Some(known) = self.cached_manifest(&hash) {
+            return known.map_err(|verdict| not_manifest(&verdict));
+        }
+        let _fill = self.manifest_fill.lock().await;
+        // A request that waited on the fill lock finds what the one before it
+        // pulled.
+        if let Some(known) = self.cached_manifest(&hash) {
+            return known.map_err(|verdict| not_manifest(&verdict));
+        }
+        match self.pull_manifest(hash, namespace, paying, cap_mb).await {
+            Ok((manifest, size)) => {
+                self.manifests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(hash, Arc::clone(&manifest), size);
+                Ok(manifest)
+            }
+            Err(ManifestStop::Not(verdict)) => {
+                let error = not_manifest(&verdict);
+                self.not_manifests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(hash, verdict);
+                Err(error)
+            }
+            Err(ManifestStop::Pull(e)) => Err(e),
+        }
+    }
+
+    /// Pull `hash` under the manifest cap of `cap_mb` and parse it, with the
+    /// manifest's JSON size.
+    async fn pull_manifest(
+        self: &Arc<Self>,
+        hash: [u8; 32],
+        namespace: Option<u64>,
+        paying: &Payment,
+        cap_mb: u64,
+    ) -> Result<(Arc<BundleManifest>, usize), ManifestStop> {
         let (first, mut reader, done, mut guard) = self
             .start_pull(hash, namespace, paying, cap_mb, None, None)
             .await
-            .map_err(|e| over_manifest_cap(e, cap_mb, raw_past_cap))?;
+            .map_err(|e| over_manifest_cap(e.into()))?;
         // Every byte pulled is charged as it lands, whether or not it parses:
         // a blob that is no manifest was paid for all the same. The read stops
         // where the allowance does, instead of draining to the manifest cap.
         let bucket = paying.bucket();
         if !self.charge(bucket, first.len()) {
-            return Err(PullError::Allowance);
+            return Err(PullError::Allowance.into());
         }
         let mut bytes = first.to_vec();
         let read = async {
@@ -2043,36 +2181,29 @@ impl Gateway {
                     break;
                 }
                 if !self.charge(bucket, n) {
-                    return Err(PullError::Allowance);
+                    return Err(PullError::Allowance.into());
                 }
                 bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
                 // A backstop: the manifest cap ends the pull before this.
                 if bytes.len() > MAX_MANIFEST_BYTES {
-                    return Err(PullError::NotManifest(anyhow::anyhow!(
+                    return Err(ManifestStop::Not(NotManifest::Plain(format!(
                         "the blob is larger than {MAX_MANIFEST_BYTES} bytes, the most this \
                          gateway reads as a bundle manifest"
-                    )));
+                    ))));
                 }
             }
-            finished(done).await
+            finished(done).await.map_err(ManifestStop::from)
         }
         .await;
         // The pull ended whole: nothing past the bytes read was paid for. A
         // read that ended short leaves the guard armed, and its drop charges
         // the bound of what the pull may have paid past them.
-        read.map_err(|e| over_manifest_cap(e, cap_mb, raw_past_cap))?;
+        read.map_err(over_manifest_cap)?;
         guard.disarm();
         // The blob fits under the manifest cap, so it fits under the gateway's.
-        let manifest = Arc::new(
-            BundleManifest::parse(&bytes)
-                .map_err(|e| manifest_parse_context(e, format!("not a bundle manifest; {raw}")))
-                .map_err(PullError::NotManifest)?,
-        );
-        self.manifests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(hash, Arc::clone(&manifest), bytes.len());
-        Ok(manifest)
+        let manifest = BundleManifest::parse(&bytes)
+            .map_err(|e| ManifestStop::Not(NotManifest::unparsed(e)))?;
+        Ok((Arc::new(manifest), bytes.len()))
     }
 
     /// A response streaming `hash`'s verified bytes, presented as `present`
@@ -2642,19 +2773,16 @@ fn classify(e: anyhow::Error) -> PullError {
     }
 }
 
-/// Mark a manifest pull that the cap of `cap_mb` ended as
-/// [`PullError::NotManifest`]: the gateway reads no larger blob as a manifest.
-/// `raw` is the hint to fetch the raw blob, when the gateway serves it.
-fn over_manifest_cap(e: PullError, cap_mb: u64, raw: Option<&str>) -> PullError {
-    match e {
-        PullError::Other(e) if e.downcast_ref::<decdn_client::BlobTooLarge>().is_some() => {
-            let hint = raw.map_or_else(String::new, |raw| format!("; {raw}"));
-            PullError::NotManifest(e.context(format!(
-                "the blob is larger than {cap_mb} MiB, the most this gateway reads as a \
-                 bundle manifest{hint}"
-            )))
+/// Mark a manifest pull that the manifest cap ended as
+/// [`NotManifest::OverCap`]: the gateway reads no larger blob as a manifest.
+fn over_manifest_cap(stop: ManifestStop) -> ManifestStop {
+    match stop {
+        ManifestStop::Pull(PullError::Other(e))
+            if e.downcast_ref::<decdn_client::BlobTooLarge>().is_some() =>
+        {
+            ManifestStop::Not(NotManifest::OverCap(format!("{e:#}")))
         }
-        e => e,
+        stop => stop,
     }
 }
 

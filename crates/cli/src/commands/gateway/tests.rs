@@ -57,6 +57,28 @@ fn manifest_cache_reinsert_replaces_without_double_counting() {
 }
 
 #[test]
+fn not_manifests_evict_the_least_recently_used_past_the_count() {
+    let verdict = || NotManifest::Plain("no".into());
+    let mut known = NotManifests::default();
+    for n in 0..MAX_NOT_MANIFESTS {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&n.to_le_bytes());
+        known.insert(h, verdict());
+    }
+    // Reading the oldest makes it the newest, so the next insert evicts 1.
+    assert!(known.get(&[0; 32]).is_some());
+    known.insert(hash(0xff), verdict());
+    assert_eq!(known.entries.len(), MAX_NOT_MANIFESTS);
+    assert!(known.get(&[0; 32]).is_some());
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    assert!(known.get(&one).is_none());
+    // A repeat insert replaces, not duplicates.
+    known.insert(hash(0xff), verdict());
+    assert_eq!(known.entries.len(), MAX_NOT_MANIFESTS);
+}
+
+#[test]
 fn scope_parses_any_domain_and_host() {
     assert_eq!(Scope::parse("*").unwrap(), Scope::Any);
     assert_eq!(
@@ -392,6 +414,7 @@ async fn test_gateway_in(
         delegates: Mutex::new(HashMap::new()),
         pulls: PullWorker::start(backend, 1).await.unwrap(),
         manifests: std::sync::Mutex::new(ManifestCache::default()),
+        not_manifests: std::sync::Mutex::new(NotManifests::default()),
         manifest_fill: Mutex::new(()),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
         sites,
@@ -646,9 +669,15 @@ async fn a_manifest_pull_is_capped_and_an_oversize_blob_is_not_found() {
         body.contains(&format!("fetch `/{blob}?ns=7` for the raw blob")),
         "the gateway serves the raw blob past the manifest cap: {body}"
     );
-    let (status, _) = get(&gateway, &format!("/{blob}/a.bin")).await;
+    // The verdict is remembered: the next request pulls nothing, and its
+    // hint names its own namespace.
+    let (status, body) = get(&gateway, &format!("/{blob}/a.bin?ns=9")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB, MAX_MANIFEST_MB]);
+    assert!(
+        body.contains(&format!("fetch `/{blob}?ns=9` for the raw blob")),
+        "{body}"
+    );
+    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB]);
 
     let (gateway, caps) = recording_gateway(Reply::TooLarge, &["--max-blob-mb", "10"]).await;
     let (status, body) = get(&gateway, &format!("/{blob}/")).await;
@@ -681,14 +710,37 @@ async fn a_raw_blob_pull_keeps_the_gateway_cap() {
 
 #[tokio::test]
 async fn a_blob_that_is_not_a_manifest_is_not_found() {
-    let (gateway, _) = recording_gateway(Reply::Bytes(b"not json".to_vec()), &[]).await;
+    let (gateway, caps) = recording_gateway(Reply::Bytes(b"not json".to_vec()), &[]).await;
     let blob = alloy::hex::encode(BLOB);
-    let (status, body) = get(&gateway, &format!("/{blob}/")).await;
+    let (status, first) = get(&gateway, &format!("/{blob}/")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(
-        body.contains(&format!("fetch `/{blob}` for the raw blob")),
-        "{body}"
+        first.contains(&format!("fetch `/{blob}` for the raw blob")),
+        "{first}"
     );
+    let (status, again) = get(&gateway, &format!("/{blob}/")).await;
+    assert_eq!(
+        (status, again.as_str()),
+        (StatusCode::NOT_FOUND, first.as_str())
+    );
+    assert_eq!(
+        *caps.lock().unwrap(),
+        [MAX_MANIFEST_MB],
+        "the repeat request pays for no second pull"
+    );
+}
+
+/// A pull that failed upstream says nothing of the blob, so the next request
+/// pulls again.
+#[tokio::test]
+async fn a_failed_manifest_pull_is_not_remembered() {
+    let (gateway, caps) = recording_gateway_of(HashMap::new(), &[]).await;
+    let blob = alloy::hex::encode(BLOB);
+    for _ in 0..2 {
+        let (status, body) = get(&gateway, &format!("/{blob}/")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    }
+    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB; 2]);
 }
 
 /// A bundle reads its manifest under the manifest cap, once, and serves its
@@ -748,8 +800,8 @@ async fn a_malformed_entry_hash_makes_the_bundle_not_found() {
     }
     assert_eq!(
         *caps.lock().unwrap(),
-        [MAX_MANIFEST_MB; 3],
-        "each request pulls only the manifest"
+        [MAX_MANIFEST_MB],
+        "the first request pulls only the manifest, and the rest none"
     );
 }
 
@@ -1088,16 +1140,16 @@ fn only_a_cap_stop_marks_a_manifest_pull_not_a_manifest() {
         })
     };
     assert!(matches!(
-        over_manifest_cap(PullError::Other(too_large()), 64, None),
-        PullError::NotManifest(_)
+        over_manifest_cap(PullError::Other(too_large()).into()),
+        ManifestStop::Not(NotManifest::OverCap(_))
     ));
     assert!(matches!(
-        over_manifest_cap(PullError::Other(anyhow::anyhow!("no node")), 64, None),
-        PullError::Other(_)
+        over_manifest_cap(PullError::Other(anyhow::anyhow!("no node")).into()),
+        ManifestStop::Pull(PullError::Other(_))
     ));
     assert!(matches!(
-        over_manifest_cap(PullError::Funding(too_large()), 64, None),
-        PullError::Funding(_)
+        over_manifest_cap(PullError::Funding(too_large()).into()),
+        ManifestStop::Pull(PullError::Funding(_))
     ));
 }
 
@@ -3035,12 +3087,7 @@ async fn status_spells_addresses_eip55_and_hashes_bare() {
     let payer = serde_json::to_value(PayerLabel::Capability { signer: mixed }).unwrap();
     assert_eq!(payer["signer"], mixed.to_string());
     let pool = alloy::primitives::B256::repeat_byte(0x01);
-    let lanes = serde_json::to_value(worker::DelegateLanes {
-        signer: mixed,
-        pool_id: pool,
-        lanes: Vec::new(),
-    })
-    .unwrap();
+    let lanes = serde_json::to_value(worker::DelegateLanes::new(mixed, pool, Vec::new())).unwrap();
     assert_eq!(lanes["signer"], mixed.to_string());
     assert_eq!(lanes["pool_id"], format!("{pool:#x}"));
     let (gateway, _logs, _) = public_gateway().await;

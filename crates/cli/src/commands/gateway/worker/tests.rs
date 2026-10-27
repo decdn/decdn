@@ -2,12 +2,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use alloy::primitives::Address;
+use std::collections::HashMap;
+
+use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser as _;
+use decdn_client::Cumulative;
+use decdn_common::admin::BuyerLaneSnapshot;
 use decdn_common::cli::ClientFetchArgs;
 use decdn_incentive::CapabilityGrant;
-use decdn_incentive::lane::PoolId;
+use decdn_incentive::lane::{LaneKey, PoolId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, oneshot};
 
@@ -33,7 +37,18 @@ struct Log {
     payers_made: usize,
     /// The payer id each pull ran under, in the order the pulls ran.
     pulled_under: Vec<usize>,
+    /// The delegate key of each held payer, by payer id.
+    signers: HashMap<usize, Address>,
 }
+
+/// The provider of the one lane each [`Fake`] held payer has a ledger on.
+const LIVE_PROVIDER: Address = Address::repeat_byte(9);
+
+/// What that ledger has committed.
+const LIVE: Cumulative = Cumulative {
+    bytes: U256::from_limbs([4096, 0, 0, 0]),
+    amount: U256::from_limbs([500, 0, 0, 0]),
+};
 
 /// A backend whose pulls act by the blob's first hash byte.
 struct Fake {
@@ -52,10 +67,12 @@ impl Backend for Fake {
         Ok(())
     }
 
-    fn payer(&self, _credential: Credential) -> anyhow::Result<usize> {
+    fn payer(&self, credential: Credential) -> anyhow::Result<usize> {
         let mut log = self.log.lock().unwrap();
         log.payers_made += 1;
-        Ok(log.payers_made)
+        let id = log.payers_made;
+        log.signers.insert(id, credential.signer.address());
+        Ok(id)
     }
 
     async fn pool_payer(&self, (): &()) -> anyhow::Result<Option<usize>> {
@@ -100,14 +117,27 @@ impl Backend for Fake {
         Ok(PoolSnapshot {
             delegate_lanes: delegates
                 .iter()
-                .map(|&(pool_id, signer)| DelegateLanes {
-                    signer,
-                    pool_id,
-                    lanes: Vec::new(),
-                })
+                .map(|&(pool_id, signer)| DelegateLanes::new(signer, pool_id, Vec::new()))
                 .collect(),
             ..PoolSnapshot::default()
         })
+    }
+
+    /// A held payer has one lane on the zero pool, at [`LIVE`].
+    fn live_lanes(&self, payer: &usize) -> Vec<(LaneKey, Cumulative)> {
+        let log = self.log.lock().unwrap();
+        log.signers
+            .get(payer)
+            .map(|&signer| {
+                let lane = LaneKey {
+                    pool_id: PoolId::ZERO,
+                    signer,
+                    provider: LIVE_PROVIDER,
+                };
+                (lane, LIVE)
+            })
+            .into_iter()
+            .collect()
     }
 
     async fn close(&self, (): ()) {
@@ -487,6 +517,95 @@ async fn a_pools_query_is_answered_beside_running_pulls() {
     release.notify_one();
     held_done.await.unwrap().unwrap();
     worker.stop().await;
+}
+
+/// A capability's spend counts the live ledger of a pull through it while the
+/// pull runs, and the store alone once it ended.
+#[tokio::test]
+async fn a_pools_query_counts_the_pulls_in_flight() {
+    let (worker, _log, release) = start(2).await;
+    let alice = Arc::new(PrivateKeySigner::random());
+    let bob = Arc::new(PrivateKeySigner::random());
+    let (_held, held_done) = send(&worker, HOLD, &alice, 1024);
+    let delegates = vec![
+        (PoolId::ZERO, alice.address()),
+        (PoolId::ZERO, bob.address()),
+    ];
+    let spend = |snapshot: &PoolSnapshot| {
+        snapshot
+            .delegate_lanes
+            .iter()
+            .map(|d| (d.spent_micro_usdc, d.bytes_delivered))
+            .collect::<Vec<_>>()
+    };
+    let during = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = worker.pools(delegates.clone()).await.unwrap();
+            if snapshot.delegate_lanes[0].spent_micro_usdc > 0 {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the held pull's payer is live");
+    assert_eq!(
+        spend(&during),
+        [(500, 4096), (0, 0)],
+        "alice's pull in flight counts, and bob has none"
+    );
+    release.notify_one();
+    held_done.await.unwrap().unwrap();
+    let after = worker.pools(delegates).await.unwrap();
+    assert_eq!(spend(&after), [(0, 0), (0, 0)], "only the store is left");
+    worker.stop().await;
+}
+
+/// A lane's spend is the larger of its stored watermark and its live ledger,
+/// never their sum; a lane the store does not hold yet counts in full, and
+/// another key's lanes not at all.
+#[test]
+fn live_ledgers_lift_the_stored_spend_without_double_counting() {
+    let signer = Address::repeat_byte(1);
+    let stored = |provider: Address, amount: u64| BuyerLaneSnapshot {
+        voucher_signer: signer.to_string(),
+        provider: provider.to_string(),
+        last_amount_micro_usdc: amount,
+        last_bytes_delivered: amount * 10,
+    };
+    let behind = Address::repeat_byte(0xa);
+    let ahead = Address::repeat_byte(0xb);
+    let unstored = Address::repeat_byte(0xc);
+    let mut delegate = DelegateLanes::new(
+        signer,
+        PoolId::ZERO,
+        vec![stored(behind, 300), stored(ahead, 700)],
+    );
+    assert_eq!(
+        (delegate.spent_micro_usdc, delegate.bytes_delivered),
+        (1000, 10_000)
+    );
+    let lane = |signer, provider| LaneKey {
+        pool_id: PoolId::ZERO,
+        signer,
+        provider,
+    };
+    let at = |amount: u64| Cumulative {
+        bytes: U256::from(amount * 10),
+        amount: U256::from(amount),
+    };
+    let live = HashMap::from([
+        (lane(signer, behind), at(500)),
+        (lane(signer, ahead), at(600)),
+        (lane(signer, unstored), at(40)),
+        (lane(Address::repeat_byte(2), behind), at(9000)),
+    ]);
+    delegate.include_live(&live);
+    // behind 500 (not 300 + 500), ahead 700, unstored 40.
+    assert_eq!(
+        (delegate.spent_micro_usdc, delegate.bytes_delivered),
+        (1240, 12_400)
+    );
 }
 
 /// A query after the worker stopped fails instead of hanging.

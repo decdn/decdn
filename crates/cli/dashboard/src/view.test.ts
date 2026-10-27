@@ -129,9 +129,27 @@ describe("pools", () => {
 });
 
 describe("capabilities", () => {
-  it("sums the delegate lanes of the capability's signer and pool against its cap", () => {
+  it("takes the spend of the capability's signer and pool against its cap", () => {
     const rows = capabilities(
       status({
+        active_pulls: [
+          {
+            hash: "ab",
+            namespace: null,
+            range: null,
+            payer: { kind: "capability", signer: signer.toLowerCase() },
+            since_secs: 1,
+            delivered_bytes: 0,
+          },
+          {
+            hash: "cd",
+            namespace: null,
+            range: null,
+            payer: { kind: "pool" },
+            since_secs: 1,
+            delivered_bytes: 0,
+          },
+        ],
         capabilities: [
           {
             cap: 4_000,
@@ -150,17 +168,27 @@ describe("capabilities", () => {
             {
               signer: signer.toLowerCase(),
               pool_id: pool,
+              // The spend counts the pull in flight the stored lanes lag.
               lanes: [lane(1_000, 100), lane(2_000, 200, "0xcc")],
+              spent_micro_usdc: 3_500,
+              bytes_delivered: 350,
             },
-            { signer: "0x99", pool_id: pool, lanes: [lane(500, 5)] },
+            {
+              signer: "0x99",
+              pool_id: pool,
+              lanes: [lane(500, 5)],
+              spent_micro_usdc: 500,
+              bytes_delivered: 5,
+            },
           ],
         },
       }),
     );
     expect(rows[0]).toMatchObject({
-      spentMicro: 3_000,
-      bytes: 300,
-      used: 0.75,
+      spentMicro: 3_500,
+      bytes: 350,
+      used: 0.875,
+      inFlight: 1,
     });
   });
 

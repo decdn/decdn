@@ -59,7 +59,9 @@
             "last_amount_micro_usdc": 1250000,
             "last_bytes_delivered": 18000000000
           }
-        ]
+        ],
+        "spent_micro_usdc": 1250000,
+        "bytes_delivered": 18000000000
       }
     ]
   },
