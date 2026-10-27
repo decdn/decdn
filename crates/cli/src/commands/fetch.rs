@@ -1368,6 +1368,7 @@ pub(crate) async fn fetch_on(
                     hash,
                     total_bytes,
                     stop.clone(),
+                    common.max_sources,
                 )
                 .await;
                 let blob = blake3::Hash::from_bytes(hash).to_hex();
@@ -1449,8 +1450,7 @@ pub(crate) async fn fetch_on(
             eprintln!("warning: {shortfall}");
         }
         let result = result.map_err(|err| annotate(err, &sources.fault_context()));
-        // A size proof writes no byte, so a replacement runs it again.
-        match next_pass(result, &mut replaced, streams && !args.prove) {
+        match next_pass(result, &mut replaced, streams) {
             Some(pass_result) => return pass_result,
             None => recovery.start_next_pass(),
         }
@@ -1478,10 +1478,9 @@ pub(crate) fn held_cap(max_blob_mb: u64, size_cap: Option<u64>) -> u64 {
 /// Only a pass that a [`PoolReplaced`] ended runs again, and at most once: a
 /// second replacement in one command ends it "funding needed". A replacement
 /// that an untracked escrow ended the pass over survives in `result` only as
-/// text, and runs nothing again. A pass that `streams` its bytes (to stdout
-/// or a writer) never runs again, because the bytes it already wrote cannot
-/// be taken back; its replacement ends the command with the new pool named.
-/// A size proof writes none, so it does not count as one. The command names
+/// text, and runs nothing again. A stream (stdout or a writer) never runs
+/// again, because the bytes it already wrote cannot be taken back; its
+/// replacement ends the command with the new pool named. The command names
 /// each closed pool as it ends, from the gate ([`print_reclaim_notes`]).
 fn next_pass(
     result: anyhow::Result<()>,
@@ -1705,7 +1704,9 @@ where
 }
 
 /// Prove the size of `hash` under the first claim `total_bytes`
-/// ([`Streamer::prove_size`]): `None` when no leg proved it.
+/// ([`Streamer::prove_size`]) on at most `max_sources` lanes, as a stream
+/// of it would run: `None` when no leg proved it.
+#[allow(clippy::too_many_arguments)]
 async fn prove_size<P>(
     deps: &LaneDeps<'_, P>,
     sources: &LaneSources<'_, P>,
@@ -1714,13 +1715,18 @@ async fn prove_size<P>(
     hash: [u8; 32],
     total_bytes: u64,
     stop: StopPolicy,
+    max_sources: usize,
 ) -> anyhow::Result<Option<u64>>
 where
     P: alloy::providers::Provider + Clone,
 {
+    let config = PullConfig {
+        streamer_lane_cap: max_sources.max(1),
+        ..PullConfig::new()
+    };
     let scratch = stream_scratch(deps)?;
     streamer_over(deps, sources, holders, health, scratch.path())
-        .prove_size(hash, total_bytes, &PullConfig::new(), stop)
+        .prove_size(hash, total_bytes, &config, stop)
         .await
 }
 
