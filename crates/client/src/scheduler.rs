@@ -2566,7 +2566,9 @@ where
                 // end where the victim reached, and a declined one lets it
                 // reach `end`.
                 let reached = unit.progress.frontier.load(Ordering::Acquire).min(end);
-                if split < end && reached < end {
+                // A retired lane lowers its own end, with no steal.
+                let is_retired = retired(engine.credentials, &lane);
+                if split < end && reached < end && !is_retired {
                     tracing::debug!(
                         %provider,
                         start = r_start,
@@ -2590,7 +2592,7 @@ where
                 }
                 // A retired lane keeps its range for the loop top, which
                 // re-queues what it did not receive.
-                if !retired(engine.credentials, &lane) {
+                if !is_retired {
                     work.lock().await.clear(i)?;
                 }
             }
