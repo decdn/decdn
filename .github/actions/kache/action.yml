@@ -3,7 +3,7 @@ description: >-
   Run rustc behind kache (https://github.com/kunobi-ninja/kache) against the shared
   S3-compatible store, so a job restores every crate another job or an earlier
   `main` run already compiled with the same inputs.
-  Only `main` writes the store; every other run reads it. A caller runs this
+  Only a push to `main` writes the store; every other run reads it. A caller runs this
   only when the workflow's `REMOTE_BUILD_CACHE` is `true`, and keeps
   Swatinem/rust-cache for the cargo registry, with `cache-targets` off.
 
@@ -22,16 +22,20 @@ inputs:
     required: false
     default: auto
   s3-access-key-id:
-    description: The store's access key ID (`secrets.KACHE_S3_ACCESS_KEY_ID`).
+    description: >-
+      The store's access key ID: `KACHE_S3_WRITE_ACCESS_KEY_ID` on a push to
+      `main`, the read-only `KACHE_S3_READ_ACCESS_KEY_ID` otherwise.
     required: true
   s3-secret-access-key:
-    description: The store's secret key (`secrets.KACHE_S3_SECRET_ACCESS_KEY`).
+    description: >-
+      The secret for that key: `KACHE_S3_WRITE_SECRET_ACCESS_KEY` or
+      `KACHE_S3_READ_SECRET_ACCESS_KEY`.
     required: true
 
 runs:
   using: composite
   steps:
-    # SHA-pinned (v1): the action receives the store's write credentials.
+    # SHA-pinned (v1): on `main` the action receives the store's write key.
     - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed
       with:
         version: 1.2.2
@@ -43,8 +47,9 @@ runs:
         # Each job builds its own flags and features, so each keeps its own
         # prefetch manifest. The content-addressed entries are still shared.
         manifest-key: ${{ github.job }}
-        # Read-only off `main`, as Swatinem/rust-cache's `save-if` is.
-        save-cache: ${{ github.ref == 'refs/heads/main' }}
+        # Read-only except on a push to `main`, which alone gets the write key.
+        # The read-only key, not this flag, is what stops other runs writing.
+        save-cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         github-cache: false
         # A PR comment needs `pull-requests: write`; the job summary carries
         # the same stats.
