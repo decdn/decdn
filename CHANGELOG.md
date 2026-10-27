@@ -3626,15 +3626,16 @@ since project inception and will roll into the first tagged release.
   rustc behind kache against an S3-compatible bucket
   (`.github/actions/kache`). A job then restores every crate that another job,
   or an earlier `main` run, compiled with the same inputs. A pull request from
-  a fork does not use it. Swatinem/rust-cache keeps only the cargo registry in
-  those jobs, which takes their target directories out of the 10 GB GitHub
-  cache. The store is on when the `KACHE_S3_BUCKET` repository variable is
-  set, with `KACHE_S3_ENDPOINT` and `KACHE_S3_REGION` beside it. A push to
-  `main` uses the `KACHE_S3_WRITE_*` key pair; every other run uses
-  `KACHE_S3_READ_*`, a key the bucket allows only to read, so code in a pull
-  request cannot write the store. With the variable unset, CI caches as
-  before. `clippy` and every release job do not use the store, so a cache
-  entry never reaches a shipped binary.
+  a fork, and a run Dependabot triggers, do not use it: neither can read the
+  store's Actions secrets. With the store on, Swatinem/rust-cache keeps only
+  the cargo registry in those jobs, which takes their target directories out
+  of the 10 GB GitHub cache. The store is on when the `KACHE_S3_BUCKET`
+  repository variable is set, with `KACHE_S3_ENDPOINT` and `KACHE_S3_REGION`
+  beside it. A push to `main` uses the `KACHE_S3_WRITE_*` key pair; every
+  other run uses `KACHE_S3_READ_*`, a key the bucket allows only to read, so
+  code in a pull request cannot write the store. With the variable unset, CI
+  caches as before. `clippy` and every release job do not use the store, so a
+  cache entry never reaches a shipped binary.
 - **Gateway: a public gateway answers every origin (#2628).** `decdn gateway
   --public-url` adds `Access-Control-Allow-Origin: *` and exposes
   `Content-Length`, `Content-Range`, `Accept-Ranges`, `Content-Type`,

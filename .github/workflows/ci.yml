@@ -27,14 +27,17 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # The shared kache compiler-cache store (`.github/actions/kache`). It is on when the `KACHE_S3_BUCKET` variable is set and the run can
-  # read the store's secrets, which a pull request from a fork cannot. Clear the
-  # variable to turn it off. A push to `main` gets the write key; every other
-  # run gets a key the bucket allows only to read, because kache-action exports
-  # the key to every later step, build scripts and tests included. The name keeps clear of the `CARGO*`/`RUST*`
-  # variables Swatinem/rust-cache hashes into its key, and of the `KACHE_*`
-  # variables kache reads.
-  REMOTE_BUILD_CACHE: ${{ vars.KACHE_S3_BUCKET != '' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
+  # The shared kache compiler-cache store (`.github/actions/kache`). It is on
+  # when the `KACHE_S3_BUCKET` variable is set and the run can read the store's
+  # Actions secrets. A pull request from a fork cannot, and neither can a run
+  # Dependabot triggers, re-runs included: it reads only Dependabot secrets.
+  # Those runs keep rust-cache's targets instead. Clear the variable to turn
+  # the store off. A push to `main` gets the write key; every other run gets a
+  # key the bucket allows only to read, because kache-action exports the key to
+  # every later step, build scripts and tests included. The name keeps clear of
+  # the `CARGO*`/`RUST*` variables Swatinem/rust-cache hashes into its key, and
+  # of the `KACHE_*` variables kache reads.
+  REMOTE_BUILD_CACHE: ${{ vars.KACHE_S3_BUCKET != '' && github.actor != 'dependabot[bot]' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
 
 jobs:
   fmt:
