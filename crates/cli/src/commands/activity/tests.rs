@@ -255,6 +255,29 @@ fn records_read_newest_first_and_skip_what_does_not_parse() {
     assert_eq!(unreadable, 1);
 }
 
+/// An entry written to a file runs the bundle path, which reports file
+/// progress and counts: its record keeps the bytes and none of the rest.
+#[tokio::test]
+async fn an_entry_run_records_no_bundle_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = start(dir.path(), &format!("{BLOB}/docs/a.bin"));
+    let file = recorder.file_started(&["a.bin".to_owned()], Arc::new(Quiet));
+    file.delivered(20, 20);
+    recorder.file_landed();
+    recorder.bundle_counts(BundleCounts {
+        fetched: 1,
+        ..BundleCounts::default()
+    });
+    recorder.finish(&Ok(()), None).await;
+    let record = only(dir.path());
+    assert_eq!(record.kind, PullKind::Entry);
+    assert_eq!(record.received_bytes, 20);
+    let json = serde_json::to_value(&record).unwrap();
+    for field in ["files_started", "files_landed", "counts", "bundle"] {
+        assert!(json.get(field).is_none(), "{field} in {json}");
+    }
+}
+
 /// A blob or entry record carries no bundle field; a bundle record carries
 /// them all beside its kind.
 #[test]
@@ -278,9 +301,15 @@ fn only_a_bundle_record_carries_bundle_fields() {
     assert_eq!(serde_json::from_value::<PullRecord>(json).unwrap(), bundle);
 }
 
-/// A record file a build before the bundle kind carried its fields wrote:
-/// flat `files_started` / `files_landed` and a `bundle` key on every kind.
-fn old_shape(started: u64, kind: &str, uri: &str) -> serde_json::Value {
+/// A record with its bundle fields flat on every kind: top-level
+/// `files_started` / `files_landed`, and its counts under a `bundle` key. A
+/// blob record holds them as `0, 0, null`.
+fn flat_shape(started: u64, kind: &str, uri: &str) -> serde_json::Value {
+    let bundle = kind == "bundle";
+    let counts = serde_json::json!({
+        "fetched": 2, "linked": 0, "skipped": 0, "excluded": 0, "failed": 0,
+        "not_run": 0, "downloaded": 5, "resumed_bytes": 0, "reused_bytes": 0,
+    });
     serde_json::json!({
         "uri": uri,
         "kind": kind,
@@ -292,25 +321,24 @@ fn old_shape(started: u64, kind: &str, uri: &str) -> serde_json::Value {
         "finished_unix_ms": started,
         "received_bytes": 5,
         "expected_bytes": 5,
-        "files_started": 3,
-        "files_landed": 2,
+        "files_started": if bundle { 3 } else { 0 },
+        "files_landed": if bundle { 2 } else { 0 },
         "paid": { "amount_micro_usdc": 0, "bytes": 0 },
         "nodes": [],
-        "bundle": { "fetched": 2, "linked": 0, "skipped": 0, "excluded": 0, "failed": 0,
-                    "not_run": 0, "downloaded": 5, "resumed_bytes": 0, "reused_bytes": 0 },
+        "bundle": if bundle { counts } else { serde_json::Value::Null },
     })
 }
 
-/// An old-shape record on disk is no error. It parses: the flat file counts
-/// feed the bundle kind, its counts read as none, and the leftover `bundle`
-/// key is ignored, as are a blob record's flat bundle fields.
+/// A record with flat bundle fields parses: the flat file counts feed a
+/// bundle kind, its counts read as none, and the `bundle` key and a blob
+/// record's flat fields are ignored as unknown keys.
 #[test]
-fn an_old_shape_record_reads_without_error() {
+fn a_record_with_flat_bundle_fields_reads_without_error() {
     let dir = tempfile::tempdir().unwrap();
-    let old_bundle = old_shape(1, "bundle", &format!("{BLOB}/"));
-    let old_blob = old_shape(2, "blob", BLOB);
-    std::fs::write(dir.path().join("1-1.json"), old_bundle.to_string()).unwrap();
-    std::fs::write(dir.path().join("2-1.json"), old_blob.to_string()).unwrap();
+    let flat_bundle = flat_shape(1, "bundle", &format!("{BLOB}/"));
+    let flat_blob = flat_shape(2, "blob", BLOB);
+    std::fs::write(dir.path().join("1-1.json"), flat_bundle.to_string()).unwrap();
+    std::fs::write(dir.path().join("2-1.json"), flat_blob.to_string()).unwrap();
     write(dir.path(), &record(3, done()));
     let (records, unreadable) = read_records(dir.path()).unwrap();
     assert_eq!(unreadable, 0, "{records:?}");

@@ -108,8 +108,6 @@ export interface GatewayStatus {
 
 // The `decdn get` runs this host recorded.
 
-export type PullKind = PullTarget["kind"];
-
 export interface Paid {
   amount_micro_usdc: number;
   /** The wire bytes the amount pays for. */
@@ -147,9 +145,11 @@ export type PullTarget =
       files_started: number;
       /** Blobs the run landed. */
       files_landed: number;
-      /** Set once the run ended. */
+      /** Set once the run ended with a summary; null while it runs or when it ended before one. */
       counts: BundleCounts | null;
     };
+
+export type PullKind = PullTarget["kind"];
 
 /** What every run's record carries, whatever its kind and state. */
 export type PullFields = PullTarget & {

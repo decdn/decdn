@@ -74,7 +74,12 @@ type Variants<T extends { state: string }> = {
   [S in T["state"]]: Keys<Extract<T, { state: S }>>;
 };
 
-/** Each arm of a `kind`-tagged union, with the keys it adds to every arm's. */
+/**
+ * Each arm of a `kind`-tagged union, with only the keys that arm adds beyond
+ * those every arm shares. An arm that adds none is `{}`, which the compiler
+ * cannot hold to no keys: `expectShape` checks it at run time, against
+ * fixtures that hold every kind.
+ */
 type KindVariants<T extends { kind: string }> = {
   [K in T["kind"]]: Keys<Omit<Extract<T, { kind: K }>, keyof T>>;
 };

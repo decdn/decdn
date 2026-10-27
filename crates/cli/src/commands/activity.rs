@@ -51,7 +51,8 @@ pub(crate) fn pulls_dir() -> Option<PathBuf> {
 }
 
 /// What a `decdn get` URI names. A bundle run carries its file progress and,
-/// once it ended, its counts; a blob or entry run carries neither.
+/// once it ended, its counts; a blob or entry run carries neither, even an
+/// entry written to a file, which runs the bundle path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PullKind {
@@ -65,7 +66,8 @@ pub(crate) enum PullKind {
         files_started: u64,
         /// Blobs the run landed.
         files_landed: u64,
-        /// The run's counts, once it ended.
+        /// The run's counts, once it ended with a summary; `None` while it
+        /// runs or when it ended before one.
         counts: Option<BundleCounts>,
     },
 }
@@ -367,7 +369,7 @@ impl ActivityRecorder {
 
     /// A bundle blob that lands at `paths` starts; the returned observer
     /// reports its position here and to `inner`. A blob started again, in a
-    /// second pass, counts once.
+    /// second pass, counts once. A non-bundle run records the position only.
     pub(crate) fn file_started(
         self: &Arc<Self>,
         paths: &[String],
@@ -394,7 +396,7 @@ impl ActivityRecorder {
         })
     }
 
-    /// A bundle blob landed.
+    /// A bundle blob landed. A non-bundle run ignores it.
     pub(crate) fn file_landed(&self) {
         self.update(|r| {
             if let PullKind::Bundle { files_landed, .. } = &mut r.kind {
@@ -403,7 +405,8 @@ impl ActivityRecorder {
         });
     }
 
-    /// A bundle run's counts, which [`Self::finish`] writes with its end.
+    /// A bundle run's counts, which [`Self::finish`] writes with its end. A
+    /// non-bundle run's record keeps none.
     pub(crate) fn bundle_counts(&self, counts: BundleCounts) {
         *self.counts.lock().unwrap_or_else(PoisonError::into_inner) = Some(counts);
     }
