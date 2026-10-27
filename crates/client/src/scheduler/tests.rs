@@ -30,6 +30,36 @@ fn blob(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
+/// A `tracing_subscriber::fmt` writer that keeps every line it is handed.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    /// Everything written so far.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A shared handle to a healthy buyer context (huge deposit so the pacer never
 /// tops up) paying the given `provider`.
 fn ctx_for(provider: u8) -> Arc<Mutex<PoolContext>> {
@@ -1515,7 +1545,9 @@ async fn forced_steal_does_not_double_fetch_the_stolen_tail() -> anyhow::Result<
 /// one by the two rates, so both finish together: the slow source is
 /// stolen from once, keeps its one stream, and stops that stream at the
 /// split. A midpoint split would leave the slow source enough for a second
-/// steal, and a third.
+/// steal, and a third. Each completed range logs, at info, the provider that
+/// served it and the extent it completed (#2332): the victim's extent ends
+/// where its stream stopped, so the logged extents tile the blob.
 #[tokio::test(start_paused = true)]
 async fn a_slow_victim_is_stolen_from_once() -> anyhow::Result<()> {
     let data = blob(128 * MIB as usize);
@@ -1535,12 +1567,22 @@ async fn a_slow_victim_is_stolen_from_once() -> anyhow::Result<()> {
         candidate(slow.clone(), ledger_slow, 0xB2, None),
     ])?;
     let (pacer, funder) = (BudgetPacer::new(), no_funding());
+    let log = CapturedLog::default();
+    let sink = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    // `set_default` is per-thread: `acquire` polls every worker on this one.
+    let guard = tracing::subscriber::set_default(subscriber);
     tokio::time::timeout(
         Duration::from_mins(5),
         run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None),
     )
     .await
     .map_err(|_| anyhow::anyhow!("the fetch stalled"))??;
+    drop(guard);
     store.finalize().await?;
     assert_eq!(std::fs::read(dir.path().join("b"))?, data);
 
@@ -1565,6 +1607,46 @@ async fn a_slow_victim_is_stolen_from_once() -> anyhow::Result<()> {
         delivered <= total + 2 * MIB,
         "no byte is fetched twice: delivered {delivered} of {total}"
     );
+
+    let text = log.text();
+    let message = "a lane completed its range";
+    // The event's own fields follow its message; a span's precede it.
+    let field = |fields: &str, key: &str| -> Option<String> {
+        fields
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_owned)
+    };
+    let num = |fields: &str, key: &str| -> anyhow::Result<u64> {
+        field(fields, key)
+            .ok_or_else(|| anyhow::anyhow!("no {key} in {fields}"))?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{key} in {fields}: {e}"))
+    };
+    let hash = blake3::Hash::from_bytes(root).to_hex().to_string();
+    let mut completed = Vec::new();
+    for (head, fields) in text.lines().filter_map(|l| l.split_once(message)) {
+        assert!(head.contains(" INFO "), "{text}");
+        assert_eq!(field(fields, "hash"), Some(hash.clone()), "{text}");
+        assert!(num(fields, "landed")? > 0, "{text}");
+        let from = field(fields, "provider").unwrap_or_default().to_lowercase();
+        completed.push((from, num(fields, "offset")?, num(fields, "len")?));
+    }
+    let slow_addr = Address::repeat_byte(0xB2).to_string().to_lowercase();
+    let fast_addr = Address::repeat_byte(0xA1).to_string().to_lowercase();
+    let by = |addr: &str| completed.iter().filter(|(p, ..)| p == addr).count();
+    assert_eq!(
+        (by(&fast_addr), by(&slow_addr)),
+        (2, 1),
+        "the fast source completes its half and the steal, the slow one its trimmed range: {text}"
+    );
+    completed.sort_by_key(|&(_, offset, _)| offset);
+    let mut at = 0;
+    for (_, offset, len) in &completed {
+        assert_eq!(*offset, at, "the completed extents tile the blob: {text}");
+        at = offset.saturating_add(*len);
+    }
+    assert_eq!(at, total, "the completed extents tile the blob: {text}");
     Ok(())
 }
 
@@ -7535,20 +7617,6 @@ async fn a_capability_refused_with_headroom_left_reads_as_revoked() -> anyhow::R
 /// lane build's chain error names the RPC URL, which may carry a key.
 #[test]
 fn extra_stream_fault_level_follows_landed_and_class() {
-    #[derive(Clone, Default)]
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     let range = |landed| crate::source_set::LaneRange {
         offset: 0,
         len: 1024,
@@ -7575,12 +7643,7 @@ fn extra_stream_fault_level_follows_landed_and_class() {
         )));
         super::log_extra_fault(Address::ZERO, [0; 32], range(1), &retry);
     });
-    let text = String::from_utf8_lossy(
-        &log.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
-    .into_owned();
+    let text = log.text();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 4, "{text}");
     let level = |i: usize| lines.get(i).copied().unwrap_or_default();
