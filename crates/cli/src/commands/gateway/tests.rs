@@ -79,6 +79,18 @@ fn not_manifests_evict_the_least_recently_used_past_the_count() {
 }
 
 #[test]
+fn verdict_text_is_clipped_on_a_character_boundary() {
+    assert_eq!(clip("short".to_owned()), "short");
+    let exact = "x".repeat(MAX_VERDICT_TEXT);
+    assert_eq!(clip(exact.clone()), exact);
+    // A multi-byte character straddles the cut.
+    let long = format!("{}é{}", "x".repeat(MAX_VERDICT_TEXT - 4), "y".repeat(100));
+    let clipped = clip(long);
+    assert!(clipped.len() <= MAX_VERDICT_TEXT, "{}", clipped.len());
+    assert!(clipped.ends_with('…'));
+}
+
+#[test]
 fn scope_parses_any_domain_and_host() {
     assert_eq!(Scope::parse("*").unwrap(), Scope::Any);
     assert_eq!(
@@ -809,6 +821,32 @@ async fn a_malformed_entry_hash_makes_the_bundle_not_found() {
         [MAX_MANIFEST_MB],
         "the first request pulls only the manifest, and the rest none"
     );
+}
+
+/// A malformed manifest quotes its publisher's path and hash string, so the
+/// remembered verdict, and the 404 that carries it, keep only the first
+/// [`MAX_VERDICT_TEXT`] bytes.
+#[tokio::test]
+async fn a_malformed_manifest_with_huge_fields_is_remembered_clipped() {
+    let path = "p".repeat(100 << 10);
+    let manifest = serde_json::json!({"version": 1, "entries": [
+        {"path": path, "hash": "z".repeat(100 << 10), "size": 3},
+    ]});
+    let (gateway, caps) =
+        recording_gateway(Reply::Bytes(manifest.to_string().into_bytes()), &[]).await;
+    let blob = alloy::hex::encode(BLOB);
+    for _ in 0..2 {
+        let (status, body) = get(&gateway, &format!("/{blob}/")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.starts_with(MALFORMED_MANIFEST), "{}", &body[..80]);
+        assert!(body.len() <= MAX_VERDICT_TEXT + 1, "{}", body.len());
+    }
+    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB]);
+    let kept = gateway.not_manifests.lock().unwrap();
+    let NotManifest::Plain(text) = &kept.entries[0].1 else {
+        panic!("a malformed manifest is a plain verdict");
+    };
+    assert!(text.len() <= MAX_VERDICT_TEXT);
 }
 
 /// A response's status, headers and body as text.

@@ -39,6 +39,9 @@ struct Log {
     pulled_under: Vec<usize>,
     /// The key each payer signs its lanes with, by payer id.
     signers: HashMap<usize, Address>,
+    /// Whether a store read releases the held pulls and lets them end
+    /// before it answers.
+    end_pulls_in_store_read: bool,
 }
 
 /// The key a [`Fake`] pool payer signs its lanes with, as a `--capability`
@@ -120,6 +123,13 @@ impl Backend for Fake {
         (): &(),
         delegates: &[(PoolId, Address)],
     ) -> anyhow::Result<PoolSnapshot> {
+        if self.log.lock().unwrap().end_pulls_in_store_read {
+            self.release.notify_waiters();
+            // The released pulls end, and drop their payers, on this thread.
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+        }
         Ok(PoolSnapshot {
             delegate_lanes: delegates
                 .iter()
@@ -630,6 +640,36 @@ fn live_ledgers_lift_the_stored_spend_without_double_counting() {
         (delegate.spent_micro_usdc, delegate.bytes_delivered),
         (1240, 12_400)
     );
+}
+
+/// A pull that ends while the store is read, and drops its payer, still
+/// counts: its ledger was read before the store.
+#[tokio::test]
+async fn a_pull_that_ends_during_the_store_read_still_counts() {
+    let (worker, log, _release) = start(2).await;
+    let alice = Arc::new(PrivateKeySigner::random());
+    let (_held, held_done) = send(&worker, HOLD, &alice, 1024);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while log.lock().unwrap().pulled_under.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the held pull starts");
+    log.lock().unwrap().end_pulls_in_store_read = true;
+    let snapshot = worker
+        .pools(vec![(PoolId::ZERO, alice.address())])
+        .await
+        .unwrap();
+    held_done.await.unwrap().unwrap();
+    assert_eq!(
+        (
+            snapshot.delegate_lanes[0].spent_micro_usdc,
+            snapshot.delegate_lanes[0].bytes_delivered
+        ),
+        (500, 4096)
+    );
+    worker.stop().await;
 }
 
 /// The gateway's pool payer lives for the run, so the lanes a `--capability`

@@ -240,6 +240,11 @@ const MANIFEST_CACHE_BYTES: usize = 64 << 20;
 /// The most hashes the gateway remembers as no bundle manifest.
 const MAX_NOT_MANIFESTS: usize = 1024;
 
+/// The most bytes of text a not-manifest verdict keeps. A parse error quotes
+/// the publisher's paths and hash strings, which a manifest under the cap can
+/// make megabytes long.
+const MAX_VERDICT_TEXT: usize = 1024;
+
 /// The duplex buffer between a pull and its HTTP response.
 const PIPE_BYTES: usize = 1 << 20;
 
@@ -1066,9 +1071,9 @@ impl NotManifest {
     /// the same broken JSON.
     fn unparsed(err: anyhow::Error) -> Self {
         if err.is::<MalformedManifest>() {
-            Self::Plain(format!("{:#}", err.context(MALFORMED_MANIFEST)))
+            Self::Plain(clip(format!("{:#}", err.context(MALFORMED_MANIFEST))))
         } else {
-            Self::Unparsed(format!("{err:#}"))
+            Self::Unparsed(clip(format!("{err:#}")))
         }
     }
 
@@ -1094,6 +1099,17 @@ impl NotManifest {
             Self::Plain(text) => anyhow::Error::msg(text.clone()),
         }
     }
+}
+
+/// `text` cut to at most [`MAX_VERDICT_TEXT`] bytes, on a character
+/// boundary, with `…` where it was cut.
+fn clip(mut text: String) -> String {
+    const MARK: &str = "…";
+    if text.len() > MAX_VERDICT_TEXT {
+        text.truncate(text.floor_char_boundary(MAX_VERDICT_TEXT - MARK.len()));
+        text.push_str(MARK);
+    }
+    text
 }
 
 /// Hashes found to be no bundle manifest, with their verdicts, least recently
@@ -2785,7 +2801,7 @@ fn over_manifest_cap(stop: ManifestStop) -> ManifestStop {
         ManifestStop::Pull(PullError::Other(e))
             if e.downcast_ref::<decdn_client::BlobTooLarge>().is_some() =>
         {
-            ManifestStop::Not(NotManifest::OverCap(format!("{e:#}")))
+            ManifestStop::Not(NotManifest::OverCap(clip(format!("{e:#}"))))
         }
         stop => stop,
     }

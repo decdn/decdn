@@ -1143,8 +1143,9 @@ since project inception and will roll into the first tagged release.
   pulled, and paid for up to the manifest cap, again on every request. The
   gateway now keeps up to 1024 such hashes for its run, and a repeat request
   answers the same 404 with no pull; its raw-blob hint names the asker's
-  namespace. A pull that failed upstream, on funding or on the allowance is
-  not kept.
+  namespace. Each kept verdict holds at most 1 KiB of text, since a parse
+  error quotes the publisher's paths and hash strings. A pull that failed
+  upstream, on funding or on the allowance is not kept.
 - **Gateway: a repeat bare-hash pull on a pinned gateway sends no probe
   (#2632).** A `decdn gateway` pinned with `--node-id` probed the node for
   the size of every bare-hash pull, and above about 5 pulls per second the
