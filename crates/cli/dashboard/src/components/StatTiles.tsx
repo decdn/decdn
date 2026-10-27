@@ -1,13 +1,18 @@
 import type { Counters } from "../api";
 import { formatBytes, formatCount } from "../format";
 
-interface Tile {
+export interface Tile {
   label: string;
   value: string;
   hint: string;
 }
 
-function tiles(c: Counters, publicMode: boolean): Tile[] {
+/**
+ * The tiles for `c`. A 402 is a spent allowance on a public gateway, and a
+ * page no capability covers on a loopback one: both modes show it, under
+ * its own name.
+ */
+export function tiles(c: Counters, publicMode: boolean): Tile[] {
   const list: Tile[] = [
     {
       label: "Bytes served",
@@ -45,19 +50,25 @@ function tiles(c: Counters, publicMode: boolean): Tile[] {
       hint: "Answered 502",
     },
   ];
+  list.push(
+    publicMode
+      ? {
+          label: "Allowance spent",
+          value: formatCount(c.requests_allowance_exhausted),
+          hint: "Answered 402: the day's allowance is spent",
+        }
+      : {
+          label: "No capability for the page",
+          value: formatCount(c.requests_allowance_exhausted),
+          hint: "Answered 402: no registered capability covers the page's host",
+        },
+  );
   if (publicMode) {
-    list.push(
-      {
-        label: "Allowance spent",
-        value: formatCount(c.requests_allowance_exhausted),
-        hint: "Answered 402",
-      },
-      {
-        label: "Pointer updates",
-        value: formatCount(c.pointer_updates),
-        hint: "Stored through PUT /_pointer",
-      },
-    );
+    list.push({
+      label: "Pointer updates",
+      value: formatCount(c.pointer_updates),
+      hint: "Stored through PUT /_pointer",
+    });
   }
   return list;
 }
