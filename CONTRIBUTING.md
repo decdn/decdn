@@ -184,6 +184,12 @@ checkout path. It misses the cache in each new worktree, and so does every crate
 Read such a value at run time with `std::env::var_os`; cargo and nextest set `CARGO_MANIFEST_DIR`
 for every test process.
 
+CI runs the heavy Rust jobs (`test`, `doc`, `doctest`, `public-api`, the three `anvil-e2e` jobs)
+behind kache too, against a shared S3-compatible store, through `.github/actions/kache`. The store
+is on when the `KACHE_S3_BUCKET` repository variable is set. Only a push to `main` gets the write
+key; every other run gets a read-only key, and a fork's pull request and a Dependabot run do not use
+the store. The kache step's job summary shows the hit rate.
+
 ### Unit test placement
 
 Every unit-test module lives in its own file. Declare it in the source file and put the body in a
