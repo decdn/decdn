@@ -1,5 +1,6 @@
-// The body of `GET /_status`, field for field as
-// crates/cli/src/commands/gateway/status.rs serializes it.
+// The body of `GET /_status`, field for field as the gateway serializes it.
+// src/fixtures/ holds that body as the Rust tests pin it, and
+// contract.test.ts checks these types against it.
 
 export interface Counters {
   bytes_served: number;
@@ -105,17 +106,27 @@ export type Fetched =
   | { kind: "unauthorized" }
   | { kind: "error"; message: string };
 
-/** Read `/_status`, with `token` when there is one. */
+/** How long a read waits for the gateway: past its own 5 s store read. */
+export const STATUS_TIMEOUT_MS = 8_000;
+
+/**
+ * Read `/_status`, with `token` when there is one. A gateway that does not
+ * answer within `timeoutMs` is an error, so the page never shows a stalled
+ * gateway as live.
+ */
 export async function fetchStatus(
   token: string | null,
   fetchImpl: typeof fetch = fetch,
+  timeoutMs: number = STATUS_TIMEOUT_MS,
 ): Promise<Fetched> {
   const headers: Record<string, string> = {};
   if (token) headers[TOKEN_HEADER] = token;
+  const signal = AbortSignal.timeout(timeoutMs);
   try {
     const response = await fetchImpl("/_status", {
       headers,
       cache: "no-store",
+      signal,
     });
     if (response.status === 401) return { kind: "unauthorized" };
     if (!response.ok) {
@@ -124,8 +135,18 @@ export async function fetchStatus(
         message: `${response.status} ${(await response.text()).trim()}`,
       };
     }
-    return { kind: "ok", status: (await response.json()) as Status };
+    const body: unknown = await response.json();
+    if (typeof body !== "object" || body === null || !("counters" in body)) {
+      return { kind: "error", message: "the gateway's answer is not a status" };
+    }
+    return { kind: "ok", status: body as Status };
   } catch (e) {
+    if (signal.aborted) {
+      return {
+        kind: "error",
+        message: `the gateway did not answer within ${timeoutMs / 1000} s`,
+      };
+    }
     return {
       kind: "error",
       message: e instanceof Error ? e.message : String(e),

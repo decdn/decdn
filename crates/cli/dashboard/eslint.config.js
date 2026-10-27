@@ -13,13 +13,14 @@ export default defineConfig([
   {
     languageOptions: { globals: globals.browser },
     rules: {
-      // The page runs under a policy with no inline style: a `style` prop
-      // would be dropped by the browser. Size things with classes or <meter>.
+      // Every style lives in app.css, so the page needs no inline style under
+      // its policy (a `style` attribute in markup is blocked there). Size
+      // things with classes or <meter>.
       "no-restricted-syntax": [
         "error",
         {
           selector: "JSXAttribute[name.name='style']",
-          message: "The dashboard's CSP blocks inline style; use a class.",
+          message: "Keep every style in app.css; use a class.",
         },
       ],
     },

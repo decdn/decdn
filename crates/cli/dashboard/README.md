@@ -18,9 +18,13 @@ gateway on `127.0.0.1:8484`. Paste the gateway token into the page when it
 asks.
 
 Rules the gateway's content security policy sets: no inline script, no
-inline style (no `style` prop; `eslint` refuses one), and nothing loaded from
-another origin. The build emits exactly three files with fixed names; CI
+inline style attribute, and nothing loaded from another origin. Every style
+lives in the stylesheet: `eslint` refuses a `style` prop. The build emits exactly three files with fixed names; CI
 checks that.
 
-`src/api.ts` mirrors `crates/cli/src/commands/gateway/status.rs` field for
-field: change both together.
+`src/api.ts` mirrors the body of `/_status`. The Rust tests in
+`crates/cli/src/commands/gateway/status/tests.rs` pin that body to
+`src/fixtures/*.json`, and `src/contract.test.ts` checks `api.ts` against the
+same files. After a change to the body, rewrite them with
+`UPDATE_STATUS_FIXTURES=1 cargo nextest run -p decdn-cli gateway::status` and
+make `api.ts` match.

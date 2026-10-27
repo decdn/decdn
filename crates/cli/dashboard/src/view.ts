@@ -20,14 +20,15 @@ export interface PoolRow {
   owner: string;
   deposit: number;
   spent: number;
-  /** What every signer on the pool may still spend. */
+  /** At most what every signer on the pool may still spend: the spend is a
+   * lower bound, missing vouchers that no node redeemed yet. */
   headroom: number;
   used: number;
   severity: Severity;
   lanes: Lane[];
 }
 
-/** The store's pools, with the headroom the whole pool has left. */
+/** The store's pools, with at most the headroom the whole pool has left. */
 export function pools(status: Status): PoolRow[] {
   return (status.pools?.pools.pools ?? []).map((p) => {
     const used = share(p.spent_micro_usdc, p.deposit_micro_usdc);

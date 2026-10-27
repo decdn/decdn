@@ -8,17 +8,19 @@ import { Pointers } from "./components/Pointers";
 import { Pools } from "./components/Pools";
 import { StatTiles } from "./components/StatTiles";
 import { TokenForm } from "./components/TokenForm";
-import { adoptToken, clearToken, saveToken } from "./token";
+import {
+  adoptToken,
+  clearToken,
+  saveToken,
+  session,
+  type Adopted,
+} from "./token";
 import { buckets, capabilities, pools } from "./view";
 
 const POLL_MS = 2_000;
 
-function initialToken(): string | null {
-  try {
-    return adoptToken(window.location, window.history, window.sessionStorage);
-  } catch {
-    return null;
-  }
+function initialToken(): Adopted {
+  return adoptToken(window.location, window.history, session(window));
 }
 
 /** Polls `/_status` every two seconds while the page is visible. */
@@ -55,16 +57,16 @@ function usePolledStatus(token: string | null) {
 }
 
 export function App() {
-  const [token, setToken] = useState<string | null>(initialToken);
+  const [adopted, setAdopted] = useState<Adopted>(initialToken);
+  const token = adopted.token;
   const { last, status, live } = usePolledStatus(token);
 
   const acceptToken = useCallback((given: string) => {
-    saveToken(window.sessionStorage, given);
-    setToken(given);
+    setAdopted({ token: given, kept: saveToken(session(window), given) });
   }, []);
   const forget = useCallback(() => {
-    clearToken(window.sessionStorage);
-    setToken(null);
+    clearToken(session(window));
+    setAdopted({ token: null, kept: true });
   }, []);
 
   const unauthorized = last?.kind === "unauthorized";
@@ -79,9 +81,15 @@ export function App() {
       {unauthorized ? (
         <TokenForm rejected={token !== null} onToken={acceptToken} />
       ) : null}
+      {token && !adopted.kept ? (
+        <p role="status" className="text-sm text-ink-2">
+          ⚠ This browser blocks storage for this page, so it keeps the token
+          until you reload.
+        </p>
+      ) : null}
       {last?.kind === "error" ? (
         <p role="alert" className="text-sm text-critical-ink">
-          ⛔ The gateway did not answer: {last.message}
+          ⛔ Could not read the gateway's status: {last.message}
           {status ? " · showing the last answer" : ""}
         </p>
       ) : null}
