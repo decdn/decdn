@@ -8,6 +8,7 @@ import {
   formatUsdc,
   formatWhen,
   shortHex,
+  shortPath,
   shortUri,
 } from "./format";
 
@@ -83,5 +84,17 @@ describe("shortUri", () => {
       "decdn:afafaf…afaf/docs/index.html",
     );
     expect(shortUri("decdn:short")).toBe("decdn:short");
+  });
+});
+
+describe("shortPath", () => {
+  it("keeps the last two segments of a long path", () => {
+    expect(shortPath("/tmp/a/b/pulls/whisper")).toBe("…/pulls/whisper");
+    expect(shortPath("/home/me/out.bin")).toBe("…/me/out.bin");
+  });
+  it("keeps a short path, a relative one and stdout as they are", () => {
+    expect(shortPath("/out.bin")).toBe("/out.bin");
+    expect(shortPath("models/a")).toBe("models/a");
+    expect(shortPath("-")).toBe("-");
   });
 });

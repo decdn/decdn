@@ -62,6 +62,13 @@ export function formatWhen(unix: number): string {
   return new Date(unix * 1000).toLocaleString();
 }
 
+/** A path as its last two segments: `/home/me/models/whisper` is `…/models/whisper`. */
+export function shortPath(path: string): string {
+  const parts = path.split("/").filter((p) => p !== "");
+  if (parts.length <= 2) return path;
+  return `…/${parts.slice(-2).join("/")}`;
+}
+
 /** A `decdn:` URI with its 64-hex hash as head and tail: `decdn:af1349…3262/a`. */
 export function shortUri(uri: string): string {
   return uri.replace(
