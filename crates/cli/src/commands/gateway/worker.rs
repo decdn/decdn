@@ -29,7 +29,7 @@ use alloy::primitives::Address;
 use decdn_common::admin::{BuyerLaneSnapshot, BuyerPoolsResponse};
 use decdn_common::cli::ClientFetchArgs;
 use decdn_incentive::CapabilityGrant;
-use decdn_incentive::buyer_pool::{BuyerLaneProgress, lane_snapshot};
+use decdn_incentive::buyer_pool::lane_snapshot;
 use decdn_incentive::lane::{LaneKey, PoolId};
 use serde::Serialize;
 use tokio::io::DuplexStream;
@@ -235,23 +235,22 @@ impl Backend for FetchBackend {
             let delegate_lanes = delegates
                 .into_iter()
                 .map(|(pool_id, signer)| {
-                    let lanes = store.delegate_lanes(deployment, pool_id, signer)?;
+                    let lanes = store
+                        .delegate_lanes(deployment, pool_id, signer)?
+                        .into_iter()
+                        .map(|(provider, progress)| {
+                            let lane = LaneKey {
+                                pool_id,
+                                signer,
+                                provider,
+                            };
+                            lane_snapshot(lane, progress)
+                        })
+                        .collect();
                     Ok(DelegateLanes {
                         signer,
                         pool_id,
-                        lanes: lanes
-                            .into_iter()
-                            .map(|(provider, progress): (Address, BuyerLaneProgress)| {
-                                lane_snapshot(
-                                    LaneKey {
-                                        pool_id,
-                                        signer,
-                                        provider,
-                                    },
-                                    progress,
-                                )
-                            })
-                            .collect(),
+                        lanes,
                     })
                 })
                 .collect::<anyhow::Result<_>>()?;

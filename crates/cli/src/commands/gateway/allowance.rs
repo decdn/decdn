@@ -26,6 +26,13 @@ use serde::Serialize;
 /// Seconds in the UTC day the allowance counts over.
 const DAY_SECS: u64 = 86_400;
 
+/// The seconds from `now_secs` until the UTC day turns.
+const fn secs_to_next_day(now_secs: u64) -> u64 {
+    (now_secs / DAY_SECS + 1)
+        .saturating_mul(DAY_SECS)
+        .saturating_sub(now_secs)
+}
+
 /// Bytes delivered in one day.
 struct Used {
     day: u64,
@@ -47,25 +54,31 @@ impl Bucket {
         }
     }
 
+    /// The bytes delivered on the UTC day of `now_secs`.
+    fn spent_today(&self, now_secs: u64) -> u64 {
+        let used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        if used.day == now_secs / DAY_SECS {
+            used.bytes
+        } else {
+            0
+        }
+    }
+
     fn remaining(&self, now_secs: u64) -> Result<u64, u64> {
         if self.per_day == u64::MAX {
             return Ok(u64::MAX);
         }
-        let day = now_secs / DAY_SECS;
-        let used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
-        let spent = if used.day == day { used.bytes } else { 0 };
-        let left = self.per_day.saturating_sub(spent);
+        let left = self.per_day.saturating_sub(self.spent_today(now_secs));
         if left > 0 {
             Ok(left)
         } else {
-            Err((day + 1).saturating_mul(DAY_SECS).saturating_sub(now_secs))
+            Err(secs_to_next_day(now_secs))
         }
     }
 
     /// What the bucket delivered today and has left, for `namespace`'s row.
     fn view(&self, namespace: Option<u64>, now_secs: u64) -> BucketView {
-        let day = now_secs / DAY_SECS;
-        let resets_in_secs = (day + 1).saturating_mul(DAY_SECS).saturating_sub(now_secs);
+        let resets_in_secs = secs_to_next_day(now_secs);
         if self.per_day == u64::MAX {
             return BucketView {
                 namespace,
@@ -75,8 +88,7 @@ impl Bucket {
                 resets_in_secs,
             };
         }
-        let used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
-        let used = if used.day == day { used.bytes } else { 0 };
+        let used = self.spent_today(now_secs);
         BucketView {
             namespace,
             per_day: Some(self.per_day),

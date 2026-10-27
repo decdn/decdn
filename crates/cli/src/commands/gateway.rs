@@ -487,8 +487,8 @@ fn registry_address(
 /// `/_status` and the dashboard answer as on a loopback gateway's host. A
 /// public gateway's `/_status` takes no token here; a loopback gateway's
 /// takes its token, as on its host. A `Host` other than the listener's own
-/// loopback names is refused,
-/// so a page whose name was rebound to this address reads nothing.
+/// loopback names is refused, so a page whose name was rebound to this
+/// address reads nothing.
 async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
     let hosts = Arc::new(listener.local_addr().map(allowed_hosts).unwrap_or_default());
     loop {
@@ -503,29 +503,25 @@ async fn serve_metrics(gateway: Arc<Gateway>, listener: TcpListener) {
                 // The capabilities a loopback gateway lists are the token
                 // holder's: its listener asks for the token, as its host does.
                 let authorized = gateway.public() || gateway.authorized(req.headers());
-                let known = req
-                    .headers()
-                    .get(header::HOST)
-                    .and_then(|h| h.to_str().ok())
-                    .is_some_and(|host| hosts.iter().any(|allowed| allowed == host));
+                let known = hosts
+                    .iter()
+                    .any(|allowed| allowed == host_header(req.headers()));
                 async move {
                     if !known {
                         return Ok(text(StatusCode::FORBIDDEN, "unknown Host\n"));
                     }
                     let response = match (req.method(), req.uri().path()) {
-                        (&Method::GET, "/metrics") => typed(
+                        (&Method::GET, "/metrics") => Some(typed(
                             StatusCode::OK,
                             gateway.metrics.render(),
                             "text/plain; version=0.0.4; charset=utf-8",
-                        ),
-                        (&Method::GET, path) => {
-                            gateway.operator(path, authorized).await.unwrap_or_else(|| {
-                                text(StatusCode::NOT_FOUND, "GET /, /_status, /metrics\n")
-                            })
-                        }
-                        _ => text(StatusCode::NOT_FOUND, "GET /, /_status, /metrics\n"),
+                        )),
+                        (&Method::GET, path) => gateway.operator(path, authorized).await,
+                        _ => None,
                     };
-                    Ok::<_, Infallible>(response)
+                    Ok::<_, Infallible>(response.unwrap_or_else(|| {
+                        text(StatusCode::NOT_FOUND, "GET /, /_status, /metrics\n")
+                    }))
                 }
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
@@ -1217,11 +1213,7 @@ impl Gateway {
         B: HttpBody<Data = Bytes>,
         B::Error: std::error::Error + Send + Sync + 'static,
     {
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+        let host = host_header(req.headers());
         let gateway = Arc::clone(&self);
         let route = self.sites.route(host);
         if route.is_none() && !self.hosts.iter().any(|allowed| allowed == host) {
@@ -1352,11 +1344,7 @@ impl Gateway {
     /// gateway's own host: the dashboard's page, assets and polls, which
     /// the counters it shows leave out.
     fn operator_request<B>(&self, req: &Request<B>) -> bool {
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
+        let host = host_header(req.headers());
         let path = req.uri().path();
         !self.public()
             && req.method() == Method::GET
@@ -2363,15 +2351,8 @@ impl Gateway {
         common.max_blob_mb = max_blob_mb;
         // Armed before the worker has the job: a request dropped while it
         // waits for its first byte still charges the pull's read-ahead.
-        let bucket = paying.bucket();
-        let mut guard = PullGuard::new(
-            Arc::clone(self),
-            bucket,
-            hash,
-            namespace,
-            range,
-            PayerLabel::of(paying),
-        );
+        let mut guard = PullGuard::new(Arc::clone(self), paying, hash, namespace, range);
+        let bucket = guard.bucket;
         // Asked once the pull has its slot: the allowance the requests before
         // it spent while it waited refuses it before any paid work.
         let admit = self.public().then(|| {
@@ -2622,16 +2603,16 @@ struct PullGuard {
 }
 
 impl PullGuard {
-    /// A guard for a pull `gateway` is about to start against `bucket`:
-    /// armed on a public gateway, counted among its pulls in flight, and
-    /// listed in [`Gateway::active`] until it drops.
+    /// A guard for a pull `gateway` is about to start, paid by `paying`
+    /// against its allowance bucket: armed on a public gateway, counted
+    /// among its pulls in flight, and listed in [`Gateway::active`] until it
+    /// drops.
     fn new(
         gateway: Arc<Gateway>,
-        bucket: Option<u64>,
+        paying: &Payment,
         hash: [u8; 32],
         namespace: Option<u64>,
         range: Option<(u64, u64)>,
-        payer: PayerLabel,
     ) -> Self {
         gateway.metrics.pull_started();
         let armed = gateway.public();
@@ -2647,7 +2628,7 @@ impl PullGuard {
                     hash,
                     namespace,
                     range,
-                    payer,
+                    payer: PayerLabel::of(paying),
                     since: Instant::now(),
                     delivered: Arc::clone(&delivered),
                 },
@@ -2655,7 +2636,7 @@ impl PullGuard {
         Self {
             gateway,
             armed,
-            bucket,
+            bucket: paying.bucket(),
             id,
             delivered,
         }
@@ -3001,6 +2982,15 @@ fn rewrites(present: Present, path: &str) -> bool {
     let content_type = site::content_type(name);
     let essence = content_type.split(';').next().unwrap_or_default();
     Rewrite::for_type(essence).is_some()
+}
+
+/// The request's `Host` header, or `""` when it has none the gateway can
+/// read.
+fn host_header(headers: &HeaderMap) -> &str {
+    headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
 }
 
 /// The request's `Range` header, when it has one the gateway can read.

@@ -112,65 +112,76 @@ impl Metrics {
     }
 
     /// The Prometheus text exposition, read through [`Self::snapshot`] so it
-    /// and `/_status` cannot disagree.
+    /// and `/_status` cannot disagree. The destructure names every field of
+    /// [`Counters`], so a counter the exposition leaves out fails the build.
     pub(super) fn render(&self) -> String {
-        let c = self.snapshot();
+        let Counters {
+            bytes_served,
+            requests_ok,
+            requests_not_found,
+            requests_refused,
+            requests_allowance_exhausted,
+            pull_failures_funding,
+            pull_failures_other,
+            pulls_active,
+            pointer_updates,
+        } = self.snapshot();
         let series: [(&str, &str, &str, u64); 9] = [
             (
                 "decdn_gateway_bytes_served_total",
                 "counter",
                 "Content bytes handed to responses.",
-                c.bytes_served,
+                bytes_served,
             ),
             (
                 "decdn_gateway_requests_ok_total",
                 "counter",
                 "Requests answered with success or a redirect.",
-                c.requests_ok,
+                requests_ok,
             ),
             (
                 "decdn_gateway_requests_not_found_total",
                 "counter",
                 "Requests for a path, entry or manifest that does not exist.",
-                c.requests_not_found,
+                requests_not_found,
             ),
             (
                 "decdn_gateway_requests_refused_total",
                 "counter",
                 "Requests refused before any pull: an unknown host, a missing token, a bad URI, a \
                  method, a range past the end.",
-                c.requests_refused,
+                requests_refused,
             ),
             (
                 "decdn_gateway_requests_allowance_exhausted_total",
                 "counter",
                 "Requests answered 402: on a public gateway the day's allowance is spent; on a \
                  loopback gateway no capability covers the page.",
-                c.requests_allowance_exhausted,
+                requests_allowance_exhausted,
             ),
             (
                 "decdn_gateway_pull_failures_funding_total",
                 "counter",
                 "Requests answered 503: the gateway's pool cannot pay.",
-                c.pull_failures_funding,
+                pull_failures_funding,
             ),
             (
                 "decdn_gateway_pull_failures_other_total",
                 "counter",
                 "Requests answered 502: the upstream pull failed.",
-                c.pull_failures_other,
+                pull_failures_other,
             ),
             (
                 "decdn_gateway_pulls_active",
                 "gauge",
                 "Pulls handed to the worker and not yet ended.",
-                c.pulls_active,
+                pulls_active,
             ),
             (
                 "decdn_gateway_pointer_updates_total",
                 "counter",
                 "Namespace pointers stored through PUT /_pointer.",
-                c.pointer_updates,
+                pointer_updates,
             ),
         ];
         let mut out = String::new();

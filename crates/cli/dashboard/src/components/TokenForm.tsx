@@ -8,7 +8,8 @@ export function TokenForm(props: {
   const [value, setValue] = useState("");
   const submit = (e: FormEvent) => {
     e.preventDefault();
-    if (value.trim()) props.onToken(value.trim());
+    const token = value.trim();
+    if (token) props.onToken(token);
   };
   return (
     <form
