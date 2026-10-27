@@ -18,7 +18,12 @@ deCDN builds with a native toolchain and works with any editor. Install the prer
 
 Pre-commit covers Solidity too: `forge fmt` and `solhint` run on every commit that touches `contracts/` (solhint needs no local install — pre-commit builds its own node sandbox), `forge build` and `forge test` run on push. The `slither` and `aderyn` static-analysis hooks are manual-stage and need their own installs — see [Solidity development](#solidity-development).
 
-Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`). The [TypeScript SDK contract run](#typescript-sdk-contract-run) needs Node.js 20.19+ and pnpm.
+Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`). The [TypeScript SDK contract run](#typescript-sdk-contract-run) needs Node.js 20.19+ and pnpm. The `decdn dashboard` page (`crates/cli/dashboard/`) needs Node.js 24 and pnpm 10 (`corepack enable` provides it). Without them `cargo build` still succeeds and the `decdn` binary embeds a page that says how to build the dashboard:
+
+```bash
+pnpm -C crates/cli/dashboard install --frozen-lockfile
+pnpm -C crates/cli/dashboard build   # then cargo build -p decdn-cli embeds it
+```
 
 ### Clone and Build
 
@@ -55,7 +60,9 @@ pre-commit install --hook-type pre-commit --hook-type pre-push   # one-time setu
 pre-commit run --all-files        # run all hooks manually
 ```
 
-Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo deny`, adr-book-list, adr-ref-hygiene, package-embeds, deployment-manifest-mirror, toolchain-pin, workspace-manifests, crate-edges, forge-fmt, solhint, forge-build, forge-test, slither, aderyn.
+Hooks: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, check-added-large-files, markdownlint, `cargo fmt`, `cargo clippy`, `cargo doc`, `cargo deny`, adr-book-list, adr-ref-hygiene, package-embeds, dashboard-lint, deployment-manifest-mirror, toolchain-pin, workspace-manifests, crate-edges, forge-fmt, solhint, forge-build, forge-test, slither, aderyn.
+
+dashboard-lint runs the dashboard's `eslint` and `prettier` when a file under `crates/cli/dashboard/` changes, with pnpm from `PATH`, else through `corepack`. Without the app's `node_modules` it skips and says so, so `pre-commit run --all-files` needs no Node; CI's `dashboard` job lints every change to the app.
 
 The repo-shape hooks (package-embeds, toolchain-pin, workspace-manifests, crate-edges) are stdlib-Python guards under `.github/scripts/`, each with a thin `.sh` wrapper and a pytest suite under `.github/scripts/tests/`; deployment-manifest-mirror is plain bash. They mirror the `packaging` CI job, which is authoritative. The pytest suites run in the `CI tooling tests` job, which is not part of the `CI success` gate, so a failing guard test does not block a merge — the guards themselves do. A new guard follows the same shape: a `check(...)` function the tests can drive on a fixture, a module docstring saying what breaks silently without it, a `repo: local` hook with a scoped `files:` regex, and a named step in `packaging`.
 

@@ -58,9 +58,10 @@ fi
 # ---- preconditions -------------------------------------------------------
 
 # python3 is in here because it reads the crate list out of `cargo metadata`
-# below. Bare coreutils (sed, head, cat) are not: they are assumed the way bash
-# itself is.
-for tool in cargo gh gpg git curl python3; do
+# below, node because decdn-cli's .crate carries the dashboard page's build
+# (pnpm comes from PATH or corepack, through .github/scripts/pnpm.sh). Bare
+# coreutils (sed, head, cat) are not: they are assumed the way bash itself is.
+for tool in cargo gh gpg git curl python3 node; do
   command -v "$tool" >/dev/null || die "$tool not found on PATH"
 done
 
@@ -326,12 +327,25 @@ elif (( ${#NEW_CRATES[@]} > 0 )); then
   echo "    ${#NEW_CRATES[@]} new, ${#CRATES[@]} total (within the burst of $PUBLISH_NEW_BURST)"
 fi
 
+echo "==> Gateway dashboard"
+# dashboard/dist/ is gitignored, so the tag's worktree has none: without this
+# build, decdn-cli's .crate would embed the page that says how to build it.
+.github/scripts/pnpm.sh -C crates/cli/dashboard install --frozen-lockfile ||
+  die "the dashboard's install failed"
+.github/scripts/pnpm.sh -C crates/cli/dashboard build || die "the dashboard's build failed"
+# cargo counts that gitignored build, which decdn-cli packages through
+# `include`, as uncommitted, so both publishes below take --allow-dirty. This
+# proves the tag's worktree is otherwise clean, and that decdn-cli's .crate
+# carries the build and no other untracked file.
+.github/scripts/check-dashboard-packaged.sh ||
+  die "decdn-cli would not package as released: see the errors above"
+
 echo "==> Dry run"
 # On a re-run after a successful publish this is where cargo stops, because the
 # version already exists in the registry — so the message must not claim
 # nothing was uploaded. That claim is exactly the belief that leads someone to
 # retry a publish that already happened.
-cargo publish --workspace --locked --dry-run || die \
+cargo publish --workspace --locked --allow-dirty --dry-run || die \
   "the dry run failed.
 
 If it reports the version already exists, THE PUBLISH ALREADY SUCCEEDED — this
@@ -356,7 +370,7 @@ read -r -p "Type the version ($VERSION) to continue: " confirm < /dev/tty
 echo "==> Publishing"
 # --workspace resolves the dependency order itself and waits for each crate to
 # appear in the index before publishing its dependents.
-cargo publish --workspace --locked || die \
+cargo publish --workspace --locked --allow-dirty || die \
   "publishing failed partway. Crates uploaded before the failure ARE published
 and cannot be re-uploaded. Do NOT re-run this script — it would fail on the
 first already-published crate. Check which succeeded:

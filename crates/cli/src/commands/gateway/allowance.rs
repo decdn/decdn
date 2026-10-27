@@ -21,8 +21,17 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
+use serde::Serialize;
+
 /// Seconds in the UTC day the allowance counts over.
 const DAY_SECS: u64 = 86_400;
+
+/// The seconds from `now_secs` until the UTC day turns.
+const fn secs_to_next_day(now_secs: u64) -> u64 {
+    (now_secs / DAY_SECS + 1)
+        .saturating_mul(DAY_SECS)
+        .saturating_sub(now_secs)
+}
 
 /// Bytes delivered in one day.
 struct Used {
@@ -45,18 +54,47 @@ impl Bucket {
         }
     }
 
+    /// The bytes delivered on the UTC day of `now_secs`.
+    fn spent_today(&self, now_secs: u64) -> u64 {
+        let used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
+        if used.day == now_secs / DAY_SECS {
+            used.bytes
+        } else {
+            0
+        }
+    }
+
     fn remaining(&self, now_secs: u64) -> Result<u64, u64> {
         if self.per_day == u64::MAX {
             return Ok(u64::MAX);
         }
-        let day = now_secs / DAY_SECS;
-        let used = self.used.lock().unwrap_or_else(PoisonError::into_inner);
-        let spent = if used.day == day { used.bytes } else { 0 };
-        let left = self.per_day.saturating_sub(spent);
+        let left = self.per_day.saturating_sub(self.spent_today(now_secs));
         if left > 0 {
             Ok(left)
         } else {
-            Err((day + 1).saturating_mul(DAY_SECS).saturating_sub(now_secs))
+            Err(secs_to_next_day(now_secs))
+        }
+    }
+
+    /// What the bucket delivered today and has left, for `namespace`'s row.
+    fn view(&self, namespace: Option<u64>, now_secs: u64) -> BucketView {
+        let resets_in_secs = secs_to_next_day(now_secs);
+        if self.per_day == u64::MAX {
+            return BucketView {
+                namespace,
+                per_day: None,
+                used: 0,
+                remaining: None,
+                resets_in_secs,
+            };
+        }
+        let used = self.spent_today(now_secs);
+        BucketView {
+            namespace,
+            per_day: Some(self.per_day),
+            used,
+            remaining: Some(self.per_day.saturating_sub(used)),
+            resets_in_secs,
         }
     }
 
@@ -72,6 +110,21 @@ impl Bucket {
         used.bytes = used.bytes.saturating_add(bytes);
         used.bytes < self.per_day
     }
+}
+
+/// One bucket as `/_status` reports it.
+#[derive(Debug, Serialize)]
+pub(super) struct BucketView {
+    /// The namespace the bucket is for; `None` for the shared one.
+    pub(super) namespace: Option<u64>,
+    /// The bytes per UTC day; `None` when there is no bound.
+    pub(super) per_day: Option<u64>,
+    /// The bytes delivered today. A bucket with no bound counts nothing.
+    pub(super) used: u64,
+    /// The bytes it may still deliver today; `None` when there is no bound.
+    pub(super) remaining: Option<u64>,
+    /// The seconds until the UTC day turns and the count starts again.
+    pub(super) resets_in_secs: u64,
 }
 
 /// The bytes the gateway may deliver per day: one bucket shared by every
@@ -112,6 +165,20 @@ impl Allowance {
     /// seconds until the UTC day turns and it may again.
     pub(super) fn remaining(&self, namespace: Option<u64>, now_secs: u64) -> Result<u64, u64> {
         self.bucket(namespace).remaining(now_secs)
+    }
+
+    /// Every bucket at `now_secs`: the shared one first, then each
+    /// namespace's in ascending order.
+    pub(super) fn view(&self, now_secs: u64) -> Vec<BucketView> {
+        let mut namespaces: Vec<_> = self.namespaces.iter().collect();
+        namespaces.sort_by_key(|(ns, _)| **ns);
+        std::iter::once(self.shared.view(None, now_secs))
+            .chain(
+                namespaces
+                    .into_iter()
+                    .map(|(ns, bucket)| bucket.view(Some(*ns), now_secs)),
+            )
+            .collect()
     }
 
     /// Record `bytes` delivered now for a request of `namespace`'s pointer

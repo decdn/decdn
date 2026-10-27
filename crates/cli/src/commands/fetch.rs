@@ -55,8 +55,8 @@ use decdn_client::targets::{
 use decdn_client::{
     Connections, CredentialSlot, DownloadTarget, Downloader, Holder, LaneLedgers,
     NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PeerStore, PoolContext, PoolReplaced,
-    ProgressClock, PullConfig, PullDeadlines, RecoveryGate, StopPolicy, Streamer, UpstreamRefused,
-    UpstreamVoucherRejected,
+    ProgressCallback, ProgressClock, PullConfig, PullDeadlines, RecoveryGate, StopPolicy, Streamer,
+    UpstreamRefused, UpstreamVoucherRejected,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -71,6 +71,7 @@ use iroh::{Endpoint, PublicKey, RelayUrl};
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::provider;
 
+use super::activity::ActivityRecorder;
 use super::buyer_store::{DataDirSource, chain_adoption_for_buy, open_client_store_for_buy};
 use super::fetch_timings::{FetchTimings, Mark};
 use super::interrupt::{Interrupt, Interrupted, name_held_escrows};
@@ -538,6 +539,7 @@ pub(crate) async fn fetch(
     uri: &DecdnUri,
     config_path: Option<&Path>,
     evidence: &Arc<ReceiptEvidence>,
+    activity: Option<&Arc<ActivityRecorder>>,
 ) -> anyhow::Result<()> {
     let timings = FetchTimings::start();
     let (host, grant) = FetchHost::open(&args.common, config_path, false).await?;
@@ -549,7 +551,7 @@ pub(crate) async fn fetch(
     // Ctrl-C or a fault dropped before its record committed is still named.
     let mut interrupt = Interrupt::watch(host.escrows.clone());
     let result = tokio::select! {
-        result = fetch_target(&host, &payer, args, output, uri, &timings) => result,
+        result = fetch_target(&host, &payer, (args, activity), output, uri, &timings) => result,
         () = interrupt.wait() => Err(Interrupted.into()),
     };
     // On every exit, a Ctrl-C's included: the gate lists a replacement whose
@@ -573,12 +575,18 @@ pub(crate) async fn fetch(
 async fn fetch_target(
     host: &FetchHost,
     payer: &Payer,
-    args: &cli::GetArgs,
+    (args, activity): (&cli::GetArgs, Option<&Arc<ActivityRecorder>>),
     output: &Path,
     uri: &DecdnUri,
     timings: &FetchTimings,
 ) -> anyhow::Result<()> {
+    let progress = activity.map(|activity| {
+        let activity = Arc::clone(activity);
+        Arc::new(move |received, expected| activity.progress(received, expected))
+            as Arc<ProgressCallback>
+    });
     let blob = |hash| BlobFetch {
+        progress: progress.clone(),
         estimate: true,
         read_ahead: None,
         size_cap: None,
@@ -619,6 +627,7 @@ async fn fetch_entry_hash(
     let mut common = args.common.clone();
     common.max_blob_mb = manifest_cap_mb(common.max_blob_mb);
     let manifest = BlobFetch {
+        progress: None,
         estimate: false,
         read_ahead: None,
         size_cap: None,
@@ -734,6 +743,9 @@ pub(crate) struct BlobFetch {
     /// paid byte (#2600): set for the blob a user asked for, and not for a
     /// manifest or a gateway response.
     pub(crate) estimate: bool,
+    /// Where the fetch also reports its verified content bytes, beside its
+    /// own bar: set for the blob a `decdn get` run records for the dashboard.
+    pub(crate) progress: Option<Arc<ProgressCallback>>,
 }
 
 /// A delegate credential held in memory: the key that signs vouchers and the
@@ -855,6 +867,16 @@ impl FetchHost {
             token: tokio::sync::OnceCell::new(),
         };
         Ok((host, grant))
+    }
+
+    /// The buyer-pool store every fetch on this host records into.
+    pub(crate) fn store(&self) -> Arc<dyn BuyerPoolStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// The chain and `PaymentPool` this host pays on.
+    pub(crate) const fn deployment(&self) -> decdn_incentive::Deployment {
+        self.chain.config.deployment()
     }
 
     /// Wait for every queued peer-record and watermark write to land, then
@@ -1256,6 +1278,7 @@ pub(crate) async fn fetch_on(
                     total_bytes,
                     stop.clone(),
                     (common.max_sources, args.read_ahead, args.range, timings),
+                    args.progress.as_deref(),
                     &mut *sink,
                 )
                 .await
@@ -1272,7 +1295,7 @@ pub(crate) async fn fetch_on(
                         ranges: None,
                     },
                     &stop,
-                    (common.max_sources, timings),
+                    (common.max_sources, timings, args.progress.as_deref()),
                 )
                 .await
             };
@@ -1532,6 +1555,7 @@ async fn stream_out<P>(
         Option<(u64, u64)>,
         &FetchTimings,
     ),
+    also: Option<&ProgressCallback>,
     sink: &mut Sink,
 ) -> anyhow::Result<u64>
 where
@@ -1595,6 +1619,9 @@ where
         if let Some((_, cb, _)) = &bar {
             cb(received, expected);
         }
+        if let Some(also) = also {
+            also(received, expected);
+        }
     };
 
     // The drive runs beside the copy, not inside its reads: a blocked stdout
@@ -1651,7 +1678,7 @@ async fn download_to_file<P>(
     health: Arc<PeerHealth>,
     target: DownloadTarget<'_>,
     stop: &StopPolicy,
-    (max_sources, timings): (usize, &FetchTimings),
+    (max_sources, timings, also): (usize, &FetchTimings, Option<&ProgressCallback>),
 ) -> anyhow::Result<u64>
 where
     P: alloy::providers::Provider + Clone,
@@ -1662,6 +1689,9 @@ where
             timings.mark(Mark::FirstByte);
         }
         on_bar(received, expected);
+        if let Some(also) = also {
+            also(received, expected);
+        }
     };
     let mut downloader = Downloader::new(sources, sources.funder())
         .holders(holders)

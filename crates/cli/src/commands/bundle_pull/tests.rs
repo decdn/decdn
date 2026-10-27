@@ -556,7 +556,7 @@ async fn dry_run_still_rejects_a_dangling_provider_address() {
         &Destination::of(&args, &uri),
         &uri,
         Some(&offline_config()),
-        &Arc::new(ReceiptEvidence::new()),
+        (&Arc::new(ReceiptEvidence::new()), None),
     )
     .await
     .expect_err("a dangling --provider-address must be rejected even for --dry-run");
@@ -599,7 +599,7 @@ async fn dry_run_reads_a_cached_manifest() {
             &Destination::of(&args, &uri),
             &uri,
             Some(&offline_config()),
-            &Arc::new(ReceiptEvidence::new()),
+            (&Arc::new(ReceiptEvidence::new()), None),
         )
         .await
         .unwrap_or_else(|e| panic!("overwrite={overwrite}: {e:#}"));
@@ -610,7 +610,7 @@ async fn dry_run_reads_a_cached_manifest() {
             &Destination::of(&args, &uri),
             &uri,
             Some(&offline_config()),
-            &Arc::new(ReceiptEvidence::new()),
+            (&Arc::new(ReceiptEvidence::new()), None),
         )
         .await
         .expect_err("the cached manifest has no such entry");
@@ -633,7 +633,7 @@ async fn dry_run_has_no_manifest_for_an_uncached_hash() {
         &Destination::of(&args, &uri),
         &uri,
         Some(&offline_config()),
-        &Arc::new(ReceiptEvidence::new()),
+        (&Arc::new(ReceiptEvidence::new()), None),
     )
     .await
     .unwrap();
@@ -656,7 +656,7 @@ async fn dry_run_fails_on_a_cached_manifest_that_does_not_parse() {
         &Destination::of(&args, &uri),
         &uri,
         Some(&offline_config()),
-        &Arc::new(ReceiptEvidence::new()),
+        (&Arc::new(ReceiptEvidence::new()), None),
     )
     .await
     .expect_err("a cached non-v1 manifest fails the dry run");
@@ -687,7 +687,7 @@ async fn dry_run_fails_on_a_cached_manifest_with_a_malformed_hash() {
             &Destination::of(&args, &parsed),
             &parsed,
             Some(&offline_config()),
-            &Arc::new(ReceiptEvidence::new()),
+            (&Arc::new(ReceiptEvidence::new()), None),
         )
         .await
         .expect_err("a malformed cached manifest fails the dry run");
@@ -752,7 +752,7 @@ async fn dry_run_fails_naming_an_unreadable_cached_manifest() {
         &Destination::of(&args, &uri),
         &uri,
         Some(&offline_config()),
-        &Arc::new(ReceiptEvidence::new()),
+        (&Arc::new(ReceiptEvidence::new()), None),
     )
     .await
     .expect_err("an unreadable cached manifest fails the dry run");
@@ -781,7 +781,7 @@ async fn dry_run_fails_naming_a_cached_manifest_that_fails_its_hash_check() {
         &Destination::of(&args, &uri),
         &uri,
         Some(&offline_config()),
-        &Arc::new(ReceiptEvidence::new()),
+        (&Arc::new(ReceiptEvidence::new()), None),
     )
     .await
     .expect_err("a tampered cached manifest fails the dry run");
@@ -1167,7 +1167,7 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
         &dest,
         &parsed,
         Some(&offline_config()),
-        &Arc::new(ReceiptEvidence::new()),
+        (&Arc::new(ReceiptEvidence::new()), None),
     )
     .await
     .unwrap();
@@ -1178,7 +1178,7 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
         &dest,
         &parsed,
         Some(&offline_config()),
-        &Arc::new(ReceiptEvidence::new()),
+        (&Arc::new(ReceiptEvidence::new()), None),
     )
     .await
     .expect_err("an unrecorded c.bin must be refused");
@@ -1192,7 +1192,7 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
         &dest,
         &parsed,
         Some(&offline_config()),
-        &Arc::new(ReceiptEvidence::new()),
+        (&Arc::new(ReceiptEvidence::new()), None),
     )
     .await
     .unwrap();
@@ -1202,7 +1202,7 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
         &dest,
         &parsed,
         Some(&offline_config()),
-        &Arc::new(ReceiptEvidence::new()),
+        (&Arc::new(ReceiptEvidence::new()), None),
     )
     .await
     .expect_err("a c.bin another entry wrote must be refused");
@@ -1218,7 +1218,7 @@ async fn a_default_entry_dry_run_lands_at_its_name_and_refuses_an_unrecorded_fil
         &Destination::of(&args, &parsed),
         &parsed,
         Some(&offline_config()),
-        &Arc::new(ReceiptEvidence::new()),
+        (&Arc::new(ReceiptEvidence::new()), None),
     )
     .await
     .unwrap();
@@ -1298,4 +1298,35 @@ fn offline_config() -> std::path::PathBuf {
         dir
     });
     dir.path().join("config.toml")
+}
+
+/// A bundle run reports to its dashboard record through the observer: the
+/// planned download, each blob's position, and the counts at its end.
+#[tokio::test]
+async fn the_observer_feeds_the_runs_record() {
+    use std::str::FromStr as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let text = format!("decdn:{}/", "ab".repeat(32));
+    let uri = DecdnUri::from_str(&text).unwrap();
+    let evidence = Arc::new(ReceiptEvidence::new());
+    let activity =
+        ActivityRecorder::start_in(dir.path(), &uri, &text, Path::new("."), &evidence).unwrap();
+    let observer = PullObserver::new(true, "pull".to_owned(), Some(Arc::clone(&activity)));
+    observer.run_started(Some(100), Some(120));
+    observer
+        .file_started(&["a.bin".to_owned()], 60, 0)
+        .delivered(40, 60);
+    let mut report = BundleReport::default();
+    report.fetched = 1;
+    observer.record_counts(&report, 2);
+    activity.finish(&Ok(()), None).await;
+
+    let (records, _) = crate::commands::activity::read_records(dir.path()).unwrap();
+    let record = records.first().unwrap();
+    assert_eq!(record.expected_bytes, Some(100));
+    assert_eq!(record.received_bytes, 40);
+    assert_eq!(record.files_started, 1);
+    let counts = record.bundle.unwrap();
+    assert_eq!((counts.fetched, counts.excluded), (1, 2));
 }

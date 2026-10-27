@@ -82,6 +82,17 @@ repos:
         files: '^crates/.*\.(rs|toml|sh|ps1|html|json)$'
         pass_filenames: false
 
+      # The `decdn dashboard` page's eslint and prettier, when its files change.
+      # Without the app's node_modules it skips with a notice, so a
+      # contributor who never touches the app needs no Node; CI's `dashboard`
+      # job lints every change to it.
+      - id: dashboard-lint
+        name: dashboard lint
+        entry: .github/scripts/dashboard-lint.sh
+        language: system
+        files: '^crates/cli/dashboard/'
+        pass_filenames: false
+
       # The CLI embeds a deployment manifest, but `include_str!` cannot escape
       # the package, so crates/cli/deployments/ mirrors contracts/deployments/.
       # Drift means `decdn config init` bakes stale contract addresses.

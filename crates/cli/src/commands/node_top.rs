@@ -53,7 +53,7 @@ pub(crate) fn parse_openmetrics(text: &str) -> HashMap<String, f64> {
 /// Selected fields of a single `/metrics` scrape, normalised to
 /// integer types so the renderer can format them without re-checking
 /// for fractional values from the `OpenMetrics` float wire type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct Snapshot {
     pub uptime_seconds: u64,
     pub active_connections: u64,
@@ -108,7 +108,7 @@ impl Snapshot {
 /// implicit in the type name; the field-level comments make it
 /// re-readable at use sites where `SnapshotDelta` isn't visible
 /// (e.g. `format_rate_bytes(d.bytes)`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct SnapshotDelta {
     /// Cache hits per second.
     pub hits: f64,
@@ -550,7 +550,7 @@ pub async fn run(args: &cli::TopArgs, global_config: Option<&Path>) -> anyhow::R
 /// query value. The resolver in this crate hands us a clean
 /// `http://127.0.0.1:{port}` so the public-facing exposure here is
 /// the `--metrics-url` / `DECDN_METRICS_URL` path.
-fn append_metrics_path(base: &str) -> String {
+pub(crate) fn append_metrics_path(base: &str) -> String {
     // Split off any query string or fragment first so we can
     // manipulate the path independently. Without this split, an
     // operator URL like `http://h:9090?token=foo` would have
@@ -596,7 +596,7 @@ fn is_permanent_scrape_error(err: &anyhow::Error) -> bool {
     })
 }
 
-async fn fetch_metrics(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
+pub(crate) async fn fetch_metrics(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
     let resp = client
         .get(url)
         .send()

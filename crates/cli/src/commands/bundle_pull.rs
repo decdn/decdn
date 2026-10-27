@@ -37,6 +37,7 @@ use iroh::{Endpoint, RelayUrl};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+use super::activity::{ActivityRecorder, BundleCounts};
 use super::buyer_store::open_client_store_for_buy;
 use super::fetch;
 use super::get::Destination;
@@ -668,7 +669,7 @@ pub(crate) async fn bundle_pull(
     dest: &Destination,
     uri: &DecdnUri,
     config_path: Option<&Path>,
-    evidence: &Arc<ReceiptEvidence>,
+    (evidence, activity): (&Arc<ReceiptEvidence>, Option<&Arc<ActivityRecorder>>),
 ) -> anyhow::Result<()> {
     // `-o -` is stdout, which a pull cannot write a tree to; the blob fetch
     // takes every `-o -` run. Fail rather than create a directory named `-`.
@@ -751,7 +752,7 @@ pub(crate) async fn bundle_pull(
         &endpoint,
         &relays,
         (&filter, filters_given),
-        evidence,
+        (evidence, activity),
     )
     .await;
     endpoint.close().await;
@@ -761,7 +762,8 @@ pub(crate) async fn bundle_pull(
 /// The part of [`bundle_pull`] that runs over its open `endpoint`: resolve the
 /// providers and the buyer signer, build the puller, obtain the manifest, and
 /// pull it. `filter` is the compiled entry selection and whether `--include` or
-/// `--exclude` was given. Every lane keeps its receipt evidence in `evidence`.
+/// `--exclude` was given. Every lane keeps its receipt evidence in `evidence`,
+/// and the run reports its progress to `activity` too.
 #[allow(clippy::too_many_arguments)]
 async fn pull_over(
     args: &GetArgs,
@@ -773,9 +775,13 @@ async fn pull_over(
     endpoint: &Endpoint,
     relays: &[RelayUrl],
     (filter, filters_given): (&EntryFilter, bool),
-    evidence: &Arc<ReceiptEvidence>,
+    (evidence, activity): (&Arc<ReceiptEvidence>, Option<&Arc<ActivityRecorder>>),
 ) -> anyhow::Result<()> {
-    let observer = Arc::new(PullObserver::new(args.json, run_label(out)));
+    let observer = Arc::new(PullObserver::new(
+        args.json,
+        run_label(out),
+        activity.cloned(),
+    ));
     // Outlives the puller's passes, so an `openPool` or `topUp` that a Ctrl-C
     // or a fault dropped before its record committed is still named, and so is
     // one that escrowed untracked in an entry the pull dropped.
@@ -906,7 +912,7 @@ pub(crate) async fn fetch_manifest_paid(
     let escrows = UnconfirmedEscrows::default();
     // No bars: a manifest fetch reports no run totals. Warnings and pool
     // notes still print.
-    let observer = Arc::new(PullObserver::new(true, run_label(out)));
+    let observer = Arc::new(PullObserver::new(true, run_label(out), None));
     let puller = open_puller(
         common,
         (chain, grant.as_ref(), &store),
@@ -991,6 +997,7 @@ async fn pull_manifest(
         }
     };
     observer.finish();
+    observer.record_counts(&outcome.report, excluded);
     warn_leftover_partials(out, &manifest.entries, uri.hash);
     let reported = report(&outcome.report, excluded, out, args.json);
     // A fault that ended the whole pull is its result, so `main` maps it to
@@ -1065,21 +1072,33 @@ async fn obtain_manifest(
 }
 
 /// The CLI's [`BundleObserver`]: the multi-bar progress renderer, built once
-/// the run's totals are known; the `-v` line for each landed entry; and a
-/// `warning:` or `note:` line on stderr for what does not fail the pull.
+/// the run's totals are known; the `-v` line for each landed entry; a
+/// `warning:` or `note:` line on stderr for what does not fail the pull; and
+/// the run's dashboard record, when it keeps one.
 struct PullObserver {
     json: bool,
     label: String,
     progress: OnceLock<PullProgress>,
+    activity: Option<Arc<ActivityRecorder>>,
 }
 
 impl PullObserver {
-    /// An observer that renders bars unless `json`, under the header `label`.
-    const fn new(json: bool, label: String) -> Self {
+    /// An observer that renders bars unless `json`, under the header `label`,
+    /// and reports to `activity`.
+    const fn new(json: bool, label: String, activity: Option<Arc<ActivityRecorder>>) -> Self {
         Self {
             json,
             label,
             progress: OnceLock::new(),
+            activity,
+        }
+    }
+
+    /// Record the finished run's counts, beside the `excluded` entries it did
+    /// not pull.
+    fn record_counts(&self, report: &BundleReport, excluded: u64) {
+        if let Some(activity) = &self.activity {
+            activity.bundle_counts(BundleCounts::of(report, excluded));
         }
     }
 
@@ -1103,6 +1122,9 @@ impl BundleObserver for PullObserver {
             content_total,
             &self.label,
         ));
+        if let Some(activity) = &self.activity {
+            activity.run_started(download_total);
+        }
     }
 
     fn file_started(
@@ -1116,10 +1138,16 @@ impl BundleObserver for PullObserver {
             Some(progress) => progress.file_bar(&label, download_total, reconstruct_total),
             None => PullProgress::disabled().file_bar(&label, download_total, reconstruct_total),
         };
-        Arc::new(bar)
+        match &self.activity {
+            Some(activity) => activity.file_started(paths, Arc::new(bar)),
+            None => Arc::new(bar),
+        }
     }
 
     fn entry_landed(&self, landed: &EntryLanded) {
+        if let Some(activity) = &self.activity {
+            activity.file_landed();
+        }
         let bytes = EntryBytes {
             paid: landed.paid,
             spliced: landed.spliced,

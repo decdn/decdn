@@ -1,0 +1,5 @@
+dist/
+node_modules/
+pnpm-lock.yaml
+# Written by the Rust status tests (UPDATE_STATUS_FIXTURES=1), byte for byte.
+src/fixtures/

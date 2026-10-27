@@ -1,0 +1,67 @@
+{
+  "mode": "loopback",
+  "version": "0.0.0-fixture",
+  "started_unix": 1793000000,
+  "uptime_secs": 93784,
+  "listen": "127.0.0.1:8484",
+  "chain_id": 421614,
+  "payment_pool": "0x3535353535353535353535353535353535353535",
+  "counters": {
+    "bytes_served": 48318382080,
+    "requests_ok": 128400,
+    "requests_not_found": 312,
+    "requests_refused": 41,
+    "requests_allowance_exhausted": 7,
+    "pull_failures_funding": 1,
+    "pull_failures_other": 3,
+    "pulls_active": 2,
+    "pointer_updates": 5
+  },
+  "active_pulls": [
+    {
+      "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "namespace": null,
+      "range": null,
+      "payer": {
+        "kind": "capability",
+        "signer": "0xCdCDCdCdcdcdcdCdcDcDCdcDcDCdCdcdCdcDCDcD"
+      },
+      "since_secs": 2,
+      "delivered_bytes": 65536
+    }
+  ],
+  "capabilities": [
+    {
+      "cap": 4000000,
+      "expiry": 1900000000,
+      "origin": "https://decdn.org",
+      "pool": "0x0202020202020202020202020202020202020202020202020202020202020202",
+      "scope": "decdn.org",
+      "signer": "0xCdCDCdCdcdcdcdCdcDcDCdcDcDCdCdcdCdcDCDcD",
+      "spent": false
+    }
+  ],
+  "allowance": null,
+  "pointers": null,
+  "pools": {
+    "pools": {
+      "pools": [],
+      "skipped": []
+    },
+    "delegate_lanes": [
+      {
+        "signer": "0xCdCDCdCdcdcdcdCdcDcDCdcDcDCdCdcdCdcDCDcD",
+        "pool_id": "0x0202020202020202020202020202020202020202020202020202020202020202",
+        "lanes": [
+          {
+            "voucher_signer": "0xCdCDCdCdcdcdcdCdcDcDCdcDcDCdCdcdCdcDCDcD",
+            "provider": "0xb2b2b2b2b2B2b2B2B2b2b2B2B2b2B2B2b2b2b2b2",
+            "last_amount_micro_usdc": 1250000,
+            "last_bytes_delivered": 18000000000
+          }
+        ]
+      }
+    ]
+  },
+  "pool_error": null
+}

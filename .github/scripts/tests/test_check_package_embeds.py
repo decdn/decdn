@@ -27,11 +27,14 @@ _spec.loader.exec_module(cpe)
 # --- helpers ---------------------------------------------------------------
 
 
-def build_crate(tmp_path: Path, source: str, *, outside: bool = True) -> tuple[Path, Path, set[Path]]:
+def build_crate(
+    tmp_path: Path, source: str, *, outside: bool = True, build_script: bool = False
+) -> tuple[Path, Path, set[Path]]:
     """A crate at <tmp>/crates/demo with `source` as src/lib.rs.
 
     Also drops a fixture at the workspace root (outside the crate) and one
     inside it, so a test can embed either. Everything is reported as tracked.
+    With `build_script`, the crate also has a tracked `build.rs`.
     """
     crate_root = tmp_path / "crates" / "demo"
     (crate_root / "src").mkdir(parents=True)
@@ -46,6 +49,9 @@ def build_crate(tmp_path: Path, source: str, *, outside: bool = True) -> tuple[P
     }
     if not outside:
         tracked.discard((tmp_path / "OUTSIDE.md").resolve())
+    if build_script:
+        (crate_root / "build.rs").write_text("fn main() {}\n")
+        tracked.add((crate_root / "build.rs").resolve())
     return crate_root, src, tracked
 
 
@@ -94,6 +100,28 @@ def test_embed_inside_the_crate_but_untracked_is_an_error(tmp_path):
     errors, _ = cpe.scan_source(src, crate_root, tmp_path, tracked)
     assert len(errors) == 1
     assert "not tracked by git" in errors[0]
+
+
+OUT_DIR_EMBED = 'const X: &str = include_str!(concat!(env!("OUT_DIR"), "/dashboard/index.html"));\n'
+
+
+def test_out_dir_embed_from_a_crate_with_a_build_script_is_accepted(tmp_path):
+    crate_root, src, tracked = build_crate(tmp_path, OUT_DIR_EMBED, build_script=True)
+    assert cpe.scan_source(src, crate_root, tmp_path, tracked) == ([], [])
+
+
+def test_out_dir_embed_without_a_build_script_is_an_error(tmp_path):
+    errors, warnings = scan(tmp_path, OUT_DIR_EMBED)
+    assert len(errors) == 1, errors
+    assert "embeds a file under OUT_DIR but the crate has no tracked build.rs" in errors[0]
+    assert warnings == []
+
+
+def test_out_dir_embed_with_an_untracked_build_script_is_an_error(tmp_path):
+    crate_root, src, tracked = build_crate(tmp_path, OUT_DIR_EMBED, build_script=True)
+    tracked.discard((crate_root / "build.rs").resolve())
+    errors, _ = cpe.scan_source(src, crate_root, tmp_path, tracked)
+    assert len(errors) == 1, errors
 
 
 def test_unresolvable_argument_is_an_error_not_a_pass(tmp_path):
@@ -207,3 +235,40 @@ def test_workspace_members_are_discovered_from_the_manifest():
     assert {"cli", "node", "protocol", "e2e"} <= names
     for m in members:
         assert (m / "Cargo.toml").is_file()
+
+
+# --- [package].include -----------------------------------------------------
+# A crate with an `include` list ships only what it matches, tracked or not,
+# so an embed of a tracked file the list leaves out is as absent from the
+# .crate as one outside the package.
+
+INSIDE_EMBED = 'const X: &str = include_str!("../INSIDE.md");\n'
+
+
+def test_an_embed_the_include_list_leaves_out_is_an_error(tmp_path):
+    crate_root, src, tracked = build_crate(tmp_path, INSIDE_EMBED)
+    errors, _ = cpe.scan_source(src, crate_root, tmp_path, tracked, include=["/src/**"])
+    assert len(errors) == 1, errors
+    assert "include" in errors[0] and "INSIDE.md" in errors[0]
+
+
+def test_an_embed_the_include_list_names_is_accepted(tmp_path):
+    crate_root, src, tracked = build_crate(tmp_path, INSIDE_EMBED)
+    for include in (["/src/**", "/INSIDE.md"], ["/src/**", "*.md"], ["/**"]):
+        assert cpe.scan_source(src, crate_root, tmp_path, tracked, include=include) == ([], []), include
+
+
+def test_an_out_dir_embed_needs_the_build_script_included(tmp_path):
+    crate_root, src, tracked = build_crate(tmp_path, OUT_DIR_EMBED, build_script=True)
+    errors, _ = cpe.scan_source(src, crate_root, tmp_path, tracked, include=["/src/**"])
+    assert len(errors) == 1, errors
+    ok = cpe.scan_source(src, crate_root, tmp_path, tracked, include=["/src/**", "/build.rs"])
+    assert ok == ([], [])
+
+
+def test_include_patterns_match_as_cargo_reads_them():
+    assert cpe.included("deployments/421614.json", ["/deployments/**"])
+    assert not cpe.included("src/deployments/421614.json", ["/deployments/**"])
+    # Unanchored, a name matches at any depth, as in .gitignore.
+    assert cpe.included("dashboard/node_modules/x/README.md", ["README.md"])
+    assert not cpe.included("dashboard/node_modules/x/README.md", ["/README.md"])

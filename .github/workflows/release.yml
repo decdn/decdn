@@ -208,6 +208,17 @@ jobs:
           CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets
           cargo nextest run --workspace --no-tests=pass
 
+      # decdn-cli's .crate carries the dashboard's gitignored build; the
+      # verify build below then embeds it rather than the fallback page.
+      - uses: ./.github/actions/dashboard-build
+
+      # cargo counts that build as uncommitted, so the dry run takes
+      # --allow-dirty. This proves the checkout is otherwise clean (the tests
+      # above included) and that decdn-cli's .crate carries the build and no
+      # other untracked file.
+      - name: decdn-cli packages the dashboard build, and nothing else untracked
+        run: .github/scripts/check-dashboard-packaged.sh
+
       # publish-crates.sh uploads these to crates.io after the release is
       # signed, and a crates.io version can never be replaced. Packaging must
       # therefore be proven BEFORE the draft exists, not discovered mid-publish.
@@ -217,7 +228,7 @@ jobs:
       # outside the package (an `include_str!` reaching the workspace root
       # builds fine in-tree and fails for every `cargo install` user).
       - name: Verify every crate packages and builds standalone
-        run: cargo publish --workspace --dry-run --locked
+        run: cargo publish --workspace --dry-run --locked --allow-dirty
 
       # Baseline = the highest v* tag that does not point at HEAD, rather than
       # the crates.io registry baseline. Publishing is a manual post-signing
@@ -410,6 +421,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Before the build, which embeds it: `cross` mounts this checkout, so the
+      # container build reads the same dist/.
+      - uses: ./.github/actions/dashboard-build
+
       - name: Install cross
         if: matrix.cross
         uses: taiki-e/install-action@v2.87.29
@@ -444,6 +459,23 @@ jobs:
           done
         env:
           BUILDS: ${{ matrix.builds }}
+          TARGET: ${{ matrix.target }}
+
+      # A `decdn` built without the dashboard embeds a page that says how to
+      # build it, marked by the HTML comment `decdn-dashboard-fallback`
+      # (crates/cli/build.rs). A release never ships that.
+      - name: The CLI embeds the dashboard
+        if: contains(matrix.builds, 'decdn-cli:decdn')
+        shell: bash
+        run: |
+          exe="target/$TARGET/release/decdn"
+          [ -f "$exe" ] || exe="$exe.exe"
+          [ -f "$exe" ] || { echo "::error::$exe was not built"; exit 1; }
+          if grep -aq 'decdn-dashboard-fallback' "$exe"; then
+            echo "::error::$exe embeds the dashboard's fallback page, not its build"
+            exit 1
+          fi
+        env:
           TARGET: ${{ matrix.target }}
 
       # Enforce the glibc 2.31 floor (Debian 11, Ubuntu 20.04, RHEL 8) that

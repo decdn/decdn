@@ -653,6 +653,15 @@ pub struct BuyerPoolSnapshot {
     /// `U256`-derived field on [`BuyerLaneSnapshot`], including
     /// `last_bytes_delivered`.
     pub deposit_micro_usdc: u64,
+    /// What the pool has spent as far as the store knows, in micro-USDC: every
+    /// tracked lane's cumulative amount plus the redeemed spend that no
+    /// tracked lane accounts for (another signer sharing the pool).
+    ///
+    /// A lower bound: a voucher another signer issued and no provider has
+    /// redeemed yet is in neither. So
+    /// `deposit_micro_usdc.saturating_sub(spent_micro_usdc)` is an upper
+    /// bound: every signer on the pool together can spend at most that much.
+    pub spent_micro_usdc: u64,
     /// Every lane funded from this pool, ordered by `(signer, provider)`. One
     /// pool fans out to every provider the owner pays (ADR 003), so this is
     /// where the pool's spend is actually visible.
@@ -664,7 +673,7 @@ pub struct BuyerPoolSnapshot {
 /// This is the only way to read `buyer.redb` on a running node: `redb` holds a
 /// process-exclusive lock on that file for the daemon's lifetime, so no CLI can
 /// open it — not even read-only — while the node is up.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BuyerPoolsResponse {
     /// One entry per tracked pool, ordered by `pool_id` so the output is stable
     /// across calls regardless of the store's internal key order.

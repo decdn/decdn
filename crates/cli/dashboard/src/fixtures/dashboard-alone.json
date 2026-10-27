@@ -1,0 +1,82 @@
+{
+  "version": "0.3.0",
+  "now_unix_ms": 1793000600000,
+  "dashboard_built": true,
+  "started_unix": 1793000000,
+  "pulls": {
+    "dir": "/home/me/.decdn/activity/pulls",
+    "updated_unix_ms": 1793000600000,
+    "active": [],
+    "recent": [
+      {
+        "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "kind": "blob",
+        "output": "/home/me/site",
+        "pid": 4242,
+        "started_unix_ms": 1793000300000,
+        "updated_unix_ms": 1793000342000,
+        "state": "gave_up",
+        "finished_unix_ms": 1793000342000,
+        "error": "gave up: no verified byte for 2m",
+        "received_bytes": 734003200,
+        "expected_bytes": 1073741824,
+        "files_started": 12,
+        "files_landed": 9,
+        "paid": {
+          "amount_micro_usdc": 7340,
+          "bytes": 736100352
+        },
+        "nodes": [
+          {
+            "provider": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+            "amount_micro_usdc": 7340,
+            "bytes": 736100352
+          }
+        ],
+        "bundle": null,
+        "stale": false
+      }
+    ],
+    "unreadable": 0,
+    "error": null
+  },
+  "gateway": {
+    "url": "http://127.0.0.1:8484/",
+    "updated_unix_ms": 1793000600000,
+    "state": "absent"
+  },
+  "node": {
+    "admin_url": "http://127.0.0.1:9191",
+    "metrics_url": "http://127.0.0.1:9090/metrics",
+    "state": "absent",
+    "health": {
+      "updated_unix_ms": 1793000600000,
+      "state": "error",
+      "message": "admin at http://127.0.0.1:9191 refused the connection"
+    },
+    "status": {
+      "updated_unix_ms": null,
+      "state": "waiting"
+    },
+    "metrics": {
+      "updated_unix_ms": null,
+      "state": "waiting"
+    },
+    "lanes": {
+      "updated_unix_ms": null,
+      "state": "waiting"
+    },
+    "earnings": {
+      "updated_unix_ms": null,
+      "state": "waiting"
+    },
+    "pools": {
+      "updated_unix_ms": null,
+      "state": "waiting"
+    },
+    "slashes": {
+      "updated_unix_ms": null,
+      "state": "waiting"
+    }
+  }
+}

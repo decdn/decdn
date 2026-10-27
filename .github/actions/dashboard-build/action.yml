@@ -1,0 +1,37 @@
+name: Dashboard build
+description: >-
+  Build the `decdn dashboard` page (crates/cli/dashboard) into `dist/`, where
+  `crates/cli/build.rs` embeds it in the `decdn` binary. A build without it
+  embeds a fallback page instead, which a release must never ship.
+
+inputs:
+  checks:
+    description: >-
+      Also run the app's lint, type check and tests before the build.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v6.1.0
+      with:
+        package_json_file: crates/cli/dashboard/package.json
+    - uses: actions/setup-node@v7.1.0
+      with:
+        node-version: '24'
+        cache: pnpm
+        cache-dependency-path: crates/cli/dashboard/pnpm-lock.yaml
+    - name: Install the dashboard's dependencies
+      shell: bash
+      run: pnpm -C crates/cli/dashboard install --frozen-lockfile
+    - name: Lint, type-check and test the dashboard
+      if: inputs.checks == 'true'
+      shell: bash
+      run: |
+        pnpm -C crates/cli/dashboard lint
+        pnpm -C crates/cli/dashboard typecheck
+        pnpm -C crates/cli/dashboard test
+    - name: Build the dashboard
+      shell: bash
+      run: pnpm -C crates/cli/dashboard build

@@ -1,0 +1,100 @@
+import { describe, expect, it } from "vitest";
+import {
+  formatBytes,
+  formatCount,
+  formatDuration,
+  formatRate,
+  formatShare,
+  formatUsdc,
+  formatWhen,
+  shortHex,
+  shortPath,
+  shortUri,
+} from "./format";
+
+describe("formatBytes", () => {
+  it("uses binary units with one decimal past bytes", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(1023)).toBe("1023 B");
+    expect(formatBytes(1536)).toBe("1.5 KiB");
+    expect(formatBytes(20 * 1024 ** 3)).toBe("20.0 GiB");
+  });
+});
+
+describe("formatUsdc", () => {
+  it("shows at least two decimals and keeps the micro digits that matter", () => {
+    expect(formatUsdc(0)).toBe("0.00");
+    expect(formatUsdc(1_500_000)).toBe("1.50");
+    expect(formatUsdc(1_234)).toBe("0.001234");
+    expect(formatUsdc(10_000_000)).toBe("10.00");
+    expect(formatUsdc(191_205)).toBe("0.191205");
+  });
+});
+
+describe("formatDuration", () => {
+  it("names the two largest units", () => {
+    expect(formatDuration(45)).toBe("45s");
+    expect(formatDuration(192)).toBe("3m 12s");
+    expect(formatDuration(7_500)).toBe("2h 05m");
+    expect(formatDuration(3 * 86_400 + 4 * 3_600)).toBe("3d 4h");
+  });
+});
+
+describe("formatCount", () => {
+  it("groups below ten thousand and compacts above", () => {
+    expect(formatCount(1_284)).toBe("1,284");
+    expect(formatCount(12_900)).toBe("12.9K");
+    expect(formatCount(4_200_000)).toBe("4.2M");
+  });
+});
+
+describe("shortHex", () => {
+  it("keeps the head and tail of a long hex string", () => {
+    expect(shortHex("0x1234567890abcdef1234")).toBe("0x1234…1234");
+    expect(shortHex("0x12")).toBe("0x12");
+  });
+});
+
+describe("formatRate", () => {
+  it("rounds to whole bytes per second, never below zero", () => {
+    expect(formatRate(2_097_152.4)).toBe("2.0 MiB/s");
+    expect(formatRate(511.6)).toBe("512 B/s");
+    expect(formatRate(-3)).toBe("0 B/s");
+  });
+});
+
+describe("formatShare", () => {
+  it("is a whole percent", () => {
+    expect(formatShare(0.9)).toBe("90%");
+    expect(formatShare(0.3125)).toBe("31%");
+  });
+});
+
+describe("formatWhen", () => {
+  it("reads Unix seconds, not milliseconds", () => {
+    expect(formatWhen(1_793_000_000)).toBe(
+      new Date(1_793_000_000_000).toLocaleString(),
+    );
+  });
+});
+
+describe("shortUri", () => {
+  it("shortens the hash and keeps the path", () => {
+    expect(shortUri(`decdn:${"af".repeat(32)}/docs/index.html`)).toBe(
+      "decdn:afafaf…afaf/docs/index.html",
+    );
+    expect(shortUri("decdn:short")).toBe("decdn:short");
+  });
+});
+
+describe("shortPath", () => {
+  it("keeps the last two segments of a long path", () => {
+    expect(shortPath("/tmp/a/b/pulls/whisper")).toBe("…/pulls/whisper");
+    expect(shortPath("/home/me/out.bin")).toBe("…/me/out.bin");
+  });
+  it("keeps a short path, a relative one and stdout as they are", () => {
+    expect(shortPath("/out.bin")).toBe("/out.bin");
+    expect(shortPath("models/a")).toBe("models/a");
+    expect(shortPath("-")).toBe("-");
+  });
+});

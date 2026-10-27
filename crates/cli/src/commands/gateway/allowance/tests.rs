@@ -67,3 +67,38 @@ fn a_namespace_without_its_own_allowance_shares() {
     assert_eq!(allowance.remaining(Some(9), now), Ok(40));
     assert_eq!(allowance.remaining(Some(7), now), Ok(30));
 }
+
+/// The view lists the shared bucket first, then each namespace's in
+/// ascending order, with what each delivered today and when its day turns.
+#[test]
+fn view_lists_the_shared_bucket_then_each_namespace() {
+    let allowance = Allowance::with_namespaces(100, [(9, 50), (3, u64::MAX)]);
+    let now = 10 * DAY + 400;
+    assert!(allowance.charge(None, 30, now));
+    assert!(allowance.charge(Some(9), 20, now));
+    let view = allowance.view(now);
+    let rows: Vec<_> = view
+        .iter()
+        .map(|b| {
+            (
+                b.namespace,
+                b.per_day,
+                b.used,
+                b.remaining,
+                b.resets_in_secs,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (None, Some(100), 30, Some(70), DAY - 400),
+            (Some(3), None, 0, None, DAY - 400),
+            (Some(9), Some(50), 20, Some(30), DAY - 400),
+        ]
+    );
+    // A charge from an earlier day is not today's.
+    let tomorrow = allowance.view(now + DAY);
+    assert_eq!(tomorrow.first().map(|b| b.used), Some(0));
+    assert_eq!(tomorrow.first().and_then(|b| b.remaining), Some(100));
+}

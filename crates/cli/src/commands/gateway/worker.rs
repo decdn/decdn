@@ -13,6 +13,12 @@
 //! with the host, and every pool pull shares it for the run; a pull that ends
 //! with a pool replacement retires it, so the next pull's ledgers know only
 //! the new pool.
+//!
+//! The worker also answers what the store holds ([`PullWorker::pools`]): the
+//! store is open on the worker's host, and redb refuses a second open of it
+//! in the same process. Each pull persists its lanes' watermarks before it
+//! ends, so the answer lags the pulls' in-memory ledgers by at most the pulls
+//! in flight.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -20,8 +26,13 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use alloy::primitives::Address;
+use decdn_common::admin::{BuyerLaneSnapshot, BuyerPoolsResponse};
 use decdn_common::cli::ClientFetchArgs;
 use decdn_incentive::CapabilityGrant;
+use decdn_incentive::Deployment;
+use decdn_incentive::buyer_pool::{BuyerPoolStore, lane_snapshot};
+use decdn_incentive::lane::{LaneKey, PoolId};
+use serde::Serialize;
 use tokio::io::DuplexStream;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -70,6 +81,40 @@ pub(super) struct Job {
     pub(super) admit: Option<Box<dyn FnOnce() -> bool + Send>>,
 }
 
+/// What the worker's buyer-pool store holds.
+#[derive(Serialize, Default, Clone, Debug)]
+pub(super) struct PoolSnapshot {
+    /// The pools the store holds rows for: the gateway's own pool on a
+    /// public gateway.
+    pub(super) pools: BuyerPoolsResponse,
+    /// The lanes each held capability's key signs on. A delegate's pool has
+    /// no row in the store, so its lanes are only here.
+    pub(super) delegate_lanes: Vec<DelegateLanes>,
+}
+
+/// The lanes one delegate key signs on in one pool.
+#[derive(Serialize, Clone, Debug)]
+pub(super) struct DelegateLanes {
+    /// The delegate key.
+    #[serde(serialize_with = "super::eip55")]
+    pub(super) signer: Address,
+    /// The pool the capability spends.
+    pub(super) pool_id: PoolId,
+    /// Its lanes, by provider.
+    pub(super) lanes: Vec<BuyerLaneSnapshot>,
+}
+
+/// What the gateway sends the worker.
+enum Request {
+    /// A pull to run.
+    Pull(Box<Job>),
+    /// Read the store: its pools, and the lanes of each `(pool, signer)`.
+    Pools {
+        delegates: Vec<(PoolId, Address)>,
+        reply: oneshot::Sender<anyhow::Result<PoolSnapshot>>,
+    },
+}
+
 /// A job its [`Job::admit`] check refused at its slot.
 #[derive(Debug)]
 pub(super) struct NotAdmitted;
@@ -111,6 +156,18 @@ pub(super) trait Backend: Send + 'static {
         blob: &BlobFetch,
         sink: &mut Sink,
     ) -> anyhow::Result<()>;
+
+    /// What `host`'s store holds: its pools, and the lanes of each
+    /// `(pool, signer)` in `delegates`. A backend without a store holds
+    /// nothing.
+    async fn pools(
+        &self,
+        host: &Self::Host,
+        delegates: &[(PoolId, Address)],
+    ) -> anyhow::Result<PoolSnapshot> {
+        let _ = (host, delegates);
+        Ok(PoolSnapshot::default())
+    }
 
     /// Shut the host down once every pull has ended.
     async fn close(&self, host: Self::Host);
@@ -164,14 +221,86 @@ impl Backend for FetchBackend {
         result
     }
 
+    /// Read off the async thread, so a slow store read never stalls the
+    /// pulls running on it. The `--capability` grant a public gateway pays
+    /// under signs delegate lanes too, so its key is read beside the
+    /// registered capabilities'.
+    async fn pools(
+        &self,
+        (host, grant): &Self::Host,
+        delegates: &[(PoolId, Address)],
+    ) -> anyhow::Result<PoolSnapshot> {
+        let store = host.store();
+        let deployment = host.deployment();
+        let queries = lane_queries(grant.as_ref(), delegates);
+        tokio::task::spawn_blocking(move || read_pools(store.as_ref(), deployment, &queries))
+            .await?
+    }
+
     async fn close(&self, (host, _): Self::Host) {
         host.close().await;
     }
 }
 
+/// The `(pool, signer)` keys whose delegate lanes a store read lists: each
+/// registered capability's, and the `--capability` grant's when the gateway
+/// pays under one, once.
+pub(super) fn lane_queries(
+    grant: Option<&CapabilityGrant>,
+    delegates: &[(PoolId, Address)],
+) -> Vec<(PoolId, Address)> {
+    let mut queries = delegates.to_vec();
+    if let Some(grant) = grant
+        && !queries.contains(&(grant.pool_id, grant.signer))
+    {
+        queries.push((grant.pool_id, grant.signer));
+    }
+    queries
+}
+
+/// What `store` holds on `deployment`: its pool rows, and the delegate lanes
+/// of each `(pool, signer)` in `queries`.
+///
+/// # Errors
+///
+/// The store cannot be read, or a record does not decode.
+pub(super) fn read_pools(
+    store: &dyn BuyerPoolStore,
+    deployment: Deployment,
+    queries: &[(PoolId, Address)],
+) -> anyhow::Result<PoolSnapshot> {
+    let pools = BuyerPoolsResponse::from(store.load_all()?);
+    let delegate_lanes = queries
+        .iter()
+        .map(|&(pool_id, signer)| {
+            let lanes = store
+                .delegate_lanes(deployment, pool_id, signer)?
+                .into_iter()
+                .map(|(provider, progress)| {
+                    let lane = LaneKey {
+                        pool_id,
+                        signer,
+                        provider,
+                    };
+                    lane_snapshot(lane, progress)
+                })
+                .collect();
+            Ok(DelegateLanes {
+                signer,
+                pool_id,
+                lanes,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(PoolSnapshot {
+        pools,
+        delegate_lanes,
+    })
+}
+
 /// The handle the gateway holds on its worker thread.
 pub(super) struct PullWorker {
-    jobs: mpsc::UnboundedSender<Job>,
+    jobs: mpsc::UnboundedSender<Request>,
     stop: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -223,8 +352,27 @@ impl PullWorker {
     /// The worker has stopped.
     pub(super) fn pull(&self, job: Job) -> anyhow::Result<()> {
         self.jobs
-            .send(job)
+            .send(Request::Pull(Box::new(job)))
             .map_err(|_| anyhow::anyhow!("the gateway is shutting down"))
+    }
+
+    /// What the store holds: its pools, and the lanes of each
+    /// `(pool, signer)` in `delegates`. Answered beside the pulls in flight.
+    ///
+    /// # Errors
+    ///
+    /// The worker has stopped, or the store cannot be read.
+    pub(super) async fn pools(
+        &self,
+        delegates: Vec<(PoolId, Address)>,
+    ) -> anyhow::Result<PoolSnapshot> {
+        let (reply, answer) = oneshot::channel();
+        self.jobs
+            .send(Request::Pools { delegates, reply })
+            .map_err(|_| anyhow::anyhow!("the gateway is shutting down"))?;
+        answer
+            .await
+            .map_err(|_| anyhow::anyhow!("the gateway is shutting down"))?
     }
 
     /// Stop the worker: drop every pull in flight, which queues what each
@@ -276,7 +424,7 @@ type Payers<P> = Rc<RefCell<HashMap<PayerId, Rc<P>>>>;
 async fn run<B: Backend>(
     backend: B,
     max_pulls: usize,
-    mut jobs: mpsc::UnboundedReceiver<Job>,
+    mut jobs: mpsc::UnboundedReceiver<Request>,
     mut stop: oneshot::Receiver<()>,
     ready: oneshot::Sender<anyhow::Result<()>>,
 ) {
@@ -306,15 +454,22 @@ async fn run<B: Backend>(
     let mut tasks = JoinSet::new();
     loop {
         tokio::select! {
-            job = jobs.recv() => match job {
-                Some(job) => {
+            request = jobs.recv() => match request {
+                Some(Request::Pull(job)) => {
                     tasks.spawn_local(pull(
                         Rc::clone(&backend),
                         Rc::clone(&host),
                         Rc::clone(&slots),
                         Rc::clone(&payers),
-                        job,
+                        *job,
                     ));
+                }
+                Some(Request::Pools { delegates, reply }) => {
+                    let backend = Rc::clone(&backend);
+                    let host = Rc::clone(&host);
+                    tasks.spawn_local(async move {
+                        let _ = reply.send(backend.pools(&host, &delegates).await);
+                    });
                 }
                 None => break,
             },

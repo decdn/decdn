@@ -1,0 +1,180 @@
+{
+  "version": "0.3.0",
+  "now_unix_ms": 1793000600000,
+  "dashboard_built": true,
+  "started_unix": 1793000000,
+  "pulls": {
+    "dir": "/home/me/.decdn/activity/pulls",
+    "updated_unix_ms": 1793000600000,
+    "active": [],
+    "recent": [],
+    "unreadable": 0,
+    "error": "cannot list /home/me/.decdn/activity/pulls: Permission denied (os error 13)"
+  },
+  "gateway": {
+    "url": "http://127.0.0.1:8484/",
+    "updated_unix_ms": 1793000600000,
+    "state": "error",
+    "message": "error sending request: connection reset by peer"
+  },
+  "node": {
+    "admin_url": "http://127.0.0.1:9191",
+    "metrics_url": "http://127.0.0.1:9090/metrics",
+    "state": "error",
+    "message": "admin at http://127.0.0.1:9191 did not respond within 3000ms",
+    "health": {
+      "updated_unix_ms": 1793000600000,
+      "state": "error",
+      "message": "admin at http://127.0.0.1:9191 did not respond within 3000ms"
+    },
+    "status": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "node_id": "5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+        "routing": {
+          "total_peers": 7,
+          "non_empty_buckets": 2,
+          "buckets": [
+            {
+              "index": 250,
+              "fill": 3
+            },
+            {
+              "index": 255,
+              "fill": 4
+            }
+          ],
+          "bucket_capacity": 20,
+          "refresh_interval_s": 300,
+          "last_refresh_us": 1793000500000000
+        },
+        "known_stakers": 9,
+        "record_store": {
+          "records": 1204,
+          "capacity": 65536
+        },
+        "republish": {
+          "scheduled_records": 1204
+        },
+        "chain_denied_origins": 0,
+        "operator_address": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2"
+      }
+    },
+    "metrics": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "uptime_seconds": 86400,
+        "active_connections": 5,
+        "dispatch_in_flight": 2,
+        "cache_hits": 9000,
+        "cache_misses": 1000,
+        "cache_bytes_returned": 52428800000,
+        "unredeemed_usdc": 1250000,
+        "rpc_healthy": true,
+        "rates": {
+          "hits": 4.5,
+          "misses": 0.5,
+          "bytes": 2097152.0
+        },
+        "hit_rate": 0.9
+      }
+    },
+    "lanes": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "lanes": [
+          {
+            "pool_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "counterparty": "0xAbaBabaBABaBAbAbABABaBABAbabABAbAbaBabab",
+            "voucher_signer": "0xCdCdCdCDCdcDcDCdCdCDCdCDCdcdcDcDcdcDCDcd",
+            "last_nonce": 812,
+            "outstanding_micro_usdc": 3200,
+            "unredeemed_micro_usdc": 41000,
+            "deposit_micro_usdc": 5000000,
+            "seconds_since_last_voucher": 12,
+            "settlement_eligible": true
+          }
+        ],
+        "redeem_threshold_micro_usdc": 100000
+      }
+    },
+    "earnings": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "operator_address": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+        "ledger_since_unix": 1790000000,
+        "last_24h": {
+          "from_unix": 1792913600,
+          "net_micro_usdc": 120000,
+          "gross_micro_usdc": 133333,
+          "bytes_settled": 120000000,
+          "settlements": 3
+        },
+        "last_7d": {
+          "from_unix": 1792395200,
+          "net_micro_usdc": 910000,
+          "gross_micro_usdc": 1011111,
+          "bytes_settled": 910000000,
+          "settlements": 3
+        },
+        "since_ledger_start": {
+          "from_unix": 1790000000,
+          "net_micro_usdc": 4400000,
+          "gross_micro_usdc": 4888888,
+          "bytes_settled": 4400000000,
+          "settlements": 3
+        },
+        "since": null,
+        "last_settlement": {
+          "at_unix": 1792990000,
+          "tx_hash": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "block_number": 9876543,
+          "net_micro_usdc": 54000
+        },
+        "pending": {
+          "micro_usdc": 41000,
+          "lanes": 1,
+          "stranded_micro_usdc": 0,
+          "stranded_lanes": 0,
+          "last_sweep_at_unix": 1792999000,
+          "next_sweep_at_unix": 1793002600
+        }
+      }
+    },
+    "pools": {
+      "updated_unix_ms": 1793000600000,
+      "state": "ok",
+      "value": {
+        "pools": [
+          {
+            "pool_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
+            "chain_id": 421614,
+            "payment_pool": "0x1111111111111111111111111111111111111111",
+            "owner": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+            "token": "0x2222222222222222222222222222222222222222",
+            "deposit_micro_usdc": 2000000,
+            "spent_micro_usdc": 310000,
+            "lanes": [
+              {
+                "voucher_signer": "0xCdCdCdCDCdcDcDCdCdCDCdCDCdcdcDcDcdcDCDcd",
+                "provider": "0x3333333333333333333333333333333333333333",
+                "last_amount_micro_usdc": 310000,
+                "last_bytes_delivered": 31000000000
+              }
+            ]
+          }
+        ],
+        "skipped": []
+      }
+    },
+    "slashes": {
+      "updated_unix_ms": 1793000600000,
+      "state": "unconfigured",
+      "message": "slash detection is not configured"
+    }
+  }
+}

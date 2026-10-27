@@ -28,6 +28,16 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Admin wire: `BuyerPoolSnapshot` carries `spent_micro_usdc`.** The field
+  is the pool's spend as the store knows it (every tracked lane plus the
+  spend other signers redeemed). It is a lower bound, so deposit less spend
+  is an upper bound on what every signer on the pool can still spend. The
+  field is required, so a `decdn` CLI at
+  this release reads `admin_v1_pools` only from a daemon at this release.
+  `decdn node pools` and `decdn pool list` gain a `SPENT` column between
+  `DEPOSIT` and `LANES`, which moves `LANES`.
+  - Why: `decdn dashboard` shows each pool's headroom, which the deposit
+    alone overstates on a shared pool.
 - **Admin wire: `LaneSnapshot` carries `unredeemed_micro_usdc` (#2598).** The
   field is required, so a `decdn` CLI at this release reads `admin_v1_lanes`
   only from a daemon at this release (`decdn node lanes` fails with "missing
@@ -3554,6 +3564,13 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Gateway: `--metrics-listen` works on every gateway, and serves
+  `/_status` beside `/metrics`.** A loopback gateway counts
+  its requests too, and the flag no longer needs `--public-url`. The
+  listener answers only its own loopback names in `Host` and refuses any
+  other with 403, `/metrics` included, so a scraper addresses it by
+  `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` or the listen
+  address. A non-loopback address is refused when the flag is parsed.
 - **Gateway: a public gateway answers every origin (#2628).** `decdn gateway
   --public-url` adds `Access-Control-Allow-Origin: *` and exposes
   `Content-Length`, `Content-Range`, `Accept-Ranges`, `Content-Type`,
@@ -4130,6 +4147,35 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Gateway: `GET /_status`.** `/_status` is one JSON document of what the
+  gateway holds and did: its counters, the pulls in flight, the
+  capabilities, a public gateway's allowance buckets and pointers, and the
+  buyer-pool store's pools and lanes. A loopback gateway answers it on its
+  own host behind the gateway token. `--metrics-listen` serves it too, with
+  no token on a public gateway and behind the token on a loopback one. A
+  public gateway's public host does not answer it. See
+  [`adr/appendix-gateway.md` § State](https://github.com/decdn/decdn/blob/main/adr/appendix-gateway.md#state).
+- **CLI: `decdn dashboard`, one page of this host's pulls, gateway and
+  node.** It serves a page on `127.0.0.1:8485` (`--listen`) that shows the
+  `decdn get` runs on the host, live and finished; the gateway at
+  `--gateway` (default `http://127.0.0.1:8484`), from its `/_status`, when
+  one answers, with the gateway token sent to a loopback address only; and the local node's health, `node top` metrics, lanes,
+  earnings, buyer pools and slashes, from its admin RPC and `/metrics`, when
+  one runs. The dashboard process reads every source and the page reads
+  only the dashboard's own `/_status`, behind the dashboard's token
+  (`~/.decdn/dashboard/token`); the printed
+  `http://127.0.0.1:8485/#token=<token>` link hands the page the token. The
+  page only reads. It is a Vite app in `crates/cli/dashboard/`, embedded by
+  `decdn-cli`'s build script; a build with no Node toolchain embeds a page
+  that says how to build it, and no release ships that page. See
+  [`adr/appendix-binaries.md` § Dashboard](https://github.com/decdn/decdn/blob/main/adr/appendix-binaries.md#dashboard).
+- **CLI: every `decdn get` run keeps a record for the dashboard.** A run
+  writes `~/.decdn/activity/pulls/<start-ms>-<pid>.json`, whatever its
+  `--data-dir`, and rewrites it every second: the URI, the destination, the
+  bytes verified, what each node was paid, and at the end the result. A run
+  that cannot write its record pulls on, and warns once. A run prunes the
+  directory to the newest 200 records when it starts. `--dry-run` writes
+  none.
 - **CLI: `decdn get` ends with a pull receipt, and `decdn receipt
   {verify,settle}` checks and settles it (#2599).** Every `get` that paid
   prints a receipt block: the hash, the bytes verified and paid, each node

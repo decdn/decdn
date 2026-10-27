@@ -187,6 +187,12 @@ impl NodeFixture {
         &self.admin_url
     }
 
+    /// Loopback Prometheus `/metrics` URL.
+    #[must_use]
+    pub fn metrics_url(&self) -> String {
+        format!("http://127.0.0.1:{}/metrics", self.metrics_port)
+    }
+
     /// Path to the rendered `node.toml`: lets a journey point the `decdn` CLI at
     /// the same `[blockchain]` coordinates + keystore the daemon uses (#1032).
     #[must_use]

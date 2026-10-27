@@ -19,7 +19,11 @@
 //!   6. The metrics listener on loopback counts what the gateway served, and
 //!      the node wrote the wire bytes of those pulls and no more: no pull of
 //!      a.bin or b opens a stream it drops unread (#2619). Every pull reaches
-//!      the node, since the gateway keeps no blob bodies.
+//!      the node, since the gateway keeps no blob bodies. Its `/_status`
+//!      agrees with the exposition and shows the pool's lane and the spent
+//!      allowance; its `/` is no page.
+//!   7. `decdn dashboard`, pointed at that listener and at the node, shows the
+//!      gateway's state and the node's health and lanes.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and built `decdn` and `decdn-node` binaries:
@@ -411,6 +415,118 @@ async fn run() -> anyhow::Result<()> {
         counter("decdn_gateway_pulls_active")? == 0,
         "pulls in flight: {exposition}"
     );
+
+    // The same counters, and what the store holds, as `/_status` has them.
+    let status: serde_json::Value = serde_json::from_str(
+        &http
+            .get(format!("http://{metrics}/_status"))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?,
+    )?;
+    anyhow::ensure!(status["mode"] == "public", "mode: {status}");
+    let counters = &status["counters"];
+    anyhow::ensure!(
+        counters["bytes_served"].as_u64() == Some(counter("decdn_gateway_bytes_served_total")?),
+        "bytes served disagree: {counters} vs {exposition}"
+    );
+    anyhow::ensure!(
+        counters["requests_allowance_exhausted"] == 1 && counters["pulls_active"] == 0,
+        "counters: {counters}"
+    );
+    let pools = status["pools"]["pools"]["pools"]
+        .as_array()
+        .with_context(|| format!("pools: {status}"))?;
+    anyhow::ensure!(pools.len() == 1, "one pool: {status}");
+    let lanes = pools[0]["lanes"].as_array().context("lanes")?;
+    anyhow::ensure!(
+        lanes
+            .iter()
+            .any(|l| l["last_bytes_delivered"].as_u64().is_some_and(|b| b > 0)),
+        "a lane that delivered: {status}"
+    );
+    anyhow::ensure!(
+        status["allowance"][0]["used"]
+            .as_u64()
+            .is_some_and(|u| u > 0),
+        "the shared bucket spent: {status}"
+    );
+    let page = http.get(format!("http://{metrics}/")).send().await?;
+    anyhow::ensure!(
+        page.status() == StatusCode::NOT_FOUND,
+        "the gateway serves no page: {}",
+        page.status()
+    );
+
+    // ---- (7) `decdn dashboard` shows the gateway and the node ----
+    let dashboard_dir = private_tempdir("dashboard")?;
+    let dashboard_listen = format!("127.0.0.1:{}", free_port()?);
+    let mut dashboard =
+        tokio::process::Command::from(decdn_command(dashboard_dir.path(), KEYSTORE_PASSWORD)?)
+            .args(strs(&[
+                "dashboard",
+                "--listen",
+                &dashboard_listen,
+                "--gateway",
+                &format!("http://{metrics}"),
+                "--admin-url",
+                node.admin_url(),
+                "--metrics-url",
+                &node.metrics_url(),
+            ]))
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn decdn dashboard")?;
+    let token_file = dashboard_dir.path().join(".decdn/dashboard/token");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let shown = loop {
+        let token = std::fs::read_to_string(&token_file).unwrap_or_default();
+        let answer = http
+            .get(format!("http://{dashboard_listen}/_status"))
+            .header("x-decdn-token", token.trim())
+            .send()
+            .await;
+        if let Ok(answer) = answer
+            && answer.status() == StatusCode::OK
+        {
+            let shown: serde_json::Value = answer.json().await?;
+            if shown["gateway"]["state"] == "up"
+                && shown["node"]["state"] == "up"
+                && shown["node"]["lanes"]["state"] == "ok"
+                && shown["node"]["metrics"]["state"] == "ok"
+            {
+                break shown;
+            }
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the dashboard never showed the gateway and the node"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    anyhow::ensure!(
+        shown["gateway"]["status"]["mode"] == "public",
+        "the gateway's own /_status: {shown}"
+    );
+    anyhow::ensure!(
+        shown["node"]["lanes"]["value"]["lanes"]
+            .as_array()
+            .is_some_and(|l| !l.is_empty()),
+        "the node's lane for the gateway's pool: {shown}"
+    );
+    let unauthorized = http
+        .get(format!("http://{dashboard_listen}/_status"))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        unauthorized.status() == StatusCode::UNAUTHORIZED,
+        "the dashboard's /_status takes its token: {}",
+        unauthorized.status()
+    );
+    dashboard.start_kill().context("stop the dashboard")?;
+    let _ = dashboard.wait().await;
 
     gateway.start_kill().context("stop the gateway")?;
     let _ = gateway.wait().await;
