@@ -3614,6 +3614,21 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Dev builds carry line tables only, and dependencies no debuginfo.**
+  `[profile.dev]` sets `debug = "line-tables-only"` and
+  `[profile.dev.package."*"]` sets `debug = false`, so a panic backtrace and a
+  test failure still name `file:line` but a debugger shows no locals. Measured
+  on a 16-core `cargo build --workspace --all-targets`: a clean build 329s ->
+  204s, a rebuild after a one-line `decdn-protocol` edit 75s -> 44s, and
+  `target/` 44 GB -> 11 GB. `CARGO_PROFILE_DEV_DEBUG=true` restores full
+  debuginfo on workspace crates. Release builds do not change.
+  - Why: every one of the ~100 integration-test binaries links the
+    debuginfo, so it dominated dev build time, disk, and the CI cache.
+- **`decdn-e2e` finds `contracts/` at run time.** `chain::contracts_dir` reads
+  `CARGO_MANIFEST_DIR` from the test process, not with `env!`, so the checkout
+  path is not part of the library's compiled output. A compiler cache (kache,
+  sccache) reuses `decdn-e2e`, and every test binary that links it, in a new
+  worktree.
 - **Gateway: `--metrics-listen` works on every gateway, and serves
   `/_status` beside `/metrics`.** A loopback gateway counts
   its requests too, and the flag no longer needs `--public-url`. The

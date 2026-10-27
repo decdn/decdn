@@ -299,3 +299,16 @@ fn ci_scaling_widens_the_budget_only_under_ci() {
     assert_eq!(scale_for_ci(base, false), base);
     assert_eq!(scale_for_ci(base, true), base * CI_TIMEOUT_MULTIPLIER);
 }
+
+#[test]
+#[allow(clippy::expect_used)]
+fn contracts_dir_resolves_from_the_runtime_package_dir() {
+    // Pins the run-time `CARGO_MANIFEST_DIR` read: the test runner sets it, and
+    // `../../contracts` from a `crates/<package>/` directory is the Foundry root.
+    let contracts = contracts_dir().expect("resolve contracts dir");
+    assert!(
+        contracts.join("foundry.toml").is_file(),
+        "{}",
+        contracts.display()
+    );
+}
