@@ -2561,21 +2561,24 @@ where
             None | Some(UnitOutcome::Completed) => {
                 let split = unit.stop_at.load(Ordering::Acquire);
                 let end = r_start.saturating_add(r_len);
-                if split < end {
+                // The extent ends at the verified prefix, not at `stop_at`: a
+                // steal that finds the victim past its split keeps the victim's
+                // end where the victim reached, and a declined one lets it
+                // reach `end`.
+                let reached = unit.progress.frontier.load(Ordering::Acquire).min(end);
+                if split < end && reached < end {
                     tracing::debug!(
                         %provider,
                         start = r_start,
                         split,
+                        reached,
                         "a lane stopped its stream at a steal split"
                     );
                 }
                 // Info, so who served each completed range shows without debug
-                // logs (#2332). The extent ends at the verified prefix, not at
-                // `stop_at`: a steal that finds the victim past its split keeps
-                // the victim's end where the victim reached. A range that
-                // verified no byte served nothing, so it logs nothing.
+                // logs (#2332). A range that verified no byte served nothing,
+                // so it logs nothing.
                 if landed > 0 {
-                    let reached = unit.progress.frontier.load(Ordering::Acquire).min(end);
                     tracing::info!(
                         %provider,
                         hash = %blake3::Hash::from_bytes(hash).to_hex(),
