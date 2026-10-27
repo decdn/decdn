@@ -1045,10 +1045,11 @@ impl ManifestCache {
     }
 }
 
-/// Why a blob is no bundle manifest. The bytes are content-addressed and a
-/// cap stop comes from verified bytes, so the verdict holds for the hash for
-/// the whole run. It holds no request's raw-blob hint: [`Self::error`] adds
-/// the asker's.
+/// Why a blob is no bundle manifest. The hash fixes the bytes, and a cap
+/// stop comes from verified bytes or a proven size (a node's lying size claim
+/// fails verification first), so the verdict holds for the hash while the
+/// manifest cap stays the same: the whole run. It holds no request's raw-blob
+/// hint: [`Self::error`] adds the asker's.
 #[derive(Clone, Debug)]
 enum NotManifest {
     /// The manifest cap ended the pull: the cap stop's text.
@@ -1061,8 +1062,8 @@ enum NotManifest {
 
 impl NotManifest {
     /// The verdict on bytes whose parse failed with `err`. A malformed
-    /// manifest names its publisher, not the raw blob, which is the same
-    /// broken JSON.
+    /// manifest's error names its publisher and no raw blob: the raw blob is
+    /// the same broken JSON.
     fn unparsed(err: anyhow::Error) -> Self {
         if err.is::<MalformedManifest>() {
             Self::Plain(format!("{:#}", err.context(MALFORMED_MANIFEST)))
@@ -1125,7 +1126,8 @@ impl NotManifests {
 enum ManifestStop {
     /// The blob is no manifest, for good.
     Not(NotManifest),
-    /// The pull failed; a later request may pull again.
+    /// The pull ended for a reason that says nothing of the blob (upstream,
+    /// funding, the allowance); a later request pulls again.
     Pull(PullError),
 }
 
@@ -2104,8 +2106,9 @@ impl Gateway {
 
     /// The bundle manifest `hash`, from the cache or pulled. The pull requests,
     /// and so pays for, at most the manifest cap. A blob that is no manifest
-    /// is remembered as such, so a repeat request answers without a pull; a
-    /// pull that failed upstream is not.
+    /// is remembered as such (up to [`MAX_NOT_MANIFESTS`] hashes), so a repeat
+    /// request answers without a pull. A pull that ends for any other reason
+    /// is not, and a later request pulls again.
     async fn manifest(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -2149,8 +2152,8 @@ impl Gateway {
         }
     }
 
-    /// Pull `hash` under the manifest cap of `cap_mb` and parse it, with the
-    /// manifest's JSON size.
+    /// Pull `hash` under the manifest cap of `cap_mb` and parse it. Returns
+    /// the manifest and its JSON length, the weight the manifest cache counts.
     async fn pull_manifest(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -2775,6 +2778,8 @@ fn classify(e: anyhow::Error) -> PullError {
 
 /// Mark a manifest pull that the manifest cap ended as
 /// [`NotManifest::OverCap`]: the gateway reads no larger blob as a manifest.
+/// Only [`PullError::Other`] carrying [`decdn_client::BlobTooLarge`] is one;
+/// a funding stop that carries it stays a funding stop.
 fn over_manifest_cap(stop: ManifestStop) -> ManifestStop {
     match stop {
         ManifestStop::Pull(PullError::Other(e))

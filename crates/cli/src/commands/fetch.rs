@@ -799,7 +799,8 @@ pub(crate) struct FetchHost {
     pub(crate) escrows: UnconfirmedEscrows,
     /// The pool's settlement token, `PaymentPool.usdc()`, read once.
     token: tokio::sync::OnceCell<alloy::primitives::Address>,
-    /// The size of each blob a fetch on this host verified whole.
+    /// The sizes of blobs fetches on this host verified whole, up to
+    /// [`MAX_SIZE_HINTS`].
     sizes: Mutex<SizeHints>,
 }
 
@@ -823,11 +824,13 @@ impl SizeHints {
         self.sizes.get(hash).copied()
     }
 
-    /// Remember that `hash`'s blob verified to `size` bytes.
+    /// Remember that `hash`'s blob verified to `size` bytes. A hash fixes its
+    /// blob's size, so a hash already known keeps its size and its place.
     pub(crate) fn insert(&mut self, hash: [u8; 32], size: u64) {
-        if self.sizes.insert(hash, size).is_some() {
+        let std::collections::hash_map::Entry::Vacant(entry) = self.sizes.entry(hash) else {
             return;
-        }
+        };
+        entry.insert(size);
         self.order.push_back(hash);
         while self.order.len() > MAX_SIZE_HINTS {
             if let Some(evicted) = self.order.pop_front() {
@@ -838,8 +841,8 @@ impl SizeHints {
 }
 
 /// The size a fetch of `hash` starts from: `size_cap`, the caller's declared
-/// size (a gateway's manifest entry), else one an earlier fetch on the host
-/// verified. Only the declared size caps the fetch ([`held_cap`]).
+/// size (a bundle manifest's entry size), else one an earlier fetch on the
+/// host verified. Only the declared size caps the fetch ([`held_cap`]).
 pub(crate) fn known_size(
     hash: &[u8; 32],
     size_cap: Option<u64>,

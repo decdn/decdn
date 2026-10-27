@@ -168,7 +168,8 @@ describe("capabilities", () => {
             {
               signer: signer.toLowerCase(),
               pool_id: pool,
-              // The spend counts the pull in flight the stored lanes lag.
+              // spent_micro_usdc (3_500) runs ahead of the stored lanes
+              // (3_000): it counts the pull in flight.
               lanes: [lane(1_000, 100), lane(2_000, 200, "0xcc")],
               spent_micro_usdc: 3_500,
               bytes_delivered: 350,

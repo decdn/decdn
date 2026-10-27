@@ -71,6 +71,9 @@ const VOUCHER_REJECTED: &str = "decdn_serve_stream_voucher_rejected_total";
 const SERVED: &str = "decdn_bytes_served_total";
 /// The node's count of `cdn/probe/v1` requests it answered.
 const PROBES: &str = "decdn_probe_requests_total";
+/// The node's count of probes its per-peer bucket shed, which [`PROBES`]
+/// does not count.
+const PROBES_SHED: &str = "decdn_probe_rate_limit_rejected_per_peer_total";
 /// What the node may write past the wire bytes of the pulls: the parent
 /// nodes a pull's later legs repeat, a few hundred bytes here. For the 4 MiB
 /// blobs here, below the 64 KiB first frame that a stream opened and dropped
@@ -317,6 +320,7 @@ async fn run() -> anyhow::Result<()> {
     // ---- (3) Four pulls at once on the one pool payer ----
     let rejected_before = node.scrape_metric(VOUCHER_REJECTED).await?;
     let probes_before = node.scrape_metric(PROBES).await?;
+    let shed_before = node.scrape_metric(PROBES_SHED).await?;
     let paid = |hash: Hash| {
         let request = get(DOMAIN, &format!("/{}", hash.to_hex()));
         async move {
@@ -353,11 +357,16 @@ async fn run() -> anyhow::Result<()> {
         "the node rejected {rejected} voucher stream(s) on the pool payer's lane"
     );
     // Steps (1) and (2) verified both blobs whole, so the gateway starts each
-    // repeat pull from the size it learned and probes the pinned node for none.
+    // repeat pull from the size it learned and sends the pinned node no
+    // probe: the node neither answers nor sheds one.
     let probes = node
         .scrape_metric(PROBES)
         .await?
-        .saturating_sub(probes_before);
+        .saturating_sub(probes_before)
+        + node
+            .scrape_metric(PROBES_SHED)
+            .await?
+            .saturating_sub(shed_before);
     anyhow::ensure!(
         probes == 0,
         "repeat pulls of verified blobs probed the pinned node {probes} time(s)"

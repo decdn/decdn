@@ -730,8 +730,9 @@ fn size_hints_forget_the_oldest_past_the_bound() {
     for n in 0..MAX_SIZE_HINTS {
         sizes.insert(key(n), 7);
     }
-    // A repeat insert neither duplicates nor refreshes the entry.
-    sizes.insert(key(0), 7);
+    // A repeat insert keeps the first size and the entry's place.
+    sizes.insert(key(0), 8);
+    assert_eq!(sizes.get(&key(0)), Some(7));
     assert_eq!(sizes.order.len(), MAX_SIZE_HINTS);
     sizes.insert(key(MAX_SIZE_HINTS), 9);
     assert_eq!(sizes.get(&key(0)), None, "the oldest is forgotten");

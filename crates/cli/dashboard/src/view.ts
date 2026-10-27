@@ -77,7 +77,7 @@ export interface CapabilityRow {
   spentMicro: number | null;
   bytes: number | null;
   used: number | null;
-  /** The pulls in flight it pays for, whose spend is still growing. */
+  /** The pulls in flight its key pays for, whose spend may still grow. */
   inFlight: number;
   severity: Severity;
 }

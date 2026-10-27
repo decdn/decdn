@@ -134,3 +134,37 @@ async fn paid_bytes_sums_what_every_lane_paid_past_its_seed() -> anyhow::Result<
     assert_eq!(reg.paid_bytes(), U256::from(500u64));
     Ok(())
 }
+
+/// `committed_lanes` lists every registered lane with its own ledger's
+/// committed cumulative: the seed until a voucher lands, and what the ledger
+/// says after.
+#[tokio::test]
+async fn committed_lanes_lists_each_lane_at_its_committed_cumulative() -> anyhow::Result<()> {
+    use crate::ledger::EpochAction;
+
+    let reg = LaneLedgers::new();
+    let seed = Cumulative {
+        bytes: U256::from(4_000u64),
+        amount: U256::from(40u64),
+    };
+    let h1 = reg.get_or_insert(lane(1), || LaneHandle::for_test(seed));
+    let h2 = reg.get_or_insert(lane(2), || LaneHandle::for_test(Cumulative::default()));
+    let listed = |reg: &LaneLedgers| {
+        let mut lanes = reg.committed_lanes();
+        lanes.sort_by_key(|(lane, _)| lane.provider);
+        lanes
+    };
+    assert_eq!(
+        listed(&reg),
+        [(lane(1), seed), (lane(2), Cumulative::default())]
+    );
+    h2.ledger
+        .issue(200, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+        .await?;
+    assert_eq!(
+        listed(&reg),
+        [(lane(1), seed), (lane(2), h2.ledger.committed())]
+    );
+    assert_eq!(h1.ledger.committed(), seed);
+    Ok(())
+}

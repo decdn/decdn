@@ -8,9 +8,9 @@ use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser as _;
 use decdn_client::Cumulative;
-use decdn_common::admin::BuyerLaneSnapshot;
 use decdn_common::cli::ClientFetchArgs;
 use decdn_incentive::CapabilityGrant;
+use decdn_incentive::buyer_pool::{BuyerLaneProgress, lane_snapshot};
 use decdn_incentive::lane::{LaneKey, PoolId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, oneshot};
@@ -37,11 +37,15 @@ struct Log {
     payers_made: usize,
     /// The payer id each pull ran under, in the order the pulls ran.
     pulled_under: Vec<usize>,
-    /// The delegate key of each held payer, by payer id.
+    /// The key each payer signs its lanes with, by payer id.
     signers: HashMap<usize, Address>,
 }
 
-/// The provider of the one lane each [`Fake`] held payer has a ledger on.
+/// The key a [`Fake`] pool payer signs its lanes with, as a `--capability`
+/// grant's.
+const POOL_SIGNER: Address = Address::repeat_byte(0x77);
+
+/// The provider of the one lane each [`Fake`] payer has a ledger on.
 const LIVE_PROVIDER: Address = Address::repeat_byte(9);
 
 /// What that ledger has committed.
@@ -81,7 +85,9 @@ impl Backend for Fake {
         }
         let mut log = self.log.lock().unwrap();
         log.payers_made += 1;
-        Ok(Some(log.payers_made))
+        let id = log.payers_made;
+        log.signers.insert(id, POOL_SIGNER);
+        Ok(Some(id))
     }
 
     async fn pull(
@@ -123,7 +129,7 @@ impl Backend for Fake {
         })
     }
 
-    /// A held payer has one lane on the zero pool, at [`LIVE`].
+    /// A payer has one lane on the zero pool, at [`LIVE`].
     fn live_lanes(&self, payer: &usize) -> Vec<(LaneKey, Cumulative)> {
         let log = self.log.lock().unwrap();
         log.signers
@@ -567,11 +573,18 @@ async fn a_pools_query_counts_the_pulls_in_flight() {
 #[test]
 fn live_ledgers_lift_the_stored_spend_without_double_counting() {
     let signer = Address::repeat_byte(1);
-    let stored = |provider: Address, amount: u64| BuyerLaneSnapshot {
-        voucher_signer: signer.to_string(),
-        provider: provider.to_string(),
-        last_amount_micro_usdc: amount,
-        last_bytes_delivered: amount * 10,
+    // Stored lanes spelled as the store's reader spells them.
+    let stored = |provider: Address, amount: u64| {
+        let lane = LaneKey {
+            pool_id: PoolId::ZERO,
+            signer,
+            provider,
+        };
+        let progress = BuyerLaneProgress {
+            last_amount: U256::from(amount),
+            last_bytes: U256::from(amount * 10),
+        };
+        lane_snapshot(lane, progress)
     };
     let behind = Address::repeat_byte(0xa);
     let ahead = Address::repeat_byte(0xb);
@@ -590,6 +603,10 @@ fn live_ledgers_lift_the_stored_spend_without_double_counting() {
         signer,
         provider,
     };
+    let other_pool = LaneKey {
+        pool_id: PoolId::repeat_byte(3),
+        ..lane(signer, behind)
+    };
     let at = |amount: u64| Cumulative {
         bytes: U256::from(amount * 10),
         amount: U256::from(amount),
@@ -599,6 +616,7 @@ fn live_ledgers_lift_the_stored_spend_without_double_counting() {
         (lane(signer, ahead), at(600)),
         (lane(signer, unstored), at(40)),
         (lane(Address::repeat_byte(2), behind), at(9000)),
+        (other_pool, at(9000)),
     ]);
     delegate.include_live(&live);
     // behind 500 (not 300 + 500), ahead 700, unstored 40.
@@ -606,6 +624,34 @@ fn live_ledgers_lift_the_stored_spend_without_double_counting() {
         (delegate.spent_micro_usdc, delegate.bytes_delivered),
         (1240, 12_400)
     );
+    // Counting again changes nothing.
+    delegate.include_live(&live);
+    assert_eq!(
+        (delegate.spent_micro_usdc, delegate.bytes_delivered),
+        (1240, 12_400)
+    );
+}
+
+/// The gateway's pool payer lives for the run, so the lanes a `--capability`
+/// grant signs through it count live even between pulls.
+#[tokio::test]
+async fn a_pools_query_counts_the_pool_payers_live_lanes() {
+    let (worker, _log, _release) = start_with(2, true).await;
+    let (reader, done) = send_pool(&worker, HELLO);
+    assert_eq!(read_all(reader).await, b"hello");
+    done.await.unwrap().unwrap();
+    let snapshot = worker
+        .pools(vec![(PoolId::ZERO, POOL_SIGNER)])
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            snapshot.delegate_lanes[0].spent_micro_usdc,
+            snapshot.delegate_lanes[0].bytes_delivered
+        ),
+        (500, 4096)
+    );
+    worker.stop().await;
 }
 
 /// A query after the worker stopped fails instead of hanging.

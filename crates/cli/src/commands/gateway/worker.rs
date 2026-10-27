@@ -17,9 +17,9 @@
 //! The worker also answers what the store holds ([`PullWorker::pools`]): the
 //! store is open on the worker's host, and redb refuses a second open of it
 //! in the same process. Each pull persists its lanes' watermarks only when it
-//! ends, so the store lags the pulls in flight; each capability's spend in
-//! the answer ([`DelegateLanes::spent_micro_usdc`]) also counts what the
-//! live ledgers of those pulls committed.
+//! ends, so the store lags the pulls in flight; each capability key's spend
+//! in the answer ([`DelegateLanes`]) also counts what the live ledgers of its
+//! payers committed.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -100,61 +100,62 @@ pub(super) struct PoolSnapshot {
 pub(super) struct DelegateLanes {
     /// The delegate key.
     #[serde(serialize_with = "super::eip55")]
-    pub(super) signer: Address,
+    signer: Address,
     /// The pool the capability spends.
-    pub(super) pool_id: PoolId,
+    pool_id: PoolId,
     /// Its lanes, by provider, as the store holds them.
-    pub(super) lanes: Vec<BuyerLaneSnapshot>,
-    /// What the key signed for over its lanes, in micro-USDC: each lane's
-    /// stored watermark, or what the pulls in flight on it committed when
-    /// that is more.
-    pub(super) spent_micro_usdc: u64,
-    /// The lane bytes the same vouchers paid for.
-    pub(super) bytes_delivered: u64,
+    lanes: Vec<BuyerLaneSnapshot>,
+    /// What the key signed for, in micro-USDC, summed over its lanes: each
+    /// lane's stored watermark, or its live ledger when that is ahead.
+    spent_micro_usdc: u64,
+    /// The lane bytes paid for, taken per lane the same way.
+    bytes_delivered: u64,
 }
 
 impl DelegateLanes {
-    /// The lanes `signer` signs on in `pool_id`, as the store holds them.
+    /// The lanes `signer` signs on in `pool_id`, as the store holds them,
+    /// with their stored spend and bytes summed.
     pub(super) fn new(signer: Address, pool_id: PoolId, lanes: Vec<BuyerLaneSnapshot>) -> Self {
-        let sum = |field: fn(&BuyerLaneSnapshot) -> u64| {
-            lanes.iter().map(field).fold(0, u64::saturating_add)
-        };
-        let spent_micro_usdc = sum(|l| l.last_amount_micro_usdc);
-        let bytes_delivered = sum(|l| l.last_bytes_delivered);
-        Self {
+        let mut delegate = Self {
             signer,
             pool_id,
             lanes,
-            spent_micro_usdc,
-            bytes_delivered,
-        }
+            spent_micro_usdc: 0,
+            bytes_delivered: 0,
+        };
+        delegate.include_live(&HashMap::new());
+        delegate
     }
 
-    /// Count what the pulls in flight committed on this key's lanes in
-    /// `live` past each lane's stored watermark. A stored watermark is what
-    /// a ledger committed when its pull ended, and a ledger only grows, so
-    /// the larger of the two is the lane's spend.
+    /// Sum the key's spend and bytes again, with each of its lanes in `live`
+    /// at the larger of its stored watermark and its live ledger. A live
+    /// ledger starts from the stored watermark and a pull moves it on, so the
+    /// larger is the lane's spend and the two are never added. A ledger that
+    /// a rebase moved back below the store leaves the stored value. A lane
+    /// only `live` knows counts in full.
     fn include_live(&mut self, live: &HashMap<LaneKey, Cumulative>) {
+        let mut lanes: HashMap<String, (u64, u64)> = self
+            .lanes
+            .iter()
+            .map(|l| {
+                let stored = (l.last_amount_micro_usdc, l.last_bytes_delivered);
+                (l.provider.clone(), stored)
+            })
+            .collect();
         let mine = live
             .iter()
             .filter(|(lane, _)| lane.pool_id == self.pool_id && lane.signer == self.signer);
         for (lane, committed) in mine {
-            let provider = lane.provider.to_string();
-            let (amount, bytes) = self
-                .lanes
-                .iter()
-                .find(|l| l.provider == provider)
-                .map_or((0, 0), |l| {
-                    (l.last_amount_micro_usdc, l.last_bytes_delivered)
-                });
-            let past = |now: U256, stored: u64| narrow(now).saturating_sub(stored);
-            self.spent_micro_usdc = self
-                .spent_micro_usdc
-                .saturating_add(past(committed.amount, amount));
-            self.bytes_delivered = self
-                .bytes_delivered
-                .saturating_add(past(committed.bytes, bytes));
+            // The store spells a provider as `lane_snapshot` does.
+            let (amount, bytes) = lanes.entry(lane.provider.to_string()).or_default();
+            *amount = (*amount).max(narrow(committed.amount));
+            *bytes = (*bytes).max(narrow(committed.bytes));
         }
+        let (spent, bytes) = lanes.values().fold((0u64, 0u64), |(spent, bytes), (a, b)| {
+            (spent.saturating_add(*a), bytes.saturating_add(*b))
+        });
+        self.spent_micro_usdc = spent;
+        self.bytes_delivered = bytes;
     }
 }
 
@@ -535,10 +536,11 @@ async fn run<B: Backend>(
                     let host = Rc::clone(&host);
                     let payers = Rc::clone(&payers);
                     tasks.spawn_local(async move {
-                        // The ledgers are read after the store: a pull that
-                        // ended in between persisted what its ledger held.
+                        // The ledgers are read before the store: a pull that
+                        // ends during the store read is already counted live,
+                        // and one that ended before it persisted first.
+                        let live = live_lanes(backend.as_ref(), &payers);
                         let snapshot = backend.pools(&host, &delegates).await.map(|mut s| {
-                            let live = live_lanes(backend.as_ref(), &payers);
                             for delegate in &mut s.delegate_lanes {
                                 delegate.include_live(&live);
                             }
@@ -639,8 +641,9 @@ fn payer_for<B: Backend>(
     Ok(payer)
 }
 
-/// Each lane a payer of the pulls in flight holds a live ledger on, with
-/// the most any of them committed on it.
+/// Each lane a live payer holds a ledger on, with the most any payer
+/// committed on it. A held payer lives while its pulls run; the pool payer
+/// lives for the run.
 fn live_lanes<B: Backend>(backend: &B, payers: &Payers<B::Payer>) -> HashMap<LaneKey, Cumulative> {
     let mut live = HashMap::new();
     for payer in payers.borrow().values() {

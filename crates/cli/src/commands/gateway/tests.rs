@@ -694,9 +694,16 @@ async fn a_manifest_pull_is_capped_and_an_oversize_blob_is_not_found() {
 #[tokio::test]
 async fn a_cap_stop_after_the_first_bytes_is_not_found() {
     let reply = Reply::BytesThenTooLarge(b"{\"version\": 1, ".to_vec());
-    let (gateway, _) = recording_gateway(reply, &["--max-blob-mb", "10"]).await;
-    let (status, body) = get(&gateway, &format!("/{}/", alloy::hex::encode(BLOB))).await;
+    let (gateway, caps) = recording_gateway(reply, &["--max-blob-mb", "10"]).await;
+    let path = format!("/{}/", alloy::hex::encode(BLOB));
+    let (status, body) = get(&gateway, &path).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, again) = get(&gateway, &path).await;
+    assert_eq!(
+        (status, again.as_str()),
+        (StatusCode::NOT_FOUND, body.as_str())
+    );
+    assert_eq!(*caps.lock().unwrap(), [10], "the cap stop is remembered");
 }
 
 #[tokio::test]
@@ -718,16 +725,15 @@ async fn a_blob_that_is_not_a_manifest_is_not_found() {
         first.contains(&format!("fetch `/{blob}` for the raw blob")),
         "{first}"
     );
-    let (status, again) = get(&gateway, &format!("/{blob}/")).await;
+    // The repeat request pays for no second pull, and its hint names its
+    // own namespace.
+    let (status, again) = get(&gateway, &format!("/{blob}/?ns=9")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(
-        (status, again.as_str()),
-        (StatusCode::NOT_FOUND, first.as_str())
+        again,
+        first.replace(&format!("`/{blob}`"), &format!("`/{blob}?ns=9`"))
     );
-    assert_eq!(
-        *caps.lock().unwrap(),
-        [MAX_MANIFEST_MB],
-        "the repeat request pays for no second pull"
-    );
+    assert_eq!(*caps.lock().unwrap(), [MAX_MANIFEST_MB]);
 }
 
 /// A pull that failed upstream says nothing of the blob, so the next request
@@ -2020,6 +2026,43 @@ async fn a_pool_that_cannot_pay_answers_503() {
     );
     let body: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
     assert_eq!(body["uri"], format!("decdn:{unfunded}"));
+}
+
+/// A manifest pull the pool cannot pay for says nothing of the blob, so the
+/// next request pulls again.
+#[tokio::test]
+async fn a_manifest_pull_stopped_for_funding_is_not_remembered() {
+    let (gateway, logs, _) = public_gateway().await;
+    let host = gateway.sites.site_host(&Site {
+        hash: UNFUNDED,
+        namespace: None,
+    });
+    for _ in 0..2 {
+        let answer = request(&gateway, &host, "/", &[]).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            answer.body
+        );
+    }
+    assert_eq!(*logs.caps.lock().unwrap(), [MAX_MANIFEST_MB; 2]);
+}
+
+/// A manifest read that one namespace's allowance stopped says nothing of
+/// the blob: the same bundle on the shared allowance still serves.
+#[tokio::test]
+async fn a_manifest_read_stopped_by_the_allowance_is_not_remembered() {
+    let (gateway, _logs, host) =
+        public_gateway_for(Allowance::with_namespaces(u64::MAX, [(7, 1)])).await;
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), Address::ZERO);
+    let refused = request(&gateway, "7.decdn.test", "/a.txt", &[]).await;
+    assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
+    let served = request(&gateway, &host, "/a.txt", &[]).await;
+    assert_eq!(
+        (served.status, served.body.as_str()),
+        (StatusCode::OK, "abc")
+    );
 }
 
 /// What the public allowance has left right now.
