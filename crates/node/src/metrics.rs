@@ -894,6 +894,14 @@ pub struct DecdnMetrics {
     /// cycle. Operator-visible name:
     /// `decdn_redemption_skipped_pool_unresolved_total`.
     pub redemption_skipped_pool_unresolved: Counter,
+    /// Admission chain reads (`getPool`, `getAuthorization`) that found every
+    /// read slot taken for the whole slot wait and were refused without a read
+    /// (#2706). The request answers `NotFound` and counts on
+    /// `decdn_serve_stream_rejected_pool_unconfirmed_total` or the signer
+    /// refusal; this counter says the node was busy, not that the pool or
+    /// signer failed to resolve. Operator-visible name:
+    /// `decdn_serve_admit_read_slot_timeouts_total`.
+    pub serve_admit_read_slot_timeouts: Counter,
     /// Lanes with value owed that the redeemer skipped because the signer's
     /// capability has expired, or expires within the redeemer's landing slack
     /// (ADR 003 §Revocation). The contract pays 0 for an expired capability, so
@@ -1822,7 +1830,9 @@ pub struct DecdnMetrics {
     /// the pool on-chain — the pool has no on-chain record, is closed/reclaimed, or
     /// the admit-path `getPool` faulted — or could not confirm the voucher signer:
     /// the admit-path `getAuthorization` faulted and the node holds no cached
-    /// registered read of the signer. Signed as `NotFound`, like a cache miss,
+    /// registered read of the signer. Either read also refuses when it finds no
+    /// free read slot in time, which `serve_admit_read_slot_timeouts` counts
+    /// apart. Signed as `NotFound`, like a cache miss,
     /// so this counter is the only place the reason lives;
     /// kept distinct from `insufficient_deposit` so a real drained-pool refusal is
     /// not conflated with an unconfirmed or unreachable pool. Visible name:
@@ -3138,6 +3148,9 @@ recorders! {
     /// `n` lanes were kept out of a submit because their pool stayed unknown
     /// after the pre-submit `getPool` (`resolve_unknown_pools`).
     redemption_skipped_pool_unresolved_by(n: u64) => redemption_skipped_pool_unresolved.inc_by(n);
+
+    /// An admission chain read found no free read slot within its wait.
+    serve_admit_read_slot_timeout => serve_admit_read_slot_timeouts.inc();
 
     /// `n` lanes were dropped from a redeem batch by the pre-submit on-chain
     /// watermark reconciliation because the chain already shows them settled to

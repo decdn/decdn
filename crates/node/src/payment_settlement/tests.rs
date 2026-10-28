@@ -1237,6 +1237,57 @@ async fn a_read_that_finds_no_slot_is_refused_uncached() {
     );
 }
 
+/// #2706: `getAuthorization` reads share the admit-read slots with `getPool`.
+/// With every slot held, a signer confirm waits `ADMIT_CHAIN_READ_SLOT_WAIT`,
+/// sends no read, caches nothing for the signer, and counts on the slot-timeout
+/// counter.
+#[tokio::test(start_paused = true)]
+async fn a_signer_confirm_that_finds_no_slot_is_refused_uncached() {
+    use crate::pool_view::PoolView;
+    use std::sync::atomic::Ordering;
+
+    let (view, calls) = counting_hanging_view();
+    let holders = futures_util::future::join_all((0..ADMIT_CHAIN_READ_CONCURRENCY).map(|i| {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        view.status(B256::from(id))
+    }));
+    tokio::pin!(holders);
+    let pool_id = B256::repeat_byte(0xEF);
+    let signer = Address::from([0xEF; 20]);
+    let started = tokio::time::Instant::now();
+    // `biased`: the holders take every slot before the signer confirm asks.
+    let answer = tokio::select! {
+        biased;
+        _ = &mut holders => panic!("hung reads cannot answer before the slot wait ends"),
+        answer = view.signer_authorization(pool_id, signer) => answer,
+    };
+
+    assert!(
+        answer.is_none(),
+        "a signer confirm with no free slot is refused"
+    );
+    assert_eq!(started.elapsed(), ADMIT_CHAIN_READ_SLOT_WAIT);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        ADMIT_CHAIN_READ_CONCURRENCY,
+        "the refused confirm sent no read"
+    );
+    assert!(
+        !view
+            .auth_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&(pool_id, signer)),
+        "a busy refusal caches nothing for the signer"
+    );
+    let text = view.metrics.encode().unwrap_or_default();
+    assert!(
+        text.contains("decdn_serve_admit_read_slot_timeouts_total 1"),
+        "the busy refusal is counted:\n{text}"
+    );
+}
+
 /// With the negative cache full of in-window entries, the read's fault is
 /// not cached; its waiters still take the read's answer instead of each
 /// starting a read of its own in turn.

@@ -69,6 +69,10 @@ impl ServeRateLimiter {
 
     /// Try to admit one inbound request. See [`ThreeLayerRateLimiter::check`].
     ///
+    /// The limiter counts no refusal itself: a caller that is refused must end
+    /// the stream as `ResetCause::RateLimited`, which the client handler's
+    /// dispatch sink counts on the layer's `serve_rate_limit_rejected_*`.
+    ///
     /// # Errors
     ///
     /// Returns the layer that refused the request.

@@ -5272,12 +5272,14 @@ since project inception and will roll into the first tagged release.
   of requests for fresh random pool ids could spend the operator's RPC quota
   until the blacklist watcher stalled and the node refused every serve. A
   request with no verified client binding can name no lane, so the node now
-  refuses it `NotFound` before any chain read (it counts on
+  refuses it `NotFound` before any chain read, and before an origin-only
+  node's backend `HEAD` (it counts on
   `decdn_serve_stream_rejected_owner_mismatch_total`). Admission `getPool` and
   `getAuthorization` reads hold one of 16 node-wide slots. A read waits up to
   5 s for a slot and its own timeout starts once it holds one; a request that
   finds no slot in time is refused without caching a fault against its pool,
-  so the pool's next request reads again. Bound requests are bounded by these
+  so the pool's next request reads again, and counts on
+  `decdn_serve_admit_read_slot_timeouts_total`. Bound requests are bounded by these
   slots and by the `[serve.rate_limit]` limiter.
 
 - **Node: inbound `cdn/client/v1` requests pass a three-layer rate limiter

@@ -611,9 +611,11 @@ impl PoolProjection {
     ///
     /// `0` for a pool the projection has not folded, or one in which the signer has
     /// redeemed nothing. On a pool seeded from one `getPool`
-    /// ([`Self::record_resolved`]) the total counts only redemptions folded after
-    /// the seed, so it misses the signer's earlier spend; the production view adds
-    /// that spend from its admit-path `getAuthorization` read. The folded total
+    /// ([`Self::record_resolved`]) the projection holds no lane baselines, so the
+    /// total counts each lane's whole cumulative from its first redemption folded
+    /// after the seed, and nothing for a lane that has not redeemed since; the
+    /// production view adds the signer's spend from its admit-path
+    /// `getAuthorization` read. The folded total
     /// cannot exceed `total_redeemed`, which is itself bounded by the deposit.
     #[must_use]
     pub fn signer_spent(&self, pool_id: B256, signer: Address) -> u64 {

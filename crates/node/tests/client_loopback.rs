@@ -13486,6 +13486,91 @@ async fn a_rate_limited_stream_is_reset_before_its_request_is_read() -> anyhow::
     Ok(())
 }
 
+/// #2694: the serve limiter's per-IP layer keys on the connection's direct-path
+/// source IP. Two peers with distinct node ids on the same loopback IP share
+/// one per-IP bucket: once the other peer spent it, this client's stream is
+/// reset `RATE_LIMITED` and counts on the per-IP counter, not the per-peer one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_per_ip_request_layer_binds_two_peers_on_one_ip() -> anyhow::Result<()> {
+    use decdn_node::handlers::serve_rate_limit::ServeRateLimiter;
+
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&[0x4Fu8; 1024]).await?;
+    let store_dyn: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let request_limiter = Arc::new(ServeRateLimiter::from_resolved(
+        &decdn_common::config::ResolvedServe {
+            per_peer_rate_per_sec: 0.0,
+            per_peer_burst: 0,
+            per_ip_rate_per_sec: 0.001,
+            per_ip_burst: 1,
+            global_rate_per_sec: 0.0,
+            global_burst: 0,
+            max_tracked_per_ip: 16,
+            max_tracked_per_peer: 16,
+        },
+        Arc::clone(&metrics),
+    ));
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        16,
+        |deps| deps.request_limiter = Some(Arc::clone(&request_limiter)),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Another peer on the same IP spends the IP's one token out of band.
+    let (second_ep, second_addr) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_ip = second_addr.ip();
+    anyhow::ensure!(
+        request_limiter
+            .check(
+                &decdn_node::dht::routing::NodeId::from_bytes([0x77; 32]),
+                Some(client_ip),
+            )
+            .is_ok()
+    );
+
+    // The client finds the per-IP bucket empty.
+    let second = second_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = second
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    send.write_all(&support::frame_len_prefix(
+        decdn_protocol::MAX_CLIENT_CONTROL_FRAME,
+    ))
+    .await
+    .map_err(|e| anyhow::anyhow!("write prefix: {e}"))?;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        assert_stream_reset(&mut recv, decdn_protocol::APP_ERR_RATE_LIMITED),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the second client's stream was not refused"))??;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_rate_limit_rejected_per_ip_total")? == 1
+            && counter(&metrics, "decdn_serve_rate_limit_rejected_per_peer_total")? == 0,
+        "the refusal counts on the per-IP layer"
+    );
+
+    second.close(0u32.into(), b"done");
+    shutdown([server_task], [&second_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// A request frame announced past [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`]
 /// is reset with `MESSAGE_TOO_LARGE` (`0x02`) on its length prefix alone (ADR 013
 /// § Wire Framing). The handler does not buffer the payload or wait for it, so an

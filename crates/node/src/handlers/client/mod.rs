@@ -1710,13 +1710,17 @@ impl ClientHandler {
     /// admit-time gate confirms (`ClientHandler::serve_stream`), so the mid-stream
     /// threshold matches admission.
     ///
-    /// Error bounds: a lane's first fold after the read counts its whole
-    /// cumulative, so `spent` can run high by at most the read's `spent`, which
-    /// stops a stream early near the cap and never over-delivers. With no projection
-    /// wired, `signer_spent_cached` returns `None` and the stop is skipped; with no
-    /// registered read held (evicted from the bounded cache, or the signer was
-    /// unregistered at admit) the fold alone can run low by the spend before
-    /// admission. The on-chain `redeemMany` `min(desired, cap − spent)` is the
+    /// Error bounds: on a pool seeded from one `getPool`, a lane's first fold
+    /// after the read counts its whole cumulative, including what the read's
+    /// `spent` already holds, so `spent` can run high by up to the read's `spent`
+    /// (about twice the true spend at worst). That stops a stream early, possibly
+    /// well short of the cap, and never over-delivers; admission reads the same
+    /// number, so it refuses the signer's next stream the same way. With no
+    /// projection wired, `signer_spent_cached` returns `None` and the stop is
+    /// skipped; with no registered read held (evicted from the bounded cache, or
+    /// the signer was unregistered at admit) the fold alone can run low by the
+    /// signer's spend before the pool was seeded, on lanes that have not redeemed
+    /// since. The on-chain `redeemMany` `min(desired, cap − spent)` is the
     /// backstop; this re-check only BOUNDS over-delivery, it is not a correctness
     /// gate. The caller ends the stream as `Stopped { SignerCapExhausted }`, which
     /// the dispatch sink counts on the mid-stream metric.
@@ -1922,6 +1926,19 @@ impl ClientHandler {
         lane.owner_sig = Some(sig_bytes);
         if let Err(e) = self.register_lane(lane) {
             tracing::warn!(%pool_id, %signer, error = %e, "lane registration failed; the request refuses as an unknown lane and the client retries");
+        }
+    }
+
+    /// Log a request that carries no verified binding, throttled: it names no
+    /// lane, so it can never be served.
+    pub(super) fn warn_unbound_request(&self, peer: &PublicKey) {
+        if let Some(suppressed) = self.unbound_request_warn.admit() {
+            tracing::warn!(
+                %peer,
+                suppressed,
+                interval = ?self.unbound_request_warn.interval(),
+                "stream request with no verified binding; refusing pre-serve"
+            );
         }
     }
 
