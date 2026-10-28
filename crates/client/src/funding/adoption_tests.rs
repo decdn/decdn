@@ -129,7 +129,8 @@ async fn a_lost_row_adopts_the_live_pool_and_resumes_from_the_chain_watermark() 
     let older = B256::repeat_byte(0xAA);
     let newer = B256::repeat_byte(0xBB);
 
-    let ctx = run(
+    let funding = RunFunding::default();
+    let ctx = run_in(
         &store,
         &signer,
         ChainAdoption::Allowed,
@@ -141,11 +142,18 @@ async fn a_lost_row_adopts_the_live_pool_and_resumes_from_the_chain_watermark() 
             Some(TOKEN.abi_encode().into()),
             Some(lane(1_106_908, 1_106_908_000)),
         ],
+        &funding,
     )
     .await
+    .0
+    .map(|(ctx, _)| ctx)
     .expect("a live, solvent pool is adopted — nothing is opened");
 
     assert_eq!(ctx.pool_id, older);
+    assert!(
+        funding.escrows().saw_live(older),
+        "the adoption read the pool on chain as this wallet's"
+    );
     assert_eq!(
         (ctx.prior_bytes_delivered, ctx.prior_amount),
         (U256::from(1_106_908_000u64), U256::from(1_106_908u64)),
@@ -347,6 +355,13 @@ async fn a_tracked_pool_is_reused_only_while_the_chain_shows_it_open() {
             "{case}"
         );
         assert_eq!(funding.pool_id(), reused.then_some(id), "{case}");
+        // Only a read of this owner's open pool shows it live, so a recovery
+        // step later tells a pool gone from a lagging read.
+        assert_eq!(
+            funding.escrows().saw_live(id),
+            case == "open",
+            "{case}: the pool is noted live"
+        );
         assert!(asserter.read_q().is_empty(), "{case}: the status was read");
     }
 }
@@ -1187,6 +1202,18 @@ async fn step_on_a_full_pool_holding(
     asserter: Asserter,
     untracked: Option<anyhow::Error>,
 ) -> (anyhow::Result<Recovery>, Vec<OpenUnconfirmed>) {
+    step_on_the_pool(asserter, untracked, false, WORKING).await
+}
+
+/// [`step_on_a_full_pool_holding`] for a run that sees `remaining` of the
+/// pool's deposit, in a command that saw the pool live
+/// ([`UnconfirmedEscrows::note_live`]) when `seen_live` is set.
+async fn step_on_the_pool(
+    asserter: Asserter,
+    untracked: Option<anyhow::Error>,
+    seen_live: bool,
+    remaining: u64,
+) -> (anyhow::Result<Recovery>, Vec<OpenUnconfirmed>) {
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
     let signer = full_pool_owner();
@@ -1210,6 +1237,9 @@ async fn step_on_a_full_pool_holding(
     if let Some(err) = untracked {
         funding.escrows().hold_untracked(&err);
     }
+    if seen_live {
+        funding.escrows().note_live(id);
+    }
     let funder = PoolFunder {
         contract: &contract,
         rpc: &rpc,
@@ -1222,7 +1252,7 @@ async fn step_on_a_full_pool_holding(
         max_approve: false,
         funding: &funding,
     };
-    (funder.recover(U256::from(WORKING)).await, opens.opens())
+    (funder.recover(U256::from(remaining)).await, opens.opens())
 }
 
 /// A full pool that still accepts funds settles: the step escrows nothing and
@@ -1424,6 +1454,90 @@ async fn a_full_closing_pool_is_replaced() {
     let msg = format!("{err:#}");
     assert!(msg.contains("eth_estimateGas"), "{msg}");
     assert!(!msg.contains("eth_sendTransaction"), "{msg}");
+    assert!(opens.is_empty(), "{opens:?}");
+}
+
+/// The `getPool` answer for a pool the chain holds no record of: a zeroed
+/// struct, whose status reads `Open` because `Open` is enum value 0.
+fn no_record_on_chain() -> Bytes {
+    pool(Address::ZERO, 0, 0).abi_encode().into()
+}
+
+/// Queue the chain calls of a replacement open: the allowance read finds
+/// enough, and the pending-nonce read answers, so the open goes on to submit.
+/// Its gas estimate is left unanswered, so nothing is sent.
+fn answer_a_replacement_open(asserter: &Asserter) {
+    asserter.push_success(&U256::MAX.abi_encode());
+    asserter.push_success(&U256::ZERO);
+}
+
+/// Assert that a recovery step went straight to a replacement open, which the
+/// mock stops at its gas estimate: no `topUp` and no settle estimate ran, and
+/// nothing was signed.
+fn assert_replaced_without_a_top_up(
+    stepped: anyhow::Result<Recovery>,
+    opens: &[OpenUnconfirmed],
+    asserter: &Asserter,
+) {
+    let err = stepped.expect_err("the replacement open reaches the chain");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("submit openPool"),
+        "the step submitted an openPool: {msg}"
+    );
+    assert!(!msg.contains("NotPoolOwner"), "no topUp reverted: {msg}");
+    assert!(msg.contains("eth_estimateGas"), "{msg}");
+    assert!(!msg.contains("eth_sendTransaction"), "{msg}");
+    assert!(
+        asserter.read_q().is_empty(),
+        "the pool read and the open's allowance and nonce reads ran"
+    );
+    assert!(opens.is_empty(), "{opens:?}");
+}
+
+/// #2665: the stored row names a pool the chain holds no record of, as a row
+/// from another deployment does. `getPool` reads a zero owner and the status
+/// `Open`, and a `topUp` would revert `NotPoolOwner`. No run of the command
+/// saw the pool live, so the step opens a replacement, as it does for a closed
+/// pool. Here the run sees the pool short, so it would otherwise top up.
+#[tokio::test]
+async fn a_stored_pool_the_chain_does_not_know_is_replaced() {
+    let asserter = Asserter::new();
+    asserter.push_success(&no_record_on_chain());
+    answer_a_replacement_open(&asserter);
+    let (stepped, opens) = step_on_the_pool(asserter.clone(), None, false, 0).await;
+    assert_replaced_without_a_top_up(stepped, &opens, &asserter);
+}
+
+/// #2665, the settle path: the run sees the unknown pool full, so a step on a
+/// pool the chain knows would only settle. The settle estimate would revert
+/// `NotPoolOwner` and its fallback read would show the zeroed pool `Open`, so
+/// the step would settle on a pool that does not exist. It replaces it.
+#[tokio::test]
+async fn a_full_stored_pool_the_chain_does_not_know_is_replaced() {
+    let asserter = Asserter::new();
+    asserter.push_success(&no_record_on_chain());
+    answer_a_replacement_open(&asserter);
+    let (stepped, opens) = step_on_the_pool(asserter.clone(), None, false, WORKING).await;
+    assert_replaced_without_a_top_up(stepped, &opens, &asserter);
+}
+
+/// A pool a run of this command saw live reads as no record only on a lagging
+/// RPC. A replacement would escrow a second deposit beside it, so the step
+/// keeps the run's view: here the run sees the pool full, and the step
+/// settles.
+#[tokio::test]
+async fn a_pool_the_command_saw_live_is_not_replaced_on_a_lagging_read() {
+    let asserter = Asserter::new();
+    asserter.push_success(&no_record_on_chain());
+    // The settle path's `topUp` gas estimate answers: the pool accepts funds.
+    asserter.push_success(&alloy::primitives::U64::from(50_000u64));
+    let (stepped, opens) = step_on_the_pool(asserter.clone(), None, true, WORKING).await;
+    assert_matches!(stepped.unwrap(), Recovery::ToppedUp(d) if d == U256::from(WORKING));
+    assert!(
+        asserter.read_q().is_empty(),
+        "only the pool read and the estimate ran"
+    );
     assert!(opens.is_empty(), "{opens:?}");
 }
 
@@ -2964,6 +3078,10 @@ async fn an_open_after_an_unrecorded_open_is_refused() {
         "the first build sent its openPool"
     );
     assert!(funding.escrows().pending().is_empty(), "held, not pending");
+    assert!(
+        funding.escrows().saw_live(B256::repeat_byte(0xEE)),
+        "the mined open names its pool live, though its record failed"
+    );
 
     let rpc = ScriptedRpc::mined(mined_open(signer.address(), B256::repeat_byte(0xEF)))
         .answering_calls([Bytes::from(TOKEN.abi_encode())]);

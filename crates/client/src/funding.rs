@@ -404,7 +404,9 @@ impl RunFunding {
 /// `PoolNotOpen`; the owner
 /// then opens a new pool at the working deposit and records it as the current
 /// pool in the buyer store, and the step reports [`Recovery::Replaced`]. The
-/// old pool is not reclaimed here.
+/// old pool is not reclaimed here. A pool the chain holds no record of, and
+/// that no run of the command saw live, is replaced the same way
+/// (`chain_remaining`).
 ///
 /// A delegated signer has no funder this command can ask, so its working
 /// deposit is zero and every step reports [`Recovery::Unavailable`]: the fetch
@@ -463,7 +465,19 @@ where
                 .funding
                 .pool_id()
                 .ok_or_else(|| anyhow::anyhow!("no payment lane is built, so no pool to top up"))?;
-            let (remaining, overdraft) = self.chain_remaining(pool_id, remaining).await;
+            let (remaining, overdraft) = match self.chain_remaining(pool_id, remaining).await {
+                PoolFunds::Held {
+                    remaining,
+                    overdraft,
+                } => (remaining, overdraft),
+                PoolFunds::Gone => {
+                    tracing::info!(
+                        %pool_id,
+                        "the chain holds no record of the stored buyer pool; opening a new pool"
+                    );
+                    return self.replace(pool_id).await;
+                }
+            };
             let additional = self
                 .working_deposit
                 .saturating_sub(remaining)
@@ -500,11 +514,7 @@ where
                         %pool_id,
                         "the current buyer pool no longer accepts funds; opening a new pool"
                     );
-                    let opened = self.open_replacement().await?;
-                    return Ok(Recovery::Replaced(PoolReplaced {
-                        closed: pool_id,
-                        opened,
-                    }));
+                    return self.replace(pool_id).await;
                 }
                 Err(err) => {
                     let short = self
@@ -534,6 +544,22 @@ where
             Ok(Recovery::ToppedUp(new_deposit))
         })
     }
+}
+
+/// A funding recovery step's read of its pool ([`PoolFunder::chain_remaining`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolFunds {
+    /// The pool's remaining deposit, and how far its spend runs past its
+    /// deposit.
+    Held {
+        /// The remaining deposit.
+        remaining: U256,
+        /// The spend past the deposit.
+        overdraft: U256,
+    },
+    /// The chain holds no record of the pool, and no run of this command saw
+    /// it live.
+    Gone,
 }
 
 impl<P> PoolFunder<'_, P>
@@ -567,33 +593,17 @@ where
     /// the run's `remaining` and takes the overdraft from the run's own view:
     /// its lanes' spend past the deposit its store records
     /// ([`Self::local_overdraft`]).
-    async fn chain_remaining(&self, pool_id: PoolId, remaining: U256) -> (U256, U256) {
-        match self.contract.getPool(pool_id).call().await {
-            Ok(pool) if pool.owner == self.owner => {
-                let spent = self
-                    .funding
-                    .pool_spent()
-                    .unwrap_or(U256::ZERO)
-                    .max(U256::from(pool.totalRedeemed));
-                // A lagging RPC can answer from before a top-up the store has
-                // credited, so neither deposit moves the other down.
-                let deposit = U256::from(pool.deposit)
-                    .max(self.recorded_deposit(pool_id).unwrap_or(U256::ZERO));
-                (
-                    remaining.min(deposit.saturating_sub(spent)),
-                    spent.saturating_sub(deposit),
-                )
-            }
-            Ok(pool) => {
-                tracing::warn!(
-                    %pool_id,
-                    chain_owner = %pool.owner,
-                    owner = %self.owner,
-                    "the chain does not show the buyer pool as this wallet's; the funding \
-                     step uses the run's view"
-                );
-                (remaining, self.local_overdraft(pool_id))
-            }
+    ///
+    /// A pool the chain holds no record of ([`PoolStanding::Unknown`]) is
+    /// [`PoolFunds::Gone`] unless a run of this command saw it live
+    /// ([`UnconfirmedEscrows::saw_live`]). Such a pool is a stored row that this
+    /// deployment never opened, and a `topUp` on it reverts `NotPoolOwner`, so
+    /// the step opens a replacement. A pool a run saw live reads so only on a
+    /// lagging RPC. It keeps the run's view, because a replacement would
+    /// escrow a second deposit beside it.
+    async fn chain_remaining(&self, pool_id: PoolId, remaining: U256) -> PoolFunds {
+        let pool = match self.contract.getPool(pool_id).call().await {
+            Ok(pool) => pool,
             Err(error) => {
                 tracing::warn!(
                     %pool_id,
@@ -601,8 +611,72 @@ where
                     "could not read the buyer pool; the funding step uses the run's view and \
                      cannot see other signers' redemptions"
                 );
-                (remaining, self.local_overdraft(pool_id))
+                return self.run_view(pool_id, remaining);
             }
+        };
+        self.funds_on_chain(pool_id, remaining, &pool)
+    }
+
+    /// The step's view of `pool`, as `getPool` read it
+    /// ([`Self::chain_remaining`]).
+    fn funds_on_chain(
+        &self,
+        pool_id: PoolId,
+        remaining: U256,
+        pool: &PaymentPool::Pool,
+    ) -> PoolFunds {
+        match pool_standing(pool, self.owner) {
+            PoolStanding::Open | PoolStanding::NotAccepting => {
+                self.funding.escrows().note_live(pool_id);
+                self.owned_view(pool_id, remaining, pool)
+            }
+            PoolStanding::Unknown if !self.funding.escrows().saw_live(pool_id) => PoolFunds::Gone,
+            PoolStanding::Unknown => {
+                tracing::warn!(
+                    %pool_id,
+                    "the chain holds no record of the buyer pool this command saw open; the \
+                     RPC may lag, so the funding step uses the run's view"
+                );
+                self.run_view(pool_id, remaining)
+            }
+            PoolStanding::Foreign => {
+                tracing::warn!(
+                    %pool_id,
+                    chain_owner = %pool.owner,
+                    owner = %self.owner,
+                    "the chain does not show the buyer pool as this wallet's; the funding \
+                     step uses the run's view"
+                );
+                self.run_view(pool_id, remaining)
+            }
+        }
+    }
+
+    /// The funds of this owner's `pool`, as `getPool` read it: the run's
+    /// `remaining` capped at what the chain shows, with at least
+    /// `totalRedeemed` counted as spent.
+    fn owned_view(&self, pool_id: PoolId, remaining: U256, pool: &PaymentPool::Pool) -> PoolFunds {
+        let spent = self
+            .funding
+            .pool_spent()
+            .unwrap_or(U256::ZERO)
+            .max(U256::from(pool.totalRedeemed));
+        // A lagging RPC can answer from before a top-up the store has
+        // credited, so neither deposit moves the other down.
+        let deposit =
+            U256::from(pool.deposit).max(self.recorded_deposit(pool_id).unwrap_or(U256::ZERO));
+        PoolFunds::Held {
+            remaining: remaining.min(deposit.saturating_sub(spent)),
+            overdraft: spent.saturating_sub(deposit),
+        }
+    }
+
+    /// The run's own view of the pool's funds: its `remaining`, and its
+    /// overdraft ([`Self::local_overdraft`]).
+    fn run_view(&self, pool_id: PoolId, remaining: U256) -> PoolFunds {
+        PoolFunds::Held {
+            remaining,
+            overdraft: self.local_overdraft(pool_id),
         }
     }
 
@@ -653,11 +727,7 @@ where
                 "the current buyer pool holds its working deposit but accepts no more funds; \
                  opening a new pool"
             );
-            let opened = self.open_replacement().await?;
-            return Ok(Recovery::Replaced(PoolReplaced {
-                closed: pool_id,
-                opened,
-            }));
+            return self.replace(pool_id).await;
         }
         // The settle step escrows nothing, so an estimate is safe here: it only
         // names the deposit the nodes are asked again at.
@@ -680,6 +750,17 @@ where
             "the buyer pool already holds its working deposit; waiting for the nodes to see it"
         );
         Ok(Recovery::ToppedUp(deposit))
+    }
+
+    /// Replace `closed`, a pool that takes no more funds, with a new pool
+    /// ([`Self::open_replacement`]).
+    ///
+    /// # Errors
+    ///
+    /// The replacement open fails.
+    async fn replace(&self, closed: PoolId) -> anyhow::Result<Recovery> {
+        let opened = self.open_replacement().await?;
+        Ok(Recovery::Replaced(PoolReplaced { closed, opened }))
     }
 
     /// Open a new pool at the working deposit and record it as the owner's
@@ -1085,7 +1166,7 @@ where
     // A lane of this run already pays from the pool, so its first build read it.
     let tracked = match tracked {
         Some(state) if funding.pool_id() != Some(state.pool_id) => {
-            let kept = still_open(contract, self_address, state).await;
+            let kept = still_open(contract, self_address, funding.escrows(), state).await;
             if let Some(state) = &kept {
                 funding.note_pool(state.pool_id);
             }
@@ -1097,15 +1178,53 @@ where
         (Some(state), _) => Some(state),
         (None, ChainAdoption::Refused) => None,
         (None, ChainAdoption::Allowed) => {
-            adopt_owned_pool(store, contract, self_address, deployment).await?
+            let adopted = adopt_owned_pool(store, contract, self_address, deployment).await?;
+            if let Some(state) = &adopted {
+                funding.escrows().note_live(state.pool_id);
+            }
+            adopted
         }
     })
+}
+
+/// What one `getPool` read says about a pool `owner` tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolStanding {
+    /// `owner`'s pool, open.
+    Open,
+    /// `owner`'s pool, `Closing` or `Closed`: it accepts no more work or funds.
+    NotAccepting,
+    /// The chain holds no record of the pool. `getPool` then reads a zeroed
+    /// struct: a zero owner, and the status `Open`, which is enum value 0. A
+    /// pool opened moments ago reads so on a lagging RPC. So does a stored id
+    /// that this deployment never opened.
+    Unknown,
+    /// Another owner's pool.
+    Foreign,
+}
+
+/// Classify `pool`, as `getPool` read it, for `owner` ([`PoolStanding`]).
+fn pool_standing(pool: &PaymentPool::Pool, owner: Address) -> PoolStanding {
+    if pool.owner == owner {
+        if matches!(pool.status, PaymentPool::Status::Open) {
+            PoolStanding::Open
+        } else {
+            PoolStanding::NotAccepting
+        }
+    } else if pool.owner == Address::ZERO {
+        PoolStanding::Unknown
+    } else {
+        PoolStanding::Foreign
+    }
 }
 
 /// `state` while the chain shows its pool open, or `None` once the chain shows
 /// this owner's pool `Closing` or `Closed`. A failed read, or a pool the chain
 /// holds no record of yet, keeps `state`: a lagging RPC can miss a pool opened
 /// moments ago, and replacing it on that read would escrow a second deposit.
+/// The funding recovery step tells the two apart
+/// ([`PoolFunder::chain_remaining`]), so an open pool is noted live in
+/// `escrows` ([`UnconfirmedEscrows::note_live`]).
 /// An open pool's `state` takes in its on-chain deposit and redeemed spend
 /// ([`BuyerPoolState::reconcile_with_chain`]), so the run's funding counts what
 /// other signers on the pool spent. This is a run's first lane build, so the
@@ -1113,30 +1232,33 @@ where
 async fn still_open<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     self_address: Address,
+    escrows: &UnconfirmedEscrows,
     state: BuyerPoolState,
 ) -> Option<BuyerPoolState>
 where
     P: alloy::providers::Provider + Clone,
 {
     match contract.getPool(state.pool_id).call().await {
-        Ok(pool)
-            if pool.owner == self_address && !matches!(pool.status, PaymentPool::Status::Open) =>
-        {
-            tracing::info!(
-                pool_id = %state.pool_id,
-                status = status_label(pool.status),
-                "the tracked buyer pool no longer accepts work; a new pool replaces it"
-            );
-            None
-        }
-        // The pool is open: take in the top-ups and redemptions of the other
-        // signers that share it, which reach this row only from chain.
-        Ok(pool) if pool.owner == self_address => {
-            let mut state = state;
-            state.reconcile_with_chain(U256::from(pool.deposit), U256::from(pool.totalRedeemed));
-            Some(state)
-        }
-        Ok(_) => Some(state),
+        Ok(pool) => match pool_standing(&pool, self_address) {
+            PoolStanding::NotAccepting => {
+                tracing::info!(
+                    pool_id = %state.pool_id,
+                    status = status_label(pool.status),
+                    "the tracked buyer pool no longer accepts work; a new pool replaces it"
+                );
+                None
+            }
+            // The pool is open: take in the top-ups and redemptions of the other
+            // signers that share it, which reach this row only from chain.
+            PoolStanding::Open => {
+                escrows.note_live(state.pool_id);
+                let mut state = state;
+                state
+                    .reconcile_with_chain(U256::from(pool.deposit), U256::from(pool.totalRedeemed));
+                Some(state)
+            }
+            PoolStanding::Unknown | PoolStanding::Foreign => Some(state),
+        },
         Err(error) => {
             tracing::warn!(
                 pool_id = %state.pool_id,
