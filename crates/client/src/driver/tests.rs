@@ -3433,3 +3433,62 @@ async fn a_streamed_drive_adopts_a_pull_primed_at_its_first_leg() {
         );
     }
 }
+
+/// Under a cap on held bytes, a streamed drive over a store the cap's reach
+/// sizes adopts a pull primed at [`crate::lane_sources::primed_first_leg`]
+/// (#2644): the primed range carries the store's size, not the signed one.
+#[tokio::test]
+async fn a_capped_streamed_drive_adopts_its_primed_first_leg() {
+    use crate::lane_sources::{FirstLeg, primed_first_leg, size_open_span};
+    let pacer = crate::streamer::stream_pacer(0);
+    let window = crate::pacer::PULL_WINDOW_FLOOR;
+    let total = 3 * window + 1234;
+    let cap = 2 * window;
+    let streamed = FirstLeg::Streamed {
+        window: (0, 0),
+        read_ahead: 0,
+    };
+    let (root, plaintext, _) = synth_blob(total as usize);
+    let span = size_open_span(root, streamed, cap).expect("a span");
+    let primed_at = primed_first_leg(streamed, cap, &span, total).expect("the pull is the leg");
+    let store = fresh_store(root, cap);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let primed = PrimedSource::new(
+        ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .capped(cap)
+            .paying(Arc::clone(&ledger)),
+    );
+    let (header, reader) = primed
+        .inner()
+        .open(root, primed_at.clone())
+        .await
+        .expect("priming open");
+    primed.prime_next(root, primed_at, header, reader, tokio::time::Instant::now());
+    let downstream = || super::DownstreamFrontier {
+        served_paid: u64::MAX,
+        serve_demand: 0,
+    };
+    // The drive stops at the cap; only its first leg matters here.
+    let _ = drive(
+        &store,
+        &primed,
+        &pacer,
+        &Arc::new(Mutex::new(healthy_ctx())),
+        &ledger,
+        root,
+        0,
+        0,
+        None,
+        None,
+        Some(&downstream),
+        None,
+    )
+    .await;
+    let opened = primed.inner().opened_ranges();
+    assert_eq!(
+        opened.iter().filter(|&&(start, _)| start == 0).count(),
+        1,
+        "the first leg adopted the primed pull: {opened:?}"
+    );
+}

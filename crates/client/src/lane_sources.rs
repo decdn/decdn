@@ -96,6 +96,65 @@ where
     }
 }
 
+/// The span a size open of `first_leg` pulls for `hash`, or `None` when the
+/// size comes from a whole open: a download, the empty blob, or a window that
+/// holds no byte.
+///
+/// A streamed drive's first leg is cut to its read-ahead window
+/// ([`streamed_first_leg`]). Its end does not depend on the size while the
+/// blob runs past it, so the span is the leg of an unbounded blob. A node
+/// clamps a pull that runs past the end, so on a shorter blob the pull is the
+/// clamped leg. A holder serves the empty blob only as a whole, and refuses
+/// any other range of it.
+pub(crate) fn size_open_span(
+    hash: [u8; 32],
+    first_leg: FirstLeg,
+    max_blob_bytes: u64,
+) -> Option<AlignedRange> {
+    let FirstLeg::Streamed { window, read_ahead } = first_leg else {
+        return None;
+    };
+    if hash == decdn_protocol::EMPTY_ROOT {
+        return None;
+    }
+    streamed_first_leg(
+        &stream_pacer(read_ahead),
+        window,
+        max_blob_bytes,
+        UNBOUNDED_SIZE,
+    )
+}
+
+/// The range the streamed drive's first leg asks for, when the pull of `span`
+/// at the signed `total_bytes` is that leg; `None` otherwise.
+///
+/// The streamer sizes its store at the size the cap on held bytes lets the
+/// window reach ([`crate::scheduler::claim_reach`]), and the leg's range
+/// carries that size, so the range is built against it. The pull is the leg
+/// only when the node served exactly the leg's span: the span clamped to the
+/// signed size.
+pub(crate) fn primed_first_leg(
+    first_leg: FirstLeg,
+    max_blob_bytes: u64,
+    span: &AlignedRange,
+    total_bytes: u64,
+) -> Option<AlignedRange> {
+    let FirstLeg::Streamed { window, read_ahead } = first_leg else {
+        return None;
+    };
+    let store_bytes = total_bytes.min(crate::scheduler::claim_reach(&[window], max_blob_bytes));
+    streamed_first_leg(
+        &stream_pacer(read_ahead),
+        window,
+        max_blob_bytes,
+        store_bytes,
+    )
+    .filter(|leg| {
+        leg.fetch_start() == span.fetch_start()
+            && leg.fetch_end() == span.fetch_end().min(total_bytes)
+    })
+}
+
 /// Open the whole blob for its signed header: a download's first leg, primed
 /// at `align_range(0, 0, n)`, which holds for every `n`.
 ///
@@ -439,14 +498,9 @@ where
     /// header, the pull, and the range the drive's first leg asks for when the
     /// pull is that leg.
     ///
-    /// A download's first leg is the whole blob. A streamed drive's first leg
-    /// is cut to its read-ahead window ([`streamed_first_leg`]), and its end does
-    /// not depend on the size while the blob runs past it, so the open pulls
-    /// the leg of an unbounded blob. A node clamps a pull that runs past the
-    /// end, so on a shorter blob the pull is the clamped leg, which is the
-    /// drive's first leg for that size. A window that starts past the end
-    /// serves nothing ([`is_range_past_end`]), and the size comes from a whole
-    /// open instead.
+    /// The span comes from [`size_open_span`], and the range to prime from
+    /// [`primed_first_leg`]. A window that starts past the end serves nothing
+    /// ([`is_range_past_end`]), and the size comes from a whole open instead.
     ///
     /// # Errors
     ///
@@ -457,12 +511,8 @@ where
         hash: [u8; 32],
         first_leg: FirstLeg,
     ) -> anyhow::Result<(UpstreamPullHeader, PullReader, Option<AlignedRange>)> {
-        let FirstLeg::Streamed { window, read_ahead } = first_leg else {
-            return open_whole_primed(source, hash).await;
-        };
-        let pacer = stream_pacer(read_ahead);
         let max_blob_bytes = self.deps.max_blob_bytes;
-        let Some(span) = streamed_first_leg(&pacer, window, max_blob_bytes, UNBOUNDED_SIZE) else {
+        let Some(span) = size_open_span(hash, first_leg, max_blob_bytes) else {
             return open_whole_primed(source, hash).await;
         };
         let (header, pull) = match source
@@ -473,13 +523,7 @@ where
             Err(e) if is_range_past_end(&e) => return open_whole_primed(source, hash).await,
             Err(e) => return Err(e),
         };
-        let total_bytes = header.total_bytes;
-        // The pull is the drive's first leg only when it covers exactly that
-        // leg's span at the signed size.
-        let range = streamed_first_leg(&pacer, window, max_blob_bytes, total_bytes).filter(|leg| {
-            leg.fetch_start() == span.fetch_start()
-                && leg.fetch_end() == span.fetch_end().min(total_bytes)
-        });
+        let range = primed_first_leg(first_leg, max_blob_bytes, &span, header.total_bytes);
         Ok((header, PullReader::new(pull), range))
     }
 
