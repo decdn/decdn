@@ -5262,7 +5262,10 @@ since project inception and will roll into the first tagged release.
   whose `hostname` differs from `ONRAMP_PUBLIC_URL`'s host or whose `action`
   is not the onramp's. A custom `ONRAMP_GATE_TEMPLATE` must set
   `data-action="{{ACTION}}"` on its Turnstile widget; the onramp refuses to
-  start with a template that lacks the placeholder.
+  start with a template that lacks the placeholder. A siteverify failure
+  caused by the gate itself (a missing or wrong `ONRAMP_TURNSTILE_SECRET`,
+  `bad-request`, `internal-error`) is now the gate's own error, answered
+  `500` and logged at warn, not a silent `403` refusal (#2719).
 
 - **Node: a pool resolved from chain counts its on-chain redemptions toward
   its remaining deposit (GHSA-9x5g-h559-vp5m).** After a restart the pool

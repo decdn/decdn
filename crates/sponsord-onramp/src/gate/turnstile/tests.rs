@@ -72,6 +72,26 @@ async fn failure_json_refuses() {
 }
 
 #[tokio::test]
+async fn an_operator_side_error_code_is_the_gates_own_failure() {
+    for code in OPERATOR_ERROR_CODES {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/siteverify"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": false, "error-codes": [code]})),
+            )
+            .mount(&server)
+            .await;
+        let err = gate(&server)
+            .verify(CLIENT, "token", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(code), "{code}: {err}");
+    }
+}
+
+#[tokio::test]
 async fn missing_or_empty_hostname_or_action_is_refused() {
     for body in [
         serde_json::json!({"success": true}),

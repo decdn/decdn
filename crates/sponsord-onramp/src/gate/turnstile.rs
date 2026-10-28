@@ -45,7 +45,7 @@ impl std::fmt::Debug for TurnstileGate {
     }
 }
 
-// Siteverify omits `hostname` and `action` on failure, so both default.
+// Siteverify may omit every field but `success`, so the others default.
 #[derive(Deserialize)]
 struct SiteVerify {
     success: bool,
@@ -53,7 +53,18 @@ struct SiteVerify {
     hostname: Option<String>,
     #[serde(default)]
     action: Option<String>,
+    #[serde(default, rename = "error-codes")]
+    error_codes: Vec<String>,
 }
+
+/// Siteverify error codes that mean the gate itself is misconfigured or
+/// Cloudflare failed, not that the visitor's token is bad.
+const OPERATOR_ERROR_CODES: &[&str] = &[
+    "missing-input-secret",
+    "invalid-input-secret",
+    "bad-request",
+    "internal-error",
+];
 
 impl TurnstileGate {
     /// A gate verifying against Cloudflare with `secret`, rendering
@@ -122,6 +133,14 @@ impl Gate for TurnstileGate {
             .json()
             .await?;
         if !resp.success {
+            if resp
+                .error_codes
+                .iter()
+                .any(|code| OPERATOR_ERROR_CODES.contains(&code.as_str()))
+            {
+                anyhow::bail!("turnstile siteverify failed: {:?}", resp.error_codes);
+            }
+            tracing::debug!(codes = ?resp.error_codes, "turnstile token refused");
             return Ok(false);
         }
         if resp.hostname.as_deref() != Some(self.expected_hostname.as_str()) {
