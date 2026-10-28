@@ -39,8 +39,9 @@
 //!    from a whole-blob open whose pull the download adopts as its first leg
 //!    (#2633): the holders write the blob's wire bytes once, not once for
 //!    the claim and again for the download. The lane that answered the open
-//!    connects with no network work, so it is the only lane in the batch
-//!    the download plans first, and that plan gives it the whole blob.
+//!    starts with no build, before the download polls any other lane's
+//!    build, so the download plans its first leg for that lane alone, and
+//!    that plan gives it the whole blob.
 //! 2. **Cross-process persistence.** The two `decdn get` invocations above
 //!    are separate OS processes sharing only `data_dir` on disk — a passing
 //!    fetch #2 that reused the store already demonstrates this, and this

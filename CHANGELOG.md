@@ -1239,6 +1239,19 @@ since project inception and will roll into the first tagged release.
   covered, so discovery runs only for a range no running or building lane
   covers, or when no source can start. ADR 012 and ADR 039 § Source set and
   selection state the rule.
+- **Client: the lane that answered the size open plans its first leg alone
+  (#2740).** A fetch with no size hint keeps the pull it opened for the size
+  on the lane that answered, for that lane's first leg to adopt. The lane
+  reached the acquire loop as a build, and the loop plans the work across
+  every build that has finished when it looks. When another holder's lane
+  built just as fast, the loop split a download between the two lanes. The
+  answering lane's first leg was then part of the blob, so it closed the kept
+  pull after the holder had written up to a credit window into it, and the
+  legs pulled those bytes again: a small blob was served twice. The loop now
+  starts a lane its provider built before the fetch
+  (`SourceProvider::built`) before it polls any build, so that lane is
+  planned alone and its first leg is the pull it keeps. ADR 039 states the
+  rule.
 - **Node: a recovery `topUp` whose nonce the redeemer took is sent again
   (#2721).** The node signs its sellers' `redeemMany` and its buyer `topUp`
   with one key. A redemption that mined at the nonce the `topUp` had read
