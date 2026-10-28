@@ -312,8 +312,8 @@ export interface PendingRedeem {
 
 export interface EarningsResponse {
   operator_address: string | null;
-  /** The earliest settlement the ledger holds; null while it holds none. */
-  ledger_since_unix: number | null;
+  /** The time the figures cover from: no settlement landed before it is counted. */
+  covered_from_unix: number;
   last_24h: EarningsPeriod;
   last_7d: EarningsPeriod;
   since_ledger_start: EarningsPeriod;

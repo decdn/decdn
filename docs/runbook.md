@@ -993,7 +993,8 @@ different deployment the node deletes its seller lane frontiers, both
 pending-settle sets, the event-scan checkpoints, and the settlement ledger
 `decdn node earnings` reads, because their pool ids repeat on the new
 deployment. Unredeemed vouchers on the old deployment are forfeit after the
-drop, and the earnings history starts over. The old deployment's settlements
+drop, and the earnings history starts over: the `covered_from=<date>` that
+`decdn node earnings` prints is that boot. The old deployment's settlements
 are still on the chain:
 
 ```bash
@@ -1014,8 +1015,9 @@ while a pool this node closed awaits its grace window. Nothing lists the
 pending-settle sets: `decdn_pool_grace_closes_total` counts the closes this
 node holds unredeemed value on, so wait until the dispute deadline of the last
 one has passed. Then stop the node, move `settle.redb` aside and restart: the
-earnings history starts over, and `decdn node earnings --address` still has
-the chain's record.
+earnings history starts over, and `covered_from` reads that boot or the first
+landing the watcher backfills from the downtime before it. `decdn node
+earnings --address` still has the chain's record.
 
 **Before repointing:**
 

@@ -67,12 +67,10 @@ export function NodeEarnings(props: {
               </tr>
             ))}
           </Table>
-          {e.ledger_since_unix === null ? null : (
-            <p className="text-sm text-ink-3">
-              The ledger holds settlements from{" "}
-              {formatWhen(e.ledger_since_unix)} on.
-            </p>
-          )}
+          <p className="text-sm text-ink-3">
+            The figures cover settlements from {formatWhen(e.covered_from_unix)}{" "}
+            on.
+          </p>
           <Pending e={e} />
           <Last e={e} />
         </div>

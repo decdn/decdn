@@ -366,3 +366,96 @@ mod scan {
         assert_eq!(rows.first().map(|r| r.net_micro_usdc), Some(900));
     }
 }
+
+mod response_from_rows {
+    use super::*;
+
+    const FROM_UNIX: u64 = 1_790_000_000;
+    const HEAD_UNIX: u64 = FROM_UNIX + 30 * DAY_SECS;
+
+    fn row(block: u64) -> SettlementRecord {
+        SettlementRecord {
+            block_number: block,
+            log_index: 0,
+            tx_hash: B256::repeat_byte(0xAB),
+            landed_at_unix: 0,
+            epoch: 1,
+            gross_micro_usdc: 1_000,
+            net_micro_usdc: 600,
+            bytes_delivered: 4_096,
+            operator: OPERATOR,
+        }
+    }
+
+    /// Block 10 is the scan's first block, a month before head block 11,
+    /// which holds the only settlement. The coverage starts at block 10's
+    /// time, not at the settlement's, and a `--since` before it keeps its own
+    /// start so the CLI can label it.
+    #[tokio::test]
+    async fn coverage_starts_at_the_first_scanned_block() {
+        let since = FROM_UNIX - 30 * DAY_SECS;
+        // `Asserter` replies in call order: the last row's header, then for
+        // each of the day, week and since cutoffs `hi` (block 11) and one
+        // probe of block 10.
+        let asserter = Asserter::new();
+        for unix in [
+            HEAD_UNIX, HEAD_UNIX, FROM_UNIX, HEAD_UNIX, FROM_UNIX, HEAD_UNIX, FROM_UNIX,
+        ] {
+            asserter.push_success(&block(unix));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let range = ScanRange {
+            from: 10,
+            from_unix: FROM_UNIX,
+            head: 11,
+            head_unix: HEAD_UNIX,
+        };
+        let resp = super::super::response_from_rows(
+            &provider,
+            OPERATOR,
+            vec![row(11)],
+            range,
+            Some(since),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.covered_from_unix, FROM_UNIX);
+        assert_eq!(
+            (
+                resp.since_ledger_start.from_unix,
+                resp.since_ledger_start.settlements
+            ),
+            (FROM_UNIX, 1)
+        );
+        assert_eq!(resp.last_7d.settlements, 1);
+        let custom = resp.since.expect("asked for");
+        assert_eq!((custom.from_unix, custom.settlements), (since, 1));
+        assert_eq!(resp.last_settlement.map(|l| l.at_unix), Some(HEAD_UNIX));
+        assert!(resp.pending.is_none(), "chain mode sees no lane state");
+    }
+
+    /// A scan that finds nothing still reports where it started.
+    #[tokio::test]
+    async fn an_empty_scan_is_covered_from_its_first_block() {
+        // One header read per cutoff: `from` is `head`, so the search reads
+        // `hi` and stops.
+        let asserter = Asserter::new();
+        asserter.push_success(&block(FROM_UNIX));
+        asserter.push_success(&block(FROM_UNIX));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let range = ScanRange {
+            from: 10,
+            from_unix: FROM_UNIX,
+            head: 10,
+            head_unix: FROM_UNIX,
+        };
+        let resp = super::super::response_from_rows(&provider, OPERATOR, Vec::new(), range, None)
+            .await
+            .unwrap();
+        assert_eq!(resp.covered_from_unix, FROM_UNIX);
+        assert_eq!(resp.since_ledger_start.from_unix, FROM_UNIX);
+        assert_eq!(resp.since_ledger_start.settlements, 0);
+        assert_eq!(resp.last_settlement, None);
+    }
+}

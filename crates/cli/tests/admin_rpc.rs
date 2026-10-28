@@ -1190,6 +1190,7 @@ async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
         ledger: ledger as Arc<dyn SettlementLedger>,
         pool_store: store as Arc<dyn PoolStateStore>,
         schedule: RedeemSchedule::default(),
+        ledger_started_at_unix: now - 50 * 86_400,
     });
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
@@ -1203,7 +1204,7 @@ async fn earnings_round_trips_seeded_ledger() -> anyhow::Result<()> {
         resp.operator_address.as_deref(),
         Some(Address::repeat_byte(0xEE).to_string().as_str())
     );
-    assert_eq!(resp.ledger_since_unix, Some(now - 40 * 86_400));
+    assert_eq!(resp.covered_from_unix, now - 50 * 86_400);
     let summary = |p: &decdn_common::admin::EarningsPeriod| (p.net_micro_usdc, p.settlements);
     assert_eq!(summary(&resp.last_24h), (400, 1));
     assert_eq!(summary(&resp.last_7d), (600, 2));

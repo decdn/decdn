@@ -694,41 +694,38 @@ pub(crate) fn write_earnings(
 ) -> io::Result<()> {
     writeln!(
         w,
-        "operator={} ledger_since={}",
+        "operator={} covered_from={}",
         resp.operator_address.as_deref().unwrap_or("(unknown)"),
-        resp.ledger_since_unix.map_or_else(
-            || "(no settlements yet)".to_owned(),
-            civil_time::format_date
-        ),
+        civil_time::format_date(resp.covered_from_unix),
     )?;
     writeln!(
         w,
-        "{:<34} {:>14} {:>14} {:>12}",
+        "{:<42} {:>14} {:>14} {:>12}",
         "PERIOD", "SETTLED_USDC", "BYTES_SETTLED", "SETTLEMENTS",
     )?;
-    let since_ledger = resp.ledger_since_unix.map_or_else(
-        || "since (no settlements yet)".to_owned(),
-        |since| format!("since {}", civil_time::format_date(since)),
-    );
+    let covered_from = resp.covered_from_unix;
     let mut rows = vec![
         (
-            period_label("last 24h", &resp.last_24h, resp.ledger_since_unix),
+            period_label("last 24h", &resp.last_24h, covered_from),
             &resp.last_24h,
         ),
         (
-            period_label("last 7d", &resp.last_7d, resp.ledger_since_unix),
+            period_label("last 7d", &resp.last_7d, covered_from),
             &resp.last_7d,
         ),
-        (since_ledger, &resp.since_ledger_start),
+        (
+            format!("since {}", civil_time::format_date(covered_from)),
+            &resp.since_ledger_start,
+        ),
     ];
     if let Some(since) = &resp.since {
         let label = format!("since {}", civil_time::format_date(since.from_unix));
-        rows.push((period_label(&label, since, resp.ledger_since_unix), since));
+        rows.push((period_label(&label, since, covered_from), since));
     }
     for (label, period) in rows {
         writeln!(
             w,
-            "{label:<34} {:>14} {:>14} {:>12}",
+            "{label:<42} {:>14} {:>14} {:>12}",
             format_usdc(period.net_micro_usdc),
             human_bytes(period.bytes_settled),
             period.settlements,
@@ -783,15 +780,19 @@ fn write_pending(w: &mut impl io::Write, pending: &PendingRedeem, now_unix: u64)
     Ok(())
 }
 
-/// A period row's label. A period that starts before the ledger does says so,
-/// because the forward-only ledger sums a shorter span than the label names;
-/// `decdn node earnings --address` has the earlier history.
-fn period_label(name: &str, period: &EarningsPeriod, ledger_since_unix: Option<u64>) -> String {
-    match ledger_since_unix {
-        Some(since) if period.from_unix < since => {
-            format!("{name} (ledger from {})", civil_time::format_date(since))
-        }
-        _ => name.to_owned(),
+/// A period row's label. A period that starts before `covered_from_unix` says
+/// so, because the figures sum a shorter span than the label names: the
+/// daemon's ledger is forward-only, and a chain scan starts at its first block.
+/// `decdn node earnings --address` has the earlier history: it scans from the
+/// deployment's first block, or from an earlier `--from-block`.
+fn period_label(name: &str, period: &EarningsPeriod, covered_from_unix: u64) -> String {
+    if period.from_unix < covered_from_unix {
+        format!(
+            "{name} (covered from {})",
+            civil_time::format_date(covered_from_unix)
+        )
+    } else {
+        name.to_owned()
     }
 }
 

@@ -1509,6 +1509,8 @@ mod earnings {
     use super::*;
 
     const NOW: u64 = 1_800_000_000;
+    /// When [`build`]'s ledger started recording: before every row of [`rows`].
+    const STARTED: u64 = NOW - 60 * DAY_SECS;
 
     fn row(block: u64, landed_at: u64, net: u64, gross: u64, bytes: u64) -> SettlementRecord {
         SettlementRecord {
@@ -1539,6 +1541,16 @@ mod earnings {
         operator: Option<Address>,
         since: Option<u64>,
     ) -> EarningsResponse {
+        build_started(rows, lanes, operator, since, STARTED)
+    }
+
+    fn build_started(
+        rows: &[SettlementRecord],
+        lanes: &[LaneState],
+        operator: Option<Address>,
+        since: Option<u64>,
+        started: u64,
+    ) -> EarningsResponse {
         build_earnings_response(
             rows,
             lanes,
@@ -1546,6 +1558,7 @@ mod earnings {
             NOW,
             since,
             &RedeemSchedule::default(),
+            started,
         )
     }
 
@@ -1572,9 +1585,9 @@ mod earnings {
         let all = &resp.since_ledger_start;
         assert_eq!(
             (all.from_unix, all.settlements, all.net_micro_usdc),
-            (NOW - 30 * DAY_SECS, 3, 70)
+            (STARTED, 3, 70)
         );
-        assert_eq!(resp.ledger_since_unix, Some(NOW - 30 * DAY_SECS));
+        assert_eq!(resp.covered_from_unix, STARTED);
         let last = resp.last_settlement.expect("a last settlement");
         assert_eq!(
             (last.block_number, last.net_micro_usdc, last.at_unix),
@@ -1613,10 +1626,39 @@ mod earnings {
         );
     }
 
+    /// The ledger ran for a month before its first settlement, an hour ago:
+    /// the figures are complete from the ledger start, not from that row, so
+    /// no period reads as truncated (#2624).
     #[test]
-    fn an_empty_ledger_has_no_start_and_zero_periods() {
+    fn coverage_starts_when_the_ledger_started_not_at_the_first_row() {
+        let started = NOW - 30 * DAY_SECS;
+        let rows = [row(1, NOW - 3_600, 40, 80, 400)];
+        let resp = build_started(&rows, &[], None, None, started);
+        assert_eq!(resp.covered_from_unix, started);
+        assert_eq!(resp.since_ledger_start.from_unix, started);
+        assert!(resp.last_7d.from_unix >= resp.covered_from_unix);
+    }
+
+    /// The ledger start is wall-clock time and a row's is block time; a row
+    /// stamped before the start moves the coverage back to it.
+    #[test]
+    fn a_row_before_the_ledger_start_moves_coverage_back() {
+        let rows = [row(1, STARTED - 5, 40, 80, 400)];
+        let resp = build(&rows, &[], None, None);
+        assert_eq!(resp.covered_from_unix, STARTED - 5);
+        assert_eq!(
+            (
+                resp.since_ledger_start.from_unix,
+                resp.since_ledger_start.settlements
+            ),
+            (STARTED - 5, 1)
+        );
+    }
+
+    #[test]
+    fn an_empty_ledger_is_covered_from_its_start_with_zero_periods() {
         let resp = build(&[], &[], None, None);
-        assert_eq!(resp.ledger_since_unix, None);
+        assert_eq!(resp.covered_from_unix, STARTED);
         assert_eq!(resp.last_settlement, None);
         let all = &resp.since_ledger_start;
         assert_eq!(
@@ -1626,7 +1668,7 @@ mod earnings {
                 all.net_micro_usdc,
                 all.bytes_settled
             ),
-            (0, 0, 0, 0)
+            (STARTED, 0, 0, 0)
         );
     }
 
@@ -1679,17 +1721,17 @@ mod earnings {
     }
 
     /// After `rotate-key eth` the ledger still holds the old address's rows;
-    /// they are neither summed nor the "since" date nor the last settlement.
+    /// they are neither summed nor the coverage start nor the last settlement.
     #[test]
     fn another_operators_rows_are_left_out() {
         let ours = Address::repeat_byte(0xEE);
-        let mut theirs = row(1, NOW - 30 * DAY_SECS, 1_000, 2_000, 10);
+        let mut theirs = row(1, STARTED - DAY_SECS, 1_000, 2_000, 10);
         theirs.operator = Address::repeat_byte(0x99);
         let mut latest_theirs = row(50, NOW - 10, 1_000, 2_000, 10);
         latest_theirs.operator = Address::repeat_byte(0x99);
         let rows = vec![theirs, row(2, NOW - 3_600, 40, 80, 400), latest_theirs];
         let resp = build(&rows, &[], Some(ours), None);
-        assert_eq!(resp.ledger_since_unix, Some(NOW - 3_600));
+        assert_eq!(resp.covered_from_unix, STARTED);
         assert_eq!(
             (
                 resp.since_ledger_start.settlements,
@@ -1701,6 +1743,7 @@ mod earnings {
         // No operator: nothing can be attributed, so every row counts.
         let all = build(&rows, &[], None, None);
         assert_eq!(all.since_ledger_start.settlements, 3);
+        assert_eq!(all.covered_from_unix, STARTED - DAY_SECS);
     }
 
     #[test]

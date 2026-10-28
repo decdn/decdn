@@ -430,7 +430,7 @@ mod earnings_key {
 
         let resp = EarningsResponse {
             operator_address: None,
-            ledger_since_unix: Some(5),
+            covered_from_unix: 5,
             last_24h: period(1),
             last_7d: period(2),
             since_ledger_start: period(3),
@@ -443,7 +443,7 @@ mod earnings_key {
             summary["earnings"]["since_ledger_start"]["net_micro_usdc"],
             3
         );
-        assert_eq!(summary["earnings"]["ledger_since_unix"], 5);
+        assert_eq!(summary["earnings"]["covered_from_unix"], 5);
         assert!(summary["earnings"]["since"].is_null());
         attach_earnings(&mut summary, &Err("ledger corrupt".to_owned()));
         assert_eq!(summary["earnings"]["error"], "ledger corrupt");

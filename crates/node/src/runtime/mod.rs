@@ -2354,6 +2354,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             ledger: Arc::clone(&infra.settlement_ledger),
             pool_store: Arc::clone(&infra.pool_state_store),
             schedule: ch.payment_service.redeem_schedule(),
+            ledger_started_at_unix: infra.concrete_pool_store.ledger_started_at_unix(),
         })
         // Buyer-pool introspection for `admin_v1_pools` (#2078). The SAME store
         // handle `BuyerPoolService` records into, so the admin surface reports
