@@ -1932,9 +1932,10 @@ fn chunk_redemptions(
 }
 
 /// Redemption policy: whether a lane whose pool has this `status` is worth
-/// submitting now. Fails OPEN on an unknown pool (`None`) — a projection gap
+/// submitting now. An unknown pool (`None`) passes planning: a projection gap
 /// (cold start, reorg, an unfolded event) must never hold a lane and strand real
-/// money; only a positive zero-`remaining` holds. A drained `Open` pool is held
+/// money, and [`resolve_unknown_pools`] reads the pool before any submit. Only a
+/// positive zero-`remaining` holds. A drained `Open` pool is held
 /// (a top-up re-drives it); a drained `Closing` pool is dropped (it cannot be
 /// topped up, so `remaining == 0` is irreversible); a funded `Closing` pool is
 /// redeemable only while its deadline lies more than [`REDEEM_LANDING_SLACK_SECS`]
@@ -1959,7 +1960,7 @@ fn pool_is_redeemable(status: Option<PoolStatus>, now: u64) -> bool {
 
 /// Split candidate lanes into the ones whose pool can pay now and a count of the
 /// ones held/dropped by [`pool_is_redeemable`]. A pool absent from `snapshot` is
-/// `None` (fail open).
+/// `None` and passes, for [`resolve_unknown_pools`] to read before a submit.
 fn partition_redeemable(
     states: Vec<LaneState>,
     snapshot: &HashMap<PoolId, Option<PoolStatus>>,
@@ -2252,9 +2253,10 @@ fn plan_lanes(
     pool_view: &PoolProjection,
     now: u64,
 ) -> Vec<PlannedLane> {
-    // The redeemer's only on-chain-derived gate: hold/drop lanes whose pool cannot
-    // pay, read from the event-fed projection. Fail open on an unknown pool. A
-    // lane's signer-registration status is resolved locally below — no chain read.
+    // Hold/drop lanes whose pool cannot pay, read from the event-fed projection.
+    // An unknown pool passes here; the pre-submit `resolve_unknown_pools` reads it
+    // once a chunk clears the floor. A lane's signer-registration status is
+    // resolved locally below — no chain read.
     let mut snapshot: HashMap<PoolId, Option<PoolStatus>> = HashMap::new();
     for st in &states {
         snapshot
@@ -2371,6 +2373,7 @@ async fn redeem_one<P: Provider + Clone>(
         max_vouchers,
         true,
         metrics,
+        pool_view,
         recorder,
     )
     .await;
@@ -2434,6 +2437,7 @@ async fn redeem_sweep<P: Provider + Clone>(
         max_vouchers,
         strict_flush,
         metrics,
+        pool_view,
         recorder,
     )
     .await
@@ -2902,6 +2906,88 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
     })
 }
 
+/// Read every pool of `plans` the projection does not hold, seed the ones that
+/// can still be redeemed ([`PoolProjection::record_resolved`]), and drop each
+/// lane whose pool cannot pay now ([`pool_is_redeemable`]). The projection learns
+/// pools only from the events it folds and the admit path's reads, so after a
+/// restart a pool opened before it is unknown until one of them reads it. A lane
+/// on a pool that is closed or closing past its deadline reverts the whole
+/// `redeemMany` (`PoolClosed`), and would revert again on every sweep.
+///
+/// Fails closed: a pool whose read faults, or that the chain shows absent or
+/// `Closed`, drops its lanes from this cycle. Returns the kept lanes and whether
+/// a read faulted. Each pool costs one `getPool`, at most
+/// [`REANCHOR_READ_CONCURRENCY`] at once; a seeded pool is then known, so the
+/// read is paid once per pool.
+async fn resolve_unknown_pools<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    plans: Vec<PlannedLane>,
+    pool_view: &PoolProjection,
+    metrics: &Arc<Metrics>,
+) -> (Vec<PlannedLane>, bool) {
+    let unknown: Vec<PoolId> = plans
+        .iter()
+        .map(|plan| plan.pool_id)
+        .filter(|pool_id| pool_view.snapshot(*pool_id).is_none())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut read_failed = false;
+    let mut reads = futures_util::stream::iter(unknown)
+        .map(|pool_id| async move {
+            let call = contract.getPool(pool_id);
+            let read = timed(
+                Some(REANCHOR_RPC_TIMEOUT),
+                "pre-redeem getPool",
+                call.call(),
+            )
+            .await;
+            (pool_id, read)
+        })
+        .buffer_unordered(REANCHOR_READ_CONCURRENCY);
+    while let Some((pool_id, read)) = reads.next().await {
+        match read {
+            Ok(pool) => {
+                if let Some(lifecycle) = resolved_lifecycle(&pool) {
+                    pool_view.record_resolved(
+                        pool.owner,
+                        PoolRead {
+                            pool_id,
+                            deposit: pool.deposit,
+                            total_redeemed: pool.totalRedeemed,
+                            lifecycle,
+                        },
+                    );
+                } else {
+                    debug!(
+                        %pool_id,
+                        "redeemer: pool absent or closed on-chain; its lanes are not submitted"
+                    );
+                }
+            }
+            Err(err) => {
+                read_failed = true;
+                warn!(
+                    stage = "resolve",
+                    error = %sanitize_err_chain(&err),
+                    %pool_id,
+                    "pre-redeem getPool failed; the pool's lanes wait for the next attempt"
+                );
+            }
+        }
+    }
+    let now = unix_now();
+    let (kept, dropped): (Vec<_>, Vec<_>) = plans.into_iter().partition(|plan| {
+        pool_view
+            .snapshot(plan.pool_id)
+            .is_some_and(|status| pool_is_redeemable(Some(status), now))
+    });
+    if !dropped.is_empty() {
+        metrics.redemption_skipped_insolvent_by(dropped.len() as u64);
+    }
+    (kept, read_failed)
+}
+
 /// Chunk planned lanes under the per-chunk floor + voucher-count cap and submit
 /// each chunk. Every caller passes the configured
 /// `blockchain.redeem_threshold_micro_usdc`, which config keeps above zero, so a
@@ -2945,16 +3031,22 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     max_vouchers: usize,
     strict_flush: bool,
     metrics: &Arc<Metrics>,
+    pool_view: &PoolProjection,
     recorder: &SettlementRecorder,
 ) -> bool {
     // Apply the floor on the cached total before any chain read.
     if plans.is_empty() || sum_unredeemed(&plans) < floor {
         return false;
     }
+    // Every submitted lane's pool must be known to the projection and able to
+    // pay: a lane on a pool that is closed, or closing past its deadline,
+    // reverts its whole `redeemMany`.
+    let (plans, resolve_failed) = resolve_unknown_pools(contract, plans, pool_view, metrics).await;
     // Last check before spending gas: reconcile against the on-chain watermark
     // and drop lanes the chain already shows settled, so a lagging cache or a
     // concurrent redeemer can never cost a no-op `redeemMany`.
     let (plans, read_failed) = reconcile_onchain_watermarks(contract, plans, metrics).await;
+    let read_failed = read_failed || resolve_failed;
     let chunks = chunk_redemptions(plans, floor, max_vouchers);
     if chunks.is_empty() {
         return read_failed;

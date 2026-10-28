@@ -5254,6 +5254,19 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: after a restart, the redeemer reads a pool it does not know before
+  it submits that pool's lanes (#2692).** The redeemer's pool view learns a
+  pool only from the events it folds and the admit path's reads, and the
+  watcher resumes at its checkpoint, so a pool opened before a restart stayed
+  unknown. Its lanes were submitted even once the pool was `Closing` past its
+  deadline, reverted `PoolClosed` (taking the whole `redeemMany` with them)
+  and reverted again on every sweep. Once a chunk clears the redemption
+  floor, the redeemer now reads each unknown pool with one `getPool` and
+  seeds the view from it. A lane whose pool is absent, `Closed`, past its
+  close deadline or unreadable stays out of the submit and counts on
+  `decdn_redemption_skipped_insolvent_total`. A failed read counts as a chain
+  fault, so parked lanes stay parked until a clean sweep.
+
 - **Node: the mid-stream signer cap check counts a resolved pool's
   pre-restart spend (#2711).** After a restart the projection seeds a pool it
   has not folded from one `getPool`, and it counts a signer's spend only from

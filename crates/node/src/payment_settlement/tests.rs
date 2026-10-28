@@ -1742,6 +1742,20 @@ fn partition_keeps_redeemable_and_counts_skips() {
 
 /// Build a [`PlannedLane`] for a given pool/signer, with an optional
 /// capability registration, for `group_by_pool` tests.
+/// A projection that holds pools `[1; 32]` to `[4; 32]` open and funded, so a
+/// redemption cycle submits their lanes without a pre-redeem `getPool`.
+fn open_pools() -> PoolProjection {
+    let projection = PoolProjection::new();
+    for pool in 1..=4u8 {
+        projection.record_opened(
+            PoolId::from([pool; 32]),
+            Address::from([1u8; 20]),
+            U256::MAX,
+        );
+    }
+    projection
+}
+
 fn planned(pool: u8, signer: u8, unredeemed: u64, register: bool) -> PlannedLane {
     let signer_addr = Address::from([signer; 20]);
     let reg = register.then(|| PaymentPool::CapabilityReg {
@@ -2372,6 +2386,7 @@ async fn a_sub_floor_plan_set_reads_nothing_from_the_chain() -> Result<()> {
         300,
         true,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -2422,6 +2437,7 @@ async fn a_set_that_clears_the_floor_in_total_reads_every_lane() -> Result<()> {
         2,
         true,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -2462,6 +2478,7 @@ async fn a_zero_floor_still_reads_every_lane() -> Result<()> {
         300,
         false,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -2502,7 +2519,7 @@ fn shutdown_service<P: Provider + Clone + 'static>(
         redeem_threshold,
         redeem_max_vouchers_per_tx: 300,
         metrics,
-        pool_view: PoolProjection::new(),
+        pool_view: open_pools(),
         recorder: test_recorder(),
         backfills: LedgerBackfills::new(test_recorder()),
         schedule: RedeemSchedule::default(),
@@ -2886,7 +2903,7 @@ fn spawn_redeemer<P: Provider + Clone + 'static>(
         margin,
         rx,
         metrics,
-        PoolProjection::new(),
+        open_pools(),
         test_recorder(),
         RedeemSchedule::default(),
     ));
@@ -3397,6 +3414,7 @@ async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Resul
         300,
         true,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -3407,6 +3425,86 @@ async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Resul
         &metrics,
         &[
             "decdn_redemption_reconcile_ok_total 1",
+            "decdn_onchain_tx_send_failed_total 0",
+        ],
+    )
+}
+
+/// #2692: after a restart the projection does not hold a pool opened before it.
+/// The cycle reads that pool before it submits, and a pool closing past its
+/// deadline keeps its lanes out of the `redeemMany`, which would revert
+/// `PoolClosed`. The read seeds the projection, so the next cycle drops the
+/// lanes without reading the pool again.
+#[tokio::test]
+async fn a_lane_on_an_unknown_pool_past_its_close_deadline_is_not_submitted() -> Result<()> {
+    use alloy::sol_types::SolValue;
+
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let projection = PoolProjection::new();
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&Bytes::from(
+        pool(Address::from([7u8; 20]), PaymentPool::Status::Closing, 1).abi_encode(),
+    ));
+
+    for _ in 0..2 {
+        let faulted = redeem_planned_lanes(
+            &contract,
+            &store,
+            vec![planned(1, 0, 1_000, false)],
+            SELLER,
+            U256::from(1u64),
+            300,
+            true,
+            &metrics,
+            &projection,
+            &test_recorder(),
+        )
+        .await;
+        anyhow::ensure!(!faulted, "a dropped lane is not a chain fault");
+    }
+
+    assert_eq!(asserter.read_q().len(), 0, "the pool was read once");
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_redemption_skipped_insolvent_total 2",
+            "decdn_redemption_reconcile_ok_total 0",
+            "decdn_redemption_reconcile_failures_total 0",
+            "decdn_onchain_tx_send_failed_total 0",
+        ],
+    )
+}
+
+/// #2692: a pool the cycle cannot read keeps its lanes out of the
+/// `redeemMany` and reports a chain fault, so a parked lane stays parked.
+#[tokio::test]
+async fn a_failed_pre_redeem_pool_read_holds_the_lane() -> Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    // Nothing queued: the `getPool` fails.
+    let (contract, _asserter) = mocked_contract();
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 1_000, false)],
+        SELLER,
+        U256::from(1u64),
+        300,
+        true,
+        &metrics,
+        &PoolProjection::new(),
+        &test_recorder(),
+    )
+    .await;
+
+    anyhow::ensure!(faulted, "a failed pool read is a chain fault");
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_redemption_skipped_insolvent_total 1",
+            "decdn_redemption_reconcile_ok_total 0",
             "decdn_onchain_tx_send_failed_total 0",
         ],
     )
@@ -3463,6 +3561,7 @@ async fn a_redeem_send_with_no_answer_is_possibly_broadcast() -> Result<()> {
         300,
         false,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -3521,6 +3620,7 @@ async fn redeem_after_failed_sends(
         300,
         false,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -3678,6 +3778,7 @@ async fn a_redeem_whose_gas_fill_fails_is_refused() -> Result<()> {
         300,
         false,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -3714,6 +3815,7 @@ async fn a_failed_read_stays_a_chain_fault_past_a_failed_strict_flush() -> Resul
         300,
         true,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -4550,6 +4652,7 @@ mod settlement_ledger_rows {
             300,
             false,
             &metrics,
+            &open_pools(),
             &recorder,
         )
         .await;
