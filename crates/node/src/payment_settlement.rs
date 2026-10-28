@@ -74,6 +74,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alloy::contract::Error as ContractError;
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
@@ -87,6 +88,7 @@ use decdn_incentive::{
     CheckpointKey, KeyedCheckpointStore, LaneKey, LaneState, PoolId, PoolStateStore,
     SettlementLedger, StoreError,
 };
+use futures_util::StreamExt as _;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{Instrument as _, debug, error, info, warn};
@@ -98,7 +100,7 @@ use crate::chain_events::{REORG_MARGIN_BLOCKS, timed};
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
-use crate::pool_view::{Lifecycle, PoolProjection, PoolStatus};
+use crate::pool_view::{Lifecycle, PoolProjection, PoolRead, PoolStatus};
 use crate::settlement_ledger::{LedgerBackfills, SettlementRecorder};
 use decdn_incentive::payment_pool::SignerAuthorization;
 
@@ -530,6 +532,8 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             pool_view: pool_view.clone(),
             contract: contract.clone(),
             backfills: backfills.clone(),
+            reanchor_cursor: None,
+            applied_through: 0,
         };
         let route = Route {
             addresses: vec![payment_pool_addr],
@@ -802,20 +806,32 @@ struct PoolSettlementSink<P: Provider + Clone> {
     /// `PoolRedeemed` for EVERY provider (pool-wide `totalRedeemed`),
     /// `PoolCloseInitiated` (mark `Closing` with its deadline), and `PoolReclaimed`
     /// (drop) into the projection so a serve request reads `{owner, remaining}`
-    /// in-memory rather than through a `getPool` `eth_call`.
+    /// in-memory rather than through a `getPool` `eth_call`. At the end of each
+    /// tick it re-reads the snapshot-seeded pools that are pending
+    /// (`reanchor_pools`).
     pool_view: PoolProjection,
-    /// The `PaymentPool` instance; the backfill's receipt and header reads
-    /// ride its provider.
+    /// The `PaymentPool` instance; the backfill's receipt and header reads and
+    /// the end-of-tick re-anchor reads ride its provider.
     contract: PaymentPool::PaymentPoolInstance<P>,
     /// Backfills a settlement ledger row (#2598) for an own-provider
     /// `PoolRedeemed` whose `redeemMany` the redeemer never saw land, each on
     /// its own task; the service drains them at shutdown.
     backfills: LedgerBackfills,
+    /// The last pool `reanchor_pools` attempted, so the next tick starts after it
+    /// and every pending pool gets its turn.
+    reanchor_cursor: Option<B256>,
+    /// The highest block of any log this sink has applied, including logs for a
+    /// pool the projection did not hold yet. A re-anchor read pinned below it
+    /// could miss such a log, so `reanchor_pools` skips it.
+    applied_through: u64,
 }
 
 impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
-    #[allow(clippy::cognitive_complexity)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     async fn apply(&mut self, log: Log) -> Result<()> {
+        if let Some(block) = log.block_number {
+            self.applied_through = self.applied_through.max(block);
+        }
         match log.topic0().copied() {
             Some(sig) if sig == PaymentPool::PoolOpened::SIGNATURE_HASH => {
                 // Projection-only: `PoolOpened` seeds the serve path's owner +
@@ -844,8 +860,12 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
                 // solvency projection records this event before the own-provider
                 // filter below — the serve path's `remaining` must reflect other
                 // nodes' redemptions against the same pool, not just this node's.
-                self.pool_view
-                    .record_redeemed(event.poolId, event.provider, &event.lanes);
+                self.pool_view.record_redeemed(
+                    event.poolId,
+                    event.provider,
+                    &event.lanes,
+                    log.block_number,
+                );
                 // Not enough to filter on the event signature — `provider` is
                 // an indexed topic but the OR-set filter cannot pin it, so
                 // confirm it names this node before recording the paid watermark.
@@ -899,7 +919,8 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
                 };
                 // Raise the serve path's projected deposit so the solvency gate
                 // reserves against the topped-up balance, not the stale one.
-                self.pool_view.record_topup(event.poolId, event.newDeposit);
+                self.pool_view
+                    .record_topup(event.poolId, event.newDeposit, log.block_number);
                 // A top-up may re-open lanes a dry pool left `owed > paid`.
                 // Re-drive by hinting the redeemer for each of the pool's lanes
                 // this node provides.
@@ -951,6 +972,181 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
         }
         Ok(())
     }
+
+    /// Re-read the pools the admit path seeded, and the snapshots a redemption
+    /// left stale, at a pinned block. Every log of the tick is folded by now, so
+    /// the read sees every event the projection holds; a read from a backend
+    /// behind them is skipped (see `PoolProjection::reanchor`).
+    async fn on_tick_complete(&mut self) -> Result<()> {
+        reanchor_pools(
+            &self.contract,
+            &self.pool_view,
+            &mut self.reanchor_cursor,
+            self.applied_through,
+        )
+        .await;
+        Ok(())
+    }
+}
+
+/// Cap on the pools [`reanchor_pools`] reads in one tick, bounding the RPCs and
+/// the time it holds the shared poller. Pools past the cap take their turn on
+/// later ticks, and until then their `remaining` errs toward serving (see
+/// `pool_view::Snapshot`).
+const REANCHOR_POOLS_PER_TICK: usize = 64;
+
+/// How many re-anchor `getPool` reads run at once.
+const REANCHOR_READ_CONCURRENCY: usize = 8;
+
+/// Bound on each re-anchor RPC. The reads run on the poller every watcher
+/// shares. A hung endpoint holds it for two of these per tick: the block
+/// number, then one wave of reads, whose first fault stops the batch. A slow
+/// endpoint that still answers holds it for at most one bound per wave of
+/// [`REANCHOR_READ_CONCURRENCY`] reads.
+const REANCHOR_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Read the pools `projection` has pending at one block and anchor them there
+/// ([`PoolProjection::reanchor`]); forget a pool the read finds `Closed`.
+///
+/// The turn rotates: the batch starts after `cursor`, the last pool attempted
+/// on an earlier tick. The first fault stops the batch and leaves the rest for
+/// the next tick, so a hung endpoint costs one [`REANCHOR_RPC_TIMEOUT`] wave
+/// and never puts the watcher into backoff. A pool absent at the pinned block
+/// (a backend behind the admit read, or an open a reorg dropped) stays pending.
+///
+/// A block number below `applied_through`, the highest log block the sink has
+/// applied, comes from a backend behind the watcher: a read there could miss a
+/// redemption the watcher dropped while the pool was not yet in the projection.
+/// The tick then reads nothing and every pool stays pending.
+async fn reanchor_pools<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    projection: &PoolProjection,
+    cursor: &mut Option<B256>,
+    applied_through: u64,
+) {
+    let pending = projection.pending_rereads();
+    if pending.is_empty() {
+        return;
+    }
+    let Some(block) = reanchor_block(contract, pending.len(), applied_through).await else {
+        return;
+    };
+    let batch = reanchor_batch(&pending, *cursor);
+    let (anchored, closed) = read_reanchor_batch(contract, batch, block, cursor).await;
+    projection.reanchor(block, &anchored);
+    for pool_id in closed {
+        debug!(%pool_id, block, "pool re-anchor: pool closed; forgetting");
+        projection.forget(pool_id);
+    }
+}
+
+/// The block a re-anchor tick pins its reads at, or `None` when the read faults
+/// or the answer is behind `applied_through`; the pending pools then wait for
+/// the next tick.
+async fn reanchor_block<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    pending: usize,
+    applied_through: u64,
+) -> Option<u64> {
+    let block = match timed(
+        Some(REANCHOR_RPC_TIMEOUT),
+        "re-anchor block number",
+        contract.provider().get_block_number(),
+    )
+    .await
+    {
+        Ok(block) => block,
+        Err(err) => {
+            warn!(
+                error = %sanitize_err_chain(&err),
+                pools = pending,
+                "pool re-anchor: block number read failed; retrying next tick"
+            );
+            return None;
+        }
+    };
+    if block < applied_through {
+        debug!(
+            block,
+            applied_through, "pool re-anchor: block number behind the watcher; retrying next tick"
+        );
+        return None;
+    }
+    Some(block)
+}
+
+/// Read `batch` at `block`, at most [`REANCHOR_READ_CONCURRENCY`] at once and in
+/// order, stopping at the first fault. Returns the reads to anchor and the pools
+/// found `Closed`, and moves `cursor` to the last pool attempted.
+async fn read_reanchor_batch<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    batch: Vec<B256>,
+    block: u64,
+    cursor: &mut Option<B256>,
+) -> (Vec<PoolRead>, Vec<B256>) {
+    let mut reads = futures_util::stream::iter(batch)
+        .map(|pool_id| async move { (pool_id, read_pool_at(contract, pool_id, block).await) })
+        .buffered(REANCHOR_READ_CONCURRENCY);
+    let mut anchored = Vec::new();
+    let mut closed = Vec::new();
+    while let Some((pool_id, read)) = reads.next().await {
+        // A faulted pool moves the cursor too, so a pool whose read keeps
+        // failing cannot hold back the pools behind it.
+        *cursor = Some(pool_id);
+        let pool = match read {
+            Ok(pool) => pool,
+            Err(err) => {
+                warn!(
+                    error = %sanitize_err_chain(&err),
+                    %pool_id,
+                    block,
+                    "pool re-anchor: getPool failed; retrying next tick"
+                );
+                break;
+            }
+        };
+        if matches!(pool.status, PaymentPool::Status::Closed) {
+            closed.push(pool_id);
+        } else if let Some(lifecycle) = resolved_lifecycle(&pool) {
+            anchored.push(PoolRead {
+                pool_id,
+                deposit: pool.deposit,
+                total_redeemed: pool.totalRedeemed,
+                lifecycle,
+            });
+        } else {
+            debug!(%pool_id, block, "pool re-anchor: pool absent at the pinned block; retrying");
+        }
+    }
+    (anchored, closed)
+}
+
+/// The pools of one re-anchor tick: up to [`REANCHOR_POOLS_PER_TICK`] of the
+/// sorted `pending`, starting after `cursor` and wrapping around.
+fn reanchor_batch(pending: &[B256], cursor: Option<B256>) -> Vec<B256> {
+    let start = cursor.map_or(0, |cursor| pending.partition_point(|id| *id <= cursor));
+    pending
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(pending.len().min(REANCHOR_POOLS_PER_TICK))
+        .copied()
+        .collect()
+}
+
+/// `getPool(pool_id)` pinned at `block`, bounded by [`REANCHOR_RPC_TIMEOUT`].
+async fn read_pool_at<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    pool_id: B256,
+    block: u64,
+) -> Result<PaymentPool::Pool> {
+    let call = contract.getPool(pool_id);
+    timed(
+        Some(REANCHOR_RPC_TIMEOUT),
+        "re-anchor getPool",
+        call.call().block(BlockId::Number(block.into())),
+    )
+    .await
 }
 
 impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
@@ -1038,13 +1234,16 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
 ///
 /// The serve gates read `{owner, remaining}` from the event-fed [`PoolProjection`]
 /// the settlement watcher folds, so the common case costs no `eth_call`. A pool
-/// the projection has not observed is the hard case: a pool opened before this
-/// node's `ColdStart::Head` anchor never appears in the forward-only `PoolOpened`
-/// scan, so its owner is absent from the projection even though the pool is live.
+/// the projection has not observed is the hard case: a pool opened before the
+/// watcher's scan start (the head on a first boot, the rewound checkpoint after a
+/// restart) never appears in the forward-only `PoolOpened` scan, so its owner is
+/// absent from the projection even though the pool is live.
 /// Rather than fail open on that gap, [`status`](crate::pool_view::PoolView::status) does ONE `getPool` at
-/// admission — a read the admission path tolerates (it may block) — folds a
-/// servable pool into the projection, and refuses an absent, closed, or faulted
-/// pool. Every admit-path chain read (`getPool` and the signer's
+/// admission — a read the admission path tolerates (it may block) — seeds a
+/// servable pool into the projection with its on-chain `totalRedeemed`, and
+/// refuses an absent, closed, or faulted pool. The settlement watcher re-reads
+/// that seed at a pinned block at the end of its tick (`reanchor_pools`).
+/// Every admit-path chain read (`getPool` and the signer's
 /// `getAuthorization`) runs under `chain_events::timed`'s default bound, so a
 /// hung read times out and takes the fault path instead of stalling admission.
 /// The client re-sends its capability on its next request (the documented
@@ -1135,10 +1334,11 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
 }
 
 impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
-    /// Read `pool_id` on-chain once and record the result: fold a servable pool
-    /// into the projection, or negative-cache an absent / `Closed` pool as a
-    /// [`NegativeReason::Verdict`] and a failed read as a
-    /// [`NegativeReason::Fault`]. The caller holds the pool's [`ReadSlot::Lead`].
+    /// Read `pool_id` on-chain once and record the result: seed a servable pool
+    /// into the projection as an unanchored snapshot of its `deposit` and
+    /// `totalRedeemed` ([`PoolProjection::record_resolved`]), or negative-cache
+    /// an absent / `Closed` pool as a [`NegativeReason::Verdict`] and a failed
+    /// read as a [`NegativeReason::Fault`]. The caller holds the pool's [`ReadSlot::Lead`].
     async fn resolve(&self, pool_id: B256) -> Option<PoolStatus> {
         // Bounded: the alloy HTTP provider sets no timeout of its own, so a hung
         // read times out here and takes the fault path below.
@@ -1168,8 +1368,15 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
             remember_negative(&mut guard, pool_id, NegativeReason::Verdict);
             return None;
         };
-        self.projection
-            .record_resolved(pool_id, pool.owner, U256::from(pool.deposit), lifecycle);
+        self.projection.record_resolved(
+            pool.owner,
+            PoolRead {
+                pool_id,
+                deposit: pool.deposit,
+                total_redeemed: pool.totalRedeemed,
+                lifecycle,
+            },
+        );
         // The pool resolved: drop its lapsed negative entry. The projection
         // answers for it from here on.
         {
