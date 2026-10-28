@@ -21,7 +21,9 @@
 //!   start: the head on a first boot, the rewound checkpoint after a restart), does ONE
 //!   `getPool` to confirm the pool exists and is solvent BEFORE a serve is
 //!   admitted. An absent, closed, or errored pool yields `None` and the admit gate
-//!   refuses — it does not fail open.
+//!   refuses — it does not fail open. That read seeds a provisional snapshot of
+//!   the pool's `totalRedeemed`, which the settlement watcher re-anchors at a
+//!   pinned block at the end of its tick ([`PoolProjection::reanchor`]).
 //! - **Mid-stream** ([`PoolView::cached_status`]) MUST NOT block: it reads the
 //!   projection only. An admitted stream's pool was seeded at admission and a
 //!   projection entry persists until the pool is forgotten (a `PoolReclaimed`
@@ -173,12 +175,16 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
 struct PoolEntry {
     /// The pool owner, from `PoolOpened`.
     owner: Address,
-    /// The current on-chain `deposit` (token base units): set by `PoolOpened`, then
-    /// re-set to `newDeposit` by each `PoolToppedUp`.
+    /// The current on-chain `deposit` (token base units): the highest of the
+    /// `PoolOpened` deposit, each `PoolToppedUp` `newDeposit` and a snapshot read.
+    /// The on-chain deposit only rises, so the maximum is the latest value and a
+    /// replayed older log never lowers it.
     deposit: u64,
-    /// `Σ` of every lane's latest `newPaidCumulative` across all providers. This
-    /// equals on-chain `totalRedeemed`, which accumulates only per-lane deltas — so
-    /// summing each lane's *latest* cumulative reconstructs the same total.
+    /// `Σ` of every folded lane's latest `newPaidCumulative` across all providers.
+    /// On-chain `totalRedeemed` accumulates only per-lane deltas, so for a pool
+    /// folded from its `PoolOpened` this is exactly `totalRedeemed`. For a pool
+    /// seeded from a snapshot it counts only the lanes the watcher has seen, which
+    /// is a lower bound; [`Self::snapshot`] carries the rest.
     total_redeemed: u64,
     /// Each `(signer, provider)` lane's latest paid cumulative, so a re-delivered
     /// `PoolRedeemed` (watcher retry / reorg rewind) folds only the positive
@@ -194,13 +200,53 @@ struct PoolEntry {
     /// The pool's lifecycle: `Open` by default, `Closing { deadline }` after a
     /// `PoolCloseInitiated`. `PoolReclaimed` removes the whole entry.
     lifecycle: Lifecycle,
+    /// The on-chain `totalRedeemed` read for a pool the projection did not fold
+    /// from its `PoolOpened`. `None` for a pool folded from its `PoolOpened`.
+    snapshot: Option<Snapshot>,
+}
+
+/// A `getPool` read of `totalRedeemed` for a pool whose redemption history lies
+/// below the watcher's scan start, plus the redemptions folded after it.
+///
+/// The lane fold cannot count such a pool on its own. A lane's first folded
+/// `PoolRedeemed` has no baseline, so its `newPaidCumulative` cannot be split
+/// into history the read already counts and a new advance. The snapshot counts
+/// an advance only when it is certain of it: an event above the anchor block, on
+/// a lane with a folded baseline. An event above the anchor on a lane with no
+/// baseline drops the anchor, and the settlement watcher reads the pool again at
+/// the end of its tick.
+///
+/// `snapshot.redeemed + snapshot.since` therefore never exceeds on-chain
+/// `totalRedeemed`, and neither does the lane fold, so `remaining` errs only
+/// toward serving. The error lasts from an admit-path seed or an unbaselined
+/// redemption until the watcher's next clean tick re-anchors the pool, and
+/// through a re-anchor read that faults, which the next clean tick retries. A
+/// reorg that drops redemptions at or below the anchor block over-counts until
+/// the next re-anchor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Snapshot {
+    /// On-chain `totalRedeemed` at the read.
+    redeemed: u64,
+    /// The block the read is pinned at. `None` until the watcher re-anchors an
+    /// admit-path seed, which reads at an unknown block, and after a redemption
+    /// the snapshot cannot attribute.
+    anchor: Option<u64>,
+    /// `Σ` of the lane advances folded above `anchor`.
+    since: u64,
+    /// The highest block of a `PoolRedeemed` folded into the entry. A re-anchor
+    /// read pinned below it would count those redemptions twice, so it is ignored.
+    folded_through: u64,
 }
 
 impl PoolEntry {
     fn status(&self) -> PoolStatus {
+        let redeemed = self.snapshot.map_or(self.total_redeemed, |snapshot| {
+            self.total_redeemed
+                .max(snapshot.redeemed.saturating_add(snapshot.since))
+        });
         PoolStatus {
             owner: self.owner,
-            remaining: U256::from(self.deposit.saturating_sub(self.total_redeemed)),
+            remaining: U256::from(self.deposit.saturating_sub(redeemed)),
             lifecycle: self.lifecycle,
         }
     }
@@ -253,43 +299,57 @@ impl PoolProjection {
     }
 
     /// Apply a `PoolOpened(poolId, owner, deposit)`: record the owner and the
-    /// initial deposit. Absolute, so a re-delivered log is idempotent. The deposit
-    /// is a `uint256` on the wire but a `uint64` on-chain; an out-of-range value
-    /// (impossible by construction) saturates to `u64::MAX`, which over-states
-    /// remaining and so fails toward serving — the fail-open direction.
+    /// initial deposit. Monotone, so a re-delivered log is idempotent and never
+    /// lowers a later deposit. The deposit is a `uint256` on the wire but a
+    /// `uint64` on-chain; an out-of-range value (impossible by construction)
+    /// saturates to `u64::MAX`, which over-states remaining and so fails toward
+    /// serving — the fail-open direction.
     pub fn record_opened(&self, pool_id: B256, owner: Address, deposit: U256) {
         self.update(|pools| {
             let entry = pools.entry(pool_id).or_default();
             entry.owner = owner;
-            entry.deposit = u64::try_from(deposit).unwrap_or(u64::MAX);
+            entry.deposit = entry
+                .deposit
+                .max(u64::try_from(deposit).unwrap_or(u64::MAX));
         });
     }
 
-    /// Apply a `PoolToppedUp(poolId, _, newDeposit)`: `deposit = newDeposit`.
-    /// Absolute, so idempotent. Skipped for a pool never opened in the projection's
-    /// scan window — there is no owner to serve, and the serve gate fails open.
+    /// Apply a `PoolToppedUp(poolId, _, newDeposit)`: raise `deposit` to
+    /// `newDeposit`. Monotone, so idempotent. Skipped for a pool never opened in
+    /// the projection's scan window — there is no owner to serve, and the serve
+    /// gate fails open.
     pub fn record_topup(&self, pool_id: B256, new_deposit: U256) {
         if !self.pools.load().contains_key(&pool_id) {
             return;
         }
         self.update(|pools| {
             if let Some(entry) = pools.get_mut(&pool_id) {
-                entry.deposit = u64::try_from(new_deposit).unwrap_or(u64::MAX);
+                entry.deposit = entry
+                    .deposit
+                    .max(u64::try_from(new_deposit).unwrap_or(u64::MAX));
             }
         });
     }
 
-    /// Apply a `PoolRedeemed(poolId, provider, lanes)` for ANY provider: fold each
-    /// lane's positive advance into `total_redeemed`, matching on-chain
-    /// `totalRedeemed += Σ delta`. Monotone and idempotent — a replayed event
-    /// advances no lane and adds nothing. Skipped for a pool the projection has not
-    /// opened (a redemption whose `PoolOpened` predates the scan window): without a
-    /// deposit there is no remaining to reserve, and the serve gate fails open.
+    /// Apply a `PoolRedeemed(poolId, provider, lanes)` for ANY provider, mined in
+    /// `block`: fold each lane's positive advance into `total_redeemed`, matching
+    /// on-chain `totalRedeemed += Σ delta`. Monotone and idempotent — a replayed
+    /// event advances no lane and adds nothing. Skipped for a pool the projection
+    /// has not opened (a redemption whose `PoolOpened` predates the scan window):
+    /// without a deposit there is no remaining to reserve, and the serve gate fails
+    /// open.
+    ///
+    /// For a pool seeded from a snapshot, an advance above the anchor block on a
+    /// lane with a folded baseline also adds to the snapshot. An event at or below
+    /// the anchor only sets lane baselines, because the read already counts it. An
+    /// advance above the anchor on a lane with no baseline, or an event with no
+    /// block, drops the anchor.
     pub fn record_redeemed(
         &self,
         pool_id: B256,
         provider: Address,
         lanes: &[PaymentPool::LaneSettled],
+        block: Option<u64>,
     ) {
         if !self.pools.load().contains_key(&pool_id) {
             return;
@@ -298,17 +358,36 @@ impl PoolProjection {
             let Some(entry) = pools.get_mut(&pool_id) else {
                 return;
             };
+            let mut snapshot = entry.snapshot;
+            if let Some(snapshot) = snapshot.as_mut() {
+                match block {
+                    Some(block) => snapshot.folded_through = snapshot.folded_through.max(block),
+                    None => snapshot.anchor = None,
+                }
+            }
             for lane in lanes {
                 let key = (lane.signer, provider);
-                let prev = entry.lanes.get(&key).copied().unwrap_or(0);
+                let baseline = entry.lanes.get(&key).copied();
+                let prev = baseline.unwrap_or(0);
                 if lane.newPaidCumulative > prev {
                     let delta = lane.newPaidCumulative - prev;
                     entry.total_redeemed = entry.total_redeemed.saturating_add(delta);
                     let signer_total = entry.signer_spent.entry(lane.signer).or_insert(0);
                     *signer_total = signer_total.saturating_add(delta);
                     entry.lanes.insert(key, lane.newPaidCumulative);
+                    if let Some(snapshot) = snapshot.as_mut()
+                        && let (Some(anchor), Some(block)) = (snapshot.anchor, block)
+                        && block > anchor
+                    {
+                        if baseline.is_some() {
+                            snapshot.since = snapshot.since.saturating_add(delta);
+                        } else {
+                            snapshot.anchor = None;
+                        }
+                    }
                 }
             }
+            entry.snapshot = snapshot;
         });
     }
 
@@ -356,20 +435,17 @@ impl PoolProjection {
     ///
     /// Inserts ONLY IF the pool is still absent, so a concurrent event fold — the
     /// projection's authoritative writer — always wins and this never clobbers a
-    /// live entry. `deposit` is the pool's FULL cumulative `getPool.deposit` (not
-    /// its remaining), seeded with `total_redeemed == 0`, exactly as
-    /// [`Self::record_opened`] seeds an event-observed open: the projection then
-    /// rebuilds `total_redeemed` from post-seed `PoolRedeemed` deltas off a zero
-    /// per-lane baseline, so no redemption is ever double-counted. Redemptions that
-    /// predate the snapshot are simply not folded, which only OVER-states
-    /// `remaining` — the fail-toward-serving direction this module commits to. An
-    /// out-of-range deposit (impossible by construction) saturates to `u64::MAX`,
-    /// the same fail-open direction as [`Self::record_opened`].
+    /// live entry. `deposit` and `total_redeemed` are the pool's `getPool.deposit`
+    /// and `getPool.totalRedeemed`. The read's block is unknown, so the seed is an
+    /// unanchored snapshot: `remaining` counts every redemption up to the read
+    /// from the first admission on, and the settlement watcher re-anchors the pool
+    /// at a pinned block at the end of its tick ([`Self::reanchor`]).
     pub fn record_resolved(
         &self,
         pool_id: B256,
         owner: Address,
-        deposit: U256,
+        deposit: u64,
+        total_redeemed: u64,
         lifecycle: Lifecycle,
     ) {
         // Fast path: a pool already known (a race where an event fold inserted
@@ -387,14 +463,66 @@ impl PoolProjection {
                 pool_id,
                 PoolEntry {
                     owner,
-                    deposit: u64::try_from(deposit).unwrap_or(u64::MAX),
+                    deposit,
                     total_redeemed: 0,
                     lanes: HashMap::new(),
                     signer_spent: HashMap::new(),
                     lifecycle,
+                    snapshot: Some(Snapshot {
+                        redeemed: total_redeemed,
+                        ..Snapshot::default()
+                    }),
                 },
             );
         });
+    }
+
+    /// Anchor a snapshot-seeded pool at a `getPool` read pinned at `block`: set its
+    /// `totalRedeemed` from the read, raise its deposit to the read's, take a
+    /// `Closing` lifecycle from the read, and restart the count of advances above
+    /// it. A no-op for a pool folded from its `PoolOpened`, for a
+    /// pool no longer in the projection, and for a read pinned below a redemption
+    /// already folded into the entry, which the read would then count twice.
+    pub fn reanchor(
+        &self,
+        pool_id: B256,
+        deposit: u64,
+        total_redeemed: u64,
+        lifecycle: Lifecycle,
+        block: u64,
+    ) {
+        self.update(|pools| {
+            let Some(entry) = pools.get_mut(&pool_id) else {
+                return;
+            };
+            let Some(snapshot) = entry.snapshot.as_mut() else {
+                return;
+            };
+            if block < snapshot.folded_through {
+                return;
+            }
+            snapshot.redeemed = total_redeemed;
+            snapshot.anchor = Some(block);
+            snapshot.since = 0;
+            entry.deposit = entry.deposit.max(deposit);
+            // A pool never returns to `Open`, so a read from a lagging backend
+            // does not undo a folded `PoolCloseInitiated`.
+            if matches!(lifecycle, Lifecycle::Closing { .. }) {
+                entry.lifecycle = lifecycle;
+            }
+        });
+    }
+
+    /// The snapshot-seeded pools with no anchor: the ones the settlement watcher
+    /// reads again at the end of its tick.
+    #[must_use]
+    pub fn unanchored(&self) -> Vec<B256> {
+        self.pools
+            .load()
+            .iter()
+            .filter(|(_, entry)| entry.snapshot.is_some_and(|s| s.anchor.is_none()))
+            .map(|(pool_id, _)| *pool_id)
+            .collect()
     }
 
     /// A non-blocking snapshot read for callers outside an async trait object.

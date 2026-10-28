@@ -74,6 +74,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alloy::contract::Error as ContractError;
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
@@ -802,10 +803,11 @@ struct PoolSettlementSink<P: Provider + Clone> {
     /// `PoolRedeemed` for EVERY provider (pool-wide `totalRedeemed`),
     /// `PoolCloseInitiated` (mark `Closing` with its deadline), and `PoolReclaimed`
     /// (drop) into the projection so a serve request reads `{owner, remaining}`
-    /// in-memory rather than through a `getPool` `eth_call`.
+    /// in-memory rather than through a `getPool` `eth_call`. At the end of each
+    /// tick it re-anchors the pools the admit path seeded (`reanchor_pools`).
     pool_view: PoolProjection,
-    /// The `PaymentPool` instance; the backfill's receipt and header reads
-    /// ride its provider.
+    /// The `PaymentPool` instance; the backfill's receipt and header reads and
+    /// the end-of-tick re-anchor reads ride its provider.
     contract: PaymentPool::PaymentPoolInstance<P>,
     /// Backfills a settlement ledger row (#2598) for an own-provider
     /// `PoolRedeemed` whose `redeemMany` the redeemer never saw land, each on
@@ -841,11 +843,11 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
                     }
                 };
                 // Pool-wide `totalRedeemed` folds EVERY provider's lanes, so the
-                // solvency projection records this event before the own-provider
-                // filter below — the serve path's `remaining` must reflect other
-                // nodes' redemptions against the same pool, not just this node's.
+                // projection records this event before the own-provider filter
+                // below: `remaining` reflects other nodes' redemptions too.
+                let (pool_id, provider) = (event.poolId, event.provider);
                 self.pool_view
-                    .record_redeemed(event.poolId, event.provider, &event.lanes);
+                    .record_redeemed(pool_id, provider, &event.lanes, log.block_number);
                 // Not enough to filter on the event signature — `provider` is
                 // an indexed topic but the OR-set filter cannot pin it, so
                 // confirm it names this node before recording the paid watermark.
@@ -951,6 +953,85 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
         }
         Ok(())
     }
+
+    /// Re-anchor the pools the admit path seeded, or whose redemptions the
+    /// projection could not attribute, at a pinned block. Every log of the tick
+    /// is folded by now and this sink is the projection's only writer, so the
+    /// read sees every redemption the projection holds.
+    async fn on_tick_complete(&mut self) -> Result<()> {
+        reanchor_pools(&self.contract, &self.pool_view).await;
+        Ok(())
+    }
+}
+
+/// Cap on the pools [`reanchor_pools`] reads in one tick, bounding the tick's
+/// RPC count. A pool past the cap waits for a later tick, and until then its
+/// `remaining` errs toward serving (see `pool_view::Snapshot`).
+const REANCHOR_POOLS_PER_TICK: usize = 64;
+
+/// Read every unanchored pool in `projection` at one block and anchor it there
+/// ([`PoolProjection::reanchor`]); forget a pool the read finds absent or
+/// `Closed`. A fault logs and leaves the pool unanchored for the next tick, so
+/// it never puts the watcher into backoff.
+async fn reanchor_pools<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    projection: &PoolProjection,
+) {
+    let pending = projection.unanchored();
+    if pending.is_empty() {
+        return;
+    }
+    let block = match timed(
+        None,
+        "re-anchor block number",
+        contract.provider().get_block_number(),
+    )
+    .await
+    {
+        Ok(block) => block,
+        Err(err) => {
+            warn!(
+                error = %sanitize_err_chain(&err),
+                pools = pending.len(),
+                "pool re-anchor: block number read failed; retrying next tick"
+            );
+            return;
+        }
+    };
+    for pool_id in pending.into_iter().take(REANCHOR_POOLS_PER_TICK) {
+        reanchor_pool(contract, projection, pool_id, block).await;
+    }
+}
+
+/// Read `pool_id` at `block` and anchor it there, or forget it when the read
+/// finds it absent or `Closed`. A fault logs and leaves the pool unanchored.
+async fn reanchor_pool<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    projection: &PoolProjection,
+    pool_id: B256,
+    block: u64,
+) {
+    let call = contract.getPool(pool_id);
+    let read = call.call().block(BlockId::Number(block.into()));
+    let pool = match timed(None, "re-anchor getPool", read).await {
+        Ok(pool) => pool,
+        Err(err) => {
+            warn!(
+                error = %sanitize_err_chain(&err),
+                %pool_id,
+                block,
+                "pool re-anchor: getPool failed; retrying next tick"
+            );
+            return;
+        }
+    };
+    let Some(lifecycle) = resolved_lifecycle(&pool) else {
+        debug!(%pool_id, block, "pool re-anchor: pool absent or closed; forgetting");
+        projection.forget(pool_id);
+        return;
+    };
+    projection.reanchor(pool_id, pool.deposit, pool.totalRedeemed, lifecycle, block);
+    debug!(%pool_id, block, total_redeemed = pool.totalRedeemed, "re-anchored pool");
 }
 
 impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
@@ -1042,9 +1123,11 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
 /// node's `ColdStart::Head` anchor never appears in the forward-only `PoolOpened`
 /// scan, so its owner is absent from the projection even though the pool is live.
 /// Rather than fail open on that gap, [`status`](crate::pool_view::PoolView::status) does ONE `getPool` at
-/// admission — a read the admission path tolerates (it may block) — folds a
-/// servable pool into the projection, and refuses an absent, closed, or faulted
-/// pool. Every admit-path chain read (`getPool` and the signer's
+/// admission — a read the admission path tolerates (it may block) — seeds a
+/// servable pool into the projection with its on-chain `totalRedeemed`, and
+/// refuses an absent, closed, or faulted pool. The settlement watcher re-anchors
+/// that seed at a pinned block at the end of its tick (`reanchor_pools`).
+/// Every admit-path chain read (`getPool` and the signer's
 /// `getAuthorization`) runs under `chain_events::timed`'s default bound, so a
 /// hung read times out and takes the fault path instead of stalling admission.
 /// The client re-sends its capability on its next request (the documented
@@ -1135,8 +1218,9 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
 }
 
 impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
-    /// Read `pool_id` on-chain once and record the result: fold a servable pool
-    /// into the projection, or negative-cache an absent / `Closed` pool as a
+    /// Read `pool_id` on-chain once and record the result: seed a servable pool
+    /// into the projection as an unanchored snapshot of its `deposit` and
+    /// `totalRedeemed` ([`PoolProjection::record_resolved`]), or negative-cache an absent / `Closed` pool as a
     /// [`NegativeReason::Verdict`] and a failed read as a
     /// [`NegativeReason::Fault`]. The caller holds the pool's [`ReadSlot::Lead`].
     async fn resolve(&self, pool_id: B256) -> Option<PoolStatus> {
@@ -1168,8 +1252,13 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
             remember_negative(&mut guard, pool_id, NegativeReason::Verdict);
             return None;
         };
-        self.projection
-            .record_resolved(pool_id, pool.owner, U256::from(pool.deposit), lifecycle);
+        self.projection.record_resolved(
+            pool_id,
+            pool.owner,
+            pool.deposit,
+            pool.totalRedeemed,
+            lifecycle,
+        );
         // The pool resolved: drop its lapsed negative entry. The projection
         // answers for it from here on.
         {

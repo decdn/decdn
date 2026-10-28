@@ -318,6 +318,139 @@ async fn resolving_status_does_getpool_on_miss_and_admits_solvent_pool() -> Resu
     Ok(())
 }
 
+/// The admit-path seed counts the pool's on-chain `totalRedeemed`: a pool
+/// drained before a restart reads as drained at its first admission.
+#[tokio::test]
+async fn resolving_status_counts_onchain_redemptions() -> Result<()> {
+    use crate::pool_view::PoolView;
+
+    let owner = Address::from([7u8; 20]);
+    let drained = PaymentPool::Pool {
+        totalRedeemed: 1_000,
+        ..pool(owner, PaymentPool::Status::Open, 0)
+    };
+    let (view, projection, _asserter) = mocked_getpool_view(Some(drained));
+    let pool_id = B256::repeat_byte(0x45);
+
+    let status = view
+        .status(pool_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("a live pool resolves"))?;
+    assert_eq!(status.remaining, U256::ZERO);
+    assert_eq!(projection.unanchored(), vec![pool_id]);
+    Ok(())
+}
+
+/// A mocked `PaymentPool` whose RPC answers come from the returned queue.
+fn mocked_contract() -> (
+    PaymentPool::PaymentPoolInstance<impl Provider + Clone + 'static>,
+    alloy::providers::mock::Asserter,
+) {
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+
+    let asserter = Asserter::new();
+    let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+    (PaymentPool::new(Address::ZERO, provider), asserter)
+}
+
+/// The end-of-tick re-anchor reads the block number, then `getPool` at it, and
+/// anchors the seed there.
+#[tokio::test]
+async fn reanchor_pools_anchors_an_admit_seed() -> Result<()> {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::from([7u8; 20]);
+    let pool_id = B256::repeat_byte(0x46);
+    let projection = PoolProjection::new();
+    projection.record_resolved(pool_id, owner, 1_000, 0, Lifecycle::Open);
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&alloy::primitives::U64::from(42u64));
+    asserter.push_success(&Bytes::from(
+        PaymentPool::Pool {
+            totalRedeemed: 700,
+            ..pool(owner, PaymentPool::Status::Open, 0)
+        }
+        .abi_encode(),
+    ));
+
+    reanchor_pools(&contract, &projection).await;
+
+    assert!(projection.unanchored().is_empty());
+    let status = projection
+        .snapshot(pool_id)
+        .ok_or_else(|| anyhow::anyhow!("the pool stays known"))?;
+    assert_eq!(status.remaining, U256::from(300u64));
+    assert!(asserter.read_q().is_empty(), "both reads were consumed");
+    Ok(())
+}
+
+/// A faulted re-anchor read leaves the pool unanchored for the next tick.
+#[tokio::test]
+async fn reanchor_pools_retries_a_faulted_read() {
+    let pool_id = B256::repeat_byte(0x47);
+    let projection = PoolProjection::new();
+    projection.record_resolved(pool_id, Address::from([7u8; 20]), 1_000, 0, Lifecycle::Open);
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&alloy::primitives::U64::from(42u64));
+    asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+
+    reanchor_pools(&contract, &projection).await;
+
+    assert_eq!(projection.unanchored(), vec![pool_id]);
+}
+
+/// A failed block-number read reads no pool and leaves it unanchored.
+#[tokio::test]
+async fn reanchor_pools_retries_a_faulted_block_number() {
+    let pool_id = B256::repeat_byte(0x48);
+    let projection = PoolProjection::new();
+    projection.record_resolved(pool_id, Address::from([7u8; 20]), 1_000, 0, Lifecycle::Open);
+    let (contract, asserter) = mocked_contract();
+    asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+
+    reanchor_pools(&contract, &projection).await;
+
+    assert_eq!(projection.unanchored(), vec![pool_id]);
+}
+
+/// A pool the re-anchor read finds `Closed` leaves the projection.
+#[tokio::test]
+async fn reanchor_pools_forgets_a_closed_pool() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::from([7u8; 20]);
+    let pool_id = B256::repeat_byte(0x49);
+    let projection = PoolProjection::new();
+    projection.record_resolved(pool_id, owner, 1_000, 0, Lifecycle::Open);
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&alloy::primitives::U64::from(42u64));
+    asserter.push_success(&Bytes::from(
+        pool(owner, PaymentPool::Status::Closed, 0).abi_encode(),
+    ));
+
+    reanchor_pools(&contract, &projection).await;
+
+    assert!(projection.snapshot(pool_id).is_none());
+}
+
+/// With nothing to re-anchor the tick costs no RPC.
+#[tokio::test]
+async fn reanchor_pools_without_seeds_reads_nothing() {
+    let projection = PoolProjection::new();
+    projection.record_opened(
+        B256::repeat_byte(0x4a),
+        Address::from([7u8; 20]),
+        U256::from(1u64),
+    );
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&alloy::primitives::U64::from(42u64));
+
+    reanchor_pools(&contract, &projection).await;
+
+    assert_eq!(asserter.read_q().len(), 1, "no read was sent");
+}
+
 /// Admit path (ii, verdict): an absent (`owner == 0`) or `Closed` pool the
 /// `getPool` returns is refused (`None`), never folded, and negative-cached as
 /// a `Verdict`. The entry still suppresses a repeat `getPool` past the fault
@@ -1136,13 +1269,13 @@ async fn a_registered_read_adds_the_spent_folded_since() {
         .record_opened(pool_id, Address::from([1u8; 20]), U256::from(5_000_000u64));
     // Folded before the read: the read's `spent` already holds it.
     view.projection
-        .record_redeemed(pool_id, Address::from([9u8; 20]), &[lane(200_000)]);
+        .record_redeemed(pool_id, Address::from([9u8; 20]), &[lane(200_000)], None);
     assert_eq!(
         view.signer_authorization(pool_id, signer).await,
         Some(registered(1_000_000, 200_000))
     );
     view.projection
-        .record_redeemed(pool_id, Address::from([10u8; 20]), &[lane(650_000)]);
+        .record_redeemed(pool_id, Address::from([10u8; 20]), &[lane(650_000)], None);
     assert_eq!(
         view.signer_authorization(pool_id, signer).await,
         Some(registered(1_000_000, 850_000)),
@@ -1196,6 +1329,7 @@ async fn a_folded_redemption_lapses_an_unregistered_read() {
             newPaidCumulative: 50_000,
             bytesPaid: 0,
         }],
+        None,
     );
     assert_eq!(
         view.signer_authorization(pool_id, signer).await,

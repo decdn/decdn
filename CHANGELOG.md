@@ -5254,6 +5254,20 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: a pool resolved from chain counts its on-chain redemptions toward
+  its remaining deposit (GHSA-9x5g-h559-vp5m).** After a restart the pool
+  projection is empty, so the admit path reads a pool it has not folded with
+  one `getPool`. It seeded that pool with zero redemptions, so a pool drained
+  before the restart reported its whole deposit as `remaining` for the rest of
+  the node's uptime, and the admission solvency gate and the mid-stream
+  re-check served it unpaid. The seed now carries `getPool.totalRedeemed`, and
+  the settlement watcher re-reads each seeded pool at a pinned block at the
+  end of its tick (at most 64 pools per tick). Redemptions folded after that
+  block count on top of the read; one on a lane the projection has no
+  baseline for triggers another re-read rather than a guess, so `remaining`
+  never counts a redemption twice and errs only toward serving, until the
+  next clean tick.
+
 - **Node: request timestamps are bounded to the node's clock before anything
   is signed (GHSA-fjcq-8x46-cq5c).** The signed probe and stream response
   bodies echo the requester-generated `timestamp_us` (ADR 014 § Slash

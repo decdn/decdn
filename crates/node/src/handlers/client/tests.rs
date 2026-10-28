@@ -1697,7 +1697,12 @@ async fn midstream_signer_recheck_trips_when_signer_drains_at_other_nodes() -> a
 
     // At admit the signer has spent one window across providers — nine windows of
     // headroom remain, above the one-window floor, so the stream keeps serving.
-    projection.record_redeemed(pool, Address::new([0xc0; 20]), &[lane_settled(signer, ow)]);
+    projection.record_redeemed(
+        pool,
+        Address::new([0xc0; 20]),
+        &[lane_settled(signer, ow)],
+        None,
+    );
     anyhow::ensure!(
         !handler
             .signer_cap_drained_midstream(pool, signer, held_cap, TEST_RATE)
@@ -1712,6 +1717,7 @@ async fn midstream_signer_recheck_trips_when_signer_drains_at_other_nodes() -> a
         pool,
         Address::new([0xc1; 20]),
         &[lane_settled(signer, ow.saturating_mul(9))],
+        None,
     );
     anyhow::ensure!(
         handler
