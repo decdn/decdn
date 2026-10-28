@@ -46,8 +46,8 @@ use decdn_client::lane_sources::{FaultContext, FirstLeg, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::session::{
-    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, ProxyWarmingParams,
-    PullSite,
+    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, PoolOpen,
+    ProxyWarmingParams, PullSite,
 };
 use decdn_client::targets::{
     ProbeOpts, ProbeRound, ResolveConfigFault, holders_or_none, resolve_target_node,
@@ -150,23 +150,28 @@ pub(crate) struct ResolvedChain {
 
 impl ResolvedChain {
     /// How the command funds its pool. A delegated command (`--capability`)
-    /// opens no pool, so it adopts none either; a self-owned one adopts the
+    /// opens no pool, so it adopts none either. A self-owned one adopts the
     /// wallet's live pool only when neither the data dir nor the keystore
-    /// belongs to a node ([`chain_adoption_for_buy`]).
+    /// belongs to a node ([`chain_adoption_for_buy`]), and opens a pool when
+    /// it has none; `decdn quote` narrows that ([`PoolOpen::Refused`]).
     ///
     /// # Errors
     ///
     /// The owner of the data dir or the keystore's dir cannot be told.
     pub(crate) fn deposit_policy(&self, delegated: bool) -> anyhow::Result<DepositPolicy> {
-        let adoption = if delegated {
-            ChainAdoption::Refused
+        let (adoption, open) = if delegated {
+            (ChainAdoption::Refused, PoolOpen::Refused)
         } else {
-            chain_adoption_for_buy(&self.site.data_dir, &self.keystore)?
+            (
+                chain_adoption_for_buy(&self.site.data_dir, &self.keystore)?,
+                PoolOpen::Allowed,
+            )
         };
         Ok(DepositPolicy {
             working_deposit: self.working_deposit,
             max_approve: self.max_approve,
             adoption,
+            open,
         })
     }
 }

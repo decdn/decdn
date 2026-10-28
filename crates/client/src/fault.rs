@@ -99,6 +99,46 @@ impl std::fmt::Display for HealExhausted {
 
 impl std::error::Error for HealExhausted {}
 
+/// The refusal of an `openPool` under [`PoolOpen::Refused`]: the buy has no
+/// open pool to reuse or adopt, and may not open one. Nothing is sent: no
+/// allowance and no `openPool`. It is fatal to the command
+/// ([`FatalScope::Command`]), since every later lane build would refuse the
+/// same way.
+///
+/// [`PoolOpen::Refused`]: crate::session::PoolOpen::Refused
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "test-util"), non_exhaustive)]
+pub struct PoolOpenRefused {
+    /// The working deposit the refused `openPool` would have escrowed, in
+    /// micro-USDC.
+    pub deposit: alloy::primitives::U256,
+}
+
+impl PoolOpenRefused {
+    /// The refusal `err` carries, directly or as the error a
+    /// [`LaneBuildFault`] holds: that wrapper hides it from a downcast.
+    #[must_use]
+    pub fn find(err: &anyhow::Error) -> Option<&Self> {
+        err.downcast_ref::<Self>().or_else(|| {
+            err.downcast_ref::<LaneBuildFault>()
+                .and_then(|LaneBuildFault(inner)| Self::find(inner))
+        })
+    }
+}
+
+impl std::fmt::Display for PoolOpenRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing an openPool: this command may not open a pool, which would escrow {} \
+             micro-USDC",
+            self.deposit
+        )
+    }
+}
+
+impl std::error::Error for PoolOpenRefused {}
+
 /// Whether `err` reports a `topUp` or `openPool` that may have escrowed USDC
 /// no local record credits ([`EscrowUntracked`], [`TopUpUnconfirmed`],
 /// [`OpenUnconfirmed`]). A retry escrows again, so it is fatal to the command.
@@ -203,6 +243,7 @@ pub fn classify(err: &anyhow::Error) -> Fault {
             .downcast_ref::<crate::credential::FundingNeeded>()
             .is_some()
         || err.downcast_ref::<RefusedAfterUntracked>().is_some()
+        || err.downcast_ref::<PoolOpenRefused>().is_some()
     {
         return Fault::Fatal(FatalScope::Command);
     }

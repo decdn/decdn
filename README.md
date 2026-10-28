@@ -192,7 +192,11 @@ decdn receipt verify ./blob.receipt.json
 ```
 
 `quote` prices the pull from the rates the nodes sign in their probe answers, and pays
-nothing for a blob; a bundle with no cached manifest costs one small paid pull for it.
+nothing for a blob; a bundle with no cached manifest costs one small paid pull for it,
+from your open pool. With no open pool, `quote` stops before it opens one: add
+`--open-pool` to let it, which escrows the working deposit (10 USDC by default) and pays
+gas, or fund a pool first with `decdn pool open`. With or without the flag, an open pool
+that runs low gets a top-up, which also escrows USDC and pays gas.
 `get` prints the same estimate on one line before it starts. It ends with a receipt: the
 bytes it verified, the nodes that served them, and the USDC it paid. `--receipt` writes
 the nodes' signed answers and your vouchers to a file that `decdn receipt verify` checks

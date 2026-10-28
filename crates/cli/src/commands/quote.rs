@@ -15,7 +15,8 @@
 //! manifest's planned download for a fresh pull: a blob two paths name, and
 //! a chunk two blobs share, count once, and a file already on disk still
 //! counts. The manifest comes from the output directory's cache, or from a
-//! small paid pull that caches it.
+//! small paid pull that caches it. That pull opens no pool unless
+//! `--open-pool` lets it.
 //!
 //! `decdn get --dry-run` prints the same block for a blob, or for a bundle
 //! from a cached manifest (`dry_run_quote`), and `decdn get` prints a
@@ -27,13 +28,14 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::U256;
 use anyhow::Context as _;
+use decdn_client::PoolOpenRefused;
 use decdn_client::bundle::{BundleManifest, PlannedBlob, planned_downloads};
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::quote::{
     CENSUS_ENTRY_SAMPLE, Census, PriceRange, PricedBlob, RateHint, census, hint_rates, price,
     wire_bytes,
 };
-use decdn_client::session::ProxyWarmingParams;
+use decdn_client::session::{PoolOpen, ProxyWarmingParams};
 use decdn_client::targets::ResolveConfigFault;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::{ClientFetchArgs, QuoteArgs};
@@ -42,6 +44,7 @@ use iroh::{Endpoint, RelayUrl};
 
 use super::bundle_pull::{self, human_bytes};
 use super::fetch;
+use super::interrupt::UnreconciledEscrows;
 
 /// Run `decdn quote`: plan the pull `args.uri` names, probe its nodes, and
 /// print the quote.
@@ -70,7 +73,9 @@ pub async fn quote(args: &QuoteArgs, config_path: Option<&Path>) -> anyhow::Resu
 }
 
 /// The plan of `uri` on `host`, priced. A bundle's manifest comes from the
-/// cache in `args.output`, or from a paid fetch that caches it there.
+/// cache in `args.output`, or from a paid fetch that caches it there. The
+/// fetch opens a pool only under `--open-pool`; without it, a buyer with no
+/// open pool gets [`open_refused`]'s error before any transaction.
 async fn quote_on(
     host: &mut QuoteHost,
     args: &QuoteArgs,
@@ -86,25 +91,56 @@ async fn quote_on(
             let manifest = if let Some(manifest) = cached {
                 manifest
             } else {
+                let (open, pays) = if args.open_pool {
+                    (PoolOpen::Allowed, "that opens a pool if you have none")
+                } else {
+                    (PoolOpen::Refused, "from your open pool")
+                };
                 eprintln!(
-                    "note: no cached manifest in {}; fetching it, a small paid pull that opens \
-                     a pool if you have none",
+                    "note: no cached manifest in {}; fetching it, a small paid pull {pays}",
                     out.display()
                 );
                 bundle_pull::fetch_manifest_paid(
                     &args.common,
                     &out,
                     uri,
-                    &mut host.chain,
+                    (&mut host.chain, open),
                     (&host.endpoint, &host.relays),
                 )
-                .await?
+                .await
+                .map_err(|err| {
+                    let Some(refused) = PoolOpenRefused::find(&err).map(open_refused) else {
+                        return err;
+                    };
+                    // An escrow the fetch still holds keeps its note, which
+                    // names the transaction to reconcile.
+                    if err.downcast_ref::<UnreconciledEscrows>().is_some() {
+                        err.context(refused)
+                    } else {
+                        anyhow::Error::msg(refused)
+                    }
+                })?
             };
             Plan::of_target(&manifest, &uri.target)?
         }
         _ => anyhow::bail!("unsupported URI target in {:?}", args.uri),
     };
     host.price(&args.common, &plan).await
+}
+
+/// The error of a quote whose manifest fetch would open a pool without
+/// `--open-pool`: what opening one costs, the flag that allows it, and
+/// `decdn pool open` to fund a pool first. The rerun keeps every other flag,
+/// since they choose the wallet, the chain and the deposit.
+pub(crate) fn open_refused(refused: &PoolOpenRefused) -> String {
+    format!(
+        "no open pool pays for the manifest fetch, and opening one escrows the working deposit \
+         ({} USDC) and pays gas for the openPool (and an approve when the allowance is short); \
+         this openPool and its approve were not sent. Rerun the same `decdn quote` command with \
+         `--open-pool` added to open it, or fund a pool first with \
+         `decdn pool open --deposit-micro-usdc <amount>`",
+        usdc_short(refused.deposit),
+    )
 }
 
 /// What a quote prices on: the chain, the relays and one endpoint for the

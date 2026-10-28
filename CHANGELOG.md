@@ -28,6 +28,22 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **CLI: `decdn quote` opens no pool unless `--open-pool` (#2675).** A
+  bundle quote with no cached manifest fetches it with a small paid pull from
+  the buyer's open pool. With no open pool to reuse or adopt, the quote sends
+  no approve or `openPool`, exits non-zero, and names both ways on:
+  `--open-pool`, which lets the fetch open one at the working deposit
+  (10 USDC by default) and pay its gas, and `decdn pool open`. A script that
+  relied on `quote` opening the pool adds `--open-pool`. With or without the
+  flag, an open pool gets a `topUp` when it runs low or a node refuses it for
+  funds, which escrows USDC and pays gas. `decdn get` opens a pool as before.
+  - `decdn-client`: `DepositPolicy` carries `open:
+    decdn_client::session::PoolOpen` (`Allowed` or `Refused`), a required
+    field. Under `Refused`, a lane build with no open pool to reuse or adopt,
+    and a funding recovery step that would replace the run's pool, end the
+    command with `decdn_client::PoolOpenRefused` before any allowance or
+    `openPool`; `PoolOpenRefused::find` detects it in a pull's error.
+
 - **Config: `cache.node_to_node_pull_through_enabled` defaults by role
   (#2603).** Absent, it resolves on for a node with no origin backend and off
   for a node that configures one, the same derivation as
@@ -4381,8 +4397,9 @@ since project inception and will roll into the first tagged release.
   largest blobs and prices the rest, and any probed blob with no usable rate,
   at their mean rate, because the reference node signs one rate for every
   hash. The manifest comes from the output directory's cache, or from a small
-  paid pull that caches it for the `get` that follows. `--json` gives every
-  amount in micro-USDC. `decdn get --dry-run` prints the same block, on a blob
+  paid pull from the buyer's open pool that caches it for the `get` that
+  follows; with no open pool, it opens one only under `--open-pool` (#2675).
+  `--json` gives every amount in micro-USDC. `decdn get --dry-run` prints the same block, on a blob
   URI too, where `--json` also applies with `--dry-run`; it sends no
   transaction and opens no keystore, but reads the registry when the peer
   store cannot supply it, and probes. Its `--json` plan carries `quote` and

@@ -26,6 +26,7 @@ use decdn_client::bundle::{
 use decdn_client::buyer_pool::UnconfirmedEscrows;
 use decdn_client::endpoint as client_endpoint;
 use decdn_client::receipt::ReceiptEvidence;
+use decdn_client::session::{DepositPolicy, PoolOpen};
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli::get::{DEFAULT_JOBS, DEFAULT_MAX_LANE_STREAMS};
 use decdn_common::cli::{ClientFetchArgs, GetArgs};
@@ -800,7 +801,7 @@ async fn pull_over(
             Arc::clone(&observer) as Arc<dyn BundleObserver>,
             Some(Arc::clone(evidence)),
         ),
-        &escrows,
+        (&escrows, PoolOpen::Allowed),
     )
     .await?;
 
@@ -833,7 +834,8 @@ async fn pull_over(
 /// The run's puller: its node selection, its buyer key and funding, and
 /// its pull settings, with `observer`, the receipt `evidence` when there is
 /// one, and `escrows` attached. `lanes` is the `--jobs` and
-/// `--max-lane-streams` pair.
+/// `--max-lane-streams` pair. `open` says whether a self-owned run may open
+/// a pool when it has none.
 async fn open_puller(
     common: &ClientFetchArgs,
     (chain, grant, store): (
@@ -845,7 +847,7 @@ async fn open_puller(
     namespace: Option<u64>,
     (jobs, max_lane_streams): (usize, usize),
     (observer, evidence): (Arc<dyn BundleObserver>, Option<Arc<ReceiptEvidence>>),
-    escrows: &UnconfirmedEscrows,
+    (escrows, open): (&UnconfirmedEscrows, PoolOpen),
 ) -> anyhow::Result<BundlePuller> {
     // The node selection is resolved BEFORE the keystore prompt, so a failed
     // discovery never prompts. A registry read is bounded by `--timeout-ms`
@@ -858,7 +860,10 @@ async fn open_puller(
     let funding = match grant {
         None => Funding::SelfOwned {
             owner: signer,
-            deposit: chain.deposit_policy(false)?,
+            deposit: DepositPolicy {
+                open,
+                ..chain.deposit_policy(false)?
+            },
         },
         Some(grant) => Funding::Delegated {
             slot: fetch::delegated_slot(grant, signer)?,
@@ -894,13 +899,15 @@ async fn open_puller(
 
 /// The manifest of the bundle `uri` names, read from `out`'s manifest cache
 /// or fetched and cached there: a paid pull from the caller's pool, which it
-/// opens or tops up as `decdn get` does. `decdn quote` calls it for a bundle
-/// with no cached manifest. A Ctrl-C ends the fetch [`Interrupted`].
+/// tops up as `decdn get` does, and opens only under `open`
+/// ([`decdn_client::PoolOpenRefused`] when it may not). `decdn quote` calls it
+/// for a bundle with no cached manifest. A Ctrl-C ends the fetch
+/// [`Interrupted`].
 pub(crate) async fn fetch_manifest_paid(
     common: &ClientFetchArgs,
     out: &Path,
     uri: &DecdnUri,
-    chain: &mut fetch::ResolvedChain,
+    (chain, open): (&mut fetch::ResolvedChain, PoolOpen),
     (endpoint, relays): (&Endpoint, &[RelayUrl]),
 ) -> anyhow::Result<BundleManifest> {
     let grant = fetch::resolve_delegation_grant(common, chain)?;
@@ -920,7 +927,7 @@ pub(crate) async fn fetch_manifest_paid(
         uri.namespace,
         (1, usize::from(DEFAULT_MAX_LANE_STREAMS)),
         (observer, None),
-        &escrows,
+        (&escrows, open),
     )
     .await?;
     let mut interrupt = Interrupt::watch(escrows.clone());
@@ -1363,7 +1370,8 @@ async fn dry_run(
             format!(" -o {}", quote::shell_quote(&o.display().to_string()))
         });
         println!(
-            "run `decdn quote {}{out_flag}` to price it (a small paid pull fetches the manifest)",
+            "run `decdn quote {}{out_flag}` to price it (a small paid pull from your open pool \
+             fetches the manifest; with no open pool, add `--open-pool` to open one)",
             quote::shell_quote(&args.uri)
         );
         return Ok(());

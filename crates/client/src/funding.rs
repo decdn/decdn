@@ -29,8 +29,9 @@ use crate::buyer_pool::{
     escrowed_but_untracked, grade_deposit_credit, open_pool, pool_accepts_funds, refill_amount,
     self_owned_lane_ctx, top_up_unless_ended, topped_up_effect,
 };
+use crate::fault::PoolOpenRefused;
 use crate::lanes::LaneDeps;
-use crate::session::{ChainAdoption, ChainConfig, DepositPolicy};
+use crate::session::{ChainAdoption, ChainConfig, DepositPolicy, PoolOpen};
 use crate::source::{Funder, SourceFuture};
 use crate::{NoAffordableSource, PoolContext, PoolLedger, PoolReplaced, Recovery};
 
@@ -160,6 +161,15 @@ pub(crate) fn refuse_after_end(ended: Option<&CancellationToken>) -> anyhow::Res
         return Err(anyhow::Error::new(FetchEnded));
     }
     Ok(())
+}
+
+/// Refuse an `openPool` of `deposit` under [`PoolOpen::Refused`]
+/// ([`PoolOpenRefused`]), before its allowance or the `openPool` is sent.
+fn refuse_open(open: PoolOpen, deposit: U256) -> anyhow::Result<()> {
+    match open {
+        PoolOpen::Allowed => Ok(()),
+        PoolOpen::Refused => Err(anyhow::Error::new(PoolOpenRefused { deposit })),
+    }
 }
 
 /// Take `lock`, or refuse with [`FetchEnded`] once `ended` fires, whichever
@@ -430,6 +440,8 @@ pub struct PoolFunder<'a, P> {
     /// Zero for a delegated signer, which has no funding path.
     pub(crate) working_deposit: U256,
     pub(crate) max_approve: bool,
+    /// Whether a replacement pool may be opened ([`PoolOpenRefused`] when not).
+    pub(crate) open: PoolOpen,
     /// The run's funding facts: its outside spend, a wallet shortfall that
     /// makes a further top-up pointless, an unconfirmed `topUp` or an
     /// untracked escrow that makes any further escrow unsafe, and the pool to
@@ -800,12 +812,14 @@ where
     /// # Errors
     ///
     /// The run's handle holds an untracked escrow ([`RefusedAfterUntracked`]:
-    /// nothing sent), the allowance or `openPool` fails (nothing escrowed), or the
+    /// nothing sent), the run may not open a pool ([`PoolOpenRefused`]: nothing
+    /// sent), the allowance or `openPool` fails (nothing escrowed), or the
     /// `openPool` mined but the pool it opened cannot be named or recorded
     /// (escrowed and untracked: fatal).
     async fn open_replacement(&self) -> anyhow::Result<PoolId> {
         self.funding.refuse_after_untracked()?;
         let deposit = self.working_deposit;
+        refuse_open(self.open, deposit)?;
         ensure_allowance(
             self.rpc,
             self.token,
@@ -1641,7 +1655,8 @@ where
 /// tracked row is reused only on it, a new or adopted row carries it, and the
 /// voucher EIP-712 domain derives from it. `deposit` is how the pool is
 /// funded: the working deposit a new pool opens at and a low pool refills
-/// toward, the allowance mode, and whether a lost row adopts from chain.
+/// toward, the allowance mode, whether a lost row adopts from chain, and
+/// whether a pool may be opened at all.
 /// `ended` fires once the fetch the lane serves has ended.
 ///
 /// # Errors
@@ -1649,8 +1664,10 @@ where
 /// A chain read, allowance, `openPool` or `topUp` fails, the buyer store
 /// cannot record a pool the chain escrowed (fatal: the escrow is untracked),
 /// the run's handle holds an untracked escrow, so no `openPool` or `topUp`
-/// is sent ([`RefusedAfterUntracked`], fatal), or `ended` fired before the
-/// `openPool` or `topUp` was sent ([`FetchEnded`]).
+/// is sent ([`RefusedAfterUntracked`], fatal), the run has no open pool to
+/// reuse or adopt and `deposit` refuses an open ([`PoolOpenRefused`], fatal:
+/// nothing is sent), or `ended` fired before the `openPool` or `topUp` was
+/// sent ([`FetchEnded`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_or_reuse_pool<P>(
     store: &dyn BuyerPoolStore,
@@ -1671,6 +1688,7 @@ where
         working_deposit,
         max_approve,
         adoption,
+        open,
     } = deposit;
     let payment_pool_addr = deployment.payment_pool;
     let tracked =
@@ -1730,6 +1748,7 @@ where
 
     funding.refuse_after_untracked()?;
     refuse_after_end(Some(ended))?;
+    refuse_open(open, working_deposit)?;
     // Authoritative USDC token for the pool, from the contract itself.
     let token = contract
         .usdc()

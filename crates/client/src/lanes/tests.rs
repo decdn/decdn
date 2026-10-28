@@ -1,5 +1,5 @@
 use super::*;
-use crate::session::ChainAdoption;
+use crate::session::{ChainAdoption, PoolOpen};
 use alloy::primitives::B256;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::buyer_pool::{BuyerLaneProgress, BuyerPoolState};
@@ -239,6 +239,7 @@ async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()
                 working_deposit: U256::from(1_000_000u64),
                 max_approve: false,
                 adoption: ChainAdoption::Refused,
+                open: PoolOpen::Allowed,
             },
             namespace_id: decdn_protocol::client::NO_NAMESPACE,
             max_rate_per_mb: 0,
@@ -694,6 +695,7 @@ async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result
             working_deposit: U256::from(1_000_000u64),
             max_approve: false,
             adoption: ChainAdoption::Refused,
+            open: PoolOpen::Allowed,
         },
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
         max_rate_per_mb: 0,

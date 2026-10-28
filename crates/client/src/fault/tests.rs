@@ -1,4 +1,4 @@
-use super::{FatalScope, Fault, HealExhausted, LaneBuildFault, classify};
+use super::{FatalScope, Fault, HealExhausted, LaneBuildFault, PoolOpenRefused, classify};
 use crate::driver::PoolExhausted;
 use crate::{BlobTooLarge, LocalPullFault, UpstreamRefused, UpstreamVoucherRejected};
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
@@ -318,4 +318,25 @@ fn only_source_and_fatal_faults_warn() {
     assert!(Fault::Fatal(FatalScope::Item).warns());
     assert!(!Fault::Unaffordable.warns());
     assert!(!Fault::Transient.warns());
+}
+
+/// #2675: a refused `openPool` ends the command, bare or from a lane build,
+/// and [`PoolOpenRefused::find`] names it through the [`LaneBuildFault`]
+/// wrapper and through context.
+#[test]
+fn a_refused_open_is_fatal_and_found_through_a_lane_build() {
+    let refused = PoolOpenRefused {
+        deposit: alloy::primitives::U256::from(10_000_000u64),
+    };
+    let bare = anyhow::Error::new(refused).context("fetch the manifest");
+    let built = anyhow::Error::new(LaneBuildFault(anyhow::Error::new(refused)))
+        .context("fetch the manifest");
+    for err in [&bare, &built] {
+        assert_eq!(classify(err), Fault::Fatal(FatalScope::Command), "{err:#}");
+        assert_eq!(PoolOpenRefused::find(err), Some(&refused), "{err:#}");
+    }
+    assert_eq!(
+        PoolOpenRefused::find(&anyhow::anyhow!("rpc timed out")),
+        None
+    );
 }

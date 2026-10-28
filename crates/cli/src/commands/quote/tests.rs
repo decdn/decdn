@@ -440,3 +440,42 @@ async fn a_dry_run_quote_rejects_bad_pin_flags_first() {
         assert!(format!("{err:#}").contains(want), "{err:#}");
     }
 }
+
+/// The `QuoteArgs` of `decdn quote <argv>`.
+fn quote_args(argv: &[&str]) -> QuoteArgs {
+    let argv = ["decdn", "quote"].into_iter().chain(argv.iter().copied());
+    match decdn_common::cli::Cli::try_parse_from(argv)
+        .unwrap()
+        .command
+    {
+        decdn_common::cli::Command::Quote(quote) => *quote,
+        other => panic!("parsed {other:?}"),
+    }
+}
+
+/// #2675: a quote that would open a pool without `--open-pool` names what
+/// opening one costs, says the refused `openPool` and its approve were not
+/// sent (a `topUp` of the run may have sent an approve before it), and names both
+/// ways on: the same command with `--open-pool` added, and `decdn pool open`.
+/// It prints no command line to paste, which would drop the flags that pick
+/// the wallet, the chain and the deposit.
+#[test]
+fn a_refused_open_names_the_cost_and_both_ways_on() {
+    let refused = PoolOpenRefused {
+        deposit: U256::from(1_000_000u64),
+    };
+    let msg = open_refused(&refused);
+    for part in [
+        "no open pool pays for the manifest fetch",
+        "escrows the working deposit (1.00 USDC)",
+        "pays gas for the openPool (and an approve when the allowance is short)",
+        "this openPool and its approve were not sent",
+        "Rerun the same `decdn quote` command with `--open-pool` added",
+        "`decdn pool open --deposit-micro-usdc <amount>`",
+    ] {
+        assert!(msg.contains(part), "{part:?} missing from: {msg}");
+    }
+    assert!(!msg.contains("decdn quote '"), "{msg}");
+    assert!(quote_args(&["decdn:ab/", "--open-pool"]).open_pool);
+    assert!(!quote_args(&["decdn:ab/"]).open_pool);
+}

@@ -19,9 +19,13 @@
 //!   3. A pinned `--node-id` quote probes that node alone.
 //!   4. `decdn get --dry-run` prints the quote block, and under `--json`
 //!      carries the quote, and writes no output file.
-//!   5. A bundle quote with no cached manifest says it fetches the manifest,
-//!      pays for it, caches it, and prices both entries; a second quote and
-//!      `get --dry-run --json` read the cache.
+//!   5. A bundle quote with no cached manifest and no open pool stops
+//!      before any transaction and names `--open-pool` (#2675). With
+//!      `--open-pool`, it says it fetches the manifest, opens a pool, pays
+//!      for the manifest, caches it, and prices both entries; a second quote
+//!      and `get --dry-run --json` read the cache. A quote into a fresh
+//!      directory then fetches the manifest from that pool with no flag, and
+//!      sends no transaction.
 //!   6. `decdn get` of the blob prints exactly one `Estimate:` line before
 //!      its pull.
 //!
@@ -90,6 +94,8 @@ struct Journey {
     chain: ChainFixture,
     client_dir: tempfile::TempDir,
     keystore: std::path::PathBuf,
+    /// The buyer key, to read its transaction count.
+    buyer: alloy::signers::local::PrivateKeySigner,
     /// The cheap node: holds the blob, the small blob and the manifest.
     cheap: NodeFixture,
     /// The more expensive node: holds the blob. Kept so it keeps serving.
@@ -103,7 +109,26 @@ struct Journey {
 impl Journey {
     /// Run `decdn <argv>` as the journey's buyer ([`run_decdn`]).
     fn decdn(&self, argv: &[&str]) -> anyhow::Result<Ran> {
-        run_decdn(self.client_dir.path(), &self.keystore, &self.chain, argv)
+        let (ok, ran) = run_decdn(self.client_dir.path(), &self.keystore, &self.chain, argv)?;
+        anyhow::ensure!(ok, "decdn {argv:?} failed: {}", ran.stderr);
+        Ok(ran)
+    }
+
+    /// Run `decdn <argv>` as the journey's buyer, and expect it to fail.
+    fn decdn_failing(&self, argv: &[&str]) -> anyhow::Result<Ran> {
+        let (ok, ran) = run_decdn(self.client_dir.path(), &self.keystore, &self.chain, argv)?;
+        anyhow::ensure!(!ok, "decdn {argv:?} succeeded: {}", ran.stderr);
+        Ok(ran)
+    }
+
+    /// How many transactions the buyer has sent: its nonce.
+    async fn buyer_nonce(&self) -> anyhow::Result<u64> {
+        use alloy::providers::Provider as _;
+        self.chain
+            .provider_for(&self.buyer)
+            .get_transaction_count(self.buyer.address())
+            .await
+            .context("read the buyer's nonce")
     }
 
     /// The blob's URI.
@@ -116,7 +141,7 @@ async fn run() -> anyhow::Result<()> {
     let j = launch().await?;
     blob_quotes(&j)?;
     dry_runs(&j)?;
-    bundle_quote(&j)?;
+    bundle_quote(&j).await?;
     get_estimate(&j)
 }
 
@@ -176,6 +201,7 @@ async fn launch() -> anyhow::Result<Journey> {
         chain,
         client_dir,
         keystore,
+        buyer,
         cheap,
         _dear: dear,
         blob_hash,
@@ -263,13 +289,52 @@ fn dry_runs(j: &Journey) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Step 5: a bundle quote pays for the manifest once and caches it.
-fn bundle_quote(j: &Journey) -> anyhow::Result<()> {
-    // (5) A bundle quote pays for the manifest once and caches it.
+/// Step 5: a bundle quote opens no pool without `--open-pool`, pays for the
+/// manifest once and caches it, and reuses the pool it opened.
+async fn bundle_quote(j: &Journey) -> anyhow::Result<()> {
     let bundle_dir = j.client_dir.path().join("bundle");
     let bundle_arg = bundle_dir.display().to_string();
     let bundle_uri = format!("decdn:{}/", j.manifest_hash.to_hex());
-    let first = j.decdn(&["quote", &bundle_uri, "-o", &bundle_arg, "--json"])?;
+    let cached = BundleManifest::cache_path(&bundle_dir, *j.manifest_hash.as_bytes());
+
+    // (5a) No open pool and no `--open-pool`: the quote stops before any
+    // transaction, and says what opening one costs.
+    anyhow::ensure!(
+        j.buyer_nonce().await? == 0,
+        "the buyer has sent nothing yet"
+    );
+    let refused = j.decdn_failing(&["quote", &bundle_uri, "-o", &bundle_arg, "--json"])?;
+    for part in [
+        "no open pool pays for the manifest fetch",
+        "escrows the working deposit (10.00 USDC)",
+        "pays gas",
+        "--open-pool`",
+        "decdn pool open",
+    ] {
+        assert!(
+            refused.stderr.contains(part),
+            "{part:?}: {}",
+            refused.stderr
+        );
+    }
+    assert!(refused.stdout.trim().is_empty(), "{}", refused.stdout);
+    assert_eq!(
+        j.buyer_nonce().await?,
+        0,
+        "the refused quote sent a transaction"
+    );
+    assert!(!cached.exists(), "the refused quote cached a manifest");
+
+    // (5b) `--open-pool`: the quote opens a pool, pays for the manifest once
+    // and caches it.
+    let first = j.decdn(&[
+        "quote",
+        &bundle_uri,
+        "-o",
+        &bundle_arg,
+        "--json",
+        "--open-pool",
+    ])?;
     assert!(
         first.stderr.contains("no cached manifest"),
         "{}",
@@ -285,12 +350,13 @@ fn bundle_quote(j: &Journey) -> anyhow::Result<()> {
     );
     assert_eq!(bundle["sampled_blobs"], 2, "{bundle}");
     assert!(bundle["price_micro_usdc"].is_object(), "{bundle}");
-    let cached = BundleManifest::cache_path(&bundle_dir, *j.manifest_hash.as_bytes());
     anyhow::ensure!(
         cached.exists(),
         "no cached manifest at {}",
         cached.display()
     );
+    let opened = j.buyer_nonce().await?;
+    anyhow::ensure!(opened > 0, "the quote opened no pool");
     let second = j.decdn(&["quote", &bundle_uri, "-o", &bundle_arg, "--json"])?;
     assert!(
         !second.stderr.contains("no cached manifest"),
@@ -300,6 +366,27 @@ fn bundle_quote(j: &Journey) -> anyhow::Result<()> {
     let plan = json(&j.decdn(&["get", &bundle_uri, "-o", &bundle_arg, "--dry-run", "--json"])?)?;
     assert_eq!(plan["count"], 2, "{plan}");
     assert_eq!(plan["quote"]["target"], "bundle", "{plan}");
+
+    // (5c) An open pool and no flag: a quote into a fresh directory fetches
+    // the manifest from that pool, and sends no transaction.
+    let fresh_dir = j.client_dir.path().join("bundle-again");
+    let fresh_arg = fresh_dir.display().to_string();
+    let from_pool = j.decdn(&["quote", &bundle_uri, "-o", &fresh_arg, "--json"])?;
+    assert!(
+        from_pool.stderr.contains("no cached manifest"),
+        "{}",
+        from_pool.stderr
+    );
+    assert_eq!(json(&from_pool)?["entries"], 2, "{}", from_pool.stdout);
+    assert!(
+        BundleManifest::cache_path(&fresh_dir, *j.manifest_hash.as_bytes()).exists(),
+        "the quote cached no manifest in {fresh_arg}"
+    );
+    assert_eq!(
+        j.buyer_nonce().await?,
+        opened,
+        "the quote sent a transaction with an open pool"
+    );
 
     Ok(())
 }
@@ -327,14 +414,14 @@ fn json(ran: &Ran) -> anyhow::Result<serde_json::Value> {
 }
 
 /// Run `decdn <argv> <chain flags>` against `chain` with `data_dir` as its
-/// home and data dir and `keystore` as its buyer key. A non-zero exit is an
-/// error that carries the stderr.
+/// home and data dir and `keystore` as its buyer key: whether it exited zero,
+/// and what it printed.
 fn run_decdn(
     data_dir: &Path,
     keystore: &Path,
     chain: &ChainFixture,
     argv: &[&str],
-) -> anyhow::Result<Ran> {
+) -> anyhow::Result<(bool, Ran)> {
     let output = decdn_command(data_dir, KEYSTORE_PASSWORD)?
         .args(argv)
         .args([
@@ -357,10 +444,11 @@ fn run_decdn(
         ])
         .output()
         .context("spawn decdn")?;
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    anyhow::ensure!(output.status.success(), "decdn {argv:?} failed: {stderr}");
-    Ok(Ran {
-        stdout: String::from_utf8(output.stdout)?,
-        stderr,
-    })
+    Ok((
+        output.status.success(),
+        Ran {
+            stdout: String::from_utf8(output.stdout)?,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        },
+    ))
 }
