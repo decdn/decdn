@@ -127,10 +127,32 @@ fn contracts_dir() -> PathBuf {
         .expect("contracts dir")
 }
 
-/// Grab an ephemeral TCP port, then release it for the caller to claim.
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
-    l.local_addr().expect("local_addr").port()
+/// Reserve a loopback TCP port for the test's duration, and return the held
+/// socket with its port. Keep the socket alive while anything may bind the port.
+///
+/// The socket is bound with `SO_REUSEADDR` and never listens. On Linux the
+/// kernel then hands the port to no other socket's `bind(…:0)` and to no
+/// `connect()` as a source port, so a parallel test process cannot take it. An
+/// explicit bind with `SO_REUSEADDR`, which anvil and the runtime's admin and
+/// metrics listeners make, still succeeds.
+fn reserve_port() -> (socket2::Socket, u16) {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .expect("port reservation socket");
+    socket.set_reuse_address(true).expect("SO_REUSEADDR");
+    socket
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .expect("bind ephemeral");
+    let port = socket
+        .local_addr()
+        .expect("local_addr")
+        .as_socket()
+        .expect("inet socket")
+        .port();
+    (socket, port)
 }
 
 /// Poll `f` until it yields `Some`, or `timeout` elapses.
@@ -474,7 +496,7 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
     );
 
     // ---- 1. Spawn anvil.
-    let anvil_port = free_port();
+    let (_anvil_port_hold, anvil_port) = reserve_port();
     let rpc_url = format!("http://127.0.0.1:{anvil_port}");
     let child = Command::new("anvil")
         .args([
@@ -543,8 +565,8 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
     let addrs = read_manifest(&manifest)?;
 
     // ---- 4. Build the resolved config with explicit free listener ports.
-    let admin_port = free_port();
-    let metrics_port = free_port();
+    let (_admin_port_hold, admin_port) = reserve_port();
+    let (_metrics_port_hold, metrics_port) = reserve_port();
     let cfg = build_config(
         data_tmp.path().to_path_buf(),
         cache_tmp.path().to_path_buf(),

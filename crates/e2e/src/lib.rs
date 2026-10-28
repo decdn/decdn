@@ -12,6 +12,7 @@
 //!   and verify delivered bytes.
 //! - [`cli::decdn_command`] — spawn the user-facing `decdn` binary under an
 //!   isolated `HOME`, so a journey never touches the developer's `~/.decdn`.
+//! - [`ports`] — loopback ports a spawned process binds without a race.
 //! - [`time`] — advance anvil time across dispute / timelock / unbond windows.
 //! - [`mod@assert`] — on-chain + admin-RPC + delivered-bytes assertion helpers.
 //!
@@ -34,43 +35,11 @@ pub mod cli;
 pub mod client;
 pub mod node;
 mod poll;
+pub mod ports;
 pub mod time;
 pub mod timeout;
 
 pub use poll::poll;
-
-/// Grab `N` distinct ephemeral TCP ports, then release them for spawned
-/// processes (anvil or the daemon) to claim. Shared by [`chain`] and [`node`] so
-/// the fixtures derive ports the same way.
-///
-/// The `N` listeners are bound *simultaneously* and dropped together, so the OS
-/// is forced to hand back `N` distinct ports — `N` sequential single-port grabs
-/// can (and under parallel load do) repeat a number.
-///
-/// A residual TOCTOU remains: between releasing a port here and the child
-/// binding it, another process can claim it. Callers that can detect the
-/// resulting failure should retry — [`chain::ChainFixture::launch`] re-picks its
-/// port when anvil dies at startup. The fully race-free alternative (hold the
-/// listener and hand its fd to the child via `SO_REUSEADDR`) isn't available:
-/// neither `anvil` nor `decdn-node` accepts an inherited listener.
-pub(crate) fn free_ports<const N: usize>() -> anyhow::Result<[u16; N]> {
-    use anyhow::Context;
-    let listeners: Vec<std::net::TcpListener> = (0..N)
-        .map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).context("bind ephemeral port"))
-        .collect::<anyhow::Result<_>>()?;
-    let mut ports = [0u16; N];
-    for (slot, l) in ports.iter_mut().zip(&listeners) {
-        *slot = l.local_addr().context("local_addr")?.port();
-    }
-    Ok(ports)
-    // `listeners` drops here, freeing all N ports at once.
-}
-
-/// Grab a single ephemeral TCP port. See [`free_ports`] for the TOCTOU caveat.
-pub(crate) fn free_port() -> anyhow::Result<u16> {
-    let [port] = free_ports::<1>()?;
-    Ok(port)
-}
 
 /// Bail if a mined transaction reverted. alloy's `get_receipt()` resolves `Ok`
 /// for a transaction that was *mined but reverted* (`status == false`), so every

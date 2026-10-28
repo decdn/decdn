@@ -1266,6 +1266,18 @@ since project inception and will roll into the first tagged release.
   `decdn_incentive::tx::GasHeadroomFiller`, which adds `GAS_HEADROOM` (50,000)
   to an estimated limit. A caller-set limit goes out unchanged. Unused gas is
   refunded.
+- **`decdn-e2e`: a fixture never releases a port before its child binds it
+  (#2729).** Parallel journeys no longer fail at bring-up with `Address
+  already in use`. `anvil` binds port 0 and the fixture reads the port from
+  its `Listening on` line. The daemon's admin and metrics ports and the
+  gateway and dashboard ports are held by a `ports::PortReservation`, a
+  `SO_REUSEADDR` socket that never listens, for the child's lifetime, a
+  `NodeFixture::restart` included. Linux hands a held port to no `bind(…:0)`
+  and to no `connect()`, and the child still binds it. The daemon's QUIC port
+  is a `ports::UdpPortClaim` below the kernel's ephemeral range, locked across
+  fixtures by a TCP socket on the same number. `free_ports` and the retry of
+  an anvil that died at startup are gone. The `decdn-node` anvil tests and the
+  `sponsord` binary anvil test hold their ports the same way.
 - **Client: a streamed fetch with no size hint keeps the pull it opened for
   the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
   fast path, or a gateway pull whose size lookup finds none), the client read

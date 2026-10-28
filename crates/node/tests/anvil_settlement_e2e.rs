@@ -317,10 +317,32 @@ fn contracts_dir() -> PathBuf {
         .expect("contracts dir")
 }
 
-/// Grab an ephemeral TCP port, then release it for anvil to claim.
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
-    l.local_addr().expect("local_addr").port()
+/// Reserve a loopback TCP port for the test's duration, and return the held
+/// socket with its port. Keep the socket alive while anything may bind the port.
+///
+/// The socket is bound with `SO_REUSEADDR` and never listens. On Linux the
+/// kernel then hands the port to no other socket's `bind(…:0)` and to no
+/// `connect()` as a source port, so a parallel test process cannot take it. An
+/// explicit bind with `SO_REUSEADDR`, which anvil and the runtime's admin and
+/// metrics listeners make, still succeeds.
+fn reserve_port() -> (socket2::Socket, u16) {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .expect("port reservation socket");
+    socket.set_reuse_address(true).expect("SO_REUSEADDR");
+    socket
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .expect("bind ephemeral");
+    let port = socket
+        .local_addr()
+        .expect("local_addr")
+        .as_socket()
+        .expect("inet socket")
+        .port();
+    (socket, port)
 }
 
 /// Poll `f` until it yields `Some`, or `timeout` elapses.
@@ -527,7 +549,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     );
 
     // ---- 1. Spawn anvil.
-    let port = free_port();
+    let (_port_hold, port) = reserve_port();
     let rpc_url = format!("http://127.0.0.1:{port}");
     let child = Command::new("anvil")
         .args([
