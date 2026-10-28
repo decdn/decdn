@@ -1595,17 +1595,9 @@ async fn a_stale_pool_read_invents_no_overdraft() {
 /// the allowance and nonce reads.
 #[tokio::test]
 async fn a_refused_open_replaces_no_closing_pool() {
-    let selector = alloy::primitives::keccak256("PoolNotOpen()");
     let asserter = Asserter::new();
     asserter.push_success(&full_pool_on_chain(0));
-    asserter.push_failure(
-        serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
-            "code": 3,
-            "message": "execution reverted",
-            "data": format!("0x{}", alloy::primitives::hex::encode(&selector[..4])),
-        }))
-        .unwrap(),
-    );
+    answer_a_top_up_reverting_pool_not_open(&asserter);
     answer_a_replacement_open(&asserter);
     let funding = RunFunding::default();
     let err = step_opening(asserter.clone(), &funding, WORKING, PoolOpen::Refused)
@@ -1622,21 +1614,10 @@ async fn a_refused_open_replaces_no_closing_pool() {
 /// estimate fails before anything is sent).
 #[tokio::test]
 async fn a_full_closing_pool_is_replaced() {
-    let selector = alloy::primitives::keccak256("PoolNotOpen()");
     let asserter = Asserter::new();
     asserter.push_success(&full_pool_on_chain(0));
-    asserter.push_failure(
-        serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
-            "code": 3,
-            "message": "execution reverted",
-            "data": format!("0x{}", alloy::primitives::hex::encode(&selector[..4])),
-        }))
-        .unwrap(),
-    );
-    // The open's allowance read finds enough, and its pending-nonce read
-    // answers, so the open goes on to submit.
-    asserter.push_success(&U256::MAX.abi_encode());
-    asserter.push_success(&U256::ZERO);
+    answer_a_top_up_reverting_pool_not_open(&asserter);
+    answer_a_replacement_open(&asserter);
     let (stepped, opens) = step_on_a_full_pool(asserter.clone()).await;
     let err = stepped.expect_err("the replacement open reaches the chain");
     assert!(
@@ -1667,6 +1648,21 @@ fn no_record_on_chain() -> Bytes {
 fn answer_a_replacement_open(asserter: &Asserter) {
     asserter.push_success(&U256::MAX.abi_encode());
     asserter.push_success(&U256::ZERO);
+}
+
+/// Queue a `topUp` gas estimate that reverts `PoolNotOpen`: a code-3
+/// "execution reverted" error whose data is the error's 4-byte selector.
+fn answer_a_top_up_reverting_pool_not_open(asserter: &Asserter) {
+    use alloy::sol_types::SolError;
+    use decdn_incentive::pool_open_error::PoolNotOpen;
+    asserter.push_failure(
+        serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
+            "code": 3,
+            "message": "execution reverted",
+            "data": alloy::primitives::hex::encode_prefixed(PoolNotOpen::SELECTOR),
+        }))
+        .unwrap(),
+    );
 }
 
 /// Assert that a recovery step went straight to a replacement open, which the
@@ -3443,17 +3439,9 @@ async fn an_open_with_no_pool_opened_event_is_untracked() {
 /// before the replacement's allowance read.
 #[tokio::test]
 async fn a_replacement_open_after_an_untracked_escrow_is_refused() {
-    let selector = alloy::primitives::keccak256("PoolNotOpen()");
     let asserter = Asserter::new();
     asserter.push_success(&full_pool_on_chain(0));
-    asserter.push_failure(
-        serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
-            "code": 3,
-            "message": "execution reverted",
-            "data": format!("0x{}", alloy::primitives::hex::encode(&selector[..4])),
-        }))
-        .unwrap(),
-    );
+    answer_a_top_up_reverting_pool_not_open(&asserter);
     let held = crate::buyer_pool::escrowed_but_untracked(
         "pool 0x01 topped up by 5 µUSDC",
         decdn_incentive::test_rpc::SCRIPTED_TX,
