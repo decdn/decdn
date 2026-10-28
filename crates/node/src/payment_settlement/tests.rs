@@ -1168,6 +1168,33 @@ async fn admit_getpool_coalesces_concurrent_reads() {
     );
 }
 
+/// #2706: admit-path chain reads across distinct pools hold at most
+/// `ADMIT_CHAIN_READ_CONCURRENCY` slots, so a flood of fresh pool ids cannot send
+/// one `getPool` each at once. While the first reads hang, the rest wait for a
+/// slot and send nothing.
+#[tokio::test(start_paused = true)]
+async fn admit_chain_reads_across_pools_are_capped() {
+    use crate::pool_view::PoolView;
+    use std::sync::atomic::Ordering;
+
+    let (view, calls) = counting_hanging_view();
+    let flood = futures_util::future::join_all((0..ADMIT_CHAIN_READ_CONCURRENCY * 3).map(|i| {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        view.status(B256::from(id))
+    }));
+    tokio::pin!(flood);
+    tokio::select! {
+        _ = &mut flood => panic!("hung reads cannot answer inside one second"),
+        () = tokio::time::sleep(Duration::from_secs(1)) => {}
+    }
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        ADMIT_CHAIN_READ_CONCURRENCY,
+        "only the reads that hold a slot reach the provider"
+    );
+}
+
 /// With the negative cache full of in-window entries, the read's fault is
 /// not cached; its waiters still take the read's answer instead of each
 /// starting a read of its own in turn.

@@ -5254,6 +5254,18 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: unbound requests read no pool on-chain, and admission reads are
+  capped (#2706).** At admission, an unseen `pool_id` cost one `getPool` and
+  an unseen signer one `getAuthorization`, with no global bound, so a stream
+  of requests for fresh random pool ids could spend the operator's RPC quota
+  until the blacklist watcher stalled and the node refused every serve. A
+  request with no verified client binding can name no lane, so the node now
+  refuses it `NotFound` before any chain read (it counts on
+  `decdn_serve_stream_rejected_owner_mismatch_total`). Admission `getPool` and
+  `getAuthorization` reads hold one of 16 node-wide slots; a read that waits
+  for a slot counts the wait against its timeout. Bound requests are bounded
+  by these slots and by the `[serve.rate_limit]` limiter.
+
 - **Node: inbound `cdn/client/v1` requests pass a three-layer rate limiter
   before they are read (#2694).** The only gates on `cdn/client/v1` were the
   per-connection limiter and the stream cap. Every refusal past them signs a

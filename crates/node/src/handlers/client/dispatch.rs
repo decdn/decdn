@@ -578,6 +578,27 @@ impl ClientHandler {
             }
         }
 
+        // Chain reads only for a request that names a lane. A request with no
+        // verified binding can name none, so it can never be served and ends
+        // in the same refusal it meets at the lane gate below. Refuse it here
+        // instead, before an unseen pool costs it a `getPool`: a stream of
+        // unbound requests for fresh random `pool_id`s would otherwise spend
+        // one RPC each. A bound request still reads the chain, because a
+        // registered signer sends no capability and its funding refusal
+        // (`Unfunded`) needs the read; the per-request limiter and the
+        // admit-read cap bound what bound requests can spend. With no
+        // pool-view wired (dev/test) there is no read to spare.
+        if self.pool_view.is_some() && lane_key.is_none() {
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::OwnerMismatch,
+                    rate_per_mb,
+                )
+                .await;
+        }
+
         // Pool `getPool` view (owner + remaining), read ONCE and reused by the
         // funder gate here, the capability owner check, and the floor-`M` solvency
         // gates below. Read AFTER the origin-only gate, not beside it: a declined

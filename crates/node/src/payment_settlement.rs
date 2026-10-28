@@ -173,6 +173,14 @@ const UNREGISTERED_AUTH_TTL: Duration = Duration::from_mins(1);
 /// admit.
 const AUTH_CACHE_MAX: usize = 4096;
 
+/// How many admit-path chain reads (`getPool`, `getAuthorization`) may be in
+/// flight at once, across every pool and signer. Each distinct key coalesces to
+/// one read, but a flood of distinct pool ids or signers would otherwise send
+/// one read each at once and spend the operator's RPC quota, and a stalled
+/// watcher then refuses every serve. A read that waits for a slot counts its
+/// wait against its timeout.
+const ADMIT_CHAIN_READ_CONCURRENCY: usize = 16;
+
 /// One admit-path `getAuthorization` read held in the signer-auth cache.
 ///
 /// A `Registered` read never goes stale. Its `cap` and `expiry` are write-once,
@@ -1289,6 +1297,8 @@ pub struct ResolvingPoolView<P: Provider + Clone> {
     /// `(pool_id, signer)` → a receiver for the in-flight admit
     /// `getAuthorization` of that pair. See [`ReadSlot`].
     auth_inflight: InflightReads<(B256, Address), Option<SignerAuthorization>>,
+    /// Slots for admit-path chain reads; see [`ADMIT_CHAIN_READ_CONCURRENCY`].
+    chain_reads: tokio::sync::Semaphore,
     /// Counts each signer confirm by what the cache held for it.
     metrics: Arc<Metrics>,
 }
@@ -1318,6 +1328,7 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
             inflight: Mutex::new(HashMap::new()),
             auth_cache: Mutex::new(HashMap::new()),
             auth_inflight: Mutex::new(HashMap::new()),
+            chain_reads: tokio::sync::Semaphore::new(ADMIT_CHAIN_READ_CONCURRENCY),
             metrics,
         }
     }
@@ -1342,7 +1353,11 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
     async fn resolve(&self, pool_id: B256) -> Option<PoolStatus> {
         // Bounded: the alloy HTTP provider sets no timeout of its own, so a hung
         // read times out here and takes the fault path below.
-        let pool = match timed(None, "admit getPool", self.contract.getPool(pool_id).call()).await {
+        let read = async {
+            let _slot = self.chain_reads.acquire().await;
+            self.contract.getPool(pool_id).call().await
+        };
+        let pool = match timed(None, "admit getPool", read).await {
             Ok(pool) => pool,
             Err(err) => {
                 warn!(
@@ -1500,13 +1515,11 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
         // The baseline is taken before the read is sent; see `AuthRead`.
         let folded_at_read = self.projection.signer_spent(pool_id, signer);
         // Bounded: a hung read times out here and takes the fault path below.
-        let auth = match timed(
-            None,
-            "admit getAuthorization",
-            self.contract.getAuthorization(pool_id, signer).call(),
-        )
-        .await
-        {
+        let read = async {
+            let _slot = self.chain_reads.acquire().await;
+            self.contract.getAuthorization(pool_id, signer).call().await
+        };
+        let auth = match timed(None, "admit getAuthorization", read).await {
             Ok(auth) => SignerAuthorization::from_onchain(&auth),
             Err(err) => {
                 warn!(
