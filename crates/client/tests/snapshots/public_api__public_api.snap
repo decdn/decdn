@@ -707,6 +707,7 @@ pub fn decdn_client::streamer::Streamer<'a, P, F>::recovery(self, alloc::sync::A
 impl<P, F> decdn_client::streamer::Streamer<'_, P, F> where P: SourceProvider, F: decdn_client::source::Funder
 pub async fn decdn_client::streamer::Streamer<'_, P, F>::open<'a>(self, [u8; 32], u64, &decdn_client::config::PullConfig, alloc::sync::Arc<dyn decdn_client::sink::BlobCache>, decdn_client::stop::StopPolicy) -> anyhow::Result<(decdn_client::streamer::VerifiedReader, decdn_client::streamer::StreamDrive<'a>)> where P: 'a, F: 'a
 pub async fn decdn_client::streamer::Streamer<'_, P, F>::open_range<'a>(self, [u8; 32], u64, (u64, u64), &decdn_client::config::PullConfig, alloc::sync::Arc<dyn decdn_client::sink::BlobCache>, decdn_client::stop::StopPolicy) -> anyhow::Result<(decdn_client::streamer::VerifiedReader, decdn_client::streamer::StreamDrive<'a>)> where P: 'a, F: 'a
+pub async fn decdn_client::streamer::Streamer<'_, P, F>::prove_size(self, [u8; 32], u64, &decdn_client::config::PullConfig, decdn_client::stop::StopPolicy) -> anyhow::Result<core::option::Option<u64>>
 impl<P, F> core::fmt::Debug for decdn_client::streamer::Streamer<'_, P, F>
 pub fn decdn_client::streamer::Streamer<'_, P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub mod decdn_client::uri
@@ -1013,6 +1014,7 @@ pub fn decdn_client::streamer::Streamer<'a, P, F>::recovery(self, alloc::sync::A
 impl<P, F> decdn_client::streamer::Streamer<'_, P, F> where P: SourceProvider, F: decdn_client::source::Funder
 pub async fn decdn_client::streamer::Streamer<'_, P, F>::open<'a>(self, [u8; 32], u64, &decdn_client::config::PullConfig, alloc::sync::Arc<dyn decdn_client::sink::BlobCache>, decdn_client::stop::StopPolicy) -> anyhow::Result<(decdn_client::streamer::VerifiedReader, decdn_client::streamer::StreamDrive<'a>)> where P: 'a, F: 'a
 pub async fn decdn_client::streamer::Streamer<'_, P, F>::open_range<'a>(self, [u8; 32], u64, (u64, u64), &decdn_client::config::PullConfig, alloc::sync::Arc<dyn decdn_client::sink::BlobCache>, decdn_client::stop::StopPolicy) -> anyhow::Result<(decdn_client::streamer::VerifiedReader, decdn_client::streamer::StreamDrive<'a>)> where P: 'a, F: 'a
+pub async fn decdn_client::streamer::Streamer<'_, P, F>::prove_size(self, [u8; 32], u64, &decdn_client::config::PullConfig, decdn_client::stop::StopPolicy) -> anyhow::Result<core::option::Option<u64>>
 impl<P, F> core::fmt::Debug for decdn_client::streamer::Streamer<'_, P, F>
 pub fn decdn_client::streamer::Streamer<'_, P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::UpstreamRefused

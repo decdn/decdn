@@ -72,19 +72,24 @@
 //! An entry's pull is capped at the size its manifest declares, so a manifest
 //! cannot make the gateway pay for more than it says, and a declared size is
 //! what `Content-Length` and the allowance count on. A raw blob's size is
-//! the one a whole pull here verified: its first request streams with no
-//! length, and a repeat request has its size, as an entry does. No node's
-//! size claim gives a response its length, since the server stops reading a
-//! body at its length and a short pull would then end as a whole file. A
+//! one a whole pull here verified, or else one a size proof proves before
+//! the response: a pull of the last chunk group under the first node's size
+//! claim, whose final chunk verifies only under the true size (ADR 039). A
+//! loopback gateway proves sizes too, on the capability that pays. A blob
+//! whose proof proves nothing streams with no length. No node's size
+//! claim gives a response its length, since the server stops reading a body
+//! at its length and a short pull would then end as a whole file. A
 //! sized response takes one
 //! `Range`: the response is `206` over exactly that window, the pull pays
 //! only for the chunk-group-aligned span around it (ADR 038), the allowance
 //! admits and charges the request by that span, and a window past the end is
 //! `416`; a range the gateway cannot honour (several, a
-//! rewritten page, a blob no pull here verified) is ignored, as HTTP
+//! rewritten page, a raw blob of unknown size) is ignored, as HTTP
 //! allows, so a `curl -r`, a resumed download and a BEP 19 webseed all work.
 //! `HEAD` on an entry is answered from the bundle manifest, at no pull of the
-//! entry, and on a raw blob from its verified size, at no pull at all. The
+//! entry, and on a raw blob from its verified size, at no pull at all; a
+//! raw blob of unknown size pays for its size proof (`PROOF_BYTES` of the
+//! allowance), as its `GET` would. The
 //! API paths answer `404`,
 //! and a site's `Sec-Fetch-*` headers decide nothing: the operator pays,
 //! within the allowance. Every answer is readable by every origin
@@ -276,6 +281,14 @@ const DROP_PENALTY_BYTES: u64 = {
     };
     window + PIPE_BYTES as u64 + CHUNK_BYTES as u64
 };
+
+/// What a size proof counts against the allowance: the one chunk group it
+/// pays for, its proof aside.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a chunk group is 16 KiB, within any usize"
+)]
+const PROOF_BYTES: usize = decdn_bao_range::CHUNK_GROUP_BYTES as usize;
 
 /// Run the gateway until Ctrl-C.
 ///
@@ -1372,7 +1385,7 @@ impl Gateway {
     /// content. `Err(req)` when the request is not one of those,
     /// and on a loopback gateway.
     async fn public_bare<B>(
-        &self,
+        self: &Arc<Self>,
         req: Request<B>,
         path: &str,
         target: &str,
@@ -1391,7 +1404,7 @@ impl Gateway {
             (&Method::PUT, "/_pointer") => self.put_pointer(req).await,
             (&Method::HEAD, "/" | "/favicon.ico") => text(StatusCode::OK, ""),
             (&Method::HEAD, _) => {
-                self.head_blob(target.trim_start_matches('/'), Present::Bare)
+                self.head_blob(target.trim_start_matches('/'), Present::Bare, "", |_| None)
                     .await
             }
             _ => return Err(Box::new(req)),
@@ -1472,7 +1485,13 @@ impl Gateway {
         let target = req.uri().path_and_query().map_or(path, |pq| pq.as_str());
         if head {
             return match target.strip_prefix("/_decdn/") {
-                Some(rest) => self.head_blob(rest, Present::Site).await,
+                Some(rest) => {
+                    // The bucket a `GET` of it under `/_decdn/` would spend.
+                    let bundle = site.hash;
+                    let bucket = move |hash| pointer.filter(|_| hash == bundle);
+                    self.head_blob(rest, Present::Site, &page_host, bucket)
+                        .await
+                }
                 None => self.head_site(&site, path, pointer).await,
             };
         }
@@ -1487,13 +1506,13 @@ impl Gateway {
             let bucket = pointer.filter(|_| uri.hash == site.hash);
             if !site::is_navigation(headers) {
                 return self
-                    .paid(&page_host, bucket, &uri, Present::Site, range)
+                    .paid(&page_host, bucket, &uri, Present::Site, Ask::Get(range))
                     .await;
             }
             // Another bundle's pages run on their own origin; a blob has none.
             return match uri.target {
                 UriTarget::Blob => {
-                    self.paid(&page_host, bucket, &uri, Present::Download, range)
+                    self.paid(&page_host, bucket, &uri, Present::Download, Ask::Get(range))
                         .await
                 }
                 _ => self.to_site(&uri),
@@ -1511,7 +1530,7 @@ impl Gateway {
             Ok(uri) => DecdnUri::new(uri.hash, uri.target, site.namespace),
             Err(e) => return text(StatusCode::NOT_FOUND, &format!("{e}\n")),
         };
-        self.paid(&page_host, pointer, &uri, Present::Site, range)
+        self.paid(&page_host, pointer, &uri, Present::Site, Ask::Get(range))
             .await
     }
 
@@ -1880,7 +1899,10 @@ impl Gateway {
             // a public gateway a blob streams from the bare host as bytes.
             return match uri.target {
                 UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
-                _ if self.public() => self.paid("", None, &uri, Present::Bare, range).await,
+                _ if self.public() => {
+                    self.paid("", None, &uri, Present::Bare, Ask::Get(range))
+                        .await
+                }
                 _ => text(StatusCode::UNAUTHORIZED, "token required\n"),
             };
         }
@@ -1891,7 +1913,7 @@ impl Gateway {
         else {
             return text(StatusCode::UNAUTHORIZED, "page host required\n");
         };
-        self.paid(&page_host, None, &uri, Present::Bare, range)
+        self.paid(&page_host, None, &uri, Present::Bare, Ask::Get(range))
             .await
     }
 
@@ -1904,7 +1926,7 @@ impl Gateway {
         pointer: Option<u64>,
         uri: &DecdnUri,
         present: Present,
-        range: Option<&str>,
+        ask: Ask<'_>,
     ) -> Response<Body> {
         if let Some(refused) = self.allowance_refusal(pointer, uri) {
             return refused;
@@ -1919,7 +1941,7 @@ impl Gateway {
                     &format!("no capability covers {page_host}\n"),
                 );
             };
-            match self.serve(uri, &paying, present, range).await {
+            match self.serve(uri, &paying, present, ask).await {
                 Ok(response) => return response,
                 Err(PullError::Allowance) => return self.allowance_spent(pointer, uri),
                 Err(PullError::Funding(e)) => match &paying {
@@ -1963,18 +1985,22 @@ impl Gateway {
         ))
     }
 
-    /// Serve what `uri` names, as `present` says, paid by `paying`; `range` is
-    /// the request's `Range` header, honoured on a blob or entry of known
-    /// size.
+    /// Serve what `uri` names, as `present` says, paid by `paying`, to
+    /// `ask`: a `GET` and its `Range` header, honoured on a blob or entry of
+    /// known size, or a blob's `HEAD`.
     async fn serve(
         self: &Arc<Self>,
         uri: &DecdnUri,
         paying: &Payment,
         present: Present,
-        range: Option<&str>,
+        ask: Ask<'_>,
     ) -> Result<Response<Body>, PullError> {
+        let range = match ask {
+            Ask::Get(range) => range,
+            Ask::Head => None,
+        };
         match &uri.target {
-            UriTarget::Blob => self.blob(uri, paying, present, range).await,
+            UriTarget::Blob => self.blob(uri, paying, present, ask).await,
             UriTarget::BundleEntry(path) => {
                 self.entry(uri.hash, uri.namespace, path, paying, present, range)
                     .await
@@ -1987,21 +2013,31 @@ impl Gateway {
         }
     }
 
-    /// A blob by its hash. The size a pull here verified
-    /// ([`Self::blob_size`]) gives the response its length, admits the
-    /// request against the allowance, caps the pull and lets one `Range`
-    /// through, as an entry's declared size does. A blob no pull verified
-    /// streams whole, with no length.
+    /// A blob by its hash. Its size, as a pull here verified it
+    /// ([`Self::blob_size`]) or else as a size proof proves it
+    /// ([`Self::prove`]), gives the response its length, admits the request
+    /// against the allowance, caps the pull and lets one `Range` through, as
+    /// an entry's declared size does. A blob whose proof proved nothing
+    /// streams whole, with no length. A `HEAD` answers with the headers once
+    /// the size is known or the proof ends.
     async fn blob(
         self: &Arc<Self>,
         uri: &DecdnUri,
         paying: &Payment,
         present: Present,
-        range: Option<&str>,
+        ask: Ask<'_>,
     ) -> Result<Response<Body>, PullError> {
-        let size = self.blob_size(uri.hash).await;
         let name = alloy::hex::encode(uri.hash);
-        let extent = match Extent::of(size, range, rewrites(present, &name)) {
+        let rewritten = rewrites(present, &name);
+        let mut size = self.blob_size(uri.hash).await;
+        if size.is_none() && !rewritten {
+            size = self.prove(uri, paying).await?;
+        }
+        let range = match ask {
+            Ask::Get(range) => range,
+            Ask::Head => return Ok(head_response(&blob_type(present, &name), size, uri.hash)),
+        };
+        let extent = match Extent::of(size, range, rewritten) {
             Ok(extent) => extent,
             Err(size) => return Ok(not_satisfiable(size)),
         };
@@ -2015,8 +2051,8 @@ impl Gateway {
             .await
     }
 
-    /// The size of the blob `hash` as a whole pull here verified it
-    /// ([`PullWorker::size`]); the empty root's is zero. A node's size claim
+    /// The size of the blob `hash` as a whole pull or a size proof here
+    /// verified it ([`PullWorker::size`]); the empty root's is zero. A node's size claim
     /// never counts: the server stops reading a body at its length, so a
     /// claim below the real size would end a short pull as a whole file.
     async fn blob_size(&self, hash: [u8; 32]) -> Option<u64> {
@@ -2024,6 +2060,66 @@ impl Gateway {
             return Some(0);
         }
         self.pulls.size(hash).await
+    }
+
+    /// Prove the size of the blob `uri` names before its response, paid by
+    /// `paying`: the worker pays for the last chunk group under the first
+    /// node's size claim, and a size its final chunk verifies joins the
+    /// verified sizes ([`PullWorker::size`]). `None` when the proof proved
+    /// nothing. The allowance it waited behind refuses it at its slot, as a
+    /// pull's does. A proof that ends without an error counts [`PROOF_BYTES`]
+    /// against the allowance, and so does a request dropped while its proof
+    /// runs ([`ProofCharge`]), since the worker still pays for the proof.
+    ///
+    /// # Errors
+    ///
+    /// What ends the request as it ends a pull: a funding stop, an allowance
+    /// stop, a fault before the proof (such as no holder), or a fault the
+    /// pull after the proof would reach again. A proof that fails on its own
+    /// is no error.
+    async fn prove(
+        self: &Arc<Self>,
+        uri: &DecdnUri,
+        paying: &Payment,
+    ) -> Result<Option<u64>, PullError> {
+        let bucket = paying.bucket();
+        // The proof writes nothing; the reader is held to its end, so the
+        // pipe never reads as closed.
+        let (writer, _reader) = tokio::io::duplex(1);
+        let (done, ended) = oneshot::channel();
+        let admit = self.admission(bucket);
+        self.pulls
+            .pull(Job {
+                blob: BlobFetch {
+                    estimate: false,
+                    progress: None,
+                    hash: uri.hash,
+                    output: PathBuf::from("-"),
+                    namespace: uri.namespace,
+                    common: self.common.clone(),
+                    read_ahead: None,
+                    size_cap: None,
+                    range: None,
+                    prove: true,
+                },
+                paying: paying.clone(),
+                writer,
+                done,
+                admit,
+            })
+            .map_err(PullError::Other)?;
+        let mut charge = ProofCharge {
+            gateway: Arc::clone(self),
+            bucket,
+            armed: true,
+        };
+        let failed = match ended.await {
+            Ok(Ok(())) => return Ok(self.pulls.size(uri.hash).await),
+            Ok(Err(e)) => classify(e),
+            Err(_) => PullError::Other(anyhow::anyhow!("the size proof ended without a result")),
+        };
+        charge.armed = false;
+        Err(failed)
     }
 
     /// One bundle entry, by its literal manifest path. A path the manifest
@@ -2364,25 +2460,35 @@ impl Gateway {
     }
 
     /// `HEAD` on the public bare host, or under a site's `/_decdn/`: a blob's
-    /// headers with no pull, and its length when a pull here verified it
-    /// ([`Self::blob_size`]); a bundle or an entry redirects to its site, at
-    /// no pull, where `GET` under `/_decdn/` would serve a page's request for
-    /// it inline.
-    async fn head_blob(&self, rest: &str, present: Present) -> Response<Body> {
+    /// headers, with its length when a pull here verified it
+    /// ([`Self::blob_size`]), at no pull; a blob of unknown size pays for its
+    /// size proof as its `GET` would ([`Self::prove`]): from the pool, as
+    /// [`Self::paid`] pays for `page_host`, against the allowance `bucket`
+    /// names for the blob's hash. A bundle or an entry redirects to its site, at no pull,
+    /// where `GET` under `/_decdn/` would serve a page's request for it
+    /// inline.
+    async fn head_blob(
+        self: &Arc<Self>,
+        rest: &str,
+        present: Present,
+        page_host: &str,
+        bucket: impl FnOnce([u8; 32]) -> Option<u64>,
+    ) -> Response<Body> {
         let uri: DecdnUri = match format!("decdn:{rest}").parse() {
             Ok(uri) => uri,
             Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
         };
         match uri.target {
-            UriTarget::Blob => {
-                let name = alloy::hex::encode(uri.hash);
-                let content_type = match present {
-                    Present::Bare | Present::Download => content_type(&name),
-                    Present::Site => site::content_type(&name),
-                };
-                let size = self.blob_size(uri.hash).await;
-                head_response(&content_type, size, uri.hash)
-            }
+            UriTarget::Blob => match self.blob_size(uri.hash).await {
+                Some(size) => {
+                    let name = alloy::hex::encode(uri.hash);
+                    head_response(&blob_type(present, &name), Some(size), uri.hash)
+                }
+                None => {
+                    self.paid(page_host, bucket(uri.hash), &uri, present, Ask::Head)
+                        .await
+                }
+            },
             UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
             _ => text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
         }
@@ -2483,10 +2589,7 @@ impl Gateway {
         let bucket = guard.bucket;
         // Asked once the pull has its slot: the allowance the requests before
         // it spent while it waited refuses it before any paid work.
-        let admit = self.public().then(|| {
-            let gateway = Arc::clone(self);
-            Box::new(move || gateway.allowance_admits(bucket)) as Box<dyn FnOnce() -> bool + Send>
-        });
+        let admit = self.admission(bucket);
         self.pulls
             .pull(Job {
                 blob: BlobFetch {
@@ -2499,6 +2602,7 @@ impl Gateway {
                     read_ahead: self.public().then_some(PUBLIC_READ_AHEAD_BYTES),
                     size_cap,
                     range,
+                    prove: false,
                 },
                 paying: paying.clone(),
                 writer,
@@ -2517,6 +2621,19 @@ impl Gateway {
             }
         };
         Ok((first, reader, done_rx, guard))
+    }
+
+    /// The check a job asks once it has its slot ([`Job::admit`]): whether
+    /// the public allowance `bucket` still admits it. `None` on a loopback
+    /// gateway.
+    fn admission(
+        self: &Arc<Self>,
+        bucket: Option<u64>,
+    ) -> Option<Box<dyn FnOnce() -> bool + Send>> {
+        self.public().then(|| {
+            let gateway = Arc::clone(self);
+            Box::new(move || gateway.allowance_admits(bucket)) as Box<dyn FnOnce() -> bool + Send>
+        })
     }
 
     /// Whether the public allowance `bucket` admits a request right now.
@@ -2729,6 +2846,23 @@ struct PullGuard {
     id: u64,
     /// Content bytes its response delivered so far, shared with that entry.
     delivered: Arc<AtomicU64>,
+}
+
+/// Counts a size proof's [`PROOF_BYTES`] against its allowance `bucket` when
+/// it drops armed: once its proof ends without an error, or when the request
+/// drops while the worker still runs (and pays for) its proof.
+struct ProofCharge {
+    gateway: Arc<Gateway>,
+    bucket: Option<u64>,
+    armed: bool,
+}
+
+impl Drop for ProofCharge {
+    fn drop(&mut self) {
+        if self.armed {
+            self.gateway.charge(self.bucket, PROOF_BYTES);
+        }
+    }
 }
 
 impl PullGuard {
@@ -3177,6 +3311,23 @@ fn not_satisfiable(size: u64) -> Response<Body> {
         header::HeaderValue::from_static("bytes"),
     );
     response
+}
+
+/// What a request asks of the content it names.
+#[derive(Clone, Copy)]
+enum Ask<'a> {
+    /// A `GET`, with its `Range` header.
+    Get(Option<&'a str>),
+    /// A `HEAD` of a blob: its headers alone.
+    Head,
+}
+
+/// The type a raw blob named `name` is served as, where `present` shows it.
+fn blob_type(present: Present, name: &str) -> String {
+    match present {
+        Present::Bare | Present::Download => content_type(name),
+        Present::Site => site::content_type(name),
+    }
 }
 
 /// A `HEAD` answer: the type, the length when known (and with it that ranges
