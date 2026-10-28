@@ -1319,6 +1319,14 @@ since project inception and will roll into the first tagged release.
   yet then waited for the restarted daemon's next full redeem interval, past
   the 90 s settlement poll. The journey now sends SIGTERM first, as the
   runbook's "Stop" step does, so the final redeem sweep settles it.
+- **`decdn-e2e`: the bundle multi-source journey splits its large entry on the
+  first pull (#2741).** The entry was 640 KiB. Its probe round starts the
+  fetch at the first holder that answers, and that lane takes the whole blob.
+  The other holder joins a few milliseconds later, but ADR 039 splits no range
+  below `min_split_size` (16 MiB) for a late lane. So a pull split the entry
+  only when both holders answered before the fetch started (6 of 82 pulls in a
+  local sample), and the 90 s retry ladder sometimes ran out. The entry is now
+  64 MiB, so the late holder steals half of it.
 - **Client: a streamed fetch with no size hint keeps the pull it opened for
   the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
   fast path, or a gateway pull whose size lookup finds none), the client read
