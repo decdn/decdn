@@ -1278,6 +1278,15 @@ since project inception and will roll into the first tagged release.
   fixtures by a TCP socket on the same number. `free_ports` and the retry of
   an anvil that died at startup are gone. The `decdn-node` anvil tests and the
   `sponsord` binary anvil test hold their ports the same way.
+- **e2e: `NodeFixture` counts a health answer only from its own daemon
+  (#2738).** `wait_healthy` compares the `node_id` in `admin_v1_health` with
+  the key in the fixture's data dir. The admin port is picked free and released
+  before the daemon binds it, so a daemon from another test process can hold
+  it first. The wait then returned on that daemon's answer, and the journey
+  asserted against the wrong node: `g_node_04::global_blacklist_compliance`
+  saw a dry-run `evict` report `was_present: false` for a blob its node held.
+  The wait now keeps polling until its own daemon answers. If that daemon exits
+  first, the error names the node that held the port.
 - **Client: a streamed fetch with no size hint keeps the pull it opened for
   the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
   fast path, or a gateway pull whose size lookup finds none), the client read

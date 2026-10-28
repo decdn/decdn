@@ -22,7 +22,7 @@ use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::{CacheEngine, FilesystemOrigin, Hash, Origin};
-use decdn_common::admin::{AdminRpcClient, BindingStatus};
+use decdn_common::admin::{AdminRpcClient, BindingStatus, HealthResponse};
 use decdn_common::identity;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
@@ -152,16 +152,7 @@ impl NodeFixture {
             .health()
             .await
             .context("admin_v1_health")?;
-        let bytes: [u8; 32] = alloy::primitives::hex::decode(&health.node_id)
-            .context("decode health node_id hex")?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("health node_id is not 32 bytes: {}", health.node_id))?;
-        iroh::PublicKey::from_bytes(&bytes).with_context(|| {
-            format!(
-                "health node_id is not a valid ed25519 key: {}",
-                health.node_id
-            )
-        })
+        health_node_id(&health)
     }
 
     /// The daemon's bring-up verdict on whether its local key is the one bound
@@ -913,9 +904,19 @@ impl NodeFixture {
             .with_context(|| format!("build admin client for {}", self.admin_url))
     }
 
-    /// Poll `admin_v1_health` until it succeeds or `timeout` elapses. Fails fast
-    /// if the daemon process exits before becoming healthy (e.g. bad config /
-    /// port clash) rather than waiting out the full timeout.
+    /// Poll `admin_v1_health` until this fixture's own daemon answers it, or
+    /// `timeout` elapses. Fails fast if the daemon process exits before becoming
+    /// healthy (e.g. bad config / port clash) rather than waiting out the full
+    /// timeout.
+    ///
+    /// An answer counts only when its `node_id` is the key in this node's data
+    /// dir, which is the key the daemon loads at startup. The admin port is
+    /// picked free and then released before the daemon binds it, so another
+    /// process's daemon can hold it first. That daemon answers health too, and
+    /// a journey that trusted it would assert against the wrong node (a dry-run
+    /// `evict` that reports `was_present: false` for a blob this node holds).
+    /// Once this daemon answers, it owns the listener, so every later admin
+    /// call reaches it.
     pub async fn wait_healthy(&self, timeout: Duration) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         // Remember the last probe error so a persistent-but-alive failure mode
@@ -923,12 +924,9 @@ impl NodeFixture {
         // written before the deadline read below, so it starts uninitialized.
         let mut last_err: Option<String>;
         loop {
-            match self.admin_client() {
-                Ok(client) => match client.health().await {
-                    Ok(_) => return Ok(()),
-                    Err(e) => last_err = Some(e.to_string()),
-                },
-                Err(e) => last_err = Some(e.to_string()),
+            match self.own_daemon_health().await {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(format!("{e:#}")),
             }
             // Detect a daemon that died at startup. Scope the lock so the guard
             // is dropped before the `sleep().await` (never hold a std `Mutex`
@@ -940,8 +938,11 @@ impl NodeFixture {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Ok(Some(status)) = child.try_wait() {
+                    let cause = last_err
+                        .map(|e| format!(" (last probe error: {e})"))
+                        .unwrap_or_default();
                     anyhow::bail!(
-                        "decdn-node exited prematurely before becoming healthy: {status}"
+                        "decdn-node exited prematurely before becoming healthy: {status}{cause}"
                     );
                 }
             }
@@ -957,6 +958,51 @@ impl NodeFixture {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
+
+    /// One `admin_v1_health` probe that succeeds only when this fixture's daemon
+    /// answers it. The expected key is read on each probe: a respawn after a key
+    /// rotation loads whatever `node.secret` holds at that moment.
+    async fn own_daemon_health(&self) -> anyhow::Result<()> {
+        let expected = identity::load(self.data_dir.path())
+            .context("read the node key the daemon loads")?
+            .public();
+        let health = self
+            .admin_client()?
+            .health()
+            .await
+            .context("admin_v1_health")?;
+        ensure_health_from(&health, expected, &self.admin_url)
+    }
+}
+
+/// Decode an `admin_v1_health` `node_id` (lowercase hex of the iroh key).
+fn health_node_id(health: &HealthResponse) -> anyhow::Result<iroh::PublicKey> {
+    let bytes: [u8; 32] = alloy::primitives::hex::decode(&health.node_id)
+        .context("decode health node_id hex")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("health node_id is not 32 bytes: {}", health.node_id))?;
+    iroh::PublicKey::from_bytes(&bytes).with_context(|| {
+        format!(
+            "health node_id is not a valid ed25519 key: {}",
+            health.node_id
+        )
+    })
+}
+
+/// Accept a health answer from `admin_url` only when it names `expected`. Any
+/// other node on the port is a different daemon that holds the port.
+fn ensure_health_from(
+    health: &HealthResponse,
+    expected: iroh::PublicKey,
+    admin_url: &str,
+) -> anyhow::Result<()> {
+    let answered = health_node_id(health)?;
+    anyhow::ensure!(
+        answered == expected,
+        "admin RPC at {admin_url} answered as node {answered}, not as this fixture's node \
+         {expected}: another daemon holds the port"
+    );
+    Ok(())
 }
 
 /// The ports one daemon binds, held for its fixture's lifetime.
