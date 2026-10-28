@@ -1184,7 +1184,7 @@ jobs:
     if: needs.changes.outputs.markdown == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v7
-      - uses: DavidAnson/markdownlint-cli2-action@v24
+      - uses: DavidAnson/markdownlint-cli2-action@v25
         with:
           globs: |
             **/*.md
