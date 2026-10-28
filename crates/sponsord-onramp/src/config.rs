@@ -244,6 +244,9 @@ pub struct TurnstileConfig {
     pub secret: Secret,
     /// Letters, digits, `_` and `-` only: it is interpolated into the page.
     pub sitekey: String,
+    /// The host of `ONRAMP_PUBLIC_URL`: the only hostname siteverify may
+    /// report for a token the gate accepts.
+    pub expected_hostname: String,
 }
 
 /// Resolved configuration.
@@ -307,13 +310,22 @@ impl OnrampConfig {
     ///
     /// A secret or template file cannot be read, a URL is malformed or carries
     /// characters the installer scripts can't hold, the sitekey isn't a
-    /// plain token, or a release pin is malformed.
+    /// plain token, a Turnstile gate template has no `{{ACTION}}`, or a
+    /// release pin is malformed.
     pub fn from_args(args: Args) -> anyhow::Result<Self> {
         let releases_base = base_url("ONRAMP_RELEASES_BASE", &args.releases_base)?;
         anyhow::ensure!(
             releases_base.starts_with("https://"),
             "ONRAMP_RELEASES_BASE must be an https URL"
         );
+        let public_url = base_url("ONRAMP_PUBLIC_URL", &args.public_url)?;
+        let gate_template = args
+            .gate_template
+            .map(|path| {
+                std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("ONRAMP_GATE_TEMPLATE {}: {e}", path.display()))
+            })
+            .transpose()?;
         let turnstile = match args.gate {
             GateKind::Turnstile => {
                 let sitekey = args.turnstile_sitekey.ok_or_else(|| {
@@ -328,6 +340,21 @@ impl OnrampConfig {
                             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
                     "ONRAMP_TURNSTILE_SITEKEY must be letters, digits, '_' and '-'"
                 );
+                // Siteverify reports the widget's `data-action`, and the gate
+                // refuses every token whose action is not its own.
+                anyhow::ensure!(
+                    gate_template
+                        .as_deref()
+                        .is_none_or(|t| t.contains("{{ACTION}}")),
+                    "ONRAMP_GATE_TEMPLATE must set data-action=\"{{{{ACTION}}}}\" on the Turnstile \
+                     widget, or the gate refuses every token"
+                );
+                // A browser reaches the gate page at this host, so it is the
+                // hostname Turnstile reports for the widget's token.
+                let expected_hostname = reqwest::Url::parse(&public_url)?
+                    .host_str()
+                    .ok_or_else(|| anyhow::anyhow!("ONRAMP_PUBLIC_URL has no hostname"))?
+                    .to_owned();
                 Some(TurnstileConfig {
                     secret: Secret::resolve(
                         "ONRAMP_TURNSTILE_SECRET",
@@ -335,13 +362,14 @@ impl OnrampConfig {
                         args.turnstile_secret_file.as_deref(),
                     )?,
                     sitekey,
+                    expected_hostname,
                 })
             }
             GateKind::Custom => None,
         };
         Ok(Self {
             bind: args.bind,
-            public_url: base_url("ONRAMP_PUBLIC_URL", &args.public_url)?,
+            public_url,
             daemon_url: args.daemon_url,
             daemon_token: Secret::resolve(
                 "ONRAMP_DAEMON_TOKEN",
@@ -356,14 +384,7 @@ impl OnrampConfig {
             turnstile,
             gate: args.gate,
             brand_name: args.brand_name,
-            gate_template: args
-                .gate_template
-                .map(|path| {
-                    std::fs::read_to_string(&path).map_err(|e| {
-                        anyhow::anyhow!("ONRAMP_GATE_TEMPLATE {}: {e}", path.display())
-                    })
-                })
-                .transpose()?,
+            gate_template,
             client_ip: args
                 .client_ip_header
                 .map_or(ClientIpSource::Peer, ClientIpSource::Header),

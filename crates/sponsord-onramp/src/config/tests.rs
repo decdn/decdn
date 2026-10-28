@@ -97,6 +97,47 @@ fn turnstile_settings_are_required_only_for_the_turnstile_gate() {
 }
 
 #[test]
+fn turnstile_expected_hostname_is_the_public_url_host() {
+    for (url, host) in [
+        ("https://up.example.org/", "up.example.org"),
+        ("https://up.example.org:8443/onramp", "up.example.org"),
+        ("https://UP.Example.ORG", "up.example.org"),
+    ] {
+        let cfg = OnrampConfig::from_args(args(&["--public-url", url]).unwrap()).unwrap();
+        assert_eq!(cfg.turnstile.unwrap().expected_hostname, host, "{url}");
+    }
+}
+
+#[test]
+fn a_turnstile_template_without_the_action_is_refused() {
+    let dir = std::env::temp_dir().join(format!("onramp-template-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let without = dir.join("without.html");
+    let with = dir.join("with.html");
+    std::fs::write(&without, r#"<div data-sitekey="{{SITEKEY}}"></div>"#).unwrap();
+    std::fs::write(&with, r#"<div data-action="{{ACTION}}"></div>"#).unwrap();
+
+    let refused = args(&["--gate-template", without.to_str().unwrap()]).unwrap();
+    let err = OnrampConfig::from_args(refused).unwrap_err();
+    assert!(err.to_string().contains("{{ACTION}}"), "{err}");
+
+    let accepted = args(&["--gate-template", with.to_str().unwrap()]).unwrap();
+    assert!(OnrampConfig::from_args(accepted).is_ok());
+
+    // A custom gate renders its own page, so the Turnstile action is not
+    // required of a template it is given.
+    let custom = args(&[
+        "--gate",
+        "custom",
+        "--gate-template",
+        without.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(OnrampConfig::from_args(custom).is_ok());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn sitekey_must_be_a_plain_token() {
     let parsed = args(&["--turnstile-sitekey", "<script>"]).unwrap();
     assert!(OnrampConfig::from_args(parsed).is_err());

@@ -40,16 +40,14 @@ async fn main() -> anyhow::Result<()> {
                 .turnstile
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("the turnstile gate has no settings"))?;
-            // ONRAMP_PUBLIC_URL is the onramp as users reach it, which is the
-            // hostname Turnstile sees; the config validated it parses.
-            let expected_hostname = reqwest::Url::parse(&cfg.public_url)?
-                .host_str()
-                .ok_or_else(|| anyhow::anyhow!("ONRAMP_PUBLIC_URL has no hostname"))?
-                .to_owned();
+            tracing::info!(
+                expected_hostname = %turnstile.expected_hostname,
+                "turnstile gate accepts tokens for this hostname only"
+            );
             Arc::new(TurnstileGate::new(
                 turnstile.secret,
                 turnstile.sitekey,
-                expected_hostname,
+                turnstile.expected_hostname,
                 cfg.brand_name.clone(),
                 cfg.gate_template.clone(),
                 http_client,

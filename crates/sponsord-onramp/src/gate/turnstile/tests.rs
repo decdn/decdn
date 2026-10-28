@@ -72,6 +72,48 @@ async fn failure_json_refuses() {
 }
 
 #[tokio::test]
+async fn missing_or_empty_hostname_or_action_is_refused() {
+    for body in [
+        serde_json::json!({"success": true}),
+        serde_json::json!({"success": true, "hostname": "up.example.org"}),
+        serde_json::json!({"success": true, "action": TURNSTILE_ACTION}),
+        serde_json::json!({"success": true, "hostname": "up.example.org", "action": ""}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/siteverify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+        assert!(
+            !gate(&server).verify(CLIENT, "token", None).await.unwrap(),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn failure_refuses_even_with_matching_hostname_and_action() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/siteverify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "error-codes": ["timeout-or-duplicate"],
+            "hostname": "up.example.org",
+            "action": TURNSTILE_ACTION
+        })))
+        .mount(&server)
+        .await;
+    assert!(
+        !gate(&server)
+            .verify(CLIENT, "replayed", None)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn page_carries_sitekey_client_and_escaped_brand() {
     let server = MockServer::start().await;
     let html = gate(&server).page(CLIENT);
