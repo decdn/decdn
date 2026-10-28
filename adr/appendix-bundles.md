@@ -425,10 +425,22 @@ The rules below apply to every pull:
   mtime match is a fast path. Without a match, the pull hashes the file
   against the manifest. Each saved record also names its source: the
   manifest hash and the entry's manifest path.
-- **Output directory.** `-o <dir>` names the output directory. Without
-  `-o`, the output directory is `.`. An entry URI without `-o` writes the
-  entry to `./<name>`. `<name>` is the last segment of the entry's path.
-  The pull does not make the entry's parent directories. A pull without `-o`
+- **Output directory.** `-o <dir>` names the output directory. A
+  whole-bundle pull without `-o` writes to `./<hash>/`, in lowercase hex.
+  The bundle lands in its own directory, not among the current directory's
+  files. An entry URI without `-o` uses `.` as the output directory and
+  writes the entry to `./<name>`. `<name>` is the last segment of the
+  entry's path. The pull does not make the entry's parent directories.
+  A blob pull without `-o` writes a file at the same `./<hash>`. When
+  `./<hash>` exists and is not a directory, a whole-bundle pull without
+  `-o` stops before any network call. `decdn quote` does the same.
+  A pull without `-o` refuses a hidden landed path. A hidden landed path
+  has a component that starts with `.`. This includes the entry's `<name>`.
+  This check splits components at `\` and at `/`. Thus the refusal is the
+  same on every platform, and it comes before any fetch. A hidden path can
+  be configuration that other programs read. A directory the user did not
+  name must not gain such a file. `--overwrite` does not lift this refusal.
+  Only an explicit `-o` takes hidden paths. A pull without `-o` also
   refuses an entry path that holds a file, directory or link with no
   skip-cache record, because the user did not choose that directory. It
   also refuses a path whose record does not vouch for it. A record vouches
@@ -453,10 +465,13 @@ The rules below apply to every pull:
   directory, and names the `decdn quote` command that gets the price. That
   command fetches the manifest with a small paid pull from the buyer's open
   pool. When the buyer has no open pool to reuse or adopt, `decdn quote`
-  sends no `openPool` unless the user adds `--open-pool`. On a blob URI,
-  the dry run prints the destination and the price. A cache file that the
-  dry run cannot read, or that fails its
-  hash check, fails the dry run. A pull caches each manifest it fetches, keyed by its hash.
+  sends no `openPool` unless the user adds `--open-pool`. With a cached
+  manifest, a dry run without `-o` refuses a hidden landed path. It also
+  refuses an entry path that holds a file with no record that vouches for
+  it. A real pull refuses the same paths. On a blob URI, the dry run prints
+  the destination and the price. A cache file that the dry run cannot read,
+  or that fails its hash check, fails the dry run. A pull caches each
+  manifest it fetches, keyed by its hash.
   A later pull of the same bundle into the same directory reads the
   cache. `--overwrite` makes a real pull fetch the manifest again.
 

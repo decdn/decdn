@@ -49,7 +49,7 @@ The URI names what to download, in the `decdn:` form `decdn get` takes
 
 | URI | Downloads |
 |---|---|
-| `decdn:<hash>/` | every file of the bundle whose manifest has this hash |
+| `decdn:<hash>/` | every file of the bundle whose manifest has this hash (without `-o`, into `./<hash>/`) |
 | `decdn:<hash>/a/b.txt` | that one file of the bundle, to `<dir>/a/b.txt` (without `-o`, to `./b.txt`) |
 | `decdn:<hash>` | the blob with this hash, to the file `-o` names |
 | any with `?ns=<id>` | the same, routed to the namespace's origins |
@@ -88,10 +88,12 @@ curl -fsSL https://<onramp>/decdn.sh | sh -s -- get 'decdn:<hash>/?ns=7' -o out 
 ```
 
 For a bundle or entry URI without `-o` (or `--output`), the script adds
-none, so `decdn get` picks the destination: `.` for a bundle, `./<name>`
-for one file. It then refuses to replace a file that no earlier pull of the
-same entry left there unchanged, so a download into a directory with other
-files does not overwrite them. Pass `--overwrite` to replace them. A blob
+none, so `decdn get` picks the destination: `./<hash>/` for a bundle,
+`./<name>` for one file. It then refuses a hidden path — one with a
+`.`-prefixed component — outright (pass `-o <dir>` to pull such paths), and
+refuses to replace a file that no earlier pull of the same entry left there
+unchanged, so a download into a directory with other files does not
+overwrite them. Pass `--overwrite` to replace them. A blob
 URI without `-o` stops before installing anything. `?ns=<id>` lets a
 node that hasn't cached the content fetch it from that namespace's origins;
 it never changes which bytes are accepted. A bad URI path or namespace is

@@ -480,3 +480,105 @@ fn a_refused_open_names_the_cost_and_both_ways_on() {
     assert!(quote_args(&["decdn:ab/", "--open-pool"]).open_pool);
     assert!(!quote_args(&["decdn:ab/"]).open_pool);
 }
+
+const HEX: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+
+fn uri(s: &str) -> DecdnUri {
+    s.parse().unwrap()
+}
+
+/// A quote reads and caches a bundle's manifest where the `decdn get` it
+/// prices does: `-o` when given, and otherwise `get`'s default — the whole
+/// bundle's own `./<hash>` directory, and `.` for one entry.
+#[test]
+fn the_quote_directory_is_the_gets() {
+    let bundle = format!("decdn:{HEX}/");
+    let entry = format!("decdn:{HEX}/models/a.bin");
+    assert_eq!(
+        quote_out(&quote_args(&[&bundle]), &uri(&bundle)),
+        PathBuf::from(format!("./{HEX}"))
+    );
+    assert_eq!(
+        quote_out(&quote_args(&[&entry]), &uri(&entry)),
+        PathBuf::from(".")
+    );
+    for target in [&bundle, &entry] {
+        assert_eq!(
+            quote_out(&quote_args(&[target, "-o", "dir"]), &uri(target)),
+            PathBuf::from("dir"),
+            "{target}"
+        );
+    }
+}
+
+/// The note before a paid manifest fetch says why there is no manifest to
+/// use: none is cached, or the cached one is unusable, with the reason.
+#[test]
+fn the_fetch_note_tells_a_missing_cache_from_an_unusable_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path();
+    let parsed = uri(&format!("decdn:{HEX}/"));
+    let note = cached_manifest(out, &parsed, "from your open pool").unwrap_err();
+    assert!(note.contains("no cached manifest in"), "{note}");
+    assert!(
+        note.ends_with("a small paid pull from your open pool"),
+        "{note}"
+    );
+
+    let path = BundleManifest::cache_path(out, parsed.hash);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"not this manifest").unwrap();
+    let note = cached_manifest(out, &parsed, "from your open pool").unwrap_err();
+    assert!(
+        note.contains(&format!(
+            "the cached manifest in {} is unusable: ",
+            out.display()
+        )),
+        "{note}"
+    );
+    assert!(!note.contains("no cached manifest"), "{note}");
+    assert!(note.contains("fetching it"), "{note}");
+
+    let bytes = br#"{"version":1,"entries":[]}"#;
+    let hash = *blake3::hash(bytes).as_bytes();
+    let path = BundleManifest::cache_path(out, hash);
+    std::fs::write(&path, bytes).unwrap();
+    let good = uri(&format!(
+        "decdn:{}/",
+        blake3::Hash::from_bytes(hash).to_hex()
+    ));
+    assert!(cached_manifest(out, &good, "x").is_ok());
+}
+
+/// Without `-o`, a quote whose plan holds a hidden landed path warns that a
+/// default `decdn get` refuses it, and names the `-o` that pulls it: the
+/// bundle's own directory for a whole bundle. An entry URI is checked at its
+/// landing name, the last segment of its path, alone.
+#[test]
+fn a_hidden_landed_path_warns_that_a_default_get_refuses_it() {
+    let manifest = BundleManifest::new(
+        [0xab; 32],
+        vec![
+            entry("model.bin", 1, Some(3)),
+            entry("a/.git/config", 2, Some(3)),
+            entry(".env", 3, Some(3)),
+        ],
+    );
+    let bundle = uri(&format!("decdn:{HEX}/"));
+    let warning = hidden_warning(&bundle, &manifest).unwrap();
+    assert!(
+        warning.contains(r#""a/.git/config" (and 1 more)"#),
+        "{warning}"
+    );
+    assert!(warning.contains(&format!("`-o ./{HEX}`")), "{warning}");
+
+    let clean = BundleManifest::new([0xab; 32], vec![entry("model.bin", 1, Some(3))]);
+    assert_eq!(hidden_warning(&bundle, &clean), None);
+
+    let hidden_entry = uri(&format!("decdn:{HEX}/conf/.env"));
+    let warning = hidden_warning(&hidden_entry, &manifest).unwrap();
+    assert!(warning.contains(r#"".env""#), "{warning}");
+    assert!(warning.contains("`<dir>/<path>`"), "{warning}");
+    let plain_name = uri(&format!("decdn:{HEX}/.conf/env.toml"));
+    assert_eq!(hidden_warning(&plain_name, &manifest), None);
+}

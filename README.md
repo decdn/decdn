@@ -67,10 +67,10 @@ curl -fsSL https://up.decdn.org/decdn.sh | sh -s -- get 'decdn:9194000d7b356650e
 ```
 
 The line installs `decdn` and asks you to pass one check in the browser (it opens the
-link, or prints it). Then it downloads into the current directory and verifies every byte
-on the way in. It refuses to overwrite a file it did not write itself; add `--overwrite`
-after the URI to replace one. Run it again after an interruption and it resumes. A sponsor
-pays for the transfer, so you need no wallet, keys, or account.
+link, or prints it). Then it downloads the bundle into its own `./<hash>/` directory and
+verifies every byte on the way in. It refuses to overwrite a file it did not write itself;
+add `--overwrite` after the URI to replace one. Run it again after an interruption and it
+resumes. A sponsor pays for the transfer, so you need no wallet, keys, or account.
 Later, `decdn self-update` moves the installed binary to the latest signed release.
 
 The [catalogue on decdn.org](https://decdn.org/#try) lists more seeded content. To pay for
@@ -216,15 +216,17 @@ A `decdn:` URI names a blob, a whole bundle, or one file of a bundle
 | URI | `get` pulls | `-o` is | Without `-o` |
 |-----|-------------|---------|--------------|
 | `decdn:<hash>` | the blob | a file, or `-` for stdout | `./<hash>` |
-| `decdn:<hash>/` | every file of the bundle whose manifest has this hash | a directory | `.` |
+| `decdn:<hash>/` | every file of the bundle whose manifest has this hash | a directory | `./<hash>/` |
 | `decdn:<hash>/a/b.txt` | that one file of the bundle | a directory, or `-` for stdout | `./b.txt` |
 | any of these with `?ns=<id>` | the same, routed to a namespace's origins | the same | the same |
 
 Without `-o`, a bundle or entry pull refuses to replace a file unless an earlier pull wrote it
 there and it has not changed since. That earlier pull must be of the same entry, or have
-written the same bytes. A new version of a bundle that changes a file is refused, so pass `-o .`
-to update a bundle in place: the pull replaces the files that changed and skips the rest.
-`--overwrite` fetches every file again.
+written the same bytes. It also refuses a hidden path — one with a `.`-prefixed component —
+outright; name the directory with `-o <dir>` to pull such paths. A new version of a bundle
+has a new hash, so it lands in its own directory; to update the old directory in place, pass
+`-o <the old bundle's directory>`: the pull replaces the files that changed and skips the
+rest. `--overwrite` fetches every file again.
 
 `get` probes bonded nodes and picks one that holds the blob. When none does, it tries
 bonded non-holders nearest first. Each fills the miss from its own origin, or from a peer

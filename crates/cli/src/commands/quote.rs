@@ -59,6 +59,11 @@ pub async fn quote(args: &QuoteArgs, config_path: Option<&Path>) -> anyhow::Resu
         .uri
         .parse()
         .with_context(|| format!("parse URI {:?}", args.uri))?;
+    // A file at the default `./<hash>` blocks the bundle's directory, as it
+    // does for `decdn get`: refuse before anything binds or pays.
+    if args.output.is_none() {
+        super::get::refuse_file_at_bundle_dir(&uri, &quote_out(args, &uri))?;
+    }
     let mut host = QuoteHost::open(&args.common, config_path).await?;
     let result = quote_on(&mut host, args, &uri).await;
     host.close().await;
@@ -72,55 +77,113 @@ pub async fn quote(args: &QuoteArgs, config_path: Option<&Path>) -> anyhow::Resu
     Ok(())
 }
 
+/// The output directory of the `decdn get` that `args` prices: `-o`, or
+/// `get`'s default for `uri` ([`super::get::default_path`]).
+fn quote_out(args: &QuoteArgs, uri: &DecdnUri) -> PathBuf {
+    args.output
+        .clone()
+        .unwrap_or_else(|| super::get::default_path(uri))
+}
+
+/// The manifest of `uri` cached in `out`, or the note to print before a
+/// paid fetch of it, which a small paid pull `pays`. A cache that cannot be
+/// read is fetched over, as `get` does, and the note says why.
+fn cached_manifest(out: &Path, uri: &DecdnUri, pays: &str) -> Result<BundleManifest, String> {
+    let dir = out.display();
+    match BundleManifest::cached(out, uri.hash) {
+        Ok(Some(manifest)) => Ok(manifest),
+        Ok(None) => Err(format!(
+            "note: no cached manifest in {dir}; fetching it, a small paid pull {pays}"
+        )),
+        Err(e) => Err(format!(
+            "note: the cached manifest in {dir} is unusable: {e:#}; fetching it, a small paid \
+             pull {pays}"
+        )),
+    }
+}
+
+/// The warning for a quote without `-o` whose plan a `decdn get` without
+/// `-o` refuses: a landed path is hidden ([`bundle_pull::is_hidden`]). A
+/// whole bundle lands at its manifest paths, and an entry URI at the last
+/// segment of its path. `None` when no landed path is hidden.
+fn hidden_warning(uri: &DecdnUri, manifest: &BundleManifest) -> Option<String> {
+    let entry_name = super::get::default_entry_name(uri);
+    let landed: Vec<&str> = match &entry_name {
+        Some(name) => vec![name.as_str()],
+        None => manifest.entries.iter().map(|e| e.path.as_str()).collect(),
+    };
+    let hidden: Vec<&str> = landed
+        .into_iter()
+        .filter(|p| bundle_pull::is_hidden(p))
+        .collect();
+    let named = bundle_pull::first_and_more(&hidden)?;
+    let remedy = match &entry_name {
+        Some(_) => "pass `-o <dir>` to `decdn get` to pull it, at its full manifest path \
+                    `<dir>/<path>`"
+            .to_owned(),
+        None => format!(
+            "pass `-o {}` to `decdn get` to pull it into the bundle's own directory, not \
+             `-o .` or your home directory",
+            super::get::default_path(uri).display()
+        ),
+    };
+    Some(format!(
+        "warning: a `decdn get` of this URI without `-o` refuses hidden path {named}; {remedy}"
+    ))
+}
+
 /// The plan of `uri` on `host`, priced. A bundle's manifest comes from the
-/// cache in `args.output`, or from a paid fetch that caches it there. The
-/// fetch opens a pool only under `--open-pool`; without it, a buyer with no
-/// open pool gets [`open_refused`]'s error before any transaction.
+/// cache in the output directory (`args.output`, or `get`'s default,
+/// [`super::get::default_path`]), or from a paid fetch that caches it there.
+/// The fetch opens a pool only under `--open-pool`; without it, a buyer with
+/// no open pool gets [`open_refused`]'s error before any transaction. Without
+/// `-o`, a plan a default `decdn get` refuses gets a warning
+/// ([`hidden_warning`]).
 async fn quote_on(
     host: &mut QuoteHost,
     args: &QuoteArgs,
     uri: &DecdnUri,
 ) -> anyhow::Result<QuoteView> {
-    let out = args.output.clone().unwrap_or_else(|| PathBuf::from("."));
+    let out = quote_out(args, uri);
     let plan = match uri.target {
         UriTarget::Blob => Plan::Blob(uri.hash),
         UriTarget::Bundle | UriTarget::BundleEntry(_) => {
-            // A cache file that cannot be read is fetched over, as `get` does;
-            // the fetch reports it.
-            let cached = BundleManifest::cached(&out, uri.hash).ok().flatten();
-            let manifest = if let Some(manifest) = cached {
-                manifest
+            let (open, pays) = if args.open_pool {
+                (PoolOpen::Allowed, "that opens a pool if you have none")
             } else {
-                let (open, pays) = if args.open_pool {
-                    (PoolOpen::Allowed, "that opens a pool if you have none")
-                } else {
-                    (PoolOpen::Refused, "from your open pool")
-                };
-                eprintln!(
-                    "note: no cached manifest in {}; fetching it, a small paid pull {pays}",
-                    out.display()
-                );
-                bundle_pull::fetch_manifest_paid(
-                    &args.common,
-                    &out,
-                    uri,
-                    (&mut host.chain, open),
-                    (&host.endpoint, &host.relays),
-                )
-                .await
-                .map_err(|err| {
-                    let Some(refused) = PoolOpenRefused::find(&err).map(open_refused) else {
-                        return err;
-                    };
-                    // An escrow the fetch still holds keeps its note, which
-                    // names the transaction to reconcile.
-                    if err.downcast_ref::<UnreconciledEscrows>().is_some() {
-                        err.context(refused)
-                    } else {
-                        anyhow::Error::msg(refused)
-                    }
-                })?
+                (PoolOpen::Refused, "from your open pool")
             };
+            let manifest = match cached_manifest(&out, uri, pays) {
+                Ok(manifest) => manifest,
+                Err(note) => {
+                    eprintln!("{note}");
+                    bundle_pull::fetch_manifest_paid(
+                        &args.common,
+                        &out,
+                        uri,
+                        (&mut host.chain, open),
+                        (&host.endpoint, &host.relays),
+                    )
+                    .await
+                    .map_err(|err| {
+                        let Some(refused) = PoolOpenRefused::find(&err).map(open_refused) else {
+                            return err;
+                        };
+                        // An escrow the fetch still holds keeps its note, which
+                        // names the transaction to reconcile.
+                        if err.downcast_ref::<UnreconciledEscrows>().is_some() {
+                            err.context(refused)
+                        } else {
+                            anyhow::Error::msg(refused)
+                        }
+                    })?
+                }
+            };
+            if args.output.is_none()
+                && let Some(warning) = hidden_warning(uri, &manifest)
+            {
+                eprintln!("{warning}");
+            }
             Plan::of_target(&manifest, &uri.target)?
         }
         _ => anyhow::bail!("unsupported URI target in {:?}", args.uri),

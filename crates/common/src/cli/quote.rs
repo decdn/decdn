@@ -33,7 +33,8 @@ pub struct QuoteArgs {
 
     /// The output directory of the `decdn get` this quote prices: where a
     /// bundle's cached manifest is read from, and cached to when the quote
-    /// fetches it. The default is `decdn get`'s: `.`.
+    /// fetches it. The default is `decdn get`'s: `./<hash>/` for a whole
+    /// bundle, `.` for one entry.
     #[arg(short = 'o', long, value_name = "DIR")]
     pub output: Option<PathBuf>,
 

@@ -89,8 +89,9 @@ fn a_command_with_no_dropped_open_ends_as_it_did() {
     assert_eq!(stop_exit(&err), Some(GAVE_UP_EXIT));
 }
 
-/// A `decdn get` run without `-o` names the directory its `.partial` state
-/// sits in, so a re-run from elsewhere does not start over and pay again.
+/// A `decdn get` run without `-o` names the directory to run it again from,
+/// which its relative destination and `.partial` state resolve against, so a
+/// re-run from elsewhere does not start over and pay again.
 #[test]
 fn an_interrupt_names_the_resume_directory() {
     let dir = Path::new("/abs/dir");

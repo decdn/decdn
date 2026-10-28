@@ -24,7 +24,7 @@ pub const DEFAULT_MAX_LANE_STREAMS: u16 = 4;
 /// - `decdn:<hash>`: the raw blob. `-o` is the destination file, or `-` for
 ///   stdout. Without `-o`, the blob lands at `./<hash>`.
 /// - `decdn:<hash>/`: every entry of the bundle whose manifest has this hash.
-///   `-o` is the output directory. Without `-o`, it is `.`.
+///   `-o` is the output directory. Without `-o`, it is `./<hash>/`.
 /// - `decdn:<hash>/<path>`: that one bundle entry. `-o` is the output
 ///   directory, and the file lands at `<OUT>/<path>`. Without `-o`, the file
 ///   lands at `./<name>`, where `<name>` is the last segment of `<path>`.
@@ -51,11 +51,15 @@ pub struct GetArgs {
     /// stdout. For a bundle or entry URI, the output directory (created if
     /// absent); each entry's relative path resolves within it, and
     /// `..`/absolute/escaping paths are rejected. An entry URI also takes `-`,
-    /// to stream that one entry to stdout. Without `-o`, a blob lands at
-    /// `./<hash>`, a bundle in `.`, and an entry at `./<name>` (the last
-    /// segment of its path); a bundle or entry pull then refuses a path that
-    /// holds a file no earlier pull of the same entry (or of the same bytes)
-    /// left there unchanged, unless `--overwrite`.
+    /// to stream that one entry to stdout.
+    ///
+    /// Without `-o`, a blob lands at `./<hash>`, a bundle in `./<hash>/`, and
+    /// an entry at `./<name>`, the last segment of its path. A bundle or entry
+    /// pull without `-o` then refuses two kinds of path. It refuses a hidden
+    /// path, one with a `.`-prefixed component (the entry's `<name>`
+    /// included); only an explicit `-o` takes such a path. It also refuses a
+    /// path that holds a file no earlier pull of the same entry (or of the
+    /// same bytes) left there unchanged, unless `--overwrite`.
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
@@ -136,7 +140,8 @@ pub struct GetArgs {
     /// `.decdn-manifest.json` for skip decisions, so it disables both the
     /// skip-existing path and the whole-root reuse above; the file is still
     /// read and rewritten with the run's results. It also fetches the
-    /// manifest again instead of reading the output root's cached copy.
+    /// manifest again instead of reading the output root's cached copy. It
+    /// does not lift the refusal of a hidden path without `-o`.
     #[arg(long)]
     pub overwrite: bool,
 

@@ -36,9 +36,12 @@ pub struct ReleasePin {
 }
 
 /// The oldest decdn release the installers work with. They run `decdn get`
-/// without `-o` so that it picks the destination and keeps its overwrite
-/// guard, and `get -o` became optional in decdn v0.2.0 (decdn#2466,
-/// decdn#2476): v0.1.x's `decdn get` refuses the command.
+/// without `-o` so that it picks the destination and keeps its overwrite and
+/// hidden-path guards, which an explicit `-o` turns off. `get -o` became
+/// optional in decdn v0.2.0 (decdn#2466, decdn#2476): v0.1.x's `decdn get`
+/// refuses the command. The hidden-path guard is newer than this floor: a pin
+/// of a release older than the guard serves installers whose `decdn get`
+/// lacks it.
 pub const MIN_DECDN_RELEASE: (u64, u64, u64) = (0, 2, 0);
 
 impl ReleasePin {

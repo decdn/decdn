@@ -170,11 +170,12 @@ fn output_defaults_follow_the_uri_target() {
             None,
             format!("./{HEX}"),
         ),
+        // A whole bundle lands in its own `./<hash>/` directory, never `.`.
         (
             format!("decdn:{HEX}/"),
-            ".".to_owned(),
+            format!("./{HEX}"),
             None,
-            ".".to_owned(),
+            format!("./{HEX}"),
         ),
         (
             format!("decdn:{HEX}/models/a.bin"),
@@ -196,6 +197,7 @@ fn output_defaults_follow_the_uri_target() {
         assert_eq!(dest.path, PathBuf::from(&path), "{uri}");
         assert_eq!(dest.entry_name.as_deref(), entry_name, "{uri}");
         assert_eq!(dest.shown(), PathBuf::from(&shown), "{uri}");
+        assert!(dest.defaulted, "{uri}");
     }
 }
 
@@ -210,6 +212,7 @@ fn an_explicit_output_is_kept_as_given() {
         Destination {
             path: PathBuf::from("dir"),
             entry_name: None,
+            defaulted: false,
         }
     );
 }
@@ -250,4 +253,65 @@ fn an_interrupt_names_no_directory_for_an_absolute_or_stdout_destination() {
         interrupt_line(&[&format!("decdn:{HEX}/model.bin"), "-o", "-"]),
         plain
     );
+}
+
+/// Without `-o`, a blob and a whole bundle share the default `./<hash>` (the
+/// file, and the bundle's own directory), and an entry's default directory
+/// is `.`. Its landing name is the last segment of its path.
+#[test]
+fn the_default_path_follows_the_target() {
+    for (uri, path, name) in [
+        (format!("decdn:{HEX}"), format!("./{HEX}"), None),
+        (format!("decdn:{HEX}/"), format!("./{HEX}"), None),
+        (
+            format!("decdn:{HEX}/models/a.bin"),
+            ".".to_owned(),
+            Some("a.bin"),
+        ),
+        (format!("decdn:{HEX}/.env"), ".".to_owned(), Some(".env")),
+    ] {
+        let parsed = parse_and_check(&get_args(&[&uri])).unwrap();
+        assert_eq!(super::default_path(&parsed), PathBuf::from(path), "{uri}");
+        assert_eq!(super::default_entry_name(&parsed).as_deref(), name, "{uri}");
+    }
+}
+
+/// A file at a whole bundle's default `./<hash>` (a blob pull of the same
+/// hash wrote it) is refused, naming the file, the likely cause and both
+/// remedies. A directory, an absent path and every other target pass.
+#[test]
+fn a_file_at_the_bundles_directory_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join(HEX);
+    std::fs::write(&file, b"{}").unwrap();
+    let bundle = parse_and_check(&get_args(&[&format!("decdn:{HEX}/")])).unwrap();
+    let err = super::refuse_file_at_bundle_dir(&bundle, &file).unwrap_err();
+    let msg = format!("{err:#}");
+    for part in [
+        &format!("{} exists and is not a directory", file.display()),
+        &format!("`decdn get decdn:{HEX}` (without the trailing `/`)"),
+        "remove it",
+        "`-o <dir>`",
+    ] {
+        assert!(msg.contains(part), "{part:?} missing from: {msg}");
+    }
+
+    let blob = parse_and_check(&get_args(&[&format!("decdn:{HEX}")])).unwrap();
+    super::refuse_file_at_bundle_dir(&blob, &file).unwrap();
+    let entry = parse_and_check(&get_args(&[&format!("decdn:{HEX}/a.bin")])).unwrap();
+    super::refuse_file_at_bundle_dir(&entry, &file).unwrap();
+    super::refuse_file_at_bundle_dir(&bundle, tmp.path()).unwrap();
+    super::refuse_file_at_bundle_dir(&bundle, &tmp.path().join("absent")).unwrap();
+}
+
+/// A dangling symlink at the bundle's directory blocks it too: the pull could
+/// not create the directory there either.
+#[cfg(unix)]
+#[test]
+fn a_dangling_link_at_the_bundles_directory_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join(HEX);
+    std::os::unix::fs::symlink(tmp.path().join("gone"), &link).unwrap();
+    let bundle = parse_and_check(&get_args(&[&format!("decdn:{HEX}/")])).unwrap();
+    super::refuse_file_at_bundle_dir(&bundle, &link).unwrap_err();
 }

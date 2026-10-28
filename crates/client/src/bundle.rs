@@ -18,7 +18,11 @@
 //! 3. Get the manifest: [`BundlePuller::fetch_manifest`] it by its hash, or
 //!    [`BundleManifest::parse`] bytes you already hold.
 //! 4. Drop the entries you do not want, then [`BundlePuller::pull`] the rest.
-//!    Progress reaches a [`BundleObserver`]; the result is a [`BundleOutcome`].
+//!    The puller writes every entry path the path-safety rules accept, hidden
+//!    (`.`-prefixed) components included, except its own state paths: when
+//!    the user did not choose the output directory, vet the entry paths
+//!    first, as the `decdn get` CLI does. Progress reaches a [`BundleObserver`]; the result is a
+//!    [`BundleOutcome`].
 //! 5. [`BundlePuller::finish`] waits for the lanes' watermark writes.
 //!
 //! The pull future is not `Send`: every entry and lane runs on the task that
@@ -887,6 +891,12 @@ impl BundlePuller {
     /// already on disk are fetched again instead of skipped. A fired `cancel`
     /// stops every fetch where it is; what landed is recorded, and the next
     /// pull resumes.
+    ///
+    /// The puller writes every entry path the path-safety rules accept,
+    /// hidden (`.`-prefixed) components included, except its own state
+    /// paths. When the user did not choose `out_dir`, vetting the entry
+    /// paths first is the caller's job — the `decdn get` CLI refuses hidden
+    /// paths into a default destination.
     ///
     /// An entry that fails does not stop the others. A fault only the user
     /// can fix, or the stop policy, ends the pull ([`BundleEnd`]).

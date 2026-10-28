@@ -28,6 +28,26 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **CLI: a whole-bundle `decdn get decdn:<hash>/` without `-o` pulls into
+  `./<hash>/` (lowercase hex), not `.`, and a pull into a default
+  destination refuses hidden entry paths (GHSA-rff9-95mx-xpw9).** Without
+  `-o`, a bundle lands in its own directory, and any landed path with a
+  `.`-prefixed component — an entry URI's landing name included — is
+  refused before any entry lands; the error names the first such path and
+  how many more there are, and `--overwrite` does not lift it. An explicit
+  `-o` names the directory, so it takes hidden paths unchanged. `--dry-run`
+  with a cached manifest applies the same refusal. `decdn quote` reads and
+  caches a bundle's manifest under the same `./<hash>/` default, and
+  without `-o` warns when a default `decdn get` would refuse the plan. When
+  `./<hash>` holds a file — the raw manifest a `decdn get decdn:<hash>`
+  without the trailing `/` writes — a whole-bundle `get` or `quote` without
+  `-o` stops before any network call instead of paying for a manifest it
+  cannot land. A resumed default-destination pull now finds its state
+  under `./<hash>/`. An older interrupted pull into `.` resumes with
+  `-o .`, but that turns off both the overwrite and the hidden-path
+  guards: use it only for a bundle you trust. Otherwise delete the old
+  `.decdn-partial/` and pull again into the new default.
+
 - **CLI: `decdn quote` opens no pool unless `--open-pool` (#2675).** A
   bundle quote with no cached manifest fetches it with a small paid pull from
   the buyer's open pool. With no open pool to reuse or adopt, the quote sends
@@ -4578,25 +4598,25 @@ since project inception and will roll into the first tagged release.
   so the keystore password is read once. The bundle flags are an error with
   `-o -`, and `-o -` on a whole bundle (`decdn:<hash>/`) stays an error.
 - **CLI: `-o` is optional on `decdn get` (#2466).** Without `-o`, a blob
-  lands at `./<hash>`, a bundle in `.`, and an entry URI
+  lands at `./<hash>`, a bundle in `./<hash>/`, and an entry URI
   (`decdn:<hash>/<path>`) at `./<name>`, the last segment of its path, with
   no parent directories. A bundle or entry pull without `-o` refuses a path
   that holds a file no earlier pull left there unchanged, unless
   `--overwrite` (#2472). The earlier pull must be of the same entry (the
   same manifest hash and manifest path), or have written the same bytes. A
-  new version of a bundle that changes a file is refused, so `-o .` updates
-  a bundle in place: it replaces the files that changed and skips the rest.
-  `--overwrite` fetches every file again. The error says why: no pull wrote
-  the file, it changed after a pull wrote it, or a pull wrote it from
-  another entry, named as a `decdn:` URI. So `decdn get
+  new version of a bundle has a new hash, so it lands in its own directory;
+  `-o <old dir>` updates the old one in place: it replaces the files that
+  changed and skips the rest. `--overwrite` fetches every file again. The
+  error says why: no pull wrote the file, it changed after a pull wrote it,
+  or a pull wrote it from another entry, named as a `decdn:` URI. So `decdn get
   decdn:<h>/tokenizer/config.json` does not replace the `./config.json`
   that `decdn:<h>/text_encoder/config.json` wrote. Each
   `.decdn-manifest.json` record names its manifest hash and manifest path.
   A `.decdn-manifest.json` an older build wrote vouches for no file, so the
   first pull without `-o` into such a directory refuses its files, and the
-  error names the version mismatch; pass `-o .` once to pull there. The
-  pull leaves its `.decdn-bundles/`, `.decdn-manifest.json` and
-  `.decdn-partial/` in `.`.
+  error names the version mismatch; name the directory with `-o <dir>` once
+  to pull there. The pull leaves its `.decdn-bundles/`,
+  `.decdn-manifest.json` and `.decdn-partial/` in the output directory.
   Without `-o`, the command prints `Downloading to <absolute path>` on stderr
   before the pull starts (not under `--json` or `--dry-run`). With `-o`, each
   target lands where `-o` names. A bundle entry at `.decdn-manifest.json` or

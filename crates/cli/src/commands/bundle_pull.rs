@@ -242,21 +242,15 @@ impl EntryFilter {
     }
 }
 
-/// Refuse a pull into a default destination (no `-o`) that may replace a file
-/// no earlier pull of the same entry left there unchanged: one no pull wrote,
-/// one that changed after a pull wrote it, or one a pull wrote from another
-/// bundle entry. A pull fetches over a file whose bytes differ from its
-/// entry's, and the user did not choose this directory. `--overwrite` asks for
-/// the replacement, so it passes.
-///
-/// # Errors
-///
-/// When an entry path of `manifest` under `out` holds a file, directory or
-/// link that [`decdn_client::bundle::foreign_paths`] names.
 /// Refuse a `--receipt` path that an entry of `manifest` lands at: the
 /// receipt would replace the entry, and a run that paid nothing would remove
 /// it. Checked once the manifest names the entries, before any entry is
 /// fetched.
+///
+/// # Errors
+///
+/// When the receipt path is the landed path of an entry of `manifest` under
+/// `out`.
 fn refuse_receipt_collision(
     args: &GetArgs,
     out: &Path,
@@ -275,10 +269,31 @@ fn refuse_receipt_collision(
     Ok(())
 }
 
-fn refuse_foreign(args: &GetArgs, out: &Path, manifest: &BundleManifest) -> anyhow::Result<()> {
-    if args.output.is_some() || args.overwrite {
+/// Refuse a pull into a default destination ([`Destination::defaulted`]) that
+/// may replace a file no earlier pull of the same entry left there unchanged:
+/// one no pull wrote, one that changed after a pull wrote it, or one a pull
+/// wrote from another bundle entry. A pull fetches over a file whose bytes
+/// differ from its entry's, and the user did not choose this directory.
+/// `--overwrite` asks for the replacement, so it passes.
+///
+/// The error's remedy depends on the target: a whole bundle can be pulled
+/// into the same directory with `-o <that dir>`, while an entry URI's file
+/// lands at its full manifest path under an explicit `-o`, not at the refused
+/// `./<name>`, so for an entry the error points to `--overwrite`.
+///
+/// # Errors
+///
+/// When an entry path of `manifest` under the destination holds a file,
+/// directory or link that [`decdn_client::bundle::foreign_paths`] names.
+fn refuse_foreign(
+    args: &GetArgs,
+    dest: &Destination,
+    manifest: &BundleManifest,
+) -> anyhow::Result<()> {
+    if !dest.defaulted || args.overwrite {
         return Ok(());
     }
+    let out = dest.path.as_path();
     let found = decdn_client::bundle::foreign_paths(manifest, out);
     let Some(first) = found.first() else {
         return Ok(());
@@ -307,11 +322,111 @@ fn refuse_foreign(args: &GetArgs, out: &Path, manifest: &BundleManifest) -> anyh
         }
         _ => "no earlier `decdn get` of this entry wrote it".to_owned(),
     };
+    let replace = match &dest.entry_name {
+        Some(_) => "`--overwrite` to replace it".to_owned(),
+        None => format!(
+            "`-o {}` to pull into the same directory and replace each such file whose \
+             bytes differ",
+            out.display()
+        ),
+    };
     anyhow::bail!(
         "refusing to replace {}{more}: {why}; pass `-o <dir>` to pull into another \
-         directory, or `-o .` to pull here and replace each such file whose bytes differ",
+         directory, or {replace}",
         out.join(&first.path).display()
     )
+}
+
+/// Whether the landed path `path` is hidden: one of its components starts
+/// with `.`.
+///
+/// Components split at `\` as well as at `/`. Manifest parsing accepts a `\`
+/// in a path. On Windows the path-safety rules refuse such an entry, and on
+/// Unix it lands as one literal name. Splitting at `\` too makes the answer
+/// the same on every platform and keeps the refusal ahead of any fetch.
+pub(crate) fn is_hidden(path: &str) -> bool {
+    path.split(['/', '\\']).any(|seg| seg.starts_with('.'))
+}
+
+/// The first of `paths` and, when there are more, how many: `"x" (and 2
+/// more)`.
+pub(crate) fn first_and_more(paths: &[&str]) -> Option<String> {
+    let first = paths.first()?;
+    Some(match paths.len() {
+        1 => format!("{first:?}"),
+        n => format!("{first:?} (and {} more)", n.saturating_sub(1)),
+    })
+}
+
+/// Refuse a pull into a default destination ([`Destination::defaulted`]) of
+/// any entry whose landed path is hidden ([`is_hidden`]), an entry URI's
+/// landing name included. Such a path can land as configuration other
+/// programs read — a shell startup file, a tool's config directory — which a
+/// directory the user did not choose must not gain. An explicit `-o` names
+/// the directory, so it takes such paths unchanged; nothing else lifts this
+/// refusal — it never reads `--overwrite`.
+///
+/// The error's remedy depends on the target. A whole bundle can be pulled
+/// into the same directory with `-o <that dir>`, which keeps its hidden
+/// files inside it and reuses the cached manifest. An entry URI's file lands
+/// at its full manifest path under an explicit `-o`.
+///
+/// # Errors
+///
+/// When an entry of `manifest` has a hidden landed path. The error names the
+/// first such path and how many more there are.
+fn refuse_hidden(dest: &Destination, manifest: &BundleManifest) -> anyhow::Result<()> {
+    if !dest.defaulted {
+        return Ok(());
+    }
+    let hidden: Vec<&str> = manifest
+        .entries
+        .iter()
+        .map(|e| e.path.as_str())
+        .filter(|path| is_hidden(path))
+        .collect();
+    let Some(named) = first_and_more(&hidden) else {
+        return Ok(());
+    };
+    let out = dest.path.display();
+    let remedy = match &dest.entry_name {
+        Some(_) => "pass `-o <dir>` to pull it into a directory you name; with `-o <dir>` \
+                    the entry lands at its full manifest path, `<dir>/<path>`"
+            .to_owned(),
+        None => format!(
+            "pass `-o {out}` to pull the bundle into this same directory, hidden paths \
+             included (it reuses the cached manifest); do not pass `-o .` or your home \
+             directory, where a hidden path can land as configuration other programs read"
+        ),
+    };
+    anyhow::bail!(
+        "refusing to pull hidden path {named} into the default destination {out}: a path \
+         with a `.`-prefixed component lands only in a directory named with `-o`; {remedy}"
+    )
+}
+
+/// The post-manifest guards of a pull run, on the final kept set — the exact
+/// entries the pull writes: apply `--select`, then refuse hidden landed paths
+/// ([`refuse_hidden`]) and foreign files ([`refuse_foreign`]) in a default
+/// destination, then a `--receipt` path an entry lands at
+/// ([`refuse_receipt_collision`]), in that order. `Ok(None)` means the user
+/// deselected every file ([`report_nothing_to_fetch`] already ran). Every
+/// live pull runs this guard; nothing may bypass it. `dry_run`, which takes
+/// no `--select`, applies the same two default-destination refusals to its
+/// cached plan.
+fn guard_selection(
+    args: &GetArgs,
+    dest: &Destination,
+    uri: &DecdnUri,
+    kept: Kept,
+) -> anyhow::Result<Option<Kept>> {
+    let Some(kept) = maybe_select(args, &dest.path, uri, kept)? else {
+        return Ok(None);
+    };
+    refuse_hidden(dest, &kept.manifest)?;
+    refuse_foreign(args, dest, &kept.manifest)?;
+    refuse_receipt_collision(args, &dest.path, &kept.manifest)?;
+    Ok(Some(kept))
 }
 
 /// Mark in `hits` every pattern of `set` that matches `path`, and return
@@ -695,13 +810,19 @@ pub(crate) async fn bundle_pull(
     };
     let filter = EntryFilter::compile(entry, &args.include, &args.exclude)?
         .landing_as(dest.entry_name.clone());
-    let out = dest.path.as_path();
     let filters_given = !args.include.is_empty() || !args.exclude.is_empty();
 
     // `--select` opens an editor: reject an incompatible combo or a non-terminal
     // up front — before any network, chain, or keystore work — so it fails fast
     // rather than after paying to fetch the manifest.
     check_select_flags(args)?;
+
+    // A file at the default `./<hash>` (a blob pull of the same hash wrote
+    // it) blocks the bundle's directory: refuse before the manifest fetch
+    // pays, and before a dry run reports a plan no pull can follow.
+    if dest.defaulted {
+        super::get::refuse_file_at_bundle_dir(uri, &dest.path)?;
+    }
 
     // Dry-run short-circuits before any payment, transaction or keystore
     // prompt.
@@ -710,7 +831,7 @@ pub(crate) async fn bundle_pull(
         // future past the `large_futures` limit.
         return Box::pin(dry_run(
             args,
-            out,
+            dest,
             uri,
             (&filter, filters_given),
             config_path,
@@ -745,7 +866,7 @@ pub(crate) async fn bundle_pull(
     // cleanly instead of being aborted on drop.
     let result = pull_over(
         args,
-        out,
+        dest,
         uri,
         &chain,
         grant,
@@ -768,7 +889,7 @@ pub(crate) async fn bundle_pull(
 #[allow(clippy::too_many_arguments)]
 async fn pull_over(
     args: &GetArgs,
-    out: &Path,
+    dest: &Destination,
     uri: &DecdnUri,
     chain: &fetch::ResolvedChain,
     grant: Option<CapabilityGrant>,
@@ -778,6 +899,7 @@ async fn pull_over(
     (filter, filters_given): (&EntryFilter, bool),
     (evidence, activity): (&Arc<ReceiptEvidence>, Option<&Arc<ActivityRecorder>>),
 ) -> anyhow::Result<()> {
+    let out = dest.path.as_path();
     let observer = Arc::new(PullObserver::new(
         args.json,
         run_label(out),
@@ -813,7 +935,7 @@ async fn pull_over(
         &mut puller,
         &mut interrupt,
         &observer,
-        (args, out),
+        (args, dest),
         uri,
         (filter, filters_given),
     )
@@ -956,25 +1078,22 @@ async fn pull_manifest(
     puller: &mut BundlePuller,
     interrupt: &mut Interrupt,
     observer: &PullObserver,
-    (args, out): (&GetArgs, &Path),
+    (args, dest): (&GetArgs, &Destination),
     uri: &DecdnUri,
     (filter, filters_given): (&EntryFilter, bool),
 ) -> anyhow::Result<()> {
+    let out = dest.path.as_path();
     // Obtain the manifest: the bundle blob fetched and filtered here. `None` =>
     // filtered to empty (already reported). `--select`: let the user trim the
     // (already glob-filtered) list in their editor. Everything deselected ends
-    // the run (reported) like an empty filter.
+    // the run (reported) like an empty filter. `guard_selection` then applies
+    // `--select` and the pre-pull refusals.
     let selected = async {
         let fetch = obtain_manifest(puller, (args, out), uri, filter, filters_given);
         let Some(kept) = until_interrupted(fetch, interrupt).await? else {
             return Ok(None);
         };
-        let kept = maybe_select(args, out, uri, kept)?;
-        if let Some(Kept { manifest, .. }) = &kept {
-            refuse_foreign(args, out, manifest)?;
-            refuse_receipt_collision(args, out, manifest)?;
-        }
-        anyhow::Ok(kept)
+        guard_selection(args, dest, uri, kept)
     }
     .await;
     // The manifest fetch is paid, so a run that ends here still owes the
@@ -1324,6 +1443,7 @@ fn json_plan(out: &str, entries: &[ManifestEntry]) -> serde_json::Value {
 /// the ones it prints. A real run then skips files already present in the
 /// output root (unless `--overwrite`) and warns on leftover partials; the dry
 /// run does neither, and its quote prices a fresh pull. It does refuse a
+/// hidden entry path into a default destination ([`refuse_hidden`]) and a
 /// default destination that holds a file the pull may replace
 /// ([`refuse_foreign`]), as a real run does. A bundle with no cached manifest
 /// reports only the bundle and the output root, with `entries: null` and
@@ -1335,11 +1455,12 @@ fn json_plan(out: &str, entries: &[ManifestEntry]) -> serde_json::Value {
 /// run ([`quote::dry_run_quote`]).
 async fn dry_run(
     args: &GetArgs,
-    output: &Path,
+    dest: &Destination,
     uri: &DecdnUri,
     (filter, filters_given): (&EntryFilter, bool),
     config_path: Option<&Path>,
 ) -> anyhow::Result<()> {
+    let output = dest.path.as_path();
     let out = output.display();
     let cached = BundleManifest::cached(output, uri.hash).map_err(not_a_manifest_hint)?;
     let Some(mut manifest) = cached else {
@@ -1378,7 +1499,8 @@ async fn dry_run(
     };
     let raw_empty = manifest.entries.is_empty();
     manifest.entries = filter.apply_and_warn(manifest.entries)?.0;
-    refuse_foreign(args, output, &manifest)?;
+    refuse_hidden(dest, &manifest)?;
+    refuse_foreign(args, dest, &manifest)?;
     let quoted = if manifest.entries.is_empty() {
         None
     } else {

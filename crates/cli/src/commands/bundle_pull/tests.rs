@@ -1016,7 +1016,9 @@ fn a_landing_name_without_an_entry_uri_is_dropped() {
     assert_eq!(paths, ["models/v1/c.bin", "d.bin"]);
 }
 
-/// Without `-o`, a path that holds a file no pull wrote is refused, naming it;
+/// Without `-o`, a path that holds a file no pull wrote is refused, naming
+/// it; because an entry URI's file lands at its full manifest path under an
+/// explicit `-o`, the remedy the error names for an entry is `--overwrite`.
 /// `-o` and `--overwrite` each pass, and an absent path passes.
 #[test]
 fn a_default_destination_refuses_an_unrecorded_file() {
@@ -1025,20 +1027,329 @@ fn a_default_destination_refuses_an_unrecorded_file() {
     std::fs::write(out.join("config.json"), b"mine").unwrap();
     let uri = format!("decdn:{}/x/config.json", "ab".repeat(32));
     let manifest = |path| BundleManifest::new([0xab; 32], vec![sel_entry(path, 3)]);
+    let dest = default_dest(out, Some("config.json"));
 
     let (args, _) = get_args(&uri, &[]);
-    let err = super::refuse_foreign(&args, out, &manifest("config.json")).unwrap_err();
+    let err = super::refuse_foreign(&args, &dest, &manifest("config.json")).unwrap_err();
     let msg = format!("{err:#}");
     assert!(msg.contains("config.json"), "{msg}");
     assert!(msg.contains("no earlier `decdn get` wrote it"), "{msg}");
-    assert!(msg.contains("-o"), "{msg}");
+    assert!(msg.contains("`--overwrite` to replace it"), "{msg}");
 
-    for extra in [&["-o", "."][..], &["--overwrite"]] {
-        let (args, _) = get_args(&uri, extra);
-        super::refuse_foreign(&args, out, &manifest("config.json")).unwrap();
-    }
+    let (args, parsed) = get_args(&uri, &["-o", "."]);
+    super::refuse_foreign(
+        &args,
+        &Destination::of(&args, &parsed),
+        &manifest("config.json"),
+    )
+    .unwrap();
+    let (args, _) = get_args(&uri, &["--overwrite"]);
+    super::refuse_foreign(&args, &dest, &manifest("config.json")).unwrap();
+
     let (args, _) = get_args(&uri, &[]);
-    super::refuse_foreign(&args, out, &manifest("absent.json")).unwrap();
+    super::refuse_foreign(&args, &dest, &manifest("absent.json")).unwrap();
+}
+
+/// A default [`Destination`] at `out`, with the entry landing at
+/// `entry_name` when set: what `Destination::of` builds without `-o`, at a
+/// test-chosen path.
+fn default_dest(out: &Path, entry_name: Option<&str>) -> Destination {
+    Destination {
+        path: out.to_path_buf(),
+        entry_name: entry_name.map(str::to_owned),
+        defaulted: true,
+    }
+}
+
+/// Into a default destination, an entry path with a `.`-prefixed component is
+/// refused, naming the first such path and how many more there are. For a
+/// whole bundle the remedy is `-o` naming the same directory, with a warning
+/// against `.` and the home directory. An explicit `-o` passes.
+#[test]
+fn a_default_destination_refuses_a_hidden_path() {
+    let uri = format!("decdn:{}/", "ab".repeat(32));
+    let manifest = BundleManifest::new(
+        [0xab; 32],
+        vec![
+            sel_entry("ok/config.json", 3),
+            sel_entry(".decdn/node.toml", 3),
+            sel_entry("dir/.ssh/authorized_keys", 3),
+        ],
+    );
+    let err = super::refuse_hidden(&default_dest(Path::new("./out"), None), &manifest).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains(".decdn/node.toml"), "{msg}");
+    assert!(msg.contains("(and 1 more)"), "{msg}");
+    assert!(msg.contains("pass `-o ./out` to pull the bundle"), "{msg}");
+    assert!(msg.contains("reuses the cached manifest"), "{msg}");
+    assert!(
+        msg.contains("do not pass `-o .` or your home directory"),
+        "{msg}"
+    );
+
+    let (args, parsed) = get_args(&uri, &["-o", "dir"]);
+    super::refuse_hidden(&Destination::of(&args, &parsed), &manifest).unwrap();
+
+    let clean = BundleManifest::new([0xab; 32], vec![sel_entry("ok/config.json", 3)]);
+    super::refuse_hidden(&default_dest(Path::new("./out"), None), &clean).unwrap();
+}
+
+/// A `\` separates components for the hidden-path check on every platform,
+/// so the refusal is the same everywhere and comes before any fetch.
+#[test]
+fn a_default_destination_refuses_a_hidden_component_after_a_backslash() {
+    let manifest =
+        BundleManifest::new([0xab; 32], vec![sel_entry("dir\\.ssh\\authorized_keys", 3)]);
+    let err = super::refuse_hidden(&default_dest(Path::new("./out"), None), &manifest).unwrap_err();
+    assert!(
+        format!("{err:#}").contains(r#""dir\\.ssh\\authorized_keys""#),
+        "{err:#}"
+    );
+
+    let plain = BundleManifest::new([0xab; 32], vec![sel_entry("dir\\ssh\\keys", 3)]);
+    super::refuse_hidden(&default_dest(Path::new("./out"), None), &plain).unwrap();
+}
+
+/// The live path's post-manifest guard refuses a hidden landed path into a
+/// default destination even under `--overwrite` (which lifts only the
+/// foreign-file refusal), and passes the kept set through with an explicit
+/// `-o`.
+#[test]
+fn guard_selection_refuses_hidden_paths_even_under_overwrite() {
+    let uri = format!("decdn:{}/", "ab".repeat(32));
+    let kept = || Kept {
+        manifest: BundleManifest::new([0xab; 32], vec![sel_entry(".decdn/node.toml", 3)]),
+        excluded: 0,
+    };
+    let (args, parsed) = get_args(&uri, &["--overwrite"]);
+    let dest = default_dest(Path::new("./out"), None);
+    let err = super::guard_selection(&args, &dest, &parsed, kept()).unwrap_err();
+    assert!(format!("{err:#}").contains(".decdn/node.toml"), "{err:#}");
+
+    let (args, parsed) = get_args(&uri, &["-o", "dir"]);
+    let dest = Destination::of(&args, &parsed);
+    let through = super::guard_selection(&args, &dest, &parsed, kept())
+        .unwrap()
+        .expect("an explicit -o keeps the entries");
+    assert_eq!(through.manifest.entries.len(), 1);
+}
+
+/// Without `-o`, an entry URI whose landing name starts with `.` is refused:
+/// the check runs on the landed path, which for a default entry pull is the
+/// last segment of the entry's path.
+#[test]
+fn a_default_entry_pull_refuses_a_hidden_landing_name() {
+    let filter = EntryFilter::compile(Some("conf/.env".to_owned()), &[], &[])
+        .unwrap()
+        .landing_as(Some(".env".to_owned()));
+    let entries = vec![sel_entry("conf/.env", 3), sel_entry("ok.bin", 3)];
+    let manifest = BundleManifest::new([0xab; 32], filter.apply_and_warn(entries).unwrap().0);
+    let dest = default_dest(Path::new("."), Some(".env"));
+    let err = super::refuse_hidden(&dest, &manifest).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains(r#"".env""#), "{msg}");
+    assert!(
+        msg.contains("the entry lands at its full manifest path, `<dir>/<path>`"),
+        "{msg}"
+    );
+    assert!(!msg.contains("-o ."), "{msg}");
+}
+
+/// A hidden component in the middle of an entry's path does not hide its
+/// default landing name, which is only the last segment: the landed path is
+/// the checked one, and it is plain.
+#[test]
+fn a_hidden_parent_does_not_refuse_a_plain_landing_name() {
+    let filter = EntryFilter::compile(Some(".conf/env.toml".to_owned()), &[], &[])
+        .unwrap()
+        .landing_as(Some("env.toml".to_owned()));
+    let entries = vec![sel_entry(".conf/env.toml", 3)];
+    let manifest = BundleManifest::new([0xab; 32], filter.apply_and_warn(entries).unwrap().0);
+    let dest = default_dest(Path::new("."), Some("env.toml"));
+    super::refuse_hidden(&dest, &manifest).unwrap();
+}
+
+/// The dry run of a default-destination pull refuses a manifest with a hidden
+/// entry path, naming it, before anything lands; the same manifest with an
+/// explicit `-o` is planned.
+#[tokio::test]
+async fn a_default_dry_run_refuses_a_hidden_entry_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path();
+    let hash = cache_manifest(
+        out,
+        &serde_json::json!({"version": 1, "entries": [
+            {"path": "model.bin", "hash": format_hash([0xaa; 32]), "size": 3},
+            {"path": ".decdn/node.toml", "hash": format_hash([0xbb; 32]), "size": 3},
+        ]}),
+    );
+    let (args, parsed) = get_args(&format!("decdn:{hash}/"), &["--dry-run"]);
+    let mut dest = Destination::of(&args, &parsed);
+    dest.path = out.to_path_buf();
+    let err = super::bundle_pull(
+        &args,
+        &dest,
+        &parsed,
+        Some(&offline_config()),
+        (&Arc::new(ReceiptEvidence::new()), None),
+    )
+    .await
+    .expect_err("a hidden entry path into a default destination is refused");
+    assert!(format!("{err:#}").contains(".decdn/node.toml"), "{err:#}");
+
+    // Excluding the hidden entries keeps the default destination usable: the
+    // refusal runs on the kept set, after the filter.
+    let (args, parsed) = get_args(
+        &format!("decdn:{hash}/"),
+        &["--dry-run", "--exclude", ".decdn/*"],
+    );
+    let mut dest = Destination::of(&args, &parsed);
+    dest.path = out.to_path_buf();
+    super::bundle_pull(
+        &args,
+        &dest,
+        &parsed,
+        Some(&offline_config()),
+        (&Arc::new(ReceiptEvidence::new()), None),
+    )
+    .await
+    .unwrap();
+
+    let out_s = out.to_str().unwrap();
+    let (args, parsed) = get_args(&format!("decdn:{hash}/"), &["--dry-run", "-o", out_s]);
+    super::bundle_pull(
+        &args,
+        &Destination::of(&args, &parsed),
+        &parsed,
+        Some(&offline_config()),
+        (&Arc::new(ReceiptEvidence::new()), None),
+    )
+    .await
+    .unwrap();
+}
+
+/// Run the dry run of `args` for `uri` into `dest` against the offline
+/// config: no chain, no network.
+async fn dry_run_into(args: &GetArgs, dest: &Destination, uri: &DecdnUri) -> anyhow::Result<()> {
+    super::bundle_pull(
+        args,
+        dest,
+        uri,
+        Some(&offline_config()),
+        (&Arc::new(ReceiptEvidence::new()), None),
+    )
+    .await
+}
+
+/// An entry URI whose landing name is hidden, built through
+/// `Destination::of`: without `-o` the dry run refuses it, naming the
+/// landing name; with `-o <out>` the entry lands at its full manifest path
+/// in a directory the user named, so the dry run plans it.
+#[tokio::test]
+async fn a_default_entry_dry_run_refuses_a_hidden_landing_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path();
+    let hash = cache_manifest(
+        out,
+        &serde_json::json!({"version": 1, "entries": [
+            {"path": "conf/.env", "hash": format_hash([0xaa; 32]), "size": 3},
+        ]}),
+    );
+    let uri = format!("decdn:{hash}/conf/.env");
+    let (args, parsed) = get_args(&uri, &["--dry-run"]);
+    let mut dest = Destination::of(&args, &parsed);
+    assert!(dest.defaulted);
+    assert_eq!(dest.entry_name.as_deref(), Some(".env"));
+    dest.path = out.to_path_buf();
+    let err = dry_run_into(&args, &dest, &parsed)
+        .await
+        .expect_err("a hidden landing name into a default destination is refused");
+    assert!(format!("{err:#}").contains(r#"".env""#), "{err:#}");
+
+    let (args, parsed) = get_args(&uri, &["--dry-run", "-o", out.to_str().unwrap()]);
+    dry_run_into(&args, &Destination::of(&args, &parsed), &parsed)
+        .await
+        .unwrap();
+}
+
+/// Into a default destination, a hidden entry path is refused before an
+/// unrecorded file that the pull would replace: the hidden-path refusal is the
+/// one `--overwrite` cannot lift, so it names the fault the user must fix
+/// first. A manifest whose only entry is nested under a hidden directory is
+/// refused too.
+#[tokio::test]
+async fn a_hidden_path_is_refused_before_a_foreign_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path();
+    let hash = cache_manifest(
+        out,
+        &serde_json::json!({"version": 1, "entries": [
+            {"path": "model.bin", "hash": format_hash([0xaa; 32]), "size": 3},
+            {"path": "a/.git/config", "hash": format_hash([0xbb; 32]), "size": 3},
+        ]}),
+    );
+    std::fs::write(out.join("model.bin"), b"mine").unwrap();
+    let (args, parsed) = get_args(&format!("decdn:{hash}/"), &["--dry-run"]);
+    let dest = default_dest(out, None);
+    let err = dry_run_into(&args, &dest, &parsed).await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(r#"refusing to pull hidden path "a/.git/config""#),
+        "{msg}"
+    );
+    assert!(!msg.contains("refusing to replace"), "{msg}");
+
+    // The live path's guard holds the same order.
+    let kept = Kept {
+        manifest: BundleManifest::new(
+            [0xab; 32],
+            vec![sel_entry("model.bin", 3), sel_entry("a/.git/config", 3)],
+        ),
+        excluded: 0,
+    };
+    let err = super::guard_selection(&args, &dest, &parsed, kept).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("refusing to pull hidden path"),
+        "{err:#}"
+    );
+
+    let nested = BundleManifest::new([0xab; 32], vec![sel_entry("a/.git/config", 3)]);
+    let err = super::refuse_hidden(&default_dest(out, None), &nested).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains(r#""a/.git/config""#), "{msg}");
+    assert!(!msg.contains("more)"), "{msg}");
+}
+
+/// A file at a whole bundle's default `./<hash>` blocks its directory: a
+/// default pull, dry or live, is refused before any network call, naming
+/// the file. A live run here has no chain to pay on, so reaching the
+/// refusal proves it comes first. With `-o`, the check does not run.
+#[tokio::test]
+async fn a_file_at_the_default_bundle_directory_is_refused_before_the_network() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hex = "ab".repeat(32);
+    let file = tmp.path().join(&hex);
+    std::fs::write(&file, b"{}").unwrap();
+    for extra in [&["--dry-run"][..], &[]] {
+        let (args, parsed) = get_args(&format!("decdn:{hex}/"), extra);
+        let mut dest = Destination::of(&args, &parsed);
+        dest.path.clone_from(&file);
+        let err = dry_run_into(&args, &dest, &parsed).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("{} exists and is not a directory", file.display())),
+            "{extra:?}: {msg}"
+        );
+    }
+
+    let out = tmp.path().join("elsewhere");
+    let (args, parsed) = get_args(
+        &format!("decdn:{hex}/"),
+        &["--dry-run", "-o", out.to_str().unwrap()],
+    );
+    dry_run_into(&args, &Destination::of(&args, &parsed), &parsed)
+        .await
+        .unwrap();
 }
 
 /// Write the skip-cache record a pull of `decdn:<bundle_hex>/<manifest_path>`
@@ -1092,8 +1403,9 @@ fn a_default_destination_refuses_a_file_another_entry_wrote() {
     };
 
     let uri = format!("decdn:{hex}/tokenizer/config.json");
+    let dest = default_dest(out, Some("config.json"));
     let (args, _) = get_args(&uri, &[]);
-    let err = super::refuse_foreign(&args, out, &landed("tokenizer/config.json")).unwrap_err();
+    let err = super::refuse_foreign(&args, &dest, &landed("tokenizer/config.json")).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains(&format!(
@@ -1101,12 +1413,18 @@ fn a_default_destination_refuses_a_file_another_entry_wrote() {
         )),
         "{msg}"
     );
-    for extra in [&["-o", "."][..], &["--overwrite"]] {
-        let (args, _) = get_args(&uri, extra);
-        super::refuse_foreign(&args, out, &landed("tokenizer/config.json")).unwrap();
-    }
+    let (args, parsed) = get_args(&uri, &["-o", "."]);
+    super::refuse_foreign(
+        &args,
+        &Destination::of(&args, &parsed),
+        &landed("tokenizer/config.json"),
+    )
+    .unwrap();
+    let (args, _) = get_args(&uri, &["--overwrite"]);
+    super::refuse_foreign(&args, &dest, &landed("tokenizer/config.json")).unwrap();
+
     let (args, _) = get_args(&format!("decdn:{hex}/text_encoder/config.json"), &[]);
-    super::refuse_foreign(&args, out, &landed("text_encoder/config.json")).unwrap();
+    super::refuse_foreign(&args, &dest, &landed("text_encoder/config.json")).unwrap();
 }
 
 /// Without `-o`, a file that changed after a pull wrote it is refused, and the
@@ -1121,21 +1439,25 @@ fn a_default_destination_refuses_a_changed_file_and_an_old_cache() {
     record_pull(out, "a.txt", [0x00; 32], &hex, "a.txt");
     std::fs::write(out.join("a.txt"), b"abcd").unwrap();
     let manifest = BundleManifest::new([0xab; 32], vec![sel_entry("a.txt", 3)]);
+    let dest = default_dest(out, None);
     let (args, _) = get_args(&format!("decdn:{hex}/"), &[]);
-    let err = super::refuse_foreign(&args, out, &manifest).unwrap_err();
+    let err = super::refuse_foreign(&args, &dest, &manifest).unwrap_err();
+    let msg = format!("{err:#}");
     assert!(
-        format!("{err:#}").contains(&format!(
+        msg.contains(&format!(
             "it changed after an earlier `decdn get` wrote it from decdn:{hex}/a.txt"
         )),
-        "{err:#}"
+        "{msg}"
     );
+    // A whole-bundle refusal points back at the same directory by name.
+    assert!(msg.contains(&format!("`-o {}`", out.display())), "{msg}");
 
     std::fs::write(
         out.join(".decdn-manifest.json"),
         br#"{"version":1,"files":{}}"#,
     )
     .unwrap();
-    let err = super::refuse_foreign(&args, out, &manifest).unwrap_err();
+    let err = super::refuse_foreign(&args, &dest, &manifest).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains("the skip-cache cannot say which `decdn get` wrote it")

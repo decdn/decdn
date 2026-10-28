@@ -12,8 +12,9 @@
 #
 # The `decdn:` URI comes first. It and every argument after it go to
 # `decdn get` as given. A blob URI needs `-o <file>`. Without `-o`, a bundle
-# or entry URI lets `decdn get` pick the destination and refuse to replace a
-# file no earlier pull of the same entry left there.
+# or entry URI lets `decdn get` pick the destination, refuse a hidden
+# (`.`-prefixed) path, and refuse to replace a file no earlier pull of the
+# same entry left there.
 #
 # Without arguments, it only installs decdn into ~/.local/bin and checks that
 # the directory is on PATH, printing how to add it when it is not:
@@ -366,8 +367,8 @@ main() {
     if [ -z "$has_output" ]; then
       # uri_hash admits only `/`, `?` or the end after the hash, so a `/`
       # before the query marks a bundle URI. That one goes without `-o`:
-      # decdn get picks the destination and keeps its overwrite guard, which
-      # an explicit `-o` would turn off.
+      # decdn get picks the destination and keeps its overwrite and
+      # hidden-path guards, which an explicit `-o` would turn off.
       case "${uri%%\?*}" in
         */*) ;;
         *) die "a blob URI needs -o <file> to name the file it is written to: $uri" ;;

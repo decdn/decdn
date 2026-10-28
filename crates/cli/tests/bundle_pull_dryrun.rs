@@ -12,6 +12,10 @@
 //! `common::decdn_command`'s sealed environment holds no chain config, so the
 //! quote stops at chain resolution, before it binds an endpoint. It prints
 //! `warning: quote unavailable: …` on stderr and the run still exits 0.
+//!
+//! A dry run without `-o` runs from a temporary current directory, against
+//! which its default `./<hex>` destination resolves. Those tests show what a
+//! default destination refuses and that the directory gains nothing else.
 
 #![allow(
     clippy::unwrap_used,
@@ -56,6 +60,27 @@ fn cache_manifest(out: &Path, bytes: &[u8]) -> String {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, bytes).unwrap();
     hash.to_hex().to_string()
+}
+
+/// Run `decdn get 'decdn:<hex>/' --dry-run` with no `-o`, from `cwd`, under
+/// `common::decdn_command`'s sealed environment: the destination defaults to
+/// `./<hex>`, which resolves against `cwd`.
+fn default_dry_run(home: &Path, cwd: &Path, hex: &str) -> Output {
+    common::decdn_command(home)
+        .current_dir(cwd)
+        .args(["get", &format!("decdn:{hex}/"), "--dry-run"])
+        .output()
+        .expect("run decdn binary")
+}
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 /// Run `decdn get 'decdn:<hex>/' -o <out> <filters…> --dry-run` under
@@ -180,4 +205,99 @@ fn no_cached_manifest_notes_deferred_filters_without_warning() {
         !stderr.contains("matched no entries"),
         "no entries were matched against, so no unmatched-pattern warning: {stderr}"
     );
+}
+
+/// Without `-o`, the dry run of a whole bundle reads the manifest cached in
+/// the bundle's own `./<hex>` directory and refuses a hidden entry path there,
+/// as a real pull does: it exits non-zero, names the path and the `-o` that
+/// takes it, and the current directory gains nothing but `<hex>`.
+#[test]
+fn a_default_dry_run_refuses_a_hidden_path_from_the_binary() {
+    let home = TempDir::new().unwrap();
+    let cwd = home.path().join("work");
+    fs::create_dir(&cwd).unwrap();
+    let entry_hash = format!("b3:{}", blake3::hash(b"entry").to_hex());
+    let manifest = serde_json::json!({
+        "version": 1,
+        "entries": [
+            {"path": "model.bin", "hash": entry_hash, "size": 10},
+            {"path": ".decdn/node.toml", "hash": entry_hash, "size": 20},
+        ],
+    })
+    .to_string()
+    .into_bytes();
+    let hex = blake3::hash(&manifest).to_hex().to_string();
+    let bundle_dir = cwd.join(&hex);
+    assert_eq!(cache_manifest(&bundle_dir, &manifest), hex);
+
+    let run = default_dry_run(home.path(), &cwd, &hex);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains(r#"refusing to pull hidden path ".decdn/node.toml""#),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("`-o ./{hex}`")),
+        "stderr: {stderr}"
+    );
+    assert!(!stdout.contains("would fetch"), "stdout: {stdout}");
+    assert_eq!(names_in(&cwd), std::slice::from_ref(&hex));
+    assert_eq!(names_in(&bundle_dir), [".decdn-bundles"]);
+}
+
+/// Without `-o`, the dry run of a clean bundle plans it into its own `./<hex>`
+/// directory, from the manifest cached there.
+#[test]
+fn a_default_dry_run_plans_into_the_bundles_own_directory() {
+    let home = TempDir::new().unwrap();
+    let cwd = home.path().join("work");
+    fs::create_dir(&cwd).unwrap();
+    let hex = blake3::hash(&manifest_json()).to_hex().to_string();
+    cache_manifest(&cwd.join(&hex), &manifest_json());
+
+    let run = default_dry_run(home.path(), &cwd, &hex);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.contains(&format!("would fetch 2 entr(ies) into ./{hex}:")),
+        "stdout: {stdout}"
+    );
+    assert_eq!(names_in(&cwd), [hex]);
+}
+
+/// A file at the bundle's default `./<hex>` (what `decdn get decdn:<hex>`
+/// writes) blocks its directory: a default dry run and a `decdn quote` both
+/// refuse before any network call, naming the file and the trailing `/` it
+/// most likely lacked. The sealed environment has no chain, so a quote that
+/// went on would fail on chain resolution instead.
+#[test]
+fn a_blob_file_at_the_bundles_directory_is_refused_up_front() {
+    let home = TempDir::new().unwrap();
+    let cwd = home.path().join("work");
+    fs::create_dir(&cwd).unwrap();
+    let hex = blake3::hash(&manifest_json()).to_hex().to_string();
+    fs::write(cwd.join(&hex), manifest_json()).unwrap();
+
+    let dry = default_dry_run(home.path(), &cwd, &hex);
+    let quote = common::decdn_command(home.path())
+        .current_dir(&cwd)
+        .args(["quote", &format!("decdn:{hex}/")])
+        .output()
+        .expect("run decdn binary");
+    for (what, run) in [("get --dry-run", dry), ("quote", quote)] {
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(!run.status.success(), "{what}: {stderr}");
+        assert!(
+            stderr.contains(&format!("./{hex} exists and is not a directory")),
+            "{what}: {stderr}"
+        );
+        assert!(
+            stderr.contains("(without the trailing `/`)"),
+            "{what}: {stderr}"
+        );
+    }
+    assert_eq!(names_in(&cwd), [hex]);
 }

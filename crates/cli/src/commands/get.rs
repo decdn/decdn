@@ -19,12 +19,14 @@
 //! and `--receipt` writes the signed evidence to a file.
 //!
 //! Without `-o`, the destination follows the target: `./<hash>` for a blob,
-//! `.` for a bundle, and `./<name>` for an entry, where `<name>` is the last
-//! segment of the entry's path. The command then writes the absolute
+//! `./<hash>/` for a bundle, and `./<name>` for an entry, where `<name>` is
+//! the last segment of the entry's path. The command then writes the absolute
 //! destination to stderr before the pull starts, except under `--json` or
 //! `--dry-run`. A bundle or entry pull into a default destination refuses a
 //! path that holds a file no earlier pull of the same entry left there
-//! unchanged, unless `--overwrite`.
+//! unchanged, unless `--overwrite`, and refuses a hidden path — one with a
+//! `.`-prefixed component — outright; an explicit `-o` names the directory,
+//! so it takes such paths unchanged.
 //!
 //! A default destination, like any relative `-o`, resolves against the
 //! current directory, and so does the run's resume state. A run that stops on
@@ -121,6 +123,62 @@ fn resume_dir(args: &GetArgs) -> Option<PathBuf> {
     std::env::current_dir().ok()
 }
 
+/// The path a `decdn get` of `uri` without `-o` writes to: `./<hash>` for
+/// a blob (the file) and for a whole bundle (its own directory), and `.` for
+/// an entry (the directory its file lands in, at its name). A bundle's
+/// manifest cache and resume state live in this directory, so `decdn quote`
+/// reads and caches a manifest at the same default.
+pub(crate) fn default_path(uri: &DecdnUri) -> PathBuf {
+    match &uri.target {
+        UriTarget::BundleEntry(_) => PathBuf::from("."),
+        _ => Path::new(".").join(blake3::Hash::from_bytes(uri.hash).to_hex().as_str()),
+    }
+}
+
+/// The name the entry an entry URI names lands at without `-o`: the last
+/// segment of its path. `None` for any other target.
+pub(crate) fn default_entry_name(uri: &DecdnUri) -> Option<String> {
+    // The URI parser holds every segment non-empty and free of `/`, so an
+    // entry's last segment is a plain name. The pull still checks it against
+    // the path-safety rules, like any manifest path.
+    match &uri.target {
+        UriTarget::BundleEntry(entry) => Some(
+            entry
+                .rsplit_once('/')
+                .map_or(entry.as_str(), |(_, name)| name)
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
+/// Refuse a whole-bundle pull of `uri` into its default directory `path`
+/// ([`default_path`]) when `path` holds something that is not a directory.
+/// A blob URI without `-o` writes its file at the same `./<hash>`, so the
+/// file there is most likely the raw manifest of an earlier `decdn get` of
+/// the URI without the trailing `/`. The pull could never create its
+/// directory there, so this check runs before any network call or payment.
+/// Other targets pass.
+///
+/// # Errors
+///
+/// When `uri` names a whole bundle and `path` exists and is not a directory
+/// (a symlink counts by its target).
+pub(crate) fn refuse_file_at_bundle_dir(uri: &DecdnUri, path: &Path) -> anyhow::Result<()> {
+    if uri.target != UriTarget::Bundle || path.is_dir() || std::fs::symlink_metadata(path).is_err()
+    {
+        return Ok(());
+    }
+    let hex = blake3::Hash::from_bytes(uri.hash).to_hex();
+    anyhow::bail!(
+        "{path} exists and is not a directory, so the bundle cannot land in it: it is likely \
+         the raw manifest that `decdn get decdn:{hex}` (without the trailing `/`) wrote there; \
+         remove it to pull the bundle into {path}, or pass `-o <dir>` to pull it into another \
+         directory",
+        path = path.display(),
+    )
+}
+
 /// Where a `decdn get` run writes: `-o`, or the default for the URI's target.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Destination {
@@ -130,40 +188,28 @@ pub(crate) struct Destination {
     /// `path`, in place of its full manifest path under `path`. Set only for
     /// an entry URI without `-o`.
     pub(crate) entry_name: Option<String>,
+    /// Whether no `-o` was given: `path` is the target's default, a path the
+    /// user did not name. The bundle pull's default-destination refusals read
+    /// this field, not `args.output`.
+    pub(crate) defaulted: bool,
 }
 
 impl Destination {
     /// The destination of `args` for `uri`: `-o` as given, or else
-    /// `./<hash>` for a blob, `.` for a bundle, and `.` for an entry with the
-    /// entry landing at the last segment of its path.
+    /// `./<hash>` for a blob, `./<hash>/` for a bundle, and `.` for an entry
+    /// with the entry landing at the last segment of its path.
     pub(crate) fn of(args: &GetArgs, uri: &DecdnUri) -> Self {
         if let Some(output) = &args.output {
             return Self {
                 path: output.clone(),
                 entry_name: None,
+                defaulted: false,
             };
         }
-        match &uri.target {
-            UriTarget::Blob => Self {
-                path: Path::new(".").join(blake3::Hash::from_bytes(uri.hash).to_hex().as_str()),
-                entry_name: None,
-            },
-            // The URI parser holds every segment non-empty and free of `/`,
-            // so the last segment is a plain name. The pull still checks it
-            // against the path-safety rules, like any manifest path.
-            UriTarget::BundleEntry(entry) => Self {
-                path: PathBuf::from("."),
-                entry_name: Some(
-                    entry
-                        .rsplit_once('/')
-                        .map_or(entry.as_str(), |(_, name)| name)
-                        .to_owned(),
-                ),
-            },
-            _ => Self {
-                path: PathBuf::from("."),
-                entry_name: None,
-            },
+        Self {
+            path: default_path(uri),
+            entry_name: default_entry_name(uri),
+            defaulted: true,
         }
     }
 

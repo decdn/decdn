@@ -12,8 +12,9 @@
 #
 # The `decdn:` URI comes first. It and every argument after it go to
 # `decdn get` as given. A blob URI needs `-o <file>`. Without `-o`, a bundle
-# or entry URI lets `decdn get` pick the destination and refuse to replace a
-# file no earlier pull of the same entry left there.
+# or entry URI lets `decdn get` pick the destination, refuse a hidden
+# (`.`-prefixed) path, and refuse to replace a file no earlier pull of the
+# same entry left there.
 #
 # Each download gets a throwaway key under ~\.decdn\sponsored\downloads\<hash>\
 # and a capability for it, issued once the person passes the gate in the
@@ -85,7 +86,8 @@
       # The rest go to decdn get, which checks them.
       foreach ($Arg in ($args | Select-Object -Skip 2)) { $PassArgs.Add([string]$Arg) }
       # A bundle URI goes without `-o`: decdn get picks the destination and
-      # keeps its overwrite guard, which an explicit `-o` would turn off.
+      # keeps its overwrite and hidden-path guards, which an explicit `-o`
+      # would turn off.
       if ((-not $IsBundle) -and -not ($PassArgs | Where-Object { $_ -cmatch '^(-o|--output(=|$))' })) {
         throw "decdn: a blob URI needs -o <file> to name the file it is written to: $Uri"
       }
