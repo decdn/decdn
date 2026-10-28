@@ -90,9 +90,10 @@ const EGRESS_EWMA_INTERVAL: Duration = Duration::from_secs(1);
 /// the other along.
 const DHT_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 
-/// Interval between periodic GC sweeps of the probe rate-limiter's per-IP and
-/// per-peer keyed maps (#645, #982). Matches `DHT_RATE_LIMIT_GC_INTERVAL` — the
-/// probe and DHT keyed limiters share the same keyspace-cleanup mental model.
+/// Interval between periodic GC sweeps of the probe and serve rate-limiters'
+/// per-IP and per-peer keyed maps (#645, #982). Matches
+/// `DHT_RATE_LIMIT_GC_INTERVAL` — the keyed limiters share the same
+/// keyspace-cleanup mental model.
 /// Separate constant so a future tune to one limiter doesn't drag the other.
 const PROBE_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 
@@ -385,7 +386,7 @@ fn warn_if_pins_exceed_cache(cache: &decdn_cache::CacheEngine, cache_size_mb: u6
 }
 
 /// Emit one `debug` line for a keyed rate-limiter GC sweep that pruned buckets.
-/// Shared by the DHT and probe rate-limiter GC ticks, whose per-layer
+/// Shared by the DHT, probe and serve rate-limiter GC ticks, whose per-layer
 /// (`per_ip` / `per_peer`) log arms are otherwise byte-identical.
 fn log_keyspace_gc(kind: &'static str, layer: &'static str, sweep: Option<(usize, usize)>) {
     if let Some((before, after)) = sweep {
@@ -853,6 +854,7 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     slash_store: crate::slash_watcher::SlashStore,
     node_address_resolver: Option<Arc<dyn crate::dht::NodeAddressResolver>>,
     probe_rate_limiter: Arc<ProbeRateLimiter>,
+    serve_rate_limiter: Arc<crate::handlers::serve_rate_limit::ServeRateLimiter>,
     probe_handler: Arc<ProbeHandler>,
     dht_rate_limiter: Arc<DhtRateLimiter>,
     record_store: Arc<std::sync::Mutex<RecordStore>>,
@@ -1126,6 +1128,15 @@ async fn build_chain_and_handlers(
         &cfg.probe,
         Arc::clone(&infra.node_metrics),
     ));
+    // `cdn/client/v1` per-request limiter, from `[serve.rate_limit]` (ADR 005
+    // §Request rate limiting). Checked once per stream before the request is
+    // read, in addition to the `ConnectionLimiter` and the stream cap.
+    let serve_rate_limiter = Arc::new(
+        crate::handlers::serve_rate_limit::ServeRateLimiter::from_resolved(
+            &cfg.serve,
+            Arc::clone(&infra.node_metrics),
+        ),
+    );
 
     // Chain-read liveness (ADR 011 §Serving while chain-stale). One handle,
     // stamped by the blacklist watcher (boot enumeration + every successful poll
@@ -1385,7 +1396,7 @@ async fn build_chain_and_handlers(
     // (a pool opened before the watcher's `ColdStart::Head` anchor), does ONE
     // `getPool` to confirm the pool is live and solvent before a serve is admitted
     // — folding a servable pool into the projection and refusing an absent/closed/
-    // errored one. The mid-stream re-check reads the projection only.
+    // errored one. The mid-stream pool re-check reads the projection only.
     let resolving_pool_view = crate::payment_settlement::ResolvingPoolView::new(
         decdn_incentive::payment_pool::PaymentPool::new(payment_pool_addr, wallet_provider.clone()),
         pool_view.clone(),
@@ -1431,6 +1442,7 @@ async fn build_chain_and_handlers(
         pool_state_store: Arc::clone(&infra.pool_state_store),
         receipt_sink: Arc::clone(&infra.receipt_sink),
         pool_view: Some(Arc::new(resolving_pool_view) as Arc<dyn crate::pool_view::PoolView>),
+        request_limiter: Some(Arc::clone(&serve_rate_limiter)),
         pool_min_remaining_deposit: U256::from(
             cfg.blockchain.pool_min_remaining_deposit_micro_usdc,
         ),
@@ -1614,6 +1626,7 @@ async fn build_chain_and_handlers(
         slash_store,
         node_address_resolver,
         probe_rate_limiter,
+        serve_rate_limiter,
         probe_handler,
         dht_rate_limiter,
         record_store,
@@ -1651,6 +1664,7 @@ struct Background {
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
+    serve_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     reputation_evict_stop_tx: oneshot::Sender<()>,
     republish_stop: CancellationToken,
     bucket_refresh_stop_tx: oneshot::Sender<()>,
@@ -1906,6 +1920,21 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         )
     };
 
+    // `cdn/client/v1` request-limiter keyspace GC, same shape as the probe GC
+    // above, for the serve per-IP / per-peer keyed maps.
+    let serve_rate_limit_gc_stop_tx = {
+        let limiter = Arc::clone(&ch.serve_rate_limiter);
+        spawn_periodic(
+            &mut tasks,
+            "serve_rate_limit_gc",
+            PROBE_RATE_LIMIT_GC_INTERVAL,
+            move || {
+                log_keyspace_gc("serve", "per_ip", limiter.gc_per_ip());
+                log_keyspace_gc("serve", "per_peer", limiter.gc_per_peer());
+            },
+        )
+    };
+
     // DHT republish scheduler (ADR 022 §STORE Flow). The subscribe
     // handle is taken before the cold-start seed so an announcement racing
     // with seed-time lands in the channel backlog rather than the
@@ -1959,6 +1988,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         infra.dht_conns.clone(),
         infra.secret_key.public(),
         Arc::clone(&ch.dht_routing),
+        Arc::clone(&ch.staker_set),
         Arc::clone(&republish_scheduler),
         infra.cache.clone(),
         cfg.cache.relay_foreign_namespaces,
@@ -2031,6 +2061,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         infra.dht_conns.clone(),
         infra.secret_key.public(),
         Arc::clone(&ch.dht_routing),
+        Arc::clone(&ch.staker_set),
         bucket_refresh_stop_rx,
         crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
         Arc::clone(&bucket_refresh_clock),
@@ -2432,6 +2463,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx,
+        serve_rate_limit_gc_stop_tx,
         reputation_evict_stop_tx,
         republish_stop,
         bucket_refresh_stop_tx,
@@ -2526,6 +2558,7 @@ pub async fn run(
         eviction_stop_tx: bg.eviction_stop_tx,
         dht_rate_limit_gc_stop_tx: bg.dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx: bg.probe_rate_limit_gc_stop_tx,
+        serve_rate_limit_gc_stop_tx: bg.serve_rate_limit_gc_stop_tx,
         reputation_evict_stop_tx: bg.reputation_evict_stop_tx,
         republish_stop: bg.republish_stop,
         bucket_refresh_stop_tx: bg.bucket_refresh_stop_tx,
@@ -2561,6 +2594,7 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
+    serve_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     reputation_evict_stop_tx: oneshot::Sender<()>,
     republish_stop: CancellationToken,
     bucket_refresh_stop_tx: oneshot::Sender<()>,
@@ -2649,6 +2683,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx,
+        serve_rate_limit_gc_stop_tx,
         reputation_evict_stop_tx,
         republish_stop,
         bucket_refresh_stop_tx,
@@ -2702,6 +2737,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
     let _ = eviction_stop_tx.send(());
     let _ = dht_rate_limit_gc_stop_tx.send(());
     let _ = probe_rate_limit_gc_stop_tx.send(());
+    let _ = serve_rate_limit_gc_stop_tx.send(());
     // Best-effort, same rationale as the GC sweeps above: the reputation
     // evict tick exits on this stop signal (or a panic, which surfaces
     // through `JoinSet::join_next` during the drain phase below).

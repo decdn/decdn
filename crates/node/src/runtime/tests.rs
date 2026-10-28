@@ -367,6 +367,7 @@ fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, Resolve
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         dht: decdn_common::config::ResolvedDht::default(),
         probe: decdn_common::config::ResolvedProbe::default(),
+        serve: decdn_common::config::ResolvedServe::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
         content: decdn_common::config::ResolvedContent::default(),
     };

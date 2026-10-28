@@ -98,6 +98,9 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_client_declined_total",
     "decdn_serve_stream_client_abandoned_total",
     "decdn_serve_stream_node_fault_total",
+    "decdn_serve_rate_limit_rejected_per_peer_total",
+    "decdn_serve_rate_limit_rejected_per_ip_total",
+    "decdn_serve_rate_limit_rejected_global_total",
 ];
 
 #[derive(
@@ -672,6 +675,31 @@ pub struct DecdnMetrics {
     /// Sibling of `probe_rate_limit_tracked_per_ip` for the per-peer map.
     /// Operator-visible name: `decdn_probe_rate_limit_tracked_per_peer` (#645).
     pub probe_rate_limit_tracked_per_peer: Gauge,
+    /// Inbound `cdn/client/v1` streams refused by the per-peer (`NodeId`) token
+    /// bucket before the request was read (ADR 005 §Request rate limiting).
+    /// One Counter per layer, like `probe_rate_limit_rejected_*`. Each bump
+    /// ends exactly one inbound stream as failed. Operator-visible name:
+    /// `decdn_serve_rate_limit_rejected_per_peer_total`.
+    pub serve_rate_limit_rejected_per_peer: Counter,
+    /// Sibling of `serve_rate_limit_rejected_per_peer` for the per-IP bucket.
+    /// Operator-visible name: `decdn_serve_rate_limit_rejected_per_ip_total`.
+    pub serve_rate_limit_rejected_per_ip: Counter,
+    /// Sibling of `serve_rate_limit_rejected_per_peer` for the global bucket.
+    /// Operator-visible name: `decdn_serve_rate_limit_rejected_global_total`.
+    pub serve_rate_limit_rejected_global: Counter,
+    /// `retain_recent` sweeps of the per-IP serve keyed-limiter map that ran.
+    /// Operator-visible name: `decdn_serve_rate_limit_prune_sweeps_per_ip_total`.
+    pub serve_rate_limit_prune_sweeps_per_ip: Counter,
+    /// Sibling of `serve_rate_limit_prune_sweeps_per_ip` for the per-peer map.
+    /// Operator-visible name:
+    /// `decdn_serve_rate_limit_prune_sweeps_per_peer_total`.
+    pub serve_rate_limit_prune_sweeps_per_peer: Counter,
+    /// Current size of the per-IP serve keyed-limiter map after the most recent
+    /// prune. Operator-visible name: `decdn_serve_rate_limit_tracked_per_ip`.
+    pub serve_rate_limit_tracked_per_ip: Gauge,
+    /// Sibling of `serve_rate_limit_tracked_per_ip` for the per-peer map.
+    /// Operator-visible name: `decdn_serve_rate_limit_tracked_per_peer`.
+    pub serve_rate_limit_tracked_per_peer: Gauge,
     /// `cdn/dht/v1` request handling failed after the request was admitted
     /// by the rate limiter — frame decode error, response write error,
     /// read timeout, etc. Tracked separately from the rate-limit
@@ -858,6 +886,22 @@ pub struct DecdnMetrics {
     /// which pools are dry. Operator-visible name:
     /// `decdn_redemption_skipped_insolvent_total`.
     pub redemption_skipped_insolvent: Counter,
+    /// Lanes the redeemer kept out of a submit because their pool stayed
+    /// unknown after its pre-submit `getPool`: the read faulted, a fault ended
+    /// the reads before this pool's, or the chain shows the pool absent or
+    /// `Closed`. A fault clears on a later cycle; an absent or `Closed` pool
+    /// logs a `warn!` naming it and stays out. Counted once per skipped lane per
+    /// cycle. Operator-visible name:
+    /// `decdn_redemption_skipped_pool_unresolved_total`.
+    pub redemption_skipped_pool_unresolved: Counter,
+    /// Admission chain reads (`getPool`, `getAuthorization`) that found every
+    /// read slot taken for the whole slot wait and were refused without a read
+    /// (#2706). The request answers `NotFound` and counts on
+    /// `decdn_serve_stream_rejected_pool_unconfirmed_total` or the signer
+    /// refusal; this counter says the node was busy, not that the pool or
+    /// signer failed to resolve. Operator-visible name:
+    /// `decdn_serve_admit_read_slot_timeouts_total`.
+    pub serve_admit_read_slot_timeouts: Counter,
     /// Lanes with value owed that the redeemer skipped because the signer's
     /// capability has expired, or expires within the redeemer's landing slack
     /// (ADR 003 §Revocation). The contract pays 0 for an expired capability, so
@@ -1786,7 +1830,9 @@ pub struct DecdnMetrics {
     /// the pool on-chain — the pool has no on-chain record, is closed/reclaimed, or
     /// the admit-path `getPool` faulted — or could not confirm the voucher signer:
     /// the admit-path `getAuthorization` faulted and the node holds no cached
-    /// registered read of the signer. Signed as `NotFound`, like a cache miss,
+    /// registered read of the signer. Either read also refuses when it finds no
+    /// free read slot in time, which `serve_admit_read_slot_timeouts` counts
+    /// apart. Signed as `NotFound`, like a cache miss,
     /// so this counter is the only place the reason lives;
     /// kept distinct from `insufficient_deposit` so a real drained-pool refusal is
     /// not conflated with an unconfirmed or unreachable pool. Visible name:
@@ -3099,6 +3145,13 @@ recorders! {
     /// pass (ADR 003); the batched form of `redemption_skipped_insolvent`.
     redemption_skipped_insolvent_by(n: u64) => redemption_skipped_insolvent.inc_by(n);
 
+    /// `n` lanes were kept out of a submit because their pool stayed unknown
+    /// after the pre-submit `getPool` (`resolve_unknown_pools`).
+    redemption_skipped_pool_unresolved_by(n: u64) => redemption_skipped_pool_unresolved.inc_by(n);
+
+    /// An admission chain read found no free read slot within its wait.
+    serve_admit_read_slot_timeout => serve_admit_read_slot_timeouts.inc();
+
     /// `n` lanes were dropped from a redeem batch by the pre-submit on-chain
     /// watermark reconciliation because the chain already shows them settled to
     /// their claim value (the `redeemMany` no-op guard, avoided before it costs
@@ -3637,6 +3690,28 @@ recorders! {
     /// Set the per-peer probe keyed-limiter tracked-size gauge (#645).
     probe_rate_limit_tracked_per_peer_set(n: usize)
         => probe_rate_limit_tracked_per_peer.set(sat(n));
+
+    /// Record an inbound `cdn/client/v1` stream refused at the per-peer layer.
+    serve_rate_limit_rejected_per_peer => serve_rate_limit_rejected_per_peer.inc();
+
+    /// Record an inbound `cdn/client/v1` stream refused at the per-IP layer.
+    serve_rate_limit_rejected_per_ip => serve_rate_limit_rejected_per_ip.inc();
+
+    /// Record an inbound `cdn/client/v1` stream refused at the global layer.
+    serve_rate_limit_rejected_global => serve_rate_limit_rejected_global.inc();
+
+    /// Record a `retain_recent` sweep of the per-IP serve keyed-limiter map.
+    serve_rate_limit_prune_sweep_per_ip => serve_rate_limit_prune_sweeps_per_ip.inc();
+
+    /// Record a `retain_recent` sweep of the per-peer serve keyed-limiter map.
+    serve_rate_limit_prune_sweep_per_peer => serve_rate_limit_prune_sweeps_per_peer.inc();
+
+    /// Set the per-IP serve keyed-limiter tracked-size gauge.
+    serve_rate_limit_tracked_per_ip_set(n: usize) => serve_rate_limit_tracked_per_ip.set(sat(n));
+
+    /// Set the per-peer serve keyed-limiter tracked-size gauge.
+    serve_rate_limit_tracked_per_peer_set(n: usize)
+        => serve_rate_limit_tracked_per_peer.set(sat(n));
 
     /// Record a `cdn/dht/v1` request that was admitted by the rate
     /// limiter but failed after that (frame decode, write, encode,

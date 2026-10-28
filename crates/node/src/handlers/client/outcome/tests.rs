@@ -10,6 +10,7 @@ use super::super::wire::{ClientPaymentFault, PeerFault, tag_paid_progress};
 use super::{ErrEnd, ResetCause, ServeEnd, ServeStop};
 use crate::handlers::client::{ServeRejectReason, StreamRequest};
 use crate::metrics::{INBOUND_FAILURE_REASONS, Metrics};
+use crate::rate_limit::RejectLayer;
 
 /// One exported span: its name and its attributes as strings.
 type Exported = (String, HashMap<String, String>);
@@ -203,6 +204,9 @@ fn every_failed_end_counts_on_exactly_one_listed_reason() {
         ResetCause::BadBinding,
         ResetCause::TimestampSkew,
         ResetCause::RequestUnreadable,
+        ResetCause::RateLimited(RejectLayer::PerPeer),
+        ResetCause::RateLimited(RejectLayer::PerIp),
+        ResetCause::RateLimited(RejectLayer::Global),
     ];
     let ends = refusals
         .into_iter()

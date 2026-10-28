@@ -5,4 +5,5 @@ pub mod client;
 pub mod dht;
 pub mod probe;
 pub mod probe_rate_limit;
+pub mod serve_rate_limit;
 pub mod timestamp_skew;

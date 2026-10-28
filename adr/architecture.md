@@ -188,6 +188,7 @@ Two things shape how a defense reads in its home ADR. First: most defenses are *
 | Pool oversubscription | Contract pays `min(desired, capRoom, remaining)`; refundable floor `M` (protocol) | [ADR 003 § Pool oversubscription](003-payments.md#pool-oversubscription-one-deposit-backs-many-nodes) |
 | Owner reclaims before a node redeems | Grace window + periodic redeem sweep capped well inside it (protocol + node policy) | [ADR 003 § Owner reclaims before a node redeems](003-payments.md#owner-reclaims-before-a-node-redeems) |
 | Probe fishing / resource exhaustion | Layered per-peer + per-IP + global token bucket (node policy) | [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting) |
+| Unpaid request flood (signatures, origin `HEAD`s, chain reads) | Layered per-peer + per-IP + global token bucket before the request is read; a node-wide cap on admission chain reads (node policy) | [ADR 005 § Request rate limiting](005-protocol.md#request-rate-limiting) |
 
 **Malicious serving node** — wants payment without honest service, or to cheat pricing, region, or takedown.
 
@@ -206,7 +207,7 @@ Two things shape how a defense reads in its home ADR. First: most defenses are *
 | Attack | Bounded by | Home |
 |---|---|---|
 | Eclipse | Multi-source bootstrap (on-chain registry + DNS seeds) | [ADR 012 § Bootstrap Procedure](012-client.md#bootstrap-procedure) |
-| DHT poisoning / flooding | Per-record signature + DHT rate limiting (protocol + node policy) | [ADR 022 § DHT Rate Limiting](022-content-discovery.md#dht-rate-limiting) |
+| DHT poisoning / flooding | Per-record signature + DHT rate limiting + a routing table of bonded peers only (protocol + node policy) | [ADR 022 § DHT Rate Limiting](022-content-discovery.md#dht-rate-limiting), [§ Routing Table](022-content-discovery.md#routing-table) |
 | Voucher replay | Cumulative watermark pays `0` on a re-submitted voucher (protocol) | [ADR 003 § Replay attack on vouchers](003-payments.md#replay-attack-on-vouchers) |
 
 **Sybil / economic adversary** — wants cheap identities to dominate selection, pricing, or voting weight.

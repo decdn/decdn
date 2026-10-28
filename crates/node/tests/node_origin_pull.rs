@@ -835,7 +835,8 @@ struct FixtureDiscovery {
     directory: HashMap<U256, Vec<DhtNodeId>>,
     /// DHT servers to seed the routing table with, as `(id, socket)`. The
     /// builder primes the endpoint's address cache for each one, so the lookup
-    /// can dial it by id.
+    /// can dial it by id, and adds each to the active stakers: the lookup
+    /// seeds only from bonded routing peers.
     dht_peers: Vec<(iroh::PublicKey, std::net::SocketAddr)>,
     /// `NodeOriginConfig::probe_fanout`: how many peers one probe round may probe.
     probe_fanout: usize,
@@ -873,7 +874,7 @@ async fn build_origin_with_discovery(
     probe_cache: PositiveProbeCache,
 ) -> (NodeOrigin, CacheEngine, tempfile::TempDir) {
     let FixtureDiscovery {
-        stakers,
+        mut stakers,
         directory,
         dht_peers,
         probe_fanout,
@@ -881,6 +882,7 @@ async fn build_origin_with_discovery(
     let mut routing = RoutingTable::new(b_dht);
     for (peer_id, peer_addr) in dht_peers {
         let peer = DhtNodeId::from_bytes(*peer_id.as_bytes());
+        stakers.insert(peer);
         decdn_node::dht::client::find_node(
             &support::dht_conns(ep_b),
             EndpointAddr::new(peer_id).with_ip_addr(peer_addr),

@@ -164,10 +164,12 @@ async fn spin_up_server(staked: HashSet<[u8; 32]>) -> anyhow::Result<TestServer>
 
 #[tokio::test(flavor = "multi_thread")]
 async fn client_find_node_roundtrip_via_dht_client_module() -> anyhow::Result<()> {
-    // Server with an empty routing table; client uses the new
+    // Server with an empty routing table and the client staked, so the
+    // server admits the client into its table; client uses the new
     // `dht::client::find_node` primitive.
-    let server = spin_up_server(HashSet::new()).await?;
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_sk = fresh_key();
+    let server = spin_up_server(HashSet::from([*client_sk.public().as_bytes()])).await?;
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
     let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
     let target_id = NodeId::from_bytes([0xABu8; 32]);
     let resp = client::find_node(
@@ -201,6 +203,42 @@ async fn client_find_node_roundtrip_via_dht_client_module() -> anyhow::Result<()
     Ok(())
 }
 
+/// #2708: the routing pool holds bonded operators only. An unbonded peer that
+/// contacts the server does not enter its table, and a `FindNode` answer names
+/// no entry that has unbonded since it entered.
+#[tokio::test(flavor = "multi_thread")]
+async fn find_node_neither_learns_nor_names_an_unbonded_peer() -> anyhow::Result<()> {
+    let bonded = NodeId::from_bytes([0xB0u8; 32]);
+    let unbonded_since = NodeId::from_bytes([0xB1u8; 32]);
+    let server = spin_up_server(HashSet::from([*bonded.as_bytes()])).await?;
+    {
+        let mut t = server.routing.lock().unwrap();
+        t.insert(bonded);
+        t.insert(unbonded_since);
+    }
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_id = NodeId::from_bytes(*client_ep.id().as_bytes());
+
+    let resp = client::find_node(
+        &dht_conns(&client_ep),
+        EndpointAddr::new(server.id).with_ip_addr(server.addr),
+        NodeId::from_bytes([0xABu8; 32]),
+        client_id,
+    )
+    .await?;
+
+    assert_eq!(resp.closer_nodes.as_slice(), [bonded]);
+    assert!(
+        !server.routing.lock().unwrap().contains(&client_id),
+        "an unbonded peer that contacts the server stays out of its table"
+    );
+
+    client_ep.close().await;
+    server.endpoint.close().await;
+    server.accept_task.abort();
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bootstrap_seeds_routing_and_runs_self_lookup() -> anyhow::Result<()> {
     // Server S accepts DHT connections. Client C bootstraps with S as
@@ -209,10 +247,10 @@ async fn bootstrap_seeds_routing_and_runs_self_lookup() -> anyhow::Result<()> {
     // After bootstrap:
     // - C's routing table contains S (step 1 — seed insert).
     // - S's routing table contains C (step 2 — C's FindNode against S
-    //   refreshes C's authenticated NodeId server-side).
-    let server = spin_up_server(HashSet::new()).await?;
+    //   refreshes C's authenticated NodeId server-side; C is staked at S).
     let client_sk = fresh_key();
     let client_id = client_sk.public();
+    let server = spin_up_server(HashSet::from([*client_id.as_bytes()])).await?;
     let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
 
     // Seed: only the server's NodeId.
@@ -261,6 +299,57 @@ async fn bootstrap_seeds_routing_and_runs_self_lookup() -> anyhow::Result<()> {
     {
         let t = server.routing.lock().unwrap();
         assert!(t.contains(&NodeId::from_bytes(*client_id.as_bytes())));
+    }
+
+    client_ep.close().await;
+    server.endpoint.close().await;
+    server.accept_task.abort();
+    Ok(())
+}
+
+/// #2708: bootstrap adds only the bonded ids a responder names. The seed names
+/// a peer it holds as bonded, which this client's staker set does not hold, so
+/// the client's table gets the seed and not the named peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn bootstrap_refuses_an_unbonded_id_a_responder_names() -> anyhow::Result<()> {
+    let named = NodeId::from_bytes([0xC3u8; 32]);
+    let server = spin_up_server(HashSet::from([*named.as_bytes()])).await?;
+    server.routing.lock().unwrap().insert(named);
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let staker_set: Arc<dyn StakerSet> =
+        Arc::new(ConfigStakerSet::new(HashSet::from([NodeId::from_bytes(
+            *server.id.as_bytes(),
+        )])));
+    let client_routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
+    // Loopback tests disable discovery; one `FindNode` resolves the path, and
+    // shows the seed does name the peer.
+    let resp = client::find_node(
+        &dht_conns(&client_ep),
+        EndpointAddr::new(server.id).with_ip_addr(server.addr),
+        NodeId::from_bytes(*server.id.as_bytes()),
+        NodeId::from_bytes(*client_id.as_bytes()),
+    )
+    .await?;
+    assert_eq!(resp.closer_nodes.as_slice(), [named]);
+
+    let outcome = bootstrap::bootstrap(
+        &dht_conns(&client_ep),
+        client_id,
+        &client_routing,
+        &staker_set,
+    )
+    .await;
+
+    assert!(outcome.find_node_ok >= 1, "the seed answered");
+    assert_eq!(outcome.closer_peers_inserted, 0);
+    {
+        let t = client_routing.lock().unwrap();
+        assert!(t.contains(&NodeId::from_bytes(*server.id.as_bytes())));
+        assert!(!t.contains(&named), "an unbonded named id stays out");
     }
 
     client_ep.close().await;
@@ -369,6 +458,9 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
         dht_conns(&publisher_ep),
         publisher_id,
         Arc::clone(&routing),
+        Arc::new(ConfigStakerSet::new(HashSet::from([NodeId::from_bytes(
+            *server.id.as_bytes(),
+        )]))),
         Arc::clone(&scheduler),
         cache,
         true,
@@ -488,6 +580,7 @@ async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow:
         Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
             *publisher_id.as_bytes(),
         )))),
+        Arc::new(ConfigStakerSet::empty()),
         Arc::clone(&scheduler),
         cache,
         true,
@@ -603,6 +696,7 @@ async fn sweep_scheduled_count(relay_foreign_namespaces: bool) -> anyhow::Result
         Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
             *publisher_id.as_bytes(),
         )))),
+        Arc::new(ConfigStakerSet::empty()),
         Arc::clone(&scheduler),
         cache,
         relay_foreign_namespaces,
@@ -860,6 +954,9 @@ impl Publisher {
             dht_conns(&ep),
             id,
             routing,
+            Arc::new(ConfigStakerSet::new(HashSet::from([NodeId::from_bytes(
+                *server.id.as_bytes(),
+            )]))),
             Arc::clone(&scheduler),
             cache.clone(),
             true,

@@ -7803,3 +7803,66 @@ fn resolve_config_returns_the_notices_its_resolvers_recorded() -> anyhow::Result
     );
     Ok(())
 }
+
+// ---- `[serve.rate_limit]` resolver (ADR 005 §Request rate limiting).
+// Mirrors the `[probe.rate_limit]` resolver tests; the regression guards are
+// the ADR 005 request defaults and the `serve.*` field keys. ----
+
+fn serve_rl_with(mutate: impl FnOnce(&mut types::ServeRateLimitConfig)) -> types::ServeConfig {
+    let mut r = types::ServeRateLimitConfig::default();
+    mutate(&mut r);
+    types::ServeConfig {
+        rate_limit: Some(r),
+    }
+}
+
+#[test]
+fn resolve_serve_absent_yields_adr005_defaults() {
+    let resolved = resolve_serve(None).expect("absent section is valid");
+    assert!((resolved.per_peer_rate_per_sec - 100.0).abs() < f64::EPSILON);
+    assert_eq!(resolved.per_peer_burst, 400);
+    assert!((resolved.per_ip_rate_per_sec - 200.0).abs() < f64::EPSILON);
+    assert_eq!(resolved.per_ip_burst, 800);
+    assert!((resolved.global_rate_per_sec - 2000.0).abs() < f64::EPSILON);
+    assert_eq!(resolved.global_burst, 5000);
+    assert_eq!(resolved.max_tracked_per_ip, 4096);
+    assert_eq!(resolved.max_tracked_per_peer, 4096);
+}
+
+/// `ResolvedServe::default()` is the copy the fixtures use; it must match the
+/// resolver's defaults.
+#[test]
+fn resolved_serve_default_matches_resolver() {
+    let resolved = resolve_serve(None).expect("absent section is valid");
+    let hand = ResolvedServe::default();
+    assert!((resolved.per_peer_rate_per_sec - hand.per_peer_rate_per_sec).abs() < f64::EPSILON);
+    assert_eq!(resolved.per_peer_burst, hand.per_peer_burst);
+    assert!((resolved.per_ip_rate_per_sec - hand.per_ip_rate_per_sec).abs() < f64::EPSILON);
+    assert_eq!(resolved.per_ip_burst, hand.per_ip_burst);
+    assert!((resolved.global_rate_per_sec - hand.global_rate_per_sec).abs() < f64::EPSILON);
+    assert_eq!(resolved.global_burst, hand.global_burst);
+    assert_eq!(resolved.max_tracked_per_ip, hand.max_tracked_per_ip);
+    assert_eq!(resolved.max_tracked_per_peer, hand.max_tracked_per_peer);
+}
+
+#[test]
+fn resolve_serve_file_override_applies() {
+    let p = serve_rl_with(|r| {
+        r.per_peer_rate_per_sec = Some(7.0);
+        r.per_peer_burst = Some(9);
+    });
+    let resolved = resolve_serve(Some(&p)).expect("valid override");
+    assert!((resolved.per_peer_rate_per_sec - 7.0).abs() < f64::EPSILON);
+    assert_eq!(resolved.per_peer_burst, 9);
+    assert_eq!(resolved.per_ip_burst, 800);
+}
+
+#[test]
+fn resolve_serve_rate_positive_with_zero_burst_rejects() {
+    let p = serve_rl_with(|r| {
+        r.global_rate_per_sec = Some(5.0);
+        r.global_burst = Some(0);
+    });
+    let err = resolve_serve(Some(&p)).expect_err("rate>0+burst=0 must reject");
+    assert!(format!("{err:#}").contains("serve.rate_limit.global_burst"));
+}

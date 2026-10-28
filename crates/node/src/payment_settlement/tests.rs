@@ -1168,6 +1168,126 @@ async fn admit_getpool_coalesces_concurrent_reads() {
     );
 }
 
+/// #2706: admit-path chain reads across distinct pools hold at most
+/// `ADMIT_CHAIN_READ_CONCURRENCY` slots, so a flood of fresh pool ids cannot send
+/// one `getPool` each at once. While the first reads hang, the rest wait for a
+/// slot and send nothing.
+#[tokio::test(start_paused = true)]
+async fn admit_chain_reads_across_pools_are_capped() {
+    use crate::pool_view::PoolView;
+    use std::sync::atomic::Ordering;
+
+    let (view, calls) = counting_hanging_view();
+    let flood = futures_util::future::join_all((0..ADMIT_CHAIN_READ_CONCURRENCY * 3).map(|i| {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        view.status(B256::from(id))
+    }));
+    tokio::pin!(flood);
+    tokio::select! {
+        _ = &mut flood => panic!("hung reads cannot answer inside one second"),
+        () = tokio::time::sleep(Duration::from_secs(1)) => {}
+    }
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        ADMIT_CHAIN_READ_CONCURRENCY,
+        "only the reads that hold a slot reach the provider"
+    );
+}
+
+/// A request that finds every admit-read slot taken waits
+/// `ADMIT_CHAIN_READ_SLOT_WAIT`, then is refused without a read. The refusal
+/// says the node is busy, not that the pool faulted, so it is not
+/// negative-cached and the pool's next request reads again.
+#[tokio::test(start_paused = true)]
+async fn a_read_that_finds_no_slot_is_refused_uncached() {
+    use crate::pool_view::PoolView;
+    use std::sync::atomic::Ordering;
+
+    let (view, calls) = counting_hanging_view();
+    let holders = futures_util::future::join_all((0..ADMIT_CHAIN_READ_CONCURRENCY).map(|i| {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        view.status(B256::from(id))
+    }));
+    tokio::pin!(holders);
+    let late = B256::repeat_byte(0xEE);
+    let started = tokio::time::Instant::now();
+    // `biased`: the holders take every slot before the late request asks.
+    let answer = tokio::select! {
+        biased;
+        _ = &mut holders => panic!("hung reads cannot answer before the slot wait ends"),
+        answer = view.status(late) => answer,
+    };
+
+    assert!(answer.is_none(), "a request with no free slot is refused");
+    assert_eq!(started.elapsed(), ADMIT_CHAIN_READ_SLOT_WAIT);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        ADMIT_CHAIN_READ_CONCURRENCY,
+        "the refused request sent no read"
+    );
+    assert!(
+        !view
+            .negative
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&late),
+        "a busy refusal is not cached as a pool fault"
+    );
+}
+
+/// #2706: `getAuthorization` reads share the admit-read slots with `getPool`.
+/// With every slot held, a signer confirm waits `ADMIT_CHAIN_READ_SLOT_WAIT`,
+/// sends no read, caches nothing for the signer, and counts on the slot-timeout
+/// counter.
+#[tokio::test(start_paused = true)]
+async fn a_signer_confirm_that_finds_no_slot_is_refused_uncached() {
+    use crate::pool_view::PoolView;
+    use std::sync::atomic::Ordering;
+
+    let (view, calls) = counting_hanging_view();
+    let holders = futures_util::future::join_all((0..ADMIT_CHAIN_READ_CONCURRENCY).map(|i| {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        view.status(B256::from(id))
+    }));
+    tokio::pin!(holders);
+    let pool_id = B256::repeat_byte(0xEF);
+    let signer = Address::from([0xEF; 20]);
+    let started = tokio::time::Instant::now();
+    // `biased`: the holders take every slot before the signer confirm asks.
+    let answer = tokio::select! {
+        biased;
+        _ = &mut holders => panic!("hung reads cannot answer before the slot wait ends"),
+        answer = view.signer_authorization(pool_id, signer) => answer,
+    };
+
+    assert!(
+        answer.is_none(),
+        "a signer confirm with no free slot is refused"
+    );
+    assert_eq!(started.elapsed(), ADMIT_CHAIN_READ_SLOT_WAIT);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        ADMIT_CHAIN_READ_CONCURRENCY,
+        "the refused confirm sent no read"
+    );
+    assert!(
+        !view
+            .auth_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&(pool_id, signer)),
+        "a busy refusal caches nothing for the signer"
+    );
+    let text = view.metrics.encode().unwrap_or_default();
+    assert!(
+        text.contains("decdn_serve_admit_read_slot_timeouts_total 1"),
+        "the busy refusal is counted:\n{text}"
+    );
+}
+
 /// With the negative cache full of in-window entries, the read's fault is
 /// not cached; its waiters still take the read's answer instead of each
 /// starting a read of its own in turn.
@@ -1447,6 +1567,45 @@ async fn a_registered_read_adds_the_spent_folded_since() {
     );
 }
 
+/// #2711: on a pool seeded from one `getPool`, the projection counts only what
+/// the signer redeems after the seed. The mid-stream read adds the spend the
+/// admit-path `getAuthorization` saw, so a signer that spent most of its cap
+/// before a restart shows its whole spend once other nodes drain the rest.
+#[tokio::test]
+async fn the_midstream_read_counts_a_resolved_pools_pre_seed_spend() {
+    use crate::pool_view::PoolView;
+
+    let pool_id = B256::repeat_byte(0x48);
+    let signer = Address::from([6u8; 20]);
+    let (view, _asserter) = mocked_getauth_view(&[authz(1_000, 900)]);
+    view.projection
+        .record_resolved(Address::from([1u8; 20]), seed(pool_id, 5_000, 900));
+    assert_eq!(
+        view.signer_spent_cached(pool_id, signer).await,
+        Some(0),
+        "with no read held, the seeded projection alone answers"
+    );
+    assert_eq!(
+        view.signer_authorization(pool_id, signer).await,
+        Some(registered(1_000, 900))
+    );
+    view.projection.record_redeemed(
+        pool_id,
+        Address::from([9u8; 20]),
+        &[PaymentPool::LaneSettled {
+            signer,
+            newPaidCumulative: 100,
+            bytesPaid: 0,
+        }],
+        None,
+    );
+    assert_eq!(
+        view.signer_spent_cached(pool_id, signer).await,
+        Some(1_000),
+        "the pre-seed spend plus the drain since the read"
+    );
+}
+
 /// A fault after a cached `Unregistered` read has aged past the TTL refuses
 /// the signer: a registration may have landed since, with its cap spent.
 #[tokio::test]
@@ -1699,6 +1858,22 @@ fn partition_keeps_redeemable_and_counts_skips() {
     assert!(kept_pools.contains(&s1.pool_id));
     assert!(kept_pools.contains(&s3.pool_id));
     assert_eq!(kept.len(), 2);
+}
+
+/// A projection that holds pools `[1; 32]` to `[4; 32]` open and funded, so a
+/// redemption cycle submits their lanes without a pre-redeem `getPool`. A lane
+/// on any other pool makes the cycle read that pool first, which a test's mock
+/// queue must answer.
+fn open_pools() -> PoolProjection {
+    let projection = PoolProjection::new();
+    for pool in 1..=4u8 {
+        projection.record_opened(
+            PoolId::from([pool; 32]),
+            Address::from([1u8; 20]),
+            U256::MAX,
+        );
+    }
+    projection
 }
 
 /// Build a [`PlannedLane`] for a given pool/signer, with an optional
@@ -2333,6 +2508,7 @@ async fn a_sub_floor_plan_set_reads_nothing_from_the_chain() -> Result<()> {
         300,
         true,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -2383,6 +2559,7 @@ async fn a_set_that_clears_the_floor_in_total_reads_every_lane() -> Result<()> {
         2,
         true,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -2423,6 +2600,7 @@ async fn a_zero_floor_still_reads_every_lane() -> Result<()> {
         300,
         false,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -2463,7 +2641,7 @@ fn shutdown_service<P: Provider + Clone + 'static>(
         redeem_threshold,
         redeem_max_vouchers_per_tx: 300,
         metrics,
-        pool_view: PoolProjection::new(),
+        pool_view: open_pools(),
         recorder: test_recorder(),
         backfills: LedgerBackfills::new(test_recorder()),
         schedule: RedeemSchedule::default(),
@@ -2847,7 +3025,7 @@ fn spawn_redeemer<P: Provider + Clone + 'static>(
         margin,
         rx,
         metrics,
-        PoolProjection::new(),
+        open_pools(),
         test_recorder(),
         RedeemSchedule::default(),
     ));
@@ -3358,6 +3536,7 @@ async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Resul
         300,
         true,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -3369,6 +3548,189 @@ async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Resul
         &[
             "decdn_redemption_reconcile_ok_total 1",
             "decdn_onchain_tx_send_failed_total 0",
+        ],
+    )
+}
+
+/// #2692: after a restart the projection does not hold a pool opened before it.
+/// The cycle reads that pool before it submits, and a pool closing past its
+/// deadline keeps its lanes out of the `redeemMany`, which would revert
+/// `PoolClosed`. The read seeds the projection, so the next cycle drops the
+/// lanes without reading the pool again.
+#[tokio::test]
+async fn a_lane_on_an_unknown_pool_past_its_close_deadline_is_not_submitted() -> Result<()> {
+    use alloy::sol_types::SolValue;
+
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    let projection = PoolProjection::new();
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&Bytes::from(
+        pool(Address::from([7u8; 20]), PaymentPool::Status::Closing, 1).abi_encode(),
+    ));
+
+    for _ in 0..2 {
+        let faulted = redeem_planned_lanes(
+            &contract,
+            &store,
+            vec![planned(1, 0, 1_000, false)],
+            SELLER,
+            U256::from(1u64),
+            300,
+            true,
+            &metrics,
+            &projection,
+            &test_recorder(),
+        )
+        .await;
+        anyhow::ensure!(!faulted, "a dropped lane is not a chain fault");
+    }
+
+    assert_eq!(asserter.read_q().len(), 0, "the pool was read once");
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_redemption_skipped_insolvent_total 2",
+            "decdn_redemption_reconcile_ok_total 0",
+            "decdn_redemption_reconcile_failures_total 0",
+            "decdn_onchain_tx_send_failed_total 0",
+        ],
+    )
+}
+
+/// #2692: a pool the cycle cannot read keeps its lanes out of the
+/// `redeemMany` and reports a chain fault, so a parked lane stays parked.
+#[tokio::test]
+async fn a_failed_pre_redeem_pool_read_holds_the_lane() -> Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(decdn_incentive::MemoryPoolStateStore::new());
+    // Nothing queued: the `getPool` fails.
+    let (contract, _asserter) = mocked_contract();
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 1_000, false)],
+        SELLER,
+        U256::from(1u64),
+        300,
+        true,
+        &metrics,
+        &PoolProjection::new(),
+        &test_recorder(),
+    )
+    .await;
+
+    anyhow::ensure!(faulted, "a failed pool read is a chain fault");
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_redemption_skipped_pool_unresolved_total 1",
+            "decdn_redemption_skipped_insolvent_total 0",
+            "decdn_redemption_reconcile_ok_total 0",
+            "decdn_onchain_tx_send_failed_total 0",
+        ],
+    )
+}
+
+/// #2692: a lane on an unknown pool that the read shows open and funded is
+/// seeded into the projection and goes on to the submit path. The flush fails
+/// on purpose, so the cycle stops after the watermark reconcile.
+#[tokio::test]
+async fn a_lane_on_an_unknown_open_pool_is_seeded_and_kept() -> Result<()> {
+    use alloy::sol_types::{SolCall, SolValue};
+
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(FailingFlushStore(
+        decdn_incentive::MemoryPoolStateStore::new(),
+    ));
+    let projection = PoolProjection::new();
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&Bytes::from(
+        pool(Address::from([7u8; 20]), PaymentPool::Status::Open, 0).abi_encode(),
+    ));
+    asserter.push_success(&Bytes::from(
+        PaymentPool::getWatermarksCall::abi_encode_returns(&vec![lane(0)]),
+    ));
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 500, false)],
+        SELLER,
+        U256::from(1u64),
+        300,
+        true,
+        &metrics,
+        &projection,
+        &test_recorder(),
+    )
+    .await;
+
+    anyhow::ensure!(!faulted, "a failed flush is not a chain fault");
+    anyhow::ensure!(
+        projection.snapshot(PoolId::from([1u8; 32])).is_some(),
+        "the read seeds the pool"
+    );
+    assert_eq!(
+        asserter.read_q().len(),
+        0,
+        "the pool and watermark were read"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_redemption_skipped_pool_unresolved_total 0",
+            "decdn_redemption_skipped_insolvent_total 0",
+            "decdn_redemption_reconcile_ok_total 1",
+        ],
+    )
+}
+
+/// #2692: a pool whose read faults keeps only its own lanes out. A lane on a
+/// pool the projection already holds still reaches the submit path in the same
+/// cycle.
+#[tokio::test]
+async fn a_faulted_pool_read_leaves_known_pools_to_redeem() -> Result<()> {
+    use alloy::sol_types::SolCall;
+
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(FailingFlushStore(
+        decdn_incentive::MemoryPoolStateStore::new(),
+    ));
+    let projection = PoolProjection::new();
+    projection.record_opened(PoolId::from([1u8; 32]), Address::from([1u8; 20]), U256::MAX);
+    let (contract, asserter) = mocked_contract();
+    asserter.push_failure_msg("getPool refused");
+    asserter.push_success(&Bytes::from(
+        PaymentPool::getWatermarksCall::abi_encode_returns(&vec![lane(0)]),
+    ));
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 500, false), planned(9, 0, 500, false)],
+        SELLER,
+        U256::from(1u64),
+        300,
+        true,
+        &metrics,
+        &projection,
+        &test_recorder(),
+    )
+    .await;
+
+    anyhow::ensure!(faulted, "the failed read is a chain fault");
+    assert_eq!(
+        asserter.read_q().len(),
+        0,
+        "the known pool's watermark was read"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_redemption_skipped_pool_unresolved_total 1",
+            "decdn_redemption_reconcile_ok_total 1",
         ],
     )
 }
@@ -3424,6 +3786,7 @@ async fn a_redeem_send_with_no_answer_is_possibly_broadcast() -> Result<()> {
         300,
         false,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -3482,6 +3845,7 @@ async fn redeem_after_failed_sends(
         300,
         false,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -3639,6 +4003,7 @@ async fn a_redeem_whose_gas_fill_fails_is_refused() -> Result<()> {
         300,
         false,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -3675,6 +4040,7 @@ async fn a_failed_read_stays_a_chain_fault_past_a_failed_strict_flush() -> Resul
         300,
         true,
         &metrics,
+        &open_pools(),
         &test_recorder(),
     )
     .await;
@@ -4511,6 +4877,7 @@ mod settlement_ledger_rows {
             300,
             false,
             &metrics,
+            &open_pools(),
             &recorder,
         )
         .await;

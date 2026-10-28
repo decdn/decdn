@@ -1007,6 +1007,10 @@ pub struct ClientHandlerDeps {
     /// gate and the ADR 011 funder gate. `None` (tests) disables both gates —
     /// they fail open, exactly as before E4 wired the view.
     pub pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
+    /// Per-request rate limiter (`[serve.rate_limit]`, ADR 005 §Request rate
+    /// limiting), checked once per stream before its request is read. `None`
+    /// (tests) admits every stream the stream cap admits.
+    pub request_limiter: Option<Arc<crate::handlers::serve_rate_limit::ServeRateLimiter>>,
     /// Refundable minimum-remaining-deposit floor `M` (token base units). The
     /// seller refuses to serve a lane's pool once its on-chain remaining
     /// (`getPool.deposit − getPool.totalRedeemed`) minus this floor can no
@@ -1169,6 +1173,7 @@ impl ClientHandlerDeps {
             pool_state_store,
             receipt_sink,
             pool_view: None,
+            request_limiter: None,
             pool_min_remaining_deposit,
             rate_per_mb,
             max_concurrent_streams,
@@ -1340,6 +1345,8 @@ pub struct ClientHandler {
     /// Cached `getPool` view for the floor-`M` and ADR 011 funder gates. `None`
     /// (tests) makes both gates fail open.
     pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
+    /// See [`ClientHandlerDeps::request_limiter`].
+    request_limiter: Option<Arc<crate::handlers::serve_rate_limit::ServeRateLimiter>>,
     /// Liveness of the node's chain reads (ADR 011 § Serving while chain-stale).
     /// `Some` only when the blacklist watcher is wired; the admit path refuses
     /// once it reads stale. `None` (tests) disables the gate.
@@ -1574,6 +1581,7 @@ impl ClientHandler {
             pool_min_remaining_deposit: deps.pool_min_remaining_deposit,
             receipt_sink: deps.receipt_sink,
             pool_view: deps.pool_view,
+            request_limiter: deps.request_limiter,
             chain_freshness: deps.chain_freshness,
             lanes: Arc::new(map),
             lane_count,
@@ -1675,8 +1683,8 @@ impl ClientHandler {
     }
 
     /// The signer's total on-chain `spent` across every provider in `pool_id`, read
-    /// from the event-fed projection ONLY (never a `getAuthorization`), for the
-    /// mid-stream signer cap-headroom re-check. `None` when no pool-view is wired
+    /// from what the pool view already holds (never a fresh `getAuthorization`),
+    /// for the mid-stream signer cap-headroom re-check. `None` when no pool-view is wired
     /// (dev/test, no chain) or the view holds no projection — the re-check then skips
     /// and delivery continues, matching how [`Self::pool_view_status_cached`] fails
     /// open. See [`crate::pool_view::PoolView::signer_spent_cached`].
@@ -1695,16 +1703,24 @@ impl ClientHandler {
     /// — the node would eat the delivered bytes, unbounded for a large blob.
     ///
     /// `held_cap` is the `cap` the node already holds on the lane (the admit-time
-    /// capability), and `spent` is read from the event-fed projection. The floor is
-    /// one ramp-start credit window, the SAME quantity the admit-time gate confirms
-    /// (`ClientHandler::serve_stream`), so the mid-stream threshold matches admission.
+    /// capability). `spent` is the admit-time `getAuthorization` read (#1958) plus
+    /// what the projection has folded for the signer since, the same number the
+    /// admit-time gate reads; with no registered read held it is the projection's
+    /// fold alone. The floor is one ramp-start credit window, the SAME quantity the
+    /// admit-time gate confirms (`ClientHandler::serve_stream`), so the mid-stream
+    /// threshold matches admission.
     ///
-    /// Fails toward SERVING: `signer_spent_cached` returning `None` (no projection)
-    /// skips the stop, and a projection that has not yet folded the signer's
-    /// pre-admission spend only UNDER-counts `spent`, over-stating headroom. That is
-    /// acceptable — the admit-time `getAuthorization` (#1958) already caught an
-    /// already-exhausted signer authoritatively, so this only catches drain SINCE
-    /// admit, and the on-chain `redeemMany` `min(desired, cap − spent)` is the
+    /// Error bounds: on a pool seeded from one `getPool`, a lane's first fold
+    /// after the read counts its whole cumulative, including what the read's
+    /// `spent` already holds, so `spent` can run high by up to the read's `spent`
+    /// (about twice the true spend at worst). That stops a stream early, possibly
+    /// well short of the cap, and never over-delivers; admission reads the same
+    /// number, so it refuses the signer's next stream the same way. With no
+    /// projection wired, `signer_spent_cached` returns `None` and the stop is
+    /// skipped; with no registered read held (evicted from the bounded cache, or
+    /// the signer was unregistered at admit) the fold alone can run low by the
+    /// signer's spend before the pool was seeded, on lanes that have not redeemed
+    /// since. The on-chain `redeemMany` `min(desired, cap − spent)` is the
     /// backstop; this re-check only BOUNDS over-delivery, it is not a correctness
     /// gate. The caller ends the stream as `Stopped { SignerCapExhausted }`, which
     /// the dispatch sink counts on the mid-stream metric.
@@ -1913,6 +1929,19 @@ impl ClientHandler {
         }
     }
 
+    /// Log a request that carries no verified binding, throttled: it names no
+    /// lane, so it can never be served.
+    pub(super) fn warn_unbound_request(&self, peer: &PublicKey) {
+        if let Some(suppressed) = self.unbound_request_warn.admit() {
+            tracing::warn!(
+                %peer,
+                suppressed,
+                interval = ?self.unbound_request_warn.interval(),
+                "stream request with no verified binding; refusing pre-serve"
+            );
+        }
+    }
+
     /// Register a lane so the voucher path accepts vouchers for it — its
     /// capability handle is registered on-chain and its [`LaneState`] recorded
     /// in the lane store, then inserted into the live map. Called from the
@@ -1933,18 +1962,24 @@ impl ClientHandler {
         if self.lanes.contains_key(&key) {
             return Ok(());
         }
+        // Only the stream that wins the vacant slot records the fresh lane, and
+        // it records while it holds the entry guard. A racing first stream
+        // finds the slot occupied and records nothing, so it cannot overwrite a
+        // voucher the winner's lane has already recorded with this zero state.
+        // The gauge moves on a real insertion only, so racing first streams
+        // count the lane once.
+        //
         // #1789 item 4: call the store's `record` inline. `register_lane` sits
         // ON the per-stream open path (the first capability of every stream
         // reaches it), so it cannot afford a `spawn_blocking` hop — and does
         // not need one: `PoolStateStore::record` is contractually non-blocking,
         // a buffered insert into the store's in-memory working set, with the
-        // periodic lane flush doing the disk work.
-        self.pool_state_store.record(&state)?;
-
-        // Only a REAL insertion (a vacant slot) tunes the lane gauge — the
-        // entry guard is atomic, so racing first-streams on one lane still
-        // count it once.
+        // periodic lane flush doing the disk work. It never touches `lanes`, so
+        // calling it under the entry guard cannot invert a lock order.
         if let dashmap::mapref::entry::Entry::Vacant(entry) = self.lanes.entry(key) {
+            // A failed record leaves the slot vacant: the live map never holds
+            // a lane the store did not accept.
+            self.pool_state_store.record(&state)?;
             entry.insert(Arc::new(Mutex::new(LaneDeliveryState::hydrated(state))));
             self.tune_lane_gauge(1);
         }

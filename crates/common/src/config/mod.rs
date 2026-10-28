@@ -23,7 +23,7 @@ pub use resolved::{
     LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent,
     ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedLoadShed,
     ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedProbe,
-    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity, ResolvedServe,
     ResolvedServeEconomics, ResolvedTinyLfu,
 };
 pub use types::FileConfig;
@@ -249,6 +249,25 @@ const DEFAULT_PROBE_MAX_TRACKED_PER_IP: usize = 4096;
 /// Default hard cap on tracked per-peer (`NodeId`) entries in the probe
 /// keyed limiter (#645).
 const DEFAULT_PROBE_MAX_TRACKED_PER_PEER: usize = 4096;
+/// Default sustained per-peer (`NodeId`) rate for inbound `cdn/client/v1`
+/// requests (ADR 005 §Request rate limiting). One request is one stream, and
+/// a pull opens one per leg.
+const DEFAULT_SERVE_PER_PEER_RATE_PER_SEC: f64 = 100.0;
+/// Default per-peer burst capacity for `cdn/client/v1`. ADR 005 default: 400.
+const DEFAULT_SERVE_PER_PEER_BURST: u32 = 400;
+/// Default sustained per-IP rate for `cdn/client/v1`. ADR 005 default: 200.
+const DEFAULT_SERVE_PER_IP_RATE_PER_SEC: f64 = 200.0;
+/// Default per-IP burst capacity for `cdn/client/v1`. ADR 005 default: 800.
+const DEFAULT_SERVE_PER_IP_BURST: u32 = 800;
+/// Default sustained global rate for `cdn/client/v1`. ADR 005 default: 2000.
+const DEFAULT_SERVE_GLOBAL_RATE_PER_SEC: f64 = 2000.0;
+/// Default global burst capacity for `cdn/client/v1`. ADR 005 default: 5000.
+const DEFAULT_SERVE_GLOBAL_BURST: u32 = 5000;
+/// Default hard cap on tracked per-IP entries in the serve keyed limiter.
+const DEFAULT_SERVE_MAX_TRACKED_PER_IP: usize = 4096;
+/// Default hard cap on tracked per-peer (`NodeId`) entries in the serve keyed
+/// limiter.
+const DEFAULT_SERVE_MAX_TRACKED_PER_PEER: usize = 4096;
 /// Default interval between iroh-blobs GC sweeps in seconds (#518). Five
 /// minutes balances the hostile-origin amplification window against the
 /// per-sweep cost of walking the blob list. The window matters because
@@ -584,6 +603,7 @@ pub fn resolve_config(
     let load_shed = resolve_load_shed_into(file.load_shed.as_ref(), &mut bag);
     let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
     let probe = resolve_probe_into(file.probe.as_ref(), &mut bag);
+    let serve = resolve_serve_into(file.serve.as_ref(), &mut bag);
     let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
     let content = resolve_content_into(file.content.as_ref(), &mut bag);
 
@@ -608,6 +628,7 @@ pub fn resolve_config(
             load_shed,
             dht,
             probe,
+            serve,
             receipts,
             content,
         },
@@ -3406,6 +3427,109 @@ pub fn resolve_probe_into(
 #[cfg(test)]
 pub fn resolve_probe(file: Option<&types::ProbeConfig>) -> anyhow::Result<ResolvedProbe> {
     one_section(|bag| resolve_probe_into(file, bag))
+}
+
+/// Resolve the `[serve.rate_limit]` section into [`ResolvedServe`], applying
+/// the ADR 005 §Request rate limiting defaults and the same validation the DHT
+/// layer uses: each `*_rate_per_sec` finite and `>= 0` (0 disables the layer),
+/// and the matching `*_burst > 0` whenever its rate is `> 0` (no deny-all).
+/// Mirrors [`resolve_probe_into`]; only the
+/// defaults and the `serve.rate_limit.*` field keys differ.
+#[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
+pub fn resolve_serve_into(
+    file: Option<&types::ServeConfig>,
+    bag: &mut ConfigDiagnostics,
+) -> ResolvedServe {
+    let rate_limit = file.and_then(|p| p.rate_limit.as_ref());
+    let per_peer_rate_per_sec = rate_limit
+        .and_then(|r| r.per_peer_rate_per_sec)
+        .unwrap_or(DEFAULT_SERVE_PER_PEER_RATE_PER_SEC);
+    bag.check(
+        per_peer_rate_per_sec.is_finite() && per_peer_rate_per_sec >= 0.0,
+        "serve.rate_limit.per_peer_rate_per_sec",
+        "serve.rate_limit.per_peer_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+    );
+    let per_peer_burst = rate_limit
+        .and_then(|r| r.per_peer_burst)
+        .unwrap_or(DEFAULT_SERVE_PER_PEER_BURST);
+    bag.check(
+        per_peer_rate_per_sec == 0.0 || per_peer_burst > 0,
+        "serve.rate_limit.per_peer_burst",
+        "serve.rate_limit.per_peer_burst must be > 0 when per_peer_rate_per_sec > 0 (set both to 0 to disable)",
+    );
+
+    let per_ip_rate_per_sec = rate_limit
+        .and_then(|r| r.per_ip_rate_per_sec)
+        .unwrap_or(DEFAULT_SERVE_PER_IP_RATE_PER_SEC);
+    bag.check(
+        per_ip_rate_per_sec.is_finite() && per_ip_rate_per_sec >= 0.0,
+        "serve.rate_limit.per_ip_rate_per_sec",
+        "serve.rate_limit.per_ip_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+    );
+    let per_ip_burst = rate_limit
+        .and_then(|r| r.per_ip_burst)
+        .unwrap_or(DEFAULT_SERVE_PER_IP_BURST);
+    bag.check(
+        per_ip_rate_per_sec == 0.0 || per_ip_burst > 0,
+        "serve.rate_limit.per_ip_burst",
+        "serve.rate_limit.per_ip_burst must be > 0 when per_ip_rate_per_sec > 0 (set both to 0 to disable)",
+    );
+
+    let global_rate_per_sec = rate_limit
+        .and_then(|r| r.global_rate_per_sec)
+        .unwrap_or(DEFAULT_SERVE_GLOBAL_RATE_PER_SEC);
+    bag.check(
+        global_rate_per_sec.is_finite() && global_rate_per_sec >= 0.0,
+        "serve.rate_limit.global_rate_per_sec",
+        "serve.rate_limit.global_rate_per_sec must be a finite non-negative number (0 disables the layer)",
+    );
+    let global_burst = rate_limit
+        .and_then(|r| r.global_burst)
+        .unwrap_or(DEFAULT_SERVE_GLOBAL_BURST);
+    bag.check(
+        global_rate_per_sec == 0.0 || global_burst > 0,
+        "serve.rate_limit.global_burst",
+        "serve.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
+    );
+
+    let max_tracked_per_ip = rate_limit
+        .and_then(|r| r.max_tracked_per_ip)
+        .unwrap_or(DEFAULT_SERVE_MAX_TRACKED_PER_IP);
+    let max_tracked_per_peer = rate_limit
+        .and_then(|r| r.max_tracked_per_peer)
+        .unwrap_or(DEFAULT_SERVE_MAX_TRACKED_PER_PEER);
+    if max_tracked_per_ip == 0 {
+        bag.warn(
+            "serve.rate_limit.max_tracked_per_ip",
+            "0: per-IP bookkeeping map is unbounded; an attacker churning source IPs can \
+             grow it without limit",
+        );
+    }
+    if max_tracked_per_peer == 0 {
+        bag.warn(
+            "serve.rate_limit.max_tracked_per_peer",
+            "0: per-peer bookkeeping map is unbounded; an attacker churning NodeIds can \
+             grow it without limit",
+        );
+    }
+
+    ResolvedServe {
+        per_peer_rate_per_sec,
+        per_peer_burst,
+        per_ip_rate_per_sec,
+        per_ip_burst,
+        global_rate_per_sec,
+        global_burst,
+        max_tracked_per_ip,
+        max_tracked_per_peer,
+    }
+}
+
+/// Convenience wrapper for [`resolve_serve_into`] that takes a fresh
+/// `ConfigDiagnostics`. Test-only.
+#[cfg(test)]
+pub fn resolve_serve(file: Option<&types::ServeConfig>) -> anyhow::Result<ResolvedServe> {
+    one_section(|bag| resolve_serve_into(file, bag))
 }
 
 /// Load a [`FileConfig`] from disk.
