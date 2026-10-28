@@ -6949,6 +6949,9 @@ async fn a_mid_stream_pool_exhausted_keeps_the_proofs_the_node_accepted() -> any
         "expected PoolExhausted, got {:?}",
         rejected.reason
     );
+    // The node records the stop after the stream ends, which can be after the
+    // client reads the frame.
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         counter(
             &metrics,
@@ -6973,17 +6976,23 @@ async fn a_mid_stream_pool_exhausted_keeps_the_proofs_the_node_accepted() -> any
     );
 
     // Funded again: the resumed fetch continues the lane where the node left
-    // it, with no rebase.
+    // it. A heal would need a rejected voucher first: a rebase moves the
+    // generation, and a reseed does not.
     drained.store(false, std::sync::atomic::Ordering::Relaxed);
     let generation = ledger.generation();
+    let rejected_before = counter(&metrics, "decdn_serve_stream_voucher_rejected_total")?;
     let got = fetch(0x2664_0002)
         .await
         .map_err(|e| anyhow::anyhow!("resumed fetch: {e:#}"))?;
     anyhow::ensure!(got.as_ref() == payload.as_slice(), "resumed bytes match");
     anyhow::ensure!(
         ledger.generation() == generation,
-        "the resumed fetch needs no heal: generation {generation} -> {}",
+        "the resumed fetch needs no rebase: generation {generation} -> {}",
         ledger.generation()
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == rejected_before,
+        "the resumed fetch draws no voucher rejection, so no reseed either"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
