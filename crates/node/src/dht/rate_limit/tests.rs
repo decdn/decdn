@@ -140,7 +140,7 @@ fn relay_only_connection_skips_per_ip_layer() {
 
 /// The per-IP layer is checked before the global cap, so when both the
 /// per-IP bucket and the global bucket are exhausted, the rejection must be
-/// attributed to `PerIp` — never `Global` — and must spend no global token.
+/// attributed to `PerIp` — never `Global`.
 /// This pins the per-IP-before-global edge of the narrowest-first order
 /// (`narrowest_first_per_peer_short_circuits_global` pins the per-peer edge).
 ///

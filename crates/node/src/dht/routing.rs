@@ -16,10 +16,11 @@
 //!
 //! ADR 022 restricts the routing pool to bonded operators. Every production
 //! write goes through [`RoutingTable::insert_active`], which refuses a peer
-//! the staker set does not hold, and every production read that names peers
-//! to dial or to answer with goes through [`RoutingTable::closest_active`] or
-//! [`RoutingTable::closest_active_unbounded`], which skip an entry that has
-//! unbonded since it was inserted. A `NodeId` costs nothing, so an unchecked
+//! the staker set does not hold. Every `closer_nodes` answer, lookup seed and
+//! publish fan-out goes through [`RoutingTable::closest_active`] or
+//! [`RoutingTable::closest_active_unbounded`], and bucket refresh asks a
+//! bucket's most-recently-seen bonded entry, so an entry that has unbonded
+//! since it was inserted is neither dialed nor named. A `NodeId` costs nothing, so an unchecked
 //! write would let a stream of fresh ids displace every bonded entry.
 //!
 //! # Eviction policy
@@ -40,9 +41,10 @@
 //! stays in the table. The lookup marks it with [`RoutingTable::mark_unreachable`],
 //! and this node's lookups skip it for [`DIAL_FAILURE_COOLDOWN`]. A peer the
 //! lookup reached through a `closer_nodes` referral, and that is in no bucket,
-//! is marked the same way. [`RoutingTable::closest`] still returns a marked
-//! peer, so `closer_nodes` answers to other nodes and the republish fan-out
-//! are unchanged; the skip is this node's own, and the lookup takes its seed
+//! is marked the same way. [`RoutingTable::closest_active`] and
+//! [`RoutingTable::closest_active_unbounded`] still return a marked peer, so
+//! `closer_nodes` answers to other nodes and the republish fan-out are
+//! unchanged; the skip is this node's own, and the lookup takes its seed
 //! from the nearest peers that are not skipped. The skip ends when the
 //! cooldown lapses or when the table inserts or refreshes the peer again,
 //! which an inbound request from it does (#2532). The registry seeds every
@@ -189,9 +191,11 @@ impl RoutingTable {
         self.buckets.iter().all(Vec::is_empty)
     }
 
-    /// Insert or refresh `peer`. Returns `true` on a fresh insert, `false`
-    /// on a refresh (peer already present — its LRU position is moved to
-    /// the tail) or a self-insert (silently ignored).
+    /// Insert or refresh `peer` with no bond check. Returns `true` on a fresh
+    /// insert, `false` on a refresh (peer already present — its LRU position
+    /// is moved to the tail) or a self-insert (silently ignored). Production
+    /// writes use [`Self::insert_active`]; this unchecked form serves tests and
+    /// operator tooling.
     ///
     /// On bucket overflow the least-recently-seen entry is evicted to make
     /// room. See the module docs for the LRU rationale vs. classic
@@ -339,8 +343,9 @@ impl RoutingTable {
     ///
     /// The result is capped at [`K_BUCKET_SIZE`] (= [`MAX_CLOSER_NODES`])
     /// so it can be serialised directly into a wire `closer_nodes` field.
-    /// Callers needing more than K candidates (e.g. ADR 022 §STORE Flow
-    /// "K+3 closest" republish fanout) MUST use [`Self::closest_unbounded`].
+    /// Callers needing more than K candidates use [`Self::closest_unbounded`].
+    /// This is the unfiltered base; the wire answer reads
+    /// [`Self::closest_active`].
     #[must_use]
     pub fn closest(&self, target: &[u8; NODE_ID_LEN], n: usize) -> Vec<NodeId> {
         let cap = n.min(K_BUCKET_SIZE);
@@ -348,16 +353,16 @@ impl RoutingTable {
     }
 
     /// Like [`Self::closest`] but without the wire-cap clamp at
-    /// [`K_BUCKET_SIZE`]. Used by the republish path which fans out to
-    /// K+3 closest peers per ADR 022 §STORE Flow line 128 ("three
-    /// positions beyond K are overflow targets — publishing to a wider
-    /// set than the minimum required by the routing geometry means an
-    /// attacker forcing record expiry by suppressing receivers must
-    /// take down K+3 hosts rather than K").
+    /// [`K_BUCKET_SIZE`], and unfiltered. The republish path fans out to the
+    /// K+3 closest bonded peers per ADR 022 §STORE Flow ("three positions
+    /// beyond K are overflow targets — publishing to a wider set than the
+    /// minimum required by the routing geometry means an attacker forcing
+    /// record expiry by suppressing receivers must take down K+3 hosts rather
+    /// than K") through [`Self::closest_active_unbounded`].
     ///
     /// MUST NOT be used to populate wire responses — those are bound at
     /// [`MAX_CLOSER_NODES`] and a larger result would violate the
-    /// ADR 022 wire-cost ceiling. Use [`Self::closest`] for that path.
+    /// ADR 022 wire-cost ceiling. Use [`Self::closest_active`] for that path.
     #[must_use]
     pub fn closest_unbounded(&self, target: &[u8; NODE_ID_LEN], n: usize) -> Vec<NodeId> {
         self.closest_where(target, n, |_| true)

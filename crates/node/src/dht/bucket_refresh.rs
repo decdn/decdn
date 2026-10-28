@@ -145,7 +145,7 @@ async fn refresh_all_non_empty_buckets(
     staker_set: &Arc<dyn StakerSet>,
 ) -> usize {
     let picks: Vec<BucketPick> = with_lock(routing, "dht routing table", |table| {
-        all_non_empty_picks(table)
+        all_non_empty_picks(table, staker_set.as_ref())
     });
     if picks.is_empty() {
         return 0;
@@ -169,13 +169,18 @@ async fn refresh_all_non_empty_buckets(
     failures
 }
 
-/// Snapshot all non-empty buckets as `BucketPick`s. Returns one pick
-/// per non-empty bucket; the caller fans the corresponding `FindNode`
-/// RPCs out in parallel.
-fn all_non_empty_picks(table: &RoutingTable) -> Vec<BucketPick> {
+/// Snapshot all non-empty buckets as `BucketPick`s. Returns one pick per
+/// bucket that holds a bonded entry, aimed at its most-recently-seen bonded
+/// entry; the caller fans the corresponding `FindNode` RPCs out in parallel.
+fn all_non_empty_picks(table: &RoutingTable, staker_set: &dyn StakerSet) -> Vec<BucketPick> {
     (0..KEYSPACE_BITS)
         .filter_map(|idx| {
-            let peer = bucket_iter(table, idx).last().copied()?;
+            // The bucket's most-recently-seen bonded entry: an entry that
+            // unbonded since it entered is not a peer to ask.
+            let peer = bucket_iter(table, idx)
+                .filter(|peer| staker_set.is_active(peer))
+                .last()
+                .copied()?;
             let target = random_target_in_bucket(table.self_id(), idx);
             Some(BucketPick {
                 bucket_index: idx,

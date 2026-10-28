@@ -7,9 +7,10 @@
 //!   authenticated `NodeId`, active-staker filter, per-publisher quota
 //!   (200), global LRU (100k), per-hash provider cap (50), receiver-
 //!   anchored TTL (1 h).
-//! - `FindValue` consults the record store + the routing table; per
+//! - `FindValue` consults the record store + the routing table. Its
+//!   `closer_nodes` name only bonded peers (ADR 022 §Routing Table); per
 //!   ADR 022 §Lookup integrity the requester-side filters (XOR-distance,
-//!   active-staker, negative-probe-cache, randomisation) are the
+//!   active-staker, negative-probe-cache, randomisation) stay the
 //!   requester's job and live in the iterative-lookup module
 //!   ([`crate::dht::lookup`]).
 //! - `BatchStore` admission (ADR 022 §Batch token accounting, #648):
@@ -319,10 +320,9 @@ impl DhtHandler {
                 Self::close_stream_with_rate_limit(send, recv, layer);
                 continue;
             }
-            // Refresh routing-table entry — the requester just authenticated
-            // their NodeId via QUIC and successfully spent a rate-limit
-            // token. That's the same admission criteria ADR 022 §Routing
-            // Table demands for table insertion.
+            // The requester authenticated its NodeId via QUIC and spent a
+            // rate-limit token; `note_peer_seen` adds or refreshes it only if
+            // the staker set holds it as bonded (ADR 022 §Routing Table).
             self.note_peer_seen(peer);
             if let Err(e) = self.handle_one(peer, peer_ip, send, recv).await {
                 // The per-request error already carries the ADR 013 app
@@ -360,7 +360,7 @@ impl DhtHandler {
         );
     }
 
-    /// Refresh the peer in the routing table. Takes an
+    /// Insert or refresh the peer in the routing table if it is bonded. Takes an
     /// [`AuthenticatedNodeId`] — only the QUIC-bound identity may seed the
     /// table, never a wire-provided `requester`/`holder` (the
     /// routing-table-poisoning guard, ADR 022 §Lookup integrity). Silently
@@ -375,7 +375,7 @@ impl DhtHandler {
         // line per panic, not one per admitted request). A silent skip here
         // would drop every learned peer for the process lifetime after a
         // single panic elsewhere.
-        // Only a bonded peer enters the table (ADR 022 §Lookup integrity): a
+        // Only a bonded peer enters the table (ADR 022 §Routing Table): a
         // NodeId costs nothing, so admitting every inbound peer would let a
         // stream of fresh ids displace the bonded entries.
         with_lock(&self.routing, "dht routing table", |table| {
@@ -691,10 +691,11 @@ impl DhtHandler {
 
     /// `FindValue` flow (ADR 022 §FIND\_VALUE Flow, responder side):
     /// the responder returns its known holders for `hash` plus the
-    /// K-closest peers from the routing table. Per ADR 022 §Lookup
+    /// K-closest bonded peers from the routing table. Per ADR 022 §Lookup
     /// integrity, requester-side filtering (XOR-distance check, active-
     /// staker filter, negative-probe-cache consultation, randomisation)
-    /// is the requester's job; we don't apply it here.
+    /// stays the requester's job: this node filters only its own
+    /// `closer_nodes` against its staker set, and does not filter `providers`.
     fn handle_find_value(&self, req: wire::FindValueRequest) -> wire::FindValueResponse {
         let now_us = now_us();
         let providers = if let Ok(mut store) = self.records.lock() {

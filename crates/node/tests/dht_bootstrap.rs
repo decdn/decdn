@@ -307,6 +307,57 @@ async fn bootstrap_seeds_routing_and_runs_self_lookup() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #2708: bootstrap adds only the bonded ids a responder names. The seed names
+/// a peer it holds as bonded, which this client's staker set does not hold, so
+/// the client's table gets the seed and not the named peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn bootstrap_refuses_an_unbonded_id_a_responder_names() -> anyhow::Result<()> {
+    let named = NodeId::from_bytes([0xC3u8; 32]);
+    let server = spin_up_server(HashSet::from([*named.as_bytes()])).await?;
+    server.routing.lock().unwrap().insert(named);
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let staker_set: Arc<dyn StakerSet> =
+        Arc::new(ConfigStakerSet::new(HashSet::from([NodeId::from_bytes(
+            *server.id.as_bytes(),
+        )])));
+    let client_routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
+        *client_id.as_bytes(),
+    ))));
+    // Loopback tests disable discovery; one `FindNode` resolves the path, and
+    // shows the seed does name the peer.
+    let resp = client::find_node(
+        &dht_conns(&client_ep),
+        EndpointAddr::new(server.id).with_ip_addr(server.addr),
+        NodeId::from_bytes(*server.id.as_bytes()),
+        NodeId::from_bytes(*client_id.as_bytes()),
+    )
+    .await?;
+    assert_eq!(resp.closer_nodes.as_slice(), [named]);
+
+    let outcome = bootstrap::bootstrap(
+        &dht_conns(&client_ep),
+        client_id,
+        &client_routing,
+        &staker_set,
+    )
+    .await;
+
+    assert!(outcome.find_node_ok >= 1, "the seed answered");
+    assert_eq!(outcome.closer_peers_inserted, 0);
+    {
+        let t = client_routing.lock().unwrap();
+        assert!(t.contains(&NodeId::from_bytes(*server.id.as_bytes())));
+        assert!(!t.contains(&named), "an unbonded named id stays out");
+    }
+
+    client_ep.close().await;
+    server.endpoint.close().await;
+    server.accept_task.abort();
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn client_store_lands_record_at_server() -> anyhow::Result<()> {
     // Server admits the client as a staked publisher; client.store

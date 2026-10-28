@@ -1196,8 +1196,8 @@ async fn publish_hash(
         table.closest_active_unbounded(hash.as_bytes(), REPUBLISH_FANOUT, staker_set)
     });
     if targets.is_empty() {
-        // No routing-table entries yet (e.g. boot before bootstrap).
-        // Nothing to do this cycle; the scheduler will retry.
+        // No bonded routing-table entries (boot before bootstrap, or every
+        // entry unbonded). Nothing to do this cycle; the scheduler will retry.
         return 0;
     }
     let mut handles = Vec::with_capacity(targets.len());

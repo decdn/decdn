@@ -156,10 +156,10 @@ fn unbonded_peers_do_not_displace_bonded_entries() {
     }
 }
 
-/// #2708: a full bucket evicts an entry that has unbonded since it entered,
-/// then a cooling entry, before the least-recently-seen bonded one.
+/// #2708: a full bucket evicts its least-recently-seen entry that has unbonded
+/// since it entered or whose dial is cooling, before any other entry.
 #[test]
-fn a_full_bucket_evicts_an_unbonded_then_a_cooling_entry_first() {
+fn a_full_bucket_evicts_unbonded_or_cooling_entries_first() {
     let self_id = id(0);
     let mut rt = RoutingTable::new(self_id);
     let k = u8::try_from(K_BUCKET_SIZE).unwrap();
@@ -177,6 +177,35 @@ fn a_full_bucket_evicts_an_unbonded_then_a_cooling_entry_first() {
 
     assert!(rt.insert_active(id_in_bucket(&self_id, 100, 51), &stakers, now));
     assert!(!rt.contains(&id_in_bucket(&self_id, 100, 9)));
+    assert!(rt.contains(&id_in_bucket(&self_id, 100, 1)));
+}
+
+/// #2708: `insert_active` on a bonded peer already in the table refreshes it:
+/// it moves to most-recent, evicts nothing and ends its dial cooldown. A peer
+/// that has unbonded since it entered is not refreshed, so it stays the next
+/// eviction candidate.
+#[test]
+fn insert_active_refreshes_only_bonded_entries() {
+    let self_id = id(0);
+    let mut rt = RoutingTable::new(self_id);
+    let k = u8::try_from(K_BUCKET_SIZE).unwrap();
+    let now = Instant::now();
+    let all = staked_in_bucket_100(&self_id, (1..=k).chain([50]));
+    for salt in 1..=k {
+        assert!(rt.insert_active(id_in_bucket(&self_id, 100, salt), &all, now));
+    }
+    rt.mark_unreachable(id_in_bucket(&self_id, 100, 1), now);
+
+    assert!(!rt.insert_active(id_in_bucket(&self_id, 100, 1), &all, now));
+    assert_eq!(rt.len(), K_BUCKET_SIZE);
+    assert!(!rt.is_cooling(&id_in_bucket(&self_id, 100, 1), now));
+
+    // Salt 2 unbonds and tries to refresh: refused, so it stays least recent
+    // and the next newcomer evicts it.
+    let without_2 = staked_in_bucket_100(&self_id, (1..=k).chain([50]).filter(|s| *s != 2));
+    assert!(!rt.insert_active(id_in_bucket(&self_id, 100, 2), &without_2, now));
+    assert!(rt.insert_active(id_in_bucket(&self_id, 100, 50), &without_2, now));
+    assert!(!rt.contains(&id_in_bucket(&self_id, 100, 2)));
     assert!(rt.contains(&id_in_bucket(&self_id, 100, 1)));
 }
 
