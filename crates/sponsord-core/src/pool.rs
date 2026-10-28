@@ -108,7 +108,9 @@ pub enum TxState {
 /// that clear a held top-up) it would reuse a spent nonce. It carries the
 /// send-leg marker `decdn_client::buyer_pool::top_up` and `ensure_allowance`
 /// read: a `topUp` whose send request failed in transport is held as
-/// unconfirmed, one whose chain reads failed is not.
+/// unconfirmed, one whose chain reads failed is not. Its gas filler sends an
+/// estimate with headroom on top, so a call whose path costs more in the
+/// block it mines in than at the estimate still fits (#2730).
 fn treasury_provider<S>(url: alloy::transports::http::reqwest::Url, signer: S) -> DynProvider
 where
     S: TxSigner<Signature> + Send + Sync + 'static,
@@ -118,7 +120,7 @@ where
     decdn_common::tls::install_crypto_provider();
     ProviderBuilder::default()
         .layer(decdn_incentive::tx::SendLegLayer)
-        .with_gas_estimation()
+        .filler(decdn_incentive::tx::GasHeadroomFiller::default())
         .with_simple_nonce_management()
         .fetch_chain_id()
         .wallet(EthereumWallet::new(signer))

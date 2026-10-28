@@ -199,6 +199,33 @@ async fn treasury_provider_marks_a_failed_send_request() {
     );
 }
 
+/// The treasury provider sends an estimated gas limit with
+/// [`decdn_incentive::tx::GAS_HEADROOM`] on top, so a call whose path costs
+/// more in the block it mines in than at the estimate still fits (#2730).
+#[tokio::test]
+async fn treasury_provider_sends_an_estimate_with_headroom() {
+    let estimate = 57_076;
+    let stub = decdn_incentive::test_rpc::GasStub::spawn(estimate)
+        .await
+        .unwrap();
+    let signer = PrivateKeySigner::random();
+    let request = alloy::rpc::types::TransactionRequest {
+        from: Some(signer.address()),
+        to: Some(alloy::primitives::TxKind::Call(Address::repeat_byte(0x01))),
+        nonce: Some(0),
+        chain_id: Some(1),
+        max_fee_per_gas: Some(1),
+        max_priority_fee_per_gas: Some(1),
+        ..Default::default()
+    };
+    let provider = treasury_provider(stub.url().parse().unwrap(), signer);
+    let _pending = provider.send_transaction(request).await.unwrap();
+    assert_eq!(
+        stub.sent_gas_limits(),
+        vec![decdn_incentive::tx::with_headroom(estimate)]
+    );
+}
+
 #[test]
 fn zero_cap_and_expiry_is_unregistered() {
     let auth = |cap, expiry| Authorization {

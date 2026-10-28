@@ -85,6 +85,47 @@ async fn wallet_providers_mark_a_failed_send_request() {
     }
 }
 
+/// Both wallet providers send an estimated gas limit with
+/// [`decdn_incentive::tx::GAS_HEADROOM`] on top, so a call whose path costs
+/// more in the block it mines in than at the estimate still fits (#2730).
+#[tokio::test]
+async fn wallet_providers_send_an_estimate_with_headroom() {
+    decdn_common::tls::install_crypto_provider();
+    let estimate = 57_076;
+    let stub = decdn_incentive::test_rpc::GasStub::spawn(estimate)
+        .await
+        .expect("bind a loopback port");
+    let url: HttpUrl = stub.url().parse().expect("valid URL");
+    let providers = ProviderFactory::new(url, Arc::new(metrics::Metrics::new()));
+    let signer = PrivateKeySigner::random();
+    let request = alloy::rpc::types::TransactionRequest {
+        from: Some(signer.address()),
+        to: Some(alloy::primitives::TxKind::Call(
+            alloy::primitives::Address::repeat_byte(0x01),
+        )),
+        nonce: Some(0),
+        chain_id: Some(1),
+        max_fee_per_gas: Some(1),
+        max_priority_fee_per_gas: Some(1),
+        ..Default::default()
+    };
+    for provider in [
+        providers
+            .seller_wallet(signer.clone(), Duration::from_secs(1))
+            .erased(),
+        providers
+            .buyer_wallet(signer.clone(), Duration::from_secs(1))
+            .erased(),
+    ] {
+        let _pending = provider
+            .send_transaction(request.clone())
+            .await
+            .expect("the stub accepts the send");
+    }
+    let padded = decdn_incentive::tx::with_headroom(estimate);
+    assert_eq!(stub.sent_gas_limits(), vec![padded, padded]);
+}
+
 /// `admin_stop_order` defaults to `Early` (the original
 /// `appendix-local-admin-http` ordering) — the admin server stops
 /// before `router.shutdown` for SIGINT/SIGTERM and for any drain

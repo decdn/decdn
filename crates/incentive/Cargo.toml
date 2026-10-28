@@ -47,7 +47,8 @@ redb = ["buyer-store-core"]
 # `[dev-dependencies]` — same pattern as `decdn-client`'s `test-util`.
 # Also exposes `test_rpc::ScriptedRpc`, a scripted RPC transport that parks a
 # receipt wait, shared by the receipt-timeout tests here, in `decdn-client` and
-# in `decdn-cli`.
+# in `decdn-cli`, and `test_rpc::GasStub`, the HTTP endpoint the gas-headroom
+# tests of the wallet provider builders send to.
 test-util = ["dep:tower", "dep:alloy-json-rpc", "dep:serde_json"]
 
 [dependencies]
