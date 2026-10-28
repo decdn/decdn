@@ -454,7 +454,8 @@ fn quote_args(argv: &[&str]) -> QuoteArgs {
 }
 
 /// #2675: a quote that would open a pool without `--open-pool` names what
-/// opening one costs, says no approve or `openPool` was sent, and names both
+/// opening one costs, says the refused `openPool` and its approve were not
+/// sent (a `topUp` of the run may have sent an approve before it), and names both
 /// ways on: the same command with `--open-pool` added, and `decdn pool open`.
 /// It prints no command line to paste, which would drop the flags that pick
 /// the wallet, the chain and the deposit.
@@ -468,7 +469,7 @@ fn a_refused_open_names_the_cost_and_both_ways_on() {
         "no open pool pays for the manifest fetch",
         "escrows the working deposit (1.00 USDC)",
         "pays gas for the openPool (and an approve when the allowance is short)",
-        "no approve or openPool was sent",
+        "this openPool and its approve were not sent",
         "Rerun the same `decdn quote` command with `--open-pool` added",
         "`decdn pool open --deposit-micro-usdc <amount>`",
     ] {

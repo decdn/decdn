@@ -136,7 +136,7 @@ pub(crate) fn open_refused(refused: &PoolOpenRefused) -> String {
     format!(
         "no open pool pays for the manifest fetch, and opening one escrows the working deposit \
          ({} USDC) and pays gas for the openPool (and an approve when the allowance is short); \
-         no approve or openPool was sent. Rerun the same `decdn quote` command with \
+         this openPool and its approve were not sent. Rerun the same `decdn quote` command with \
          `--open-pool` added to open it, or fund a pool first with \
          `decdn pool open --deposit-micro-usdc <amount>`",
         usdc_short(refused.deposit),
