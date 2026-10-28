@@ -1517,8 +1517,10 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 ///
 /// A node signs its sellers' redemptions and its buyer top-ups with one key, so
 /// a top-up can lose its nonce to a redemption sent at the same moment. The
-/// settle then finds the nonce spent with no deposit growth, releases the
-/// top-up slot, and the next low-water refill sends a fresh `topUp`.
+/// node's settle then finds the nonce spent with no deposit growth. No copy of
+/// the `topUp` can mine after that, so the node's funding task sends a fresh
+/// `topUp` at a later nonce, a bounded number of times, while it keeps the
+/// top-up slot.
 ///
 /// `receipt_timeout` bounds the receipt wait when it is `Some`, as for
 /// [`open_pool`]. A caller that bounds the wait must not send another `topUp`

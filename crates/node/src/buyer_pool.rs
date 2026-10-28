@@ -106,6 +106,16 @@ const TOPUP_UNRESOLVED_WARN_INTERVAL: Duration = Duration::from_mins(1);
 /// still resolves through its spent nonce and the pool's deposit.
 const MAX_TOPUP_TXS: usize = 4;
 
+/// How many fresh `topUp`s one funding call sends after a `topUp` whose nonce
+/// was spent with nothing escrowed ([`TopUpNonceLost`]). The node's redeemer
+/// signs with the same key, so a fresh `topUp` can lose its nonce again; the
+/// bound keeps a busy redeemer from holding the top-up slot without end.
+const MAX_TOPUP_NONCE_LOST_RETRIES: u32 = 2;
+
+/// How long the funding task waits before it sends a fresh `topUp` after one
+/// lost its nonce, so a redemption sent beside it can reach the chain first.
+const TOPUP_NONCE_LOST_BACKOFF: Duration = Duration::from_millis(250);
+
 /// A lane's seed queue: the lock the streams seeding one lane take in turn, and
 /// the watermark read the first of them made, for the lane it read. The rest
 /// reuse that read, so the chain is asked once per queue.
@@ -210,6 +220,42 @@ impl std::fmt::Display for EscrowedUntracked {
 }
 
 impl std::error::Error for EscrowedUntracked {}
+
+/// Typed error: a `topUp`'s nonce is spent with no receipt in hand, and the
+/// pool's deposit where it is spent shows that the `topUp` escrowed nothing.
+/// Another transaction of the node key took the nonce, or the `topUp` mined and
+/// reverted. Every copy of the `topUp` was signed at `nonce`, and `nonce` is
+/// spent at `block`, so no copy can mine later. A fresh `topUp` at a later
+/// nonce therefore cannot escrow twice, and [`fund_pool`] sends one.
+///
+/// The node's seller redeemer and its buyer `topUp` sign with one key, so a
+/// `redeemMany` sent at the same moment as a `topUp` can take its nonce.
+#[derive(Debug)]
+struct TopUpNonceLost {
+    /// The nonce the `topUp` was sent at.
+    nonce: u64,
+    /// The block where the nonce is spent and the deposit did not grow.
+    block: u64,
+    /// The pool's deposit at `block`.
+    on_chain: U256,
+    /// The row's deposit when the settle began.
+    baseline: U256,
+    /// The error that left the `topUp` unconfirmed, sanitized.
+    original: String,
+}
+
+impl std::fmt::Display for TopUpNonceLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the topUp nonce {} is spent at block {} and the pool's deposit there ({}) is not \
+             above the row's ({}), so the topUp escrowed nothing: {}",
+            self.nonce, self.block, self.on_chain, self.baseline, self.original
+        )
+    }
+}
+
+impl std::error::Error for TopUpNonceLost {}
 
 /// Who starts a funding `topUp`. The two differ in who may rely on its headroom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -559,10 +605,17 @@ where
 /// ([`settle_unconfirmed_top_up`]). Releasing the slot earlier lets the next
 /// refill send a second `topUp` beside one that may still mine (#2489).
 ///
+/// A settle that finds the `topUp`'s nonce spent with nothing escrowed
+/// ([`TopUpNonceLost`]) sends a fresh `topUp`, up to
+/// [`MAX_TOPUP_NONCE_LOST_RETRIES`] times. No copy of the lost `topUp` can
+/// mine, so the fresh one cannot escrow twice. The task keeps the top-up slot
+/// across the retries, so a recovery step that joined it gets the retried
+/// outcome and meters one recovery step.
+///
 /// # Errors
 ///
 /// - The allowance or `topUp` failed, or the settle found that the `topUp`
-///   escrowed nothing: the funds did not move.
+///   escrowed nothing on every try: the funds did not move.
 /// - The settle found the pool no longer accepts funds, marked [`PoolNotOpen`].
 /// - The `topUp` escrowed, or may have escrowed, and the local row is not
 ///   credited: marked [`EscrowedUntracked`]. The error names the tx, or the
@@ -572,6 +625,50 @@ async fn fund_pool<P: Provider + Clone + 'static>(
     pool_id: PoolId,
     additional: U256,
 ) -> Result<TopUpLanded> {
+    let mut retries = 0;
+    let settled = loop {
+        let settled = top_up_and_settle(handles, pool_id, additional).await;
+        let lost = settled
+            .as_ref()
+            .err()
+            .and_then(|err| err.downcast_ref::<TopUpNonceLost>());
+        match lost {
+            Some(lost) if retries < MAX_TOPUP_NONCE_LOST_RETRIES => {
+                retries += 1;
+                handles.metrics.buyer_topup_nonce_lost();
+                warn!(
+                    %pool_id,
+                    %additional,
+                    nonce = lost.nonce,
+                    block = lost.block,
+                    retry = retries,
+                    "buyer top-up: the topUp's nonce is spent and the topUp escrowed nothing, \
+                     most often because a redemption took the nonce; sending a fresh topUp"
+                );
+                tokio::time::sleep(TOPUP_NONCE_LOST_BACKOFF).await;
+            }
+            _ => break settled,
+        }
+    };
+    match settled {
+        Ok(settled) => credit_settled_top_up(handles, pool_id, settled),
+        Err(err) => Err(report_top_up_failure(handles, pool_id, additional, err)),
+    }
+}
+
+/// Send one `topUp` of `additional` on `pool_id` and learn what it escrowed:
+/// from its receipt, or, when its outcome is unknown, from the chain
+/// ([`settle_unconfirmed_top_up`]). Credits nothing and meters nothing.
+///
+/// # Errors
+///
+/// As [`fund_pool`], before any credit. A spent nonce with nothing escrowed is
+/// a [`TopUpNonceLost`].
+async fn top_up_and_settle<P: Provider + Clone + 'static>(
+    handles: &FundingHandles<P>,
+    pool_id: PoolId,
+    additional: U256,
+) -> Result<SettledTopUp> {
     // Daemon posture: attempt the transfer directly against the standing
     // unlimited allowance granted at bootstrap. Only when `topUp` reverts with
     // an allowance shortfall (the approval was revoked or never granted) do a
@@ -610,7 +707,7 @@ async fn fund_pool<P: Provider + Clone + 'static>(
         credited: topped_up.credited,
         proof: TopUpProof::Receipt(topped_up.tx),
     });
-    let settled = match topped_up {
+    match topped_up {
         Err(err) => match err.downcast_ref::<TopUpUnconfirmed>().copied() {
             Some(unconfirmed) => {
                 settle_unconfirmed_top_up(handles, pool_id, additional, unconfirmed, &err).await
@@ -618,10 +715,6 @@ async fn fund_pool<P: Provider + Clone + 'static>(
             None => Err(err),
         },
         settled => settled,
-    };
-    match settled {
-        Ok(settled) => credit_settled_top_up(handles, pool_id, settled),
-        Err(err) => Err(report_top_up_failure(handles, pool_id, additional, err)),
     }
 }
 
@@ -1182,12 +1275,13 @@ impl TopUpSettling {
         let on_chain = U256::from(pool.deposit);
         let escrowed = on_chain.saturating_sub(baseline);
         if escrowed.is_zero() {
-            return Tick::Done(Err(anyhow::anyhow!(
-                "the topUp nonce {nonce} is spent at block {block} and the pool's deposit there \
-                 ({on_chain}) is not above the row's ({baseline}), so the topUp escrowed \
-                 nothing: {}",
-                self.original
-            )));
+            return Tick::Done(Err(anyhow::Error::new(TopUpNonceLost {
+                nonce,
+                block,
+                on_chain,
+                baseline,
+                original: self.original.clone(),
+            })));
         }
         if escrowed == self.additional {
             info!(

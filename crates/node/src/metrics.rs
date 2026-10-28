@@ -980,6 +980,15 @@ pub struct DecdnMetrics {
     /// gas wallet / RPC / USDC balance). Operator-
     /// visible name: `decdn_buyer_topup_failure_total`.
     pub buyer_topup_failure: Counter,
+    /// Funding `topUp`s whose nonce was spent with nothing escrowed, which the
+    /// funding task answers with a fresh `topUp` (#2721). The node's seller
+    /// redeemer signs `redeemMany` with the same key, so a redemption sent at
+    /// the same moment takes the `topUp`'s nonce. Each retry ticks this once;
+    /// a funding call that runs out of retries also ticks
+    /// `decdn_buyer_topup_failure_total`. A sustained rate means the redeemer
+    /// and the buyer contend for the key's nonces. Operator-visible name:
+    /// `decdn_buyer_topup_nonce_lost_total`.
+    pub buyer_topup_nonce_lost: Counter,
     /// Lane-store reconciliation the settlement watcher could not apply from a
     /// poll tick: a `forget_lane` store write that failed while dropping a
     /// reclaimed pool's lanes on a `PoolReclaimed` event. The failure is
@@ -3196,6 +3205,11 @@ recorders! {
     /// with the `warn!` (or `top_up`'s own error!/warn!) around the call in
     /// `spawn_refill_if_low`.
     buyer_topup_failure => buyer_topup_failure.inc();
+
+    /// A funding `topUp`'s nonce was spent with nothing escrowed, and the
+    /// funding task sends a fresh `topUp`. Pairs with the `warn!` in
+    /// `fund_pool`.
+    buyer_topup_nonce_lost => buyer_topup_nonce_lost.inc();
 
     /// The settlement watcher failed to forget a reclaimed pool's lane state
     /// (`forget_lane`) on a `PoolReclaimed` event, in `PoolSettlementSink`
