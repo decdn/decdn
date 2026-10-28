@@ -33,7 +33,8 @@
 //!    candidates for `store_fast_path` to engage, which — per its own doc
 //!    comment — "takes no `Endpoint`, so it structurally issues no network
 //!    probe": bytes still verify, without a probe round. The holders'
-//!    `decdn_probe_requests_total` shows it: fetch #2 probes none of them.
+//!    `decdn_probe_requests_total` shows it: fetch #2 probes none of them,
+//!    before the transfer or during it.
 //!    The fast path knows no size, so fetch #2 takes its first size claim
 //!    from a whole-blob open whose pull the download adopts as its first leg
 //!    (#2633): the holders write the blob's wire bytes once, not once for
@@ -306,7 +307,7 @@ async fn run() -> anyhow::Result<()> {
         sum_metric(&holders, PROBES).await? + sum_metric(&holders, PROBES_SHED).await?;
     // The pool exists, so one attempt succeeds, and the counters cover it
     // alone.
-    run_fetch_once(client_dir.path(), &args).await?;
+    let (_, log) = run_fetch_logged(client_dir.path(), &args).await?;
 
     let got = std::fs::read(&out).context("read fetch #2 output")?;
     anyhow::ensure!(
@@ -317,7 +318,17 @@ async fn run() -> anyhow::Result<()> {
     );
     let probes = (sum_metric(&holders, PROBES).await? + sum_metric(&holders, PROBES_SHED).await?)
         .saturating_sub(probes_before);
-    anyhow::ensure!(probes == 0, "fetch #2 probed the holders {probes} time(s)");
+    // No probe round runs before the transfer, and none runs during it: the
+    // lanes the store routes to leave no range uncovered while they still
+    // build, so the acquire loop asks for no discovery (#2677).
+    anyhow::ensure!(
+        log.contains("fetch timings") && !log.contains("probe_start_ms"),
+        "fetch #2 ran a probe round before the transfer:\n{log}"
+    );
+    anyhow::ensure!(
+        probes == 0,
+        "fetch #2 probed the holders {probes} time(s):\n{log}"
+    );
     let wire = decdn_bao_range::align_range_clamped(0, 0, blob.len() as u64)?.wire_len();
     let served = sum_metric(&holders, SERVED)
         .await?
@@ -409,22 +420,6 @@ async fn sum_metric(nodes: &[&NodeFixture], name: &str) -> anyhow::Result<u64> {
         sum += node.scrape_metric(name).await?;
     }
     Ok(sum)
-}
-
-/// Run `decdn get` once, and fail with its stderr unless it succeeds.
-async fn run_fetch_once(data_dir: &std::path::Path, args: &[String]) -> anyhow::Result<()> {
-    let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
-        .arg("get")
-        .args(args)
-        .output()
-        .await
-        .context("spawn decdn get")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "decdn get failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
 }
 
 /// Run `decdn get` once with the client's leg opens logged, and fail with its
