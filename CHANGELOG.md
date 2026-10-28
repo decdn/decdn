@@ -5379,6 +5379,19 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **sponsord-onramp: a Turnstile token is bound to the onramp's hostname and
+  action (GHSA-jr93-46mf-88wx).** The gate decoded only `success` from the
+  siteverify response, so a token minted for the same sitekey on another
+  hostname passed, and nothing tied a token to this gate's widget. The widget
+  now sets `data-action="onramp-fund"`, and `verify()` refuses a response
+  whose `hostname` differs from `ONRAMP_PUBLIC_URL`'s host or whose `action`
+  is not the onramp's. A custom `ONRAMP_GATE_TEMPLATE` must set
+  `data-action="{{ACTION}}"` on its Turnstile widget; the onramp refuses to
+  start with a template that lacks the placeholder. A siteverify failure
+  caused by the gate itself (a missing or wrong `ONRAMP_TURNSTILE_SECRET`,
+  `bad-request`, `internal-error`) is now the gate's own error, answered
+  `500` and logged at warn, not a silent `403` refusal (#2719).
+
 - **Node: a peer's own rate-limit bucket refuses it before the shared
   global one is charged.** The three-layer limiter behind `cdn/probe/v1` and
   `cdn/dht/v1` charged the global bucket first, so a

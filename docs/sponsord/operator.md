@@ -47,7 +47,7 @@ on another host needs it.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ONRAMP_PUBLIC_URL` | required | The onramp's public base URL; baked into the installers |
+| `ONRAMP_PUBLIC_URL` | required | The onramp's public base URL; baked into the installers. The Turnstile gate accepts only tokens for its host |
 | `ONRAMP_DAEMON_TOKEN` / `_FILE` | required | The daemon's API token |
 | `ONRAMP_RPC_URL` | required | Public RPC endpoint users' `decdn` reads the chain through |
 | `ONRAMP_CAPACITY_BOND_ADDR` | required | `CapacityBond` contract, for node discovery |
@@ -79,7 +79,8 @@ the gate again.
 ### Behind a reverse proxy
 
 Terminate TLS in front of the onramp and set `ONRAMP_PUBLIC_URL` to what
-users reach. If the proxy is the only way in, set `ONRAMP_CLIENT_IP_HEADER`
+users reach. Its host must be the host the browser shows on the gate page,
+with no redirect to another host: Turnstile tokens are bound to it. If the proxy is the only way in, set `ONRAMP_CLIENT_IP_HEADER`
 so rate limits and the gate see the real client address: `CF-Connecting-IP`
 behind Cloudflare, or `X-Forwarded-For` (the right-most address counts,
 the one your proxy appended). Don't set it if clients can reach the onramp
@@ -94,6 +95,7 @@ These placeholders are substituted:
 |---|---|
 | `{{CLIENT}}` | The download key's address (hex) |
 | `{{SITEKEY}}` | `ONRAMP_TURNSTILE_SITEKEY` |
+| `{{ACTION}}` | The gate's Turnstile action. Required: set `data-action="{{ACTION}}"` on the widget. The onramp refuses to start with a template that lacks it |
 | `{{BRAND_NAME}}` | `ONRAMP_BRAND_NAME`, HTML-escaped |
 
 Once the widget passes, the page must `POST /v1/fund` with

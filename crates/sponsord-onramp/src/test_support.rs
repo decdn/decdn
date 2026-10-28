@@ -59,6 +59,7 @@ pub fn test_config() -> OnrampConfig {
         turnstile: Some(TurnstileConfig {
             secret: "secret".into(),
             sitekey: "TEST_SITEKEY".into(),
+            expected_hostname: "up.example.org".into(),
         }),
         client_ip: ClientIpSource::Peer,
         fund_rate_per_min: 0,

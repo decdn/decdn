@@ -40,9 +40,14 @@ async fn main() -> anyhow::Result<()> {
                 .turnstile
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("the turnstile gate has no settings"))?;
+            tracing::info!(
+                expected_hostname = %turnstile.expected_hostname,
+                "turnstile gate accepts tokens for this hostname only"
+            );
             Arc::new(TurnstileGate::new(
                 turnstile.secret,
                 turnstile.sitekey,
+                turnstile.expected_hostname,
                 cfg.brand_name.clone(),
                 cfg.gate_template.clone(),
                 http_client,
