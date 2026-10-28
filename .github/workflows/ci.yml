@@ -1316,6 +1316,13 @@ jobs:
       - name: Every member inherits the workspace version and lints
         run: .github/scripts/check-workspace-manifests.sh
 
+      # Cargo.lock is the only pin on iroh and its QUIC crates: noq-proto 1.4
+      # closes client pulls mid-leg (#2585). Dependabot ignores them, but a
+      # local `cargo update` does not, and only the anvil journeys would notice.
+      # Reads the lockfile with the standard library; needs no cargo.
+      - name: iroh and noq stay at their held versions
+        run: .github/scripts/check-iroh-hold.sh
+
       - uses: dtolnay/rust-toolchain@1.99.1
 
       # Cargo enforces acyclicity and nothing more. The dependency flow in
