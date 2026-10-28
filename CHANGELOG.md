@@ -1137,6 +1137,18 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Client: a funding recovery step replaces a stored pool the chain has no
+  record of (#2665).** `getPool` on an unknown pool id returns a zeroed
+  struct: a zero owner, and the status `Open` (enum value 0). The step read
+  that as another owner's pool and tried a `topUp`, which reverts
+  `NotPoolOwner`, so the fetch ended "funding needed" behind an opaque revert.
+  On a full pool it settled on a pool that does not exist instead. The step
+  now opens a replacement, as for a closed pool, unless a run of the same
+  command opened the pool, topped it up, or read it on chain as this wallet's.
+  Such a pool reads as unknown only on a lagging RPC, and a replacement would
+  escrow a second deposit beside it. The step decides under the run's `topUp`
+  lock and refuses while a `topUp` of the command is unconfirmed. The run's escrow handle (`UnconfirmedEscrows`)
+  records the pools it saw live. ADR 003 § Funding recovery states the rule.
 - **Client: a fetch the node stops for a short deposit or a spent signer cap
   bills its whole credit-window tail when it resumes (#2629).** When the
   node's mid-stream solvency check stopped a stream with `PoolExhausted` or

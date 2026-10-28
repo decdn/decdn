@@ -28,7 +28,7 @@ use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::tx::{RECEIPT_TIMEOUT, await_receipt};
 use decdn_incentive::{
     AdvanceOutcome, BuyerLaneProgress, BuyerPoolState, BuyerPoolStore, Capability, Deployment,
-    DepositOutcome, LaneKey, PoolOpenFailureReason, SignedCapability, StoreError,
+    DepositOutcome, LaneKey, PoolId, PoolOpenFailureReason, SignedCapability, StoreError,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -731,7 +731,10 @@ pub async fn open_pool<P: Provider + Clone>(
         entry: unconfirmed.into(),
     };
     match opened_from_receipt(&receipt, tx, deployment, token, owner, deposit) {
-        Ok(opened) => Ok((opened, unrecorded)),
+        Ok(opened) => {
+            unrecorded.escrows.note_live(opened.state.pool_id);
+            Ok((opened, unrecorded))
+        }
         // An open with no `PoolOpened` event is held untracked before its
         // entry is released.
         Err(err) if err.downcast_ref::<EscrowUntracked>().is_some() => {
@@ -945,6 +948,10 @@ impl std::fmt::Display for EscrowUnconfirmed {
 /// command that ends while the handle holds one names it too: a re-run reads
 /// the uncredited row and escrows again.
 ///
+/// The handle also names every pool a run on it saw live (`saw_live`): a pool
+/// it opened or topped up, or read on chain as this wallet's. A later read that shows no
+/// record of such a pool is a lagging RPC, not a pool that is gone.
+///
 /// A clone shares the same lists, so one handle can outlive the per-pass state
 /// that the transactions run under.
 #[derive(Debug, Default, Clone)]
@@ -956,6 +963,8 @@ struct Shared {
     pending: Mutex<Vec<EscrowUnconfirmed>>,
     /// Oldest first, one per tx. An entry is never removed.
     untracked: Mutex<Vec<UntrackedEscrow>>,
+    /// One entry per pool. An entry is never removed.
+    live: Mutex<Vec<PoolId>>,
 }
 
 /// An `openPool` or `topUp` that mined and escrowed USDC that no local record
@@ -1108,6 +1117,31 @@ impl UnconfirmedEscrows {
                 EscrowUnconfirmed::Open(_) => None,
             })
             .collect()
+    }
+
+    /// Record that a run on the handle saw `pool_id` live: it opened or topped
+    /// up the pool, or read it on chain as this wallet's.
+    pub(crate) fn note_live(&self, pool_id: PoolId) {
+        let mut live = self.0.live.lock().unwrap_or_else(PoisonError::into_inner);
+        if !live.contains(&pool_id) {
+            live.push(pool_id);
+        }
+    }
+
+    /// Whether a run on the handle saw `pool_id` live ([`Self::note_live`]).
+    pub(crate) fn saw_live(&self, pool_id: PoolId) -> bool {
+        self.0
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&pool_id)
+    }
+
+    /// Hold `escrow` as a submitted transaction no record credits yet, for a
+    /// test of a step that a pending escrow refuses.
+    #[cfg(test)]
+    pub(crate) fn hold_pending_for_test(&self, escrow: impl Into<EscrowUnconfirmed>) {
+        self.insert(escrow);
     }
 
     /// Hold `escrow` from its submit.
@@ -1573,7 +1607,11 @@ pub(crate) async fn top_up_unless_ended<P: Provider + Clone>(
         entry: unconfirmed.into(),
     };
     match topped_up_from_receipt(&receipt, *contract.address(), pool_id, additional) {
-        Ok(topped_up) => Ok((topped_up, unrecorded)),
+        // The contract credited this owner's pool, so the chain knows it.
+        Ok(topped_up) => {
+            unrecorded.escrows.note_live(pool_id);
+            Ok((topped_up, unrecorded))
+        }
         // A revert escrowed nothing.
         Err(err) => {
             unrecorded.release();
