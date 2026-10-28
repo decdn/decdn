@@ -340,7 +340,7 @@ pub use peer_store::{PeerRecord, PeerStore, StoreConfig};
 #[doc(hidden)]
 pub use ranged_store::ClientRangedStore;
 #[doc(hidden)]
-pub use rate_limited::UpstreamRateLimited;
+pub use rate_limited::{UpstreamRateLimited, UpstreamTimestampRejected};
 #[doc(hidden)]
 pub use recovery::{RECOVERY_SETTLE, Stepped};
 #[doc(hidden)]

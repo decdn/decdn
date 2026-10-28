@@ -28,8 +28,10 @@
 //! Negatives, all built from the *same real* daemon output so they test the
 //! judge and not the test's own forgery skills:
 //!
-//! - a genuine probe stamped 40s before the stream is rejected
-//!   (`TimestampWindowViolated`) — the 30s window is enforced on real evidence;
+//! - a genuine pair whose requester timestamps sit just past the 30s window
+//!   (each one valid against the daemon's clock when it was captured) is
+//!   rejected (`TimestampWindowViolated`) — the window is enforced on real
+//!   evidence;
 //! - the real probe with its signature swapped for one from an unrelated key is
 //!   rejected (`InvalidProbeSignature`);
 //! - the real stream with its signature swapped for a non-operator's is rejected
@@ -86,6 +88,7 @@ use decdn_e2e::node::NodeFixture;
 use decdn_e2e::time;
 use decdn_incentive::stream_sig::StreamSlashData;
 use decdn_incentive::{ProbeSlashData, slash_judge_domain};
+use decdn_node::handlers::timestamp_skew::{MAX_REQUEST_TIMESTAMP_SKEW_US, now_us};
 use decdn_protocol::ProbeResponse;
 use decdn_protocol::client::StreamResponse;
 
@@ -97,6 +100,42 @@ const BASE_RATE_PER_MB: u64 = 10;
 /// The switched-to rate. Comfortably inside the deployed `[1, 1000]` on-chain
 /// delivery band, so the daemon signs it unclamped.
 const SWITCHED_RATE_PER_MB: u64 = 40;
+
+/// `SlashJudge.sol`'s `SLASH_WINDOW_US`: the judge reverts a pair whose
+/// stream timestamp is at least this far after the probe's. Mirrored here so
+/// the out-of-window pair is derived from the bound it must violate.
+const SLASH_WINDOW_US: u64 = 30_000_000;
+
+/// How far in the future the in-window probe is stamped. The daemon admits it
+/// for 50s after the clock read, and every later capture may be stamped up to
+/// this much after the read without leaving the probe's window.
+const PROBE_FUTURE_US: u64 = 20_000_000;
+
+/// How far in the past a post-restart capture is stamped once the probe's
+/// timestamp is older than that: the capture's budget to reach the daemon.
+const CAPTURE_BUDGET_US: u64 = 15_000_000;
+
+/// The timestamp for a capture after the rate-switch restart, read right
+/// before it is sent: the probe's timestamp, or [`CAPTURE_BUDGET_US`] in the
+/// past once that is later. It must stay inside the judge's window after
+/// `probe_ts`, so a restart slower than the window allows fails here, with
+/// the time it took, rather than as an opaque daemon refusal.
+fn capture_ts(probe_ts: u64, probe_clock: std::time::Instant, what: &str) -> anyhow::Result<u64> {
+    let ts = probe_ts.max(now_us() - CAPTURE_BUDGET_US);
+    let since_probe = probe_clock.elapsed().as_secs_f64();
+    tracing::info!(
+        what,
+        since_probe_s = since_probe,
+        "G-GOV-03: stamping a capture"
+    );
+    anyhow::ensure!(
+        ts < probe_ts + SLASH_WINDOW_US,
+        "the {what} capture started {since_probe:.1}s after the probe's clock read, too late \
+         to stamp a timestamp the daemon admits inside the probe's 30s window: the \
+         rate-switch daemon restart was too slow"
+    );
+    Ok(ts)
+}
 
 /// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule). The
 /// journey runs a full deploy, a daemon, and several commit-reveal challenges,
@@ -136,18 +175,39 @@ async fn run() -> anyhow::Result<()> {
     // a real `ok: true` delivery response below.
     let (session, _) = client.open_session(&chain, &node, hash).await?;
 
-    // Anchor evidence timestamps to chain time. The judge's staleness bound and
-    // its future-skew guard compare against `block.timestamp`; the 30s window is
-    // computed purely between the two evidence timestamps.
-    let now_us = chain.head_timestamp().await? * 1_000_000;
-    let probe_ts = now_us;
-    let stream_ts = now_us + 1_000_000; // +1s, well inside the 30s window
-    let stale_probe_ts = now_us - 40_000_000; // -40s, deliberately outside it
+    // Anchor evidence timestamps to the host's wall clock, which is the
+    // daemon's clock AND (bar the later commit-reveal warps, which only push
+    // chain time forward and so only age the evidence — the staleness bound
+    // is a day at minimum) anvil's `block.timestamp`. The daemon signs a
+    // request's timestamp only when it sits within its ±30s clock-skew bound
+    // (`MAX_REQUEST_TIMESTAMP_SKEW_US`) of its own clock at the moment the
+    // request arrives. The judge's 30s pairing window is computed purely
+    // between the two evidence timestamps. So each timestamp below uses the
+    // daemon's bound to give the slow step — the rate-switch restart — as much
+    // room as the judge's window allows:
+    //
+    // - the stale probe is stamped 20s in the past (10s of capture budget);
+    // - the probe is stamped 20s in the FUTURE (admitted while the daemon's
+    //   clock is up to 50s past the read);
+    // - the delivery and the refusal after the restart are stamped at the
+    //   probe's timestamp, or 15s in the past once that is later (15s of
+    //   capture budget each). Both must stay inside the probe's 30s window, so
+    //   each capture must start within ~65s of the probe's clock read, restart
+    //   included.
+    //
+    // Every timestamp after the stale probe's sits at least 40s after it, so
+    // the stale probe and the delivery are the out-of-window pair.
+    let stale_probe_ts = now_us() - (MAX_REQUEST_TIMESTAMP_SKEW_US - 10_000_000);
 
     // Real probes at the CONFIGURED rate, captured before the switch. The stale
     // one (same content, only the requester timestamp differs) feeds the
     // out-of-window negative.
-    let stale_probe = client.probe_at(&node, hash, stale_probe_ts).await?;
+    let stale_probe = client
+        .probe_at(&node, hash, stale_probe_ts)
+        .await
+        .context("stale probe must reach the daemon within 10s of its clock read (skew bound)")?;
+    let probe_clock = std::time::Instant::now();
+    let probe_ts = now_us() + PROBE_FUTURE_US;
     let probe = client.probe_at(&node, hash, probe_ts).await?;
     anyhow::ensure!(
         probe.body.has_blob && stale_probe.body.has_blob,
@@ -181,9 +241,17 @@ async fn run() -> anyhow::Result<()> {
     // quoted `BASE_RATE_PER_MB` in the probe and now commits to deliver at
     // `SWITCHED_RATE_PER_MB`. (A refusal here would be inert — rate manipulation
     // requires a delivery.)
+    let stream_ts = capture_ts(probe_ts, probe_clock, "delivery")?;
     let stream = client
         .capture_delivery_response(&session, hash, U256::ZERO, stream_ts)
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "delivery capture must reach the daemon within 15s of its clock read (skew \
+                 bound); {:.1}s since the probe's clock read",
+                probe_clock.elapsed().as_secs_f64()
+            )
+        })?;
     anyhow::ensure!(stream.body.ok, "the captured delivery must be ok:true");
     anyhow::ensure!(
         stream.body.hash == *hash.as_bytes(),
@@ -194,6 +262,31 @@ async fn run() -> anyhow::Result<()> {
         "the daemon must have signed the raised rate: probe {} vs stream {}",
         probe.body.rate_per_mb,
         stream.body.rate_per_mb
+    );
+
+    // The real signed REFUSAL feeding negative (2c) below, captured here —
+    // right after the delivery, while the probe's 30s window is still open —
+    // rather than between the challenge legs. The daemon signed `ok: false`
+    // for a hash it does not hold, at the raised rate, against the base-rate
+    // probe it issued for that same hash.
+    let refusal_ts = capture_ts(probe_ts, probe_clock, "refusal")?;
+    let refusal = client
+        .refused_stream(&chain, &node, session.pool_id(), absent, refusal_ts)
+        .await
+        .with_context(|| {
+            format!(
+                "refusal capture must reach the daemon within 15s of its clock read (skew \
+                 bound); {:.1}s since the probe's clock read",
+                probe_clock.elapsed().as_secs_f64()
+            )
+        })?;
+    anyhow::ensure!(!refusal.body.ok, "the captured refusal must be ok:false");
+    anyhow::ensure!(
+        refusal.body.rate_per_mb > absent_probe.body.rate_per_mb,
+        "the refusal must quote the raised rate so only the ok-guard can reject: \
+         probe {} vs stream {}",
+        absent_probe.body.rate_per_mb,
+        refusal.body.rate_per_mb
     );
 
     // ================================================================
@@ -219,7 +312,9 @@ async fn run() -> anyhow::Result<()> {
         )
         .await
         .err()
-        .ok_or_else(|| anyhow::anyhow!("a 40s-apart probe/stream pair must not be slashable"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("a pair spread past the 30s window must not be slashable")
+        })?;
     expect_revert_anyhow::<SlashJudgeRate::TimestampWindowViolated>(&err, "out-of-window pair")?;
     assert_challenge_cost_nothing(&chain, out_of_window.address(), bond).await?;
 
@@ -279,25 +374,15 @@ async fn run() -> anyhow::Result<()> {
     )?;
     assert_challenge_cost_nothing(&chain, stream_forger.address(), bond).await?;
 
-    // (2c) A real, correctly-signed REFUSAL is inert. The daemon signed
-    // `ok: false` for a hash it does not hold, at the raised rate, inside the
-    // window, against the probe it issued for that same hash at the base rate.
-    // Every other leg of the rate predicate passes — same hash, same operator,
-    // real signatures, and `stream.ratePerMb > probe.ratePerMb` — so
-    // `NotRateManipulation` here can only be the `!s.ok` guard firing. This is
-    // what lets a node sign refusals freely (ADR 014 § Rate manipulation): you
-    // cannot overcharge on a delivery you declined.
-    let refusal = client
-        .refused_stream(&chain, &node, session.pool_id(), absent, stream_ts)
-        .await?;
-    anyhow::ensure!(!refusal.body.ok, "the captured refusal must be ok:false");
-    anyhow::ensure!(
-        refusal.body.rate_per_mb > absent_probe.body.rate_per_mb,
-        "the refusal must quote the raised rate so only the ok-guard can reject: \
-         probe {} vs stream {}",
-        absent_probe.body.rate_per_mb,
-        refusal.body.rate_per_mb
-    );
+    // (2c) A real, correctly-signed REFUSAL is inert. The refusal (captured
+    // above) is for a hash the daemon does not hold, at the raised rate,
+    // inside the window, against the probe it issued for that same hash at
+    // the base rate. Every other leg of the rate predicate passes — same
+    // hash, same operator, real signatures, and
+    // `stream.ratePerMb > probe.ratePerMb` — so `NotRateManipulation` here
+    // can only be the `!s.ok` guard firing. This is what lets a node sign
+    // refusals freely (ADR 014 § Rate manipulation): you cannot overcharge on
+    // a delivery you declined.
     let refusal_challenger = PrivateKeySigner::random();
     let err = chain
         .challenge_with_real_evidence(

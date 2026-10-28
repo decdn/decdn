@@ -1772,9 +1772,13 @@ impl ChainFixture {
     /// challenger's TOKEN balance directly.
     ///
     /// **Side effect:** advances chain time ~65s on *every* call, including ones
-    /// that revert, to mature the commitment past `MIN_REVEAL_DELAY`. A journey
-    /// that captures evidence *between* challenges is working against a drifted
-    /// clock; anchor every capture with a fresh [`Self::head_timestamp`].
+    /// that revert, to mature the commitment past `MIN_REVEAL_DELAY`. Chain time
+    /// only drifts *ahead* of the wall clock, so a daemon capture between
+    /// challenges must NOT anchor on [`Self::head_timestamp`] — the daemon
+    /// refuses a timestamp more than its clock-skew bound from the wall clock.
+    /// Stamp daemon captures from the wall clock (which evidence then ages
+    /// against the evidence-age ceiling); read chain time only for evidence
+    /// built and signed locally in the test.
     pub async fn challenge_with_real_evidence(
         &self,
         challenger: &PrivateKeySigner,

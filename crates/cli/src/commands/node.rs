@@ -1615,8 +1615,9 @@ async fn probe_and_rank(
             }),
             Err(e) => {
                 eprintln!(
-                    "warning: probe of node {} failed: {e}",
-                    short_node_id(&node_id_hex(&c.node_id))
+                    "warning: probe of node {} failed: {}",
+                    short_node_id(&node_id_hex(&c.node_id)),
+                    decdn_common::redact::sanitize_err_chain(&e)
                 );
                 rows.push(LookupRow {
                     node_id: c.node_id,

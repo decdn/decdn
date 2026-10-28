@@ -87,6 +87,7 @@ use decdn_incentive::{
 use decdn_node::buyer_pool::BuyerPoolService;
 use decdn_node::chain_events::boot_retry::BootRetry;
 use decdn_node::chain_events::shared_head::{HeadSource, SharedHead};
+use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
 use decdn_node::payment_settlement::PoolSettlementService;
 use decdn_node::pool_store::{Deployment, PersistentPoolStateStore};
@@ -865,7 +866,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         node_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffe1,
+        now_us(),
         Duration::from_secs(30),
     )
     .await?;
@@ -1008,7 +1009,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         node_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffe2,
+        now_us(),
         Duration::from_secs(30),
     )
     .await?;
@@ -1346,7 +1347,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         node_addr,
         *hash.as_bytes(),
         MIB as u64,
-        0x00c0_ffe3,
+        now_us(),
         Duration::from_secs(30),
     )
     .await?;

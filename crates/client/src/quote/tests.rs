@@ -29,6 +29,7 @@ fn census_of(answers: Vec<NodeAnswer>) -> HashCensus {
         answers,
         unreachable: 0,
         rate_limited: 0,
+        clock_skewed: 0,
         unverifiable: 0,
         unusable: 0,
     }
@@ -255,6 +256,7 @@ fn tally_sorts_outcomes_by_hash() {
         (0, cand(4, 4), ProbeOutcome::RateLimited),
         (0, cand(5, 5), ProbeOutcome::Unverifiable),
         (1, cand(6, 6), ProbeOutcome::Unusable),
+        (1, cand(8, 8), ProbeOutcome::ClockSkewed),
         // An index past the hashes is dropped.
         (9, cand(7, 7), ProbeOutcome::Unreachable),
     ];
@@ -273,6 +275,7 @@ fn tally_sorts_outcomes_by_hash() {
     assert_eq!(second.answers[0].rate_per_mb, 21);
     assert!(!second.answers[0].has_blob);
     assert_eq!((second.unreachable, second.unusable), (1, 1));
+    assert_eq!((first.clock_skewed, second.clock_skewed), (0, 1));
 }
 
 /// The peer-store harvest takes one sample per node, at its lowest RTT.
@@ -336,6 +339,46 @@ fn unanswered_names_unverifiable_answers() {
             .is_some(),
         "{err}"
     );
+}
+
+/// A census whose nodes refuse this machine's timestamp fails with a typed
+/// local fault that names the clock, not "N did not answer" — once at least
+/// three nodes refuse. Two refusers stay the ordinary error with the hint.
+#[test]
+fn unanswered_names_the_clock_when_the_nodes_refuse_the_timestamp() {
+    let census = Census {
+        probed: 3,
+        hashes: vec![HashCensus {
+            clock_skewed: 3,
+            ..census_of(Vec::new())
+        }],
+        outage_fallback: false,
+    };
+    let err = unanswered(&census).unwrap();
+    assert!(
+        err.downcast_ref::<crate::targets::ResolveConfigFault>()
+            .is_some(),
+        "{err}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("clock"), "{msg}");
+    assert!(!msg.contains("did not answer"), "{msg}");
+
+    let two = Census {
+        probed: 2,
+        hashes: vec![HashCensus {
+            clock_skewed: 2,
+            ..census_of(Vec::new())
+        }],
+        outage_fallback: false,
+    };
+    let err = unanswered(&two).unwrap();
+    assert!(
+        err.downcast_ref::<crate::targets::ResolveConfigFault>()
+            .is_none(),
+        "two refusers must not end the command: {err}"
+    );
+    assert!(err.to_string().contains("time server"), "{err}");
 }
 
 /// The store's rate stands for a node unless its last failure still

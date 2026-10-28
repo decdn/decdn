@@ -38,6 +38,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod support;
+use decdn_node::handlers::timestamp_skew::now_us;
 use support::{
     HandlerDomains, build_handler_full, fresh_key, local_endpoint, permissive_limiter,
     read_client_msg, read_stream_response, shutdown, spawn_server, write_client_msg,
@@ -144,7 +145,7 @@ async fn ranged_paid_pull(
         pool_id: pool_id.into(),
         byte_offset,
         byte_len,
-        timestamp_us: 0x9001,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;

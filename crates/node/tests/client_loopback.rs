@@ -78,6 +78,7 @@ use iroh::protocol::ProtocolHandler as _;
 use iroh::{Endpoint, EndpointAddr};
 
 mod support;
+use decdn_node::handlers::timestamp_skew::{MAX_REQUEST_TIMESTAMP_SKEW_US, now_us};
 use decdn_node::receipt_log::{DownloadReceipt, spawn_receipt_writer};
 use support::{
     BlockingReceiptLog, BufferedClientReader, FailingReceiptLog, FailingRecordStore,
@@ -356,7 +357,7 @@ async fn client_delivery_roundtrip_advances_lane_state() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -474,7 +475,7 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
         server_eth.address(),
         *hash_a.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -501,7 +502,7 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
         server_eth.address(),
         *hash_b.as_bytes(),
         0,
-        0x00c0_ffef,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -847,19 +848,19 @@ async fn restarted_sub_chunk_transfer(earlier: u64) -> anyhow::Result<()> {
             .await
         }
     };
-    for timestamp_us in 0x7771..0x7771 + earlier {
+    for _ in 0..earlier {
         let mut ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
         if let Some(lane) = store.load_all()?.first() {
             ctx.prior_amount = lane.last_amount();
             ctx.prior_bytes_delivered = lane.last_bytes_delivered();
         }
-        let got = fetch(ctx, timestamp_us, Duration::from_secs(20)).await?;
+        let got = fetch(ctx, now_us(), Duration::from_secs(20)).await?;
         anyhow::ensure!(got.as_ref() == payload.as_slice());
     }
 
     // The restarted payer: its watermark is gone.
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
-    let got = fetch(ctx, 0x7770, Duration::from_secs(8)).await?;
+    let got = fetch(ctx, now_us(), Duration::from_secs(8)).await?;
     anyhow::ensure!(
         got.as_ref() == payload.as_slice(),
         "the restarted payer must reseed and recover the blob"
@@ -1029,7 +1030,7 @@ async fn open_paid_range_stream(
         pool_id: pool_id().into(),
         byte_offset,
         byte_len,
-        timestamp_us: 0x0012_61a0,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, ext).map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
@@ -2500,7 +2501,7 @@ async fn stall_delivery_at_closing_voucher(
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x0012_61a0,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, ext).map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
@@ -2638,7 +2639,7 @@ async fn open_expecting_refusal(
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x0012_61a0,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, ext).map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
@@ -2676,7 +2677,7 @@ async fn race_two_same_lane_opens(
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x0012_61a0,
+        timestamp_us: now_us(),
     };
     let req_b = StreamRequest {
         hash: hash_b,
@@ -2684,7 +2685,7 @@ async fn race_two_same_lane_opens(
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x0012_61a0,
+        timestamp_us: now_us(),
     };
     let payload_a = encode_stream_request(&req_a, Some(ext))
         .map_err(|e| anyhow::anyhow!("encode request a: {e}"))?;
@@ -3700,7 +3701,7 @@ async fn empty_blob_delivery(max_blob_size_bytes: u64) -> anyhow::Result<()> {
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c0_ffee,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(20)),
         max_blob_size_bytes,
         0,
@@ -3813,7 +3814,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c0_ffee,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(20)),
         0,
         0,
@@ -3951,7 +3952,7 @@ async fn accepted_voucher_advances_lane_activity_clock() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -4046,7 +4047,7 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -4197,7 +4198,7 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
             server_eth.address(),
             *hash.as_bytes(),
             0,
-            0x00c0_ffee,
+            now_us(),
             Duration::from_secs(20),
         ),
     )
@@ -4286,7 +4287,7 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -4367,7 +4368,7 @@ async fn client_reused_lane_resumes() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x1111,
+        now_us(),
         Duration::from_secs(15),
     )
     .await?;
@@ -4401,7 +4402,7 @@ async fn client_reused_lane_resumes() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x2222,
+        now_us(),
         Duration::from_secs(15),
     )
     .await?;
@@ -4491,7 +4492,7 @@ async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Resu
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x1111,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -4527,7 +4528,7 @@ async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Resu
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x2222,
+        now_us(),
         Duration::from_secs(8),
     )
     .await?;
@@ -4605,7 +4606,7 @@ async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x3333,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -4629,7 +4630,7 @@ async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x4444,
+        now_us(),
         Duration::from_secs(8),
     )
     .await?;
@@ -4762,7 +4763,7 @@ async fn a_restarted_payer_beside_a_live_sibling_heals_below_the_anchor() -> any
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x5555,
+        now_us(),
         Duration::from_secs(8),
     )
     .await?;
@@ -4898,7 +4899,7 @@ async fn resume_under_a_live_chain(above_anchor: u64) -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x5555,
+        now_us(),
         Duration::from_secs(8),
     )
     .await?;
@@ -4986,7 +4987,7 @@ async fn an_unadopted_chain_past_the_bundle_is_retired_and_the_pull_completes() 
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x2257,
+        now_us(),
         Duration::from_secs(8),
     )
     .await
@@ -5056,11 +5057,11 @@ async fn a_process_that_exits_before_its_last_persist_heals_in_one_rejection() -
             0,
         )
     };
-    fetch_shared(hash_a, 0x2169_0001)
+    fetch_shared(hash_a, now_us())
         .await
         .map_err(|e| anyhow::anyhow!("entry A: {e:#}"))?;
     let persisted = ledger.committed();
-    fetch_shared(hash_b, 0x2169_0002)
+    fetch_shared(hash_b, now_us())
         .await
         .map_err(|e| anyhow::anyhow!("entry B: {e:#}"))?;
     let node_claim = store
@@ -5087,7 +5088,7 @@ async fn a_process_that_exits_before_its_last_persist_heals_in_one_rejection() -
         server_eth.address(),
         *hash_a.as_bytes(),
         0,
-        0x2169_0003,
+        now_us(),
         Duration::from_secs(8),
     )
     .await
@@ -5174,7 +5175,7 @@ async fn client_byte_offset_returns_suffix_multi_group() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         offset,
-        0xfeed,
+        now_us(),
         Duration::from_secs(15),
     )
     .await?;
@@ -5264,7 +5265,7 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         offset,
-        0xfeed,
+        now_us(),
         Duration::from_secs(15),
     )
     .await?;
@@ -5348,7 +5349,7 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x1234,
+        now_us(),
         Duration::from_secs(10),
     )
     .await
@@ -5397,7 +5398,7 @@ async fn client_unknown_lane_is_rejected() -> anyhow::Result<()> {
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x5678,
+        timestamp_us: now_us(),
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), resp_ext) => {
@@ -5484,7 +5485,7 @@ async fn client_underfunded_pool_is_refused_pre_serve() -> anyhow::Result<()> {
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x1516,
+        timestamp_us: now_us(),
     };
     // Raw, so the server's FIRST reply is read directly: an `ok: true` here would
     // mean bytes were already committed to the wire.
@@ -5573,7 +5574,7 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x2C01,
+        now_us(),
         Duration::from_secs(10),
     )
     .await?;
@@ -5637,7 +5638,7 @@ async fn client_deposit_gate_reserves_only_the_floor_by_default() -> anyhow::Res
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x1477,
+        timestamp_us: now_us(),
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), _resp_ext) => anyhow::ensure!(
@@ -5698,7 +5699,7 @@ async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyh
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x1477,
+        timestamp_us: now_us(),
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), _resp_ext) => anyhow::ensure!(
@@ -5767,7 +5768,7 @@ async fn client_spent_down_pool_is_refused_pre_serve() -> anyhow::Result<()> {
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x5D01,
+        timestamp_us: now_us(),
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), _resp_ext) => anyhow::ensure!(
@@ -5843,7 +5844,7 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
         pool_id: pool_id().into(),
         byte_offset: TAIL_OFFSET,
         byte_len: 0,
-        timestamp_us: 0x9E01,
+        timestamp_us: now_us(),
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), resp_ext) => anyhow::ensure!(
@@ -5914,7 +5915,7 @@ async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> 
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0xB001,
+        timestamp_us: now_us(),
     };
     // Only the pre-serve verdict is asserted. The transfer may still stop at a
     // later voucher — the ceiling is priced in content bytes while vouchers bill
@@ -5997,7 +5998,7 @@ async fn client_store_record_failure_aborts_the_stream() -> anyhow::Result<()> {
             server_eth.address(),
             *hash.as_bytes(),
             0,
-            0x9abc,
+            now_us(),
             Duration::from_secs(10),
         )
         .await
@@ -6075,7 +6076,7 @@ async fn fetch_on_a_lane_expiring_at(expiry: u64) -> anyhow::Result<Option<Strin
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x9abd,
+        now_us(),
         Duration::from_secs(10),
     )
     .await
@@ -6936,7 +6937,7 @@ async fn a_mid_stream_pool_exhausted_keeps_the_proofs_the_node_accepted() -> any
             drained.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     });
-    let err = fetch(0x2664_0001)
+    let err = fetch(now_us())
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("the drained pool must stop the fetch"))?;
@@ -6981,7 +6982,7 @@ async fn a_mid_stream_pool_exhausted_keeps_the_proofs_the_node_accepted() -> any
     drained.store(false, std::sync::atomic::Ordering::Relaxed);
     let generation = ledger.generation();
     let rejected_before = counter(&metrics, "decdn_serve_stream_voucher_rejected_total")?;
-    let got = fetch(0x2664_0002)
+    let got = fetch(now_us())
         .await
         .map_err(|e| anyhow::anyhow!("resumed fetch: {e:#}"))?;
     anyhow::ensure!(got.as_ref() == payload.as_slice(), "resumed bytes match");
@@ -7496,7 +7497,7 @@ async fn buyer_aborts_oversized_small_blob_without_paying() -> anyhow::Result<()
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c1,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(10)),
         16 * 1024,
         0,
@@ -7552,7 +7553,7 @@ async fn buyer_pays_for_received_bytes_then_aborts_over_ceiling() -> anyhow::Res
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c2,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(10)),
         ceiling,
         0,
@@ -7611,7 +7612,7 @@ async fn buyer_rejects_over_ceiling_rate() -> anyhow::Result<()> {
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c4,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(10)),
         0,
         buyer_ceiling,
@@ -7687,7 +7688,7 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c2,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(10)),
         u64::try_from(payload.len())?,
         0,
@@ -7924,7 +7925,7 @@ async fn buyer_accepts_rate_at_exact_ceiling() -> anyhow::Result<()> {
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c5,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(10)),
         0,
         RATE_PER_MB, // ceiling == quote → accepted
@@ -7977,7 +7978,7 @@ async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c3,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(10)),
         0, // unlimited buyer blob-size ceiling
         0, // unlimited buyer rate ceiling
@@ -8131,7 +8132,7 @@ async fn denylisted_hash_is_refused_even_when_held() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00e2,
+        now_us(),
         Duration::from_secs(10),
     )
     .await
@@ -8188,7 +8189,7 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00e4,
+        now_us(),
         Duration::from_secs(10),
     )
     .await
@@ -8259,7 +8260,7 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
             server_addr,
             hash_bytes,
             0,
-            0x00e5,
+            now_us(),
             Duration::from_secs(30),
         )
         .await
@@ -8337,7 +8338,7 @@ async fn blacklisted_funder_is_refused_on_a_cache_miss() -> anyhow::Result<()> {
         server_eth.address(),
         [0x5a; 32], // never cached — the miss path
         0,
-        0x00e3,
+        now_us(),
         Duration::from_secs(10),
     )
     .await
@@ -8380,7 +8381,7 @@ async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00e1,
+        now_us(),
         Duration::from_secs(10),
     )
     .await
@@ -8435,7 +8436,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x00ba_d001,
+        timestamp_us: now_us(),
     };
     let res = raw_request(&client_ep, target, &req, Some(&ext)).await;
     anyhow::ensure!(
@@ -8443,6 +8444,312 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
         "a binding recovering a different address must reset the stream, got {res:?}"
     );
 
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Clock-skew gate (`handlers::timestamp_skew`): a stream request whose
+/// `timestamp_us` sits beyond the node's clock-skew bound — in either
+/// direction — is a client fault. The node resets the stream with
+/// `TIMESTAMP_SKEW` (0x04, ADR 013) and NO signed response (every signed
+/// `StreamResponseBody`, refusals included, echoes the requester's timestamp
+/// into the slash-evidence set, ADR 014 §1). A fresh-stamped request on the
+/// same handler then draws a signed response, pinning the resets to the
+/// timestamp alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_request_with_skewed_timestamp_resets_without_response() -> anyhow::Result<()> {
+    let payload = b"skewed timestamps never draw a signed response".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, _owner, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+
+    let request_at = |timestamp_us| StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us,
+    };
+
+    // 5s past the bound on each side: far enough that loopback latency can
+    // never carry the request back inside it. Each is computed right before
+    // its request is sent.
+    let skewed: [fn() -> u64; 2] = [stale_timestamp_us, future_timestamp_us];
+    for timestamp_us in skewed {
+        expect_skew_reset(
+            &client_ep,
+            target.clone(),
+            &request_at(timestamp_us()),
+            None,
+        )
+        .await?;
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_timestamp_skew_total 2"
+        ),
+        "each skew reset must bump its reason counter"
+    );
+
+    // Same handler, same blob, fresh timestamp: a signed response arrives, so
+    // the resets above can only be the timestamp gate.
+    match raw_request(&client_ep, target.clone(), &request_at(now_us()), None).await? {
+        (ClientMessage::StreamResponse(resp), _ext) => {
+            anyhow::ensure!(
+                resp.body.timestamp_us.abs_diff(now_us()) <= MAX_REQUEST_TIMESTAMP_SKEW_US,
+                "the signed response echoes a node-clock-consistent timestamp"
+            );
+        }
+        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
+    }
+
+    // A timestamp 25 s old — inside the bound by 5 s of loopback margin — is
+    // admitted, and the signed response echoes it verbatim. The bound is
+    // inclusive of honest staleness, not just of an exact clock match. That
+    // signing never re-checks the bound is pinned by the handler's unit test
+    // `sign_response_signs_a_timestamp_far_older_than_the_skew_bound`.
+    let near_boundary = now_us().saturating_sub(MAX_REQUEST_TIMESTAMP_SKEW_US - 5_000_000);
+    match raw_request(&client_ep, target, &request_at(near_boundary), None).await? {
+        (ClientMessage::StreamResponse(resp), _ext) => {
+            anyhow::ensure!(
+                resp.body.timestamp_us == near_boundary,
+                "the signed response echoes the admitted near-boundary timestamp verbatim"
+            );
+        }
+        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
+    }
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A timestamp 5 s older than the node's clock-skew bound allows.
+fn stale_timestamp_us() -> u64 {
+    now_us().saturating_sub(MAX_REQUEST_TIMESTAMP_SKEW_US + 5_000_000)
+}
+
+/// A timestamp 5 s further ahead than the node's clock-skew bound allows.
+fn future_timestamp_us() -> u64 {
+    now_us() + MAX_REQUEST_TIMESTAMP_SKEW_US + 5_000_000
+}
+
+/// Send `req` on a fresh connection and assert the node resets the stream with
+/// `TIMESTAMP_SKEW` and sends no frame first: no signed response, not even a
+/// refusal.
+async fn expect_skew_reset(
+    client_ep: &Endpoint,
+    target: EndpointAddr,
+    req: &StreamRequest,
+    ext: Option<&StreamRequestExt>,
+) -> anyhow::Result<()> {
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let payload = encode_stream_request(req, ext)?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    assert_stream_reset(&mut recv, decdn_protocol::APP_ERR_TIMESTAMP_SKEW).await
+}
+
+/// The timestamp gate runs before every signed refusal. A request the node
+/// would refuse with a signed `ok: false` — an unknown lane (`NotFound`) or a
+/// denylisted hash (`Declined`) — still resets with `TIMESTAMP_SKEW` and no
+/// signed body when its timestamp is skewed, because that signed refusal
+/// would echo the skewed timestamp. The same request with a fresh timestamp
+/// then draws the signed refusal, so the gate, not the refusal, produced the
+/// reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_timestamp_gate_precedes_every_signed_refusal() -> anyhow::Result<()> {
+    // Unknown lane: a bound client whose lane is not in the (empty) store.
+    let payload = b"a lane the node has never seen".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&PrivateKeySigner::random(), client_node_id)?;
+    let request_at = |timestamp_us| StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us,
+    };
+    expect_skew_reset(
+        &client_ep,
+        target.clone(),
+        &request_at(stale_timestamp_us()),
+        Some(&ext),
+    )
+    .await?;
+    expect_signed_refusal(
+        &client_ep,
+        target,
+        &request_at(now_us()),
+        Some(&ext),
+        StreamError::NotFound,
+    )
+    .await?;
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&text, "decdn_serve_stream_rejected_timestamp_skew_total 1")
+            && metric_line_present(&text, "decdn_serve_stream_rejected_unknown_lane_total 1"),
+        "the skewed request counts only as a skew reset, the fresh one as an unknown lane"
+    );
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+
+    // Denylisted hash: held, but under a local takedown order.
+    let payload = b"content under a local takedown order".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    cache.set_denied(&denied_hashes(&[hash]));
+    let (store, _owner, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let request_at = |timestamp_us| StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us,
+    };
+    expect_skew_reset(
+        &client_ep,
+        target.clone(),
+        &request_at(future_timestamp_us()),
+        None,
+    )
+    .await?;
+    expect_signed_refusal(
+        &client_ep,
+        target,
+        &request_at(now_us()),
+        None,
+        StreamError::Declined,
+    )
+    .await?;
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&text, "decdn_serve_stream_rejected_timestamp_skew_total 1")
+            && metric_line_present(&text, "decdn_serve_stream_rejected_hash_denied_total 1"),
+        "the skewed request counts only as a skew reset, the fresh one as a takedown"
+    );
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Send `req` and assert the node answers with a signed `ok: false`
+/// `StreamResponse` carrying `expected`.
+async fn expect_signed_refusal(
+    client_ep: &Endpoint,
+    target: EndpointAddr,
+    req: &StreamRequest,
+    ext: Option<&StreamRequestExt>,
+    expected: StreamError,
+) -> anyhow::Result<()> {
+    match raw_request(client_ep, target, req, ext).await? {
+        (ClientMessage::StreamResponse(resp), resp_ext) => {
+            anyhow::ensure!(!resp.body.ok, "expected a refusal, got a serve");
+            anyhow::ensure!(!resp.slash_sig.is_empty(), "the refusal must be signed");
+            anyhow::ensure!(
+                resp.body.timestamp_us == req.timestamp_us,
+                "the signed refusal echoes the request timestamp"
+            );
+            anyhow::ensure!(
+                resp_ext.error.as_ref() == Some(&expected),
+                "expected {expected:?}, got {:?}",
+                resp_ext.error
+            );
+            Ok(())
+        }
+        other => anyhow::bail!("expected a signed StreamResponse refusal, got {other:?}"),
+    }
+}
+
+/// The requester types a stream-path `TIMESTAMP_SKEW` reset as
+/// [`decdn_client::UpstreamTimestampRejected`], and the gate runs per stream,
+/// not per connection: on one warm connection a fresh-stamped fetch is served,
+/// a stale-stamped one is refused with the typed sentinel, and a fresh one
+/// after it is served again on the same connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_stream_on_a_warm_connection_is_typed_and_refused_alone() -> anyhow::Result<()> {
+    let payload = b"one warm connection, three streams".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let warm = WarmConnection::connect(&client_ep, target, Duration::from_secs(20), None).await?;
+
+    let lane_ctx = || -> anyhow::Result<PoolContext> {
+        let mut ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
+        if let Some(lane) = store.load_all()?.first() {
+            ctx.prior_amount = lane.last_amount();
+            ctx.prior_bytes_delivered = lane.last_bytes_delivered();
+        }
+        Ok(ctx)
+    };
+    let fetch = |ctx: PoolContext, timestamp_us: u64| {
+        let warm = &warm;
+        let expected = server_eth.address();
+        async move {
+            stream_fetch_on(
+                warm,
+                &ctx,
+                &slash_domain(),
+                expected,
+                *hash.as_bytes(),
+                0,
+                timestamp_us,
+                Duration::from_secs(20),
+            )
+            .await
+        }
+    };
+
+    let got = fetch(lane_ctx()?, now_us()).await?;
+    anyhow::ensure!(got.as_ref() == payload.as_slice(), "first fetch bytes");
+
+    let err = fetch(lane_ctx()?, stale_timestamp_us())
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a stale-stamped stream must be refused"))?;
+    let rejected = err
+        .downcast_ref::<decdn_client::UpstreamTimestampRejected>()
+        .ok_or_else(|| anyhow::anyhow!("the refusal must be typed: {err:#}"))?;
+    anyhow::ensure!(
+        rejected.label.is_none(),
+        "a stream reset carries no reason label: {rejected:?}"
+    );
+
+    let got = fetch(lane_ctx()?, now_us()).await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "the connection outlives the refused stream"
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_timestamp_skew_total 1"
+        ),
+        "only the stale stream is refused"
+    );
+
+    drop(warm);
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
@@ -8479,7 +8786,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x00ba_d002,
+        timestamp_us: now_us(),
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), resp_ext) => {
@@ -8586,7 +8893,7 @@ async fn binding_matching_the_delegate_signer_is_authorized() -> anyhow::Result<
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x00de_1e01,
+        timestamp_us: now_us(),
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), resp_ext) => {
@@ -8626,7 +8933,7 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x00de_1e02,
+        timestamp_us: now_us(),
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), resp_ext) => {
@@ -8688,7 +8995,7 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x00de_1e03,
+        timestamp_us: now_us(),
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), resp_ext) => {
@@ -8749,7 +9056,7 @@ async fn delegate_signed_vouchers_carry_a_delivery_to_completion() -> anyhow::Re
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00de_1e05,
+        now_us(),
         Duration::from_secs(30),
     )
     .await?;
@@ -8821,7 +9128,7 @@ async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> a
             server_addr,
             hash_bytes,
             0,
-            0x00de_1e06,
+            now_us(),
             Duration::from_secs(30),
         )
         .await
@@ -8938,7 +9245,7 @@ async fn client_concurrent_same_lane_both_succeed() -> anyhow::Result<()> {
             server_addr,
             *hash_a.as_bytes(),
             0,
-            0x00aa,
+            now_us(),
             PullDeadlines::whole_transfer(Duration::from_secs(15)),
             0,
             0,
@@ -8952,7 +9259,7 @@ async fn client_concurrent_same_lane_both_succeed() -> anyhow::Result<()> {
             server_addr,
             *hash_b.as_bytes(),
             0,
-            0x00bb,
+            now_us(),
             PullDeadlines::whole_transfer(Duration::from_secs(15)),
             0,
             0,
@@ -9033,7 +9340,7 @@ async fn honest_concurrent_rollovers_draw_no_voucher_rejection() -> anyhow::Resu
                 server_addr,
                 *hash_a.as_bytes(),
                 0,
-                0x0a00 + round,
+                now_us() + round,
                 PullDeadlines::whole_transfer(Duration::from_secs(20)),
                 0,
                 0,
@@ -9047,7 +9354,9 @@ async fn honest_concurrent_rollovers_draw_no_voucher_rejection() -> anyhow::Resu
                 server_addr,
                 *hash_b.as_bytes(),
                 0,
-                0x0b00 + round,
+                // +1 keeps the two arms' timestamps distinct even when the
+                // two `now_us()` reads land on the same microsecond.
+                now_us() + round + 1,
                 PullDeadlines::whole_transfer(Duration::from_secs(20)),
                 0,
                 0,
@@ -9115,7 +9424,7 @@ async fn a_sub_chunk_stream_on_a_live_chain_sends_only_its_closing_voucher() -> 
         )
     };
 
-    let got = fetch(big_hash, 0x2132_0001)
+    let got = fetch(big_hash, now_us())
         .await
         .map_err(|e| anyhow::anyhow!("multi-chunk pull failed: {e:?}"))?;
     anyhow::ensure!(got.as_ref() == big.as_slice(), "multi-chunk blob mismatch");
@@ -9125,7 +9434,7 @@ async fn a_sub_chunk_stream_on_a_live_chain_sends_only_its_closing_voucher() -> 
     );
 
     let before = counter(&metrics, "decdn_vouchers_received_total")?;
-    let got = fetch(small_hash, 0x2132_0002)
+    let got = fetch(small_hash, now_us())
         .await
         .map_err(|e| anyhow::anyhow!("sub-chunk pull failed: {e:?}"))?;
     anyhow::ensure!(got.as_ref() == small.as_slice(), "sub-chunk blob mismatch");
@@ -9204,7 +9513,7 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
         server_eth.address(),
         [0x42u8; 32], // a hash the node does not hold
         0,
-        0x9abc,
+        now_us(),
         Duration::from_secs(10),
     )
     .await
@@ -9391,7 +9700,7 @@ async fn pull_through_gate_authorizes_only_lane_signer() -> anyhow::Result<()> {
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x0091_1001,
+        timestamp_us: now_us(),
     };
 
     // 1) Unbound request: no binding → not authorized → pull NOT attempted.
@@ -9492,7 +9801,7 @@ async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x00de_1e04,
+        timestamp_us: now_us(),
     };
 
     // 1) Bound as the FUNDER: it holds no voucher authority here, so it must not
@@ -9645,7 +9954,7 @@ async fn underfunded_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x1519,
+        timestamp_us: now_us(),
     };
     match raw_request(&client_ep, target, &req, Some(&ext)).await? {
         (ClientMessage::StreamResponse(resp), resp_ext) => {
@@ -9725,7 +10034,7 @@ async fn funded_pool_still_reaches_the_paid_pull() -> anyhow::Result<()> {
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x151A,
+        timestamp_us: now_us(),
     };
     // `CountingOrigin` has nothing to serve, so the request still ends in a
     // refusal — but a `cache_miss` one, AFTER the origin was asked. Asserted rather
@@ -9798,7 +10107,7 @@ async fn spent_out_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x3301,
+        timestamp_us: now_us(),
     };
     let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
 
@@ -9846,7 +10155,7 @@ async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> 
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x00b1_ac11,
+        timestamp_us: now_us(),
     };
     let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
     anyhow::ensure!(
@@ -9893,7 +10202,7 @@ async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> any
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x00b2_ac11,
+        timestamp_us: now_us(),
     };
     let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
     anyhow::ensure!(
@@ -10008,7 +10317,7 @@ async fn pull_through_fills_under_deadline(
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x0091_1001,
+        timestamp_us: now_us(),
     };
     let owner_sk = fresh_key();
     let owner_node_id = B256::from(*owner_sk.public().as_bytes());
@@ -10274,7 +10583,7 @@ async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyh
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -10395,7 +10704,7 @@ async fn origin_only_node_declines_a_foreign_hash() -> anyhow::Result<()> {
         server_eth_addr,
         *foreign_hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await;
@@ -10433,7 +10742,7 @@ async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -10478,7 +10787,7 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
         server_eth_addr,
         *foreign_hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await;
@@ -10525,7 +10834,7 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -10625,7 +10934,7 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -10733,7 +11042,7 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_dec0,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -10788,7 +11097,7 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -10855,7 +11164,7 @@ async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -10993,7 +11302,7 @@ async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Res
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -11038,7 +11347,7 @@ async fn unbound_local_populate_is_refused() -> anyhow::Result<()> {
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -11087,7 +11396,7 @@ async fn local_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -11152,7 +11461,7 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -11261,7 +11570,7 @@ async fn unbound_miss_refuses_on_a_throttled_no_lane_line() -> anyhow::Result<()
             server_eth_addr,
             *hash.as_bytes(),
             0,
-            0x00c0_ffee,
+            now_us(),
             Duration::from_secs(20),
         )
         .await
@@ -11366,7 +11675,7 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
             server_eth_addr,
             *hash.as_bytes(),
             0,
-            0x00c0_ffee,
+            now_us(),
             Duration::from_secs(20),
         )
     };
@@ -11683,7 +11992,7 @@ async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> any
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -11745,7 +12054,7 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -11820,7 +12129,7 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
         server_eth_addr,
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -12897,7 +13206,7 @@ async fn over_cap_stream_is_reset_without_signing_a_response() -> anyhow::Result
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x0012_61a0,
+        timestamp_us: now_us(),
     };
     write_frame(&mut send2, &encode_stream_request(&req, Some(&ext))?)
         .await
@@ -13293,7 +13602,7 @@ async fn client_rejects_a_server_that_oversends_past_the_promised_length() -> an
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -13350,7 +13659,7 @@ async fn client_rejects_a_frame_that_straddles_the_promised_length() -> anyhow::
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c0_ffee,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(20)),
         0,
         0,
@@ -13417,7 +13726,7 @@ async fn client_rejects_hash_mismatched_bytes() -> anyhow::Result<()> {
         server_eth.address(),
         *wanted_hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -13470,7 +13779,7 @@ async fn client_rejects_an_empty_claim_for_a_non_empty_hash() -> anyhow::Result<
         server_eth.address(),
         *wanted_hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -13525,7 +13834,7 @@ async fn fetch_inflated_garbage(frame: usize) -> anyhow::Result<(anyhow::Error, 
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c0_ffee,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(20)),
         // No buyer-side size ceiling: the bound under test is verification, not
         // `max_blob_size_bytes`.
@@ -13601,7 +13910,7 @@ async fn client_refuses_an_oversized_stream_response_on_its_prefix() -> anyhow::
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c0_ffee,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(20)),
         0,
         0,
@@ -13727,7 +14036,7 @@ async fn client_pays_for_an_honest_prefix_and_stops_at_the_first_bad_group() -> 
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
-        0x00c0_ffee,
+        now_us(),
         PullDeadlines::whole_transfer(Duration::from_secs(20)),
         0,
         0,
@@ -13914,7 +14223,7 @@ async fn a_payer_that_stops_reading_faults_at_the_no_progress_timeout() -> anyho
         pool_id: pool_id().into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x0012_61a1,
+        timestamp_us: now_us(),
     };
     let request = encode_stream_request(&req, Some(&ext))
         .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
@@ -14211,7 +14520,7 @@ async fn client_completes_when_its_send_is_stopped_before_the_closing_voucher() 
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -14266,7 +14575,7 @@ async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_clo
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_ffee,
+        now_us(),
         Duration::from_secs(20),
     )
     .await
@@ -14316,7 +14625,7 @@ async fn fetch_with_frames_in_flight(signal: StopThenSignal) -> anyhow::Result<a
         server_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_ffef,
+        now_us(),
         Duration::from_secs(20),
     )
     .await

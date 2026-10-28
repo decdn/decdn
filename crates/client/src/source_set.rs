@@ -214,6 +214,10 @@ pub enum DeclineReason {
     /// The node rejected this client's voucher mid-stream for a reason no
     /// watermark bundle heals, and that is not a funding reason.
     Voucher(VoucherRejectReason),
+    /// The node refused this client's request timestamp
+    /// (`APP_ERR_TIMESTAMP_SKEW`): its clock and this machine's differ by more
+    /// than 30 seconds.
+    ClockSkew,
 }
 
 /// Every known source declined this fetch (ADR 039 §Failure handling). The
@@ -233,10 +237,17 @@ impl std::fmt::Display for NoNodeWillServe {
             .iter()
             .filter_map(|r| match r {
                 DeclineReason::Voucher(reason) => Some(format!("{reason:?}")),
-                DeclineReason::Refused => None,
+                DeclineReason::Refused | DeclineReason::ClockSkew => None,
             })
             .collect();
         let refused = self.reasons.contains(&DeclineReason::Refused);
+        let clock = self.reasons.contains(&DeclineReason::ClockSkew);
+        if clock && !refused && vouchers.is_empty() {
+            return f.write_str(
+                "no node will serve this: every node refused this machine's request timestamp \
+                 as more than 30 seconds from its clock; check this machine's clock",
+            );
+        }
         match (refused, vouchers.is_empty()) {
             (_, true) => {
                 f.write_str("no node will serve this: every node declined this blob for this fetch")
@@ -252,7 +263,13 @@ impl std::fmt::Display for NoNodeWillServe {
                  client's vouchers ({})",
                 vouchers.join(", ")
             ),
+        }?;
+        if clock {
+            f.write_str(
+                "; some refused this machine's request timestamp, so check this machine's clock",
+            )?;
         }
+        Ok(())
     }
 }
 
@@ -657,6 +674,19 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         let left_the_hash = match fault {
             // This client's voucher, not the node's delivery: the node declines
             // this fetch, and its peer-store record keeps no failure stamp.
+            // A clock refusal is no fault of the node's delivery either: the
+            // usual cause is this machine's clock, which makes every node refuse
+            // alike. The node leaves this hash, and its peer-store record keeps
+            // no failure stamp. A node sends the code only at admission, before
+            // it sends anything, so a refusal after verified bytes landed is a
+            // peer forging the code to dodge attribution: it stays an ordinary
+            // source fault.
+            Fault::Source
+                if crate::fault::refuses_timestamp(err)
+                    && range.as_ref().is_none_or(|r| r.landed == 0) =>
+            {
+                self.record_declined(provider, DeclineReason::ClockSkew, None)
+            }
             Fault::Source => match crate::fault::declining_rejection(err) {
                 Some(reason) => {
                     self.record_declined(provider, DeclineReason::Voucher(reason), None)

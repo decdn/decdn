@@ -35,6 +35,7 @@ fn hash_census(hash: [u8; 32], answers: Vec<NodeAnswer>) -> HashCensus {
         answers,
         unreachable: 0,
         rate_limited: 0,
+        clock_skewed: 0,
         unverifiable: 0,
         unusable: 0,
     }

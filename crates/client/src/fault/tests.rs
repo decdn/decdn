@@ -340,3 +340,17 @@ fn a_refused_open_is_fatal_and_found_through_a_lane_build() {
         None
     );
 }
+
+/// A node refusing this client's timestamp is neither fatal nor typed away:
+/// it is the source's, so the fetch moves to another node, and
+/// `refuses_timestamp` lets the source set count it as a decline rather than a
+/// delivery fault. One node can send the code at will, so it never ends the
+/// command.
+#[test]
+fn a_timestamp_refusal_is_the_sources_and_never_fatal() {
+    let err = anyhow::Error::new(crate::UpstreamTimestampRejected { label: None })
+        .context("read stream response");
+    assert_eq!(classify(&err), Fault::Source);
+    assert!(super::refuses_timestamp(&err));
+    assert!(!super::refuses_timestamp(&refusal(StreamError::Declined)));
+}

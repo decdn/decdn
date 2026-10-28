@@ -282,7 +282,10 @@ one per `submit*Challenge` entry point (per
   matters: `SlashJudge` reverts `NotRateManipulation` unless the signed
   `StreamResponse` rate strictly exceeds the signed `ProbeResponse` rate, so
   quoting high and serving cheap is never an offense. Only a reprice
-  *upward* has to wait out the window before you serve at the new rate.
+  *upward* has to wait. The window is measured between the requester
+  timestamps the node signs, and each one may sit up to 30 seconds from the
+  node's clock, so an upward reprice waits 90 seconds of real time after the
+  last probe answered at the old rate.
 - **Blacklist violation** — serving content after the blacklist entry's
   `effectiveAt` (`addedAt` plus the compliance window), not after `addedAt`
   — see [ContentBlacklist compliance](#contentblacklist-compliance).
@@ -312,8 +315,9 @@ slashed by an external adversary.
 **Remediate:**
 
 1. **Fix the root cause before anything else.** Each offense has its own:
-   blacklist watcher lag or a stale RPC endpoint (blacklist violation), a rate
-   reconfiguration applied inside the 30-second window (rate manipulation).
+   blacklist watcher lag or a stale RPC endpoint (blacklist violation), an
+   upward rate reconfiguration applied less than 90 seconds after the last
+   probe answered at the old rate (rate manipulation).
    A slash you appeal while the underlying problem persists will not stop
    the next strike.
 2. **There is no counter-evidence window.** If on-chain verification passes,

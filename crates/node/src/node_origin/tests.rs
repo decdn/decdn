@@ -606,6 +606,7 @@ fn only_our_own_fault_may_withhold_a_not_found() {
         PullVerdict::LegNoProgress,
         PullVerdict::Unreachable,
         PullVerdict::RateLimited,
+        PullVerdict::TimestampRejected,
     ] {
         assert_eq!(
             PullMiss::for_verdict(verdict),
@@ -834,6 +835,63 @@ fn a_rate_limit_shed_is_suppressed_not_scored() {
     );
 }
 
+/// An upstream's `APP_ERR_TIMESTAMP_SKEW` refusal lands in its own verdict, ahead of
+/// the `Unreachable` catch-all. The usual cause is this node's clock, which makes every
+/// honest upstream refuse alike, so the catch-all would score every candidate
+/// unreachable on the strength of a local fault.
+#[test]
+fn a_timestamp_refusal_is_not_scored_unreachable() {
+    for label in [Some("probe-error".to_owned()), None] {
+        let refused = anyhow::Error::new(UpstreamTimestampRejected { label })
+            .context("read response")
+            .context("pull from candidate");
+        assert_eq!(pull_verdict(&refused), PullVerdict::TimestampRejected);
+    }
+    assert_eq!(
+        PullMiss::for_verdict(PullVerdict::TimestampRejected),
+        PullMiss::Clean,
+        "a clock refusal says nothing about the content, so the client gets an honest miss"
+    );
+    assert_eq!(
+        PullVerdict::TimestampRejected.as_str(),
+        "timestamp_rejected"
+    );
+}
+
+/// The remedy for a timestamp refusal suppresses the `(peer, hash)` pair for the short
+/// refusal TTL, exactly as a rate-limit shed does, and counts it. The code is unsigned, so
+/// a peer that never serves could otherwise send it at will and keep winning selection
+/// on a neutral score. The remedy takes no reputation handle, so it records no outcome.
+#[test]
+fn a_timestamp_refusal_suppresses_the_pair_without_scoring() -> anyhow::Result<()> {
+    let metrics = Metrics::new();
+    let negative_cache = NegativeProbeCache::new();
+    let peer = iroh::SecretKey::from_bytes(&[7; 32]).public();
+    let hash_bytes = [9; 32];
+    let node = DhtNodeId::from_bytes(*peer.as_bytes());
+    let hash = DhtHash::from_bytes(hash_bytes);
+    assert!(!negative_cache.contains_active(&node, &hash));
+    let err =
+        anyhow::Error::new(UpstreamTimestampRejected { label: None }).context("read response");
+    record_upstream_timestamp_rejected(&metrics, &negative_cache, peer, hash_bytes, "pull", &err);
+    assert!(
+        negative_cache.contains_active(&node, &hash),
+        "a peer refusing with 0x04 is skipped for the refusal TTL, like a rate-limited one"
+    );
+    assert!(
+        !negative_cache.contains_active(&node, &DhtHash::from_bytes([1; 32])),
+        "the suppression is scoped to the refused hash"
+    );
+    let scrape = metrics.encode()?;
+    assert!(
+        scrape
+            .lines()
+            .any(|l| l == "decdn_node_upstream_timestamp_rejected_total 1"),
+        "{scrape}"
+    );
+    Ok(())
+}
+
 /// Shared in-memory sink for the captured tracing output.
 #[derive(Clone, Default)]
 struct CapturedLog(Arc<Mutex<Vec<u8>>>);
@@ -1030,6 +1088,7 @@ fn each_probe_drop_lands_in_one_trail_count() {
         ProbeDrop::Unreachable,
         ProbeDrop::Absent,
         ProbeDrop::RateLimited,
+        ProbeDrop::TimestampRejected,
         ProbeDrop::NoAddress,
         ProbeDrop::Unverifiable,
         ProbeDrop::Inconsistent,
@@ -1037,7 +1096,7 @@ fn each_probe_drop_lands_in_one_trail_count() {
         tally.record(drop);
     }
     tally.skipped = 1;
-    tally.probed = 6;
+    tally.probed = 7;
     tally.holders = 2;
     tally.spans = true;
     let mut trail = PullLegTrail {
@@ -1054,10 +1113,10 @@ fn each_probe_drop_lands_in_one_trail_count() {
             source: CandidateSource::Dht,
             discovered: 7,
             skipped: 1,
-            probed: 6,
+            probed: 7,
             unreachable: 1,
             absent: 1,
-            dropped: 4,
+            dropped: 5,
             holders: 2,
             spans: true,
             handshakes: 1,

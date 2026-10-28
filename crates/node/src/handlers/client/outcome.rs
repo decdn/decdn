@@ -48,6 +48,11 @@ pub(super) enum ResetCause {
     StreamCapFull,
     /// The client binding failed to verify (`MALFORMED_MESSAGE`).
     BadBinding,
+    /// The request's `timestamp_us` was beyond the clock-skew bound
+    /// (`TIMESTAMP_SKEW`, ADR 013 §Application Error Codes). Reset with no signed response,
+    /// because every signed body echoes that timestamp into the
+    /// slash-evidence set.
+    TimestampSkew,
     /// The first request could not be read: a timeout, a peer reset or lost
     /// connection, a length prefix above `MAX_CLIENT_CONTROL_FRAME`, or a frame
     /// that failed to decode.
@@ -60,6 +65,7 @@ impl ResetCause {
         match self {
             Self::StreamCapFull => "stream_cap_full",
             Self::BadBinding => "bad_binding",
+            Self::TimestampSkew => "timestamp_skew",
             Self::RequestUnreadable => "request_unreadable",
         }
     }
@@ -157,6 +163,7 @@ impl ServeEnd {
             Self::Reset(cause) => match cause {
                 ResetCause::StreamCapFull => metrics.serve_stream_rejected_stream_cap_full(),
                 ResetCause::BadBinding => metrics.serve_stream_rejected_bad_binding(),
+                ResetCause::TimestampSkew => metrics.serve_stream_rejected_timestamp_skew(),
                 ResetCause::RequestUnreadable => metrics.serve_stream_request_unreadable(),
             },
         }

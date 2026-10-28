@@ -58,6 +58,20 @@ impl ClientHandler {
         body: StreamResponseBody,
         error: Option<StreamError>,
     ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
+        // Every stream signature passes through here, and every caller echoes
+        // the dispatch-gated first request's `timestamp_us`
+        // (`crate::handlers::timestamp_skew`). This check catches only a
+        // timestamp ahead of the bound: a new caller that signs a future
+        // timestamp the admission gate never checked fails here in tests. A
+        // stale timestamp cannot be caught here, because an admitted
+        // timestamp ages for as long as the stream runs, and signing it late
+        // is correct.
+        debug_assert!(
+            body.timestamp_us
+                <= crate::handlers::timestamp_skew::now_us()
+                    .saturating_add(crate::handlers::timestamp_skew::MAX_REQUEST_TIMESTAMP_SKEW_US),
+            "signing a timestamp the admission gate cannot have admitted"
+        );
         let slash_sig = StreamSlashData::from_response_body(&body)
             .sign(self.eth_signer.as_ref(), &self.slash_domain)
             .map_err(|e| anyhow::anyhow!("stream slash_sig signing failed: {e}"))?

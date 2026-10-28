@@ -36,6 +36,7 @@ use decdn_incentive::{
     voucher_domain,
 };
 use decdn_node::handlers::client::ClientHandler;
+use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
 use decdn_protocol::{ALPN_CLIENT, CHUNK_BYTES, MB_BYTES, encode_stream_request, write_frame};
@@ -196,7 +197,7 @@ async fn ranged_paid_pull(
         pool_id: pool_id.into(),
         byte_offset,
         byte_len,
-        timestamp_us: 0x9001,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
@@ -392,7 +393,7 @@ async fn idle_open(
         pool_id: pool_id.into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x9002,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
@@ -846,7 +847,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
         pool_id: pool_id.into(),
         byte_offset: 16 * 1024,
         byte_len: 32 * 1024,
-        timestamp_us: 0x9001,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
@@ -1144,7 +1145,7 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
         pool_id: pool_id.into(),
         byte_offset: blob_size,
         byte_len: 0,
-        timestamp_us: 0x9001,
+        timestamp_us: now_us(),
     };
     let payload = encode_stream_request(&req, Some(&StreamRequestExt::default()))
         .map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
@@ -2213,7 +2214,7 @@ async fn own_origin_size_probe_fault_refuses_internal_error_not_cache_miss() -> 
         pool_id: pool_id.into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x9003,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
@@ -2322,7 +2323,7 @@ async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() ->
         pool_id: pool_id.into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x9004,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
@@ -2442,7 +2443,7 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
         pool_id: pool_id.into(),
         byte_offset: blob_size,
         byte_len: 16 * 1024,
-        timestamp_us: 0x9004,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
@@ -2646,7 +2647,7 @@ async fn span_capped_floor_accepts_a_small_range_a_window_poor_pool() -> anyhow:
         pool_id: pool_id.into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x9005,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;

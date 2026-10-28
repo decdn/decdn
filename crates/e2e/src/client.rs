@@ -41,10 +41,14 @@ use crate::node::NodeFixture;
 /// Default pool deposit: 10 USDC (ADR 003 recommended minimum). Public so a
 /// journey can assert the daemon reports this exact deposit for the pool.
 pub const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-/// Fixed slash-receipt timestamp (µs). The node does not gate freshness on this
-/// path; a constant keeps the voucher deterministic (matches the settlement
-/// e2e).
-const TIMESTAMP_US: u64 = 0x00c0_ffe1;
+/// Fresh request timestamp (µs): the host's wall clock, which is also the
+/// daemon's. The node refuses any request whose `timestamp_us` sits beyond
+/// its clock-skew bound, so every fixture request stamps a current read; a
+/// journey that needs a particular timestamp (evidence pairing) passes its
+/// own through the `*_at` variants, staying inside that bound at capture
+/// time. The daemon's own clock helper, so the fixture and the gate it must
+/// satisfy cannot drift apart.
+use decdn_node::handlers::timestamp_skew::now_us as timestamp_now_us;
 /// How long [`ClientFixture::capture_delivery_wire`] waits *between* frames
 /// before deciding the node has finished speaking. The tap never pays, so the
 /// node's closing-voucher pause is the terminator on a successful delivery.
@@ -273,7 +277,7 @@ impl ClientFixture {
                 *hash.as_bytes(),
                 namespace_id.to_be_bytes(),
                 0,
-                TIMESTAMP_US,
+                timestamp_now_us(),
                 // Loopback fixture: wall clock on the open, inactivity on the
                 // stream, no overall cap (#1134). Both budgets are non-zero literals, so
                 // the `ZeroBudget` arm is unreachable here — propagate rather than unwrap.
@@ -423,7 +427,7 @@ impl ClientFixture {
             *hash.as_bytes(),
             namespace_id.to_be_bytes(),
             byte_offset,
-            TIMESTAMP_US,
+            timestamp_now_us(),
             PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30), 4096)?,
             0,
             0,
@@ -481,7 +485,7 @@ impl ClientFixture {
             pool_id: session.ctx.pool_id.into(),
             byte_offset: 0,
             byte_len: 0,
-            timestamp_us: TIMESTAMP_US,
+            timestamp_us: timestamp_now_us(),
         };
         // `pull_authorized` gates every backend-fill tier on the client binding,
         // and the capability lets the node register the lane; without them the tap
@@ -684,7 +688,7 @@ impl ClientFixture {
         node: &NodeFixture,
         hash: Hash,
     ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
-        self.probe_at(node, hash, TIMESTAMP_US).await
+        self.probe_at(node, hash, timestamp_now_us()).await
     }
 
     /// [`Self::probe`] with a caller-chosen `timestamp_us`.
@@ -692,10 +696,10 @@ impl ClientFixture {
     /// The probe timestamp is requester-generated and echoed back *inside* the
     /// signed body (ADR 005), so it is what anchors the pair on-chain: the
     /// `SlashJudge` 30s window and the evidence-staleness bound are both computed
-    /// from it. The default `TIMESTAMP_US` is a fixed sentinel and would read as
-    /// 1970 to the judge, so any journey feeding a real response to `SlashJudge`
-    /// must stamp it near chain time — and any journey testing the *window* stamps
-    /// it deliberately far from the stream's (#1042).
+    /// from it. The node signs it only when it sits inside its clock-skew bound
+    /// at capture time, so a journey testing the judge's *window* spreads the
+    /// pair's two capture-time-valid timestamps across the window instead of
+    /// stamping one far in the past (#1042).
     pub async fn probe_at(
         &self,
         node: &NodeFixture,
@@ -738,7 +742,7 @@ impl ClientFixture {
             &self.endpoint,
             target,
             *hash.as_bytes(),
-            TIMESTAMP_US,
+            timestamp_now_us(),
             // Shorter than `probe_at`'s 10s on purpose: the interesting call is
             // the one that must NOT connect, and a retired id fails by timing
             // out on a handshake nobody answers. Ten seconds of that per

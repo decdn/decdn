@@ -7,14 +7,106 @@ use std::time::Instant;
 /// from the silent ones; with none, the message keeps its two counts.
 #[test]
 fn no_serve_target_error_names_rate_limited_nodes_apart_from_silent_ones() {
-    let msg = no_serve_target_error(3, 1, 2, 0).to_string();
+    let msg = no_serve_target_error(3, 1, 2, 0, 0).to_string();
     assert!(msg.contains("1 did not answer"), "{msg}");
     assert!(msg.contains("2 rate-limited this client's probes"), "{msg}");
     assert!(msg.contains("0 answered but were unusable"), "{msg}");
 
-    let msg = no_serve_target_error(3, 3, 0, 0).to_string();
+    let msg = no_serve_target_error(3, 3, 0, 0, 0).to_string();
     assert!(!msg.contains("rate-limited"), "{msg}");
+    assert!(!msg.contains("timestamp"), "{msg}");
     assert!(msg.contains("3 did not answer, 0 answered"), "{msg}");
+}
+
+/// When at least three probed nodes, and most of them, refuse this machine's
+/// timestamp, the failure is a [`ResolveConfigFault`] that names the clock and
+/// ends the command. Below that threshold any node can send the unsigned code
+/// at will, so one or two refusals stay the ordinary error, which counts them
+/// apart and still carries the clock hint.
+#[test]
+fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp() {
+    assert_eq!(CLOCK_SKEW_FATAL_MIN, 3);
+    for (probed, unreachable, skewed) in [(3, 0, 3), (4, 1, 3), (5, 0, 4)] {
+        let err = no_serve_target_error(probed, unreachable, 0, 0, skewed);
+        assert!(
+            err.downcast_ref::<ResolveConfigFault>().is_some(),
+            "{skewed} of {probed} clock refusals is this machine's fault: {err:#}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("{skewed} of {probed} probed node(s) refused")),
+            "{msg}"
+        );
+        assert!(msg.contains("Check this machine's clock"), "{msg}");
+        assert!(!msg.contains("did not answer"), "{msg}");
+    }
+    // The clock check runs before the unverifiable one: a wrong clock leaves
+    // nothing to verify.
+    let err = no_serve_target_error(3, 0, 0, 1, 3);
+    assert!(
+        err.to_string().contains("Check this machine's clock"),
+        "{err:#}"
+    );
+
+    // One or two refusers never end the command, even as a majority; three
+    // that are not a majority do not either.
+    for (probed, unreachable, skewed) in [(1, 0, 1), (2, 0, 2), (3, 1, 2), (4, 3, 1), (7, 4, 3)] {
+        let err = no_serve_target_error(probed, unreachable, 0, 0, skewed);
+        assert!(
+            err.downcast_ref::<ResolveConfigFault>().is_none(),
+            "{skewed} of {probed} refusals must not end the command: {err:#}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("{unreachable} did not answer")),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "{skewed} refused this machine's request timestamp"
+            )),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("set it from a time server"),
+            "the clock hint stays: {msg}"
+        );
+    }
+    assert!(
+        !no_serve_target_error(3, 3, 0, 0, 0)
+            .to_string()
+            .contains("time server"),
+        "no refusal, no clock hint"
+    );
+}
+
+/// A probe the node refused with `APP_ERR_TIMESTAMP_SKEW` classifies as
+/// [`ProbeOutcome::ClockSkewed`], not as an unreachable node, so the terminal
+/// error can name the clock.
+#[test]
+fn classify_probe_types_a_timestamp_refusal_as_clock_skewed() {
+    let cand = NodeCandidate {
+        node_id: node_key(1),
+        eth_address: Address::repeat_byte(1),
+        region_hint: None,
+        multiaddrs: Bytes::new(),
+    };
+    let domain = decdn_incentive::slash_judge_domain(1, Address::repeat_byte(0x0D));
+    let refused: ProbeResult = Err(anyhow::Error::new(crate::UpstreamTimestampRejected {
+        label: Some("probe-error".to_owned()),
+    })
+    .context("read response"));
+    assert!(matches!(
+        classify_probe(&cand, refused, [7; 32], micros_now(), &domain),
+        ProbeOutcome::ClockSkewed
+    ));
+    let silent: ProbeResult = Err(anyhow::anyhow!("connect failed: timed out"));
+    assert!(matches!(
+        classify_probe(&cand, silent, [7; 32], micros_now(), &domain),
+        ProbeOutcome::Unreachable
+    ));
+    let tally = ProbeTally::of(vec![ProbeOutcome::ClockSkewed, ProbeOutcome::Unreachable]);
+    assert_eq!((tally.clock_skewed, tally.unreachable), (1, 1));
 }
 
 /// A probe outcome after `ms` on the paused clock: `(id, holder)`.
@@ -291,8 +383,9 @@ async fn probe_candidate_retries_a_shedding_candidate_then_reports_the_shed() {
     let (server, target, seen) = closing_probe_server(decdn_protocol::APP_ERR_RATE_LIMITED).await;
     let client = client_endpoint().await;
     let started = Instant::now();
+    let started_us = micros_now();
 
-    let res = probe_candidate(&client, target, [7; 32], micros_now()).await;
+    let (timestamp_us, res) = probe_candidate(&client, target, [7; 32]).await;
 
     let err = res.expect_err("every probe was shed");
     assert!(probe_shed(&err), "the shed survives the retries: {err:#}");
@@ -302,6 +395,13 @@ async fn probe_candidate_retries_a_shedding_candidate_then_reports_the_shed() {
     );
     let waited: u64 = PROBE_SHED_BACKOFFS_MS.iter().sum();
     assert!(started.elapsed() >= Duration::from_millis(waited));
+    // Each attempt stamps its own timestamp, and the one returned is the last
+    // attempt's: it was taken after every backoff, not at the first attempt.
+    assert!(
+        timestamp_us >= started_us + waited * 1_000,
+        "the returned timestamp {timestamp_us} is the first attempt's, not the last's \
+         (started at {started_us}, waited {waited} ms)"
+    );
     client.close().await;
     server.close().await;
 }
@@ -313,7 +413,7 @@ async fn probe_candidate_does_not_retry_a_failure_that_is_not_a_shed() {
     let (server, target, seen) = closing_probe_server(0).await;
     let client = client_endpoint().await;
 
-    let res = probe_candidate(&client, target, [7; 32], micros_now()).await;
+    let (_, res) = probe_candidate(&client, target, [7; 32]).await;
 
     let err = res.expect_err("the connection was closed");
     assert!(!probe_shed(&err), "{err:#}");
@@ -561,6 +661,7 @@ fn a_pinned_probe_hints_only_a_verified_holder_size() {
         ProbeOutcome::NonHolder(non_holder, sample),
         ProbeOutcome::Unreachable,
         ProbeOutcome::RateLimited,
+        ProbeOutcome::ClockSkewed,
         ProbeOutcome::Unverifiable,
         ProbeOutcome::Unusable,
     ] {

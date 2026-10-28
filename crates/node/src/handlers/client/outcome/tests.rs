@@ -201,6 +201,7 @@ fn every_failed_end_counts_on_exactly_one_listed_reason() {
     let resets = [
         ResetCause::StreamCapFull,
         ResetCause::BadBinding,
+        ResetCause::TimestampSkew,
         ResetCause::RequestUnreadable,
     ];
     let ends = refusals

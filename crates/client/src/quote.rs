@@ -22,7 +22,7 @@ use iroh::{Endpoint, PublicKey, RelayUrl};
 use crate::discovery::{self, NodeCandidate};
 use crate::session::{ChainConfig, DiscoveryOptions, ProxyWarmingParams, PullSite};
 use crate::targets::{
-    ProbeOutcome, classify_probe, failover_order, micros_now, no_serve_target_error, pinned_target,
+    ProbeOutcome, classify_probe, failover_order, no_serve_target_error, pinned_target,
     probe_candidate, probe_target, select_up_to, spawn_harvest,
 };
 
@@ -71,6 +71,9 @@ pub struct HashCensus {
     pub unreachable: usize,
     /// Probes the node kept shedding.
     pub rate_limited: usize,
+    /// Probes the node refused for clock skew: its clock and this machine's
+    /// differ by more than 30 seconds.
+    pub clock_skewed: usize,
     /// Answers whose signature did not recover to the node's operator.
     pub unverifiable: usize,
     /// Answers whose `has_blob` and coverage disagree.
@@ -209,7 +212,6 @@ pub async fn census(
         (nodes, outage_fallback)
     };
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
-    let timestamp_us = micros_now();
     let probes = hashes.iter().enumerate().flat_map(|(at, &hash)| {
         nodes
             .iter()
@@ -219,7 +221,10 @@ pub async fn census(
         .map(|(at, hash, cand, target)| {
             let slash_dom = &slash_dom;
             async move {
-                let res = probe_candidate(endpoint, target.clone(), hash, timestamp_us).await;
+                // `probe_candidate` stamps each attempt: a node refuses a
+                // timestamp more than 30 s from its clock, and a census can
+                // run longer.
+                let (timestamp_us, res) = probe_candidate(endpoint, target.clone(), hash).await;
                 let outcome = classify_probe(cand, res, hash, timestamp_us, slash_dom);
                 (at, cand.clone(), outcome)
             }
@@ -252,6 +257,7 @@ pub(crate) fn unanswered(census: &Census) -> Option<anyhow::Error> {
         first.unreachable,
         first.rate_limited,
         first.unverifiable,
+        first.clock_skewed,
     ))
 }
 
@@ -271,6 +277,7 @@ pub(crate) fn tally(
             answers: Vec::new(),
             unreachable: 0,
             rate_limited: 0,
+            clock_skewed: 0,
             unverifiable: 0,
             unusable: 0,
         })
@@ -300,6 +307,7 @@ pub(crate) fn tally(
             }
             ProbeOutcome::Unreachable => entry.unreachable += 1,
             ProbeOutcome::RateLimited => entry.rate_limited += 1,
+            ProbeOutcome::ClockSkewed => entry.clock_skewed += 1,
             ProbeOutcome::Unverifiable => entry.unverifiable += 1,
             ProbeOutcome::Unusable => entry.unusable += 1,
         }

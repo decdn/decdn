@@ -580,6 +580,7 @@ pub const decdn_protocol::ALPN_CLIENT: &[u8]
 pub const decdn_protocol::ALPN_DHT: &[u8]
 pub const decdn_protocol::ALPN_PROBE: &[u8]
 pub const decdn_protocol::APP_ERR_RATE_LIMITED: u32
+pub const decdn_protocol::APP_ERR_TIMESTAMP_SKEW: u32
 pub const decdn_protocol::BINDING_SIG_LEN: usize
 pub const decdn_protocol::CHUNK_BYTES: u64
 pub const decdn_protocol::DISCOVERY_BLOCK_BYTES: u64

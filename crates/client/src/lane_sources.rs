@@ -915,6 +915,7 @@ pub(crate) fn late_join(
         }
         ProbeOutcome::Unreachable
         | ProbeOutcome::RateLimited
+        | ProbeOutcome::ClockSkewed
         | ProbeOutcome::Unverifiable
         | ProbeOutcome::Unusable => None,
     }

@@ -296,7 +296,22 @@ pub fn classify(err: &anyhow::Error) -> Fault {
             }
         };
     }
+    // Everything else is about the source, including a node refusing this
+    // client's timestamp ([`refuses_timestamp`]). That refusal is not fatal: one
+    // node can send the code at will, and its own clock may be the wrong one.
+    // `SourceSet::record_fault` counts it as a decline when it arrives before
+    // any verified byte of the range, so the node keeps no failure stamp, and a
+    // fetch that every node refuses this way ends naming the clock
+    // (`NoNodeWillServe`). After bytes landed it is an ordinary source fault.
     Fault::Source
+}
+
+/// Whether `err` is a node refusing this client's request timestamp with
+/// `APP_ERR_TIMESTAMP_SKEW` ([`crate::UpstreamTimestampRejected`]).
+#[must_use]
+pub(crate) fn refuses_timestamp(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::UpstreamTimestampRejected>()
+        .is_some()
 }
 
 /// Whether `err` is a source saying it does not hold the blob. On the wire the

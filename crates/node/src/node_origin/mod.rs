@@ -100,9 +100,56 @@ use decdn_client::probe::probe_once;
 use decdn_client::{
     BlobTooLarge, Cumulative, HashMismatch, LegNoProgress, LocalPullFault, PoolContext, PoolLedger,
     PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd,
-    UpstreamRateLimited, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    effective_rate_ceiling, sign_client_binding,
+    UpstreamRateLimited, UpstreamRefused, UpstreamTimestampRejected, UpstreamVoucherRejected,
+    VoucherProgress, effective_rate_ceiling, sign_client_binding,
 };
+
+/// Throttle for the `warn!` on an upstream that refused this node's request
+/// timestamp (`APP_ERR_TIMESTAMP_SKEW`). Process-wide: every pull and probe
+/// shares one window, because a wrong local clock trips it on every
+/// candidate at once. Each event also counts into
+/// `decdn_node_upstream_timestamp_rejected_total`.
+static UPSTREAM_TIMESTAMP_WARN: crate::warn_throttle::WarnThrottle =
+    crate::warn_throttle::WarnThrottle::new(Duration::from_secs(60));
+
+/// Meter, suppress and log (throttled) an upstream's `TIMESTAMP_SKEW` refusal
+/// of a request this node sent.
+///
+/// No reputation outcome: the usual cause is this node's own clock, and then
+/// every honest upstream refuses alike. If only one upstream refuses, that
+/// upstream's clock is wrong, and its own operator sees the refusals on its
+/// side. The `(peer, hash)` pair is suppressed for [`REFUSAL_SUPPRESSION_TTL`],
+/// as for a rate-limit shed: the code is unsigned and any peer can send it, so
+/// a peer that never serves and always refuses this way must not keep winning
+/// selection on a neutral score. Takes no reputation handle, so it cannot
+/// record an outcome.
+fn record_upstream_timestamp_rejected(
+    metrics: &Metrics,
+    negative_cache: &NegativeProbeCache,
+    peer: PublicKey,
+    hash_bytes: [u8; 32],
+    stage: &'static str,
+    err: &anyhow::Error,
+) {
+    metrics.node_upstream_timestamp_rejected();
+    negative_cache.record_failure_with_ttl(
+        DhtNodeId::from_bytes(*peer.as_bytes()),
+        DhtHash::from_bytes(hash_bytes),
+        REFUSAL_SUPPRESSION_TTL,
+    );
+    if let Some(suppressed) = UPSTREAM_TIMESTAMP_WARN.admit() {
+        warn!(
+            %peer,
+            stage,
+            suppressed,
+            interval = ?UPSTREAM_TIMESTAMP_WARN.interval(),
+            error = %format_args!("{err:#}"),
+            "node-origin: an upstream refused this node's request timestamp as too far from \
+             its clock; check this node's clock (if only one upstream refuses, that \
+             upstream's clock is wrong). Suppressing the pair briefly, not scoring the upstream"
+        );
+    }
+}
 
 /// How a probe round decides it has collected enough holders (#1506).
 #[derive(Clone, Copy)]
@@ -1196,6 +1243,8 @@ enum ProbeDrop {
     Absent,
     /// The peer shed the probe with `APP_ERR_RATE_LIMITED`.
     RateLimited,
+    /// The peer refused the probe's timestamp with `APP_ERR_TIMESTAMP_SKEW`.
+    TimestampRejected,
     /// The peer has no resolvable operator address, or its id does not decode.
     NoAddress,
     /// The response failed shape, correlation or `slash_sig` recovery.
@@ -1231,6 +1280,7 @@ impl ProbeTally {
             ProbeDrop::Unreachable => &mut self.unreachable,
             ProbeDrop::Absent => &mut self.absent,
             ProbeDrop::RateLimited
+            | ProbeDrop::TimestampRejected
             | ProbeDrop::NoAddress
             | ProbeDrop::Unverifiable
             | ProbeDrop::Inconsistent => &mut self.dropped,
@@ -1513,7 +1563,9 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
 /// holding the blob; otherwise the [`ProbeDrop`] that says why not. Side
 /// effects: a failed probe scores the provider [`Outcome::Unreachable`],
 /// except a probe the provider shed with `APP_ERR_RATE_LIMITED`, which suppresses
-/// the pair for [`REFUSAL_SUPPRESSION_TTL`] and scores nothing (#1986); a
+/// the pair for [`REFUSAL_SUPPRESSION_TTL`] and scores nothing (#1986), and a
+/// probe the provider refused with `APP_ERR_TIMESTAMP_SKEW`, which suppresses
+/// the pair the same way, scores nothing and warns about the clock (throttled); a
 /// same-region claim answered slower than [`REGION_LATENCY_MAX_MS`] scores
 /// [`Outcome::RegionLatencyMismatch`] (ADR 030); a reachable-but-absent provider
 /// is recorded in the negative-probe cache.
@@ -1559,6 +1611,22 @@ async fn probe_candidate(
                     REFUSAL_SUPPRESSION_TTL,
                 );
                 return Err(ProbeDrop::RateLimited);
+            }
+            // A `0x04` refusal is the peer answering too: it refused this node's
+            // timestamp. The usual cause is this node's clock, which makes every
+            // honest upstream refuse alike, so scoring it `Unreachable` would tar
+            // every candidate on the strength of a local fault. Suppressed like a
+            // shed, so a peer that sends the code at will cannot keep a slot.
+            if err.downcast_ref::<UpstreamTimestampRejected>().is_some() {
+                record_upstream_timestamp_rejected(
+                    &deps.metrics,
+                    &deps.negative_cache,
+                    pk,
+                    hash_bytes,
+                    "probe",
+                    &err,
+                );
+                return Err(ProbeDrop::TimestampRejected);
             }
             // A failed probe is a reachability signal: the upstream could not be
             // reached for this interaction (ADR 008 §Local Score).
@@ -1860,6 +1928,8 @@ impl PullMiss {
             // kinds, `Stalled`, `RateLimited`, `Corruption`, `Unreachable`), about OUR
             // configuration of what we will accept from it (`Oversize`, `RateCeiling`,
             // `OurDeadline`), or about one lane to one provider (the two voucher arms).
+            // `TimestampRejected` is usually this node's clock, but a wrong clock does not
+            // make a `NotFound` false: it says nothing about the content.
             // None of them is evidence that THIS node is broken for every client and
             // every blob, so none earns a `Declined`: a node with one wedged lane
             // is still a healthy node that simply cannot serve this blob right now.
@@ -1868,6 +1938,7 @@ impl PullMiss {
             | PullVerdict::OurDeadline
             | PullVerdict::Stalled
             | PullVerdict::RateLimited
+            | PullVerdict::TimestampRejected
             | PullVerdict::OurDeadLane(_)
             | PullVerdict::OurVoucherRetryable(_)
             | PullVerdict::Refused(RefusalVerdict::DurableMiss | RefusalVerdict::Transient)
@@ -2908,6 +2979,13 @@ enum PullVerdict {
     /// [`REFUSAL_SUPPRESSION_TTL`], never scored — the peer answered, it just declined
     /// the work, and the `global-full` layer is not about this caller at all.
     RateLimited,
+    /// The peer refused this node's request timestamp with `APP_ERR_TIMESTAMP_SKEW`
+    /// (ADR 013 §Application Error Codes) before any signed message existed. The usual
+    /// cause is this node's own clock, which makes every honest upstream refuse alike, so
+    /// it is never scored. It is metered, logged (throttled), and suppressed for
+    /// [`REFUSAL_SUPPRESSION_TTL`] like [`Self::RateLimited`], because any peer can send
+    /// the unsigned code.
+    TimestampRejected,
     /// The peer rejected a voucher and this lane to this provider is finished, but the
     /// shared pool deposit is NOT: it still backs every other lane and is refundable through
     /// the pool's own grace-window close and reclaim.
@@ -2960,6 +3038,7 @@ impl PullVerdict {
             Self::OurDeadline => "our_deadline",
             Self::Stalled => "stalled",
             Self::RateLimited => "rate_limited",
+            Self::TimestampRejected => "timestamp_rejected",
             Self::OurDeadLane(_) => "dead_lane",
             Self::OurVoucherRetryable(_) => "voucher_retryable",
             Self::Refused(RefusalVerdict::DurableMiss) => "declined",
@@ -3161,6 +3240,12 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     // concurrent prober at once.
     if err.downcast_ref::<UpstreamRateLimited>().is_some() {
         return PullVerdict::RateLimited;
+    }
+    // Ahead of the catch-all for the same reason: a `0x04` close or reset is the peer
+    // refusing this node's timestamp. The usual cause is this node's clock, so the
+    // residual would score every honest upstream `Unreachable` at once.
+    if err.downcast_ref::<UpstreamTimestampRejected>().is_some() {
+        return PullVerdict::TimestampRejected;
     }
     if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
         return voucher_verdict(rejected.reason, rejected.bundle.is_some());
@@ -3434,6 +3519,20 @@ fn classify_pull_failure(
             deps.metrics.node_upstream_rate_limited();
             suppress(Some(REFUSAL_SUPPRESSION_TTL));
             debug!(%provider_addr, error = %err, ttl = ?REFUSAL_SUPPRESSION_TTL, "node-origin: upstream shed the pull at the transport (rate-limited); suppressing briefly, not tarring upstream reputation");
+        }
+        // The peer refused this node's request timestamp. Not scored: the usual cause is
+        // this node's clock, and then every upstream refuses alike. Suppressed briefly, as
+        // for a shed: the code is unsigned, so a peer that never serves could otherwise
+        // send it at will and keep winning selection on a neutral score.
+        PullVerdict::TimestampRejected => {
+            record_upstream_timestamp_rejected(
+                &deps.metrics,
+                &deps.negative_cache,
+                pk,
+                hash_bytes,
+                "pull",
+                err,
+            );
         }
         // Our payment-side fault — the provider is not scored (#857). What separates this arm
         // from the retryable one below is what it costs the LANE.

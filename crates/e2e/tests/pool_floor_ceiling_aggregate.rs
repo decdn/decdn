@@ -116,9 +116,10 @@ const BLOB_BYTES: usize = 4 * 1024 * 1024 + 65_536;
 /// this journey exercises.
 const DELEGATE_CAP_MICRO_USDC: u64 = 10_000_000;
 const DELEGATE_EXPIRY_SECS: u64 = 3_600;
-/// Fixed request timestamp; the node does not gate this path on freshness and
-/// this journey never validates a signed response, so a constant suffices.
-const TIMESTAMP_US: u64 = 0x00c0_ffe1;
+/// Fresh request timestamp (µs): the node refuses a request whose
+/// `timestamp_us` sits beyond its clock-skew bound, so every request stamps a
+/// current wall-clock read — via the daemon's own clock helper.
+use decdn_node::handlers::timestamp_skew::now_us as timestamp_now_us;
 /// Budget for the very first frame of a stream: generous enough to absorb the
 /// pool-registration readiness settle on the FIRST held stream and a cache-hit
 /// serve, not just network RTT.
@@ -519,7 +520,7 @@ async fn open_and_hold(
         pool_id: ctx.pool_id.into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: TIMESTAMP_US,
+        timestamp_us: timestamp_now_us(),
     };
     let ext = StreamRequestExt {
         binding: ctx.client_binding.clone(),

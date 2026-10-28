@@ -1974,3 +1974,37 @@ async fn lane_activity_clock_ages_reports_stamped_and_omits_unstamped() {
         "an unstamped lane (stamp == 0) must be omitted, read back as never"
     );
 }
+
+/// Signing never checks the clock-skew bound again. The window tiers and the
+/// closing response sign the admitted `timestamp_us` long after admission, so
+/// a transfer that outlasts the bound must still sign: an hour-old timestamp
+/// signs, and the signature recovers to this node's key over that timestamp.
+#[tokio::test]
+async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests(&metrics).await;
+    let an_hour_ago = crate::handlers::timestamp_skew::now_us().saturating_sub(3_600 * 1_000_000);
+    assert!(
+        crate::handlers::timestamp_skew::excessive_skew_us(
+            an_hour_ago,
+            crate::handlers::timestamp_skew::now_us()
+        )
+        .is_some(),
+        "the timestamp must sit beyond the admission bound for this test to mean anything"
+    );
+    let body = StreamResponseBody {
+        hash: [7; 32],
+        ok: true,
+        rate_per_mb: 1,
+        total_bytes: 1024,
+        pool_id: [9; 32],
+        timestamp_us: an_hour_ago,
+    };
+    let (resp, _ext) = handler.sign_response(body.clone(), None)?;
+    assert_eq!(resp.body.timestamp_us, an_hour_ago);
+    let sig = alloy::primitives::Signature::try_from(resp.slash_sig.as_slice())?;
+    let recovered =
+        StreamSlashData::from_response_body(&body).recover_signer(&sig, &handler.slash_domain)?;
+    assert_eq!(recovered, handler.eth_signer.address());
+    Ok(())
+}

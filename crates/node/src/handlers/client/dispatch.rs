@@ -308,8 +308,8 @@ impl ClientHandler {
     /// `conn` is the stream's connection: each proof wait reads its transport
     /// progress ([`proof_wait`](super::proof_wait)).
     ///
-    /// Kept as one linear, ADR-ordered sequence (admit → read → bind → blob gate →
-    /// lane → sign → deliver); splitting it would scatter the ADR-005
+    /// Kept as one linear, ADR-ordered sequence (admit → read → timestamp gate →
+    /// bind → blob gate → lane → sign → deliver); splitting it would scatter the ADR-005
     /// ordering invariants across helpers — same rationale as the probe
     /// handler's `serve`.
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
@@ -352,6 +352,40 @@ impl ClientHandler {
 
         let FirstMessage::Delivery(req, ext) = first;
         let _stream_guard = self.metrics.inbound_stream_guard();
+
+        // Clock-skew gate (`crate::handlers::timestamp_skew`): every signed
+        // `StreamResponseBody` on this stream — the serve, the window tiers,
+        // and every `respond_error` refusal — echoes `req.timestamp_us` into
+        // the slash-evidence set (ADR 014 §1), which `SlashJudge` reads as
+        // the serve time, so the node signs only timestamps consistent with
+        // its own clock. Checked once here, directly on the decoded request:
+        // everything signed later on this stream reuses this same request's
+        // timestamp. A skewed request resets with NO signed response — a
+        // `respond_error` would itself sign the echoed timestamp — mirroring
+        // the bad-binding arm below, but with its own code: the request
+        // decodes fine, and the remedy is a clock fix, not a protocol fix
+        // (ADR 013 §Application Error Codes).
+        let gate_now_us = crate::handlers::timestamp_skew::now_us();
+        if let Some(skew_us) =
+            crate::handlers::timestamp_skew::excessive_skew_us(req.timestamp_us, gate_now_us)
+        {
+            if let Some(suppressed) = self.timestamp_skew_warn.admit() {
+                tracing::warn!(
+                    %peer,
+                    timestamp_us = req.timestamp_us,
+                    now_us = gate_now_us,
+                    skew_us,
+                    bound_us = crate::handlers::timestamp_skew::MAX_REQUEST_TIMESTAMP_SKEW_US,
+                    suppressed,
+                    interval = ?self.timestamp_skew_warn.interval(),
+                    "stream request timestamp beyond the clock-skew bound; resetting \
+                     (the requester's clock is wrong — or this node's, if every \
+                     request refuses)"
+                );
+            }
+            reset_stream(&mut send, &mut recv, decdn_protocol::APP_ERR_TIMESTAMP_SKEW);
+            return Ok(ServeEnd::Reset(ResetCause::TimestampSkew));
+        }
 
         // Verify an ephemeral client binding if present (ADR 005 §Client
         // identity binding) and remember the recovered address for the

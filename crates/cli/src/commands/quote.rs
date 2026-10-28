@@ -418,7 +418,11 @@ pub(crate) fn view(
             unrated_blobs += 1;
         }
         holders = Some(widen(holders, probed.holders()));
-        unanswered = unanswered.max(probed.unreachable);
+        // A node that refused this machine's timestamp gave no usable
+        // answer either. A census in which at least three nodes, and most
+        // of them, refuse it fails earlier, with an error that names the
+        // clock.
+        unanswered = unanswered.max(probed.unreachable + probed.clock_skewed);
         rate_limited = rate_limited.max(probed.rate_limited);
         for answer in &probed.answers {
             if ceiling != 0 && answer.rate_per_mb > ceiling {

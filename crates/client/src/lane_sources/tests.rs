@@ -268,6 +268,7 @@ fn late_join_ignores_failed_outcomes() {
     for outcome in [
         ProbeOutcome::Unreachable,
         ProbeOutcome::RateLimited,
+        ProbeOutcome::ClockSkewed,
         ProbeOutcome::Unverifiable,
         ProbeOutcome::Unusable,
     ] {

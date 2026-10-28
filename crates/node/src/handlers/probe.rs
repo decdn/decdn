@@ -22,6 +22,7 @@ use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer};
+use crate::handlers::timestamp_skew::{MAX_REQUEST_TIMESTAMP_SKEW_US, excessive_skew_us, now_us};
 use crate::metrics::{Metrics, ProbeHoldUnavailableReason};
 use crate::warn_throttle::WarnThrottle;
 
@@ -164,6 +165,13 @@ pub struct ProbeHandler {
     /// frame or decode, or arrives as the wrong message. The probe ALPN is
     /// unauthenticated, so any peer triggers it at will.
     read_fault_warn: WarnThrottle,
+    /// Throttle for the `warn!` on a probe request whose `timestamp_us` is
+    /// beyond the clock-skew bound. Its own window, apart from
+    /// `read_fault_warn`: the remedy is a clock fix (the requester's, or this
+    /// node's when every request refuses), not a protocol fix, and a peer can
+    /// fire either cause at will. Each event also counts into
+    /// `decdn_probe_timestamp_skew_refusals_total`.
+    timestamp_skew_warn: WarnThrottle,
 }
 
 impl std::fmt::Debug for ProbeHandler {
@@ -211,6 +219,7 @@ impl ProbeHandler {
             relay_foreign_namespaces,
             chain_freshness,
             read_fault_warn: WarnThrottle::new(PROBE_READ_FAULT_WARN_INTERVAL),
+            timestamp_skew_warn: WarnThrottle::new(PROBE_READ_FAULT_WARN_INTERVAL),
         }
     }
 
@@ -348,6 +357,49 @@ impl ProbeHandler {
                 return Ok(());
             }
         };
+
+        // Clock-skew gate (`crate::handlers::timestamp_skew`): the response
+        // below echoes `req.timestamp_us` into the signed slash-evidence set
+        // (ADR 014 §1), which `SlashJudge` reads as the serve time, so the
+        // node signs only timestamps consistent with its own clock. Checked
+        // before any store read or hold: a refused request does no work. Like
+        // a read fault, this closes the connection with no response — a
+        // signed refusal does not exist on this ALPN, and an unsigned one is
+        // a response a requester MUST reject anyway (ADR 014 §1). The close
+        // carries its own code (ADR 013 §Application Error Codes) so a
+        // requester can tell a clock problem from a malformed frame.
+        let gate_now_us = now_us();
+        if let Some(skew_us) = excessive_skew_us(req.timestamp_us, gate_now_us) {
+            self.metrics.probe_timestamp_skew_refusal();
+            if let Some(suppressed) = self.timestamp_skew_warn.admit() {
+                tracing::warn!(
+                    peer = %conn.remote_id(),
+                    timestamp_us = req.timestamp_us,
+                    now_us = gate_now_us,
+                    skew_us,
+                    bound_us = MAX_REQUEST_TIMESTAMP_SKEW_US,
+                    suppressed,
+                    interval = ?self.timestamp_skew_warn.interval(),
+                    "probe request timestamp beyond the clock-skew bound; refusing \
+                     (the requester's clock is wrong — or this node's, if every \
+                     request refuses)"
+                );
+            }
+            conn.close(
+                VarInt::from_u32(decdn_protocol::APP_ERR_TIMESTAMP_SKEW),
+                b"probe-error",
+            );
+            // Wait briefly for the close frame, as the per-peer rate-limit
+            // path does, so the peer reliably observes the `0x04` code rather
+            // than a bare connection loss. The per-peer and per-IP probe
+            // buckets above already bound how often one peer reaches this
+            // point, so the capped wait is safe.
+            let _ = tokio::time::timeout(REJECTION_CLOSE_TIMEOUT, conn.closed()).await;
+            // Handled: counted, logged (throttled) and closed with its code.
+            // An `Err` would have iroh's router log it again, unthrottled,
+            // once per skewed probe from any peer.
+            return Ok(());
+        }
 
         let hash = Hash::from_bytes(req.hash);
 

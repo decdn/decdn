@@ -43,6 +43,7 @@ use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
     StreamSlashData, bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
 };
+use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
 use decdn_protocol::client::{
     ChunkData, ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, StreamResponse,
@@ -283,7 +284,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
         a_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00b0_0a01,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -342,7 +343,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
         b_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c1_0a02,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -424,7 +425,7 @@ async fn upstream_pool_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
         Address::repeat_byte(0x55), // expected upstream signer (never reached)
         [0x42u8; 32],
         0,
-        0x00de_ad01,
+        now_us(),
         Duration::from_secs(10),
     )
     .await;
@@ -511,7 +512,7 @@ async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<(
             pool_id: pool_id.into(),
             byte_offset: 0,
             byte_len: 0,
-            timestamp_us: 0x00c0_ffee,
+            timestamp_us: now_us(),
         };
         // A bound request: the pool-model serve gate refuses any request without a
         // verified client binding (it cannot name a lane), so the abort must prove
@@ -588,7 +589,7 @@ async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<(
         b_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00c0_0d02,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -758,7 +759,7 @@ async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
         upstream_eth.address(),
         *requested_hash.as_bytes(),
         0,
-        0x00d1_0a01,
+        now_us(),
         Duration::from_secs(20),
     )
     .await;

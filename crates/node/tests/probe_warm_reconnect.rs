@@ -31,6 +31,7 @@ use decdn_incentive::ProbeSlashData;
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::handlers::probe_rate_limit::ProbeRateLimiter;
+use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{ALPN_PROBE, SLASH_SIG_LEN, message::ProbeResponse};
@@ -219,28 +220,46 @@ async fn repeat_probes_on_a_reused_endpoint_answer_like_the_first() -> anyhow::R
     let (client, _client_addr) = local_endpoint(SecretKey::generate()).await?;
 
     // Cold: nothing cached for this peer yet.
-    let (cold, _ext, _rtt) =
-        decdn_client::probe::probe_once(&client, target.clone(), PROBE_HASH, 0x1001, PROBE_TIMEOUT)
-            .await?;
-    assert_answer(&cold, 0x1001, &signer, &domain)?;
+    let ts_cold = now_us();
+    let (cold, _ext, _rtt) = decdn_client::probe::probe_once(
+        &client,
+        target.clone(),
+        PROBE_HASH,
+        ts_cold,
+        PROBE_TIMEOUT,
+    )
+    .await?;
+    assert_answer(&cold, ts_cold, &signer, &domain)?;
 
     // Let the server's session ticket land so the next probes are warm.
     tokio::time::sleep(TICKET_SETTLE).await;
 
-    let (warm, _ext, _rtt) =
-        decdn_client::probe::probe_once(&client, target.clone(), PROBE_HASH, 0x1002, PROBE_TIMEOUT)
-            .await?;
-    assert_answer(&warm, 0x1002, &signer, &domain)?;
+    let ts_warm = now_us();
+    let (warm, _ext, _rtt) = decdn_client::probe::probe_once(
+        &client,
+        target.clone(),
+        PROBE_HASH,
+        ts_warm,
+        PROBE_TIMEOUT,
+    )
+    .await?;
+    assert_answer(&warm, ts_warm, &signer, &domain)?;
     anyhow::ensure!(
         warm.body.rate_per_mb == cold.body.rate_per_mb && warm.body.has_blob == cold.body.has_blob,
         "a warm reconnection must not change the answer"
     );
 
     // The daemon-side copy of the client, on the same warm endpoint.
-    let (warm_node, _ext, _rtt) =
-        decdn_client::probe::probe_once(&client, target.clone(), PROBE_HASH, 0x1003, PROBE_TIMEOUT)
-            .await?;
-    assert_answer(&warm_node, 0x1003, &signer, &domain)?;
+    let ts_node = now_us();
+    let (warm_node, _ext, _rtt) = decdn_client::probe::probe_once(
+        &client,
+        target.clone(),
+        PROBE_HASH,
+        ts_node,
+        PROBE_TIMEOUT,
+    )
+    .await?;
+    assert_answer(&warm_node, ts_node, &signer, &domain)?;
 
     // Shut the router down *before* scraping: the handler increments
     // `decdn_probe_requests_total` after writing the response frame, so a
@@ -287,9 +306,11 @@ async fn probe_survives_a_server_restart_under_the_same_identity() -> anyhow::Re
 
     let (client, _client_addr) = local_endpoint(SecretKey::generate()).await?;
 
+    let ts_first = now_us();
     let (first, _ext, _rtt) =
-        decdn_client::probe::probe_once(&client, target, PROBE_HASH, 0x2001, PROBE_TIMEOUT).await?;
-    assert_answer(&first, 0x2001, &signer, &domain)?;
+        decdn_client::probe::probe_once(&client, target, PROBE_HASH, ts_first, PROBE_TIMEOUT)
+            .await?;
+    assert_answer(&first, ts_first, &signer, &domain)?;
 
     // The client now holds a ticket for this identity. Tear the server down.
     tokio::time::sleep(TICKET_SETTLE).await;
@@ -303,10 +324,11 @@ async fn probe_survives_a_server_restart_under_the_same_identity() -> anyhow::Re
     // now undecryptable and must not wedge the probe.
     let (router2, server_ep2, target2, signer2, domain2, _cache_tmp2) =
         spawn_probe_server(&metrics, server_sk).await?;
+    let ts_after = now_us();
     let (after, _ext, _rtt) =
-        decdn_client::probe::probe_once(&client, target2, PROBE_HASH, 0x2002, PROBE_TIMEOUT)
+        decdn_client::probe::probe_once(&client, target2, PROBE_HASH, ts_after, PROBE_TIMEOUT)
             .await?;
-    assert_answer(&after, 0x2002, &signer2, &domain2)?;
+    assert_answer(&after, ts_after, &signer2, &domain2)?;
 
     client.close().await;
     router2

@@ -365,6 +365,7 @@ pub decdn_client::quote::Census::outage_fallback: bool
 pub decdn_client::quote::Census::probed: usize
 #[non_exhaustive] pub struct decdn_client::quote::HashCensus
 pub decdn_client::quote::HashCensus::answers: alloc::vec::Vec<decdn_client::quote::NodeAnswer>
+pub decdn_client::quote::HashCensus::clock_skewed: usize
 pub decdn_client::quote::HashCensus::hash: [u8; 32]
 pub decdn_client::quote::HashCensus::rate_limited: usize
 pub decdn_client::quote::HashCensus::unreachable: usize
@@ -616,6 +617,7 @@ pub fn decdn_client::source::Funder::recover(&self, alloy_primitives::aliases::U
 pub type decdn_client::source::SourceFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = anyhow::Result<T>> + core::marker::Send + 'a)>>
 pub mod decdn_client::source_set
 pub enum decdn_client::source_set::DeclineReason
+pub decdn_client::source_set::DeclineReason::ClockSkew
 pub decdn_client::source_set::DeclineReason::Refused
 pub decdn_client::source_set::DeclineReason::Voucher(decdn_protocol::client::VoucherRejectReason)
 pub struct decdn_client::source_set::Holder

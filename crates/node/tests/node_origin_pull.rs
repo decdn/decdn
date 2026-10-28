@@ -44,6 +44,7 @@ use decdn_node::dht::{
     ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
     ProbedProvider, StakerSet, StaticNodeAddressDirectory, StaticOriginDirectory,
 };
+use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps};
 use decdn_node::selection::{MAX_PROVIDER_ATTEMPTS, POOL_OPEN_CALLER_BUDGET, outer_pull_deadline};
@@ -6984,7 +6985,7 @@ async fn leaf_ranged_paid_pull(
         pool_id: pool_id.into(),
         byte_offset,
         byte_len,
-        timestamp_us: 0x9008,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
@@ -7248,7 +7249,7 @@ async fn leaf_paced_pull_mode(
         pool_id: pool_id.into(),
         byte_offset: 0,
         byte_len,
-        timestamp_us: 0x9001,
+        timestamp_us: now_us(),
     };
     let payload =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
@@ -8748,7 +8749,7 @@ async fn concurrent_same_lane_misses_refuse_surplus() -> Result<()> {
         pool_id: leaf_pool_id.into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x9002,
+        timestamp_us: now_us(),
     };
     let payload2 =
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
@@ -10133,7 +10134,7 @@ async fn leaf_opens_paid_stream(
         pool_id: pool_id.into(),
         byte_offset: 0,
         byte_len: 0,
-        timestamp_us: 0x9002,
+        timestamp_us: now_us(),
     };
     write_frame(
         &mut send,
@@ -14943,7 +14944,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         b_eth.address(),
         *hash.as_bytes(),
         0,
-        0x00a1_0001,
+        now_us(),
         Duration::from_secs(20),
     )
     .await?;
@@ -15196,9 +15197,7 @@ async fn attack_b_attempt(
                 b_eth.address(),
                 *hash.as_bytes(),
                 0,
-                0x00b0_0000u64
-                    .saturating_add(u64::from(salt) * 0x100)
-                    .saturating_add(i as u64),
+                now_us().saturating_add(i as u64),
                 Duration::from_secs(20),
             )
             .await?;

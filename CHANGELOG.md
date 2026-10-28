@@ -5234,6 +5234,39 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: request timestamps are bounded to the node's clock before anything
+  is signed (GHSA-fjcq-8x46-cq5c).** The signed probe and stream response
+  bodies echo the requester-generated `timestamp_us` (ADR 014 § Slash
+  Signatures — secp256k1 EIP-712), and the node accepted any value. It now
+  refuses a `cdn/probe/v1` or `cdn/client/v1` request whose timestamp differs
+  from its own clock by more than a fixed 30-second bound
+  (`handlers::timestamp_skew`), before any response is built or signed: a
+  skewed probe closes the connection, and a skewed stream request resets the
+  stream, in both cases with the new `TIMESTAMP_SKEW` application error code
+  (`0x04`, ADR 013 § Application Error Codes) and no signed response. Refusals
+  count on `decdn_probe_timestamp_skew_refusals_total` /
+  `decdn_serve_stream_rejected_timestamp_skew_total` and log a throttled
+  `warn!`, so a misconfigured clock — the requester's, or the node's own — is
+  operator-visible. `decdn-client` types the code as
+  `UpstreamTimestampRejected`: when at least three probed nodes, and most
+  of them, refuse a client's timestamp, `decdn get` / `decdn quote` fail
+  with an error that names this machine's clock rather than "N did not
+  answer"; fewer refusals (which any node can send) keep the ordinary error,
+  with a clock hint. A source that refuses a stream at admission for it
+  leaves the fetch as a decline, with no peer-store failure stamp; a 0x04
+  after bytes have landed is an ordinary source fault. A fetch that every
+  source refuses this way names the clock too. A node pulling from an
+  upstream that refuses its timestamp records no reputation outcome,
+  suppresses the `(peer, hash)` pair briefly as for a rate-limit shed, and
+  counts the refusal on `decdn_node_upstream_timestamp_rejected_total`. A requester that has no
+  mapping for the code treats it as a generic transport error. Honest
+  requesters already stamp a fresh wall-clock read (ADR 005), so no message
+  layout changes — but a requester whose clock is more than 30 seconds off
+  now fails every probe and stream until its clock is fixed. **Operator
+  note:** an upward reprice (`payment.rate_per_mb`, restart-required) now
+  waits 90 seconds of real time after the last probe answered at the old
+  rate, not 30 seconds: each signed timestamp may sit up to 30 seconds from
+  the node's clock, on either side of the 30-second slashing window.
 - **Node and client: a capability `expiry` of `0` reads as expired
   (GHSA-vq47-w6q7-4rrj).** The node read a capability `expiry` of `0` as
   "never expires", while the on-chain `PaymentPool` reads it as already

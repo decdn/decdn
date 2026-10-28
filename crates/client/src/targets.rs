@@ -17,12 +17,12 @@ use decdn_incentive::slash_judge_domain;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::UpstreamRateLimited;
 use crate::discovery::{self, NodeCandidate};
 use crate::probe::probe_once;
 use crate::session::{
     ChainConfig, DiscoveryOptions, FetchMarks, PinnedNode, ProxyWarmingParams, PullSite,
 };
+use crate::{UpstreamRateLimited, UpstreamTimestampRejected};
 
 /// Per-candidate probe timeout during auto-discovery (#936). The K probes run
 /// concurrently, so this bounds selection latency rather than the overall fetch
@@ -41,22 +41,39 @@ pub(crate) fn micros_now() -> u64 {
 
 /// The terminal "nothing can serve this blob" error for [`probe_and_order`],
 /// naming the failure that actually happened (#1911). A candidate leaves the
-/// selection loop four ways: it never answered (unreachable), it kept shedding
+/// selection loop five ways: it never answered (unreachable), it kept shedding
 /// the probe with `APP_ERR_RATE_LIMITED` (rate-limited — reachable, but refusing
-/// this client's probe rate), it answered but its `slash_sig` did not recover
-/// (unverifiable), or it answered but was unusable — a `has_blob`/coverage
-/// mismatch that no honest responder produces. When any probe was unverifiable
-/// the cause is almost always local configuration rather than missing content,
-/// so that case gets its own message; otherwise the parenthetical accounts for
-/// each of the other three separately. Reached only when there is neither a
-/// cache holder nor a reachable non-holder to pull through — a `has_blob:false`
-/// answer is a serve target, not a failure, so it never lands here.
+/// this client's probe rate), it refused the probe's timestamp with
+/// `APP_ERR_TIMESTAMP_SKEW` (clock-skewed), it answered but its `slash_sig` did
+/// not recover (unverifiable), or it answered but was unusable — a
+/// `has_blob`/coverage mismatch that no honest responder produces.
+///
+/// When at least [`CLOCK_SKEW_FATAL_MIN`] probed nodes, and most of them,
+/// refused the timestamp, the cause is this machine's clock, so that case is a
+/// [`ResolveConfigFault`] that names the clock and ends the command. Fewer
+/// refusals do not end the command that way: any node can send the unsigned
+/// code at will, and a refusing node's own clock may be the wrong one. They
+/// still put the clock hint in the ordinary error's text. When any probe
+/// was unverifiable the cause is almost always local configuration rather than
+/// missing content, so that case gets its own message too. Otherwise the
+/// parenthetical accounts for each of the other counts separately. Reached
+/// only when there is neither a cache holder nor a reachable non-holder to
+/// pull through — a `has_blob:false` answer is a serve target, not a failure,
+/// so it never lands here.
 pub(crate) fn no_serve_target_error(
     probe_count: usize,
     unreachable: usize,
     rate_limited: usize,
     unverifiable: usize,
+    clock_skewed: usize,
 ) -> anyhow::Error {
+    if clock_skewed >= CLOCK_SKEW_FATAL_MIN && clock_skewed.saturating_mul(2) > probe_count {
+        return anyhow::Error::new(ResolveConfigFault(format!(
+            "{clock_skewed} of {probe_count} probed node(s) refused this machine's request \
+             timestamp as more than 30 seconds from their clocks. Check this machine's \
+             clock: set it from a time server (NTP)"
+        )));
+    }
     if unverifiable > 0 {
         return anyhow::Error::new(ResolveConfigFault(format!(
             "{unverifiable} of {probe_count} probed node(s) answered, but their probe \
@@ -72,17 +89,36 @@ pub(crate) fn no_serve_target_error(
     // wholly-unreachable set when some replied.
     let unusable = probe_count
         .saturating_sub(unreachable)
-        .saturating_sub(rate_limited);
+        .saturating_sub(rate_limited)
+        .saturating_sub(clock_skewed);
     let shed = if rate_limited > 0 {
         format!(", {rate_limited} rate-limited this client's probes")
     } else {
         String::new()
     };
+    let skewed = if clock_skewed > 0 {
+        format!(", {clock_skewed} refused this machine's request timestamp")
+    } else {
+        String::new()
+    };
+    let hint = if clock_skewed > 0 {
+        ". If this machine's clock is more than 30 seconds off, set it from a time server \
+         (NTP); if only one node refuses, that node's clock is wrong"
+    } else {
+        ""
+    };
     anyhow::anyhow!(
         "none of the {probe_count} probed node(s) could serve the blob \
-         ({unreachable} did not answer{shed}, {unusable} answered but were unusable)"
+         ({unreachable} did not answer{shed}{skewed}, {unusable} answered but were unusable)\
+         {hint}"
     )
 }
+
+/// The fewest distinct probed nodes whose `TIMESTAMP_SKEW` refusals, when they
+/// are also a majority of the probed nodes, make [`no_serve_target_error`] a
+/// [`ResolveConfigFault`] that ends the command. Any node can send the
+/// unsigned code, so one or two hostile candidates must not be able to end it.
+pub(crate) const CLOCK_SKEW_FATAL_MIN: usize = 3;
 
 /// The waits between probe attempts on a candidate that sheds the probe with
 /// `APP_ERR_RATE_LIMITED`. ADR 005's per-peer limit refills one probe every
@@ -91,21 +127,29 @@ pub(crate) fn no_serve_target_error(
 /// as rate-limited, never as silent.
 const PROBE_SHED_BACKOFFS_MS: [u64; 3] = [250, 500, 1000];
 
+/// One probe attempt's result.
+pub(crate) type ProbeResult = anyhow::Result<(
+    decdn_protocol::message::ProbeResponse,
+    decdn_protocol::ProbeResponseExt,
+    crate::probe::ProbeRtt,
+)>;
+
 /// Probe one candidate, probing it again after each [`PROBE_SHED_BACKOFFS_MS`]
 /// wait while it sheds the probe. Any other result — an answer, a timeout, a
 /// transport failure — returns at once.
+///
+/// Each attempt stamps its own `timestamp_us` from the wall clock just before
+/// it sends: a node refuses a timestamp more than 30 seconds from its clock,
+/// and the returned timestamp is the one the last attempt sent, which is the
+/// one its answer echoes and [`classify_probe`] verifies against.
 pub(crate) async fn probe_candidate(
     endpoint: &Endpoint,
     target: EndpointAddr,
     hash: [u8; 32],
-    timestamp_us: u64,
-) -> anyhow::Result<(
-    decdn_protocol::message::ProbeResponse,
-    decdn_protocol::ProbeResponseExt,
-    crate::probe::ProbeRtt,
-)> {
+) -> (u64, ProbeResult) {
     let mut backoffs = PROBE_SHED_BACKOFFS_MS.iter();
     loop {
+        let timestamp_us = micros_now();
         let res = probe_once(
             endpoint,
             target.clone(),
@@ -123,9 +167,9 @@ pub(crate) async fn probe_candidate(
                     "{} kept rate-limiting this client's probe: {e:#}",
                     target.id
                 );
-                return res;
+                return (timestamp_us, res);
             }
-            _ => return res,
+            _ => return (timestamp_us, res),
         }
     }
 }
@@ -133,6 +177,37 @@ pub(crate) async fn probe_candidate(
 /// Whether a failed probe was the node shedding it with `APP_ERR_RATE_LIMITED`.
 fn probe_shed(err: &anyhow::Error) -> bool {
     err.downcast_ref::<UpstreamRateLimited>().is_some()
+}
+
+/// Whether a failed probe was the node refusing its timestamp with
+/// `APP_ERR_TIMESTAMP_SKEW`.
+fn probe_timestamp_rejected(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<UpstreamTimestampRejected>().is_some()
+}
+
+/// Set once this process has warned about a `TIMESTAMP_SKEW` refusal.
+static CLOCK_SKEW_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Log a `TIMESTAMP_SKEW` refusal: at `warn` the first time in this process,
+/// and at `debug` after that. When this machine's clock is wrong, every node
+/// refuses every probe, and a bundle probes each node once per entry, so a
+/// line per refusal would repeat thousands of times. The count reaches the
+/// terminal error ([`no_serve_target_error`]) instead.
+fn log_timestamp_rejected(cand: &NodeCandidate, err: &anyhow::Error) {
+    if CLOCK_SKEW_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!(
+            node = %cand.node_id,
+            error = %format_args!("{err:#}"),
+            "probe refused for clock skew"
+        );
+    } else {
+        tracing::warn!(
+            "probe to {} failed: the node refused this machine's request timestamp as more \
+             than 30 seconds from its clock. Check this machine's clock. If only one node \
+             refuses, that node's clock is wrong. Later refusals in this run log at debug",
+            cand.node_id
+        );
+    }
 }
 
 /// How long a probe round keeps collecting answers after the first verified
@@ -239,6 +314,9 @@ pub(crate) enum ProbeOutcome {
     Unreachable,
     /// The candidate kept shedding the probe.
     RateLimited,
+    /// The candidate refused the probe's timestamp (`APP_ERR_TIMESTAMP_SKEW`):
+    /// its clock and this machine's differ by more than 30 seconds.
+    ClockSkewed,
     /// The answer's `slash_sig` did not recover to the candidate's operator.
     Unverifiable,
     /// The answer's `has_blob` and coverage disagree.
@@ -259,7 +337,11 @@ impl ProbeOutcome {
     pub(crate) const fn sample(&self) -> Option<(PublicKey, f64, u64)> {
         match self {
             Self::Holder(_, sample) | Self::NonHolder(_, sample) => Some(*sample),
-            Self::Unreachable | Self::RateLimited | Self::Unverifiable | Self::Unusable => None,
+            Self::Unreachable
+            | Self::RateLimited
+            | Self::ClockSkewed
+            | Self::Unverifiable
+            | Self::Unusable => None,
         }
     }
 }
@@ -375,8 +457,11 @@ struct ProbeTally {
     /// operator hunting for missing content instead of a local
     /// misconfiguration; a node shedding this client's probe rate is
     /// reachable, and reporting it as silent points at the network instead.
+    /// A node refusing this machine's timestamp is reachable too, and the
+    /// remedy is this machine's clock.
     unreachable: usize,
     rate_limited: usize,
+    clock_skewed: usize,
     unverifiable: usize,
 }
 
@@ -388,6 +473,7 @@ impl ProbeTally {
             probed_samples: Vec::new(),
             unreachable: 0,
             rate_limited: 0,
+            clock_skewed: 0,
             unverifiable: 0,
         };
         for outcome in outcomes {
@@ -402,6 +488,7 @@ impl ProbeTally {
                 }
                 ProbeOutcome::Unreachable => tally.unreachable += 1,
                 ProbeOutcome::RateLimited => tally.rate_limited += 1,
+                ProbeOutcome::ClockSkewed => tally.clock_skewed += 1,
                 ProbeOutcome::Unverifiable => tally.unverifiable += 1,
                 ProbeOutcome::Unusable => {}
             }
@@ -414,13 +501,10 @@ impl ProbeTally {
 /// before it can influence the order (ADR 014 §1). A failure is requester-local
 /// policy, with no reputation effect, because an unrecovered signature
 /// attributes nothing to anyone.
+/// `timestamp_us` is the timestamp the probe that produced `res` sent.
 pub(crate) fn classify_probe(
     cand: &NodeCandidate,
-    res: anyhow::Result<(
-        decdn_protocol::message::ProbeResponse,
-        decdn_protocol::ProbeResponseExt,
-        crate::probe::ProbeRtt,
-    )>,
+    res: ProbeResult,
     hash: [u8; 32],
     timestamp_us: u64,
     slash_domain: &alloy::sol_types::Eip712Domain,
@@ -428,6 +512,10 @@ pub(crate) fn classify_probe(
     let (resp, resp_ext, rtt) = match res {
         Ok(answer) => answer,
         Err(e) if probe_shed(&e) => return ProbeOutcome::RateLimited,
+        Err(e) if probe_timestamp_rejected(&e) => {
+            log_timestamp_rejected(cand, &e);
+            return ProbeOutcome::ClockSkewed;
+        }
         Err(_) => return ProbeOutcome::Unreachable,
     };
     if let Err(e) = crate::probe::verify_probe_response(
@@ -533,19 +621,20 @@ pub async fn probe_and_order(
     slash_domain: &alloy::sol_types::Eip712Domain,
     round: ProbeRound,
 ) -> anyhow::Result<ResolvedTargets> {
-    let timestamp_us = micros_now();
     // Probe concurrently in one task. `probe_once`'s internal timeout bounds
     // each leg; a candidate that sheds the probe is probed again after a short
-    // wait (`probe_candidate`). Each probe verifies and classifies its own
-    // answer, so the round ends only on a verified holder. Each probe owns its
-    // inputs, so a streamed round's pending probes outlive this call.
+    // wait (`probe_candidate`). Each attempt stamps its own timestamp, because
+    // a streamed round's tail can outlive a node's 30-second clock-skew bound.
+    // Each probe verifies and classifies its own answer, so the round ends
+    // only on a verified holder. Each probe owns its inputs, so a streamed
+    // round's pending probes outlive this call.
     let started = std::time::Instant::now();
     let probes = candidates.iter().cloned().map(|cand| {
         let target = probe_target(&cand, relay_hint.cloned());
         let endpoint = endpoint.clone();
         let slash_domain = slash_domain.clone();
         async move {
-            let res = probe_candidate(&endpoint, target, hash, timestamp_us).await;
+            let (timestamp_us, res) = probe_candidate(&endpoint, target, hash).await;
             log_probe_result(&cand, &res, started);
             classify_probe(&cand, res, hash, timestamp_us, &slash_domain)
         }
@@ -565,6 +654,7 @@ pub async fn probe_and_order(
         probed_samples,
         unreachable,
         rate_limited,
+        clock_skewed,
         unverifiable,
     } = ProbeTally::of(outcomes);
 
@@ -578,6 +668,7 @@ pub async fn probe_and_order(
             unreachable,
             rate_limited,
             unverifiable,
+            clock_skewed,
         ));
     }
 

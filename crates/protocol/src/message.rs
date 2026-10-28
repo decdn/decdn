@@ -233,7 +233,10 @@ impl crate::framing::TopLevelEnum for ProbeMessage {
 pub struct ProbeRequest {
     /// BLAKE3 hash of the blob being queried (iroh `Hash`, 32 bytes).
     pub hash: [u8; 32],
-    /// Requester-generated microseconds since Unix epoch, echoed back.
+    /// Requester-generated microseconds since Unix epoch, echoed back. Read
+    /// from the requester's current wall clock. It must lie within 30 seconds
+    /// of the node's clock, or the node refuses the probe with
+    /// [`crate::APP_ERR_TIMESTAMP_SKEW`].
     pub timestamp_us: u64,
 }
 

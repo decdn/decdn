@@ -23,6 +23,7 @@ use decdn_node::dht::staker_set::{ConfigStakerSet, StakerSet};
 use decdn_node::dispatch::{ConnectionLimiter, RejectReason};
 use decdn_node::handlers::probe::{ProbeHandler, StakeLanePolicy};
 use decdn_node::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer};
+use decdn_node::handlers::timestamp_skew::{MAX_REQUEST_TIMESTAMP_SKEW_US, now_us};
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
@@ -516,7 +517,7 @@ async fn probe_roundtrip() -> anyhow::Result<()> {
 
     let req = ProbeRequest {
         hash: [0x5au8; 32],
-        timestamp_us: 0x00c0_ffee,
+        timestamp_us: now_us(),
     };
     let payload = encode_message(&ProbeMessage::Request(req))?;
     write_frame(&mut send, &payload)
@@ -719,6 +720,170 @@ async fn probe_garbage_postcard_returns_malformed_code() -> anyhow::Result<()> {
 
     assert_reset_with_code(&mut recv, 0x03).await?;
     tear_down(h).await
+}
+
+/// Clock-skew gate (`handlers::timestamp_skew`): a probe whose `timestamp_us`
+/// sits beyond the node's clock-skew bound — in either direction — is refused
+/// with `TIMESTAMP_SKEW` (0x04, ADR 013) and NO signed response, because the
+/// signed slash-evidence set echoes the requester's timestamp (ADR 014 §1) and
+/// the node signs only timestamps consistent with its own clock. The refusal
+/// also does no probe work: `decdn_probe_requests_total` counts a written
+/// response, and stays at zero. The fresh-stamped positive path is every other
+/// test in this file, `probe_roundtrip` included.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_skewed_timestamp_returns_skew_code_and_no_response() -> anyhow::Result<()> {
+    // 5s past the bound on each side: far enough that loopback latency can
+    // never carry the request back inside it. Each timestamp is computed
+    // right before its request is sent, after the harness spins up.
+    const MARGIN_US: u64 = 5_000_000;
+    let stale = || now_us().saturating_sub(MAX_REQUEST_TIMESTAMP_SKEW_US + MARGIN_US);
+    let future = || now_us() + MAX_REQUEST_TIMESTAMP_SKEW_US + MARGIN_US;
+    let skewed: [&dyn Fn() -> u64; 2] = [&stale, &future];
+    for timestamp_us in skewed {
+        let h = spin_up_probe_harness().await?;
+        let (mut send, mut recv) = h
+            .client_conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let req = ProbeRequest {
+            hash: [0x5au8; 32],
+            timestamp_us: timestamp_us(),
+        };
+        let payload = encode_message(&ProbeMessage::Request(req))?;
+        write_frame(&mut send, &payload)
+            .await
+            .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+        send.finish().map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+
+        assert_reset_with_code(&mut recv, 0x04).await?;
+        let handled = support::reap("accept", h.accept_task).await?;
+        anyhow::ensure!(
+            handled.is_ok(),
+            "the skew refusal is handled, not a handler error: {handled:?}"
+        );
+        let text = h.metrics.encode()?;
+        assert_eq!(
+            metric_value(&text, "decdn_probe_timestamp_skew_refusals_total"),
+            Some(1),
+            "the skew refusal is counted once"
+        );
+        assert_eq!(
+            metric_value(&text, "decdn_probe_requests_total"),
+            Some(0),
+            "a skew refusal writes no response and does no probe work"
+        );
+        h.client_conn.close(0u32.into(), b"bye");
+        shutdown([], [&h.client_ep, &h.server_ep]).await?;
+    }
+    Ok(())
+}
+
+/// The requester side of the skew refusal: `probe_once` surfaces the
+/// `TIMESTAMP_SKEW` (0x04) close as the typed
+/// [`decdn_client::UpstreamTimestampRejected`] sentinel, recoverable with
+/// `downcast_ref` through the stage context — so the failure names this
+/// machine's clock instead of reading as a dead peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_once_types_a_skew_close_as_timestamp_rejected() -> anyhow::Result<()> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let (handler, _signer, _domain) = build_handler(server_id, 1, &metrics, limiter, cache);
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
+    let server_ep_bg = server_ep.clone();
+    let accept_task = tokio::spawn(async move {
+        if let Some(incoming) = server_ep_bg.accept().await {
+            let connecting = incoming
+                .accept()
+                .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+            let conn = connecting
+                .await
+                .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+            let _ = handler.accept(conn).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let skewed = now_us().saturating_sub(MAX_REQUEST_TIMESTAMP_SKEW_US + 5_000_000);
+    let Err(err) = decdn_client::probe::probe_once(
+        &client_ep,
+        target,
+        [0x5a; 32],
+        skewed,
+        Duration::from_secs(10),
+    )
+    .await
+    else {
+        anyhow::bail!("a skewed probe must not draw a response");
+    };
+    anyhow::ensure!(
+        err.downcast_ref::<decdn_client::UpstreamTimestampRejected>()
+            .is_some(),
+        "the skew close must be typed as UpstreamTimestampRejected: {err:#}"
+    );
+
+    let _ = support::reap("accept", accept_task).await;
+    shutdown([], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Forward compatibility of the refusal codes: a close carrying a code this
+/// client has NO mapping for is a plain, prompt error — not a crash, not a
+/// hang, not a mistyped sentinel. This is the behavior an old client shows
+/// when a newer node answers with a code (such as 0x04) that postdates it.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_once_treats_an_unknown_close_code_as_a_generic_error() -> anyhow::Result<()> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
+    let server_ep_bg = server_ep.clone();
+    let responder = tokio::spawn(async move {
+        if let Some(incoming) = server_ep_bg.accept().await {
+            let connecting = incoming
+                .accept()
+                .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+            let conn = connecting
+                .await
+                .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
+            // An unassigned application code (no ADR 013 row, no client
+            // mapping), closed before any response.
+            conn.close(VarInt::from_u32(0x3F), b"future-code");
+            let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let timeout = Duration::from_secs(10);
+    let started = std::time::Instant::now();
+    let Err(err) =
+        decdn_client::probe::probe_once(&client_ep, target, [0x22; 32], now_us(), timeout).await
+    else {
+        anyhow::bail!("a closed connection must not yield a response");
+    };
+    anyhow::ensure!(
+        started.elapsed() < timeout / 2,
+        "an unknown close code must fail promptly, waited {:?}",
+        started.elapsed()
+    );
+    anyhow::ensure!(
+        err.downcast_ref::<decdn_client::UpstreamRateLimited>()
+            .is_none()
+            && err
+                .downcast_ref::<decdn_client::UpstreamTimestampRejected>()
+                .is_none(),
+        "an unknown code must stay a plain transport error: {err:#}"
+    );
+
+    let _ = support::reap("responder", responder).await;
+    shutdown([], [&client_ep, &server_ep]).await?;
+    Ok(())
 }
 
 /// ADR 013 §Application Error Codes: an unknown enum discriminant is the
@@ -1391,7 +1556,7 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0xabc_def,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -1423,7 +1588,7 @@ async fn probe_has_blob_true_for_the_empty_blob() -> anyhow::Result<()> {
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0xabc_def,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -1479,7 +1644,7 @@ async fn probe_has_blob_false_for_the_empty_blob_when_chain_stale() -> anyhow::R
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0xabc_def,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -1518,7 +1683,7 @@ async fn probe_has_blob_false_for_a_chain_denied_empty_blob() -> anyhow::Result<
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0xabc_def,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -1559,7 +1724,7 @@ async fn probe_holds_disabled_signs_has_blob_false_for_the_empty_blob() -> anyho
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0x1234,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -1604,7 +1769,7 @@ async fn origin_only_probe_does_not_advertise_the_empty_blob_off_its_store() -> 
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 1,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -1645,7 +1810,7 @@ async fn origin_only_probe_advertises_an_empty_origin_object() -> anyhow::Result
 
     let req = ProbeRequest {
         hash: *own_hash.as_bytes(),
-        timestamp_us: 2,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -1705,7 +1870,7 @@ async fn probe_has_blob_false_when_chain_stale() -> anyhow::Result<()> {
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0xabc_def,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -1753,7 +1918,7 @@ async fn probe_has_blob_true_and_partial_coverage_for_cached_partial_holder() ->
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0xf00d,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -1830,7 +1995,7 @@ async fn probe_origin_held_advertises_full_coverage_without_caching() -> anyhow:
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0xbeef,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -1880,7 +2045,7 @@ async fn origin_only_probe_advertises_backend_only() -> anyhow::Result<()> {
 
     let foreign_req = ProbeRequest {
         hash: *foreign_hash.as_bytes(),
-        timestamp_us: 1,
+        timestamp_us: now_us(),
     };
     let (foreign_resp, foreign_resp_ext) =
         run_one_probe(fresh_key(), Arc::clone(&handler), foreign_req).await?;
@@ -1896,7 +2061,7 @@ async fn origin_only_probe_advertises_backend_only() -> anyhow::Result<()> {
 
     let own_req = ProbeRequest {
         hash: *own_hash.as_bytes(),
-        timestamp_us: 2,
+        timestamp_us: now_us(),
     };
     let (own_resp, own_resp_ext) = run_one_probe(fresh_key(), handler, own_req).await?;
     anyhow::ensure!(
@@ -1934,7 +2099,7 @@ async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyh
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0x1234,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -2002,7 +2167,7 @@ async fn probe_budget_exhausted_still_advertises_and_counts_exhausted() -> anyho
 
     let req = ProbeRequest {
         hash: *hb.as_bytes(),
-        timestamp_us: 0x55,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -2085,7 +2250,7 @@ async fn probe_end_client_reserved_out_still_advertises() -> anyhow::Result<()> 
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0x9001,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe(server_sk, handler, req).await?;
 
@@ -2171,7 +2336,7 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
 
     let req = ProbeRequest {
         hash: *hash.as_bytes(),
-        timestamp_us: 0x9002,
+        timestamp_us: now_us(),
     };
     let (resp, resp_ext) = run_one_probe_as(client_sk, server_sk, handler, req).await?;
 

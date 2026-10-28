@@ -1465,6 +1465,13 @@ pub struct ClientHandler {
     /// with the same remedy (the client signs its binding wrongly), and each
     /// event also counts into `decdn_serve_stream_rejected_bad_binding_total`.
     binding_warn: WarnThrottle,
+    /// Throttle for the `warn!` on a stream request whose `timestamp_us` is
+    /// beyond the clock-skew bound (`crate::handlers::timestamp_skew`). Its own
+    /// window: the remedy is a clock fix (the requester's, or this node's when
+    /// every request refuses), and a remote peer triggers it at will. Each
+    /// event also counts into
+    /// `decdn_serve_stream_rejected_timestamp_skew_total`.
+    timestamp_skew_warn: WarnThrottle,
     /// Throttle for the `warn!` on a stream request that carries no verified
     /// binding. A remote peer triggers it at will.
     unbound_request_warn: WarnThrottle,
@@ -1589,6 +1596,7 @@ impl ClientHandler {
             deposit_refusal_warn: WarnThrottle::new(Self::DEPOSIT_REFUSAL_WARN_INTERVAL),
             signer_cap_refusal_warn: WarnThrottle::new(Self::DEPOSIT_REFUSAL_WARN_INTERVAL),
             binding_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
+            timestamp_skew_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             unbound_request_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             unknown_lane_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             no_lane_miss_log: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),

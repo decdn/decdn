@@ -86,6 +86,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_signer_cap_exhausted_total",
     "decdn_serve_stream_rejected_signer_floor_at_cap_total",
     "decdn_serve_stream_rejected_stream_cap_full_total",
+    "decdn_serve_stream_rejected_timestamp_skew_total",
     "decdn_serve_stream_rejected_unknown_lane_total",
     "decdn_serve_stream_request_unreadable_total",
     "decdn_serve_stream_midstream_pool_exhausted_total",
@@ -1350,6 +1351,16 @@ pub struct DecdnMetrics {
     /// the upstream's close ack-wait and can still arrive as a bare drop, which
     /// lands in the unreachable counter instead of here.
     pub node_upstream_rate_limited: Counter,
+    /// `decdn_node_upstream_timestamp_rejected_total`: a probe or pull to a
+    /// candidate was refused at the transport with `APP_ERR_TIMESTAMP_SKEW`
+    /// (`0x04`, ADR 013 §Application Error Codes): the upstream found this
+    /// node's request `timestamp_us` more than 30 seconds from its own clock.
+    /// NO reputation outcome is recorded, and the `(peer, hash)` pair is
+    /// suppressed for the short refusal TTL, as for a rate-limit shed. A
+    /// value that rises with every upstream pull means this node's clock is
+    /// wrong. A value that one upstream alone causes means that upstream's
+    /// clock is wrong. The matching `warn!` line is throttled.
+    pub node_upstream_timestamp_rejected: Counter,
     /// `decdn_node_pull_backpressure_backoffs_total` (#2178): a ranged run's
     /// upstream refused the stream open for backpressure (`NotFound` or a
     /// transport rate-limit), no other candidate covered the
@@ -1729,11 +1740,24 @@ pub struct DecdnMetrics {
     /// than the one claimed. No signed response is sent. Visible name:
     /// `decdn_serve_stream_rejected_bad_binding_total`.
     pub serve_stream_rejected_bad_binding: Counter,
+    /// `serve_stream` requests reset because the request's `timestamp_us`
+    /// differs from this node's clock by more than
+    /// [`crate::handlers::timestamp_skew::MAX_REQUEST_TIMESTAMP_SKEW_US`].
+    /// No signed response is sent. Visible name:
+    /// `decdn_serve_stream_rejected_timestamp_skew_total`.
+    pub serve_stream_rejected_timestamp_skew: Counter,
     /// Probe requests this node could not read: the read timed out, the frame
     /// or the message failed to decode, or the peer sent a response on the
     /// server stream. The connection closes with the matching ADR 013 code.
     /// Visible name: `decdn_probe_read_faults_total`.
     pub probe_read_faults: Counter,
+    /// Probe requests refused because the request's `timestamp_us` differs
+    /// from this node's clock by more than
+    /// [`crate::handlers::timestamp_skew::MAX_REQUEST_TIMESTAMP_SKEW_US`].
+    /// The connection closes with `TIMESTAMP_SKEW` (ADR 013 §Application Error Codes) and no
+    /// signed response is sent. Visible name:
+    /// `decdn_probe_timestamp_skew_refusals_total`.
+    pub probe_timestamp_skew_refusals: Counter,
     /// `serve_stream` requests refused before any bytes are served because the
     /// requesting pool's remaining deposit could not cover what the node
     /// would front at its rate. (The refusal itself is signed — as an `ok: false`
@@ -3244,8 +3268,13 @@ recorders! {
     serve_stream_rejected_owner_mismatch => serve_stream_rejected_owner_mismatch.inc();
     /// A client binding failed to verify and the stream was reset.
     serve_stream_rejected_bad_binding => serve_stream_rejected_bad_binding.inc();
+    /// A `serve_stream` request's timestamp exceeded the clock-skew bound and
+    /// the stream was reset.
+    serve_stream_rejected_timestamp_skew => serve_stream_rejected_timestamp_skew.inc();
     /// A probe request could not be read.
     probe_read_fault => probe_read_faults.inc();
+    /// A probe request's timestamp exceeded the clock-skew bound.
+    probe_timestamp_skew_refusal => probe_timestamp_skew_refusals.inc();
 
     /// Record a `serve_stream` cache-miss refused by the pre-flight deposit guard
     /// (#856): the requesting pool could not cover the worst-case blob cost,
@@ -3450,6 +3479,10 @@ recorders! {
     /// An upstream shed a probe or pull at the transport with `APP_ERR_RATE_LIMITED`
     /// (#1986). Suppressed briefly, never scored — see the counter's docs.
     node_upstream_rate_limited => node_upstream_rate_limited.inc();
+
+    /// An upstream refused a probe or pull's request timestamp with
+    /// `APP_ERR_TIMESTAMP_SKEW`. Never scored — see the counter's docs.
+    node_upstream_timestamp_rejected => node_upstream_timestamp_rejected.inc();
 
     /// A ranged run completed one wait on an upstream's backpressure refusal
     /// instead of dropping the sole covering source (#2178) — see the counter's

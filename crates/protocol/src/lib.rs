@@ -114,3 +114,19 @@ pub const ALPN_DHT: &[u8] = b"cdn/dht/v1";
 /// (`decdn-client`) types this code as `UpstreamRateLimited` so the pull
 /// orchestrator suppresses the peer briefly instead of scoring it unreachable.
 pub const APP_ERR_RATE_LIMITED: u32 = 0x10;
+
+/// Request refused because its `timestamp_us` differs from the node's clock
+/// by more than 30 seconds (ADR 013 §Application Error Codes; ADR 005
+/// §`cdn/probe/v1` and §`cdn/client/v1`). The signed response bodies echo the
+/// requester's timestamp into the slash-evidence set, so a node refuses such a
+/// request with no signed response.
+///
+/// Delivered as a `RESET_STREAM` on `cdn/client/v1`. On `cdn/probe/v1` it
+/// travels in the `CONNECTION_CLOSE` frame only. The usual cause is the
+/// requester's clock. If only one node refuses, that node's clock is wrong.
+/// The requester side (`decdn-client`) types this code as
+/// `UpstreamTimestampRejected` so the failure names the clock instead of
+/// reading as an unreachable peer. A requester that has no mapping for this
+/// code treats it as a generic transport error, which is safe: the request
+/// fails.
+pub const APP_ERR_TIMESTAMP_SKEW: u32 = 0x04;

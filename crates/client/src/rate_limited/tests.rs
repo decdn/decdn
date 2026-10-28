@@ -112,3 +112,62 @@ fn transport_error_types_a_shed_and_keeps_plain_text_otherwise() -> anyhow::Resu
     assert_eq!(plain.to_string(), "open_bi failed: timed out");
     Ok(())
 }
+
+/// The `TIMESTAMP_SKEW` twin of the shed recovery: a `0x04` close or reset is
+/// typed as [`UpstreamTimestampRejected`] through the same chain shapes, and
+/// its `Display` names the clock.
+#[test]
+fn a_timestamp_refusal_is_typed_through_every_chain_shape() {
+    let close = timestamp_rejected(&app_close(APP_ERR_TIMESTAMP_SKEW, b"probe-error"));
+    assert_eq!(
+        close,
+        Some(UpstreamTimestampRejected {
+            label: Some("probe-error".to_owned())
+        })
+    );
+    let reset = ReadError::Reset(VarInt::from_u32(APP_ERR_TIMESTAMP_SKEW));
+    assert_eq!(
+        timestamp_rejected(&reset),
+        Some(UpstreamTimestampRejected { label: None })
+    );
+    let nested: FrameError =
+        std::io::Error::from(ReadError::Reset(VarInt::from_u32(APP_ERR_TIMESTAMP_SKEW))).into();
+    assert_eq!(
+        timestamp_rejected(&nested),
+        Some(UpstreamTimestampRejected { label: None })
+    );
+    assert!(
+        UpstreamTimestampRejected { label: None }
+            .to_string()
+            .contains("check this machine's clock")
+    );
+}
+
+/// `transport_error` types a `0x04` as the timestamp sentinel, and a code this
+/// client has no mapping for stays a plain transport error — the forward- and
+/// backward-compatibility contract: a peer that does not know a code treats it
+/// as a generic failure, never a crash or a special-cased refusal.
+#[test]
+fn transport_error_types_a_timestamp_refusal_and_leaves_unknown_codes_plain() -> anyhow::Result<()>
+{
+    let rejected = transport_error(
+        "read response",
+        app_close(APP_ERR_TIMESTAMP_SKEW, b"probe-error"),
+    )
+    .context("probe candidate");
+    rejected
+        .downcast_ref::<UpstreamTimestampRejected>()
+        .ok_or_else(|| anyhow::anyhow!("sentinel lost: {rejected:#}"))?;
+
+    // An unassigned code: neither sentinel claims it, and the text stays the
+    // generic transport shape.
+    let unknown = transport_error("read response", app_close(0x3F, b"future-code"));
+    assert!(unknown.downcast_ref::<UpstreamRateLimited>().is_none());
+    assert!(
+        unknown
+            .downcast_ref::<UpstreamTimestampRejected>()
+            .is_none()
+    );
+    assert!(unknown.to_string().starts_with("read response: "));
+    Ok(())
+}

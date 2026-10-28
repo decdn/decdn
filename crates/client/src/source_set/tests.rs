@@ -1346,3 +1346,85 @@ async fn discovering_a_new_holder_resets_the_backoff() {
         "a fresh holder resets the discovery timer"
     );
 }
+
+/// A node that refuses this client's timestamp declines this hash and keeps no
+/// failure stamp in the peer store: the usual cause is this machine's clock,
+/// which makes every honest node refuse alike. A set where every node refused
+/// that way ends the item with an error that names the clock.
+#[tokio::test(start_paused = true)]
+async fn a_timestamp_refusal_declines_without_a_failure_stamp() -> anyhow::Result<()> {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(
+        &p,
+        [0; 32],
+        Arc::default(),
+        vec![holder(A, 10.0), holder(B, 20.0)],
+    );
+    let skewed = || {
+        anyhow::Error::new(crate::UpstreamTimestampRejected { label: None })
+            .context("read stream response")
+    };
+    let now = Instant::now();
+    assert_eq!(
+        set.record_fault(A, &skewed(), None, now, U256::ZERO),
+        Fault::Source
+    );
+    assert!(set.exhausted(U256::ZERO, false).is_none(), "B is left");
+    set.record_fault(B, &skewed(), None, now, U256::ZERO);
+    assert!(
+        p.faults.lock().is_ok_and(|f| f.is_empty()),
+        "a clock refusal stamps no peer-store failure"
+    );
+    let err = set
+        .exhausted(U256::ZERO, false)
+        .ok_or_else(|| anyhow::anyhow!("every source declined"))?;
+    assert_eq!(
+        err.downcast_ref::<super::NoNodeWillServe>()
+            .map(|stop| stop.reasons.clone()),
+        Some(vec![super::DeclineReason::ClockSkew]),
+        "{err:#}"
+    );
+    assert!(
+        err.to_string().contains("check this machine's clock"),
+        "{err:#}"
+    );
+    Ok(())
+}
+
+/// A node sends `TIMESTAMP_SKEW` only at admission, before any byte. A 0x04
+/// after verified bytes of the range landed is a peer forging the code to
+/// dodge attribution: it stays an ordinary source fault, with a peer-store
+/// failure stamp, and no clock-skew decline.
+#[tokio::test(start_paused = true)]
+async fn a_timestamp_refusal_after_bytes_landed_is_an_ordinary_source_fault() {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(
+        &p,
+        [0; 32],
+        Arc::default(),
+        vec![holder(A, 10.0), holder(B, 20.0)],
+    );
+    let skewed =
+        anyhow::Error::new(crate::UpstreamTimestampRejected { label: None }).context("read chunk");
+    let mid_range = super::LaneRange {
+        landed: 1024,
+        ..block0()
+    };
+    let now = Instant::now();
+    assert_eq!(
+        set.record_fault(A, &skewed, Some(mid_range), now, U256::ZERO),
+        Fault::Source
+    );
+    assert_eq!(
+        p.faults.lock().map(|f| f.clone()).unwrap_or_default(),
+        vec![A],
+        "a forged mid-range 0x04 stamps the source failed"
+    );
+    // At admission (nothing landed) the same code is a decline: no stamp.
+    set.record_fault(B, &skewed, Some(block0()), now, U256::ZERO);
+    assert_eq!(
+        p.faults.lock().map(|f| f.clone()).unwrap_or_default(),
+        vec![A],
+        "an admission-time 0x04 declines without a stamp"
+    );
+}

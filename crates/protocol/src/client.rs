@@ -244,6 +244,9 @@ pub struct StreamRequest {
     /// lives in the frozen base — every node must understand it.
     pub byte_len: u64,
     /// Requester-generated microseconds since the Unix epoch, echoed back.
+    /// Read from the requester's current wall clock. It must lie within 30
+    /// seconds of the node's clock, or the node resets the stream with
+    /// [`crate::APP_ERR_TIMESTAMP_SKEW`].
     pub timestamp_us: u64,
 }
 
