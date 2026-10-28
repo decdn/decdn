@@ -81,7 +81,7 @@ A node with a cache miss issues a `cdn/dht/v1` FIND_VALUE lookup for the target 
 | Per-IP | 50 probes/sec | 200 | refill `[10, 1000]`; burst `[refill, 5×refill]` | The direct-path QUIC source IP, masked to its /64 prefix for IPv6. A relay-only connection has no direct-path IP, so this layer does not charge it. |
 | Global node | 1000 probes/sec | 2000 | refill `[100, 100000]`; burst `[refill, 10×refill]` | Single global bucket across all probes inbound to this node. |
 
-Checks fire cheapest-first (global → per-IP → per-peer) so a probe rejected by the global cap never costs a per-IP-bucket lookup. Each admitted probe consumes one token from each bucket that applies to it. A relay-only probe skips the per-IP bucket.
+Checks fire narrowest-first (per-peer → per-IP → global). A layer charges its token only after every narrower layer admits the probe. A probe that its own peer or IP bucket refuses therefore spends no token of the global budget, so one `NodeId` that floods past its cap cannot starve the other requesters. Each admitted probe consumes one token from each bucket that applies to it. A relay-only probe skips the per-IP bucket.
 
 **Why three layers, not one.** Per-peer alone is bypassable: clients are unstaked and can rotate `NodeId` for free per [ADR 003 § Probe fishing](003-payments.md#probe-fishing). The per-IP layer raises the cost of bulk probing — IP rotation requires money (proxies, IPv6 prefix delegation, cloud bills) and disadvantages bulk-probers without disadvantaging staked node-to-node traffic, which uses stable IPs. This cost argument applies only to direct-path connections. The relay does not show the client address to the node. A relay-only connection therefore passes this layer unchecked. The per-peer layer still bounds a relay peer that keeps its `NodeId`. A relay peer that rotates its `NodeId` meets only the global cap. The global cap is defence in depth against distributed attacks across many IPs that would otherwise exhaust the node's per-probe signing capacity.
 
@@ -233,7 +233,7 @@ On `cdn/client/v1` the node also holds a per-connection stream semaphore of 100 
 
 #### Request rate limiting
 
-`cdn/client/v1` inbound requests are subject to three layered token-bucket rate limits, with the same layers as [§ Probe rate limiting](#probe-rate-limiting). The node checks them once per stream, after the stream permit and **before** it reads the request. A stream that fails any layer is reset with `RATE_LIMITED` (`0x10`, [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)), and the node signs no response for it.
+`cdn/client/v1` inbound requests are subject to three layered token-bucket rate limits, with the same layers and the same narrowest-first order as [§ Probe rate limiting](#probe-rate-limiting). The node checks them once per stream, after the stream permit and **before** it reads the request. A stream that fails any layer is reset with `RATE_LIMITED` (`0x10`, [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)), and the node signs no response for it.
 
 | Layer | Default refill | Default burst | Scope |
 |---|---:|---:|---|

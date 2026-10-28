@@ -22,9 +22,12 @@
 //!
 //! # Layered checks
 //!
-//! Layers fire **global → per-IP → per-peer** (cheapest-first ordering). A
-//! request rejected by the global cap never pays the per-IP map lookup; a
-//! per-IP rejection never pays the per-peer map lookup. The first rejection
+//! Layers fire **per-peer → per-IP → global** (narrowest-first ordering). A
+//! token is charged from a layer only after every narrower layer admitted the
+//! request, so a request one peer's own bucket refuses never spends a token of
+//! the shared global budget: one `NodeId` that floods at the global rate drains
+//! only its own bucket, and honest peers keep the global one. A per-peer
+//! rejection never pays the per-IP map lookup. The first rejection
 //! short-circuits and is the only one reported to the sink's
 //! [`RateLimitMetricsSink::rejected`] — one unlabeled Counter per layer, per
 //! the sibling-counter convention settled in #1475 (see [`RejectLayer`] below
@@ -219,7 +222,7 @@ impl RejectLayer {
 /// backend-agnostic. Implementations must be cheap and lock-free on the hot
 /// `rejected` path.
 pub trait RateLimitMetricsSink: Send + Sync {
-    /// Record a request rejected at `layer` (the cheapest-first layer that
+    /// Record a request rejected at `layer` (the narrowest-first layer that
     /// drained the budget). Called at most once per rejected request.
     fn rejected(&self, layer: RejectLayer);
     /// Record a `retain_recent` sweep of the per-IP keyed-limiter map (#645).
@@ -290,12 +293,12 @@ impl ThreeLayerRateLimiter {
     /// On rejection, calls [`RateLimitMetricsSink::rejected`] with the layer
     /// that fired and returns it. No sink call on the success path.
     ///
-    /// Cheapest-first ordering (global → per-IP → per-peer): the first layer
-    /// to reject short-circuits, so a per-peer-flooded request that would also
-    /// have failed the global cap counts as `global` (the layer that actually
-    /// drained the budget).
+    /// Narrowest-first ordering (per-peer → per-IP → global): the first layer
+    /// to reject short-circuits, so a request that would fail both its peer's
+    /// bucket and the global cap counts as `per_peer`, and spends no global
+    /// token.
     pub fn check(&self, peer_node_id: &NodeId, peer_ip: Option<IpAddr>) -> Result<(), RejectLayer> {
-        // Charge one unit cheapest-first; report the layer that drained the
+        // Charge one unit narrowest-first; report the layer that drained the
         // budget to the sink. The accounting itself lives in `try_admit_one`
         // so the batch stage-2 path (`admit_batch_extra`) can reuse it without
         // the metric bump — a partial-admit boundary is not a request
@@ -310,8 +313,8 @@ impl ThreeLayerRateLimiter {
         }
     }
 
-    /// Charge exactly one unit from each enabled layer, cheapest-first
-    /// (global → per-IP → per-peer) with short-circuit on the first exhausted
+    /// Charge exactly one unit from each enabled layer, narrowest-first
+    /// (per-peer → per-IP → global) with short-circuit on the first exhausted
     /// layer. Does **not** touch any metric — callers decide whether a failure
     /// is a rejection ([`Self::check`]) or a partial-admit boundary
     /// ([`Self::admit_batch_extra`]).
@@ -328,11 +331,15 @@ impl ThreeLayerRateLimiter {
         peer_ip: Option<IpAddr>,
         prune: bool,
     ) -> Result<(), RejectLayer> {
-        // Layer 1 — global.
-        if let Some(g) = self.global.as_ref()
-            && g.check().is_err()
-        {
-            return Err(RejectLayer::Global);
+        // Layer 1 — per-peer (NodeId).
+        if let Some(limiter) = self.per_peer.as_ref() {
+            let result = limiter.check_key(peer_node_id);
+            if prune {
+                self.maybe_prune_per_peer(limiter);
+            }
+            if result.is_err() {
+                return Err(RejectLayer::PerPeer);
+            }
         }
 
         // Layer 2 — per-IP. Skipped for relay-only connections. The key is
@@ -350,15 +357,12 @@ impl ThreeLayerRateLimiter {
             }
         }
 
-        // Layer 3 — per-peer (NodeId).
-        if let Some(limiter) = self.per_peer.as_ref() {
-            let result = limiter.check_key(peer_node_id);
-            if prune {
-                self.maybe_prune_per_peer(limiter);
-            }
-            if result.is_err() {
-                return Err(RejectLayer::PerPeer);
-            }
+        // Layer 3 — global. Charged last, so a request a keyed layer refused
+        // spends none of the shared budget.
+        if let Some(g) = self.global.as_ref()
+            && g.check().is_err()
+        {
+            return Err(RejectLayer::Global);
         }
 
         Ok(())
@@ -367,7 +371,7 @@ impl ThreeLayerRateLimiter {
     /// Stage 2 of the two-stage batch admission (ADR 022 §Batch token
     /// accounting). After [`Self::check`] has charged the stage-1 frame token,
     /// this consumes up to `extra` (= `n - 1` for a batch of `n` hashes) more
-    /// units cheapest-first, each unit identical to what one separate
+    /// units narrowest-first, each unit identical to what one separate
     /// `StoreRequest` admission would charge — so the per-second work ceiling
     /// is the same whether the publisher sends `n` separate `Store`s or one
     /// `BatchStore` of size `n` (ADR 022 AC 17).
@@ -380,9 +384,9 @@ impl ThreeLayerRateLimiter {
     /// No rejection counter is bumped: the inbound frame was already admitted
     /// at stage 1, and the over-budget tail is deferred work the publisher
     /// retries, not a rejected request. Because the per-unit charge
-    /// short-circuits cheapest-first, the terminating unit may consume a global
-    /// (and per-IP) token without a per-peer token — byte-for-byte what the
-    /// `(k+1)`-th separate `Store` would have done.
+    /// short-circuits narrowest-first, the terminating unit may consume a
+    /// per-peer (and per-IP) token without a global token — byte-for-byte what
+    /// the `(k+1)`-th separate `Store` would have done.
     #[must_use]
     pub fn admit_batch_extra(
         &self,

@@ -4,8 +4,8 @@
 //! A thin serve-flavoured wrapper over the shared
 //! [`crate::rate_limit::ThreeLayerRateLimiter`] engine, like
 //! [`super::probe_rate_limit`]: it pins the serve-specific operator-visible
-//! metric names (via a private metrics sink). The layering and cheapest-first
-//! ordering (global → per-IP → per-peer) live in the shared engine.
+//! metric names (via a private metrics sink). The layering and narrowest-first
+//! ordering (per-peer → per-IP → global) live in the shared engine.
 //!
 //! The client handler charges one token per stream, before it reads the
 //! request. A refused stream is reset with `RATE_LIMITED` and gets no signed

@@ -5254,6 +5254,18 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: a peer's own rate-limit bucket refuses it before the shared
+  global one is charged.** The three-layer limiter behind `cdn/probe/v1`,
+  `cdn/dht/v1` and `cdn/client/v1` charged the global bucket first, so a
+  request that the peer's own bucket then refused had already spent a global
+  token. One `NodeId` flooding at the global rate drained the node-wide
+  budget for every other requester, even though its own cap let only a small
+  part of the flood through. The layers now fire per-peer → per-IP → global,
+  so a refused request spends no global token. A request that both its own
+  bucket and the global cap would refuse now counts on the `per_peer` (or
+  `per_ip`) rejection counter instead of `global`. ADR 005 and ADR 022 state
+  the order.
+
 - **Node: unbound requests read no pool on-chain, and admission reads are
   capped (#2706).** At admission, an unseen `pool_id` cost one `getPool` and
   an unseen signer one `getAuthorization`, with no global bound, so a stream
