@@ -970,17 +970,23 @@ const CLICK: &[(&str, &str)] = &[
 const PAGE: [u8; 32] = [0xe1; 32];
 const STYLE: [u8; 32] = [0xe2; 32];
 const DOCS: [u8; 32] = [0xe3; 32];
+const FEED: [u8; 32] = [0xe4; 32];
 const OTHER: [u8; 32] = [0xcd; 32];
 
+/// An RSS document that runs a script if a browser renders it as XML.
+const RSS: &str = "<rss version=\"2.0\"><script xmlns=\"http://www.w3.org/1999/xhtml\">\
+                   alert(1)</script></rss>";
+
 /// A gateway serving [`BLOB`] as a site bundle with `index.html`,
-/// `css/site.css` and `docs/index.html`, the blob [`OTHER`], and the host of
-/// that site.
+/// `css/site.css`, `docs/index.html` and `feed.rss`, the blob [`OTHER`], and
+/// the host of that site.
 async fn site_gateway() -> (Arc<Gateway>, String) {
     let other = alloy::hex::encode(OTHER);
     let manifest = serde_json::json!({"version": 1, "entries": [
         {"path": "index.html", "hash": alloy::hex::encode(PAGE)},
         {"path": "css/site.css", "hash": alloy::hex::encode(STYLE)},
         {"path": "docs/index.html", "hash": alloy::hex::encode(DOCS)},
+        {"path": "feed.rss", "hash": alloy::hex::encode(FEED)},
     ]});
     let page = format!(
         "<!doctype html><link rel=stylesheet href=\"css/site.css\">\
@@ -994,6 +1000,7 @@ async fn site_gateway() -> (Arc<Gateway>, String) {
             Reply::Bytes(format!("a {{ background: url(decdn:{other}) }}").into_bytes()),
         ),
         (DOCS, Reply::Bytes(b"<p>docs</p>".to_vec())),
+        (FEED, Reply::Bytes(RSS.as_bytes().to_vec())),
         (OTHER, Reply::Bytes(b"other bytes".to_vec())),
     ]);
     let (gateway, _) = recording_gateway_of(replies, &[]).await;
@@ -1209,16 +1216,65 @@ async fn the_bare_origin_still_serves_markup_as_text() {
         response.headers()[header::CONTENT_TYPE],
         "text/plain; charset=utf-8"
     );
-    assert!(
-        !response
-            .headers()
-            .contains_key(header::CONTENT_SECURITY_POLICY)
+    assert_eq!(
+        response.headers()[header::CONTENT_SECURITY_POLICY],
+        "sandbox"
     );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert!(
         String::from_utf8_lossy(&body).contains("decdn:"),
         "not rewritten"
     );
+}
+
+/// An `.rss` entry on the bare origin is neutralised to plain text and
+/// sandboxed: a browser renders any `*/*+xml` type as an XML document, so an
+/// XHTML-namespaced script inside one would otherwise run on the gateway's
+/// origin.
+#[tokio::test]
+async fn the_bare_origin_neutralises_and_sandboxes_an_rss_entry() {
+    let (gateway, _) = site_gateway().await;
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{}/feed.rss", alloy::hex::encode(BLOB)))
+        .header(header::HOST, "127.0.0.1:8484")
+        .header(TOKEN_HEADER, TEST_TOKEN)
+        .header(HOST_HEADER, "decdn.org")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let response = Arc::clone(&gateway).handle(req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers()[header::CONTENT_SECURITY_POLICY],
+        "sandbox"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(String::from_utf8_lossy(&body), RSS, "not rewritten");
+}
+
+/// `HEAD` of an `.rss`-named blob agrees with its `GET`: the same neutralised
+/// type ([`blob_type`]) and the same bare-origin sandbox ([`head_response`]).
+#[test]
+fn a_bare_head_agrees_with_get_for_an_rss_name() {
+    assert_eq!(
+        blob_type(Present::Bare, "feed.rss"),
+        "text/plain; charset=utf-8"
+    );
+    let head = head_response(
+        &blob_type(Present::Bare, "feed.rss"),
+        Some(3),
+        BLOB,
+        Present::Bare,
+    );
+    assert_eq!(
+        head.headers()[header::CONTENT_TYPE],
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(head.headers()[header::CONTENT_SECURITY_POLICY], "sandbox");
 }
 
 #[test]
@@ -1342,6 +1398,11 @@ fn content_type_by_extension_and_markup_as_text() {
         "page.xhtml",
         "logo.svg",
         "feed.xml",
+        "feed.rss",
+        "a.atom",
+        "m.rdf",
+        "m.mathml",
+        "g.kml",
         "app.js",
         "app.mjs",
         "notes.txt",

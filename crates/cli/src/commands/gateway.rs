@@ -2035,7 +2035,14 @@ impl Gateway {
         }
         let range = match ask {
             Ask::Get(range) => range,
-            Ask::Head => return Ok(head_response(&blob_type(present, &name), size, uri.hash)),
+            Ask::Head => {
+                return Ok(head_response(
+                    &blob_type(present, &name),
+                    size,
+                    uri.hash,
+                    present,
+                ));
+            }
         };
         let extent = match Extent::of(size, range, rewritten) {
             Ok(extent) => extent,
@@ -2439,6 +2446,12 @@ impl Gateway {
                 ),
             )
             .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+        // The bare origin carries no site policy, so a blob served inline is
+        // sandboxed: even a type the neutralisation misses cannot run on the
+        // gateway's origin.
+        if present == Present::Bare {
+            response = response.header(header::CONTENT_SECURITY_POLICY, "sandbox");
+        }
         if let Some(size) = size {
             response = response.header(header::CONTENT_LENGTH, size);
         }
@@ -2482,7 +2495,7 @@ impl Gateway {
             UriTarget::Blob => match self.blob_size(uri.hash).await {
                 Some(size) => {
                     let name = alloy::hex::encode(uri.hash);
-                    head_response(&blob_type(present, &name), Some(size), uri.hash)
+                    head_response(&blob_type(present, &name), Some(size), uri.hash, present)
                 }
                 None => {
                     self.paid(page_host, bucket(uri.hash), &uri, present, Ask::Head)
@@ -2533,7 +2546,12 @@ impl Gateway {
                 if manifest.entries.iter().any(|e| e.path == "index.html") {
                     "index.html"
                 } else {
-                    return head_response("text/html; charset=utf-8", None, site.hash);
+                    return head_response(
+                        "text/html; charset=utf-8",
+                        None,
+                        site.hash,
+                        Present::Site,
+                    );
                 }
             }
             UriTarget::BundleEntry(path) => path.as_str(),
@@ -2555,7 +2573,7 @@ impl Gateway {
         let content_type = site::content_type(name);
         let essence = content_type.split(';').next().unwrap_or_default();
         let length = entry.size.filter(|_| Rewrite::for_type(essence).is_none());
-        head_response(&content_type, length, entry.hash)
+        head_response(&content_type, length, entry.hash, Present::Site)
     }
 
     /// Hand the pull of `hash` to the worker, capped at `max_blob_mb` and at
@@ -3112,8 +3130,9 @@ fn with_cors(mut response: Response<Body>, origin: Option<&str>) -> Response<Bod
     response
 }
 
-/// Types a browser runs or renders as a document. The gateway serves them as
-/// plain text, so fetched content never runs on the gateway's origin.
+/// Types a browser runs or renders as a document, beyond the `*/*+xml`
+/// suffix [`is_active_type`] matches. The gateway serves them as plain text,
+/// so fetched content never runs on the gateway's origin.
 const ACTIVE_TYPES: &[&str] = &[
     "application/xhtml+xml",
     "image/svg+xml",
@@ -3122,12 +3141,20 @@ const ACTIVE_TYPES: &[&str] = &[
     "application/ecmascript",
 ];
 
+/// Whether a browser runs or renders `essence` as a document: a type in
+/// [`ACTIVE_TYPES`], or any `*/*+xml` type — a browser renders every XML
+/// MIME type as an XML document, which can embed and run an
+/// XHTML-namespaced `<script>`.
+fn is_active_type(essence: &str) -> bool {
+    ACTIVE_TYPES.contains(&essence) || essence.ends_with("+xml")
+}
+
 /// The `Content-Type` for an entry, guessed from its file name. Every `text/*`
-/// type and every type in [`ACTIVE_TYPES`] is served as plain text; a name
-/// with no known extension is served as bytes.
+/// type and every active type ([`is_active_type`]) is served as plain text; a
+/// name with no known extension is served as bytes.
 fn content_type(name: &str) -> String {
     let guess = mime_guess::from_path(name).first_or_octet_stream();
-    if guess.type_() == mime_guess::mime::TEXT || ACTIVE_TYPES.contains(&guess.essence_str()) {
+    if guess.type_() == mime_guess::mime::TEXT || is_active_type(guess.essence_str()) {
         "text/plain; charset=utf-8".to_owned()
     } else {
         guess.essence_str().to_owned()
@@ -3144,7 +3171,7 @@ fn empty_entry(path: &str, hash: [u8; 32], present: Present) -> Response<Body> {
         Present::Bare | Present::Download => content_type(name),
         Present::Site => site::content_type(name),
     };
-    head_response(&content_type, Some(0), hash)
+    head_response(&content_type, Some(0), hash, present)
 }
 
 /// What a response delivers of a blob: its size, when the manifest declares
@@ -3331,13 +3358,23 @@ fn blob_type(present: Present, name: &str) -> String {
 }
 
 /// A `HEAD` answer: the type, the length when known (and with it that ranges
-/// are taken), and the blob's hash as the entity tag, with no body.
-fn head_response(content_type: &str, size: Option<u64>, hash: [u8; 32]) -> Response<Body> {
+/// are taken), and the blob's hash as the entity tag, with no body. A bare
+/// response carries the same `sandbox` policy its `GET` does
+/// ([`Gateway::stream`]).
+fn head_response(
+    content_type: &str,
+    size: Option<u64>,
+    hash: [u8; 32],
+    present: Present,
+) -> Response<Body> {
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::ETAG, format!("\"{}\"", alloy::hex::encode(hash)))
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    if present == Present::Bare {
+        response = response.header(header::CONTENT_SECURITY_POLICY, "sandbox");
+    }
     if let Some(size) = size {
         response = response
             .header(header::CONTENT_LENGTH, size)
