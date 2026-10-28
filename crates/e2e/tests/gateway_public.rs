@@ -55,6 +55,7 @@ use decdn_cache::Hash;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
+use decdn_e2e::ports::PortReservation;
 use decdn_incentive::eth_identity;
 use reqwest::StatusCode;
 
@@ -150,9 +151,11 @@ async fn run() -> anyhow::Result<()> {
         .await?;
 
     // ---- GATEWAY: public, pinned to the node, on a free loopback port ----
-    let port = free_port()?;
-    let listen = format!("127.0.0.1:{port}");
-    let metrics = format!("127.0.0.1:{}", free_port()?);
+    // Both held until the test ends, so no other process takes them first.
+    let gateway_port = PortReservation::tcp()?;
+    let listen = gateway_port.addr().to_string();
+    let metrics_port = PortReservation::tcp()?;
+    let metrics = metrics_port.addr().to_string();
     let mut gateway =
         tokio::process::Command::from(decdn_command(gateway_dir.path(), KEYSTORE_PASSWORD)?)
             .args(
@@ -541,7 +544,8 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- (7) `decdn dashboard` shows the gateway and the node ----
     let dashboard_dir = private_tempdir("dashboard")?;
-    let dashboard_listen = format!("127.0.0.1:{}", free_port()?);
+    let dashboard_port = PortReservation::tcp()?;
+    let dashboard_listen = dashboard_port.addr().to_string();
     let mut dashboard =
         tokio::process::Command::from(decdn_command(dashboard_dir.path(), KEYSTORE_PASSWORD)?)
             .args(strs(&[
@@ -634,12 +638,6 @@ fn private_tempdir(role: &str) -> anyhow::Result<tempfile::TempDir> {
     )
     .with_context(|| format!("chmod {role} dir 0o700"))?;
     Ok(dir)
-}
-
-/// A loopback port nothing listens on.
-fn free_port() -> anyhow::Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
 }
 
 /// The chain coordinates as flags, so no config file is needed.

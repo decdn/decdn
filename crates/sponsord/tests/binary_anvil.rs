@@ -19,6 +19,7 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use decdn_client::buyer_pool::{ensure_allowance, open_pool};
 use decdn_e2e::chain::ChainFixture;
+use decdn_e2e::ports::PortReservation;
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{CapabilityGrant, Deployment, eth_identity, voucher_domain};
 
@@ -98,10 +99,9 @@ async fn daemon_binary_serves_tops_up_and_shuts_down() {
     unrecorded.recorded();
     let pool_id = opened.state.pool_id;
 
-    let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    // Held until the test ends, so no other process takes the port first.
+    let reservation = PortReservation::tcp().unwrap();
+    let port = reservation.port();
     let base = format!("http://127.0.0.1:{port}");
     let mut daemon = Daemon(Some(
         Command::new(env!("CARGO_BIN_EXE_sponsord"))

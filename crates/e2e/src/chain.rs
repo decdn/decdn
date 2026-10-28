@@ -18,8 +18,9 @@
 //! reached behind the harness's `anvil-e2e` gate.
 
 use std::fs::File;
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use alloy::network::{EthereumWallet, TransactionBuilder};
@@ -132,9 +133,11 @@ const DEPLOY_RETRY_BACKOFF: Duration = Duration::from_secs(3);
 /// socket, so the pool has to be observed quiet, not merely dropped once.
 const POOL_DRAIN_POLLS: usize = 5;
 const POOL_DRAIN_SETTLE: Duration = Duration::from_millis(250);
-/// Re-pick the ephemeral port and re-spawn anvil this many times when it dies at
-/// startup (the `free_port` TOCTOU: another process claimed the port first).
-const ANVIL_ATTEMPTS: usize = 3;
+/// How long anvil gets to print the address it listens on, and then to answer
+/// its first RPC.
+const ANVIL_START_TIMEOUT: Duration = Duration::from_secs(20);
+/// The stdout line in which anvil reports its listen address.
+const ANVIL_LISTENING: &str = "Listening on ";
 
 /// The `SlashJudge._verifyPair` offense a signed probe/stream pair can prove
 /// (#1042). Mirrors the paired entry of `ISlashJudge.OffenseType`; `Blacklist`
@@ -258,80 +261,120 @@ struct AnvilProcess {
     admin: DynProvider,
 }
 
-/// Bring up an `anvil` on a fresh ephemeral port at [`E2E_CHAIN_ID`] and wait
-/// for its RPC, retrying the `free_port` TOCTOU (another process claims the port
-/// in the gap before anvil binds, so anvil exits at startup — re-pick and retry
-/// rather than fail the fixture).
+/// Bring up an `anvil` at [`E2E_CHAIN_ID`] on a port it picks itself (see
+/// [`spawn_anvil_child`]) and wait for its RPC.
 ///
 /// `manifest` is the `deployments/*.json` path whose cleanup the guard owns —
 /// `Some` for the throwaway anvil the one-time deploy writes a manifest into,
 /// `None` for a per-journey anvil that loads a snapshot and writes none.
 async fn spawn_anvil(manifest: Option<PathBuf>) -> anyhow::Result<AnvilProcess> {
     let admin_signer: PrivateKeySigner = ADMIN_KEY.parse().context("parse admin key")?;
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        let port = crate::free_port()?;
-        let rpc_url = format!("http://127.0.0.1:{port}");
-        let child = Command::new("anvil")
-            .args([
-                "--port",
-                &port.to_string(),
-                "--chain-id",
-                &E2E_CHAIN_ID.to_string(),
-                "--silent",
-            ])
-            .spawn()
-            .context("spawn anvil (is foundry installed?)")?;
-        let mut guard = AnvilGuard {
-            child,
-            manifest: manifest.clone(),
-        };
+    let (child, port) = spawn_anvil_child(&["--chain-id", &E2E_CHAIN_ID.to_string()]).await?;
+    let mut guard = AnvilGuard { child, manifest };
+    let rpc_url = format!("http://127.0.0.1:{port}");
 
-        // Every provider this fixture hands out builds a reqwest client.
-        decdn_common::tls::install_crypto_provider();
-        let url: reqwest::Url = rpc_url.parse().context("parse anvil rpc url")?;
-        let admin: DynProvider = ProviderBuilder::new()
-            .with_simple_nonce_management()
-            .wallet(EthereumWallet::from(admin_signer.clone()))
-            .connect_http(url.clone())
-            .erased();
+    // Every provider this fixture hands out builds a reqwest client.
+    decdn_common::tls::install_crypto_provider();
+    let url: reqwest::Url = rpc_url.parse().context("parse anvil rpc url")?;
+    let admin: DynProvider = ProviderBuilder::new()
+        .with_simple_nonce_management()
+        .wallet(EthereumWallet::from(admin_signer))
+        .connect_http(url.clone())
+        .erased();
 
-        // Wait for the RPC to accept requests. A premature anvil exit is almost
-        // always the port clash above (retryable); a genuine timeout is a hard
-        // failure.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        let up = loop {
-            if admin.get_chain_id().await.is_ok() {
-                break true;
-            }
-            if let Ok(Some(status)) = guard.child.try_wait() {
-                tracing::warn!(
-                    "anvil exited before its RPC came up (status {status}) on attempt \
-                     {attempt}/{ANVIL_ATTEMPTS}; retrying on a fresh port"
-                );
-                break false;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("anvil RPC never came up within 20s");
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        };
-        if up {
-            return Ok(AnvilProcess {
-                guard,
-                rpc_url,
-                url,
-                admin,
-            });
+    let deadline = tokio::time::Instant::now() + ANVIL_START_TIMEOUT;
+    while admin.get_chain_id().await.is_err() {
+        if let Ok(Some(status)) = guard.child.try_wait() {
+            anyhow::bail!("anvil exited before its RPC came up: {status}");
         }
-        // `guard` drops here: kills the dead child before the next attempt.
-        if attempt >= ANVIL_ATTEMPTS {
-            anyhow::bail!(
-                "anvil never became ready after {ANVIL_ATTEMPTS} attempts (exited before its RPC came up each time)"
-            );
-        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "anvil RPC never came up within {ANVIL_START_TIMEOUT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    Ok(AnvilProcess {
+        guard,
+        rpc_url,
+        url,
+        admin,
+    })
+}
+
+/// Spawn `anvil --port 0` with `args`, and return it with the loopback port it
+/// bound.
+///
+/// Port 0 makes the kernel pick the port at anvil's own bind, so no other
+/// process can take it first. anvil reports the port on stdout as
+/// `Listening on 127.0.0.1:<port>`, which `--silent` suppresses, so `args` must
+/// not hold `--silent`. A thread reads stdout up to that line, then discards the
+/// rest (one line per RPC request) until anvil exits, so anvil never blocks on
+/// a full pipe. The child is killed and reaped on every error.
+async fn spawn_anvil_child(args: &[&str]) -> anyhow::Result<(Child, u16)> {
+    let mut child = Command::new("anvil")
+        .args(["--port", "0"])
+        .args(args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("spawn anvil (is foundry installed?)")?;
+    let port = match read_anvil_port(&mut child).await {
+        Ok(port) => port,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
+    Ok((child, port))
+}
+
+/// The port `child` (an anvil spawned with piped stdout) reports it listens on.
+async fn read_anvil_port(child: &mut Child) -> anyhow::Result<u16> {
+    let stdout = child
+        .stdout
+        .take()
+        .context("anvil spawned without piped stdout")?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("anvil-stdout".to_owned())
+        .spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        if let Some(port) = anvil_listen_port(&String::from_utf8_lossy(&line)) {
+                            let _ = tx.send(port);
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        })
+        .context("spawn the anvil stdout reader")?;
+    match tokio::time::timeout(ANVIL_START_TIMEOUT, rx).await {
+        Ok(Ok(port)) => Ok(port),
+        Ok(Err(_)) => anyhow::bail!(
+            "anvil closed stdout before it printed `{ANVIL_LISTENING}<addr>` (exit: {:?})",
+            child.try_wait().ok().flatten()
+        ),
+        Err(_) => anyhow::bail!(
+            "anvil printed no `{ANVIL_LISTENING}<addr>` within {ANVIL_START_TIMEOUT:?}"
+        ),
+    }
+}
+
+/// The port in anvil's `Listening on <addr>` stdout line, or `None` for any
+/// other line.
+fn anvil_listen_port(line: &str) -> Option<u16> {
+    line.trim()
+        .strip_prefix(ANVIL_LISTENING)?
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|addr| addr.port())
 }
 
 /// A live anvil deployment of the full protocol with typed handles.

@@ -75,6 +75,8 @@ tracing = { workspace = true }
 # `systemctl stop` sends, through `kill(2)`'s safe wrapper: the workspace forbids
 # `unsafe_code`, which rules out calling `libc::kill` directly.
 nix = { version = "0.31", default-features = false, features = ["signal"] }
+# `ports` binds a port reservation without listening on it, which `std` cannot.
+socket2 = { workspace = true }
 
 [dev-dependencies]
 blake3 = { workspace = true }

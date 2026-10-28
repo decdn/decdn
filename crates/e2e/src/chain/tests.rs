@@ -211,16 +211,8 @@ async fn reset_broadcast_lane_survives_a_straggler_from_a_killed_forge() {
     // POOL_DRAIN_SETTLE) so the straggler is still pending through the reset.
     const BLOCK_TIME: u64 = 4;
 
-    let port = crate::free_port().expect("free port");
-    let mut anvil = Command::new("anvil")
-        .args([
-            "--port",
-            &port.to_string(),
-            "--block-time",
-            &BLOCK_TIME.to_string(),
-            "--silent",
-        ])
-        .spawn()
+    let (mut anvil, port) = spawn_anvil_child(&["--block-time", &BLOCK_TIME.to_string()])
+        .await
         .expect("spawn anvil (is foundry installed?)");
 
     let url: reqwest::Url = format!("http://127.0.0.1:{port}")
@@ -311,4 +303,15 @@ fn contracts_dir_resolves_from_the_runtime_package_dir() {
         "{}",
         contracts.display()
     );
+}
+
+#[test]
+fn anvil_listen_port_reads_the_listening_line() {
+    assert_eq!(
+        anvil_listen_port("Listening on 127.0.0.1:46121\n"),
+        Some(46121)
+    );
+    assert_eq!(anvil_listen_port("Listening on [::1]:8545"), Some(8545));
+    assert_eq!(anvil_listen_port("Chain ID: 31337"), None);
+    assert_eq!(anvil_listen_port("Listening on localhost"), None);
 }

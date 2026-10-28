@@ -27,6 +27,7 @@ use decdn_common::identity;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 
 use crate::chain::{ChainFixture, ContractAddrs};
+use crate::ports::{PortReservation, UdpPortClaim};
 
 /// Fixed keystore password for the daemon's eth signer (test-only). Public so a
 /// journey that drives the `decdn` CLI against this node's keystore can pass it
@@ -85,11 +86,11 @@ pub struct NodeFixture {
     operator: PrivateKeySigner,
     operator_addr: Address,
     node_id: iroh::PublicKey,
-    bind_port: u16,
-    // Prometheus scrape port (loopback), retained so a journey can read a
-    // per-reason reject counter directly (`scrape_metric`) rather than infer it
-    // from the collapsed wire `NotFound` (#1371).
-    metrics_port: u16,
+    // The QUIC, admin and metrics ports, held for the fixture's lifetime so
+    // every spawn of the daemon, a restart included, binds the same ports and
+    // no other process gets them in between. Declared after `child`, so the
+    // daemon is killed before its ports are released.
+    ports: NodePorts,
     admin_url: String,
     // Rendered `node.toml`: respawns the daemon on `restart` against the same
     // state; `config_path()` lets a journey point the `decdn` CLI at the same
@@ -178,7 +179,7 @@ impl NodeFixture {
     /// QUIC bind port (loopback) the client dials.
     #[must_use]
     pub const fn bind_port(&self) -> u16 {
-        self.bind_port
+        self.ports.quic.port()
     }
 
     /// Loopback admin RPC base URL.
@@ -190,7 +191,7 @@ impl NodeFixture {
     /// Loopback Prometheus `/metrics` URL.
     #[must_use]
     pub fn metrics_url(&self) -> String {
-        format!("http://127.0.0.1:{}/metrics", self.metrics_port)
+        format!("http://{}/metrics", self.ports.metrics.addr())
     }
 
     /// Path to the rendered `node.toml`: lets a journey point the `decdn` CLI at
@@ -542,10 +543,8 @@ impl NodeFixture {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        // One simultaneous grab so the three ports are guaranteed distinct
-        // (three sequential grabs can repeat a number).
-        let [bind_port, admin_port, metrics_port] = crate::free_ports::<3>()?;
-        let multiaddr = format!("/ip4/127.0.0.1/udp/{bind_port}/quic-v1");
+        let ports = NodePorts::new()?;
+        let multiaddr = format!("/ip4/127.0.0.1/udp/{}/quic-v1", ports.quic.port());
 
         provision_on_chain(chain, &operator, &node_secret, region, &multiaddr, onboard).await?;
 
@@ -560,9 +559,9 @@ impl NodeFixture {
         let config = render_config(&RenderConfig {
             data_dir: data_dir.path().to_path_buf(),
             region,
-            bind_port,
-            admin_port,
-            metrics_port,
+            bind_port: ports.quic.port(),
+            admin_port: ports.admin.port(),
+            metrics_port: ports.metrics.port(),
             rpc_url: &rpc_url,
             keystore: &keystore,
             cache_dir: &cache_dir,
@@ -614,9 +613,8 @@ impl NodeFixture {
             operator,
             operator_addr,
             node_id,
-            bind_port,
-            metrics_port,
-            admin_url: format!("http://127.0.0.1:{admin_port}"),
+            admin_url: format!("http://{}", ports.admin.addr()),
+            ports,
             config_path,
             log,
         };
@@ -867,7 +865,7 @@ impl NodeFixture {
     /// value is parsed (the Prometheus text format renders a `_total` counter
     /// without a fraction), so a metric that later gains labels still totals up.
     pub async fn scrape_metric(&self, name: &str) -> anyhow::Result<u64> {
-        let url = format!("http://127.0.0.1:{}/metrics", self.metrics_port);
+        let url = self.metrics_url();
         let body = reqwest::get(&url)
             .await
             .with_context(|| format!("scrape {url}"))?
@@ -958,6 +956,29 @@ impl NodeFixture {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+}
+
+/// The ports one daemon binds, held for its fixture's lifetime.
+#[derive(Debug)]
+struct NodePorts {
+    /// The QUIC endpoint's UDP port, which the operator registers on-chain.
+    quic: UdpPortClaim,
+    /// The admin RPC listener.
+    admin: PortReservation,
+    /// The Prometheus `/metrics` listener. A journey scrapes it to read a
+    /// per-reason reject counter directly (`scrape_metric`) rather than infer it
+    /// from the collapsed wire `NotFound` (#1371).
+    metrics: PortReservation,
+}
+
+impl NodePorts {
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            quic: UdpPortClaim::new().context("claim the QUIC port")?,
+            admin: PortReservation::tcp().context("reserve the admin port")?,
+            metrics: PortReservation::tcp().context("reserve the metrics port")?,
+        })
     }
 }
 
