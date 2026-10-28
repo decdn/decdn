@@ -1239,6 +1239,16 @@ since project inception and will roll into the first tagged release.
   covered, so discovery runs only for a range no running or building lane
   covers, or when no source can start. ADR 012 and ADR 039 § Source set and
   selection state the rule.
+- **Node: a recovery `topUp` whose nonce the redeemer took is sent again
+  (#2721).** The node signs its sellers' `redeemMany` and its buyer `topUp`
+  with one key. A redemption that mined at the nonce the `topUp` had read
+  made the `topUp` fail `nonce too low`. The settle proved from the chain
+  that nothing escrowed, but the funding recovery step took that as final,
+  so the node-to-node fetch failed. The funding task now sends a fresh
+  `topUp` at a later nonce, at most twice, while it keeps the top-up slot.
+  Every copy of the lost `topUp` was signed at the spent nonce, so none can
+  mine later, and the fresh one cannot escrow twice. Each retry ticks the new
+  `decdn_buyer_topup_nonce_lost_total` counter.
 - **Client: a streamed fetch with no size hint keeps the pull it opened for
   the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
   fast path, or a gateway pull whose size lookup finds none), the client read
