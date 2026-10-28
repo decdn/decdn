@@ -231,6 +231,26 @@ Stream concurrency is enforced via QUIC's `MAX_STREAMS` transport parameter: a p
 
 On `cdn/client/v1` the node also holds a per-connection stream semaphore of 100 permits (`MAX_CLIENT_STREAMS`, the `cdn/client/v1` row above). A stream that finds no permit is reset with `RATE_LIMITED` before the node reads its request, and the node signs no response for it. Thus an over-cap stream does not buffer a request frame or cost a signature. Together with the frame ceilings and the connection receive window, this bounds the memory that stalled peers can hold ([ADR 013 § Wire Framing](013-schema-evolution.md#wire-framing)).
 
+#### Request rate limiting
+
+`cdn/client/v1` inbound requests are subject to three layered token-bucket rate limits, with the same layers as [§ Probe rate limiting](#probe-rate-limiting). The node checks them once per stream, after the stream permit and **before** it reads the request. A stream that fails any layer is reset with `RATE_LIMITED` (`0x10`, [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)), and the node signs no response for it.
+
+| Layer | Default refill | Default burst | Scope |
+|---|---:|---:|---|
+| Per-peer (NodeId) | 100 requests/sec | 400 | The source iroh `NodeId` on the QUIC connection. |
+| Per-IP | 200 requests/sec | 800 | The direct-path QUIC source IP, masked to its /64 prefix for IPv6. A relay-only connection has no direct-path IP, so this layer does not charge it. |
+| Global node | 2000 requests/sec | 5000 | Single global bucket across all inbound `cdn/client/v1` requests to this node. |
+
+Operators set the layers under `[serve.rate_limit]`. A rate of `0` turns a layer off.
+
+**Why the node limits unpaid requests.** A request costs the node work before any payment binds it. Every refusal past the stream permit carries a signed `StreamResponse`. An origin-only node sends its backend a `HEAD` for an unseen hash before it checks a lane or a payment. An unseen pool or signer costs a chain read. Without a limit, a peer can spend the node's signing capacity, origin requests and RPC quota on requests that never pay.
+
+**Why these defaults.** One request is one stream, and an honest client opens one stream per pull leg, with up to 100 at once on one connection ([§ Concurrent stream limits](#concurrent-stream-limits)). A node pulling on a cache miss shares one `NodeId` across all its pulls. The caps therefore sit well above the probe caps. `decdn-client` reads a `RATE_LIMITED` reset as back-off, not as a fault.
+
+**Why NodeId, IP and global, not signer.** The layers key on the connection, not on the voucher signer. A signer key is free to rotate, and a node keeps no per-signer rate memory ([ADR 003](003-payments.md#adr-003-payment-model)). The per-IP layer has the relay-only gap that [§ Probe rate limiting](#probe-rate-limiting) describes ([#2505](https://github.com/decdn/decdn/issues/2505)).
+
+**Metrics.** `decdn_serve_rate_limit_rejected_{per_peer,per_ip,global}_total`, three sibling counters, unlabeled. Each refused stream counts on the counter of the layer that refused it first.
+
 #### Payment lanes and concurrent streams
 
 A single `pool_id` can be shared across concurrent streams on the same connection. Vouchers are cumulative across **all** streams on the lane (one `(signer, provider)` pair):

@@ -332,6 +332,21 @@ impl ClientHandler {
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
             return Ok(ServeEnd::Reset(ResetCause::StreamCapFull));
         }
+        // Per-request limiter (ADR 005 §Request rate limiting), on the same
+        // footing as the stream cap: refuse before the request is read, with no
+        // signed response. Every later refusal signs, and an origin-only node
+        // probes its backend for an unseen hash before any payment check, so
+        // an unpaid flood must stop here.
+        if let Some(limiter) = &self.request_limiter
+            && let Err(layer) = limiter.check(
+                &crate::dht::routing::NodeId::from_bytes(*peer.as_bytes()),
+                crate::rate_limit::peer_ip(&conn),
+            )
+        {
+            tracing::debug!(layer = layer.as_str(), "client request rate-limited");
+            reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
+            return Ok(ServeEnd::Reset(ResetCause::RateLimited(layer)));
+        }
 
         let client_node_id = B256::from(*peer.as_bytes());
         let first = match read_first_message(&mut recv).await {

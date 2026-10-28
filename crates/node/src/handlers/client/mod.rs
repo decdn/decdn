@@ -1007,6 +1007,10 @@ pub struct ClientHandlerDeps {
     /// gate and the ADR 011 funder gate. `None` (tests) disables both gates —
     /// they fail open, exactly as before E4 wired the view.
     pub pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
+    /// Per-request rate limiter (`[serve.rate_limit]`, ADR 005 §Request rate
+    /// limiting), checked once per stream before its request is read. `None`
+    /// (tests) admits every stream the stream cap admits.
+    pub request_limiter: Option<Arc<crate::handlers::serve_rate_limit::ServeRateLimiter>>,
     /// Refundable minimum-remaining-deposit floor `M` (token base units). The
     /// seller refuses to serve a lane's pool once its on-chain remaining
     /// (`getPool.deposit − getPool.totalRedeemed`) minus this floor can no
@@ -1169,6 +1173,7 @@ impl ClientHandlerDeps {
             pool_state_store,
             receipt_sink,
             pool_view: None,
+            request_limiter: None,
             pool_min_remaining_deposit,
             rate_per_mb,
             max_concurrent_streams,
@@ -1340,6 +1345,8 @@ pub struct ClientHandler {
     /// Cached `getPool` view for the floor-`M` and ADR 011 funder gates. `None`
     /// (tests) makes both gates fail open.
     pool_view: Option<Arc<dyn crate::pool_view::PoolView>>,
+    /// See [`ClientHandlerDeps::request_limiter`].
+    request_limiter: Option<Arc<crate::handlers::serve_rate_limit::ServeRateLimiter>>,
     /// Liveness of the node's chain reads (ADR 011 § Serving while chain-stale).
     /// `Some` only when the blacklist watcher is wired; the admit path refuses
     /// once it reads stale. `None` (tests) disables the gate.
@@ -1574,6 +1581,7 @@ impl ClientHandler {
             pool_min_remaining_deposit: deps.pool_min_remaining_deposit,
             receipt_sink: deps.receipt_sink,
             pool_view: deps.pool_view,
+            request_limiter: deps.request_limiter,
             chain_freshness: deps.chain_freshness,
             lanes: Arc::new(map),
             lane_count,

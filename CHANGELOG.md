@@ -5254,6 +5254,21 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: inbound `cdn/client/v1` requests pass a three-layer rate limiter
+  before they are read (#2694).** The only gates on `cdn/client/v1` were the
+  per-connection limiter and the stream cap. Every refusal past them signs a
+  response, and an origin-only node sent its backend a `HEAD` for each unseen
+  hash before any lane or payment check, so a flood of unpaid requests spent
+  node CPU and origin requests without limit. A new `[serve.rate_limit]`
+  section (per-peer 100/s burst 400, per-IP 200/s burst 800, global 2000/s
+  burst 5000; a rate of 0 turns a layer off) is checked once per stream,
+  after the stream permit and before the request is read. A refused stream is
+  reset with `RATE_LIMITED` and no signed response, and counts on
+  `decdn_serve_rate_limit_rejected_{per_peer,per_ip,global}_total`. Those
+  three counters are inbound failure reasons, so the devops "Unattributed
+  stream failures" panels need them too. `decdn-client` reads the reset as
+  back-off. ADR 005 § Request rate limiting describes the layers.
+
 - **Node: the DHT routing table admits bonded peers only (#2708).** ADR 022
   restricts the routing pool to bonded operators, but the table admitted every
   peer that contacted the node and every id a `closer_nodes` answer named, and

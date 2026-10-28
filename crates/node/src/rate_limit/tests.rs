@@ -130,6 +130,21 @@ fn probe_mapping_is_not_transposed() {
     assert_sentinels_in_place(&RateLimitConfig::from(&resolved));
 }
 
+#[test]
+fn serve_mapping_is_not_transposed() {
+    let resolved = decdn_common::config::ResolvedServe {
+        per_peer_rate_per_sec: S_PER_PEER_RATE,
+        per_peer_burst: S_PER_PEER_BURST,
+        per_ip_rate_per_sec: S_PER_IP_RATE,
+        per_ip_burst: S_PER_IP_BURST,
+        global_rate_per_sec: S_GLOBAL_RATE,
+        global_burst: S_GLOBAL_BURST,
+        max_tracked_per_ip: S_MAX_TRACKED_PER_IP,
+        max_tracked_per_peer: S_MAX_TRACKED_PER_PEER,
+    };
+    assert_sentinels_in_place(&RateLimitConfig::from(&resolved));
+}
+
 /// No sentinel may equal a value either `Default` impl can supply.
 ///
 /// Pairwise distinctness (the `const _` asserts above) makes a *swap*
@@ -147,7 +162,8 @@ fn sentinels_never_collide_with_defaults() {
     // could plausibly reach for any of the three.
     let dht = RateLimitConfig::from(&decdn_common::config::ResolvedDht::default());
     let probe = RateLimitConfig::from(&decdn_common::config::ResolvedProbe::default());
-    for cfg in [&RateLimitConfig::default(), &dht, &probe] {
+    let serve = RateLimitConfig::from(&decdn_common::config::ResolvedServe::default());
+    for cfg in [&RateLimitConfig::default(), &dht, &probe, &serve] {
         for rate in [
             cfg.per_peer_rate_per_sec,
             cfg.per_ip_rate_per_sec,

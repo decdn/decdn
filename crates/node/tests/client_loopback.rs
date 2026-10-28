@@ -13312,6 +13312,92 @@ async fn over_cap_stream_is_reset_before_its_request_is_read() -> anyhow::Result
     Ok(())
 }
 
+/// #2694 / #2706: the `[serve.rate_limit]` limiter refuses a stream before its
+/// request is read (ADR 005 §Request rate limiting). A peer whose per-peer
+/// bucket is empty opens a stream and announces a request frame with no body.
+/// The handler resets it with `RATE_LIMITED` at once: it does not wait for the
+/// body, sign a response, probe an origin or read the chain, and the refusal
+/// counts on the per-peer counter as the stream's failure reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_limited_stream_is_reset_before_its_request_is_read() -> anyhow::Result<()> {
+    use decdn_node::handlers::serve_rate_limit::ServeRateLimiter;
+
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&[0x4Eu8; 1024]).await?;
+    let store_dyn: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    // One request per peer, refilled far slower than the test runs; the per-IP
+    // and global layers are off.
+    let request_limiter = Arc::new(ServeRateLimiter::from_resolved(
+        &decdn_common::config::ResolvedServe {
+            per_peer_rate_per_sec: 0.001,
+            per_peer_burst: 1,
+            per_ip_rate_per_sec: 0.0,
+            per_ip_burst: 0,
+            global_rate_per_sec: 0.0,
+            global_burst: 0,
+            max_tracked_per_ip: 16,
+            max_tracked_per_peer: 16,
+        },
+        Arc::clone(&metrics),
+    ));
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        16,
+        |deps| deps.request_limiter = Some(Arc::clone(&request_limiter)),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // Spend the client's one token out of band.
+    anyhow::ensure!(
+        request_limiter
+            .check(
+                &decdn_node::dht::routing::NodeId::from_bytes(*client_ep.id().as_bytes()),
+                None,
+            )
+            .is_ok()
+    );
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    send.write_all(&support::frame_len_prefix(
+        decdn_protocol::MAX_CLIENT_CONTROL_FRAME,
+    ))
+    .await
+    .map_err(|e| anyhow::anyhow!("write prefix: {e}"))?;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        assert_stream_reset(&mut recv, decdn_protocol::APP_ERR_RATE_LIMITED),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the rate-limited stream waited on its request body"))??;
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_rate_limit_rejected_per_peer_total")? == 1,
+        "the refusal counts on the per-peer layer"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// A request frame announced past [`decdn_protocol::MAX_CLIENT_CONTROL_FRAME`]
 /// is reset with `MESSAGE_TOO_LARGE` (`0x02`) on its length prefix alone (ADR 013
 /// § Wire Framing). The handler does not buffer the payload or wait for it, so an

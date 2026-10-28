@@ -101,7 +101,7 @@ impl Default for RateLimitConfig {
     }
 }
 
-// The resolved DHT/probe config (in `decdn-common`) and this engine config
+// The resolved DHT/probe/serve config (in `decdn-common`) and this engine config
 // hold the identical eight fields, but `common` can't depend on `node`, so the
 // engine config lives here. These `From` impls are the single mapping point
 // the runtime uses to build a limiter from resolved config, so a field added
@@ -153,6 +153,21 @@ impl From<&decdn_common::config::ResolvedDht> for RateLimitConfig {
 
 impl From<&decdn_common::config::ResolvedProbe> for RateLimitConfig {
     fn from(r: &decdn_common::config::ResolvedProbe) -> Self {
+        Self {
+            per_peer_rate_per_sec: r.per_peer_rate_per_sec,
+            per_peer_burst: r.per_peer_burst,
+            per_ip_rate_per_sec: r.per_ip_rate_per_sec,
+            per_ip_burst: r.per_ip_burst,
+            global_rate_per_sec: r.global_rate_per_sec,
+            global_burst: r.global_burst,
+            max_tracked_per_ip: r.max_tracked_per_ip,
+            max_tracked_per_peer: r.max_tracked_per_peer,
+        }
+    }
+}
+
+impl From<&decdn_common::config::ResolvedServe> for RateLimitConfig {
+    fn from(r: &decdn_common::config::ResolvedServe) -> Self {
         Self {
             per_peer_rate_per_sec: r.per_peer_rate_per_sec,
             per_peer_burst: r.per_peer_burst,

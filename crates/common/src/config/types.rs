@@ -37,6 +37,9 @@ pub struct FileConfig {
     /// `cdn/probe/v1` settings (ADR 005). Absent => defaults from the
     /// ADR 005 §Probe rate limiting table.
     pub probe: Option<ProbeConfig>,
+    /// `cdn/client/v1` serve-path settings (ADR 005). Absent => defaults from
+    /// the ADR 005 §Request rate limiting table.
+    pub serve: Option<ServeConfig>,
     /// Download-receipt audit-log retention settings (#802). Absent =>
     /// defaults (128 MiB per file, 4 retained backups).
     pub receipts: Option<ReceiptsConfig>,
@@ -1159,6 +1162,52 @@ pub struct ProbeRateLimitConfig {
     /// Global inbound probe sustained rate. Absent => 1000 req/s.
     pub global_rate_per_sec: Option<f64>,
     /// Global inbound probe burst capacity. Absent => 2000.
+    pub global_burst: Option<u32>,
+    /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
+    /// makes the map unbounded — operator opt-in (#645).
+    pub max_tracked_per_ip: Option<usize>,
+    /// Hard cap on the per-peer (`NodeId`) keyed-limiter map. Absent =>
+    /// 4096. `0` makes the map unbounded (#645).
+    pub max_tracked_per_peer: Option<usize>,
+}
+
+/// `[serve]` section — inbound `cdn/client/v1` settings (ADR 005).
+///
+/// The rate-limit knobs nest under `[serve.rate_limit]`, like
+/// `[probe.rate_limit]` and `[dht.rate_limit]`. `[client]` names the `decdn`
+/// requester's own settings, so the serving side is `[serve]`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeConfig {
+    /// Rate-limiter settings (ADR 005 §Request rate limiting). Absent =>
+    /// the defaults from the ADR (100/200/2000 req/s with 400/800/5000 bursts).
+    pub rate_limit: Option<ServeRateLimitConfig>,
+}
+
+/// `[serve.rate_limit]` — three-layer token-bucket settings for inbound
+/// `cdn/client/v1` requests (ADR 005 §Request rate limiting).
+///
+/// Mirrors `[probe.rate_limit]` in shape; only the defaults differ. One
+/// request is one stream, and an honest client opens many of them (one per
+/// pull leg, up to 100 at once on one connection), so the caps sit well above
+/// the probe ones. Setting any `*_rate_per_sec` to `0.0` disables that layer;
+/// the matching `*_burst` must also be `0` to avoid a deny-all configuration.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServeRateLimitConfig {
+    /// Per-peer (source `NodeId`) sustained rate. Absent => 100 req/s
+    /// (ADR 005 §Request rate limiting). `0.0` disables the layer.
+    pub per_peer_rate_per_sec: Option<f64>,
+    /// Per-peer burst capacity. Absent => 400. Required `> 0` when
+    /// `per_peer_rate_per_sec > 0`.
+    pub per_peer_burst: Option<u32>,
+    /// Per-IP sustained rate. Absent => 200 req/s. `0.0` disables.
+    pub per_ip_rate_per_sec: Option<f64>,
+    /// Per-IP burst capacity. Absent => 800.
+    pub per_ip_burst: Option<u32>,
+    /// Global inbound request sustained rate. Absent => 2000 req/s.
+    pub global_rate_per_sec: Option<f64>,
+    /// Global inbound request burst capacity. Absent => 5000.
     pub global_burst: Option<u32>,
     /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
     /// makes the map unbounded — operator opt-in (#645).

@@ -39,7 +39,7 @@ Several subsystems classify a failure into a small closed set of reasons. The co
 | Family | Series |
 |--------|--------|
 | Connection dispatch rejection (`RejectReason`) | `decdn_dispatch_rejected_global_total`, `decdn_dispatch_rejected_per_source_total` |
-| Rate-limit rejection (`RejectLayer`, shared by the probe and DHT paths) | `decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total` and `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total` |
+| Rate-limit rejection (`RejectLayer`, shared by the probe, DHT and serve paths) | `decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total`, `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total` and `decdn_serve_rate_limit_rejected_{per_peer,per_ip,global}_total` |
 | Buyer pool-open failure (`PoolOpenFailureReason`) | `decdn_pool_open_failures_insufficient_deposit_total`, `decdn_pool_open_failures_contract_revert_total`, `decdn_pool_open_failures_rpc_error_total` (plus the aggregate `decdn_node_pull_pool_open_failures_total`) |
 
 Siblings are the default because each reason in these families has an **unrelated operator remedy**, so no single alert spans the family and a shared label buys nothing; a sibling also needs no typed `EncodeLabelSet` and no pre-materialization to keep a series exporting at zero.
@@ -181,6 +181,13 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | `decdn_probe_rate_limit_prune_sweeps_per_peer_total` | Counter | R | live | — | Sweeps that expired idle per-peer buckets. |
 | `decdn_probe_rate_limit_tracked_per_ip` | Gauge | R | live | — | Live per-IP buckets. Unbounded growth against a flat sweep rate is a memory-exhaustion signal. |
 | `decdn_probe_rate_limit_tracked_per_peer` | Gauge | R | live | — | Live per-peer buckets. Same reading as the per-IP gauge. |
+| `decdn_serve_rate_limit_rejected_per_peer_total` | Counter | R | live | — | `cdn/client/v1` streams reset by the per-peer token bucket before their request was read. |
+| `decdn_serve_rate_limit_rejected_per_ip_total` | Counter | R | live | — | `cdn/client/v1` streams reset by the per-IP token bucket. It does not see relay-only connections. |
+| `decdn_serve_rate_limit_rejected_global_total` | Counter | R | live | — | `cdn/client/v1` streams reset by the node-wide ceiling. Rising while the per-peer and per-IP siblings stay flat means aggregate load, or one source that cycles node IDs over the relay. |
+| `decdn_serve_rate_limit_prune_sweeps_per_ip_total` | Counter | R | live | — | Sweeps that expired idle per-IP request buckets. |
+| `decdn_serve_rate_limit_prune_sweeps_per_peer_total` | Counter | R | live | — | Sweeps that expired idle per-peer request buckets. |
+| `decdn_serve_rate_limit_tracked_per_ip` | Gauge | R | live | — | Live per-IP request buckets. Unbounded growth against a flat sweep rate is a memory-exhaustion signal. |
+| `decdn_serve_rate_limit_tracked_per_peer` | Gauge | R | live | — | Live per-peer request buckets. Same reading as the per-IP gauge. |
 | `decdn_probe_cache_misses_total` | Counter | R | live | — | Cache-miss pulls that ran a fresh DHT lookup + probe. Counts an entry that was absent, expired, **or fully suppressed** (every cached provider negative-cached, wedged, no longer an active staker, or otherwise unselectable). On the ranged pull leg it also counts an entry whose providers do not cover every block of the blob ([ADR 001 § Probe cache](001-network.md#probe-cache)). Each case costs the same network work, which is what this measures. |
 
 > The probe-hold capacity counter `decdn_probe_hold_unavailable_total{reason}`

@@ -98,6 +98,9 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_client_declined_total",
     "decdn_serve_stream_client_abandoned_total",
     "decdn_serve_stream_node_fault_total",
+    "decdn_serve_rate_limit_rejected_per_peer_total",
+    "decdn_serve_rate_limit_rejected_per_ip_total",
+    "decdn_serve_rate_limit_rejected_global_total",
 ];
 
 #[derive(
@@ -672,6 +675,31 @@ pub struct DecdnMetrics {
     /// Sibling of `probe_rate_limit_tracked_per_ip` for the per-peer map.
     /// Operator-visible name: `decdn_probe_rate_limit_tracked_per_peer` (#645).
     pub probe_rate_limit_tracked_per_peer: Gauge,
+    /// Inbound `cdn/client/v1` streams refused by the per-peer (`NodeId`) token
+    /// bucket before the request was read (ADR 005 §Request rate limiting).
+    /// One Counter per layer, like `probe_rate_limit_rejected_*`. Each bump
+    /// ends exactly one inbound stream as failed. Operator-visible name:
+    /// `decdn_serve_rate_limit_rejected_per_peer_total`.
+    pub serve_rate_limit_rejected_per_peer: Counter,
+    /// Sibling of `serve_rate_limit_rejected_per_peer` for the per-IP bucket.
+    /// Operator-visible name: `decdn_serve_rate_limit_rejected_per_ip_total`.
+    pub serve_rate_limit_rejected_per_ip: Counter,
+    /// Sibling of `serve_rate_limit_rejected_per_peer` for the global bucket.
+    /// Operator-visible name: `decdn_serve_rate_limit_rejected_global_total`.
+    pub serve_rate_limit_rejected_global: Counter,
+    /// `retain_recent` sweeps of the per-IP serve keyed-limiter map that ran.
+    /// Operator-visible name: `decdn_serve_rate_limit_prune_sweeps_per_ip_total`.
+    pub serve_rate_limit_prune_sweeps_per_ip: Counter,
+    /// Sibling of `serve_rate_limit_prune_sweeps_per_ip` for the per-peer map.
+    /// Operator-visible name:
+    /// `decdn_serve_rate_limit_prune_sweeps_per_peer_total`.
+    pub serve_rate_limit_prune_sweeps_per_peer: Counter,
+    /// Current size of the per-IP serve keyed-limiter map after the most recent
+    /// prune. Operator-visible name: `decdn_serve_rate_limit_tracked_per_ip`.
+    pub serve_rate_limit_tracked_per_ip: Gauge,
+    /// Sibling of `serve_rate_limit_tracked_per_ip` for the per-peer map.
+    /// Operator-visible name: `decdn_serve_rate_limit_tracked_per_peer`.
+    pub serve_rate_limit_tracked_per_peer: Gauge,
     /// `cdn/dht/v1` request handling failed after the request was admitted
     /// by the rate limiter — frame decode error, response write error,
     /// read timeout, etc. Tracked separately from the rate-limit
@@ -3637,6 +3665,28 @@ recorders! {
     /// Set the per-peer probe keyed-limiter tracked-size gauge (#645).
     probe_rate_limit_tracked_per_peer_set(n: usize)
         => probe_rate_limit_tracked_per_peer.set(sat(n));
+
+    /// Record an inbound `cdn/client/v1` stream refused at the per-peer layer.
+    serve_rate_limit_rejected_per_peer => serve_rate_limit_rejected_per_peer.inc();
+
+    /// Record an inbound `cdn/client/v1` stream refused at the per-IP layer.
+    serve_rate_limit_rejected_per_ip => serve_rate_limit_rejected_per_ip.inc();
+
+    /// Record an inbound `cdn/client/v1` stream refused at the global layer.
+    serve_rate_limit_rejected_global => serve_rate_limit_rejected_global.inc();
+
+    /// Record a `retain_recent` sweep of the per-IP serve keyed-limiter map.
+    serve_rate_limit_prune_sweep_per_ip => serve_rate_limit_prune_sweeps_per_ip.inc();
+
+    /// Record a `retain_recent` sweep of the per-peer serve keyed-limiter map.
+    serve_rate_limit_prune_sweep_per_peer => serve_rate_limit_prune_sweeps_per_peer.inc();
+
+    /// Set the per-IP serve keyed-limiter tracked-size gauge.
+    serve_rate_limit_tracked_per_ip_set(n: usize) => serve_rate_limit_tracked_per_ip.set(sat(n));
+
+    /// Set the per-peer serve keyed-limiter tracked-size gauge.
+    serve_rate_limit_tracked_per_peer_set(n: usize)
+        => serve_rate_limit_tracked_per_peer.set(sat(n));
 
     /// Record a `cdn/dht/v1` request that was admitted by the rate
     /// limiter but failed after that (frame decode, write, encode,
