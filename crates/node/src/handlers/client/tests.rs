@@ -595,6 +595,83 @@ async fn concurrent_first_streams_on_one_lane_count_it_once() {
     );
 }
 
+/// A store whose `record` stalls before it writes, so a racing first stream
+/// reaches `register_lane` while the winner is still recording, and counts
+/// every record it is asked to make.
+struct SlowRecordStore {
+    inner: decdn_incentive::MemoryPoolStateStore,
+    records: std::sync::atomic::AtomicUsize,
+}
+
+impl PoolStateStore for SlowRecordStore {
+    fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
+        self.inner.load_all()
+    }
+
+    fn record(&self, state: &LaneState) -> Result<(), StoreError> {
+        self.records.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        self.inner.record(state)
+    }
+
+    fn forget(&self, key: LaneKey) -> Result<(), StoreError> {
+        self.inner.forget(key)
+    }
+
+    fn get(&self, key: LaneKey) -> Result<Option<LaneState>, StoreError> {
+        self.inner.get(key)
+    }
+}
+
+/// #2701: only the stream that wins the lane's vacant slot records the fresh
+/// zero lane. A racing first stream that recorded too would overwrite a voucher
+/// the winner's lane recorded in between, and roll the stored frontier back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_first_streams_record_the_fresh_lane_once() {
+    let metrics = Arc::new(Metrics::new());
+    let store = Arc::new(SlowRecordStore {
+        inner: decdn_incentive::MemoryPoolStateStore::new(),
+        records: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (handler, _dir) =
+        handler_over_store(&metrics, Arc::clone(&store) as Arc<dyn PoolStateStore>).await;
+    let lane = LaneKey {
+        pool_id: B256::repeat_byte(0xA2),
+        signer: Address::repeat_byte(0x12),
+        provider: Address::repeat_byte(0x23),
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut join = Vec::new();
+    for _ in 0..8 {
+        let handler = Arc::clone(&handler);
+        let barrier = Arc::clone(&barrier);
+        join.push(tokio::spawn(async move {
+            let state = LaneState::hydrate(
+                lane.pool_id,
+                lane.signer,
+                lane.provider,
+                U256::from(10u64),
+                u64::MAX,
+                U256::ZERO,
+                U256::ZERO,
+                None,
+                decdn_incentive::LaneChain::NONE,
+            );
+            barrier.wait().await;
+            handler.register_lane(state).expect("register");
+        }));
+    }
+    for handle in join {
+        handle.await.expect("register task join");
+    }
+    assert_eq!(
+        store.records.load(Ordering::SeqCst),
+        1,
+        "only the vacant-slot winner records the fresh lane"
+    );
+    assert_eq!(handler.lane_count.load(Ordering::Relaxed), 1);
+}
+
 /// Floor-`M` serving policy: the pool serves a full credit window while
 /// `remaining − M` covers it and stops the instant it cannot. `M` is the
 /// refundable minimum the pool owner is guaranteed to keep.

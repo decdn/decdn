@@ -5254,6 +5254,15 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: racing first streams on a new lane no longer roll its stored voucher
+  frontier back (#2701).** `register_lane` recorded the fresh zero lane before
+  it claimed the lane's slot in the live map, so two first streams could both
+  record it, and the second record could overwrite a voucher the first
+  stream's lane had recorded in between. A restart in that window rehydrated
+  the lane at zero, and the redeemer found no signature to submit. Only the
+  stream that claims the slot now records the fresh lane, under the slot's
+  guard.
+
 - **Node: a pool resolved from chain counts its on-chain redemptions toward
   its remaining deposit (GHSA-9x5g-h559-vp5m).** After a restart the pool
   projection is empty, so the admit path reads a pool it has not folded with

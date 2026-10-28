@@ -1933,18 +1933,24 @@ impl ClientHandler {
         if self.lanes.contains_key(&key) {
             return Ok(());
         }
+        // Only the stream that wins the vacant slot records the fresh lane, and
+        // it records while it holds the entry guard. A racing first stream
+        // finds the slot occupied and records nothing, so it cannot overwrite a
+        // voucher the winner's lane has already recorded with this zero state.
+        // The gauge moves on a real insertion only, so racing first streams
+        // count the lane once.
+        //
         // #1789 item 4: call the store's `record` inline. `register_lane` sits
         // ON the per-stream open path (the first capability of every stream
         // reaches it), so it cannot afford a `spawn_blocking` hop — and does
         // not need one: `PoolStateStore::record` is contractually non-blocking,
         // a buffered insert into the store's in-memory working set, with the
-        // periodic lane flush doing the disk work.
-        self.pool_state_store.record(&state)?;
-
-        // Only a REAL insertion (a vacant slot) tunes the lane gauge — the
-        // entry guard is atomic, so racing first-streams on one lane still
-        // count it once.
+        // periodic lane flush doing the disk work. It never touches `lanes`, so
+        // calling it under the entry guard cannot invert a lock order.
         if let dashmap::mapref::entry::Entry::Vacant(entry) = self.lanes.entry(key) {
+            // A failed record leaves the slot vacant: the live map never holds
+            // a lane the store did not accept.
+            self.pool_state_store.record(&state)?;
             entry.insert(Arc::new(Mutex::new(LaneDeliveryState::hydrated(state))));
             self.tune_lane_gauge(1);
         }
