@@ -430,6 +430,34 @@ fn watermark_gated_reasons_are_the_resyncable_ones() {
     }
 }
 
+/// Only the two mid-stream gate stops leave the last proof standing; every
+/// other reason refuses it, so the payer rewinds it.
+#[test]
+fn only_the_gate_stops_keep_the_last_proof() {
+    use VoucherRejectReason as R;
+    for r in [R::PoolExhausted, R::SignerCapExhausted] {
+        assert!(!r.refuses_proof(), "{r:?} is a gate stop, not a refusal");
+    }
+    for r in [
+        R::BadSignature,
+        R::WrongSigner,
+        R::WrongPool,
+        R::WrongProvider,
+        R::AmountRegression,
+        R::BytesRegression,
+        R::SpendingCapExhausted,
+        R::CapabilityExpired,
+        R::BadPreimage,
+        R::ChainIndexZero,
+        R::UnanchoredPreimage,
+        R::ChunkPriceMismatch,
+        R::Underpaid,
+        R::UnderFold,
+    ] {
+        assert!(r.refuses_proof(), "{r:?} refuses the proof");
+    }
+}
+
 #[test]
 fn client_message_rejects_unknown_discriminant() {
     let bytes = [99u8, 0, 0, 0, 0];

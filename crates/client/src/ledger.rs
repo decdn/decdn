@@ -479,8 +479,8 @@ pub enum Metered {
 /// held across compute → sign → send so vouchers reach the node in strict
 /// cumulative order — and released the instant the send returns, because there
 /// is no ack to wait for (implicit acceptance, ADR 005). The committed watermark
-/// advances the moment a send succeeds; a mid-stream `VoucherRejected` rewinds
-/// it through `resolve_reject`.
+/// advances the moment a send succeeds; a mid-stream `VoucherRejected` that
+/// refuses the proof rewinds it through `resolve_reject`.
 #[derive(Debug)]
 pub struct PoolLedger {
     /// Serializes issuance (compute the next cumulative → sign → send). Its
@@ -1361,8 +1361,10 @@ impl PoolLedger {
 
     /// Resolve `rejected` — the proof this stream just read a `VoucherRejected`
     /// for — as explicitly refused, undoing exactly what that proof claimed.
-    /// Called by the receive loop. A rejection is the upstream declaring it never
-    /// took the proof, so — unlike an ambiguous failure — it must not be settled
+    /// Called by the receive loop, only for a reason that refuses the proof
+    /// ([`decdn_protocol::client::VoucherRejectReason::refuses_proof`]): the
+    /// upstream declaring it never took the proof, so — unlike an ambiguous
+    /// failure — it must not be settled
     /// optimistically (that would inflate our cumulative for bytes the upstream
     /// refused to be paid for).
     ///

@@ -1266,6 +1266,103 @@ async fn a_pool_another_data_dir_drained_tops_up() {
     );
 }
 
+/// How far past the working deposit the overdrawn-pool tests' lanes signed.
+const OVER: u64 = 7_000_000;
+
+/// Run a recovery step for a pool of [`WORKING`] whose run's lanes signed
+/// `WORKING + OVER`, with the store recording the [`WORKING`] deposit.
+/// `pool_read` answers the step's `getPool`; the allowance read then faults
+/// and the wallet holds no USDC, so the step ends in a shortfall. Returns the
+/// shortfall, which names the top-up the step sized.
+async fn shortfall_on_an_overdrawn_pool(pool_read: impl FnOnce(&Asserter)) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = full_pool_owner();
+    let id = B256::repeat_byte(0xEE);
+    store
+        .record(&tracked_row(
+            id,
+            signer.address(),
+            lane_of(&store, &signer),
+            WORKING,
+            &[],
+        ))
+        .unwrap();
+    let asserter = Asserter::new();
+    pool_read(&asserter);
+    asserter.push_failure_msg("allowance read faulted");
+    asserter.push_success(&U256::ZERO.abi_encode());
+    let rpc = ProviderBuilder::new()
+        .layer(SendLegLayer)
+        .connect_mocked_client(asserter.clone());
+    let contract = PaymentPool::new(PP, rpc.clone());
+    let funding = RunFunding::default();
+    funding.join_lane(
+        lane_key(id, signer.address(), PROVIDER),
+        spend(WORKING + OVER, 0, false, false),
+        &ledger_at(0),
+    );
+    funding.note_pool(id);
+    let funder = PoolFunder {
+        contract: &contract,
+        rpc: &rpc,
+        store: &store,
+        owner: signer.address(),
+        deployment: DEPLOYMENT,
+        token: TOKEN,
+        payment_pool_addr: PP,
+        working_deposit: U256::from(WORKING),
+        max_approve: false,
+        funding: &funding,
+    };
+
+    let err = funder
+        .recover(U256::ZERO)
+        .await
+        .expect_err("a wallet with no USDC cannot top up");
+    assert!(err.downcast_ref::<WalletShortfall>().is_some(), "{err:#}");
+    assert!(
+        asserter.read_q().is_empty(),
+        "the pool, allowance and wallet reads ran"
+    );
+    funding.shortfall().unwrap_or_default()
+}
+
+/// A pool the run's lanes overdrew tops up by the overdraft as well as the
+/// working deposit. The lanes signed vouchers past the deposit, so a node
+/// redeems that overdraft out of the top-up on its next redeem sweep. A top-up
+/// of only the working deposit would leave the pool below a node's floor, every
+/// node would keep refusing it, and the fetch would end "funding needed"
+/// (#2629).
+#[tokio::test]
+async fn an_overdrawn_pool_tops_up_by_its_overdraft_too() {
+    let shortfall = shortfall_on_an_overdrawn_pool(|asserter| {
+        asserter.push_success(&full_pool_on_chain(WORKING));
+    })
+    .await;
+    let wanted = WORKING + OVER;
+    assert!(
+        shortfall.contains(&format!("less than the {wanted} µUSDC top-up")),
+        "the top-up covers the overdraft and the working deposit: {shortfall}"
+    );
+}
+
+/// A failed pool read still counts the overdraft the run knows: its lanes'
+/// spend past the deposit its store records. Only other signers' redemptions,
+/// which reach the run from chain alone, go unseen.
+#[tokio::test]
+async fn a_failed_pool_read_still_tops_up_the_runs_overdraft() {
+    let shortfall = shortfall_on_an_overdrawn_pool(|asserter| {
+        asserter.push_failure_msg("getPool faulted");
+    })
+    .await;
+    let wanted = WORKING + OVER;
+    assert!(
+        shortfall.contains(&format!("less than the {wanted} µUSDC top-up")),
+        "the run's own overdraft survives a failed read: {shortfall}"
+    );
+}
+
 /// A full pool that is closing or closed still needs a replacement: its
 /// `topUp` estimate reverts `PoolNotOpen`, and the step goes on to open a new
 /// pool (whose chain calls this mock leaves unanswered, so the open's gas

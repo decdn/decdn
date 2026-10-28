@@ -3813,7 +3813,8 @@ impl UpstreamPull {
     ///
     /// A rejection the node already sent waits behind the `ChunkData` it sent
     /// first, so the stop first reads what has arrived, without waiting: a
-    /// `VoucherRejected` there rewinds the rejected proof and surfaces as the
+    /// `VoucherRejected` there rewinds the rejected proof when its reason refuses
+    /// it, and surfaces as the
     /// typed rejection, as it does at [`Self::finish`]. A rejection still in
     /// flight reaches the lane's next leg instead. The closing voucher then
     /// settles the verified residual, the send half is finished, and the
@@ -4072,7 +4073,9 @@ struct StreamMeter {
     /// its root. `None` until it has anchored to anything.
     anchored_root: Option<B256>,
     /// The last proof THIS stream claimed money with, so a `VoucherRejected`
-    /// read here rewinds that proof and not whatever a sibling stream has done
+    /// read here whose reason refuses the proof
+    /// ([`VoucherRejectReason::refuses_proof`]) rewinds that proof and not
+    /// whatever a sibling stream has done
     /// on the lane since (see [`PoolLedger::resolve_reject`]). `None` before the
     /// stream has claimed anything, and left alone by a re-anchor — which claims
     /// nothing and so has nothing to rewind.
@@ -4271,7 +4274,10 @@ impl StreamMeter {
 /// delivery is acceptance (ADR 005) — so this handles only the rejection slot.
 ///
 /// A `VoucherRejected` is OUR payment-side fault: rewind the proof `meter` last sent
-/// (known-not-taken, so it must not be settled optimistically) and carry its typed
+/// when the reason refuses it ([`VoucherRejectReason::refuses_proof`]), since a
+/// refused proof is known-not-taken and must not be settled optimistically. A
+/// mid-stream gate stop (`PoolExhausted`, `SignerCapExhausted`) is no verdict on
+/// the last proof, so it rewinds nothing. Either way, carry its typed
 /// reason — plus the wallet-less-resume `bundle` (#1481) — so the orchestrator can
 /// exonerate the provider (#857) and the reseed loops (`driver::fill_gap`, the
 /// `test-util` `fetch_inner`) can self-heal from an authenticated watermark
@@ -4286,10 +4292,13 @@ fn voucher_rejection(
 ) -> anyhow::Error {
     match error {
         StreamError::VoucherRejected { reason, bundle } => {
-            // Rewind the proof THIS stream sent. The lane is shared, so the proof
-            // it last issued may belong to a sibling; naming ours is what keeps
-            // the rejection from un-committing a voucher the node accepted.
-            if let Some(proof) = meter.last_proof {
+            // Rewind the proof THIS stream sent, when the node refused it. The
+            // lane is shared, so the proof it last issued may belong to a
+            // sibling; naming ours is what keeps the rejection from un-committing
+            // a voucher the node accepted.
+            if reason.refuses_proof()
+                && let Some(proof) = meter.last_proof
+            {
                 ledger.resolve_reject(proof);
             }
             let proof_generation = match meter.last_proof {

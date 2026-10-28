@@ -45,6 +45,7 @@ pub decdn_protocol::client::VoucherRejectReason::WrongProvider
 pub decdn_protocol::client::VoucherRejectReason::WrongSigner
 impl decdn_protocol::client::VoucherRejectReason
 pub const fn decdn_protocol::client::VoucherRejectReason::is_watermark_gated(self) -> bool
+pub const fn decdn_protocol::client::VoucherRejectReason::refuses_proof(self) -> bool
 pub struct decdn_protocol::client::ChunkData
 impl decdn_protocol::client::ChunkData
 pub fn decdn_protocol::client::ChunkData::bytes(&self) -> &[u8]
@@ -408,6 +409,7 @@ pub decdn_protocol::VoucherRejectReason::WrongProvider
 pub decdn_protocol::VoucherRejectReason::WrongSigner
 impl decdn_protocol::client::VoucherRejectReason
 pub const fn decdn_protocol::client::VoucherRejectReason::is_watermark_gated(self) -> bool
+pub const fn decdn_protocol::client::VoucherRejectReason::refuses_proof(self) -> bool
 pub struct decdn_protocol::BatchStoreAck
 pub decdn_protocol::BatchStoreAck::results: alloc::vec::Vec<bool>
 pub struct decdn_protocol::BatchStoreRequest
