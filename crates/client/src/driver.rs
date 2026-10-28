@@ -34,8 +34,9 @@
 //!   leave the store's present-range frontier AHEAD of the last PAID byte. The
 //!   per-leg resume offset is [`sink::content_paid_frontier`] of the leg's paid
 //!   wire watermark: the tail is re-delivered (`ingest_stream` re-writes it
-//!   idempotently) and re-billed. A lane that a funding refusal ends records
-//!   that tail on its ledger, and the lane's next drive bills it first.
+//!   idempotently) and re-billed. A lane whose leg any fault ends (a funding
+//!   refusal, a lost connection, a stall) records that tail on its ledger, and
+//!   the lane's next drive opens at its paid frontier and bills it.
 //! - **Reseed** (wallet-less resync, #1481): an authenticated
 //!   [`WatermarkBundle`] that ADVANCES our committed watermark is a healable
 //!   desync — the driver reseeds the ledger
@@ -454,6 +455,11 @@ pub(crate) struct DriveCounters {
     /// A caller whose gap failed re-notes the spans the lane owes from there.
     /// `None` before the first pass.
     pub(crate) gap_paid_frontier: Option<u64>,
+    /// The paid-frontier anchor of the leg [`fill_gap`] runs or ran last: the
+    /// content offset the leg opened at, and the wire bytes the lane's
+    /// [`PoolLedger::settlement`] held then. A caller that drops [`fill_gap`] mid-leg prices the leg's paid
+    /// frontier from it ([`ended_frontiers`]). `None` before the first pass.
+    pub(crate) leg_anchor: Option<(u64, U256)>,
 }
 
 impl DriveCounters {
@@ -464,6 +470,7 @@ impl DriveCounters {
             resume_attempts: 0,
             next_voucher_cost: U256::ZERO,
             gap_paid_frontier: None,
+            leg_anchor: None,
         }
     }
 }
@@ -964,7 +971,13 @@ fn warn_on_new_hole(
 /// after its last leg ended: the leg's paid frontier, clamped to the store's
 /// contiguous delivered frontier, and that delivered frontier. `None` when the
 /// store cannot answer.
-async fn ended_frontiers<St: RangedStore + ?Sized>(
+///
+/// The paid wire is the lane's [`PoolLedger::settlement`] past the leg's
+/// baseline, not only its committed watermark. A leg that ends on a fault can
+/// leave a voucher armed whose send did not confirm. The lane's next voucher
+/// builds on that voucher, so the bytes it signs are paid, and the span the
+/// lane owes starts past them.
+pub(crate) async fn ended_frontiers<St: RangedStore + ?Sized>(
     store: &St,
     ledger: &PoolLedger,
     gap_start: u64,
@@ -977,9 +990,9 @@ async fn ended_frontiers<St: RangedStore + ?Sized>(
             .ok()?;
     let gap_end = asked_end.min(total_bytes);
     let delivered = contiguous_frontier(&still_missing, total_bytes, gap_start, gap_end);
-    let (leg_start, baseline) = leg_anchor.unwrap_or((gap_start, ledger.committed().bytes));
-    let paid_wire =
-        u64::try_from(ledger.committed().bytes.saturating_sub(baseline)).unwrap_or(u64::MAX);
+    let settled = ledger.settlement().bytes;
+    let (leg_start, baseline) = leg_anchor.unwrap_or((gap_start, settled));
+    let paid_wire = u64::try_from(settled.saturating_sub(baseline)).unwrap_or(u64::MAX);
     let paid = crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire)
         .min(gap_end)
         .min(delivered);
@@ -1046,15 +1059,21 @@ where
     counters.gap_paid_frontier = None;
 
     // Paid-frontier anchor (PER-LEG, not per-gap). A "leg" is one contiguous
-    // delivery from one successful open. `leg_anchor` records `(content offset the
-    // leg opened at, lane-cumulative committed WIRE bytes at that moment)`. It
-    // is re-anchored on every successful open (to the previous paid frontier) and
-    // on a rebase (to the delivered frontier, with the healed baseline). A reseed
-    // raises its baseline by the reseed's jump, and a stale heal keeps it. It
-    // PERSISTS across passes
+    // delivery from one successful open. `counters.leg_anchor` records `(content
+    // offset the leg opened at, lane-cumulative WIRE bytes the lane's settlement
+    // held at that moment)`. It is re-anchored on every successful open (to the
+    // previous paid frontier) and on a rebase (to the delivered frontier, with
+    // the healed baseline). A reseed raises its baseline by the reseed's jump, and
+    // a stale heal keeps it. It PERSISTS across passes
     // so a resumed leg prices the paid frontier against the previous leg's own
     // spend. Both the completion signal (`paid_cleared`) and the Draw resume
     // start are derived from it; see the per-pass computation at the loop top.
+    // It lives in `counters`, so a caller that drops this future mid-leg prices
+    // the leg's paid frontier from it ([`ended_frontiers`]).
+    //
+    // The baseline is the settlement, not the committed watermark: a leg that
+    // opens after a fault left a voucher armed must not count that voucher as
+    // its own payment once its first voucher builds on it.
     //
     // Why the PAID frontier and not the store's DELIVERED frontier: `ingest_stream`
     // checkpoints delivered+verified bytes payment-agnostically (ADR 003's credit
@@ -1068,7 +1087,7 @@ where
     // re-delivers (idempotently) and re-bills the tail. Fresh / cross-invocation
     // resume: `paid_wire == 0`, frontier collapses to the leg start (the disk
     // frontier), nothing already-paid is re-pulled (the `cli_fetch_resume` property).
-    let mut leg_anchor: Option<(u64, U256)> = None;
+    counters.leg_anchor = None;
 
     // The last leg that finished cleanly, with the gap's two frontiers as the pass
     // that opened it read them. The next pass must see one of them move (#2194).
@@ -1142,7 +1161,9 @@ where
         // the previous paid frontier, keeping the frontier monotonic and never summing
         // two legs' (proof-duplicating) wire encodings, which would map PAST the true
         // paid frontier and under-pay.
-        let (leg_start, leg_baseline) = *leg_anchor.get_or_insert((gap_start, committed.bytes));
+        let (leg_start, leg_baseline) = *counters
+            .leg_anchor
+            .get_or_insert((gap_start, ledger.settlement().bytes));
         let paid_wire_this_leg =
             u64::try_from(committed.bytes.saturating_sub(leg_baseline)).unwrap_or(u64::MAX);
         // The gap's PAID content frontier, clamped to the store's DELIVERED frontier:
@@ -1362,7 +1383,7 @@ where
                         // to THIS open's start and the committed watermark BEFORE it
                         // streams, so the next pass prices its paid frontier
                         // against this leg's own wire spend alone.
-                        leg_anchor = Some((resume_start, ledger.committed().bytes));
+                        counters.leg_anchor = Some((resume_start, ledger.settlement().bytes));
                         // The store is keyed by offset: the leg verifies under
                         // the size its own sender signs, whatever the bound.
                         match store
@@ -1436,7 +1457,7 @@ where
                     // re-delivers and re-pays content the jump did cover: a
                     // bounded over-pay, never an under-pay.
                     if healed == Some(crate::Healed::Reseeded)
-                        && let Some((_, baseline)) = leg_anchor.as_mut()
+                        && let Some((_, baseline)) = counters.leg_anchor.as_mut()
                     {
                         let jump = ledger.committed().bytes.saturating_sub(pre_heal);
                         *baseline = baseline.saturating_add(jump);
@@ -1476,25 +1497,28 @@ where
                         // frontier. That is the safe direction: at worst a bounded
                         // re-deliver and re-pay of the interim span.
                         if healed == Some(crate::Healed::Rebased) {
-                            leg_anchor = Some((delivered_frontier, ledger.committed().bytes));
+                            counters.leg_anchor =
+                                Some((delivered_frontier, ledger.settlement().bytes));
                         }
                         continue;
                     }
 
-                    // 2. Anything else (a stall, reset, hash mismatch, local I/O
-                    //    fault, a funding refusal or rejection, a voucher
-                    //    rejection no heal takes) ends the lane. The acquire
-                    //    loop classifies it ([`crate::classify`]). A lane that
-                    //    a funding refusal ends keeps the span it delivered and
-                    //    did not pay for, so its next drive, if it runs again,
-                    //    bills it.
+                    // 2. Anything else (a stall, reset, lost connection, hash
+                    //    mismatch, local I/O fault, a funding refusal or
+                    //    rejection, a voucher rejection no heal takes) ends the
+                    //    lane. The acquire loop classifies it
+                    //    ([`crate::classify`]). Whatever ended it, the lane keeps
+                    //    the span it delivered and did not pay for: the credit
+                    //    window lets the node stream ahead of the voucher that
+                    //    pays, so a leg cut short leaves verified bytes unpaid.
+                    //    The lane's next drive, if it runs again, opens at the
+                    //    paid frontier and bills them.
                     if let Some((paid, delivered)) =
-                        ended_frontiers(store, ledger, gap_start, asked_end, leg_anchor).await
+                        ended_frontiers(store, ledger, gap_start, asked_end, counters.leg_anchor)
+                            .await
                     {
                         counters.gap_paid_frontier = Some(paid);
-                        if crate::classify(&err) == crate::Fault::Unaffordable {
-                            ledger.note_unpaid(hash, paid, delivered);
-                        }
+                        ledger.note_unpaid(hash, paid, delivered);
                     }
                     return Err(err);
                 }
