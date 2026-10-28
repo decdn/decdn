@@ -3908,6 +3908,13 @@ where
             for holder in starts {
                 if let Some(lane) = sources.cached_lane(holder.provider) {
                     ready.push((holder.provider, lane));
+                } else if let Some(lane) = sources.take_built(holder.provider) {
+                    // Started in this pass, before any build below is polled:
+                    // the first batch plans for it alone, so the size open's
+                    // lane takes the first leg its pull is primed for.
+                    raise_to_lane(&raise, &lane);
+                    ready.push((holder.provider, lane));
+                    growth.wanted = true;
                 } else {
                     connecting_set.insert(holder.provider);
                     connecting.push(connect_future(sources.provider(), holder, &ended));

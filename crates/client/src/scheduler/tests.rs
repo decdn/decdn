@@ -7963,3 +7963,116 @@ async fn the_running_low_signal_prices_the_runs_highest_quote() -> anyhow::Resul
     }
     Ok(())
 }
+
+/// Static lanes beside one lane the provider built before the set: the lane
+/// that answered a size open, with its pull primed for the first leg. A start
+/// takes it through [`crate::SourceProvider::built`], and a `connect` for its
+/// provider takes it too, as `LaneSources` does. Every build resolves at
+/// once, so a lane that goes through `connect` lands in one batch with every
+/// other build.
+struct KeptLane<'a> {
+    inner: &'a StaticSources<crate::PrimedSource<ScriptedSource>>,
+    kept: Mutex<Option<(Address, PrimedLane)>>,
+}
+
+/// A lane over a [`crate::PrimedSource`].
+type PrimedLane = StreamCandidate<crate::PrimedSource<ScriptedSource>>;
+
+impl KeptLane<'_> {
+    /// The kept lane, once, when it is `provider`'s.
+    fn take(&self, provider: Address) -> Option<PrimedLane> {
+        let mut kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kept.as_ref().is_some_and(|(p, _)| *p == provider) {
+            return kept.take().map(|(_, lane)| lane);
+        }
+        None
+    }
+}
+
+impl crate::SourceProvider for KeptLane<'_> {
+    type Source = crate::PrimedSource<ScriptedSource>;
+
+    fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+        self.inner.discover(hash)
+    }
+
+    fn connect<'b>(
+        &'b self,
+        holder: &'b crate::Holder,
+        ended: &'b tokio_util::sync::CancellationToken,
+    ) -> crate::SourceFuture<'b, StreamCandidate<Self::Source>> {
+        match self.take(holder.provider) {
+            Some(lane) => Box::pin(async move { Ok(lane) }),
+            None => self.inner.connect(holder, ended),
+        }
+    }
+
+    fn built(&self, provider: Address) -> Option<StreamCandidate<Self::Source>> {
+        self.take(provider)
+    }
+}
+
+/// The lane that answered a size open, with a whole-blob pull primed on it,
+/// takes that pull as its first leg although another holder's lane builds at
+/// once. It starts before any build is polled, so the first plan is made for
+/// it alone and gives it the whole blob. Planned beside the other lane, its
+/// first leg is half the blob, the primed pull closes, and the holder serves
+/// the first half twice.
+#[tokio::test]
+async fn a_size_opens_lane_adopts_its_primed_pull_beside_a_lane_that_builds_at_once()
+-> anyhow::Result<()> {
+    let data = blob(2 * MIB as usize);
+    let (la, lb) = (
+        Arc::new(PoolLedger::new(Cumulative::default())),
+        Arc::new(PoolLedger::new(Cumulative::default())),
+    );
+    let a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&la));
+    let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+    let (a_probe, b_probe) = (a.clone(), b.clone());
+    let (root, total) = (a.root(), a.total_bytes());
+    let primed = crate::PrimedSource::new(a);
+    let whole = decdn_bao_range::align_range(0, 0, total)?;
+    let (header, reader) = primed.inner().open(root, whole.clone()).await?;
+    primed.prime_next(root, whole, header, reader, tokio::time::Instant::now());
+    let kept = candidate(primed, la, 0xA1, None);
+    let a_provider = kept.ctx.lock().unwrap().provider;
+    let inner = StaticSources::new(vec![candidate(crate::PrimedSource::new(b), lb, 0xB2, None)])?;
+    // The kept lane is the nearest holder, as the size open's holder is.
+    let mut holders = vec![crate::Holder {
+        provider: a_provider,
+        coverage: None,
+        rtt_ms: 0.0,
+        probed_holder: true,
+    }];
+    holders.extend(inner.holders().into_iter().map(|holder| crate::Holder {
+        rtt_ms: 1.0,
+        ..holder
+    }));
+    let provider = KeptLane {
+        inner: &inner,
+        kept: Mutex::new(Some((a_provider, kept))),
+    };
+    let (store, dir) = fresh_store(root, total);
+
+    acquire_over(&store, &provider, holders, root, 2).await?;
+    store.finalize().await?;
+
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    assert_eq!(
+        a_probe.opened_ranges(),
+        vec![(0, total)],
+        "the kept lane's first leg adopts the primed pull and opens nothing itself"
+    );
+    assert!(
+        b_probe
+            .opened_ranges()
+            .iter()
+            .all(|&(offset, _)| offset > 0),
+        "the other lane never opens the blob's start: {:?}",
+        b_probe.opened_ranges()
+    );
+    Ok(())
+}

@@ -141,6 +141,17 @@ pub trait SourceProvider: Send + Sync {
         ended: &'a CancellationToken,
     ) -> SourceFuture<'a, StreamCandidate<Self::Source>>;
 
+    /// The lane to `provider` that this provider built before the set, for
+    /// the next start of `provider` to take with no
+    /// [`connect`](Self::connect). The acquire loop starts such a lane in the
+    /// pass that starts its provider, before it polls any build, so its first
+    /// plan is made for that lane alone: the lane that answered a fetch's size
+    /// open takes the first leg its pull is primed for. `None`, the default,
+    /// is a provider that holds no such lane.
+    fn built(&self, _provider: Address) -> Option<StreamCandidate<Self::Source>> {
+        None
+    }
+
     /// Called once for each delivery fault `holder` raises.
     fn on_source_fault(&self, _holder: &Holder) {}
 }
@@ -162,6 +173,10 @@ impl<P: SourceProvider> SourceProvider for &P {
         ended: &'a CancellationToken,
     ) -> SourceFuture<'a, StreamCandidate<Self::Source>> {
         (**self).connect(holder, ended)
+    }
+
+    fn built(&self, provider: Address) -> Option<StreamCandidate<Self::Source>> {
+        (**self).built(provider)
     }
 
     fn on_source_fault(&self, holder: &Holder) {
@@ -508,6 +523,19 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     #[must_use]
     pub fn cached_lane(&self, provider: Address) -> Option<Arc<StreamCandidate<P::Source>>> {
         self.lanes.get(&provider).cloned()
+    }
+
+    /// Take the lane the provider built for `provider` before the set
+    /// ([`SourceProvider::built`]) into the set, as a build that just
+    /// succeeded. `None` when the provider holds no such lane.
+    pub(crate) fn take_built(
+        &mut self,
+        provider: Address,
+    ) -> Option<Arc<StreamCandidate<P::Source>>> {
+        let lane = Arc::new(self.provider.built(provider)?);
+        self.build_retry.remove(&provider);
+        self.lanes.insert(provider, Arc::clone(&lane));
+        Some(lane)
     }
 
     /// Drop every built lane `stale` names, so the next start of its provider

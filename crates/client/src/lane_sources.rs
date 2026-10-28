@@ -215,7 +215,8 @@ pub struct LaneSources<'a, P> {
     /// Every built lane's watermark handle, in build order.
     handles: Mutex<Vec<FaceLaneHandle>>,
     /// The lane that answered the first open, handed to the fetch's first
-    /// `connect` for its provider.
+    /// start of its provider ([`SourceProvider::built`]), or to the first
+    /// `connect` for it.
     parked: Mutex<HashMap<Address, StreamCandidate<PrimedSource<PeerSource<'a>>>>>,
     /// The size hint of the last probe that gave one
     /// ([`ResolvedTargets::size_hint`]): the fetch's first claim.
@@ -407,9 +408,10 @@ where
     /// open, and any other first leg closes it before opening its own, so the
     /// node never holds the floor it reserved for the pull beside the leg's.
     /// A lane that opens nothing closes it when it drops. The lane that
-    /// answered is parked for the
-    /// fetch's `connect`, so the fetch reuses it; every other lane the open
-    /// built drops, and with it any stream permit it held. Returns the claim
+    /// answered is parked for the fetch, which starts it with no build
+    /// ([`SourceProvider::built`]) before any other lane builds, so the
+    /// fetch plans the first leg for that lane alone; every other lane the
+    /// open built drops, and with it any stream permit it held. Returns the claim
     /// and every holder known, those the open's discovery found included.
     ///
     /// # Errors
@@ -617,6 +619,19 @@ where
         self.nodes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Take `provider`'s lane that the first open parked, if it is still
+    /// parked. The first open built it through [`Self::build`], so it already
+    /// holds what `build` gives every lane.
+    fn take_parked(
+        &self,
+        provider: Address,
+    ) -> Option<StreamCandidate<PrimedSource<PeerSource<'a>>>> {
+        self.parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&provider)
+    }
+
     /// `holder`'s lane: the one the first open parked, with the permit it
     /// already holds, or a fresh build. When the run caps streams per
     /// provider, a fresh lane holds one of its provider's permits
@@ -632,12 +647,7 @@ where
         holder: &Holder,
         ended: &CancellationToken,
     ) -> anyhow::Result<StreamCandidate<PrimedSource<PeerSource<'a>>>> {
-        let parked = self
-            .parked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&holder.provider);
-        let mut lane = if let Some(lane) = parked {
+        let mut lane = if let Some(lane) = self.take_parked(holder.provider) {
             lane
         } else {
             let lease = lane_lease(self.lane_cap, holder.provider).await?;
@@ -823,6 +833,13 @@ where
         ended: &'b CancellationToken,
     ) -> SourceFuture<'b, StreamCandidate<Self::Source>> {
         Box::pin(self.build(holder, ended))
+    }
+
+    /// The lane the first open parked for `provider`: the acquire loop
+    /// starts it before any other lane builds, so the drive plans its first
+    /// leg for it alone and that leg adopts the primed pull.
+    fn built(&self, provider: Address) -> Option<StreamCandidate<Self::Source>> {
+        self.take_parked(provider)
     }
 
     fn on_source_fault(&self, holder: &Holder) {
