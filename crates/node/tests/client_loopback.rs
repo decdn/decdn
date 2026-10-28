@@ -8487,13 +8487,11 @@ async fn stream_request_with_skewed_timestamp_resets_without_response() -> anyho
         )
         .await?;
     }
-    anyhow::ensure!(
-        metric_line_present(
-            &metrics.encode()?,
-            "decdn_serve_stream_rejected_timestamp_skew_total 2"
-        ),
-        "each skew reset must bump its reason counter"
-    );
+    support::wait_for_metric_line(
+        &metrics,
+        "decdn_serve_stream_rejected_timestamp_skew_total 2",
+    )
+    .await?;
 
     // Same handler, same blob, fresh timestamp: a signed response arrives, so
     // the resets above can only be the timestamp gate.
@@ -8603,12 +8601,13 @@ async fn the_timestamp_gate_precedes_every_signed_refusal() -> anyhow::Result<()
         StreamError::NotFound,
     )
     .await?;
-    let text = metrics.encode()?;
-    anyhow::ensure!(
-        metric_line_present(&text, "decdn_serve_stream_rejected_timestamp_skew_total 1")
-            && metric_line_present(&text, "decdn_serve_stream_rejected_unknown_lane_total 1"),
-        "the skewed request counts only as a skew reset, the fresh one as an unknown lane"
-    );
+    support::wait_for_metric_line(
+        &metrics,
+        "decdn_serve_stream_rejected_timestamp_skew_total 1",
+    )
+    .await?;
+    support::wait_for_metric_line(&metrics, "decdn_serve_stream_rejected_unknown_lane_total 1")
+        .await?;
     shutdown([server_task], [&client_ep, &server_ep]).await?;
 
     // Denylisted hash: held, but under a local takedown order.
@@ -8642,12 +8641,13 @@ async fn the_timestamp_gate_precedes_every_signed_refusal() -> anyhow::Result<()
         StreamError::Declined,
     )
     .await?;
-    let text = metrics.encode()?;
-    anyhow::ensure!(
-        metric_line_present(&text, "decdn_serve_stream_rejected_timestamp_skew_total 1")
-            && metric_line_present(&text, "decdn_serve_stream_rejected_hash_denied_total 1"),
-        "the skewed request counts only as a skew reset, the fresh one as a takedown"
-    );
+    support::wait_for_metric_line(
+        &metrics,
+        "decdn_serve_stream_rejected_timestamp_skew_total 1",
+    )
+    .await?;
+    support::wait_for_metric_line(&metrics, "decdn_serve_stream_rejected_hash_denied_total 1")
+        .await?;
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
