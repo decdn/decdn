@@ -1195,6 +1195,48 @@ async fn admit_chain_reads_across_pools_are_capped() {
     );
 }
 
+/// A request that finds every admit-read slot taken waits
+/// `ADMIT_CHAIN_READ_SLOT_WAIT`, then is refused without a read. The refusal
+/// says the node is busy, not that the pool faulted, so it is not
+/// negative-cached and the pool's next request reads again.
+#[tokio::test(start_paused = true)]
+async fn a_read_that_finds_no_slot_is_refused_uncached() {
+    use crate::pool_view::PoolView;
+    use std::sync::atomic::Ordering;
+
+    let (view, calls) = counting_hanging_view();
+    let holders = futures_util::future::join_all((0..ADMIT_CHAIN_READ_CONCURRENCY).map(|i| {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        view.status(B256::from(id))
+    }));
+    tokio::pin!(holders);
+    let late = B256::repeat_byte(0xEE);
+    let started = tokio::time::Instant::now();
+    // `biased`: the holders take every slot before the late request asks.
+    let answer = tokio::select! {
+        biased;
+        _ = &mut holders => panic!("hung reads cannot answer before the slot wait ends"),
+        answer = view.status(late) => answer,
+    };
+
+    assert!(answer.is_none(), "a request with no free slot is refused");
+    assert_eq!(started.elapsed(), ADMIT_CHAIN_READ_SLOT_WAIT);
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        ADMIT_CHAIN_READ_CONCURRENCY,
+        "the refused request sent no read"
+    );
+    assert!(
+        !view
+            .negative
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&late),
+        "a busy refusal is not cached as a pool fault"
+    );
+}
+
 /// With the negative cache full of in-window entries, the read's fault is
 /// not cached; its waiters still take the read's answer instead of each
 /// starting a read of its own in turn.

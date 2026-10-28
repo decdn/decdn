@@ -177,9 +177,17 @@ const AUTH_CACHE_MAX: usize = 4096;
 /// flight at once, across every pool and signer. Each distinct key coalesces to
 /// one read, but a flood of distinct pool ids or signers would otherwise send
 /// one read each at once and spend the operator's RPC quota, and a stalled
-/// watcher then refuses every serve. A read that waits for a slot counts its
-/// wait against its timeout.
+/// watcher then refuses every serve. A read's own timeout starts once it holds
+/// a slot.
 const ADMIT_CHAIN_READ_CONCURRENCY: usize = 16;
+
+/// How long an admit-path read waits for a free slot
+/// ([`ADMIT_CHAIN_READ_CONCURRENCY`]) before the node refuses the request. A wait
+/// that runs out says this node is busy, not that the pool or signer faulted,
+/// so it is not negative-cached: the next request reads again. Shorter than
+/// the read timeout, so a refused request answers before the reads ahead of it
+/// time out.
+const ADMIT_CHAIN_READ_SLOT_WAIT: Duration = Duration::from_secs(5);
 
 /// One admit-path `getAuthorization` read held in the signer-auth cache.
 ///
@@ -1333,6 +1341,15 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
         }
     }
 
+    /// A slot for one admit-path chain read, or `None` when none frees up
+    /// within [`ADMIT_CHAIN_READ_SLOT_WAIT`].
+    async fn read_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        tokio::time::timeout(ADMIT_CHAIN_READ_SLOT_WAIT, self.chain_reads.acquire())
+            .await
+            .ok()?
+            .ok()
+    }
+
     /// What the signer-auth cache holds for `(pool_id, signer)` now.
     fn lookup_auth(&self, pool_id: B256, signer: Address) -> CachedAuth {
         let folded_now = self.projection.signer_spent(pool_id, signer);
@@ -1351,13 +1368,13 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
     /// an absent / `Closed` pool as a [`NegativeReason::Verdict`] and a failed
     /// read as a [`NegativeReason::Fault`]. The caller holds the pool's [`ReadSlot::Lead`].
     async fn resolve(&self, pool_id: B256) -> Option<PoolStatus> {
+        let Some(_slot) = self.read_slot().await else {
+            debug!(%pool_id, "admit getPool: no read slot free; refusing without caching");
+            return None;
+        };
         // Bounded: the alloy HTTP provider sets no timeout of its own, so a hung
         // read times out here and takes the fault path below.
-        let read = async {
-            let _slot = self.chain_reads.acquire().await;
-            self.contract.getPool(pool_id).call().await
-        };
-        let pool = match timed(None, "admit getPool", read).await {
+        let pool = match timed(None, "admit getPool", self.contract.getPool(pool_id).call()).await {
             Ok(pool) => pool,
             Err(err) => {
                 warn!(
@@ -1514,12 +1531,18 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
     ) -> Option<SignerAuthorization> {
         // The baseline is taken before the read is sent; see `AuthRead`.
         let folded_at_read = self.projection.signer_spent(pool_id, signer);
-        // Bounded: a hung read times out here and takes the fault path below.
-        let read = async {
-            let _slot = self.chain_reads.acquire().await;
-            self.contract.getAuthorization(pool_id, signer).call().await
+        let Some(_slot) = self.read_slot().await else {
+            debug!(%pool_id, %signer, "admit getAuthorization: no read slot free; refusing");
+            return None;
         };
-        let auth = match timed(None, "admit getAuthorization", read).await {
+        // Bounded: a hung read times out here and takes the fault path below.
+        let auth = match timed(
+            None,
+            "admit getAuthorization",
+            self.contract.getAuthorization(pool_id, signer).call(),
+        )
+        .await
+        {
             Ok(auth) => SignerAuthorization::from_onchain(&auth),
             Err(err) => {
                 warn!(
