@@ -95,7 +95,7 @@ use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
 use crate::fault::{carries_untracked_escrow, fold_escrow};
 use crate::funding::RunFunding;
-use crate::lane_sources::LaneSources;
+use crate::lane_sources::{FirstLeg, LaneSources};
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
 use crate::receipt::ReceiptEvidence;
@@ -1912,7 +1912,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                 (total, holders)
             } else {
                 let claim = sources
-                    .first_claim(hash, holders, &self.health, stop)
+                    .first_claim(hash, holders, FirstLeg::Whole, &self.health, stop)
                     .await?;
                 (claim.total_bytes, claim.holders)
             };

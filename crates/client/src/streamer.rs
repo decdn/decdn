@@ -248,6 +248,21 @@ struct DriveInputs<P, F> {
     max_blob_bytes: u64,
 }
 
+/// The pacer a streamed drive under `read_ahead` runs on: a window of the
+/// read-ahead. Below one pull-window floor (one payment interval plus the
+/// chunk-group roundings, see [`PULL_WINDOW_FLOOR`]) the window can floor a
+/// lane's room to zero before the consumer has a byte to read, and neither
+/// side then moves, so the window is never below it. A size open ahead of the
+/// drive predicts the drive's first leg from it
+/// ([`crate::driver::streamed_first_leg`]).
+pub(crate) const fn stream_pacer(read_ahead: u64) -> WindowPacer {
+    WindowPacer::new(if read_ahead > PULL_WINDOW_FLOOR {
+        read_ahead
+    } else {
+        PULL_WINDOW_FLOOR
+    })
+}
+
 /// Run the streaming fetch into the store through [`crate::acquire`], bounded
 /// to one read-ahead window ahead of the consumer's cursor and capped to
 /// `lane_cap` concurrent lanes, then (on a clean finish) tee the whole verified
@@ -278,10 +293,7 @@ where
         stop,
         max_blob_bytes,
     } = inputs;
-    // Below one pull-window floor (one payment interval plus the chunk-group
-    // roundings, see `PULL_WINDOW_FLOOR`) the window can floor a lane's room to
-    // zero before the consumer has a byte to read, and neither side then moves.
-    let pacer = WindowPacer::new(read_ahead.max(PULL_WINDOW_FLOOR));
+    let pacer = stream_pacer(read_ahead);
     let on_progress = {
         let state = Arc::clone(&state);
         // Each verified-progress report may mean new bytes in the store: wake the

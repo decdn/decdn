@@ -42,7 +42,7 @@ use anyhow::Context as _;
 use decdn_client::bundle::{BundleManifest, MalformedManifest};
 use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
 use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token};
-use decdn_client::lane_sources::{FaultContext, LaneSources};
+use decdn_client::lane_sources::{FaultContext, FirstLeg, LaneSources};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use decdn_client::receipt::ReceiptEvidence;
 use decdn_client::session::{
@@ -1346,9 +1346,19 @@ pub(crate) async fn fetch_on(
         // A fetch dropped by Ctrl-C queues every lane's vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
-            // The first size claim: the probe's hint, or a whole-blob open's
-            // header.
-            let claim = sources.first_claim(hash, holders, health, &stop).await?;
+            // The first size claim: the probe's hint, or the header of an open
+            // of the drive's first leg, which that leg then adopts.
+            let first_leg = if streams {
+                FirstLeg::Streamed {
+                    window: args.range.unwrap_or((0, 0)),
+                    read_ahead: stream_read_ahead(args.read_ahead),
+                }
+            } else {
+                FirstLeg::Whole
+            };
+            let claim = sources
+                .first_claim(hash, holders, first_leg, health, &stop)
+                .await?;
             if replaced.is_none()
                 && let Some(hints) = &rate_hints
             {
@@ -1730,6 +1740,12 @@ where
         .await
 }
 
+/// The read-ahead a streamed fetch runs under: the outstanding-spend bound
+/// for an abandoned pipe, the client's default or the caller's own.
+fn stream_read_ahead(read_ahead: Option<u64>) -> u64 {
+    read_ahead.unwrap_or(PullConfig::new().read_ahead_bytes)
+}
+
 /// Stream `hash`'s verified bytes in order to `sink` (stdout for
 /// [`Sink::Output`]) via the [`Streamer`] consumption face (#1848 4b). Only
 /// bao-verified bytes ever reach the pipe — safe to `| tar x` — the fetch is
@@ -1762,11 +1778,9 @@ async fn stream_out<P>(
 where
     P: alloy::providers::Provider + Clone,
 {
-    // The read-ahead is the outstanding-spend bound for an abandoned pipe:
-    // the client's default, or the caller's own.
     let pull_config = PullConfig {
         streamer_lane_cap: max_sources.max(1),
-        read_ahead_bytes: read_ahead.unwrap_or(PullConfig::new().read_ahead_bytes),
+        read_ahead_bytes: stream_read_ahead(read_ahead),
     };
     let scratch = stream_scratch(deps)?;
     let streamer = streamer_over(deps, sources, holders, health, scratch.path());

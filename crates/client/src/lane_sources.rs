@@ -14,27 +14,53 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::Address;
+use decdn_bao_range::AlignedRange;
 use decdn_incentive::{LaneKey, PoolId};
 use iroh::RelayUrl;
 use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::WatermarkRow;
 use crate::discovery::NodeCandidate;
+use crate::driver::streamed_first_leg;
 use crate::funding::PoolFunder;
 use crate::lanes::{
     FaceLaneHandle, LaneDeps, LanePayer, build_multi_lane, lane_target, queue_face_watermarks,
 };
 use crate::session::{DiscoveryOptions, ProxyWarmingParams};
+use crate::sink::PullReader;
 use crate::source::{PrimedSource, SourceFuture, SourceStream};
 use crate::stream_cap::LaneStreamCap;
+use crate::streamer::stream_pacer;
 use crate::targets::{
     LateProbes, ProbeOpts, ProbeOutcome, ProbeRound, ResolvedTargets, now_secs, pinned_targets,
     resolve_target_node, spawn_harvest,
 };
 use crate::{
     CredentialSlot, Holder, LaneLease, LaneLedgers, PeerHealth, PeerSource, PoolContext,
-    RecoveryGate, SourceProvider, SourceSet, StopPolicy, StreamCandidate, first_open,
+    RecoveryGate, SourceProvider, SourceSet, StopPolicy, StreamCandidate, UpstreamPullHeader,
+    first_open, is_range_past_end,
 };
+
+/// The first leg the drive after a [`LaneSources::first_claim`] opens, so the
+/// claim's size open pulls that leg and the drive adopts the pull.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstLeg {
+    /// A download under a [`crate::BudgetPacer`]: the whole blob.
+    Whole,
+    /// A streamed drive ([`crate::Streamer`]) of a byte window under its
+    /// read-ahead: its first leg is cut to the read-ahead window.
+    Streamed {
+        /// The byte window, `(offset, len)`; a `len` of `0` runs to the end.
+        window: (u64, u64),
+        /// The streamer's read-ahead ([`crate::PullConfig::read_ahead_bytes`]).
+        read_ahead: u64,
+    },
+}
+
+/// A size no blob reaches, for the leg a streamed size open pulls before it
+/// knows the size: a leg that ends inside the blob ends at the same byte for
+/// every larger size, and a node clamps a pull that runs past the end.
+const UNBOUNDED_SIZE: u64 = 1 << 62;
 
 /// A fetch's first size claim ([`LaneSources::first_claim`]): a hint the fetch
 /// grows or shrinks as verified bytes land.
@@ -68,6 +94,21 @@ where
         }),
         None => open(holders).await,
     }
+}
+
+/// Open the whole blob for its signed header: a download's first leg, primed
+/// at `align_range(0, 0, n)`, which holds for every `n`.
+///
+/// # Errors
+///
+/// The open's fault.
+async fn open_whole_primed(
+    source: &PeerSource<'_>,
+    hash: [u8; 32],
+) -> anyhow::Result<(UpstreamPullHeader, PullReader, Option<AlignedRange>)> {
+    let (header, whole) = source.open_whole(hash).await?;
+    let range = decdn_bao_range::align_range(0, 0, header.total_bytes).ok();
+    Ok((header, whole, range))
 }
 
 /// What a failed fetch's lanes saw, for explaining the failure to the user
@@ -295,13 +336,14 @@ where
     /// The fetch's first size claim (#2218): the probe's size hint when a
     /// probe gave one ([`Self::holders_from`]), with no open at all. Without a
     /// hint (the peer-store fast path, or a pinned `--node-id` whose probe gave
-    /// no size), a whole-blob open of one of `holders` learns the size one
+    /// no size), an open of `first_leg` on one of `holders` learns the size one
     /// holder signs from its header ([`first_open`]), with the acquire loop's
     /// recovery: a holder that faults cools and another is tried until one
     /// answers, a fault only the user can fix ends it, and `stop` gives up.
     /// The open's pull is primed on the lane for its next open alone
-    /// ([`PrimedSource::prime_next`]) once its header is read: a first leg on
-    /// the lane that is the whole blob adopts it within two seconds of the
+    /// ([`PrimedSource::prime_next`]) once its header is read: the drive's
+    /// first leg on the lane is the range the open pulled
+    /// ([`FirstLeg`]), so it adopts the pull within two seconds of the
     /// open, and any other first leg closes it before opening its own, so the
     /// node never holds the floor it reserved for the pull beside the leg's.
     /// A lane that opens nothing closes it when it drops. The lane that
@@ -317,6 +359,7 @@ where
         &self,
         hash: [u8; 32],
         holders: Vec<Holder>,
+        first_leg: FirstLeg,
         health: &Arc<PeerHealth>,
         stop: &StopPolicy,
     ) -> anyhow::Result<FirstClaim> {
@@ -325,17 +368,18 @@ where
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         first_claim_or_open(hint, holders, |holders| {
-            self.open_for_header(hash, holders, health, stop)
+            self.open_for_header(hash, holders, first_leg, health, stop)
         })
         .await
     }
 
-    /// The size one of `holders` signs, from the header of a whole-blob open
-    /// whose pull stays primed on its lane ([`Self::first_claim`]).
+    /// The size one of `holders` signs, from the header of an open of
+    /// `first_leg` whose pull stays primed on its lane ([`Self::first_claim`]).
     async fn open_for_header(
         &self,
         hash: [u8; 32],
         holders: Vec<Holder>,
+        first_leg: FirstLeg,
         health: &Arc<PeerHealth>,
         stop: &StopPolicy,
     ) -> anyhow::Result<FirstClaim> {
@@ -350,7 +394,9 @@ where
             credentials.as_ref(),
             |lane| async move {
                 let opened_at = tokio::time::Instant::now();
-                let (header, whole) = lane.source.inner().open_whole(hash).await?;
+                let (header, pull, range) = self
+                    .open_first_leg(lane.source.inner(), hash, first_leg)
+                    .await?;
                 let provider = lane
                     .ctx
                     .lock()
@@ -358,20 +404,18 @@ where
                     .provider;
                 self.record_open(provider, header.rate_per_mb);
                 let total_bytes = header.total_bytes;
-                // The node has already written into the pull. A fresh
-                // download's first leg on this lane is the whole blob, so
-                // the pull is parked for that leg to adopt instead of dropped
-                // unread; another first leg closes it first. `align_range(0,
-                // 0, n)` holds for every `n`; were it to fail, the drive opens
-                // its own pull.
-                match decdn_bao_range::align_range(0, 0, total_bytes) {
-                    Ok(range) => lane
-                        .source
-                        .prime_next(hash, range, header, whole, opened_at),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "the size open's pull is not primed");
-                        drop((header, whole));
-                    }
+                // The node has already written into the pull, so it is parked
+                // for the drive's first leg to adopt instead of dropped unread;
+                // another first leg closes it first. A pull with no range to
+                // prime closes here, and the drive opens its own.
+                if let Some(range) = range {
+                    lane.source.prime_next(hash, range, header, pull, opened_at);
+                } else {
+                    tracing::debug!(
+                        total_bytes,
+                        "the size open's pull is not the drive's first leg; not primed"
+                    );
+                    drop((header, pull));
                 }
                 Ok(total_bytes)
             },
@@ -389,6 +433,54 @@ where
             total_bytes,
             holders,
         })
+    }
+
+    /// Open `first_leg` of `hash` on `source` for its signed header. Returns the
+    /// header, the pull, and the range the drive's first leg asks for when the
+    /// pull is that leg.
+    ///
+    /// A download's first leg is the whole blob. A streamed drive's first leg
+    /// is cut to its read-ahead window ([`streamed_first_leg`]), and its end does
+    /// not depend on the size while the blob runs past it, so the open pulls
+    /// the leg of an unbounded blob. A node clamps a pull that runs past the
+    /// end, so on a shorter blob the pull is the clamped leg, which is the
+    /// drive's first leg for that size. A window that starts past the end
+    /// serves nothing ([`is_range_past_end`]), and the size comes from a whole
+    /// open instead.
+    ///
+    /// # Errors
+    ///
+    /// The open's fault.
+    async fn open_first_leg(
+        &self,
+        source: &PeerSource<'a>,
+        hash: [u8; 32],
+        first_leg: FirstLeg,
+    ) -> anyhow::Result<(UpstreamPullHeader, PullReader, Option<AlignedRange>)> {
+        let FirstLeg::Streamed { window, read_ahead } = first_leg else {
+            return open_whole_primed(source, hash).await;
+        };
+        let pacer = stream_pacer(read_ahead);
+        let max_blob_bytes = self.deps.max_blob_bytes;
+        let Some(span) = streamed_first_leg(&pacer, window, max_blob_bytes, UNBOUNDED_SIZE) else {
+            return open_whole_primed(source, hash).await;
+        };
+        let (header, pull) = match source
+            .open_span(hash, span.fetch_start(), span.fetch_len())
+            .await
+        {
+            Ok(opened) => opened,
+            Err(e) if is_range_past_end(&e) => return open_whole_primed(source, hash).await,
+            Err(e) => return Err(e),
+        };
+        let total_bytes = header.total_bytes;
+        // The pull is the drive's first leg only when it covers exactly that
+        // leg's span at the signed size.
+        let range = streamed_first_leg(&pacer, window, max_blob_bytes, total_bytes).filter(|leg| {
+            leg.fetch_start() == span.fetch_start()
+                && leg.fetch_end() == span.fetch_end().min(total_bytes)
+        });
+        Ok((header, PullReader::new(pull), range))
     }
 
     /// Persist every built lane's voucher watermark, and return once the
