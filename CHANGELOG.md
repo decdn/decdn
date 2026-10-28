@@ -1137,6 +1137,16 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Client: a streamed fetch with no size hint keeps the pull it opened for
+  the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
+  fast path, or a gateway pull whose size lookup finds none), the client read
+  the size from a whole-blob open and primed that pull for the first leg. A
+  streamed drive's first leg is cut to the read-ahead window, so it never took
+  the pull. It closed the pull and opened offset 0 again, and the node had
+  already written into the closed pull for up to a round trip. The size open
+  of a streamed fetch now pulls the streamed drive's first leg, which the
+  drive adopts. A download still opens the whole blob. ADR 039 states the
+  rule.
 - **Client: a funding recovery step replaces a stored pool the chain has no
   record of (#2665).** `getPool` on an unknown pool id returns a zeroed
   struct: a zero owner, and the status `Open` (enum value 0). The step read

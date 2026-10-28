@@ -23,7 +23,7 @@
 //! cannot reach `MIN_FRESH_CANDIDATES`; three independently-bonded holders of
 //! the SAME blob is the minimum fixture shape that can.
 //!
-//! Two journeys, sharing one chain, three holders, and one funded buyer:
+//! Three journeys, sharing one chain, three holders, and one funded buyer:
 //!
 //! 1. **Populate + probe-less repeat.** The first auto-discovered fetch probes
 //!    all three holders (all report `has_blob:true`) and its off-critical-path
@@ -45,6 +45,11 @@
 //!    fetch #2 that reused the store already demonstrates this, and this
 //!    journey additionally asserts the peer record files are present both
 //!    right after fetch #1 and still present after fetch #2.
+//! 3. **Probe-less stream.** A third fast-path fetch streams a blob longer
+//!    than the read-ahead window to stdout (`-o -`). Its size open pulls the
+//!    streamed drive's first leg, a read-ahead window of the blob, and the
+//!    drive adopts that pull, so no leg the client opens starts at offset 0
+//!    (#2644).
 //!
 //! **Registry-outage fallback is NOT covered here —
 //! documented limitation, not a faked test.** `decdn get`'s CLI surface has
@@ -135,8 +140,19 @@ async fn peer_store_probeless_second_fetch_and_cross_process_persistence() -> an
 
 /// Deterministic pseudo-random blob with a ragged final group.
 fn make_blob() -> Vec<u8> {
-    let mut v = vec![0u8; 12 * CHUNK_GROUP + 1234];
-    let mut x: u32 = 0xFEED_BEEF;
+    make_blob_of(12 * CHUNK_GROUP + 1234, 0xFEED_BEEF)
+}
+
+/// A blob longer than the CLI's default read-ahead (16 MiB), so a streamed
+/// fetch's first leg is a window of it, not the whole blob (#2644).
+fn make_streamed_blob() -> Vec<u8> {
+    make_blob_of(17 * 1024 * 1024 + 1234, 0x2644_2644)
+}
+
+/// `len` deterministic pseudo-random bytes from xorshift `seed`.
+fn make_blob_of(len: usize, seed: u32) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    let mut x: u32 = seed;
     for b in &mut v {
         x ^= x << 13;
         x ^= x >> 17;
@@ -167,20 +183,25 @@ async fn run() -> anyhow::Result<()> {
     // `MIN_FRESH_CANDIDATES`.
     let blob = make_blob();
     let blob_hash = Hash::new(&blob);
+    let streamed = make_streamed_blob();
+    let streamed_hash = Hash::new(&streamed);
     let (holder_a, hashes_a) =
-        NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice()]).await?;
+        NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice(), streamed.as_slice()])
+            .await?;
     anyhow::ensure!(
         hashes_a.first() == Some(&blob_hash),
         "holder A hash mismatch"
     );
     let (holder_b, hashes_b) =
-        NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice()]).await?;
+        NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice(), streamed.as_slice()])
+            .await?;
     anyhow::ensure!(
         hashes_b.first() == Some(&blob_hash),
         "holder B hash mismatch"
     );
     let (holder_c, hashes_c) =
-        NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice()]).await?;
+        NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice(), streamed.as_slice()])
+            .await?;
     anyhow::ensure!(
         hashes_c.first() == Some(&blob_hash),
         "holder C hash mismatch"
@@ -307,6 +328,47 @@ async fn run() -> anyhow::Result<()> {
          stream was not the download's first leg"
     );
 
+    // ---- Journey 3: a probe-less streamed fetch (#2644) ----
+    //
+    // `-o -` with no size hint: the first size claim opens the streamed
+    // drive's first leg, a read-ahead window of the blob, and the drive adopts
+    // that pull. A whole-blob size open is not that leg, so the drive would
+    // close it and open offset 0 again, after the node had written into it for
+    // up to a round trip. On loopback the close lands before the node writes,
+    // and a steal between the lanes stops a stream past which the node has
+    // already written, so the served bytes tell the two apart neither way. The
+    // legs the client opens do: an adopted first leg opens nothing itself.
+    let mut stream_args = fetch_argv(&chain, &streamed_hash, client_dir.path(), &keystore, &out);
+    if let Some(output) = stream_args.get_mut(2) {
+        *output = "-".into();
+    }
+    let (got, log) = run_fetch_logged(client_dir.path(), &stream_args).await?;
+    anyhow::ensure!(
+        got == streamed,
+        "the streamed fetch wrote {} bytes to stdout, expected {}",
+        got.len(),
+        streamed.len()
+    );
+    // The fetch timings name a probe round only when one ran, and a probe's
+    // size hint would skip the size open.
+    anyhow::ensure!(
+        log.contains("fetch timings") && !log.contains("probe_start_ms"),
+        "the streamed fetch probed, so no size open ran:\n{log}"
+    );
+    let legs: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("opening a paid leg"))
+        .collect();
+    anyhow::ensure!(
+        !legs.is_empty(),
+        "the streamed fetch logged no leg open:\n{log}"
+    );
+    anyhow::ensure!(
+        !legs.iter().any(|line| line.contains("byte_offset=0 ")),
+        "the streamed drive opened offset 0 itself instead of adopting the size open's pull:\n{}",
+        legs.join("\n")
+    );
+
     // ---- Journey 2 (persistence half): the peer records outlive both ----
     //
     // Both `decdn get` invocations above are separate OS processes; the
@@ -363,6 +425,43 @@ async fn run_fetch_once(data_dir: &std::path::Path, args: &[String]) -> anyhow::
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
+}
+
+/// Run `decdn get` once with the client's leg opens logged, and fail with its
+/// stderr unless it succeeds. Returns its stdout and its log, with the ANSI
+/// styling stripped.
+async fn run_fetch_logged(
+    data_dir: &std::path::Path,
+    args: &[String],
+) -> anyhow::Result<(Vec<u8>, String)> {
+    let output = tokio::process::Command::from(decdn_command(data_dir, KEYSTORE_PASSWORD)?)
+        .arg("get")
+        .args(args)
+        .env("RUST_LOG", "info,decdn_client::source=debug")
+        .output()
+        .await
+        .context("spawn decdn get")?;
+    let log = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+    anyhow::ensure!(output.status.success(), "decdn get failed:\n{log}");
+    Ok((output.stdout, log))
+}
+
+/// `text` with its ANSI escape sequences (`ESC [ … letter`) removed.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Run `decdn get`, retrying until the node's chain watcher has observed the

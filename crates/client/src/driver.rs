@@ -71,7 +71,9 @@ use std::time::Duration;
 
 use alloy::primitives::U256;
 use bao_tree::ChunkRanges;
-use decdn_bao_range::{AlignedRange, RangedStore, RangedStoreError, align_range};
+use decdn_bao_range::{
+    AlignedRange, CHUNK_GROUP_BYTES, RangedStore, RangedStoreError, align_range,
+};
 use decdn_protocol::VoucherRejectReason;
 
 use crate::fault::HealExhausted;
@@ -826,6 +828,55 @@ async fn range_set_gaps<St: RangedStore + ?Sized>(
             .map_err(store_query_fault)?;
     }
     Ok(contiguous_byte_ranges(&missing, store.total_bytes()))
+}
+
+/// The aligned range a drive under `pacer` opens first for the byte window
+/// `(offset, len)` (`len == 0`: to the end) of a `total_bytes` blob, on a store
+/// that holds none of it. `None` when the window holds no byte of the blob, or
+/// when `pacer` does not draw on a fresh state.
+///
+/// The streamed counterpart of [`first_leg`], for a size open that runs before
+/// the store exists ([`crate::lane_sources::LaneSources::first_claim`]): the
+/// open reads the signed size from the header of a pull of this range, and the
+/// pull stays primed for the drive's first leg to adopt. The draw is what
+/// `pacer` decides on a fresh state, so a size open and the drive it primes
+/// cannot disagree on the window. The gap is the window widened to whole
+/// chunk groups, as an empty store reports it missing, and the leg is cut from it as
+/// [`leg_range`] cuts every leg. A drive's first leg differs from it only on a
+/// store that already holds bytes of the window.
+pub(crate) fn streamed_first_leg<P: Pacer>(
+    pacer: &P,
+    (offset, len): (u64, u64),
+    max_blob_size_bytes: u64,
+    total_bytes: u64,
+) -> Option<AlignedRange> {
+    let fresh = PaceState {
+        cleared_bytes: 0,
+        requested_bytes: u64::MAX,
+        remaining_deposit: U256::MAX,
+        next_voucher_cost: U256::ZERO,
+        pulled_frontier: 0,
+        gap_remaining: u64::MAX,
+        downstream: DownstreamFrontier::default(),
+    };
+    let PaceDecision::Draw { up_to_bytes } = pacer.decide(&fresh) else {
+        return None;
+    };
+    let start = offset - offset % CHUNK_GROUP_BYTES;
+    let end = if len == 0 {
+        total_bytes
+    } else {
+        offset
+            .saturating_add(len)
+            .div_ceil(CHUNK_GROUP_BYTES)
+            .saturating_mul(CHUNK_GROUP_BYTES)
+            .min(total_bytes)
+    };
+    if start >= end {
+        return None;
+    }
+    let max_len = held_room(max_blob_size_bytes, 0).unwrap_or(u64::MAX);
+    leg_range(start, end, up_to_bytes, max_len, total_bytes).ok()
 }
 
 /// The aligned range a drive of `ranges` over `store` opens first, or `None`

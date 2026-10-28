@@ -3306,3 +3306,189 @@ fn owed_spans_merge_and_are_taken_once() {
     assert!(ledger.take_unpaid(hash).is_empty(), "taken once");
     assert_eq!(ledger.take_unpaid([8u8; 32]), vec![(0, 5)]);
 }
+
+/// `streamed_first_leg` is the range a streamed drive opens first on an empty
+/// store (#2644), for a whole blob, a prefix window and a window off a chunk
+/// boundary, on a blob longer than the read-ahead window and on one shorter.
+/// A size open that pulls this range primes the pull the drive adopts.
+#[tokio::test]
+async fn streamed_first_leg_is_the_range_a_streamed_drive_opens_first() {
+    let pacer = crate::streamer::stream_pacer(0);
+    let window = crate::pacer::PULL_WINDOW_FLOOR;
+    let off_chunk = 5 * 1024 + 17;
+    for total in [3 * window + 1234, window / 2] {
+        let (root, plaintext, _) = synth_blob(total as usize);
+        for (offset, len) in [
+            (0, 0),
+            (0, window + 5000),
+            (off_chunk, 0),
+            (off_chunk, 2 * GROUP + 3),
+        ] {
+            let case = format!("total {total}, window ({offset}, {len})");
+            let want = super::streamed_first_leg(&pacer, (offset, len), 0, total)
+                .unwrap_or_else(|| panic!("{case}: a leg"));
+            let store = fresh_store(root, total);
+            let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+            let source = ScriptedSource::new(plaintext.clone())
+                .expect("source")
+                .paying(Arc::clone(&ledger));
+            let downstream = || super::DownstreamFrontier {
+                served_paid: u64::MAX,
+                serve_demand: 0,
+            };
+            drive(
+                &store,
+                &source,
+                &pacer,
+                &Arc::new(Mutex::new(healthy_ctx())),
+                &ledger,
+                root,
+                offset,
+                len,
+                None,
+                None,
+                Some(&downstream),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{case}: drive: {e:#}"));
+            assert_eq!(
+                source.opened_ranges().first().copied(),
+                Some((want.fetch_start(), want.fetch_len())),
+                "{case}"
+            );
+        }
+    }
+    let total = 3 * window;
+    assert!(
+        super::streamed_first_leg(&pacer, (total, 0), 0, total).is_none(),
+        "a window past the end holds no byte"
+    );
+    let capped = super::streamed_first_leg(&pacer, (0, 0), 2 * GROUP, total).expect("a leg");
+    assert_eq!(
+        capped.fetch_len(),
+        2 * GROUP,
+        "the cap on held bytes cuts the leg"
+    );
+}
+
+/// A streamed drive adopts a pull primed at [`super::streamed_first_leg`]
+/// (#2644): on a blob longer than the read-ahead window, the drive's first leg
+/// is the primed pull, so no leg opens offset `0` a second time. A pull primed
+/// at the whole blob is not that leg, and the drive reopens it.
+#[tokio::test]
+async fn a_streamed_drive_adopts_a_pull_primed_at_its_first_leg() {
+    let pacer = crate::streamer::stream_pacer(0);
+    let total = 3 * crate::pacer::PULL_WINDOW_FLOOR + 1234;
+    let (root, plaintext, _) = synth_blob(total as usize);
+    for (primed_at, opens_of_zero) in [
+        (
+            super::streamed_first_leg(&pacer, (0, 0), 0, total).expect("a leg"),
+            1,
+        ),
+        (align_range(0, 0, total).expect("align"), 2),
+    ] {
+        let store = fresh_store(root, total);
+        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+        let primed = PrimedSource::new(
+            ScriptedSource::new(plaintext.clone())
+                .expect("source")
+                .paying(Arc::clone(&ledger)),
+        );
+        let (header, reader) = primed
+            .inner()
+            .open(root, primed_at.clone())
+            .await
+            .expect("priming open");
+        primed.prime_next(root, primed_at, header, reader, tokio::time::Instant::now());
+        let downstream = || super::DownstreamFrontier {
+            served_paid: u64::MAX,
+            serve_demand: 0,
+        };
+        drive(
+            &store,
+            &primed,
+            &pacer,
+            &Arc::new(Mutex::new(healthy_ctx())),
+            &ledger,
+            root,
+            0,
+            0,
+            None,
+            None,
+            Some(&downstream),
+            None,
+        )
+        .await
+        .expect("drive");
+        let opened = primed.inner().opened_ranges();
+        assert_eq!(
+            opened.iter().filter(|&&(start, _)| start == 0).count(),
+            opens_of_zero,
+            "opens: {opened:?}"
+        );
+        assert_eq!(
+            store.read(0, 0).await.expect("read").as_ref(),
+            plaintext.as_slice()
+        );
+    }
+}
+
+/// Under a cap on held bytes, a streamed drive over a store the cap's reach
+/// sizes adopts a pull primed at [`crate::lane_sources::primed_first_leg`]
+/// (#2644): the primed range carries the store's size, not the signed one.
+#[tokio::test]
+async fn a_capped_streamed_drive_adopts_its_primed_first_leg() {
+    use crate::lane_sources::{FirstLeg, primed_first_leg, size_open_span};
+    let pacer = crate::streamer::stream_pacer(0);
+    let window = crate::pacer::PULL_WINDOW_FLOOR;
+    let total = 3 * window + 1234;
+    let cap = 2 * window;
+    let streamed = FirstLeg::Streamed {
+        window: (0, 0),
+        read_ahead: 0,
+    };
+    let (root, plaintext, _) = synth_blob(total as usize);
+    let span = size_open_span(root, streamed, cap).expect("a span");
+    let primed_at = primed_first_leg(streamed, cap, &span, total).expect("the pull is the leg");
+    let store = fresh_store(root, cap);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let primed = PrimedSource::new(
+        ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .capped(cap)
+            .paying(Arc::clone(&ledger)),
+    );
+    let (header, reader) = primed
+        .inner()
+        .open(root, primed_at.clone())
+        .await
+        .expect("priming open");
+    primed.prime_next(root, primed_at, header, reader, tokio::time::Instant::now());
+    let downstream = || super::DownstreamFrontier {
+        served_paid: u64::MAX,
+        serve_demand: 0,
+    };
+    // The drive stops at the cap; only its first leg matters here.
+    let _ = drive(
+        &store,
+        &primed,
+        &pacer,
+        &Arc::new(Mutex::new(healthy_ctx())),
+        &ledger,
+        root,
+        0,
+        0,
+        None,
+        None,
+        Some(&downstream),
+        None,
+    )
+    .await;
+    let opened = primed.inner().opened_ranges();
+    assert_eq!(
+        opened.iter().filter(|&&(start, _)| start == 0).count(),
+        1,
+        "the first leg adopted the primed pull: {opened:?}"
+    );
+}
