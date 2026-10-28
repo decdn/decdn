@@ -332,6 +332,27 @@ impl ClientHandler {
             reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
             return Ok(ServeEnd::Reset(ResetCause::StreamCapFull));
         }
+        // Per-request limiter (ADR 005 §Request rate limiting), on the same
+        // footing as the stream cap: refuse before the request is read, with no
+        // signed response. Most refusals after the request is read sign a
+        // response, and an origin-only node probes its backend for an unseen
+        // hash before any payment check, so an unpaid flood must stop here.
+        let peer_ip = crate::rate_limit::peer_ip(&conn);
+        if let Some(limiter) = &self.request_limiter
+            && let Err(layer) = limiter.check(
+                &crate::dht::routing::NodeId::from_bytes(*peer.as_bytes()),
+                peer_ip,
+            )
+        {
+            tracing::debug!(
+                layer = layer.as_str(),
+                %peer,
+                ?peer_ip,
+                "client request rate-limited"
+            );
+            reset_stream(&mut send, &mut recv, APP_ERR_RATE_LIMITED);
+            return Ok(ServeEnd::Reset(ResetCause::RateLimited(layer)));
+        }
 
         let client_node_id = B256::from(*peer.as_bytes());
         let first = match read_first_message(&mut recv).await {
@@ -514,6 +535,29 @@ impl ClientHandler {
             signer,
             provider: self_operator,
         });
+
+        // Backend and chain work only for a request that names a lane. A
+        // request with no verified binding can name none, so it can never be
+        // served; the lane gate below would refuse it `OwnerMismatch`. Refuse it
+        // here instead, before an origin-only node's backend `HEAD` and before
+        // an unseen pool costs it a `getPool`: a stream of unbound requests for
+        // fresh hashes or random `pool_id`s would otherwise spend one of each.
+        // A bound request still reads the chain, because a registered signer
+        // sends no capability and its funding refusal (`Unfunded`) needs the
+        // read; the per-request limiter and the admit-read cap bound what bound
+        // requests can spend. With no pool-view wired (dev/test) the lane gate
+        // below refuses it.
+        if self.pool_view.is_some() && lane_key.is_none() {
+            self.warn_unbound_request(&peer);
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::OwnerMismatch,
+                    rate_per_mb,
+                )
+                .await;
+        }
 
         // Origin-only policy (#1759). When the operator opts out of foreign
         // relay, the own/foreign decision is backend-authoritative: the request's
@@ -1356,14 +1400,7 @@ impl ClientHandler {
         // the initial `StreamResponse`, so use the delivery-side `NotFound` here
         // (avoids leaking lane existence).
         let Some(lane_key) = lane_key else {
-            if let Some(suppressed) = self.unbound_request_warn.admit() {
-                tracing::warn!(
-                    %peer,
-                    suppressed,
-                    interval = ?self.unbound_request_warn.interval(),
-                    "stream request with no verified binding; refusing pre-serve"
-                );
-            }
+            self.warn_unbound_request(&peer);
             return self
                 .respond_error(
                     &mut send,

@@ -1,5 +1,6 @@
 use super::*;
 use crate::dht::routing::xor_distance;
+use crate::dht::staker_set::AllStaked;
 
 fn nid(b: u8) -> NodeId {
     NodeId::from_bytes([b; 32])
@@ -29,7 +30,7 @@ fn random_target_lands_in_requested_bucket() {
 #[test]
 fn all_non_empty_picks_is_empty_for_empty_table() {
     let table = RoutingTable::new(nid(0));
-    assert!(all_non_empty_picks(&table).is_empty());
+    assert!(all_non_empty_picks(&table, &AllStaked).is_empty());
 }
 
 #[test]
@@ -52,7 +53,7 @@ fn all_non_empty_picks_returns_one_entry_per_non_empty_bucket() {
     table.insert(p1);
     table.insert(p2);
 
-    let picks = all_non_empty_picks(&table);
+    let picks = all_non_empty_picks(&table, &AllStaked);
     // One pick per non-empty bucket — exactly two here. ADR 022
     // requires *every* populated bucket be refreshed each tick.
     assert_eq!(picks.len(), 2);
@@ -82,4 +83,40 @@ fn pick_bucket_for_single_bucket_returns_a_target_in_range() {
     assert_eq!(pick.bucket_index, 255);
     let d = xor_distance(&self_id, &pick.target);
     assert_eq!(bucket_index(&d), Some(255));
+}
+
+/// #2708: a refresh asks a bucket's most-recently-seen bonded entry, skipping
+/// newer entries that have unbonded since, and skips a bucket that holds no
+/// bonded entry at all.
+#[test]
+fn all_non_empty_picks_aims_at_bonded_entries_only() {
+    use crate::dht::staker_set::ConfigStakerSet;
+
+    let self_id = nid(0);
+    let mut table = RoutingTable::new(self_id);
+    let in_255 = |b: u8| {
+        let mut id = [0u8; 32];
+        id[0] = 0x80;
+        id[31] = b;
+        NodeId::from_bytes(id)
+    };
+    let in_0 = {
+        let mut id = [0u8; 32];
+        id[31] = 0x01;
+        NodeId::from_bytes(id)
+    };
+    // Bucket 255: bonded `in_255(1)`, then the newer, unbonded `in_255(2)`.
+    table.insert(in_255(1));
+    table.insert(in_255(2));
+    // Bucket 0 holds only an unbonded entry.
+    table.insert(in_0);
+    let stakers = ConfigStakerSet::new(std::collections::HashSet::from([in_255(1)]));
+
+    let picks = all_non_empty_picks(&table, &stakers);
+    assert_eq!(picks.len(), 1);
+    assert!(
+        picks
+            .iter()
+            .all(|p| p.bucket_index == 255 && p.peer == in_255(1))
+    );
 }

@@ -6405,6 +6405,88 @@ impl decdn_node::pool_view::PoolView for ClosingPoolView {
     }
 }
 
+/// A [`PoolView`](decdn_node::pool_view::PoolView) that counts the pool reads
+/// it is asked for and answers none.
+#[derive(Debug, Default)]
+struct CountingPoolView {
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl decdn_node::pool_view::PoolView for CountingPoolView {
+    async fn status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }
+}
+
+/// #2706: a request with no verified binding names no lane, so the node
+/// refuses it `NotFound` before it reads the pool. A flood of unbound requests
+/// for unseen pools costs no chain read. A bound request still reads the pool.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbound_request_reads_no_pool() -> anyhow::Result<()> {
+    let payload = vec![0x6Du8; 4096];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let store_dyn: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let view = Arc::new(CountingPoolView::default());
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| deps.pool_view = Some(Arc::clone(&view) as _),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    for _ in 0..4 {
+        let (resp, ext) = open_expecting_refusal(&conn, *hash.as_bytes(), None).await?;
+        anyhow::ensure!(!resp.body.ok);
+        anyhow::ensure!(
+            matches!(ext.error, Some(StreamError::NotFound)),
+            "an unbound request hears NotFound, got {:?}",
+            ext.error
+        );
+    }
+    anyhow::ensure!(
+        view.reads.load(std::sync::atomic::Ordering::SeqCst) == 0,
+        "unbound requests must not read the pool"
+    );
+
+    // A bound request on a fresh connection does read it.
+    conn.close(0u32.into(), b"done");
+    let bound = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let signer = Arc::new(PrivateKeySigner::random());
+    let ext = binding_ext(&signer, client_node_id)?;
+    let _ = open_expecting_refusal(&bound, *hash.as_bytes(), Some(&ext)).await?;
+    anyhow::ensure!(
+        view.reads.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "a bound request reads the pool once"
+    );
+
+    bound.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// A node does not serve on a `Closing` pool (ADR 003 §Pool solvency). It
 /// answers a requester that holds a lane on the pool `Unfunded`, so the owner
 /// opens a new pool, and an unbound requester `NotFound`, so the pool's state
@@ -6479,10 +6561,16 @@ async fn a_closing_pool_is_unfunded_to_its_lane_and_not_found_to_anyone_else() -
         "an unbound requester must hear NotFound, got {:?}",
         unbound_ext.error
     );
+    // The unbound request names no lane, so it is refused before the pool
+    // read: it counts as an owner mismatch, not as a closing pool.
     let encoded = metrics.encode()?;
     anyhow::ensure!(
-        metric_line_present(&encoded, "decdn_serve_stream_rejected_pool_closing_total 2"),
-        "both refusals must count as pool_closing:\n{encoded}"
+        metric_line_present(&encoded, "decdn_serve_stream_rejected_pool_closing_total 1")
+            && metric_line_present(
+                &encoded,
+                "decdn_serve_stream_rejected_owner_mismatch_total 1"
+            ),
+        "the lane's refusal counts as pool_closing and the unbound one as owner_mismatch:\n{encoded}"
     );
 
     stranger.close(0u32.into(), b"done");
@@ -13309,6 +13397,177 @@ async fn over_cap_stream_is_reset_before_its_request_is_read() -> anyhow::Result
     conn.close(0u32.into(), b"done");
     support::assert_inbound_failures_attributed(&metrics, 2).await?;
     shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// #2694 / #2706: the `[serve.rate_limit]` limiter refuses a stream before its
+/// request is read (ADR 005 §Request rate limiting). A peer whose per-peer
+/// bucket is empty opens a stream and announces a request frame with no body.
+/// The handler resets it with `RATE_LIMITED` at once: it does not wait for the
+/// body, sign a response, probe an origin or read the chain, and the refusal
+/// counts on the per-peer counter as the stream's failure reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rate_limited_stream_is_reset_before_its_request_is_read() -> anyhow::Result<()> {
+    use decdn_node::handlers::serve_rate_limit::ServeRateLimiter;
+
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&[0x4Eu8; 1024]).await?;
+    let store_dyn: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    // One request per peer, refilled far slower than the test runs; the per-IP
+    // and global layers are off.
+    let request_limiter = Arc::new(ServeRateLimiter::from_resolved(
+        &decdn_common::config::ResolvedServe {
+            per_peer_rate_per_sec: 0.001,
+            per_peer_burst: 1,
+            per_ip_rate_per_sec: 0.0,
+            per_ip_burst: 0,
+            global_rate_per_sec: 0.0,
+            global_burst: 0,
+            max_tracked_per_ip: 16,
+            max_tracked_per_peer: 16,
+        },
+        Arc::clone(&metrics),
+    ));
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        16,
+        |deps| deps.request_limiter = Some(Arc::clone(&request_limiter)),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // Spend the client's one token out of band.
+    anyhow::ensure!(
+        request_limiter
+            .check(
+                &decdn_node::dht::routing::NodeId::from_bytes(*client_ep.id().as_bytes()),
+                None,
+            )
+            .is_ok()
+    );
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    send.write_all(&support::frame_len_prefix(
+        decdn_protocol::MAX_CLIENT_CONTROL_FRAME,
+    ))
+    .await
+    .map_err(|e| anyhow::anyhow!("write prefix: {e}"))?;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        assert_stream_reset(&mut recv, decdn_protocol::APP_ERR_RATE_LIMITED),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the rate-limited stream waited on its request body"))??;
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_rate_limit_rejected_per_peer_total")? == 1,
+        "the refusal counts on the per-peer layer"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// #2694: the serve limiter's per-IP layer keys on the connection's direct-path
+/// source IP. Two peers with distinct node ids on the same loopback IP share
+/// one per-IP bucket: once the other peer spent it, this client's stream is
+/// reset `RATE_LIMITED` and counts on the per-IP counter, not the per-peer one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_per_ip_request_layer_binds_two_peers_on_one_ip() -> anyhow::Result<()> {
+    use decdn_node::handlers::serve_rate_limit::ServeRateLimiter;
+
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&[0x4Fu8; 1024]).await?;
+    let store_dyn: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let request_limiter = Arc::new(ServeRateLimiter::from_resolved(
+        &decdn_common::config::ResolvedServe {
+            per_peer_rate_per_sec: 0.0,
+            per_peer_burst: 0,
+            per_ip_rate_per_sec: 0.001,
+            per_ip_burst: 1,
+            global_rate_per_sec: 0.0,
+            global_burst: 0,
+            max_tracked_per_ip: 16,
+            max_tracked_per_peer: 16,
+        },
+        Arc::clone(&metrics),
+    ));
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        16,
+        |deps| deps.request_limiter = Some(Arc::clone(&request_limiter)),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // Another peer on the same IP spends the IP's one token out of band.
+    let (second_ep, second_addr) = local_endpoint(fresh_key(), vec![]).await?;
+    let client_ip = second_addr.ip();
+    anyhow::ensure!(
+        request_limiter
+            .check(
+                &decdn_node::dht::routing::NodeId::from_bytes([0x77; 32]),
+                Some(client_ip),
+            )
+            .is_ok()
+    );
+
+    // The client finds the per-IP bucket empty.
+    let second = second_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = second
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    send.write_all(&support::frame_len_prefix(
+        decdn_protocol::MAX_CLIENT_CONTROL_FRAME,
+    ))
+    .await
+    .map_err(|e| anyhow::anyhow!("write prefix: {e}"))?;
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        assert_stream_reset(&mut recv, decdn_protocol::APP_ERR_RATE_LIMITED),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the second client's stream was not refused"))??;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_rate_limit_rejected_per_ip_total")? == 1
+            && counter(&metrics, "decdn_serve_rate_limit_rejected_per_peer_total")? == 0,
+        "the refusal counts on the per-IP layer"
+    );
+
+    second.close(0u32.into(), b"done");
+    shutdown([server_task], [&second_ep, &server_ep]).await?;
     Ok(())
 }
 

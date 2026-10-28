@@ -81,7 +81,7 @@ A node with a cache miss issues a `cdn/dht/v1` FIND_VALUE lookup for the target 
 | Per-IP | 50 probes/sec | 200 | refill `[10, 1000]`; burst `[refill, 5×refill]` | The direct-path QUIC source IP, masked to its /64 prefix for IPv6. A relay-only connection has no direct-path IP, so this layer does not charge it. |
 | Global node | 1000 probes/sec | 2000 | refill `[100, 100000]`; burst `[refill, 10×refill]` | Single global bucket across all probes inbound to this node. |
 
-Checks fire cheapest-first (global → per-IP → per-peer) so a probe rejected by the global cap never costs a per-IP-bucket lookup. Each admitted probe consumes one token from each bucket that applies to it. A relay-only probe skips the per-IP bucket.
+Checks fire narrowest-first (per-peer → per-IP → global). A layer charges its token only after every narrower layer admits the probe. A probe that its own peer or IP bucket refuses therefore spends no token of the global budget, so one `NodeId` that floods past its cap cannot starve the other requesters. Each admitted probe consumes one token from each bucket that applies to it. A relay-only probe skips the per-IP bucket.
 
 **Why three layers, not one.** Per-peer alone is bypassable: clients are unstaked and can rotate `NodeId` for free per [ADR 003 § Probe fishing](003-payments.md#probe-fishing). The per-IP layer raises the cost of bulk probing — IP rotation requires money (proxies, IPv6 prefix delegation, cloud bills) and disadvantages bulk-probers without disadvantaging staked node-to-node traffic, which uses stable IPs. This cost argument applies only to direct-path connections. The relay does not show the client address to the node. A relay-only connection therefore passes this layer unchecked. The per-peer layer still bounds a relay peer that keeps its `NodeId`. A relay peer that rotates its `NodeId` meets only the global cap. The global cap is defence in depth against distributed attacks across many IPs that would otherwise exhaust the node's per-probe signing capacity.
 
@@ -230,6 +230,26 @@ Maximum concurrent bidirectional streams per connection, set via QUIC transport 
 Stream concurrency is enforced via QUIC's `MAX_STREAMS` transport parameter: a peer MUST NOT open a new bidirectional stream beyond the advertised limit (doing so is a protocol violation resulting in `STREAM_LIMIT_ERROR` and connection close). The receiver grants additional credit by sending `MAX_STREAMS` updates as existing streams close.
 
 On `cdn/client/v1` the node also holds a per-connection stream semaphore of 100 permits (`MAX_CLIENT_STREAMS`, the `cdn/client/v1` row above). A stream that finds no permit is reset with `RATE_LIMITED` before the node reads its request, and the node signs no response for it. Thus an over-cap stream does not buffer a request frame or cost a signature. Together with the frame ceilings and the connection receive window, this bounds the memory that stalled peers can hold ([ADR 013 § Wire Framing](013-schema-evolution.md#wire-framing)).
+
+#### Request rate limiting
+
+The node limits inbound `cdn/client/v1` requests with three layered token buckets. The layers and their narrowest-first order are the same as in [§ Probe rate limiting](#probe-rate-limiting). The node checks them once per stream, after the stream permit and **before** it reads the request. A stream that fails any layer is reset with `RATE_LIMITED` (`0x10`, [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)), and the node signs no response for it.
+
+| Layer | Default refill | Default burst | Scope |
+|---|---:|---:|---|
+| Per-peer (NodeId) | 100 requests/sec | 400 | The source iroh `NodeId` on the QUIC connection. |
+| Per-IP | 200 requests/sec | 800 | The direct-path QUIC source IP, masked to its /64 prefix for IPv6. A relay-only connection has no direct-path IP, so this layer does not charge it. |
+| Global node | 2000 requests/sec | 5000 | Single global bucket across all inbound `cdn/client/v1` requests to this node. |
+
+Operators set the layers under `[serve.rate_limit]`. A rate of `0` turns a layer off.
+
+**Why the node limits unpaid requests.** A request costs the node work before any payment binds it. Most refusals after the node reads the request carry a signed `StreamResponse`. An origin-only node sends its backend a `HEAD` for an unseen hash before it checks a lane or a payment. An unseen pool or signer costs a chain read. Without a limit, a peer can spend the node's signing capacity, origin requests and RPC quota on requests that never pay.
+
+**Why these defaults.** One request is one stream, and an honest client opens one stream per pull leg, with up to 100 at once on one connection ([§ Concurrent stream limits](#concurrent-stream-limits)). A node pulling on a cache miss shares one `NodeId` across all its pulls. The caps therefore sit well above the probe caps. `decdn-client` reads a `RATE_LIMITED` reset as back-off, not as a fault.
+
+**Why NodeId, IP and global, not signer.** The layers key on the connection, not on the voucher signer. A signer key is free to rotate, and a node keeps no per-signer rate memory ([ADR 003](003-payments.md#adr-003-payment-model)). The per-IP layer has the relay-only gap that [§ Probe rate limiting](#probe-rate-limiting) describes ([#2505](https://github.com/decdn/decdn/issues/2505)).
+
+**Metrics.** `decdn_serve_rate_limit_rejected_{per_peer,per_ip,global}_total`, three sibling counters, unlabeled. Each refused stream counts on the counter of the layer that refused it first.
 
 #### Payment lanes and concurrent streams
 

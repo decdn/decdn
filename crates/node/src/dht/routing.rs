@@ -12,16 +12,28 @@
 //! cause iterative lookup to terminate on its own routing table without ever
 //! contacting the network.
 //!
+//! # Bonded peers only
+//!
+//! ADR 022 restricts the routing pool to bonded operators. Every production
+//! write goes through [`RoutingTable::insert_active`], which refuses a peer
+//! the staker set does not hold. Every `closer_nodes` answer, lookup seed and
+//! publish fan-out goes through [`RoutingTable::closest_active`] or
+//! [`RoutingTable::closest_active_unbounded`], and bucket refresh asks a
+//! bucket's most-recently-seen bonded entry, so an entry that has unbonded
+//! since it was inserted is neither dialed nor named. A `NodeId` costs nothing, so an unchecked
+//! write would let a stream of fresh ids displace every bonded entry.
+//!
 //! # Eviction policy
 //!
-//! On bucket overflow the least-recently-seen entry is evicted and the
-//! new `NodeId` appended at the tail. Standard Kademlia would ping the
-//! LRU first and evict only if it does not respond; ADR 022 §Routing
-//! Table does not mandate the ping-then-evict variant and we do not
-//! implement it. The simpler LRU here preserves the "newcomers are
-//! reachable" property — the LRU is the one least recently confirmed to
-//! be live, so evicting it is the safest bet among entries already in
-//! the bucket.
+//! On bucket overflow [`RoutingTable::insert_active`] evicts the
+//! least-recently-seen entry that has unbonded or whose dial is cooling, and
+//! otherwise the least-recently-seen entry, and appends the new `NodeId` at
+//! the tail. Standard Kademlia would ping the LRU first and evict only if it
+//! does not respond; ADR 022 §Routing Table does not mandate the
+//! ping-then-evict variant and we do not implement it. Only a bonded peer can
+//! enter, so a newcomer that displaces an entry costs its operator a bond.
+//! The LRU is the entry least recently confirmed to be live, so evicting it
+//! is the safest bet among entries already in the bucket.
 //!
 //! # Unreachable peers
 //!
@@ -29,9 +41,10 @@
 //! stays in the table. The lookup marks it with [`RoutingTable::mark_unreachable`],
 //! and this node's lookups skip it for [`DIAL_FAILURE_COOLDOWN`]. A peer the
 //! lookup reached through a `closer_nodes` referral, and that is in no bucket,
-//! is marked the same way. [`RoutingTable::closest`] still returns a marked
-//! peer, so `closer_nodes` answers to other nodes and the republish fan-out
-//! are unchanged; the skip is this node's own, and the lookup takes its seed
+//! is marked the same way. [`RoutingTable::closest_active`] and
+//! [`RoutingTable::closest_active_unbounded`] still return a marked peer, so
+//! `closer_nodes` answers to other nodes and the republish fan-out are
+//! unchanged; the skip is this node's own, and the lookup takes its seed
 //! from the nearest peers that are not skipped. The skip ends when the
 //! cooldown lapses or when the table inserts or refreshes the peer again,
 //! which an inbound request from it does (#2532). The registry seeds every
@@ -43,6 +56,8 @@ use std::time::{Duration, Instant};
 
 use decdn_protocol::MAX_CLOSER_NODES;
 pub use decdn_protocol::NodeId;
+
+use super::StakerSet;
 
 /// How long this node's lookups skip a peer after a dial of it timed out. Long
 /// enough that a dead bonded peer costs about one dial budget per node per
@@ -176,9 +191,11 @@ impl RoutingTable {
         self.buckets.iter().all(Vec::is_empty)
     }
 
-    /// Insert or refresh `peer`. Returns `true` on a fresh insert, `false`
-    /// on a refresh (peer already present — its LRU position is moved to
-    /// the tail) or a self-insert (silently ignored).
+    /// Insert or refresh `peer` with no bond check. Returns `true` on a fresh
+    /// insert, `false` on a refresh (peer already present — its LRU position
+    /// is moved to the tail) or a self-insert (silently ignored). Production
+    /// writes use [`Self::insert_active`]; this unchecked form serves tests and
+    /// operator tooling.
     ///
     /// On bucket overflow the least-recently-seen entry is evicted to make
     /// room. See the module docs for the LRU rationale vs. classic
@@ -187,6 +204,42 @@ impl RoutingTable {
     /// An insert or a refresh ends the peer's dial-failure skip: the table has
     /// a fresh reason to hold the peer.
     pub fn insert(&mut self, peer: NodeId) -> bool {
+        self.insert_evicting(peer, 0)
+    }
+
+    /// Insert `peer` if `stakers` holds it as an active bonded operator, as
+    /// [`Self::insert`] does; refuse it otherwise and return `false`.
+    ///
+    /// On bucket overflow, evict the least-recently-seen entry that `stakers`
+    /// no longer holds or whose dial is cooling at `now`, and otherwise the
+    /// least-recently-seen entry. Every production write uses this method; see
+    /// the module docs.
+    pub fn insert_active(&mut self, peer: NodeId, stakers: &dyn StakerSet, now: Instant) -> bool {
+        if !stakers.is_active(&peer) {
+            return false;
+        }
+        let victim = self
+            .bucket_of(&peer)
+            .and_then(|bucket| {
+                bucket
+                    .iter()
+                    .position(|p| !stakers.is_active(p) || self.is_cooling(p, now))
+            })
+            .unwrap_or(0);
+        self.insert_evicting(peer, victim)
+    }
+
+    /// The bucket `peer` belongs in, or `None` for this node's own id.
+    fn bucket_of(&self, peer: &NodeId) -> Option<&Vec<NodeId>> {
+        if *peer == self.self_id {
+            return None;
+        }
+        bucket_index(&xor_distance(&self.self_id, peer)).and_then(|idx| self.buckets.get(idx))
+    }
+
+    /// [`Self::insert`], evicting the entry at position `victim` of a full
+    /// bucket, or the least-recently-seen entry when `victim` is out of range.
+    fn insert_evicting(&mut self, peer: NodeId, victim: usize) -> bool {
         if peer == self.self_id {
             return false;
         }
@@ -206,8 +259,7 @@ impl RoutingTable {
             return false;
         }
         if bucket.len() >= K_BUCKET_SIZE {
-            // Evict least-recently-seen.
-            bucket.remove(0);
+            bucket.remove(if victim < bucket.len() { victim } else { 0 });
         }
         bucket.push(peer);
         true
@@ -291,8 +343,9 @@ impl RoutingTable {
     ///
     /// The result is capped at [`K_BUCKET_SIZE`] (= [`MAX_CLOSER_NODES`])
     /// so it can be serialised directly into a wire `closer_nodes` field.
-    /// Callers needing more than K candidates (e.g. ADR 022 §STORE Flow
-    /// "K+3 closest" republish fanout) MUST use [`Self::closest_unbounded`].
+    /// Callers needing more than K candidates use [`Self::closest_unbounded`].
+    /// This is the unfiltered base; the wire answer reads
+    /// [`Self::closest_active`].
     #[must_use]
     pub fn closest(&self, target: &[u8; NODE_ID_LEN], n: usize) -> Vec<NodeId> {
         let cap = n.min(K_BUCKET_SIZE);
@@ -300,18 +353,53 @@ impl RoutingTable {
     }
 
     /// Like [`Self::closest`] but without the wire-cap clamp at
-    /// [`K_BUCKET_SIZE`]. Used by the republish path which fans out to
-    /// K+3 closest peers per ADR 022 §STORE Flow line 128 ("three
-    /// positions beyond K are overflow targets — publishing to a wider
-    /// set than the minimum required by the routing geometry means an
-    /// attacker forcing record expiry by suppressing receivers must
-    /// take down K+3 hosts rather than K").
+    /// [`K_BUCKET_SIZE`], and unfiltered. The republish path fans out to the
+    /// K+3 closest bonded peers per ADR 022 §STORE Flow ("three positions
+    /// beyond K are overflow targets — publishing to a wider set than the
+    /// minimum required by the routing geometry means an attacker forcing
+    /// record expiry by suppressing receivers must take down K+3 hosts rather
+    /// than K") through [`Self::closest_active_unbounded`].
     ///
     /// MUST NOT be used to populate wire responses — those are bound at
     /// [`MAX_CLOSER_NODES`] and a larger result would violate the
-    /// ADR 022 wire-cost ceiling. Use [`Self::closest`] for that path.
+    /// ADR 022 wire-cost ceiling. Use [`Self::closest_active`] for that path.
     #[must_use]
     pub fn closest_unbounded(&self, target: &[u8; NODE_ID_LEN], n: usize) -> Vec<NodeId> {
+        self.closest_where(target, n, |_| true)
+    }
+
+    /// Like [`Self::closest`], counting only the entries `stakers` holds as
+    /// active bonded operators. Serves the wire `closer_nodes` answers.
+    #[must_use]
+    pub fn closest_active(
+        &self,
+        target: &[u8; NODE_ID_LEN],
+        n: usize,
+        stakers: &dyn StakerSet,
+    ) -> Vec<NodeId> {
+        self.closest_active_unbounded(target, n.min(K_BUCKET_SIZE), stakers)
+    }
+
+    /// Like [`Self::closest_unbounded`], counting only the entries `stakers`
+    /// holds as active bonded operators. Serves the lookup seed and the
+    /// republish fan-out, never a wire answer.
+    #[must_use]
+    pub fn closest_active_unbounded(
+        &self,
+        target: &[u8; NODE_ID_LEN],
+        n: usize,
+        stakers: &dyn StakerSet,
+    ) -> Vec<NodeId> {
+        self.closest_where(target, n, |p| stakers.is_active(p))
+    }
+
+    /// Up to `n` entries that `keep` accepts, closest to `target` first.
+    fn closest_where(
+        &self,
+        target: &[u8; NODE_ID_LEN],
+        n: usize,
+        keep: impl Fn(&NodeId) -> bool,
+    ) -> Vec<NodeId> {
         // Schwartzian transform: compute `xor_distance_bytes` exactly once per
         // candidate, then sort on the cached distance. `sort_unstable_by_key`
         // does NOT cache its key (that is what `sort_by_cached_key` is for), so
@@ -322,6 +410,7 @@ impl RoutingTable {
             .buckets
             .iter()
             .flatten()
+            .filter(|p| keep(p))
             .map(|p| (*p, xor_distance_bytes(p.as_bytes(), target)))
             .collect();
         // Sorting on the already-computed distance only re-copies the cached

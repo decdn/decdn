@@ -131,7 +131,7 @@ pub struct ProbeHandler {
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
     /// ADR 005 §Probe rate limiting three-layer token-bucket limiter
-    /// (global → per-IP → per-peer). Runs in addition to `limiter` (the
+    /// (per-peer → per-IP → global). Runs in addition to `limiter` (the
     /// connection-level [`ConnectionLimiter`]) — see
     /// [`crate::handlers::probe_rate_limit`] for why both layers run.
     probe_rate_limiter: Arc<ProbeRateLimiter>,
@@ -284,7 +284,7 @@ impl ProbeHandler {
         };
 
         // ADR 005 §Probe rate limiting: three-layer token-bucket limiter
-        // (global → per-IP → per-peer) applied *before* any signature is
+        // (per-peer → per-IP → global) applied *before* any signature is
         // computed and *before* any eviction-hold slot is allocated. It runs in
         // addition to the `ConnectionLimiter` permit above (per-source IP +
         // global concurrency) — see `probe_rate_limit` module docs for why

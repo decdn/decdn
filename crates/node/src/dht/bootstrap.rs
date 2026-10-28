@@ -22,6 +22,7 @@
 //! buckets via `FindNode` probes of random per-bucket targets.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use decdn_client::Connections;
 use iroh::{EndpointAddr, PublicKey};
@@ -100,7 +101,7 @@ pub async fn bootstrap(
                 // but skip it here so the seeds_inserted count is honest.
                 continue;
             }
-            if table.insert(peer) {
+            if table.insert_active(peer, staker_set.as_ref(), Instant::now()) {
                 inserted += 1;
             }
         }
@@ -148,19 +149,21 @@ pub async fn bootstrap(
         match handle.await {
             Ok((_, Ok(resp))) => {
                 outcome.find_node_ok += 1;
-                // Insert every peer the responder named — these are
+                // Insert every bonded peer the responder named — these are
                 // the seed's K-closest to self.node_id, exactly what
                 // we want in our k-buckets. Response-learned ids inserted
                 // as probe candidates by design (not authenticated peers);
                 // the `AuthenticatedNodeId` boundary covers the handler's
-                // recency refresh, not this discovery path.
+                // recency refresh, not this discovery path. An unbonded id is
+                // refused: the responder names whatever it likes.
+                let now = Instant::now();
                 outcome.closer_peers_inserted += with_lock(routing, "dht routing table", |table| {
                     let mut inserted = 0usize;
                     for peer in resp.closer_nodes.into_inner() {
                         if peer == self_node_id {
                             continue;
                         }
-                        if table.insert(peer) {
+                        if table.insert_active(peer, staker_set.as_ref(), now) {
                             inserted += 1;
                         }
                     }
