@@ -949,7 +949,7 @@ impl std::fmt::Display for EscrowUnconfirmed {
 /// the uncredited row and escrows again.
 ///
 /// The handle also names every pool a run on it saw live (`saw_live`): a pool
-/// it opened, or read on chain as this wallet's. A later read that shows no
+/// it opened or topped up, or read on chain as this wallet's. A later read that shows no
 /// record of such a pool is a lagging RPC, not a pool that is gone.
 ///
 /// A clone shares the same lists, so one handle can outlive the per-pass state
@@ -1119,8 +1119,8 @@ impl UnconfirmedEscrows {
             .collect()
     }
 
-    /// Record that a run on the handle saw `pool_id` live: it opened the pool,
-    /// or read it on chain as this wallet's.
+    /// Record that a run on the handle saw `pool_id` live: it opened or topped
+    /// up the pool, or read it on chain as this wallet's.
     pub(crate) fn note_live(&self, pool_id: PoolId) {
         let mut live = self.0.live.lock().unwrap_or_else(PoisonError::into_inner);
         if !live.contains(&pool_id) {
@@ -1135,6 +1135,13 @@ impl UnconfirmedEscrows {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(&pool_id)
+    }
+
+    /// Hold `escrow` as a submitted transaction no record credits yet, for a
+    /// test of a step that a pending escrow refuses.
+    #[cfg(test)]
+    pub(crate) fn hold_pending_for_test(&self, escrow: impl Into<EscrowUnconfirmed>) {
+        self.insert(escrow);
     }
 
     /// Hold `escrow` from its submit.
@@ -1600,7 +1607,11 @@ pub(crate) async fn top_up_unless_ended<P: Provider + Clone>(
         entry: unconfirmed.into(),
     };
     match topped_up_from_receipt(&receipt, *contract.address(), pool_id, additional) {
-        Ok(topped_up) => Ok((topped_up, unrecorded)),
+        // The contract credited this owner's pool, so the chain knows it.
+        Ok(topped_up) => {
+            unrecorded.escrows.note_live(pool_id);
+            Ok((topped_up, unrecorded))
+        }
         // A revert escrowed nothing.
         Err(err) => {
             unrecorded.release();

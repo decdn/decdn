@@ -1214,13 +1214,34 @@ async fn step_on_the_pool(
     seen_live: bool,
     remaining: u64,
 ) -> (anyhow::Result<Recovery>, Vec<OpenUnconfirmed>) {
+    let funding = RunFunding::default();
+    if let Some(err) = untracked {
+        funding.escrows().hold_untracked(&err);
+    }
+    if seen_live {
+        funding.escrows().note_live(STEPPED_POOL);
+    }
+    let stepped = step_in(asserter, &funding, remaining).await;
+    (stepped, funding.escrows().opens())
+}
+
+/// The pool [`step_in`] steps on.
+const STEPPED_POOL: PoolId = B256::repeat_byte(0xEE);
+
+/// Run a recovery step in the run `funding` describes, for a self-funded
+/// pool ([`STEPPED_POOL`]) that holds its working deposit in the store, the
+/// run seeing `remaining` of it. `asserter` answers the step's chain calls.
+async fn step_in(
+    asserter: Asserter,
+    funding: &RunFunding,
+    remaining: u64,
+) -> anyhow::Result<Recovery> {
     let dir = tempfile::tempdir().unwrap();
     let store = client_store(&dir);
     let signer = full_pool_owner();
-    let id = B256::repeat_byte(0xEE);
     store
         .record(&tracked_row(
-            id,
+            STEPPED_POOL,
             signer.address(),
             lane_of(&store, &signer),
             WORKING,
@@ -1231,15 +1252,7 @@ async fn step_on_the_pool(
         .layer(SendLegLayer)
         .connect_mocked_client(asserter);
     let contract = PaymentPool::new(PP, rpc.clone());
-    let opens = UnconfirmedEscrows::default();
-    let funding = RunFunding::reporting_escrows_to(opens.clone());
-    funding.note_pool(id);
-    if let Some(err) = untracked {
-        funding.escrows().hold_untracked(&err);
-    }
-    if seen_live {
-        funding.escrows().note_live(id);
-    }
+    funding.note_pool(STEPPED_POOL);
     let funder = PoolFunder {
         contract: &contract,
         rpc: &rpc,
@@ -1250,9 +1263,9 @@ async fn step_on_the_pool(
         payment_pool_addr: PP,
         working_deposit: U256::from(WORKING),
         max_approve: false,
-        funding: &funding,
+        funding,
     };
-    (funder.recover(U256::from(remaining)).await, opens.opens())
+    funder.recover(U256::from(remaining)).await
 }
 
 /// A full pool that still accepts funds settles: the step escrows nothing and
@@ -1539,6 +1552,84 @@ async fn a_pool_the_command_saw_live_is_not_replaced_on_a_lagging_read() {
         "only the pool read and the estimate ran"
     );
     assert!(opens.is_empty(), "{opens:?}");
+}
+
+/// A pool the chain holds no record of is not replaced while a `topUp` of
+/// the command is unconfirmed: the `topUp` may still mine on it, and a
+/// replacement would escrow a second deposit beside it.
+#[tokio::test]
+async fn an_unconfirmed_top_up_refuses_replacing_an_unknown_pool() {
+    let asserter = Asserter::new();
+    asserter.push_success(&no_record_on_chain());
+    let funding = RunFunding::default();
+    funding.escrows().hold_pending_for_test(HELD);
+    let err = step_in(asserter.clone(), &funding, 0)
+        .await
+        .expect_err("the step refuses");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("while a topUp of this command is unconfirmed"),
+        "{msg}"
+    );
+    assert!(asserter.read_q().is_empty(), "only the pool read ran");
+    assert!(funding.escrows().opens().is_empty(), "no openPool");
+}
+
+/// A sibling refill's `topUp` holds the run's `topUp` lock while the step
+/// reads the pool as unknown, and mines on it: the pool is live. The step
+/// decides under the same lock, so it sees that and opens no replacement.
+#[tokio::test]
+async fn a_pool_a_sibling_top_up_shows_live_while_the_step_waits_is_kept() {
+    let asserter = Asserter::new();
+    asserter.push_success(&no_record_on_chain());
+    let funding = RunFunding::default();
+    let sibling = funding.top_up_serial.lock().await;
+    let mined_meanwhile = async {
+        while !asserter.read_q().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        funding.escrows().note_live(STEPPED_POOL);
+        drop(sibling);
+    };
+    let (stepped, ()) = tokio::join!(step_in(asserter.clone(), &funding, 0), mined_meanwhile);
+    let msg = format!("{:#}", stepped.expect_err("the step refuses"));
+    assert!(msg.contains("which this command saw live"), "{msg}");
+    assert!(funding.escrows().opens().is_empty(), "no openPool");
+}
+
+/// A refill whose first pool read was inconclusive (the chain held no record
+/// yet) and whose `topUp` then mined shows the pool live, so a later recovery
+/// step that reads it as unknown keeps it rather than opening a replacement.
+#[tokio::test(start_paused = true)]
+async fn a_mined_refill_shows_its_pool_live_after_an_inconclusive_read() {
+    use decdn_incentive::test_rpc::ScriptedRpc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    let pool_id = a_spent_pool(&store, &signer);
+    let funding = RunFunding::default();
+    let rpc = ScriptedRpc::mined(mined_top_up())
+        .answering_calls([no_record_on_chain(), Bytes::from(U256::MAX.abi_encode())]);
+    run_scripted(&store, &signer, &rpc, &funding, &CancellationToken::new())
+        .await
+        .expect("the refill mines and the lane builds");
+    assert_eq!(rpc.sent_nonces().len(), 1, "the refill sent its topUp");
+    assert!(
+        funding.escrows().saw_live(pool_id),
+        "the mined topUp shows the pool live"
+    );
+
+    // The step keeps the run's view of the pool and tops it up again.
+    let rpc = ScriptedRpc::mined(mined_top_up())
+        .answering_calls([no_record_on_chain(), Bytes::from(U256::MAX.abi_encode())]);
+    let stepped = recover_scripted(&store, &signer, &rpc, &funding)
+        .await
+        .expect("the step tops the live pool up");
+    assert_matches!(stepped, Recovery::ToppedUp(_));
+    assert_eq!(rpc.sent_nonces().len(), 1, "one topUp, no openPool");
+    assert!(funding.escrows().opens().is_empty(), "no openPool");
 }
 
 /// Run a lane build's open on `rpc`, in a run reporting to `opens`: `usdc()`,

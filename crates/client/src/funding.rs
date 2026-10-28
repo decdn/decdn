@@ -470,13 +470,7 @@ where
                     remaining,
                     overdraft,
                 } => (remaining, overdraft),
-                PoolFunds::Gone => {
-                    tracing::info!(
-                        %pool_id,
-                        "the chain holds no record of the stored buyer pool; opening a new pool"
-                    );
-                    return self.replace(pool_id).await;
-                }
+                PoolFunds::Gone => return self.replace_unknown(pool_id).await,
             };
             let additional = self
                 .working_deposit
@@ -596,7 +590,8 @@ where
     ///
     /// A pool the chain holds no record of ([`PoolStanding::Unknown`]) is
     /// [`PoolFunds::Gone`] unless a run of this command saw it live
-    /// ([`UnconfirmedEscrows::saw_live`]). Such a pool is a stored row that this
+    /// ([`UnconfirmedEscrows::saw_live`]), and the step replaces it under the
+    /// run's `topUp` lock ([`Self::replace_unknown`]). Such a pool is a stored row that this
     /// deployment never opened, and a `topUp` on it reverts `NotPoolOwner`, so
     /// the step opens a replacement. A pool a run saw live reads so only on a
     /// lagging RPC. It keeps the run's view, because a replacement would
@@ -750,6 +745,40 @@ where
             "the buyer pool already holds its working deposit; waiting for the nodes to see it"
         );
         Ok(Recovery::ToppedUp(deposit))
+    }
+
+    /// Replace `pool_id`, a stored pool the chain holds no record of
+    /// ([`PoolFunds::Gone`]), with a new pool.
+    ///
+    /// A sibling lane's refill can be sending a `topUp` on the pool meanwhile.
+    /// So the step takes the run's `topUp` lock first, as every `topUp` does
+    /// ([`escrow_top_up`]), and decides under it: an unconfirmed `topUp` on the
+    /// handle refuses the replacement, and a pool a `topUp` showed live while
+    /// the step waited is kept. Either way a replacement could escrow a second
+    /// deposit beside a pool the chain knows.
+    ///
+    /// # Errors
+    ///
+    /// An unconfirmed `topUp` or a pool seen live refuses the step, or the
+    /// replacement open fails.
+    async fn replace_unknown(&self, pool_id: PoolId) -> anyhow::Result<Recovery> {
+        let _serial = lock_unless_ended(&self.funding.top_up_serial, None).await?;
+        if let Some(pending) = self.funding.escrows().top_ups().first().copied() {
+            return Err(anyhow::Error::new(pending).context(format!(
+                "refusing to replace buyer pool {pool_id}, which the chain holds no record of, \
+                 while a topUp of this command is unconfirmed"
+            )));
+        }
+        anyhow::ensure!(
+            !self.funding.escrows().saw_live(pool_id),
+            "the chain holds no record of buyer pool {pool_id}, which this command saw live; \
+             the RPC may lag, so no replacement is opened"
+        );
+        tracing::info!(
+            %pool_id,
+            "the chain holds no record of the stored buyer pool; opening a new pool"
+        );
+        self.replace(pool_id).await
     }
 
     /// Replace `closed`, a pool that takes no more funds, with a new pool
