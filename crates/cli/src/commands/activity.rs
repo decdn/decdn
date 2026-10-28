@@ -249,7 +249,7 @@ pub(crate) struct ActivityRecorder {
     /// replace, never add.
     files: Mutex<HashMap<String, u64>>,
     /// A bundle run's counts, held until [`Self::finish`] writes them with
-    /// the run's end.
+    /// the run's end; an entry run's are dropped there.
     counts: Mutex<Option<BundleCounts>>,
     evidence: Arc<ReceiptEvidence>,
     ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -369,7 +369,8 @@ impl ActivityRecorder {
 
     /// A bundle blob that lands at `paths` starts; the returned observer
     /// reports its position here and to `inner`. A blob started again, in a
-    /// second pass, counts once. A non-bundle run records the position only.
+    /// second pass, counts once. An entry run, which takes this path when it
+    /// writes to a file, records the position only.
     pub(crate) fn file_started(
         self: &Arc<Self>,
         paths: &[String],
@@ -396,7 +397,7 @@ impl ActivityRecorder {
         })
     }
 
-    /// A bundle blob landed. A non-bundle run ignores it.
+    /// A bundle blob landed. An entry run ignores it.
     pub(crate) fn file_landed(&self) {
         self.update(|r| {
             if let PullKind::Bundle { files_landed, .. } = &mut r.kind {
@@ -405,8 +406,8 @@ impl ActivityRecorder {
         });
     }
 
-    /// A bundle run's counts, which [`Self::finish`] writes with its end. A
-    /// non-bundle run's record keeps none.
+    /// A bundle run's counts, which [`Self::finish`] writes with its end. An
+    /// entry run's record keeps none.
     pub(crate) fn bundle_counts(&self, counts: BundleCounts) {
         *self.counts.lock().unwrap_or_else(PoisonError::into_inner) = Some(counts);
     }
