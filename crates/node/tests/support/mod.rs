@@ -773,6 +773,34 @@ pub(crate) async fn assert_inbound_failures_attributed(
     }
 }
 
+/// Wait until the node has recorded `completed` completed and `failed` failed
+/// inbound streams. The serve task counts a stream's end after the client sees
+/// it, and only after every other counter that stream bumps, so once both
+/// counts match, a single metrics read is settled.
+pub(crate) async fn assert_inbound_streams_ended(
+    metrics: &Metrics,
+    completed: u64,
+    failed: u64,
+) -> anyhow::Result<()> {
+    const COMPLETED: &str = "decdn_streams_completed_total{direction=\"inbound\"}";
+    const FAILED: &str = "decdn_streams_failed_total{direction=\"inbound\"}";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let encoded = metrics.encode()?;
+        let done = sample_value(&encoded, COMPLETED);
+        let failures = sample_value(&encoded, FAILED);
+        if done == completed && failures == failed {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "expected {completed} completed and {failed} failed inbound streams; got \
+             {done} and {failures}:\n{encoded}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Read one length-framed [`ClientMessage`] from `recv`. Mirrors the requester's
 /// private `decdn_client::read_client_message`, exposed for the raw fake
 /// clients/servers the `cdn/client/v1` integration binaries hand-roll.
