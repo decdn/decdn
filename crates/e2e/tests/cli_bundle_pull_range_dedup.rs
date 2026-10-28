@@ -53,7 +53,7 @@ use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_cache::range_pull::{align_range, bao_encoded_size};
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
+use decdn_e2e::cli::{CLIENT_DEBUG_LOG, decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
@@ -71,6 +71,9 @@ const SHARED_BYTES: u64 = 4 * 1024 * 1024;
 /// Each file's distinct tail. Deliberately NOT chunk-group-aligned, so this
 /// journey also proves a ragged complement is handled correctly.
 const TAIL_BYTES: u64 = 200_000 + 123;
+/// The self-heal journey's donor file tail: shorter than [`TAIL_BYTES`], so the
+/// donor is the smaller file and the pull runs it first. Also ragged.
+const SELF_HEAL_TAIL_A_BYTES: u64 = TAIL_BYTES - 4096;
 /// The lone no-overlap file used for the parity assertion.
 const LONE_BYTES: u64 = 300_000;
 /// The cross-bundle shared file's size (whole-file dedup journey). Large
@@ -325,7 +328,12 @@ async fn run_self_heal() -> anyhow::Result<()> {
     // has `donor`) yet placing `donor` at B's head makes B's whole-file BLAKE3
     // mismatch — the exact trigger for the whole-file re-drive self-heal.
     let donor = deterministic_bytes(SHARED_BYTES, 0x5EED_D010);
-    let tail_a = deterministic_bytes(TAIL_BYTES, 0x5EED_D0A1);
+    // A's tail is shorter than B's, so A is the smaller file. The pull runs a
+    // bundle's groups smallest first, and breaks a tie on the hash. With equal
+    // sizes the hashes put B first: B's lying hint then registers B's own head
+    // as `donor`, A's splice refuses that head and fetches its own, and no
+    // self-heal runs.
+    let tail_a = deterministic_bytes(SELF_HEAL_TAIL_A_BYTES, 0x5EED_D0A1);
     let prefix_b = deterministic_bytes(SHARED_BYTES, 0x5EED_D0B0);
     let tail_b = deterministic_bytes(TAIL_BYTES, 0x5EED_D0B2);
 
@@ -375,11 +383,12 @@ async fn run_self_heal() -> anyhow::Result<()> {
         .await
         .context("mint buyer USDC")?;
 
-    // `--jobs 1` forces `a.bin` to finalize (and register `hash_donor`) before
-    // `b.bin` starts, so `b` is the recipient whose lying hint splices `donor`.
+    // `a.bin` is the smaller file, so it runs first, and `--jobs 1` makes it
+    // finalize (and register `hash_donor`) before `b.bin` starts. So `b` is the
+    // recipient whose lying hint splices `donor`.
     let manifest_path = client_dir.path().join("self_heal.json");
     let manifest = format!(
-        r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"b3:{whole_a}","size":{size_a},"chunks":[{{"hash":"b3:{donor}","size":{shared_sz}}},{{"hash":"b3:{tail_a}","size":{tail_sz}}}]}},{{"path":"b.bin","hash":"b3:{whole_b}","size":{size_b},"chunks":[{{"hash":"b3:{donor}","size":{shared_sz}}},{{"hash":"b3:{tail_b}","size":{tail_sz}}}]}}]}}"#,
+        r#"{{"version":1,"entries":[{{"path":"a.bin","hash":"b3:{whole_a}","size":{size_a},"chunks":[{{"hash":"b3:{donor}","size":{shared_sz}}},{{"hash":"b3:{tail_a}","size":{tail_a_sz}}}]}},{{"path":"b.bin","hash":"b3:{whole_b}","size":{size_b},"chunks":[{{"hash":"b3:{donor}","size":{shared_sz}}},{{"hash":"b3:{tail_b}","size":{tail_b_sz}}}]}}]}}"#,
         whole_a = whole_a.to_hex(),
         whole_b = whole_b.to_hex(),
         donor = hash_donor.to_hex(),
@@ -388,7 +397,8 @@ async fn run_self_heal() -> anyhow::Result<()> {
         size_a = file_a.len(),
         size_b = file_b.len(),
         shared_sz = SHARED_BYTES,
-        tail_sz = TAIL_BYTES,
+        tail_a_sz = SELF_HEAL_TAIL_A_BYTES,
+        tail_b_sz = TAIL_BYTES,
     );
     std::fs::write(&manifest_path, manifest).context("write self-heal manifest")?;
 
@@ -431,18 +441,32 @@ async fn run_self_heal() -> anyhow::Result<()> {
         &keystore,
         1,
     );
-    let output =
-        tokio::process::Command::from(decdn_command(client_dir.path(), KEYSTORE_PASSWORD)?)
-            .arg("get")
-            .args(&out_args)
-            .output()
-            .await
-            .context("spawn single-shot self-heal get")?;
+    // At `CLIENT_DEBUG_LOG`, so every assertion below can print the run's leg trail.
+    let output = tokio::process::Command::from({
+        let mut cmd = decdn_command(client_dir.path(), KEYSTORE_PASSWORD)?;
+        cmd.env("RUST_LOG", CLIENT_DEBUG_LOG);
+        cmd
+    })
+    .arg("get")
+    .args(&out_args)
+    .output()
+    .await
+    .context("spawn single-shot self-heal get")?;
+    let cli_stderr = String::from_utf8_lossy(&output.stderr);
+    let cli_stdout = String::from_utf8_lossy(&output.stdout);
     anyhow::ensure!(
         output.status.success(),
         "self-heal get must succeed in one attempt; without the finalize-aware guard the \
-         re-driven entry fails spuriously. stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+         re-driven entry fails spuriously. stderr:\n{cli_stderr}"
+    );
+    // The deterministic witness that the self-heal ran: `b.bin`'s spliced head
+    // failed the whole-file hash and the entry re-drove it. Without it, the
+    // money figure below can match a different path: a lying donor hint that
+    // the recipient's splice refuses re-fetches the same head.
+    anyhow::ensure!(
+        cli_stderr.contains("failed its whole-file hash after range-dedup"),
+        "the measured run must log the self-heal re-drive of b.bin's spliced head; \
+         stdout:\n{cli_stdout}\nstderr:\n{cli_stderr}"
     );
 
     // Both outputs byte-exact and whole-file BLAKE3-exact — self-heal is sound.
@@ -477,7 +501,7 @@ async fn run_self_heal() -> anyhow::Result<()> {
     anyhow::ensure!(
         paid == expected_delta,
         "self-heal must pay exactly a's whole file plus b's complement plus b's \
-         re-driven head = {expected_delta}, got {paid}"
+         re-driven head = {expected_delta}, got {paid}. decdn get stderr:\n{cli_stderr}"
     );
 
     drop(node);

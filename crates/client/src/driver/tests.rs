@@ -793,6 +793,14 @@ async fn mid_gap_fault_resumes_at_the_checkpoint_not_the_whole_gap() {
         "blob not yet complete"
     );
 
+    // The lane owes the prefix the stall left delivered and unpaid. A new
+    // invocation keeps no owed span: it builds its ledger from the persisted
+    // record. Drop the span, as the restart does.
+    assert!(
+        !ledger.take_unpaid(root).is_empty(),
+        "the stall leaves the delivered prefix owed on the lane"
+    );
+
     // Drive #2: resume. Only the un-checkpointed tail is still missing.
     drive(
         &store, &source, &pacer, &ctx, &ledger, root, 0, 0, None, None, None, None,
@@ -2857,6 +2865,56 @@ async fn the_same_lane_bills_its_owed_tail_after_a_funding_refusal() {
     assert!(
         ledger.committed().bytes >= U256::from(total),
         "the lane paid for every byte it delivered"
+    );
+}
+
+/// A leg that a lost connection ends keeps the span it delivered and did not
+/// pay for on its lane, as a funding refusal does: the credit window lets the
+/// node stream ahead of the voucher, whatever ends the stream (#2718). The next
+/// drive on the SAME lane opens at the paid frontier and bills that span.
+#[tokio::test(start_paused = true)]
+async fn the_same_lane_bills_its_owed_tail_after_a_lost_connection() {
+    let total = 6 * GROUP;
+    let (root, plaintext, _outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let source = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&ledger))
+        .fault_once_after(3 * GROUP as usize, || {
+            anyhow::anyhow!("frame I/O error: connection lost")
+        });
+
+    let err = drive_whole(&store, &source, &ledger, root)
+        .await
+        .expect_err("the lost connection ends the lane");
+    assert_ne!(crate::classify(&err), crate::Fault::Unaffordable, "{err:#}");
+    let missing = store.missing_ranges(0, 0).await.expect("missing");
+    let delivered = contiguous_byte_ranges(&missing, total)
+        .first()
+        .map_or(total, |&(start, _)| start);
+    assert!(delivered > 0, "the credit window delivered bytes unpaid");
+    assert_eq!(
+        ledger.committed().amount,
+        U256::ZERO,
+        "the lane paid nothing"
+    );
+
+    drive_whole(&store, &source, &ledger, root)
+        .await
+        .expect("the same lane resumes");
+    assert!(store.is_complete().await.expect("is_complete"));
+    let opened = source.opened_ranges();
+    assert_eq!(
+        opened.get(1).copied(),
+        Some((0, total)),
+        "the next leg opens at the paid frontier, not the delivered one: {opened:?}"
+    );
+    let whole_wire = align_range(0, 0, total).expect("align").wire_len();
+    assert_eq!(
+        ledger.committed().bytes,
+        U256::from(whole_wire),
+        "the lane pays every wire byte of the blob once"
     );
 }
 

@@ -138,7 +138,7 @@ use crate::credential::{
 };
 use crate::driver::{
     DriveCounters, PRESENT_RECORD_FLUSH_INTERVAL, PacingWait, SharedPool, UnitProgress, WaitReason,
-    contiguous_byte_ranges, fill_gap, ranges_content_len,
+    contiguous_byte_ranges, ended_frontiers, fill_gap, ranges_content_len,
 };
 use crate::fault::{Fault, LaneBuildFault, escrow_untracked};
 use crate::health::PeerHealth;
@@ -1981,6 +1981,46 @@ async fn requeue_missing<St>(
 where
     St: IngestStore,
 {
+    requeue_from(store, work, i, None).await
+}
+
+/// Whether a unit that ended as `outcome` on the gap at `g_start`, with its
+/// leg's paid frontier at `paid`, re-queues its remainder from `paid`
+/// ([`requeue_from`]). `rebills` holds the starts of the gaps an owed span
+/// opened. Two ends keep the remainder at the missing bytes, and the owed span
+/// bills alone when the lane's worker next starts:
+///
+/// - A funding refusal. The lane runs again only after a funding recovery
+///   step, and a further step needs bytes verified since the last one (ADR
+///   003 § Funding recovery). A leg that re-delivers the owed span before it
+///   reaches a missing byte can end at the same refusal with none.
+/// - A leg that re-delivered an owed span and paid nothing past its start. A
+///   leg from the same frontier can end the same way, so the next leg opens
+///   at the missing bytes, and each other leg makes progress.
+fn requeues_from_paid(outcome: &UnitOutcome, rebills: &[u64], g_start: u64, paid: u64) -> bool {
+    let funding = matches!(outcome, UnitOutcome::Faulted(Some(err))
+        if crate::fault::classify(err) == Fault::Unaffordable);
+    let rebill_unpaid = paid <= g_start && rebills.contains(&g_start);
+    !funding && !rebill_unpaid
+}
+
+/// [`requeue_missing`], for a unit whose leg ended early with its paid
+/// frontier at `paid_from`. The lane owes the delivered span from there to the
+/// first missing byte past it, and the store holds that span, so it is not
+/// missing. The first missing run at or past `paid_from` re-queues from
+/// `paid_from` instead: the leg that takes it reopens at the paid frontier and
+/// bills the owed span with the missing bytes after it, in one leg. Two legs
+/// would each carry the proof path at their seam, which no voucher of a single
+/// leg pays for. `None` re-queues the missing bytes alone.
+async fn requeue_from<St>(
+    store: &St,
+    work: &AsyncMutex<Work>,
+    i: usize,
+    paid_from: Option<u64>,
+) -> anyhow::Result<Option<Requeued>>
+where
+    St: IngestStore,
+{
     let assigned = {
         let mut w = work.lock().await;
         w.in_flight.get_mut(i).and_then(Option::take)
@@ -1990,7 +2030,19 @@ where
     };
     let total_bytes = store.total_bytes();
     let missing = store_missing(store, held.0, held.1).await?;
-    let remainder = contiguous_byte_ranges(&missing, total_bytes);
+    let mut remainder = contiguous_byte_ranges(&missing, total_bytes);
+    // A paid frontier sits at or below the delivered frontier, so no missing
+    // run holds it. Should one do so, the run would overlap the extended one,
+    // and the requeue keeps the missing bytes alone.
+    if let Some(paid_from) = paid_from
+        && remainder
+            .iter()
+            .all(|&(start, len)| start >= paid_from || start.saturating_add(len) <= paid_from)
+        && let Some(run) = remainder.iter_mut().find(|(start, _)| *start >= paid_from)
+    {
+        let end = run.0.saturating_add(run.1);
+        *run = (paid_from, end.saturating_sub(paid_from));
+    }
     let bytes = remainder
         .iter()
         .map(|&(_, l)| l)
@@ -2008,7 +2060,8 @@ where
 struct Requeued {
     /// The `(start, len)` range the worker held, trimmed by any steal.
     held: (u64, u64),
-    /// The missing bytes of `held` re-queued to `pending`.
+    /// The bytes re-queued to `pending`: the missing bytes of `held`, and the
+    /// owed span [`requeue_from`] started a run at.
     bytes: u64,
 }
 
@@ -2218,12 +2271,30 @@ where
     // `yield_to_front` can move it to an earlier re-queued range.
     let lane_parked = AtomicBool::new(false);
     let lane_parked_wake = Notify::new();
-    // The spans this lane delivered and did not pay for when a funding refusal
-    // ended its last worker. The lane owes them, so when it runs again its own
-    // worker bills them first, although the store holds the bytes (ADR 003 §
-    // Funding recovery).
+    // The spans this lane delivered and did not pay for when a leg of its ended
+    // early: a funding refusal, a fault or a cancel. The lane owes them, so when
+    // it runs again its own worker bills them, although the store holds the
+    // bytes (ADR 003 § Funding recovery). A span a queued range covers stays
+    // owed here: the requeue that queued the range started it at the span
+    // ([`requeue_from`]), and the worker that takes the range bills the span
+    // in the same leg as the missing bytes after it. Every other span bills
+    // first, on its own.
     if !extra && !retired(engine.credentials, &lane) {
-        let owed = lane.ledger.take_unpaid(hash);
+        let owed = {
+            let w = work.lock().await;
+            let mut alone = Vec::new();
+            for (start, len) in lane.ledger.take_unpaid(hash) {
+                let end = start.saturating_add(len);
+                if w.pending.iter().any(|r| {
+                    r.fetch_start() <= start && end <= r.fetch_start().saturating_add(r.fetch_len())
+                }) {
+                    lane.ledger.note_unpaid(hash, start, end);
+                } else {
+                    alone.push((start, len));
+                }
+            }
+            alone
+        };
         for (index, &(start, len)) in owed.iter().enumerate() {
             let settled = tokio::select! {
                 biased;
@@ -2424,9 +2495,30 @@ where
         // present byte. Interior holes never arise (a picked range is contiguous
         // and delivered front-to-back), so this is normally one suffix gap or
         // (for a stolen completed range) none.
-        let gaps = contiguous_byte_ranges(
+        let missing_gaps = contiguous_byte_ranges(
             &store_missing(store, r_start, r_len).await?,
             store.total_bytes(),
+        );
+        // The spans inside the range this lane delivered and did not pay for
+        // join its gaps: a requeue starts a range at the paid frontier of the leg
+        // that ended ([`requeue_from`]), so its first gap reopens there and bills
+        // the delivered tail in the same leg as the missing bytes after it. A
+        // retired lane cannot sign, so it leaves them owed.
+        let owed = if retired(engine.credentials, &lane) {
+            Vec::new()
+        } else {
+            lane.ledger
+                .take_unpaid_within(hash, r_start, r_start.saturating_add(r_len))
+        };
+        // Where an owed span opens a gap: a leg there re-delivers bytes the
+        // store holds before it reaches a missing one.
+        let rebills: Vec<u64> = owed.iter().map(|&(start, _)| start).collect();
+        let gaps = crate::ledger::merge_spans(
+            missing_gaps
+                .into_iter()
+                .chain(owed)
+                .map(|(start, len)| (start, start.saturating_add(len)))
+                .collect(),
         );
         if gaps.is_empty() {
             let mut w = work.lock().await;
@@ -2457,6 +2549,9 @@ where
             parked_wake: &lane_parked_wake,
             unit: &unit,
         });
+        // The paid frontier of the gap the unit ended on, when a leg ended
+        // early: the remainder re-queues from there ([`requeue_from`]).
+        let mut owed_from: Option<u64> = None;
         for (g_start, g_len) in gaps {
             // A retired lane opens no new leg.
             if retired(engine.credentials, &lane) {
@@ -2465,7 +2560,12 @@ where
             piece_at = g_start;
             let verified = &unit.progress.verified;
             let before = verified.load(Ordering::Relaxed);
-            let outcome = {
+            // No anchor from an earlier gap: a cancel that drops `fill_gap`
+            // before its first pass prices this gap from its own start.
+            counters.leg_anchor = None;
+            // `dropped`: an arm other than `fill` ended the unit, so `fill_gap`
+            // stopped mid-leg and noted nothing.
+            let (outcome, dropped) = {
                 let fill = fill_gap(
                     store,
                     &lane.source,
@@ -2498,11 +2598,11 @@ where
                 tokio::select! {
                     biased;
                     res = fill => match res {
-                        Ok(()) => UnitOutcome::Completed,
+                        Ok(()) => (UnitOutcome::Completed, false),
                         // The loop classifies the fault once the lane ends.
-                        Err(e) => UnitOutcome::Faulted(Some(e)),
+                        Err(e) => (UnitOutcome::Faulted(Some(e)), false),
                     },
-                    () = cancelled(&handle) => UnitOutcome::Cancelled,
+                    () = cancelled(&handle) => (UnitOutcome::Cancelled, true),
                     // Parked on the consumer with an earlier range waiting: give
                     // this range back (it re-queues like a cancel) and take that
                     // one. Only under consumption pacing.
@@ -2514,17 +2614,17 @@ where
                         &lane_parked,
                         &lane_parked_wake,
                         progress_wake,
-                    ), if engine.pacing.is_some() => UnitOutcome::Cancelled,
+                    ), if engine.pacing.is_some() => (UnitOutcome::Cancelled, true),
                     // A watchdog trip carries no error by construction: the
                     // source simply stopped making verified progress. A store
                     // error while it checks is ours (#2213).
                     err = watchdog(store, g_start, g_len, engine.watchdog, verified) => {
-                        UnitOutcome::Faulted(err)
+                        (UnitOutcome::Faulted(err), true)
                     }
                     // Never ends: on a swap it lowers the unit's end, and the
                     // leg stops at its next voucher boundary.
                     () = retire_on_swap(engine.credentials, &lane, &unit, g_start) => {
-                        UnitOutcome::Cancelled
+                        (UnitOutcome::Cancelled, true)
                     }
                 }
             };
@@ -2544,6 +2644,28 @@ where
             match outcome {
                 UnitOutcome::Completed => {}
                 other => {
+                    let paid_from = if dropped {
+                        // The leg can have delivered verified bytes past its
+                        // paid frontier, inside the credit window. The lane
+                        // owes them, as when a fault ends the leg in `fill_gap`.
+                        let ended = ended_frontiers(
+                            store,
+                            &lane.ledger,
+                            g_start,
+                            g_start.saturating_add(g_len),
+                            counters.leg_anchor,
+                        )
+                        .await;
+                        if let Some((paid, delivered)) = ended {
+                            lane.ledger.note_unpaid(hash, paid, delivered);
+                        }
+                        ended.map(|(paid, _)| paid)
+                    } else {
+                        // `fill_gap` noted the span when a leg ended it.
+                        counters.gap_paid_frontier
+                    };
+                    owed_from = paid_from
+                        .filter(|&paid| requeues_from_paid(&other, &rebills, g_start, paid));
                     terminal = Some(other);
                     break;
                 }
@@ -2596,15 +2718,14 @@ where
                     work.lock().await.clear(i)?;
                 }
             }
-            // Cancelled: re-queue the remainder and stay live. The
-            // credit-window tail [paid_frontier, checkpointed_frontier) is NOT
-            // re-billed here: resume is checkpoint-frontier via `missing_ranges`,
-            // a bounded (<= credit window + INGEST_MAX_QUEUED_CHECKPOINTS + 1
-            // 4 MiB INGEST_CHECKPOINT_BYTES intervals: the dropped batch plus
-            // the checkpoints still queued), client-favorable gap identical to
-            // the single-source cross-invocation resume.
+            // Cancelled: re-queue the remainder and stay live. The lane owes the
+            // credit-window tail [paid_frontier, delivered_frontier) its leg
+            // left (noted above), so the remainder re-queues from the paid
+            // frontier, and the leg that takes it bills the tail. A retired lane
+            // cannot sign, so its remainder re-queues from the missing bytes.
             Some(UnitOutcome::Cancelled) => {
-                if let Some(Requeued { held, bytes }) = requeue_missing(store, work, i).await? {
+                let from = owed_from.filter(|_| !retired(engine.credentials, &lane));
+                if let Some(Requeued { held, bytes }) = requeue_from(store, work, i, from).await? {
                     tracing::debug!(
                         %provider,
                         held_start = held.0,
@@ -2614,10 +2735,12 @@ where
                     );
                 }
             }
-            // Stalled/faulted: re-queue the remainder and end the worker.
+            // Stalled/faulted: re-queue the remainder from the paid frontier, as
+            // for a cancel, and end the worker.
             Some(UnitOutcome::Faulted(err)) => {
                 let faulted_at = Instant::now();
-                requeue_missing(store, work, i).await?;
+                let from = owed_from.filter(|_| !retired(engine.credentials, &lane));
+                requeue_from(store, work, i, from).await?;
                 {
                     let mut w = work.lock().await;
                     if extra {

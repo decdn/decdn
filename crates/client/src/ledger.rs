@@ -530,11 +530,12 @@ pub struct PoolLedger {
     /// to another provider. A timed-out send is treated exactly like any other
     /// ambiguous send: the voucher stays armed and `settlement` settles high.
     send_deadline: Duration,
-    /// Content spans a lane delivered and did not pay for when it ended on a
-    /// funding refusal: `(hash, start, end)`. ADR 003's credit window lets the
-    /// node stream ahead of the voucher that pays for it, so the store can
-    /// hold these bytes while the lane owes them. When this lane runs again,
-    /// its next drive takes them and bills them again ([`Self::take_unpaid`]).
+    /// Content spans a lane delivered and did not pay for when a leg ended
+    /// early, on a funding refusal, a fault or a cancel: `(hash, start, end)`.
+    /// ADR 003's credit window lets the node stream ahead of the voucher that
+    /// pays for it, so the store can hold these bytes while the lane owes
+    /// them. When this lane runs again, its next drive takes them and bills
+    /// them again ([`Self::take_unpaid`]).
     /// They live only on this lane. A fetch that completes without this lane
     /// running again leaves them unpaid, and so does a replaced pool or a
     /// rotated key, which builds a new lane. An unpaid span is the node's
@@ -693,6 +694,31 @@ impl PoolLedger {
             .retain(|&(h, start, end)| {
                 if h == hash {
                     spans.push((start, end));
+                    false
+                } else {
+                    true
+                }
+            });
+        merge_spans(spans)
+    }
+
+    /// Take every span of `hash` this lane delivered and did not pay for that
+    /// lies inside `[start, end)`, as `(start, len)` in ascending order.
+    /// Overlapping or adjacent spans merge. A span that reaches outside the
+    /// range stays owed.
+    pub(crate) fn take_unpaid_within(
+        &self,
+        hash: [u8; 32],
+        start: u64,
+        end: u64,
+    ) -> Vec<(u64, u64)> {
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        self.unpaid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&(h, s, e)| {
+                if h == hash && s >= start && e <= end {
+                    spans.push((s, e));
                     false
                 } else {
                     true

@@ -8,6 +8,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+/// The `RUST_LOG` a journey sets on one `decdn` invocation whose stderr its
+/// money assertions print on failure. The paid-pull client at `debug` logs every
+/// leg, rejection, heal and resume behind a billed figure, so a load-dependent
+/// under-pay or double-pay arrives with the trail that produced it. Set it with
+/// `Command::env("RUST_LOG", CLIENT_DEBUG_LOG)` on that one invocation: it
+/// overrides the [`decdn_command`] default for that child alone.
+pub const CLIENT_DEBUG_LOG: &str = "info,decdn_client=debug";
+
 /// Assert the `decdn` CLI binary has been built, so a journey fails with an
 /// actionable message before it spends a minute launching anvil.
 ///
@@ -87,7 +95,8 @@ fn decdn_cli_bin() -> anyhow::Result<PathBuf> {
 /// goes through `Command::env` — never `set_var`, which the workspace forbids.
 ///
 /// `RUST_LOG` defaults to `warn`; raise it with `DECDN_NODE_LOG` when debugging
-/// (the same knob the daemon fixture reads).
+/// (the same knob the daemon fixture reads), or for one invocation with
+/// [`CLIENT_DEBUG_LOG`].
 ///
 /// Returns a [`std::process::Command`] so sync and async callers share one
 /// helper: `tokio::process::Command` is `From<std::process::Command>`, and

@@ -1212,6 +1212,23 @@ since project inception and will roll into the first tagged release.
   Cargo.lock resolves any of the seven to another version
   (`.github/scripts/check_iroh_hold.py` holds the table). The hold lifts once
   a noq release ports quinn#2814 (n0-computer/noq#828).
+- **Client: a stream that a lost connection, a stall or a cancel ends bills
+  its delivered tail when the lane resumes (#2718, #2722).** The node streams
+  up to one credit window ahead of the voucher that pays for it. Only a
+  funding refusal kept the delivered-but-unpaid span on the lane: any other
+  early end re-queued the missing bytes alone, and the next stream opened at
+  the delivered frontier, so the span was never billed. A QUIC connection
+  that closed mid-stream under load left about 2 MiB unpaid this way in
+  `cli_fetch_topup` and `cli_bundle_pull_range_dedup`. Now every early end
+  keeps the span owed, priced from the lane's settlement, so a voucher armed
+  when the connection dropped counts as paid. After a delivery fault or a
+  cancel, the missing bytes are queued again from the paid frontier, and one
+  stream bills the span and fetches the rest, so the proof path at the seam
+  is paid once. After a funding refusal, the span still bills in its own
+  stream first. A stream that re-bills a span and pays nothing past its start
+  queues the rest from the delivered frontier, so a source that keeps failing
+  at one point cannot stop progress. ADR 003 § Funding recovery states the
+  rule.
 - **Client: a streamed fetch with no size hint keeps the pull it opened for
   the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
   fast path, or a gateway pull whose size lookup finds none), the client read

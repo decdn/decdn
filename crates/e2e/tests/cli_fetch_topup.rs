@@ -39,7 +39,7 @@ use decdn_bao_range::align_range;
 use decdn_cache::Hash;
 use decdn_client::buyer_pool::{ensure_allowance, open_pool, top_up};
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
+use decdn_e2e::cli::{CLIENT_DEBUG_LOG, decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
@@ -848,18 +848,21 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     // lands the loop stops retrying.
     let partial = client_dir.path().join("blob.bin.partial");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let output = tokio::process::Command::from(decdn_command(
-            client_dir.path(),
-            TOPUP_KEYSTORE_PASSWORD,
-        )?)
+    // The delivering run's stderr, at `CLIENT_DEBUG_LOG`: every money assertion
+    // below prints it, so a load-dependent miss arrives with its leg trail.
+    let cli_stderr = loop {
+        let output = tokio::process::Command::from({
+            let mut cmd = decdn_command(client_dir.path(), TOPUP_KEYSTORE_PASSWORD)?;
+            cmd.env("RUST_LOG", CLIENT_DEBUG_LOG);
+            cmd
+        })
         .arg("get")
         .args(&args)
         .output()
         .await
         .context("spawn decdn get")?;
         if output.status.success() {
-            break;
+            break String::from_utf8_lossy(&output.stderr).into_owned();
         }
         // Retry ONLY the serve-path readiness race, and only before any byte lands.
         // The race surfaces as a `NotFound` — the node's collapsed pre-serve refusal
@@ -877,7 +880,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
              {progressed}): {stderr}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    };
 
     // Byte-exact delivery. A paid frontier that ever ran PAST the true one shows up
     // here: `set_len` would have zero-extended the partial over the skipped span,
@@ -930,12 +933,14 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         settled_amount >= wire_floor,
         "under-pay: settled {settled_amount} µUSDC, below the whole-blob WIRE cost of \
          {wire_floor} µUSDC. A paid frontier derived from a stale per-leg baseline \
-         overshoots the true one and skips billing exactly this way"
+         overshoots the true one and skips billing exactly this way. decdn get stderr:\n\
+         {cli_stderr}"
     );
     anyhow::ensure!(
         settled_amount <= ceiling,
         "double-pay: settled {settled_amount} µUSDC against a whole-blob WIRE cost of \
-         {wire_floor} µUSDC (ceiling {ceiling}); a re-paid chunk would add 1000"
+         {wire_floor} µUSDC (ceiling {ceiling}); a re-paid chunk would add 1000. decdn get \
+         stderr:\n{cli_stderr}"
     );
 
     // The buyer's local record mirrors the chain: whatever the escrow ended at —
