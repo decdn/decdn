@@ -292,11 +292,17 @@ impl ActivityRecorder {
         let kind = match uri.target {
             UriTarget::Blob => PullKind::Blob,
             UriTarget::BundleEntry(_) => PullKind::Entry,
-            _ => PullKind::Bundle {
+            UriTarget::Bundle => PullKind::Bundle {
                 files_started: 0,
                 files_landed: 0,
                 counts: None,
             },
+            // `UriTarget` is non-exhaustive; a target this arm does not know
+            // records bytes only, never a bundle's file progress.
+            _ => {
+                tracing::warn!("unknown URI target; recording a bytes-only (blob) run");
+                PullKind::Blob
+            }
         };
         let recorder = Arc::new(Self {
             path: dir.join(format!("{now}-{pid}.json")),
