@@ -1337,13 +1337,14 @@ async fn admin_rpc_refuses_a_foreign_host() -> anyhow::Result<()> {
 async fn admin_rpc_refuses_a_request_with_an_origin() -> anyhow::Result<()> {
     let (addr, stop_tx, join, _tmp) = spawn_plain_admin().await?;
 
-    let (status, _) = post_admin(
+    let (status, body) = post_admin(
         addr,
         HEALTH_CALL,
         &[(reqwest::header::ORIGIN, "http://evil.example".to_owned())],
     )
     .await?;
     assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    assert!(body.contains("Origin header"), "{body}");
     let (status, _) = post_admin(addr, HEALTH_CALL, &[]).await?;
     assert_eq!(status, reqwest::StatusCode::OK);
 

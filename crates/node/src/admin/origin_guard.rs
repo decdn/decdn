@@ -50,9 +50,24 @@ where
     fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
         if request.headers().contains_key(hyper::header::ORIGIN) {
             tracing::debug!("admin RPC: refused a request that carries an Origin header");
-            return Box::pin(async { Ok(response::denied()) });
+            return Box::pin(async { Ok(origin_refused()) });
         }
         let call = self.inner.call(request);
         Box::pin(async move { call.await.map_err(Into::into) })
     }
+}
+
+/// The `403` for a request that carries an `Origin` header, with a body that
+/// says why, so an operator whose tool adds the header can tell this refusal
+/// from a host-filter one.
+fn origin_refused() -> HttpResponse {
+    HttpResponse::builder()
+        .status(hyper::StatusCode::FORBIDDEN)
+        .header(hyper::header::CONTENT_TYPE, "text/plain")
+        .body(
+            "The admin RPC refuses requests that carry an Origin header \
+             (browser requests). Use the decdn CLI.\n"
+                .into(),
+        )
+        .unwrap_or_else(|_| response::denied())
 }

@@ -5255,13 +5255,14 @@ since project inception and will roll into the first tagged release.
 ### Security
 
 - **Node: a peer's own rate-limit bucket refuses it before the shared
-  global one is charged.** The three-layer limiter behind `cdn/probe/v1`,
-  `cdn/dht/v1` and `cdn/client/v1` charged the global bucket first, so a
+  global one is charged.** The three-layer limiter behind `cdn/probe/v1` and
+  `cdn/dht/v1` charged the global bucket first, so a
   request that the peer's own bucket then refused had already spent a global
   token. One `NodeId` flooding at the global rate drained the node-wide
   budget for every other requester, even though its own cap let only a small
   part of the flood through. The layers now fire per-peer → per-IP → global,
-  so a refused request spends no global token. A request that both its own
+  so a refused request spends no global token, and the new `cdn/client/v1`
+  limiter uses the same order. A request that both its own
   bucket and the global cap would refuse now counts on the `per_peer` (or
   `per_ip`) rejection counter instead of `global`. ADR 005 and ADR 022 state
   the order.
@@ -5284,8 +5285,8 @@ since project inception and will roll into the first tagged release.
 
 - **Node: inbound `cdn/client/v1` requests pass a three-layer rate limiter
   before they are read (#2694).** The only gates on `cdn/client/v1` were the
-  per-connection limiter and the stream cap. Every refusal past them signs a
-  response, and an origin-only node sent its backend a `HEAD` for each unseen
+  per-connection limiter and the stream cap. Most refusals after the request
+  is read sign a response, and an origin-only node sent its backend a `HEAD` for each unseen
   hash before any lane or payment check, so a flood of unpaid requests spent
   node CPU and origin requests without limit. A new `[serve.rate_limit]`
   section (per-peer 100/s burst 400, per-IP 200/s burst 800, global 2000/s
@@ -5345,8 +5346,8 @@ since project inception and will roll into the first tagged release.
   number admission reads, and falls back to the fold alone only when it holds
   no registered read for the signer.
 
-- **Node: racing first streams on a new lane no longer roll its stored voucher
-  frontier back (#2701).** `register_lane` recorded the fresh zero lane before
+- **Node: racing first streams on a new lane keep its stored voucher frontier
+  (#2701).** `register_lane` recorded the fresh zero lane before
   it claimed the lane's slot in the live map, so two first streams could both
   record it, and the second record could overwrite a voucher the first
   stream's lane had recorded in between. A restart in that window rehydrated

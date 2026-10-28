@@ -1,15 +1,18 @@
 //! Shared three-layer token-bucket rate limiter for per-request inbound
 //! traffic on authenticated QUIC handlers.
 //!
-//! This is the engine behind both the `cdn/dht/v1` limiter (ADR 022 §DHT
-//! Rate Limiting, via [`crate::dht::rate_limit::DhtRateLimiter`]) and the
+//! This is the engine behind the `cdn/dht/v1` limiter (ADR 022 §DHT Rate
+//! Limiting, via [`crate::dht::rate_limit::DhtRateLimiter`]), the
 //! `cdn/probe/v1` limiter (ADR 005 §Probe rate limiting, via
-//! [`crate::handlers::probe_rate_limit::ProbeRateLimiter`]). The two ADRs
-//! specify the identical three-layer shape — the differences are the default
+//! [`crate::handlers::probe_rate_limit::ProbeRateLimiter`]) and the
+//! `cdn/client/v1` limiter (ADR 005 §Request rate limiting, via
+//! [`crate::handlers::serve_rate_limit::ServeRateLimiter`]). The ADRs specify
+//! the identical three-layer shape — the differences are the default
 //! parameters, the operator-visible metric names, and that the DHT path
 //! additionally drives the engine's batch-token accounting
 //! ([`ThreeLayerRateLimiter::admit_batch_extra`]) while the probe path issues
-//! exactly one [`ThreeLayerRateLimiter::check`] per connection. So the
+//! exactly one [`ThreeLayerRateLimiter::check`] per connection and the serve
+//! path one per stream. So the
 //! mechanism lives here once and each path supplies its own
 //! [`RateLimitMetricsSink`].
 //!
@@ -36,7 +39,13 @@
 //! `DecdnMetrics::probe_hold_unavailable` and `DecdnMetrics::streams_active`
 //! both use. Each layer has an unrelated remedy, so no alert spans the family.
 //! Operators recover the rolled-up rate with
-//! `sum(rate({__name__=~"decdn_(probe|dht)_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
+//! `sum(rate({__name__=~"decdn_(probe|dht|serve)_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
+//!
+//! The trade-off of the narrowest-first order: a request the global cap
+//! refuses has still touched its peer's bucket, and its IP's bucket when the
+//! peer layer admitted it, so a flood of fresh `NodeId`s grows the keyed maps
+//! even while the global cap refuses it. `max_tracked_per_ip` /
+//! `max_tracked_per_peer` and the prune sweeps bound that growth.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -56,14 +65,13 @@ use crate::prune_guard::PruneGuard;
 ///
 /// A layer is disabled (its `Option<_>` limiter is `None`) when its quota is
 /// not buildable — see `make_quota`: that is `*_rate_per_sec <= 0.0`, a
-/// non-finite rate, **or** `*_burst == 0`. The intended operator opt-out sets
-/// **both** the rate to `0.0` and the burst to `0`; the config resolver
-/// (`resolve_{dht,probe}_into`) rejects the asymmetric `rate > 0, burst == 0`
-/// combination up front, so in production a layer is only ever disabled via the
-/// both-zero opt-out. A `RateLimitConfig` built directly (bypassing the
-/// resolver) with `rate > 0, burst == 0` will silently disable that layer
-/// rather than error — construct via the `From<&Resolved{Dht,Probe}>` impls or
-/// the resolver to keep that invariant.
+/// non-finite rate, **or** `*_burst == 0`. The config resolver
+/// (`resolve_{dht,probe,serve}_into`) rejects `rate > 0, burst == 0` as a
+/// deny-all, so in production a layer is disabled by a `0.0` rate, whatever its
+/// burst. A `RateLimitConfig` built directly (bypassing the resolver) with
+/// `rate > 0, burst == 0` will silently disable that layer rather than error —
+/// construct via the `From<&Resolved{Dht,Probe,Serve}>` impls or the resolver
+/// to keep that invariant.
 ///
 /// [`Default`] returns the ADR 022 DHT-layer values (the historical default of
 /// this struct). The probe path supplies its own ADR 005 defaults through the
@@ -514,7 +522,7 @@ impl ThreeLayerRateLimiter {
 /// silently no-op on freshly-accepted connections and an attacker churning
 /// identities could bypass the layer in that race window.
 ///
-/// Shared by [`crate::dispatch`], the DHT handler, and the probe handler so
+/// Shared by [`crate::dispatch`], the DHT, probe and client handlers so
 /// "the connection's source IP" means one thing across every rate-limit layer.
 pub(crate) fn peer_ip(conn: &Connection) -> Option<IpAddr> {
     // `paths()` returns a snapshot of the *currently open* paths (closed paths

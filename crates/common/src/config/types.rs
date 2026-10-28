@@ -1094,8 +1094,8 @@ pub struct DhtConfig {
 /// per-peer cap.
 ///
 /// Setting any `*_rate_per_sec` to `0.0` disables that layer (operator
-/// opt-out); the matching `*_burst` must also be `0` to avoid a deny-all
-/// configuration. The resolver enforces this pairing the same way
+/// opt-out), whatever its `*_burst`. A nonzero rate needs a nonzero burst: the
+/// resolver rejects `rate > 0, burst == 0` as a deny-all, the same way
 /// `security.per_source_rate_per_sec` / `per_source_burst` are paired.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1142,10 +1142,10 @@ pub struct ProbeConfig {
 /// Mirrors `[dht.rate_limit]` in shape; only the defaults differ (ADR 005
 /// specifies a tighter per-peer cap than ADR 022's DHT layer because a probe
 /// is unauthenticated and cheaper to flood). Setting any `*_rate_per_sec` to
-/// `0.0` disables that layer (operator opt-out); the matching `*_burst` must
-/// also be `0` to avoid a deny-all configuration — the resolver enforces this
-/// pairing, the same way `security.per_source_*` and `dht.rate_limit.*` are
-/// paired.
+/// `0.0` disables that layer (operator opt-out), whatever its `*_burst`. A
+/// nonzero rate needs a nonzero burst: the resolver rejects `rate > 0,
+/// burst == 0` as a deny-all, the same way `security.per_source_*` and
+/// `dht.rate_limit.*` are paired.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProbeRateLimitConfig {
@@ -1190,8 +1190,9 @@ pub struct ServeConfig {
 /// Mirrors `[probe.rate_limit]` in shape; only the defaults differ. One
 /// request is one stream, and an honest client opens many of them (one per
 /// pull leg, up to 100 at once on one connection), so the caps sit well above
-/// the probe ones. Setting any `*_rate_per_sec` to `0.0` disables that layer;
-/// the matching `*_burst` must also be `0` to avoid a deny-all configuration.
+/// the probe ones. Setting any `*_rate_per_sec` to `0.0` disables that layer,
+/// whatever its `*_burst`. A nonzero rate needs a nonzero burst: the resolver
+/// rejects `rate > 0, burst == 0` as a deny-all.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServeRateLimitConfig {

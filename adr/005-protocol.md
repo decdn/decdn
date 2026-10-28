@@ -233,7 +233,7 @@ On `cdn/client/v1` the node also holds a per-connection stream semaphore of 100 
 
 #### Request rate limiting
 
-`cdn/client/v1` inbound requests are subject to three layered token-bucket rate limits, with the same layers and the same narrowest-first order as [§ Probe rate limiting](#probe-rate-limiting). The node checks them once per stream, after the stream permit and **before** it reads the request. A stream that fails any layer is reset with `RATE_LIMITED` (`0x10`, [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)), and the node signs no response for it.
+The node limits inbound `cdn/client/v1` requests with three layered token buckets. The layers and their narrowest-first order are the same as in [§ Probe rate limiting](#probe-rate-limiting). The node checks them once per stream, after the stream permit and **before** it reads the request. A stream that fails any layer is reset with `RATE_LIMITED` (`0x10`, [ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)), and the node signs no response for it.
 
 | Layer | Default refill | Default burst | Scope |
 |---|---:|---:|---|
@@ -243,7 +243,7 @@ On `cdn/client/v1` the node also holds a per-connection stream semaphore of 100 
 
 Operators set the layers under `[serve.rate_limit]`. A rate of `0` turns a layer off.
 
-**Why the node limits unpaid requests.** A request costs the node work before any payment binds it. Every refusal past the stream permit carries a signed `StreamResponse`. An origin-only node sends its backend a `HEAD` for an unseen hash before it checks a lane or a payment. An unseen pool or signer costs a chain read. Without a limit, a peer can spend the node's signing capacity, origin requests and RPC quota on requests that never pay.
+**Why the node limits unpaid requests.** A request costs the node work before any payment binds it. Most refusals after the node reads the request carry a signed `StreamResponse`. An origin-only node sends its backend a `HEAD` for an unseen hash before it checks a lane or a payment. An unseen pool or signer costs a chain read. Without a limit, a peer can spend the node's signing capacity, origin requests and RPC quota on requests that never pay.
 
 **Why these defaults.** One request is one stream, and an honest client opens one stream per pull leg, with up to 100 at once on one connection ([§ Concurrent stream limits](#concurrent-stream-limits)). A node pulling on a cache miss shares one `NodeId` across all its pulls. The caps therefore sit well above the probe caps. `decdn-client` reads a `RATE_LIMITED` reset as back-off, not as a fault.
 

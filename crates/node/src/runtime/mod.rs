@@ -90,9 +90,10 @@ const EGRESS_EWMA_INTERVAL: Duration = Duration::from_secs(1);
 /// the other along.
 const DHT_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 
-/// Interval between periodic GC sweeps of the probe rate-limiter's per-IP and
-/// per-peer keyed maps (#645, #982). Matches `DHT_RATE_LIMIT_GC_INTERVAL` — the
-/// probe and DHT keyed limiters share the same keyspace-cleanup mental model.
+/// Interval between periodic GC sweeps of the probe and serve rate-limiters'
+/// per-IP and per-peer keyed maps (#645, #982). Matches
+/// `DHT_RATE_LIMIT_GC_INTERVAL` — the keyed limiters share the same
+/// keyspace-cleanup mental model.
 /// Separate constant so a future tune to one limiter doesn't drag the other.
 const PROBE_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 
@@ -385,7 +386,7 @@ fn warn_if_pins_exceed_cache(cache: &decdn_cache::CacheEngine, cache_size_mb: u6
 }
 
 /// Emit one `debug` line for a keyed rate-limiter GC sweep that pruned buckets.
-/// Shared by the DHT and probe rate-limiter GC ticks, whose per-layer
+/// Shared by the DHT, probe and serve rate-limiter GC ticks, whose per-layer
 /// (`per_ip` / `per_peer`) log arms are otherwise byte-identical.
 fn log_keyspace_gc(kind: &'static str, layer: &'static str, sweep: Option<(usize, usize)>) {
     if let Some((before, after)) = sweep {
@@ -1395,7 +1396,7 @@ async fn build_chain_and_handlers(
     // (a pool opened before the watcher's `ColdStart::Head` anchor), does ONE
     // `getPool` to confirm the pool is live and solvent before a serve is admitted
     // — folding a servable pool into the projection and refusing an absent/closed/
-    // errored one. The mid-stream re-check reads the projection only.
+    // errored one. The mid-stream pool re-check reads the projection only.
     let resolving_pool_view = crate::payment_settlement::ResolvingPoolView::new(
         decdn_incentive::payment_pool::PaymentPool::new(payment_pool_addr, wallet_provider.clone()),
         pool_view.clone(),
