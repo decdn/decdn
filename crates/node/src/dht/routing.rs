@@ -12,16 +12,27 @@
 //! cause iterative lookup to terminate on its own routing table without ever
 //! contacting the network.
 //!
+//! # Bonded peers only
+//!
+//! ADR 022 restricts the routing pool to bonded operators. Every production
+//! write goes through [`RoutingTable::insert_active`], which refuses a peer
+//! the staker set does not hold, and every production read that names peers
+//! to dial or to answer with goes through [`RoutingTable::closest_active`] or
+//! [`RoutingTable::closest_active_unbounded`], which skip an entry that has
+//! unbonded since it was inserted. A `NodeId` costs nothing, so an unchecked
+//! write would let a stream of fresh ids displace every bonded entry.
+//!
 //! # Eviction policy
 //!
-//! On bucket overflow the least-recently-seen entry is evicted and the
-//! new `NodeId` appended at the tail. Standard Kademlia would ping the
-//! LRU first and evict only if it does not respond; ADR 022 §Routing
-//! Table does not mandate the ping-then-evict variant and we do not
-//! implement it. The simpler LRU here preserves the "newcomers are
-//! reachable" property — the LRU is the one least recently confirmed to
-//! be live, so evicting it is the safest bet among entries already in
-//! the bucket.
+//! On bucket overflow [`RoutingTable::insert_active`] evicts the
+//! least-recently-seen entry that has unbonded or whose dial is cooling, and
+//! otherwise the least-recently-seen entry, and appends the new `NodeId` at
+//! the tail. Standard Kademlia would ping the LRU first and evict only if it
+//! does not respond; ADR 022 §Routing Table does not mandate the
+//! ping-then-evict variant and we do not implement it. Only a bonded peer can
+//! enter, so a newcomer that displaces an entry costs its operator a bond.
+//! The LRU is the entry least recently confirmed to be live, so evicting it
+//! is the safest bet among entries already in the bucket.
 //!
 //! # Unreachable peers
 //!
@@ -43,6 +54,8 @@ use std::time::{Duration, Instant};
 
 use decdn_protocol::MAX_CLOSER_NODES;
 pub use decdn_protocol::NodeId;
+
+use super::StakerSet;
 
 /// How long this node's lookups skip a peer after a dial of it timed out. Long
 /// enough that a dead bonded peer costs about one dial budget per node per
@@ -187,6 +200,42 @@ impl RoutingTable {
     /// An insert or a refresh ends the peer's dial-failure skip: the table has
     /// a fresh reason to hold the peer.
     pub fn insert(&mut self, peer: NodeId) -> bool {
+        self.insert_evicting(peer, 0)
+    }
+
+    /// Insert `peer` if `stakers` holds it as an active bonded operator, as
+    /// [`Self::insert`] does; refuse it otherwise and return `false`.
+    ///
+    /// On bucket overflow, evict the least-recently-seen entry that `stakers`
+    /// no longer holds or whose dial is cooling at `now`, and otherwise the
+    /// least-recently-seen entry. Every production write uses this method; see
+    /// the module docs.
+    pub fn insert_active(&mut self, peer: NodeId, stakers: &dyn StakerSet, now: Instant) -> bool {
+        if !stakers.is_active(&peer) {
+            return false;
+        }
+        let victim = self
+            .bucket_of(&peer)
+            .and_then(|bucket| {
+                bucket
+                    .iter()
+                    .position(|p| !stakers.is_active(p) || self.is_cooling(p, now))
+            })
+            .unwrap_or(0);
+        self.insert_evicting(peer, victim)
+    }
+
+    /// The bucket `peer` belongs in, or `None` for this node's own id.
+    fn bucket_of(&self, peer: &NodeId) -> Option<&Vec<NodeId>> {
+        if *peer == self.self_id {
+            return None;
+        }
+        bucket_index(&xor_distance(&self.self_id, peer)).and_then(|idx| self.buckets.get(idx))
+    }
+
+    /// [`Self::insert`], evicting the entry at position `victim` of a full
+    /// bucket, or the least-recently-seen entry when `victim` is out of range.
+    fn insert_evicting(&mut self, peer: NodeId, victim: usize) -> bool {
         if peer == self.self_id {
             return false;
         }
@@ -206,8 +255,7 @@ impl RoutingTable {
             return false;
         }
         if bucket.len() >= K_BUCKET_SIZE {
-            // Evict least-recently-seen.
-            bucket.remove(0);
+            bucket.remove(if victim < bucket.len() { victim } else { 0 });
         }
         bucket.push(peer);
         true
@@ -312,6 +360,41 @@ impl RoutingTable {
     /// ADR 022 wire-cost ceiling. Use [`Self::closest`] for that path.
     #[must_use]
     pub fn closest_unbounded(&self, target: &[u8; NODE_ID_LEN], n: usize) -> Vec<NodeId> {
+        self.closest_where(target, n, |_| true)
+    }
+
+    /// Like [`Self::closest`], counting only the entries `stakers` holds as
+    /// active bonded operators. Serves the wire `closer_nodes` answers.
+    #[must_use]
+    pub fn closest_active(
+        &self,
+        target: &[u8; NODE_ID_LEN],
+        n: usize,
+        stakers: &dyn StakerSet,
+    ) -> Vec<NodeId> {
+        self.closest_active_unbounded(target, n.min(K_BUCKET_SIZE), stakers)
+    }
+
+    /// Like [`Self::closest_unbounded`], counting only the entries `stakers`
+    /// holds as active bonded operators. Serves the lookup seed and the
+    /// republish fan-out, never a wire answer.
+    #[must_use]
+    pub fn closest_active_unbounded(
+        &self,
+        target: &[u8; NODE_ID_LEN],
+        n: usize,
+        stakers: &dyn StakerSet,
+    ) -> Vec<NodeId> {
+        self.closest_where(target, n, |p| stakers.is_active(p))
+    }
+
+    /// Up to `n` entries that `keep` accepts, closest to `target` first.
+    fn closest_where(
+        &self,
+        target: &[u8; NODE_ID_LEN],
+        n: usize,
+        keep: impl Fn(&NodeId) -> bool,
+    ) -> Vec<NodeId> {
         // Schwartzian transform: compute `xor_distance_bytes` exactly once per
         // candidate, then sort on the cached distance. `sort_unstable_by_key`
         // does NOT cache its key (that is what `sort_by_cached_key` is for), so
@@ -322,6 +405,7 @@ impl RoutingTable {
             .buckets
             .iter()
             .flatten()
+            .filter(|p| keep(p))
             .map(|p| (*p, xor_distance_bytes(p.as_bytes(), target)))
             .collect();
         // Sorting on the already-computed distance only re-copies the cached

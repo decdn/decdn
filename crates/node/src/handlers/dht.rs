@@ -28,7 +28,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use decdn_protocol::{
     ALPN_DHT, APP_ERR_RATE_LIMITED, FrameError, MAX_CLOSER_NODES, decode_message, dht as wire,
@@ -375,8 +375,11 @@ impl DhtHandler {
         // line per panic, not one per admitted request). A silent skip here
         // would drop every learned peer for the process lifetime after a
         // single panic elsewhere.
+        // Only a bonded peer enters the table (ADR 022 §Lookup integrity): a
+        // NodeId costs nothing, so admitting every inbound peer would let a
+        // stream of fresh ids displace the bonded entries.
         with_lock(&self.routing, "dht routing table", |table| {
-            table.insert(peer.node_id());
+            table.insert_active(peer.node_id(), self.staker_set.as_ref(), Instant::now());
         });
     }
 
@@ -726,8 +729,8 @@ impl DhtHandler {
         }
     }
 
-    /// The up-to-`MAX_CLOSER_NODES` routing-table peers closest to `target` in
-    /// XOR keyspace, ready to drop into a wire `closer_nodes` field. `target`
+    /// The up-to-`MAX_CLOSER_NODES` bonded routing-table peers closest to
+    /// `target` in XOR keyspace, ready to drop into a wire `closer_nodes` field. `target`
     /// is a raw keyspace point so both a `NodeId` (`FindNode`) and a
     /// `ContentHash` (`FindValue`) fit.
     fn closest_to(&self, target: &[u8; 32]) -> wire::CloserNodes {
@@ -737,10 +740,16 @@ impl DhtHandler {
         // while the republisher (which recovers) keeps working — a node that
         // looks healthy and answers every lookup with nothing.
         with_lock(&self.routing, "dht routing table", |table| {
-            // `closest` already caps at `K_BUCKET_SIZE == MAX_CLOSER_NODES`, so the
-            // `CloserNodes` invariant always holds; `unwrap_or_default` is a
-            // belt-and-braces fallback that can't actually fire.
-            wire::CloserNodes::try_new(table.closest(target, MAX_CLOSER_NODES)).unwrap_or_default()
+            // `closest_active` already caps at `K_BUCKET_SIZE == MAX_CLOSER_NODES`,
+            // so the `CloserNodes` invariant always holds; `unwrap_or_default` is
+            // a belt-and-braces fallback that can't actually fire. It skips an
+            // entry that unbonded after it entered the table.
+            wire::CloserNodes::try_new(table.closest_active(
+                target,
+                MAX_CLOSER_NODES,
+                self.staker_set.as_ref(),
+            ))
+            .unwrap_or_default()
         })
     }
 }

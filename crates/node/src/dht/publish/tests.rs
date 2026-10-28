@@ -1,4 +1,5 @@
 use super::*;
+use crate::dht::staker_set::AllStaked;
 
 fn h(b: u8) -> ContentHash {
     ContentHash::from_bytes([b; 32])
@@ -32,7 +33,7 @@ fn a_planned_cycle_groups_every_hash_under_each_of_its_closest_peers() {
     let now: u64 = 1_000_000_000;
     place(&s, h(0xA0), now);
     place(&s, h(0xB0), now + 1);
-    let (drained, budget) = plan_cycle(&s, &routing, now, &mut None);
+    let (drained, budget) = plan_cycle(&s, &routing, &AllStaked, now, &mut None);
     assert_eq!(drained, vec![h(0xA0), h(0xB0)]);
     let groups = budget.into_groups(&drained.iter().copied().collect());
     assert_eq!(
@@ -58,7 +59,7 @@ fn a_planned_cycle_on_an_empty_table_groups_nothing() {
     let now: u64 = 1_000_000_000;
     place(&s, h(0xA0), now);
     place(&s, h(0xB0), now + 1);
-    let (drained, budget) = plan_cycle(&s, &routing, now, &mut None);
+    let (drained, budget) = plan_cycle(&s, &routing, &AllStaked, now, &mut None);
     assert_eq!(drained, vec![h(0xA0)]);
     assert!(
         budget
@@ -76,7 +77,7 @@ fn a_planned_cycle_reaches_exactly_the_lookahead_window() {
     place(&s, h(1), now);
     place(&s, h(2), now + window - 1);
     place(&s, h(3), now + window + 1);
-    let (drained, _) = plan_cycle(&s, &routing, now, &mut None);
+    let (drained, _) = plan_cycle(&s, &routing, &AllStaked, now, &mut None);
     assert_eq!(drained, vec![h(1), h(2)]);
     assert_eq!(s.len(), 1, "the record past the window stays scheduled");
 }
@@ -99,18 +100,18 @@ fn a_planned_cycle_takes_no_lookahead_right_after_another_cycle() {
     place(&s, h(5), t3 + 11);
     let mut last = Some(t0 - 1);
     assert_eq!(
-        plan_cycle(&s, &routing, t0, &mut last).0,
+        plan_cycle(&s, &routing, &AllStaked, t0, &mut last).0,
         vec![h(1)],
         "a cycle 1 µs after the last one takes only its due record"
     );
     assert_eq!(last, Some(t0), "a non-empty cycle moves the mark");
     assert_eq!(
-        plan_cycle(&s, &routing, t0 + 1_000_000, &mut last).0,
+        plan_cycle(&s, &routing, &AllStaked, t0 + 1_000_000, &mut last).0,
         vec![h(2)],
         "1 s later: still too close, due records only"
     );
     assert_eq!(
-        plan_cycle(&s, &routing, t3, &mut last).0,
+        plan_cycle(&s, &routing, &AllStaked, t3, &mut last).0,
         vec![h(3), h(4), h(5)],
         "a full spacing later the look-ahead runs again"
     );

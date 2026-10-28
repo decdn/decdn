@@ -5254,6 +5254,17 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: the DHT routing table admits bonded peers only (#2708).** ADR 022
+  restricts the routing pool to bonded operators, but the table admitted every
+  peer that contacted the node and every id a `closer_nodes` answer named, and
+  a full bucket evicted its oldest entry unconditionally. Free NodeIds could
+  therefore push out the bonded entries, so publish fan-out and lookup seeds
+  went to non-participants, and discovery fell back to the on-chain origin
+  directory. Every routing-table insert now checks the active staker set. The
+  `FindNode` / `FindValue` answers, lookup seeds and publish fan-out skip an
+  entry that has unbonded since it entered. A full bucket evicts an unbonded
+  or dial-cooling entry before the least-recently-seen bonded one.
+
 - **Node: the admin JSON-RPC server refuses requests a web page can send
   (#2690).** It answered any request on its loopback port. A page that the
   operator opened could reach that port through DNS rebinding and call

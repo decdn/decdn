@@ -103,3 +103,20 @@ impl StakerSet for ConfigStakerSet {
     clippy::indexing_slicing
 )]
 mod tests;
+
+/// A staker set that holds every id, for unit tests that read the whole
+/// routing table.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct AllStaked;
+
+#[cfg(test)]
+impl StakerSet for AllStaked {
+    fn is_active(&self, _: &NodeId) -> bool {
+        true
+    }
+
+    fn active_nodes(&self) -> Vec<NodeId> {
+        Vec::new()
+    }
+}

@@ -136,7 +136,15 @@ impl TestServer {
 /// table + empty record store. Tests can mutate `routing` and
 /// `records` via the returned handle.
 async fn spin_up_server(staked: HashSet<[u8; 32]>) -> anyhow::Result<TestServer> {
-    let secret = fresh_key();
+    spin_up_server_with_key(fresh_key(), staked).await
+}
+
+/// [`spin_up_server`] under the identity `secret`, so a test can stake a
+/// server's id at other servers before it starts.
+async fn spin_up_server_with_key(
+    secret: iroh::SecretKey,
+    staked: HashSet<[u8; 32]>,
+) -> anyhow::Result<TestServer> {
     let id = secret.public();
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -479,9 +487,12 @@ async fn find_providers_stops_at_the_round_ceiling_even_while_still_finding_clos
     // Six servers, then SORTED by distance to the target — so the chain is strictly
     // converging without having to grind keys for it. Six because the ceiling is four: the
     // walk must want more rounds than it is allowed.
+    // Every server holds every chain id as bonded, so each one names the next.
+    let keys: Vec<iroh::SecretKey> = (0..6).map(|_| fresh_key()).collect();
+    let chain: HashSet<[u8; 32]> = keys.iter().map(|k| *k.public().as_bytes()).collect();
     let mut servers = Vec::new();
-    for _ in 0..6 {
-        servers.push(spin_up_server(HashSet::new()).await?);
+    for key in keys {
+        servers.push(spin_up_server_with_key(key, chain.clone()).await?);
     }
     // Fixed-size from here on: teardown hands `shutdown` a `[_; 6]` of accept
     // tasks and a `[_; 7]` of endpoints, and an array carries those lengths
