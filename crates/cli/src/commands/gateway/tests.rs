@@ -970,17 +970,25 @@ const CLICK: &[(&str, &str)] = &[
 const PAGE: [u8; 32] = [0xe1; 32];
 const STYLE: [u8; 32] = [0xe2; 32];
 const DOCS: [u8; 32] = [0xe3; 32];
+const FEED: [u8; 32] = [0xec; 32];
+const EMPTY_FEED: [u8; 32] = [0xed; 32];
 const OTHER: [u8; 32] = [0xcd; 32];
 
+/// An RSS document that runs a script if a browser renders it as XML.
+const RSS: &str = "<rss version=\"2.0\"><script xmlns=\"http://www.w3.org/1999/xhtml\">\
+                   alert(1)</script></rss>";
+
 /// A gateway serving [`BLOB`] as a site bundle with `index.html`,
-/// `css/site.css` and `docs/index.html`, the blob [`OTHER`], and the host of
-/// that site.
+/// `css/site.css`, `docs/index.html`, `feed.rss` and the empty `empty.rss`,
+/// the blob [`OTHER`], and the host of that site.
 async fn site_gateway() -> (Arc<Gateway>, String) {
     let other = alloy::hex::encode(OTHER);
     let manifest = serde_json::json!({"version": 1, "entries": [
         {"path": "index.html", "hash": alloy::hex::encode(PAGE)},
         {"path": "css/site.css", "hash": alloy::hex::encode(STYLE)},
         {"path": "docs/index.html", "hash": alloy::hex::encode(DOCS)},
+        {"path": "feed.rss", "hash": alloy::hex::encode(FEED)},
+        {"path": "empty.rss", "hash": alloy::hex::encode(EMPTY_FEED), "size": 0},
     ]});
     let page = format!(
         "<!doctype html><link rel=stylesheet href=\"css/site.css\">\
@@ -994,6 +1002,7 @@ async fn site_gateway() -> (Arc<Gateway>, String) {
             Reply::Bytes(format!("a {{ background: url(decdn:{other}) }}").into_bytes()),
         ),
         (DOCS, Reply::Bytes(b"<p>docs</p>".to_vec())),
+        (FEED, Reply::Bytes(RSS.as_bytes().to_vec())),
         (OTHER, Reply::Bytes(b"other bytes".to_vec())),
     ]);
     let (gateway, _) = recording_gateway_of(replies, &[]).await;
@@ -1097,6 +1106,8 @@ async fn decdn_paths_serve_a_pages_requests_and_redirect_its_navigation() {
             .unwrap()
             .starts_with("attachment"),
     );
+    let policy = download.header(header::CONTENT_SECURITY_POLICY).unwrap();
+    assert!(policy.starts_with("default-src 'self'"), "{policy}");
 }
 
 #[tokio::test]
@@ -1209,16 +1220,67 @@ async fn the_bare_origin_still_serves_markup_as_text() {
         response.headers()[header::CONTENT_TYPE],
         "text/plain; charset=utf-8"
     );
-    assert!(
-        !response
-            .headers()
-            .contains_key(header::CONTENT_SECURITY_POLICY)
+    assert_eq!(
+        response.headers()[header::CONTENT_SECURITY_POLICY],
+        "sandbox"
     );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert!(
         String::from_utf8_lossy(&body).contains("decdn:"),
         "not rewritten"
     );
+}
+
+/// An `.rss` entry on the bare origin is neutralised to plain text and
+/// sandboxed, streamed or empty: a browser renders any `+xml` type as an XML
+/// document, so an XHTML-namespaced script inside one would otherwise run on
+/// the gateway's origin.
+#[tokio::test]
+async fn the_bare_origin_neutralises_and_sandboxes_an_rss_entry() {
+    let (gateway, _) = site_gateway().await;
+    let blob = alloy::hex::encode(BLOB);
+    let token = &[(TOKEN_HEADER, TEST_TOKEN), (HOST_HEADER, "decdn.org")];
+    for (path, body) in [("feed.rss", RSS), ("empty.rss", "")] {
+        let answer = request(
+            &gateway,
+            "127.0.0.1:8484",
+            &format!("/{blob}/{path}"),
+            token,
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "{path}");
+        assert_eq!(
+            answer.header(header::CONTENT_TYPE),
+            Some("text/plain; charset=utf-8"),
+            "{path}"
+        );
+        assert_eq!(
+            answer.header(header::CONTENT_SECURITY_POLICY),
+            Some("sandbox"),
+            "{path}"
+        );
+        assert_eq!(answer.body, body, "{path} not rewritten");
+    }
+}
+
+#[test]
+fn is_active_type_matches_the_xml_suffix_only() {
+    for active in [
+        "application/xml",
+        "application/rss+xml",
+        "image/svg+xml",
+        "application/javascript",
+    ] {
+        assert!(is_active_type(active), "{active}");
+    }
+    for passive in [
+        "application/epub+zip",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/pdf",
+        "image/png",
+    ] {
+        assert!(!is_active_type(passive), "{passive}");
+    }
 }
 
 #[test]
@@ -1342,6 +1404,11 @@ fn content_type_by_extension_and_markup_as_text() {
         "page.xhtml",
         "logo.svg",
         "feed.xml",
+        "feed.rss",
+        "a.atom",
+        "m.rdf",
+        "m.mathml",
+        "g.kml",
         "app.js",
         "app.mjs",
         "notes.txt",
@@ -1904,6 +1971,7 @@ async fn the_public_bare_host_redirects_bundles_and_streams_blobs() {
         (raw.status, raw.body.as_str()),
         (StatusCode::OK, "other bytes")
     );
+    assert_eq!(raw.header(header::CONTENT_SECURITY_POLICY), Some("sandbox"));
 }
 
 /// A public gateway answers `HEAD` from the bundle manifest: the entry's
@@ -1959,6 +2027,7 @@ async fn a_public_head_is_answered_from_the_manifest() {
         None,
         "a size no proof proved gives no length"
     );
+    assert_eq!(raw.header(header::CONTENT_SECURITY_POLICY), Some("sandbox"));
     assert_eq!(*logs.proofs.lock().unwrap(), [OTHER]);
     assert_eq!(
         logs.caps.lock().unwrap().len(),
