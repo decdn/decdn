@@ -1038,6 +1038,22 @@ impl BlobSource for FaultingOpens {
 /// signed by `ctx`'s own key, for a voucher signed under `proof_generation`.
 fn underpaid(
     ctx: &PoolContext,
+    watermark: (u64, u64),
+    proof_generation: Option<u64>,
+) -> anyhow::Error {
+    rejected_with_bundle(
+        VoucherRejectReason::Underpaid,
+        ctx,
+        watermark,
+        proof_generation,
+    )
+}
+
+/// A `reason` rejection carrying the node's watermark `(amount, bytes)`,
+/// signed by `ctx`'s own key, for a voucher signed under `proof_generation`.
+fn rejected_with_bundle(
+    reason: VoucherRejectReason,
+    ctx: &PoolContext,
     (amount, bytes): (u64, u64),
     proof_generation: Option<u64>,
 ) -> anyhow::Error {
@@ -1053,7 +1069,7 @@ fn underpaid(
     .sign(&ctx.client_signer, &ctx.voucher_domain)
     .expect("sign the node's watermark");
     anyhow::Error::new(UpstreamVoucherRejected {
-        reason: VoucherRejectReason::Underpaid,
+        reason,
         bundle: Some(decdn_protocol::client::WatermarkBundle {
             amount,
             bytes_delivered: bytes,
@@ -2841,6 +2857,190 @@ async fn the_same_lane_bills_its_owed_tail_after_a_funding_refusal() {
     assert!(
         ledger.committed().bytes >= U256::from(total),
         "the lane paid for every byte it delivered"
+    );
+}
+
+/// A blob of six groups that a funding stop has left partly delivered and
+/// unpaid on `ledger`, then driven again on the same lane through `faults`,
+/// one per open, with the lane's deposit raised. Returns the source (whose
+/// `opened_ranges` lists the real opens, the faulting ones excluded), the
+/// delivered frontier the funding stop left, and the whole blob's wire size.
+async fn resume_after_a_funding_stop(
+    ledger: &Arc<PoolLedger>,
+    faults: impl FnOnce(&PoolContext, u64) -> Vec<anyhow::Error>,
+) -> (ScriptedSource, u64, u64) {
+    let total = 6 * GROUP;
+    let (root, plaintext, _outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let source = delivers_then_rejects_funding(plaintext, ledger);
+
+    let err = drive_whole(&store, &source, ledger, root)
+        .await
+        .expect_err("the funding rejection ends the lane");
+    assert_eq!(crate::classify(&err), crate::Fault::Unaffordable, "{err:#}");
+    let missing = store.missing_ranges(0, 0).await.expect("missing");
+    let delivered = contiguous_byte_ranges(&missing, total)
+        .first()
+        .map_or(total, |&(start, _)| start);
+    assert!(
+        delivered > GROUP,
+        "the credit window delivered more than the group the node will hold vouchers for"
+    );
+
+    let one_group_wire = align_range(0, GROUP, total).expect("align").wire_len();
+    let ctx = healthy_ctx();
+    let faulting = FaultingOpens::new(source.clone(), faults(&ctx, one_group_wire));
+    drive(
+        &store,
+        &faulting,
+        &BudgetPacer::new(),
+        &Arc::new(Mutex::new(ctx)),
+        ledger,
+        root,
+        0,
+        0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("the healed lane completes the fetch");
+    assert!(store.is_complete().await.expect("is_complete"));
+    let whole_wire = align_range(0, 0, total).expect("align").wire_len();
+    (source, delivered, whole_wire)
+}
+
+/// An `AmountRegression` whose bundle states the node's watermark `bytes`,
+/// signed by `ctx`'s own key: the node holds vouchers our ledger lost.
+fn node_holds(ctx: &PoolContext, bytes: u64) -> anyhow::Error {
+    rejected_with_bundle(VoucherRejectReason::AmountRegression, ctx, (1, bytes), None)
+}
+
+/// A reseed moves the ledger up to vouchers the node holds and our record
+/// lost, and nothing ties them to this leg's content. A funding stop leaves
+/// delivered bytes unpaid. When the resumed lane's first open draws an
+/// `AmountRegression` whose bundle states a watermark one group in, the jump
+/// pays for none of the delivered tail: the next leg opens at the leg's start
+/// and bills the whole blob. Counting the jump as this leg's payment, or
+/// treating the delivered frontier as paid, would skip billing it (#2629).
+#[tokio::test(start_paused = true)]
+async fn a_reseed_does_not_mark_the_delivered_tail_paid() {
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let (source, _delivered, whole_wire) =
+        resume_after_a_funding_stop(&ledger, |ctx, wire| vec![node_holds(ctx, wire)]).await;
+
+    let opened = source.opened_ranges();
+    assert_eq!(
+        opened.get(1).map(|&(start, _)| start),
+        Some(0),
+        "the leg after the reseed opens at its own start: {opened:?}"
+    );
+    assert!(
+        ledger.committed().bytes >= U256::from(whole_wire),
+        "the lane paid for every wire byte of the blob: {:?} < {whole_wire}",
+        ledger.committed()
+    );
+}
+
+/// A stale heal moves no watermark, so it says nothing about the delivered
+/// tail either. Here a second `AmountRegression` at the bundle the ledger
+/// already reached heals stale, and the next leg still opens at the leg's
+/// start rather than the delivered frontier.
+#[tokio::test(start_paused = true)]
+async fn a_stale_heal_does_not_mark_the_delivered_tail_paid() {
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let (source, _delivered, whole_wire) = resume_after_a_funding_stop(&ledger, |ctx, wire| {
+        vec![node_holds(ctx, wire), node_holds(ctx, wire)]
+    })
+    .await;
+
+    let opened = source.opened_ranges();
+    assert_eq!(
+        opened.get(1).map(|&(start, _)| start),
+        Some(0),
+        "the leg after the stale heal opens at its own start: {opened:?}"
+    );
+    assert!(
+        ledger.committed().bytes >= U256::from(whole_wire),
+        "the lane paid for every wire byte of the blob: {:?} < {whole_wire}",
+        ledger.committed()
+    );
+}
+
+/// A restarted payer whose store trails the node's watermark from earlier
+/// blobs. A small blob delivers all but its last byte inside the credit
+/// window, unpaid, and only then does the leg draw an `AmountRegression` whose
+/// bundle states that far larger, older watermark. The reseed's jump pays for
+/// none of this blob, so the drive re-opens it from the start and pays for it
+/// above the node's watermark. Counting the jump as this leg's payment would
+/// mark the delivered bytes paid and bill only the rest.
+#[tokio::test(start_paused = true)]
+async fn a_reseed_to_an_older_watermark_pays_for_the_delivered_bytes() {
+    let total = 2 * GROUP;
+    let (root, plaintext, _outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let whole_wire = align_range(0, 0, total).expect("align").wire_len();
+    let history = 100 * whole_wire;
+    let ctx = healthy_ctx();
+    let rejecting = ctx.clone();
+    let source = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&ledger))
+        .fault_once_after(whole_wire as usize - 1, move || {
+            node_holds(&rejecting, history)
+        });
+
+    drive(
+        &store,
+        &source,
+        &BudgetPacer::new(),
+        &Arc::new(Mutex::new(ctx)),
+        &ledger,
+        root,
+        0,
+        0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("the reseeded lane completes the fetch");
+    assert!(store.is_complete().await.expect("is_complete"));
+
+    let opened = source.opened_ranges();
+    assert_eq!(
+        opened.iter().map(|&(start, _)| start).collect::<Vec<_>>(),
+        vec![0, 0],
+        "the blob is opened again from its start after the reseed: {opened:?}"
+    );
+    assert!(
+        ledger.committed().bytes >= U256::from(history + whole_wire),
+        "the lane paid for the blob above the node's watermark: {:?}",
+        ledger.committed()
+    );
+}
+
+/// A rebase moves the ledger down to the node's watermark: the node took none
+/// of the vouchers above it. The leg re-anchors at the delivered frontier, so
+/// the next leg opens there and does not re-deliver and re-pay the span the
+/// node already chose to stop at.
+#[tokio::test(start_paused = true)]
+async fn a_rebase_resumes_at_the_delivered_frontier() {
+    let ledger = ledger_ahead_of_the_node();
+    let (source, delivered, _whole_wire) = resume_after_a_funding_stop(&ledger, |ctx, _wire| {
+        vec![underpaid(ctx, (60, 5_000), Some(0))]
+    })
+    .await;
+
+    assert_eq!(ledger.generation(), 1, "the ledger rebased down once");
+    let opened = source.opened_ranges();
+    assert_eq!(
+        opened.get(1).map(|&(start, _)| start),
+        Some(delivered),
+        "the leg after the rebase opens at the delivered frontier: {opened:?}"
     );
 }
 

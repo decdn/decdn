@@ -1348,3 +1348,93 @@ fn a_mid_stream_refusal_never_carries_a_response() {
         "the mid-stream wire code must survive unchanged"
     );
 }
+
+/// A ledger that has anchored a chain and released two reveals on it, plus a
+/// meter naming the second reveal as the last proof THIS stream sent.
+async fn ledger_with_a_released_reveal() -> anyhow::Result<(PoolLedger, super::StreamMeter)> {
+    use super::{EpochAction, Metered, StreamProof};
+
+    let ledger = PoolLedger::new(Cumulative::default());
+    ledger
+        .issue(1_000, 10, EpochAction::Open, |_n, _c| async { Ok(()) })
+        .await?;
+    ledger
+        .meter(ledger.chain_root(), |_r| async { Ok(()) })
+        .await?;
+    let Metered::Released(last) = ledger
+        .meter(ledger.chain_root(), |_r| async { Ok(()) })
+        .await?
+    else {
+        anyhow::bail!("the epoch must release the second reveal");
+    };
+    let meter = super::StreamMeter {
+        anchored_root: Some(last.chain_root),
+        last_proof: Some(StreamProof::Reveal {
+            chain_root: last.chain_root,
+            index: last.index,
+        }),
+    };
+    Ok((ledger, meter))
+}
+
+/// A gate stop is no verdict on the proof. The node writes `PoolExhausted` and
+/// `SignerCapExhausted` from its mid-stream solvency re-checks, which run only
+/// after it has accepted at least one of the stream's proofs. Rewinding an
+/// accepted reveal there would put the payer one chunk behind the node: the
+/// owed span would start a chunk low, and the resumed stream would re-send a
+/// reveal the node already holds and draw an `AmountRegression` (#2629).
+#[tokio::test]
+async fn a_gate_stop_keeps_the_reveal_the_node_accepted() -> anyhow::Result<()> {
+    use decdn_protocol::client::StreamError;
+
+    for reason in [
+        VoucherRejectReason::PoolExhausted,
+        VoucherRejectReason::SignerCapExhausted,
+    ] {
+        let (ledger, meter) = ledger_with_a_released_reveal().await?;
+        let before = ledger.committed();
+        let err = super::voucher_rejection(
+            &ledger,
+            &meter,
+            StreamError::VoucherRejected {
+                reason,
+                bundle: None,
+            },
+        );
+        assert!(
+            err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
+            "{reason:?} still surfaces as a voucher rejection: {err:#}"
+        );
+        assert_eq!(
+            ledger.committed(),
+            before,
+            "{reason:?} stops the stream after the node accepted the reveal; the \
+             reveal stays committed"
+        );
+    }
+    Ok(())
+}
+
+/// A reason that refuses the proof itself still rewinds it: the node holds no
+/// preimage at that index, so the payer must give the chunk back.
+#[tokio::test]
+async fn a_refused_proof_still_rewinds_its_reveal() -> anyhow::Result<()> {
+    use decdn_protocol::client::StreamError;
+
+    let (ledger, meter) = ledger_with_a_released_reveal().await?;
+    let before = ledger.committed();
+    let _ = super::voucher_rejection(
+        &ledger,
+        &meter,
+        StreamError::VoucherRejected {
+            reason: VoucherRejectReason::CapabilityExpired,
+            bundle: None,
+        },
+    );
+    assert_eq!(
+        ledger.committed().amount,
+        before.amount - U256::from(10u64),
+        "a refused reveal gives back exactly one chunk"
+    );
+    Ok(())
+}

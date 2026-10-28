@@ -998,7 +998,9 @@ where
     // delivery from one successful open. `leg_anchor` records `(content offset the
     // leg opened at, lane-cumulative committed WIRE bytes at that moment)`. It
     // is re-anchored on every successful open (to the previous paid frontier) and
-    // on a reseed (to the healed delivered frontier), and PERSISTS across passes
+    // on a rebase (to the delivered frontier, with the healed baseline). A reseed
+    // raises its baseline by the reseed's jump, and a stale heal keeps it. It
+    // PERSISTS across passes
     // so a resumed leg prices the paid frontier against the previous leg's own
     // spend. Both the completion signal (`paid_cleared`) and the Draw resume
     // start are derived from it; see the per-pass computation at the loop top.
@@ -1108,10 +1110,10 @@ where
         // `delivered_frontier >= paid_frontier` and the clamp is a no-op: resume
         // still starts at the true paid frontier and the delivered-but-unpaid tail is
         // still re-billed (no under-pay). The clamp bites in two cases. A
-        // shared-ledger concurrent pull overshoots this leg's delivery. Or the store
-        // leaves a hole before present bytes: the contiguous delivered frontier stops
-        // at the hole, so the paid frontier stops there too and the next leg opens
-        // at the hole.
+        // shared-ledger concurrent pull overshoots this leg's delivery. Or the
+        // store leaves a hole before present bytes: the contiguous delivered
+        // frontier stops at the hole, so the paid frontier stops there too and
+        // the next leg opens at the hole.
         let paid_frontier =
             crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire_this_leg)
                 .min(gap_end)
@@ -1368,10 +1370,26 @@ where
                     //    bare and falls through to step 2. Only a lane-watermark
                     //    reason is marked (`scopes_to_source`): a spending-cap
                     //    rejection stays a funding rejection.
+                    let pre_heal = ledger.committed().bytes;
                     let healed = match watermark {
                         Some(watermark) => heal_watermark_desync(&err, watermark, ledger).await,
                         None => None,
                     };
+                    // A reseed's jump is the node's watermark catching up with
+                    // vouchers our record had lost, which can predate this leg:
+                    // a restarted payer whose store trails the node. Nothing ties
+                    // the jump to this leg's content, so it pays for none of it.
+                    // Raise the leg's baseline by the jump, so the paid frontier
+                    // prices only this leg's own spend, here and in the owed span
+                    // a lane that ends below records. At worst the next leg
+                    // re-delivers and re-pays content the jump did cover: a
+                    // bounded over-pay, never an under-pay.
+                    if healed == Some(crate::Healed::Reseeded)
+                        && let Some((_, baseline)) = leg_anchor.as_mut()
+                    {
+                        let jump = ledger.committed().bytes.saturating_sub(pre_heal);
+                        *baseline = baseline.saturating_add(jump);
+                    }
                     let past_budget = counters.resume_attempts >= MAX_RESUME_ATTEMPTS;
                     if healed.is_some() && past_budget && scopes_to_source(&err) {
                         return Err(err.context(HealExhausted));
@@ -1385,26 +1403,30 @@ where
                             &err,
                             healed,
                         );
-                        // A reseed means the node HOLDS vouchers for content it
-                        // already delivered that our record had lost — so the
-                        // delivered frontier is paid. A rebase means the node took
-                        // none of the vouchers above its watermark, so the span
-                        // between is delivered and unpaid; the node already chose to
-                        // stop there, and the healed ledger pays only for what it
-                        // delivers next. Either way, re-anchor the leg there with the
-                        // healed committed baseline, so the next pass prices this
-                        // gap's paid frontier AT the delivered frontier (`paid_wire
-                        // delta == 0`): no re-delivery of bytes already delivered, and the
-                        // reseed's jump is not mistaken for this leg's own spend
-                        // (which would map past the true frontier and under-pay).
+                        // A reseed (its jump already lifted out of the leg's
+                        // baseline above) and a stale heal, which moves no
+                        // watermark, keep the leg's anchor. Neither says the node
+                        // holds vouchers for the delivered frontier: delivery runs
+                        // ahead of payment by up to a credit window. So the next
+                        // pass prices the paid frontier from the leg's start over
+                        // the leg's own spend, and the next leg re-delivers and
+                        // bills the rest.
+                        //
+                        // A rebase means the node took none of the vouchers above
+                        // its watermark, so the span between is delivered and
+                        // unpaid. The node already chose to stop there, and the
+                        // healed ledger pays only for what it delivers next. It
+                        // re-anchors the leg at the delivered frontier with the
+                        // healed committed baseline (`paid_wire delta == 0`), since
+                        // a ledger moved down cannot price from the old baseline.
                         // `delivered_frontier` is this pass's pre-ingest snapshot
-                        // (loop top); if the reseed fault arrived after some bytes
-                        // were checkpointed this pass it sits slightly behind the
-                        // fresh frontier. That is the SAFE direction — at worst a
-                        // bounded re-deliver/re-pay of the interim span (over-pay),
-                        // never under-pay — and reseed refusals almost always
-                        // surface at open, before any ingest, so the two coincide.
-                        leg_anchor = Some((delivered_frontier, ledger.committed().bytes));
+                        // (loop top). If the fault arrived after some bytes were
+                        // checkpointed this pass, it sits slightly behind the fresh
+                        // frontier. That is the safe direction: at worst a bounded
+                        // re-deliver and re-pay of the interim span.
+                        if healed == Some(crate::Healed::Rebased) {
+                            leg_anchor = Some((delivered_frontier, ledger.committed().bytes));
+                        }
                         continue;
                     }
 

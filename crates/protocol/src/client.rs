@@ -1339,6 +1339,38 @@ impl VoucherRejectReason {
                 | Self::UnderFold
         )
     }
+
+    /// Whether this reason refuses the proof the stream last sent. A refused
+    /// proof was not taken, so the payer rewinds it.
+    ///
+    /// [`Self::PoolExhausted`] and [`Self::SignerCapExhausted`] are the two
+    /// exceptions. The node writes them from its mid-stream solvency re-checks,
+    /// which run only after it has accepted at least one of the stream's proofs.
+    /// They stop delivery and are no verdict on any proof: the last proof is
+    /// either accepted or still unread, and an unread proof pays for bytes the
+    /// payer received, which a later proof on the lane covers. So the payer
+    /// keeps it. Rewinding an accepted proof would put the payer one proof
+    /// behind the node.
+    #[must_use]
+    pub const fn refuses_proof(self) -> bool {
+        match self {
+            Self::PoolExhausted | Self::SignerCapExhausted => false,
+            Self::BadSignature
+            | Self::WrongSigner
+            | Self::WrongPool
+            | Self::WrongProvider
+            | Self::AmountRegression
+            | Self::BytesRegression
+            | Self::SpendingCapExhausted
+            | Self::CapabilityExpired
+            | Self::BadPreimage
+            | Self::ChainIndexZero
+            | Self::UnanchoredPreimage
+            | Self::ChunkPriceMismatch
+            | Self::Underpaid
+            | Self::UnderFold => true,
+        }
+    }
 }
 
 #[cfg(test)]
