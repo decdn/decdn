@@ -169,6 +169,29 @@ async fn wallet_builder_marks_a_failed_send_request() {
     );
 }
 
+/// The wallet-filled builder sends an estimated gas limit with
+/// [`decdn_incentive::tx::GAS_HEADROOM`] on top. At the raw estimate, a
+/// `declareMbps` estimated in the second of the operator's last checkpoint ran
+/// out of gas when it mined in the next one (#2730).
+#[tokio::test]
+async fn wallet_builder_sends_an_estimate_with_headroom() {
+    let estimate = 57_076;
+    let stub = decdn_incentive::test_rpc::GasStub::spawn(estimate)
+        .await
+        .unwrap();
+    let signer = PrivateKeySigner::random();
+    let provider = build_provider(stub.url(), &signer).unwrap();
+    let request = alloy::rpc::types::TransactionRequest {
+        gas: None,
+        ..specified_request(&signer)
+    };
+    let _pending = provider.send_transaction(request).await.unwrap();
+    assert_eq!(
+        stub.sent_gas_limits(),
+        vec![decdn_incentive::tx::with_headroom(estimate)]
+    );
+}
+
 /// reqwest is built with `rustls-no-provider` and panics in `Client::build`
 /// with no process-wide rustls provider. An SDK host that installs none must
 /// still get a chain client, so each builder installs ring itself. nextest

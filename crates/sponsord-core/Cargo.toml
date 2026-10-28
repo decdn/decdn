@@ -38,4 +38,6 @@ tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 decdn-e2e.workspace = true
+# `test_rpc::GasStub`, the HTTP endpoint the treasury provider's gas test sends to.
+decdn-incentive = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true

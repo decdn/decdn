@@ -25,8 +25,10 @@
 //! after the receipt wait is a bug. The `decdn-e2e` fixtures are exempt: a
 //! failed fixture tx fails the test, and no operator reconciles it.
 
+mod gas_headroom;
 mod send_leg;
 
+pub use gas_headroom::{GAS_HEADROOM, GasHeadroomFiller, with_headroom};
 pub use send_leg::{SendLegFailure, SendLegLayer, SendLegProvider};
 
 use alloy::contract::{CallBuilder, CallDecoder, Error as ContractError};

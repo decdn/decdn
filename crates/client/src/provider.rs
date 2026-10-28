@@ -20,7 +20,7 @@ use alloy::network::EthereumWallet;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
-use decdn_incentive::tx::SendLegLayer;
+use decdn_incentive::tx::{GasHeadroomFiller, SendLegLayer};
 
 /// Build a wallet-filled HTTP provider that signs and sends transactions as
 /// `signer`. It reads the pending nonce on every send, so it stays correct
@@ -31,7 +31,9 @@ use decdn_incentive::tx::SendLegLayer;
 /// to tell a send request that failed in transport (the transaction may be
 /// in a mempool) from a chain read that failed before it (nothing was
 /// signed); a provider built elsewhere and handed to them must carry the
-/// layer too.
+/// layer too. Its gas filler is [`GasHeadroomFiller`], which sends an
+/// estimated gas limit with headroom on top, so a call whose path costs more
+/// in the block it mines in than at the estimate still fits (#2730).
 ///
 /// # Errors
 ///
@@ -48,8 +50,11 @@ pub fn build_provider(
 ) -> anyhow::Result<impl Provider + Clone + use<>> {
     decdn_common::tls::install_crypto_provider();
     Ok(ProviderBuilder::new()
+        .disable_recommended_fillers()
         .layer(SendLegLayer)
+        .filler(GasHeadroomFiller::default())
         .with_simple_nonce_management()
+        .fetch_chain_id()
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_http(parse_rpc_url(rpc_url)?))
 }

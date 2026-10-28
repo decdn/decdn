@@ -268,11 +268,16 @@ impl ProviderFactory {
     ) -> impl Provider + Clone + use<> {
         // The send-leg marker lets the buyer's `openPool` / `topUp` / `approve`,
         // the reclaim sweep and the seller's `redeemMany` tell a send request
-        // that failed in transport from a chain read that failed before it.
+        // that failed in transport from a chain read that failed before it. The
+        // gas filler sends an estimate with headroom on top, so a call whose
+        // path costs more in the block it mines in still fits (#2730).
         with_poll_interval(
             ProviderBuilder::new()
+                .disable_recommended_fillers()
                 .layer(decdn_incentive::tx::SendLegLayer)
+                .filler(decdn_incentive::tx::GasHeadroomFiller::default())
                 .with_simple_nonce_management()
+                .fetch_chain_id()
                 .wallet(EthereumWallet::from(signer))
                 .connect_client(self.client()),
             interval,

@@ -7,6 +7,14 @@
 //! tokio clock, a bounded receipt wait on it lapses as soon as the runtime
 //! idles, because tokio advances the paused clock to the next timer; an
 //! unbounded one never returns.
+//!
+//! [`GasStub`] is the HTTP counterpart for the provider builders, which take
+//! a URL rather than a transport: it answers a gas estimate and records the
+//! gas limit each sent transaction carries.
+
+mod http_stub;
+
+pub use http_stub::GasStub;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};

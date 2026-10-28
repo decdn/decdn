@@ -1249,6 +1249,23 @@ since project inception and will roll into the first tagged release.
   Every copy of the lost `topUp` was signed at the spent nonce, so none can
   mine later, and the fresh one cannot escrow twice. Each retry ticks the new
   `decdn_buyer_topup_nonce_lost_total` counter.
+- **CLI, client, node and sponsord: a transaction goes out with gas headroom
+  above its estimate (#2730).** `eth_estimateGas` prices a call at the pending
+  block's timestamp, and every wallet provider sent at that raw estimate.
+  `CapacityBond.declareMbps` and `deregisterNode` overwrite the operator's
+  last tier checkpoint in the same second, and push a fresh slot in a later
+  one, which costs about 22k gas more. So a `decdn node bond --mbps`, `unbond`
+  or `deregister` estimated in the second of the operator's last checkpoint
+  ran out of gas when it mined in the next second. The transaction reverted,
+  and the `unbond --all` hint wrongly blamed registration. A node's redeem
+  had the same exposure at an epoch roll: `FeeRouter` keys its byte counters
+  by epoch, so a redeem mined in a later epoch than its estimate writes two
+  fresh slots.
+  `decdn_client::provider::build_provider`, the node's buyer and seller
+  wallets and sponsord's treasury provider now fill gas with
+  `decdn_incentive::tx::GasHeadroomFiller`, which adds `GAS_HEADROOM` (50,000)
+  to an estimated limit. A caller-set limit goes out unchanged. Unused gas is
+  refunded.
 - **Client: a streamed fetch with no size hint keeps the pull it opened for
   the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
   fast path, or a gateway pull whose size lookup finds none), the client read
