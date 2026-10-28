@@ -2028,15 +2028,30 @@ async fn throwaway_open_torn_down_before_real_open_still_serves() -> anyhow::Res
     })
     .await?;
     anyhow::ensure!(wholeblob_gets == 0, "saw {wholeblob_gets} un-ranged GET(s)");
-    let ranged_gets = count_requests(&server, |r| {
+    // The serviceability probe is a ranged GET too, but it is not a draw: count
+    // it apart. The cancelled fill's draw and the real open's re-draw can both
+    // reach the origin.
+    let probe = probe_range_val(blob.len());
+    let is_probe = |r: &Request| {
+        r.headers
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == probe)
+    };
+    let is_ranged_get = |r: &Request| {
         r.method.as_str() == "GET"
             && r.url.path() == format!("/{hex}")
             && r.headers.contains_key("range")
-    })
-    .await?;
+    };
+    let probes = count_requests(&server, |r| is_ranged_get(r) && is_probe(r)).await?;
+    let draws = count_requests(&server, |r| is_ranged_get(r) && !is_probe(r)).await?;
     anyhow::ensure!(
-        ranged_gets <= 2,
-        "a torn-down throwaway costs at most one duplicate draw, saw {ranged_gets}"
+        probes <= 1,
+        "the range probe latches after one read, saw {probes} probes"
+    );
+    anyhow::ensure!(
+        draws <= 2,
+        "a torn-down throwaway costs at most one duplicate draw, saw {draws}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

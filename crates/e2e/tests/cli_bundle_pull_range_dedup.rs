@@ -689,7 +689,8 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
 /// holder (#2123), and each lane fills one of `b`'s complement ranges at a
 /// time. Each holder serves some of them, and the two lanes together bill
 /// exactly `a`'s whole file plus `b`'s complement, so no range is paid on both
-/// lanes. Every open either node served is a paid leg.
+/// lanes. Every open either node served is a paid leg. The donor `a` has one
+/// holder, so it pulls whole on one lane.
 #[tokio::test(flavor = "multi_thread")]
 async fn cli_bundle_pull_stripes_a_complement_across_two_holders() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_striped_complement()))
@@ -759,13 +760,19 @@ async fn run_striped_complement() -> anyhow::Result<()> {
         chunk_json(&b_chunks),
     );
 
-    // Two independently bonded holders of both files: distinct operators, so
-    // the entry admits a lane for each (one node per operator).
-    let blobs = [file_a.as_slice(), file_b.as_slice()];
-    let (holder_x, hashes_x) = NodeFixture::launch_with_blobs(&chain, "US", &blobs).await?;
-    let (holder_y, hashes_y) = NodeFixture::launch_with_blobs(&chain, "US", &blobs).await?;
+    // Two independently bonded holders of `b`: distinct operators, so `b`'s
+    // entry admits a lane for each (one node per operator). Only `holder_x`
+    // holds `a`, so `a` has one source and one lane. The planner splits a
+    // run evenly across every holder that covers it, with no size floor
+    // (`split_evenly`), so a second holder of `a` would split it, and each
+    // extra piece re-sends a left-boundary proof path.
+    let (holder_x, hashes_x) =
+        NodeFixture::launch_with_blobs(&chain, "US", &[file_a.as_slice(), file_b.as_slice()])
+            .await?;
+    let (holder_y, hashes_y) =
+        NodeFixture::launch_with_blobs(&chain, "US", &[file_b.as_slice()]).await?;
     anyhow::ensure!(
-        hashes_x == vec![whole_a, whole_b] && hashes_y == hashes_x,
+        hashes_x == vec![whole_a, whole_b] && hashes_y == vec![whole_b],
         "seeded blob hashes mismatch"
     );
     anyhow::ensure!(
@@ -797,15 +804,17 @@ async fn run_striped_complement() -> anyhow::Result<()> {
     std::fs::write(&manifest_path, manifest).context("write manifest")?;
     let out_dir = client_dir.path().join("out");
     // Discovered, not pinned, so `b`'s drives see both holders. `--jobs 1`
-    // lands `a` before `b` plans, and `a` stays below the multi-source floor,
-    // so it pulls whole from one holder.
-    let args = discovered_get_argv(
+    // lands `a` before `b` plans. `a` pulls whole on `holder_x`'s one lane,
+    // because `holder_x` is its only holder and proxy warming is off, so
+    // `holder_y` never joins `a` as a warming proxy.
+    let mut args = discovered_get_argv(
         &chain,
         &manifest_path,
         &out_dir,
         client_dir.path(),
         &keystore,
     );
+    args.extend(["--proxy-warming".into(), "false".into()]);
 
     let (x_addr, y_addr) = (holder_x.operator_addr(), holder_y.operator_addr());
     let billed_before = (
@@ -851,22 +860,16 @@ async fn run_striped_complement() -> anyhow::Result<()> {
         wire_complement += range_wire_bytes(*start, *len, total_b)?;
     }
     anyhow::ensure!(
-        wire_complement < wire_a,
-        "the fixture must keep b's complement below a's whole file, so only the \
-         holder that served a can bill more than a"
-    );
-    anyhow::ensure!(
         billed_x + billed_y == wire_a + wire_complement,
         "the two lanes must bill a's whole file plus b's {} complement ranges once \
          ({} wire bytes), got {billed_x} + {billed_y}",
         complement.len(),
         wire_a + wire_complement,
     );
-    // One holder served `a`. It billed more than `a` only if it also served
-    // some of `b`'s ranges, and the other holder billed only `b`'s ranges.
-    let (more, less) = (billed_x.max(billed_y), billed_x.min(billed_y));
+    // `holder_x` served `a`. It billed more than `a` only if it also served
+    // some of `b`'s ranges, and `holder_y` billed only `b`'s ranges.
     anyhow::ensure!(
-        less > 0 && more > wire_a,
+        billed_y > 0 && billed_x > wire_a,
         "both holders must serve some of b's complement: billed {billed_x} and \
          {billed_y}, a alone is {wire_a}"
     );

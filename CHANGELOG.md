@@ -1202,6 +1202,14 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Tests: three load-sensitive tests model the node and the planner exactly
+  (#2663, #2723).** `cli_bundle_pull_stripes_a_complement_across_two_holders`
+  seeds `a` on one holder, so the planner never splits it across both lanes
+  and duplicates its proof path. `over_cap_stream_is_reset_without_signing_a_response`
+  writes its second request in one `write_all` and accepts the cap-full
+  `STOP_SENDING` as the expected signal.
+  `throwaway_open_torn_down_before_real_open_still_serves` counts the
+  serviceability probe apart from the origin draws.
 - **Transport: iroh and noq stay at 1.3.0, and CI holds them there (#2585).**
   noq-proto 1.4 closes a connection with "too many gaps in stream buffer"
   once the reader falls ~2.4 MiB behind, so a paid pull dies mid-leg and the
