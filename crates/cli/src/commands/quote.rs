@@ -77,30 +77,32 @@ async fn quote_on(
     uri: &DecdnUri,
 ) -> anyhow::Result<QuoteView> {
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from("."));
-    let plan = if uri.target == UriTarget::Blob {
-        Plan::Blob(uri.hash)
-    } else {
-        // A cache file that cannot be read is fetched over, as `get` does;
-        // the fetch reports it.
-        let cached = BundleManifest::cached(&out, uri.hash).ok().flatten();
-        let manifest = if let Some(manifest) = cached {
-            manifest
-        } else {
-            eprintln!(
-                "note: no cached manifest in {}; fetching it, a small paid pull that opens a \
-                 pool if you have none",
-                out.display()
-            );
-            bundle_pull::fetch_manifest_paid(
-                &args.common,
-                &out,
-                uri,
-                &mut host.chain,
-                (&host.endpoint, &host.relays),
-            )
-            .await?
-        };
-        Plan::of_target(&manifest, &uri.target)?
+    let plan = match uri.target {
+        UriTarget::Blob => Plan::Blob(uri.hash),
+        UriTarget::Bundle | UriTarget::BundleEntry(_) => {
+            // A cache file that cannot be read is fetched over, as `get` does;
+            // the fetch reports it.
+            let cached = BundleManifest::cached(&out, uri.hash).ok().flatten();
+            let manifest = if let Some(manifest) = cached {
+                manifest
+            } else {
+                eprintln!(
+                    "note: no cached manifest in {}; fetching it, a small paid pull that opens \
+                     a pool if you have none",
+                    out.display()
+                );
+                bundle_pull::fetch_manifest_paid(
+                    &args.common,
+                    &out,
+                    uri,
+                    &mut host.chain,
+                    (&host.endpoint, &host.relays),
+                )
+                .await?
+            };
+            Plan::of_target(&manifest, &uri.target)?
+        }
+        _ => anyhow::bail!("unsupported URI target in {:?}", args.uri),
     };
     host.price(&args.common, &plan).await
 }

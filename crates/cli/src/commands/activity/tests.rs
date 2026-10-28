@@ -82,6 +82,29 @@ async fn a_run_writes_its_record_and_ends_it() {
     assert_eq!(ended.expected_bytes, Some(100));
 }
 
+/// Each URI target records as its own kind: a bare hash as a blob run, a
+/// trailing slash as a bundle run, an entry path as an entry run.
+#[tokio::test]
+async fn each_uri_target_records_its_own_kind() {
+    for (text, kind) in [
+        (BLOB.to_owned(), PullKind::Blob),
+        (
+            format!("{BLOB}/"),
+            PullKind::Bundle {
+                files_started: 0,
+                files_landed: 0,
+                counts: None,
+            },
+        ),
+        (format!("{BLOB}/a/b"), PullKind::Entry),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = start(dir.path(), &text);
+        assert_eq!(only(dir.path()).kind, kind, "{text}");
+        recorder.finish(&Ok(()), None).await;
+    }
+}
+
 /// A running record carries no end, and an ended one its end beside the
 /// state, as the reader on the other side of the file sees them.
 #[test]
