@@ -47,6 +47,16 @@ since project inception and will roll into the first tagged release.
   - A node with pull-through on logs a warning at each read of an empty buyer
     wallet: at bootstrap, then once per hourly reclaim sweep.
 
+- **Admin wire: `EarningsResponse` carries `covered_from_unix` in place of
+  `ledger_since_unix` (#2624).** The field is the time the figures cover from:
+  on the daemon, when the settlement ledger started recording (a stamp in
+  `settle.redb`), or an earlier row's time; with `decdn node earnings
+  --address`, the first scanned block's time. It is a required `u64`, so a
+  `decdn` CLI at this release reads `admin_v1_earnings` only from a daemon at
+  this release. `decdn node earnings` prints `covered_from=<date>` in its
+  header and labels a period that starts earlier `(covered from <date>)`; the
+  `decdn dashboard` earnings panel always shows the date.
+
 - **Admin wire: `BuyerPoolSnapshot` carries `spent_micro_usdc`.** The field
   is the pool's spend as the store knows it (every tracked lane plus the
   spend other signers redeemed). It is a lower bound, so deposit less spend
@@ -4405,11 +4415,18 @@ since project inception and will roll into the first tagged release.
     only a crash mid-catch-up can lose one (`--address` has the chain's
     record). Each row names its operator, so after `decdn
     node rotate-key eth` the earlier address's rows stay in the file but out
-    of the figures. The ledger drops with the other seller tables on a
-    `PaymentPool` repoint. Nothing is backfilled from before the ledger exists, so the
-    bottom row reads `since <date>`, never "all time";
+    of the figures. The file also stamps when the ledger started recording
+    (`settlement_ledger_start_v1`), and both drop with the other seller tables
+    on a `PaymentPool` repoint. Nothing is backfilled from before the
+    watcher's first scan, so the bottom row reads `since <date>`, never "all
+    time", and a period that starts earlier reads `(covered from <date>)`
+    (#2624). The date is when the ledger started (or an earlier row the
+    watcher backfilled), not its first settlement: once the ledger has run
+    for 7 days, the 7-day row has no note, whether or not anything settled in
+    it. In `--address` mode the date is the first scanned block's time;
   - the admin RPC gains `admin_v1_earnings` (and `EARNINGS_UNAVAILABLE_CODE`):
-    named periods `last_24h`, `last_7d`, `since_ledger_start` and the optional
+    `covered_from_unix` (the time the figures cover from), named
+    periods `last_24h`, `last_7d`, `since_ledger_start` and the optional
     `since`, the last settlement, and `pending` split into what the next sweep
     can redeem and what is stranded (expired capability, another provider's
     lane). `LaneSnapshot` gains `unredeemed_micro_usdc` (`owed −

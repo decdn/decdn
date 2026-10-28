@@ -180,6 +180,10 @@ pub struct EarningsHandles {
     pub pool_store: Arc<dyn PoolStateStore>,
     /// The redeemer's published sweep schedule, for "next sweep in".
     pub schedule: RedeemSchedule,
+    /// When the settlement ledger started recording, Unix seconds
+    /// (`PersistentPoolStateStore::ledger_started_at_unix`): the ledger records
+    /// every settlement landed from this time on.
+    pub ledger_started_at_unix: u64,
 }
 
 // `AdminState` derives `Debug`; the trait objects carry no `Debug` bound, so
@@ -188,6 +192,7 @@ impl std::fmt::Debug for EarningsHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EarningsHandles")
             .field("schedule", &self.schedule)
+            .field("ledger_started_at_unix", &self.ledger_started_at_unix)
             .finish_non_exhaustive()
     }
 }
@@ -1045,6 +1050,7 @@ impl AdminRpcServer for AdminRpcImpl {
             unix_now(),
             req.since_unix,
             &h.schedule,
+            h.ledger_started_at_unix,
         ))
     }
 }
@@ -1058,7 +1064,14 @@ const WEEK_SECS: u64 = 7 * DAY_SECS;
 /// pending split are unit-testable without a store.
 ///
 /// A row falls in a period when its `landed_at_unix` is at or after the
-/// period's start. The pending section is [`pending_redeem`].
+/// period's start. The figures cover settlements from `ledger_started_at_unix`
+/// on, or from this operator's earliest row when that row is earlier. A row
+/// predates the start when the `PoolRedeemed` watcher, resuming from its
+/// checkpoint, backfills a landing from before this ledger's first open, when
+/// the rows were written before the store kept a start, or by clock skew (the
+/// start is wall-clock time, a row's is block time). The watcher scans every
+/// block from its resume point, so the ledger covers the time from such a row
+/// on. The pending section is [`pending_redeem`].
 pub(crate) fn build_earnings_response(
     rows: &[SettlementRecord],
     lanes: &[LaneState],
@@ -1066,6 +1079,7 @@ pub(crate) fn build_earnings_response(
     now_unix: u64,
     since_unix: Option<u64>,
     schedule: &RedeemSchedule,
+    ledger_started_at_unix: u64,
 ) -> EarningsResponse {
     // Only this operator's rows: the ledger outlives an Ethereum key rotation
     // that kept the data directory. With no operator (a hand-built admin
@@ -1074,7 +1088,10 @@ pub(crate) fn build_earnings_response(
         .iter()
         .filter(|row| operator.is_none_or(|operator| row.operator == operator))
         .collect();
-    let ledger_since_unix = rows.iter().map(|row| row.landed_at_unix).min();
+    let covered_from_unix = rows
+        .iter()
+        .map(|row| row.landed_at_unix)
+        .fold(ledger_started_at_unix, u64::min);
     let landed_since = |from: u64| {
         rows.iter()
             .copied()
@@ -1084,10 +1101,10 @@ pub(crate) fn build_earnings_response(
     let week = now_unix.saturating_sub(WEEK_SECS);
     EarningsResponse {
         operator_address: operator.map(|a| a.to_string()),
-        ledger_since_unix,
+        covered_from_unix,
         last_24h: sum_period(day, landed_since(day)),
         last_7d: sum_period(week, landed_since(week)),
-        since_ledger_start: sum_period(ledger_since_unix.unwrap_or(0), rows.iter().copied()),
+        since_ledger_start: sum_period(covered_from_unix, rows.iter().copied()),
         since: since_unix.map(|since| sum_period(since, landed_since(since))),
         last_settlement: last_settlement(rows.iter().copied()),
         pending: Some(pending_redeem(lanes, operator, now_unix, schedule)),

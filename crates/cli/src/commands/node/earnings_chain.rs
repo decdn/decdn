@@ -13,6 +13,9 @@
 //! cost is a few dozen header reads however many settlements there are. A log
 //! that does not decode fails the command: a clean table over a mis-decoded
 //! scan would be a lie.
+//!
+//! The figures cover every settlement from the scan's first block on, so the
+//! response reports that block's time as `covered_from_unix`.
 
 use std::future::IntoFuture;
 use std::num::NonZeroU64;
@@ -186,31 +189,65 @@ pub(super) async fn run(
         from <= head_number,
         "--from-block {from} is past the chain head {head_number}"
     );
-    let mut rows = scan_rows(&provider, router, operator, from, head_number, coords.span).await?;
-
-    // The ledger-start and last-settlement times: one header read each.
-    let ledger_since_unix = match rows.first_mut() {
-        Some(first) => {
-            first.landed_at_unix = block_timestamp(&provider, first.block_number).await?;
-            Some(first.landed_at_unix)
-        }
-        None => None,
+    // Read before the scan, so an RPC that cannot serve this header fails the
+    // command before thousands of `eth_getLogs` windows, not after them.
+    let from_unix = block_timestamp(&provider, from).await?;
+    let rows = scan_rows(&provider, router, operator, from, head_number, coords.span).await?;
+    let range = ScanRange {
+        from,
+        from_unix,
+        head: head_number,
+        head_unix: now,
     };
-    if let Some(last) = rows.last_mut()
-        && last.landed_at_unix == 0
-    {
-        last.landed_at_unix = block_timestamp(&provider, last.block_number).await?;
+    response_from_rows(&provider, operator, rows, range, since_unix).await
+}
+
+/// The blocks a chain scan covered, with their times.
+#[derive(Debug, Clone, Copy)]
+struct ScanRange {
+    /// The first scanned block.
+    from: u64,
+    /// `from`'s timestamp: the response's `covered_from_unix`.
+    from_unix: u64,
+    /// The head the scan ran to.
+    head: u64,
+    /// `head`'s timestamp: the "now" the periods count back from.
+    head_unix: u64,
+}
+
+/// Sum the scanned `rows` into the [`EarningsResponse`] periods. Reads the
+/// last row's header for the last-settlement time, then binary-searches the
+/// headers in `range` for each period's first block.
+///
+/// # Errors
+///
+/// Any header read that fails.
+async fn response_from_rows<P: Provider>(
+    provider: &P,
+    operator: Address,
+    mut rows: Vec<SettlementRecord>,
+    range: ScanRange,
+    since_unix: Option<u64>,
+) -> anyhow::Result<EarningsResponse> {
+    let ScanRange {
+        from,
+        from_unix,
+        head,
+        head_unix,
+    } = range;
+    if let Some(last) = rows.last_mut() {
+        last.landed_at_unix = block_timestamp(provider, last.block_number).await?;
     }
 
     // Period cutoffs as block numbers, by binary search over header times.
-    let day = now.saturating_sub(DAY_SECS);
-    let week = now.saturating_sub(WEEK_SECS);
-    let day_block = block_at_or_after(&provider, day, from, head_number).await?;
-    let week_block = block_at_or_after(&provider, week, from, head_number).await?;
+    let day = head_unix.saturating_sub(DAY_SECS);
+    let week = head_unix.saturating_sub(WEEK_SECS);
+    let day_block = block_at_or_after(provider, day, from, head).await?;
+    let week_block = block_at_or_after(provider, week, from, head).await?;
     let landed_at_or_after = |block: u64| rows.iter().filter(move |row| row.block_number >= block);
     let since = match since_unix {
         Some(since) => {
-            let since_block = block_at_or_after(&provider, since, from, head_number).await?;
+            let since_block = block_at_or_after(provider, since, from, head).await?;
             Some(sum_period(since, landed_at_or_after(since_block)))
         }
         None => None,
@@ -218,10 +255,10 @@ pub(super) async fn run(
 
     Ok(EarningsResponse {
         operator_address: Some(operator.to_string()),
-        ledger_since_unix,
+        covered_from_unix: from_unix,
         last_24h: sum_period(day, landed_at_or_after(day_block)),
         last_7d: sum_period(week, landed_at_or_after(week_block)),
-        since_ledger_start: sum_period(ledger_since_unix.unwrap_or(0), rows.iter()),
+        since_ledger_start: sum_period(from_unix, rows.iter()),
         since,
         last_settlement: last_settlement(&rows),
         pending: None,
@@ -235,7 +272,8 @@ const PROGRESS_EVERY_WINDOWS: u32 = 50;
 
 /// Scan `[from, to]` for the operator's `Settled` logs and the router's fee
 /// split history, and decode them into ledger rows (chain order,
-/// `landed_at_unix` left `0`). Progress goes to stderr.
+/// `landed_at_unix` left `0`; [`response_from_rows`] reads the last row's).
+/// Progress goes to stderr.
 ///
 /// # Errors
 ///
@@ -448,7 +486,8 @@ pub(super) fn net_of(gross: U256, shares: FeeSplit) -> U256 {
 }
 
 /// The ledger rows of the operator's `Settled` logs, in chain order, with
-/// `landed_at_unix` left `0` (the caller stamps the two it prints).
+/// `landed_at_unix` left `0` (the caller reads the last row's header, the only
+/// time it prints).
 ///
 /// # Errors
 ///

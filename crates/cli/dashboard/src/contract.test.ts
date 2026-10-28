@@ -323,7 +323,7 @@ const LANE_SNAPSHOT: Keys<LaneSnapshot> = {
 };
 const EARNINGS: Keys<EarningsResponse> = {
   operator_address: true,
-  ledger_since_unix: true,
+  covered_from_unix: true,
   last_24h: true,
   last_7d: true,
   since_ledger_start: true,

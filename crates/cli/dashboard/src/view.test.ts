@@ -523,7 +523,7 @@ describe("earningsRows", () => {
   it("lists the standard periods, then the one a request asked for", () => {
     const rows = earningsRows({
       operator_address: null,
-      ledger_since_unix: null,
+      covered_from_unix: 0,
       last_24h: period(1),
       last_7d: period(2),
       since_ledger_start: period(0),

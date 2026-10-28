@@ -10,7 +10,8 @@
 //!   (`deployment_v1`).
 //! - `settle.redb` — the seller and buyer pending-settle sets, and the
 //!   settlement ledger (`settlement_ledger_v1`): one row per landed
-//!   `redeemMany`, read by `admin_v1_earnings`.
+//!   `redeemMany`, read by `admin_v1_earnings`, with the time the ledger
+//!   started recording (`settlement_ledger_start_v1`).
 //! - `checkpoint.redb` — the settlement watcher's scan checkpoints.
 //! - `buyer.redb` — the buyer pool state and its owner index.
 //!
@@ -181,6 +182,20 @@ const BUYER_PENDING_SETTLE_TABLE: TableDefinition<'_, &[u8; 32], u64> =
 /// the latest settlement. Value: postcard-encoded [`StoredSettlement`].
 const SETTLEMENT_LEDGER_TABLE: TableDefinition<'_, &[u8; 16], &[u8]> =
     TableDefinition::new("settlement_ledger_v1");
+
+/// redb table holding the time [`SETTLEMENT_LEDGER_TABLE`] started recording:
+/// the open of `settle.redb` that found no stamp (see
+/// `PersistentPoolStateStore::bind_ledger_start`). The ledger records every
+/// settlement from this time on, whether or not one has landed yet, so
+/// `admin_v1_earnings` reports it as the start of its coverage. Lives in
+/// `settle.redb` and is dropped with the ledger.
+///
+/// One row, key [`SETTLEMENT_LEDGER_START_KEY`], value Unix seconds.
+const SETTLEMENT_LEDGER_START_TABLE: TableDefinition<'_, &str, u64> =
+    TableDefinition::new("settlement_ledger_start_v1");
+
+/// The one key of [`SETTLEMENT_LEDGER_START_TABLE`].
+const SETTLEMENT_LEDGER_START_KEY: &str = "started_at";
 
 /// [`SETTLEMENT_LEDGER_TABLE`] opened for reading.
 type SettlementLedgerTable = redb::ReadOnlyTable<&'static [u8; 16], &'static [u8]>;
@@ -534,6 +549,9 @@ pub struct PersistentPoolStateStore {
     buyer_db: Database,
     /// Path of the lane store file (`lanes.redb`); returned by [`Self::path`].
     path: PathBuf,
+    /// When the settlement ledger started recording; returned by
+    /// [`Self::ledger_started_at_unix`].
+    ledger_started_at_unix: u64,
     /// The per-lane working set, hydrated from disk at `open()`.
     lanes: DashMap<LaneKey, LaneSlot>,
     /// Lock-free work-list of lanes changed since the last flush.
@@ -611,6 +629,8 @@ impl PersistentPoolStateStore {
         let buyer_db = Self::open_hardened_db(&data_dir.join(BUYER_DB_FILE), &chmod_fn)?;
 
         Self::bind_deployment(&lanes_db, &settle_db, &checkpoint_db, deployment)?;
+        let ledger_started_at_unix =
+            Self::bind_ledger_start(&settle_db, crate::payment_settlement::unix_now())?;
         let lanes = Self::hydrate_lanes(&lanes_db)?;
         Ok(Self {
             lanes_db,
@@ -618,6 +638,7 @@ impl PersistentPoolStateStore {
             checkpoint_db,
             buyer_db,
             path,
+            ledger_started_at_unix,
             lanes,
             dirty: SegQueue::new(),
         })
@@ -769,6 +790,7 @@ impl PersistentPoolStateStore {
                 txn.delete_table(PENDING_SETTLE_TABLE)?;
                 txn.delete_table(BUYER_PENDING_SETTLE_TABLE)?;
                 txn.delete_table(SETTLEMENT_LEDGER_TABLE)?;
+                txn.delete_table(SETTLEMENT_LEDGER_START_TABLE)?;
                 Ok(())
             })?;
             Self::delete_tables(checkpoint_db, "checkpoint", |txn| {
@@ -919,6 +941,69 @@ impl PersistentPoolStateStore {
         }
     }
 
+    /// The time the settlement ledger started recording, read after
+    /// [`Self::bind_deployment`] has dropped a foreign deployment's ledger.
+    ///
+    /// - The stamp exists: return it. The read is a READ transaction, so a boot
+    ///   against the same deployment takes no write.
+    /// - No stamp: write `now_unix` and return it. The ledger records every
+    ///   settlement from this boot on. A store has no stamp when `settle.redb`
+    ///   is new (including one moved aside), when a repoint cleared it, and
+    ///   when its ledger rows were written before this table existed: those
+    ///   rows predate the stamp, and `admin_v1_earnings` moves its coverage
+    ///   back to the earliest of them.
+    ///
+    /// A crash between a repoint's ledger clear and this write leaves no stamp,
+    /// and the next open writes one.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] when a transaction fails.
+    fn bind_ledger_start(settle_db: &Database, now_unix: u64) -> Result<u64, StoreError> {
+        let read_txn = settle_db.begin_read().map_err(|err| {
+            StoreError::Backend(format!("begin_read (settle.redb ledger start): {err}"))
+        })?;
+        let stamp = match read_txn.open_table(SETTLEMENT_LEDGER_START_TABLE) {
+            Ok(table) => table
+                .get(SETTLEMENT_LEDGER_START_KEY)
+                .map_err(|err| {
+                    StoreError::Backend(format!("get (settle.redb ledger start): {err}"))
+                })?
+                .map(|guard| guard.value()),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(err) => {
+                return Err(StoreError::Backend(format!(
+                    "open_table (settle.redb ledger start): {err}"
+                )));
+            }
+        };
+        drop(read_txn);
+        if let Some(stamp) = stamp {
+            return Ok(stamp);
+        }
+        let mut txn = settle_db.begin_write().map_err(|err| {
+            StoreError::Backend(format!("begin_write (settle.redb ledger start): {err}"))
+        })?;
+        txn.set_durability(Durability::Immediate).map_err(|err| {
+            StoreError::Backend(format!("set_durability (settle.redb ledger start): {err}"))
+        })?;
+        {
+            let mut table = txn
+                .open_table(SETTLEMENT_LEDGER_START_TABLE)
+                .map_err(|err| {
+                    StoreError::Backend(format!("open_table (settle.redb ledger start): {err}"))
+                })?;
+            table
+                .insert(SETTLEMENT_LEDGER_START_KEY, now_unix)
+                .map_err(|err| {
+                    StoreError::Backend(format!("insert (settle.redb ledger start): {err}"))
+                })?;
+        }
+        txn.commit().map_err(|err| {
+            StoreError::Backend(format!("commit (settle.redb ledger start): {err}"))
+        })?;
+        Ok(now_unix)
+    }
+
     /// Delete tables from `db` in one fsynced write transaction. `what` names
     /// the file in error messages.
     fn delete_tables(
@@ -1055,6 +1140,14 @@ impl PersistentPoolStateStore {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// When the settlement ledger started recording, Unix seconds: the open of
+    /// `settle.redb` that found no stamp (`Self::bind_ledger_start`). The
+    /// ledger records every settlement landed from this time on.
+    #[must_use]
+    pub const fn ledger_started_at_unix(&self) -> u64 {
+        self.ledger_started_at_unix
     }
 }
 

@@ -270,7 +270,7 @@ fn node_up() -> NodeSection {
         }),
         earnings: ok(EarningsResponse {
             operator_address: Some(OPERATOR.to_owned()),
-            ledger_since_unix: Some(1_790_000_000),
+            covered_from_unix: 1_790_000_000,
             last_24h: period(1_792_913_600, 120_000),
             last_7d: period(1_792_395_200, 910_000),
             since_ledger_start: period(1_790_000_000, 4_400_000),

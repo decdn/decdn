@@ -1343,6 +1343,104 @@ mod settlement_ledger {
         Ok(())
     }
 
+    /// Overwrite the ledger-start stamp in `dir`'s `settle.redb` with `at`. The
+    /// store must be closed: redb holds an exclusive lock while it is open.
+    fn seed_ledger_start(dir: &Path, at: u64) -> anyhow::Result<()> {
+        let db = Database::create(dir.join(SETTLE_DB_FILE))?;
+        let txn = db.begin_write()?;
+        {
+            let mut table = txn.open_table(SETTLEMENT_LEDGER_START_TABLE)?;
+            table.insert(SETTLEMENT_LEDGER_START_KEY, at)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The stamp is written to disk, not only returned: a second bind reads
+    /// the first one's value back.
+    #[test]
+    fn bind_ledger_start_persists_the_first_stamp() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let db = Database::create(dir.path().join(SETTLE_DB_FILE))?;
+        assert_eq!(PersistentPoolStateStore::bind_ledger_start(&db, 100)?, 100);
+        assert_eq!(PersistentPoolStateStore::bind_ledger_start(&db, 200)?, 100);
+        let txn = db.begin_read()?;
+        let stored = txn
+            .open_table(SETTLEMENT_LEDGER_START_TABLE)?
+            .get(SETTLEMENT_LEDGER_START_KEY)?
+            .map(|guard| guard.value());
+        assert_eq!(stored, Some(100));
+        Ok(())
+    }
+
+    #[test]
+    fn a_fresh_store_stamps_the_ledger_start_at_open() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let before = crate::payment_settlement::unix_now();
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+        let after = crate::payment_settlement::unix_now();
+        let started = store.ledger_started_at_unix();
+        anyhow::ensure!(
+            (before..=after).contains(&started),
+            "stamp {started} outside the open's [{before}, {after}]"
+        );
+        Ok(())
+    }
+
+    /// A reopen on the same deployment keeps the stamp: the ledger has been
+    /// recording since then.
+    #[test]
+    fn a_reopen_keeps_the_ledger_start() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        drop(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
+        seed_ledger_start(dir.path(), 5)?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+        assert_eq!(store.ledger_started_at_unix(), 5);
+        Ok(())
+    }
+
+    /// A repoint drops the ledger and its stamp together; the new deployment's
+    /// ledger starts at that open.
+    #[test]
+    fn a_foreign_deployment_restamps_the_ledger_start() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        drop(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
+        seed_ledger_start(dir.path(), 5)?;
+        let other = Deployment {
+            chain_id: DEPLOYMENT.chain_id,
+            payment_pool: address!("00000000000000000000000000000000000000cf"),
+        };
+        let before = crate::payment_settlement::unix_now();
+        let store = PersistentPoolStateStore::open(dir.path(), other)?;
+        anyhow::ensure!(
+            store.ledger_started_at_unix() >= before,
+            "the old deployment's stamp survived the repoint"
+        );
+        Ok(())
+    }
+
+    /// A crash between a repoint's ledger clear and the restamp leaves no
+    /// stamp; the next open writes one.
+    #[test]
+    fn a_missing_stamp_is_written_at_the_next_open() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        drop(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
+        {
+            let db = Database::create(dir.path().join(SETTLE_DB_FILE))?;
+            let txn = db.begin_write()?;
+            txn.delete_table(SETTLEMENT_LEDGER_START_TABLE)?;
+            txn.commit()?;
+        }
+        let before = crate::payment_settlement::unix_now();
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+        anyhow::ensure!(store.ledger_started_at_unix() >= before);
+        drop(store);
+        seed_ledger_start(dir.path(), 7)?;
+        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
+        assert_eq!(store.ledger_started_at_unix(), 7, "the new stamp is kept");
+        Ok(())
+    }
+
     /// Write raw `value` bytes under the ledger key `(block, 0)`, bypassing the
     /// encoder, to seed a row this binary cannot read.
     fn write_raw(store: &PersistentPoolStateStore, block: u64, value: &[u8]) -> anyhow::Result<()> {

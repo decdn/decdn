@@ -505,29 +505,33 @@ pub struct EarningsRequest {
 /// `--address` mode) and the integration tests.
 ///
 /// Every USDC figure is in micro-USDC (`u64`), the unit the `PaymentPool`
-/// counters use. The settled figures come from the node's settlement ledger:
-/// one row per landed `redeemMany`, decoded from its receipt. The ledger is
-/// forward-only, so the figures start at [`Self::ledger_since_unix`], not at
-/// the node's first ever redemption.
+/// counters use. On the daemon the settled figures come from the node's
+/// settlement ledger: one row per landed `redeemMany`, decoded from its
+/// receipt. The ledger is forward-only and a chain scan starts at its first
+/// block, so either way the figures start at [`Self::covered_from_unix`], not
+/// at the operator's first ever redemption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EarningsResponse {
     /// The operator address the figures belong to, EIP-55 checksummed with a
     /// `0x` prefix (`alloy`'s `Address` `Display`). `None` when the node
     /// started without a seller wallet.
     pub operator_address: Option<String>,
-    /// The time of the earliest settlement the figures cover. On the daemon
-    /// this is the `landed_at_unix` of the earliest ledger row for this
-    /// operator (a row from before an Ethereum key rotation is not counted),
-    /// `None` while the ledger holds none. Built from the chain (`decdn node earnings
-    /// --address`) it is the block time of the earliest `Settled` found from
-    /// the scan's first block, `None` when the scan found none.
-    pub ledger_since_unix: Option<u64>,
+    /// The time the figures cover from, Unix seconds: no settlement landed
+    /// before it is counted. On the daemon this is when the node's settlement
+    /// ledger started recording, or the earliest ledger row for this operator
+    /// when that row is earlier (a landing the watcher backfilled, or a skewed
+    /// clock). The ledger records every settlement from then on, apart from
+    /// the rows it drops on a failure, which the node logs and counts. Built
+    /// from the chain (`decdn node earnings --address`) it is the block time of
+    /// the scan's first block, and every settlement from that block on is
+    /// counted.
+    pub covered_from_unix: u64,
     /// The 24 hours before the request.
     pub last_24h: EarningsPeriod,
     /// The 7 days before the request.
     pub last_7d: EarningsPeriod,
     /// Every settlement the figures cover. Its `from_unix` is
-    /// [`Self::ledger_since_unix`], or `0` when there is none.
+    /// [`Self::covered_from_unix`].
     pub since_ledger_start: EarningsPeriod,
     /// The period [`EarningsRequest::since_unix`] asked for; `None` when the
     /// request asked for none.
@@ -545,9 +549,9 @@ pub struct EarningsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EarningsPeriod {
     /// The period's inclusive start, Unix seconds. Its end is the request.
-    /// The figures cover only settlements the ledger holds, so a start before
-    /// [`EarningsResponse::ledger_since_unix`] sums a shorter span than it
-    /// names; the CLI says so in the row label.
+    /// The figures cover only settlements from
+    /// [`EarningsResponse::covered_from_unix`] on, so a start before it sums a
+    /// shorter span than it names; the CLI says so in the row label.
     pub from_unix: u64,
     /// Micro-USDC the operator actually received: the sum of the USDC
     /// transfers from the `FeeRouter` to the operator, one per settlement.

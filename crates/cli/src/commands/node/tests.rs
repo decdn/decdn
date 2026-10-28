@@ -1129,7 +1129,7 @@ mod earnings {
     use super::*;
 
     const NOW: u64 = 1_792_926_150; // 2026-10-25 11:02:30 UTC
-    const LEDGER_SINCE: u64 = 1_780_000_000; // 2026-05-28
+    const COVERED_FROM: u64 = 1_780_000_000; // 2026-05-28
 
     fn period(from: u64, net: u64, bytes: u64, settlements: u64) -> EarningsPeriod {
         EarningsPeriod {
@@ -1144,10 +1144,10 @@ mod earnings {
     fn response() -> EarningsResponse {
         EarningsResponse {
             operator_address: Some("0x52908400098527886E0F7030069857D2E4169EE7".to_owned()),
-            ledger_since_unix: Some(LEDGER_SINCE),
+            covered_from_unix: COVERED_FROM,
             last_24h: period(NOW - 86_400, 4_120_000, 412_300_000_000, 9),
             last_7d: period(NOW - 604_800, 29_070_000, 2_900_000_000_000, 61),
-            since_ledger_start: period(LEDGER_SINCE, 121_410_000, 12_400_000_000_000, 1_160),
+            since_ledger_start: period(COVERED_FROM, 121_410_000, 12_400_000_000_000, 1_160),
             since: None,
             last_settlement: Some(LastSettlement {
                 at_unix: NOW - 3_600,
@@ -1178,7 +1178,7 @@ mod earnings {
         let lines: Vec<&str> = s.lines().collect();
         assert_eq!(
             lines.first().copied(),
-            Some("operator=0x52908400098527886E0F7030069857D2E4169EE7 ledger_since=2026-05-28")
+            Some("operator=0x52908400098527886E0F7030069857D2E4169EE7 covered_from=2026-05-28")
         );
         assert!(
             lines.get(1).is_some_and(|l| l.starts_with("PERIOD")
@@ -1224,11 +1224,10 @@ mod earnings {
     }
 
     #[test]
-    fn write_earnings_names_an_empty_ledger_and_a_missing_schedule() {
+    fn write_earnings_renders_an_empty_ledger_and_a_missing_schedule() {
         let mut resp = response();
-        resp.ledger_since_unix = None;
         resp.last_settlement = None;
-        resp.since_ledger_start = period(0, 0, 0, 0);
+        resp.since_ledger_start = period(COVERED_FROM, 0, 0, 0);
         resp.pending = Some(PendingRedeem {
             micro_usdc: 0,
             lanes: 0,
@@ -1238,8 +1237,8 @@ mod earnings {
             next_sweep_at_unix: None,
         });
         let s = render(&resp);
-        assert!(s.contains("ledger_since=(no settlements yet)"), "{s}");
-        assert!(s.contains("since (no settlements yet)"), "{s}");
+        assert!(s.contains("covered_from=2026-05-28"), "{s}");
+        assert!(s.lines().any(|l| l.starts_with("since 2026-05-28 ")), "{s}");
         assert!(s.contains("0 B"), "{s}");
         assert!(s.contains("last settlement: none"), "{s}");
         assert!(
@@ -1252,31 +1251,44 @@ mod earnings {
     }
 
     #[test]
-    fn a_period_older_than_the_ledger_says_so() {
+    fn a_period_older_than_the_coverage_says_so() {
         let mut resp = response();
         // The ledger started two days ago: the 7-day row and a `--since` from
         // a month ago cover less than their names say.
-        resp.ledger_since_unix = Some(NOW - 2 * 86_400);
+        resp.covered_from_unix = NOW - 2 * 86_400;
         resp.since_ledger_start.from_unix = NOW - 2 * 86_400;
         resp.since = Some(period(NOW - 30 * 86_400, 7_000_000, 1_000, 2));
         let s = render(&resp);
         assert!(
             s.lines()
-                .any(|l| l.starts_with("last 24h ") && !l.contains("ledger from")),
+                .any(|l| l.starts_with("last 24h ") && !l.contains("covered from")),
             "{s}"
         );
         assert!(
             s.lines()
-                .any(|l| l.starts_with("last 7d (ledger from 2026-10-23)")),
+                .any(|l| l.starts_with("last 7d (covered from 2026-10-23)")),
             "{s}"
         );
         assert!(
             s.lines().any(
-                |l| l.starts_with("since 2026-09-25 (ledger from 2026-10-23)")
+                |l| l.starts_with("since 2026-09-25 (covered from 2026-10-23)")
                     && l.contains("7.000000")
             ),
             "{s}"
         );
+    }
+
+    /// The ledger covered the whole week but its first settlement landed an
+    /// hour ago: the 7-day figure is complete, so its row carries no
+    /// truncation note (#2624).
+    #[test]
+    fn a_late_first_settlement_does_not_truncate_a_covered_period() {
+        let mut resp = response();
+        resp.covered_from_unix = NOW - 30 * 86_400;
+        resp.since_ledger_start = period(NOW - 30 * 86_400, 500_000, 1_000, 1);
+        let s = render(&resp);
+        assert!(!s.contains("covered from"), "{s}");
+        assert!(s.lines().any(|l| l.starts_with("last 7d ")), "{s}");
     }
 
     #[test]

@@ -255,7 +255,7 @@
       "state": "ok",
       "value": {
         "operator_address": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
-        "ledger_since_unix": 1790000000,
+        "covered_from_unix": 1790000000,
         "last_24h": {
           "from_unix": 1792913600,
           "net_micro_usdc": 120000,
