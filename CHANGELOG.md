@@ -5254,6 +5254,14 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **sponsord-onramp: a Turnstile token is bound to the onramp's hostname and
+  action (GHSA-jr93-46mf-88wx).** The gate decoded only `success` from the
+  siteverify response, so a token minted for the same sitekey on another
+  hostname passed, and nothing tied a token to this gate's widget. The widget
+  now sets `data-action="onramp-fund"`, and `verify()` refuses a response
+  whose `hostname` differs from `ONRAMP_PUBLIC_URL`'s host or whose `action`
+  is not the onramp's.
+
 - **Node: a pool resolved from chain counts its on-chain redemptions toward
   its remaining deposit (GHSA-9x5g-h559-vp5m).** After a restart the pool
   projection is empty, so the admit path reads a pool it has not folded with
