@@ -11,6 +11,18 @@
 //! blob has two admissible holders, so its loop runs a lane on each; each small
 //! blob has exactly ONE holder, so its loop runs one lane.
 //!
+//! The large blob is four times `min_split_size`, so the split does not depend
+//! on which holder answers the probe first. An entry's probe round starts the
+//! fetch at the first holder that answers. That lane takes the whole blob when
+//! it is the only lane, and the other holder joins a few milliseconds later. A
+//! lane that joins late splits a range only while the range misses at least
+//! `min_split_size` ([ADR 039 § Dynamic segmentation and
+//! tail-stealing](https://github.com/decdn/decdn/blob/main/adr/039-multi-source-parallel-fetch.md#dynamic-segmentation-and-tail-stealing)).
+//! The first lane must fetch three quarters of this blob before that floor
+//! stops the steal, and the other holder joins long before that, so it steals
+//! half of the missing bytes. A blob below `min_split_size` splits only when
+//! both holders answer before the fetch starts.
+//!
 //! What this test asserts:
 //!   1. All three outputs are byte-identical to their source blobs.
 //!   2. ONE pull invocation bills holder A MORE than the wire bytes of
@@ -69,10 +81,16 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 /// chunk-log 4 == 16 KiB chunk groups).
 const CHUNK_GROUP: usize = 16 * 1024;
 
-/// Deterministic pseudo-random blob (~640 KiB), spanning many chunk groups plus
-/// a ragged final group.
+/// The client's `min_split_size` (ADR 039 § Parameters): the fewest missing
+/// bytes in a range that a lane which joins late splits.
+const MIN_SPLIT_SIZE: usize = 16 * 1024 * 1024;
+
+/// Deterministic pseudo-random blob of `4 × MIN_SPLIT_SIZE` plus a ragged final
+/// group. A holder that joins after the other holder's lane has started steals
+/// half of the missing bytes, unless that lane has already fetched three
+/// quarters of the blob.
 fn make_large_blob() -> Vec<u8> {
-    let mut v = vec![0u8; 40 * CHUNK_GROUP + 777];
+    let mut v = vec![0u8; 4 * MIN_SPLIT_SIZE + 777];
     let mut x: u32 = 0xC0FF_EE11;
     for b in &mut v {
         x ^= x << 13;
@@ -347,7 +365,9 @@ fn billed_bytes(
 ///
 /// The nodes' chain watchers observe the freshly-opened pool asynchronously,
 /// and a holder whose watcher has not caught up refuses the stream pre-serve;
-/// exit status is therefore not a readiness signal for this journey.
+/// exit status is therefore not a readiness signal for this journey. The wait
+/// covers only that readiness: once both holders serve, the size of the large
+/// blob makes the split independent of which holder answers first.
 ///
 /// The deltas are measured PER INVOCATION (before/after baselines around each
 /// attempt): a loop that accumulated payments across attempts would pass on two
