@@ -298,6 +298,7 @@ pub use credential::{
 };
 pub use downloader::{DownloadTarget, Downloader};
 pub use driver::PoolExhausted;
+pub use fault::PoolOpenRefused;
 pub use ledger::{Cumulative, PoolLedger};
 pub use recovery::RecoveryGate;
 pub use sink::{BlobCache, NoCache, SinkFuture};

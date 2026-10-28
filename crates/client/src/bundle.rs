@@ -44,7 +44,7 @@ use crate::funding::RunFunding;
 use crate::ordered_writes::OrderedWrites;
 use crate::receipt::ReceiptEvidence;
 use crate::session::{
-    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, PullSite,
+    ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PinnedNode, PoolOpen, PullSite,
 };
 use crate::stream_cap::LaneStreamCap;
 use crate::uri::DecdnUri;
@@ -1054,6 +1054,7 @@ impl BundlePullerBuilder {
                     working_deposit: U256::ZERO,
                     max_approve: false,
                     adoption: ChainAdoption::Refused,
+                    open: PoolOpen::Refused,
                 };
                 (
                     slot.current().signer,

@@ -77,6 +77,26 @@ pub enum ChainAdoption {
     Refused,
 }
 
+/// Whether a buy may open a new pool when it has no open pool to reuse or
+/// adopt.
+///
+/// The gate covers every `openPool` of the run: a lane build's, and a funding
+/// recovery step's replacement of the run's pool. A `topUp` of a reused or
+/// adopted pool (its low-water refill, or a funding recovery step's) is not an
+/// open, so the gate leaves it as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolOpen {
+    /// The buy opens a pool at the working deposit when it has none.
+    Allowed,
+    /// The buy sends no `openPool`. With no open pool to reuse or adopt, a
+    /// lane build ends the command with
+    /// [`PoolOpenRefused`](crate::PoolOpenRefused), before any allowance or
+    /// `openPool`; so does a funding recovery step that would replace the
+    /// run's pool. [`PoolOpenRefused::find`](crate::PoolOpenRefused::find)
+    /// detects it in a pull's error.
+    Refused,
+}
+
 /// How a self-owned pull funds its pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DepositPolicy {
@@ -89,6 +109,8 @@ pub struct DepositPolicy {
     pub max_approve: bool,
     /// Whether a buyer store with no row may adopt the wallet's live pool.
     pub adoption: ChainAdoption,
+    /// Whether the buy may open a pool when it has none to reuse or adopt.
+    pub open: PoolOpen,
 }
 
 /// The proxy-warming rule (ADR 037): route through a nearer non-holder when

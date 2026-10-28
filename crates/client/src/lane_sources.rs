@@ -317,6 +317,7 @@ where
             payment_pool_addr: self.deps.chain.payment_pool,
             working_deposit: self.deps.deposit.working_deposit,
             max_approve: self.deps.deposit.max_approve,
+            open: self.deps.deposit.open,
             funding: self.deps.funding,
         }
     }

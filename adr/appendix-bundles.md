@@ -450,8 +450,12 @@ The rules below apply to every pull:
   entries only when an earlier pull or `decdn quote` into the same output
   directory cached the bundle manifest under `.decdn-bundles/`. Without
   that cache, the dry run prints only the bundle hash and the output
-  directory, and names the `decdn quote` command that gets the price. On a
-  blob URI, the dry run prints the destination and the price. A cache file that the dry run cannot read, or that fails its
+  directory, and names the `decdn quote` command that gets the price. That
+  command fetches the manifest with a small paid pull from the buyer's open
+  pool. When the buyer has no open pool to reuse or adopt, `decdn quote`
+  sends no `openPool` unless the user adds `--open-pool`. On a blob URI,
+  the dry run prints the destination and the price. A cache file that the
+  dry run cannot read, or that fails its
   hash check, fails the dry run. A pull caches each manifest it fetches, keyed by its hash.
   A later pull of the same bundle into the same directory reads the
   cache. `--overwrite` makes a real pull fetch the manifest again.

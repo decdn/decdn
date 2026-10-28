@@ -3,6 +3,7 @@ source: crates/client/tests/public_api.rs
 expression: public_api.to_string()
 ---
 pub mod decdn_client
+pub use decdn_client::PoolOpenRefused
 pub mod decdn_client::bundle
 #[non_exhaustive] pub enum decdn_client::bundle::BundleEnd
 pub decdn_client::bundle::BundleEnd::Complete
@@ -540,6 +541,9 @@ pub mod decdn_client::session
 pub enum decdn_client::session::ChainAdoption
 pub decdn_client::session::ChainAdoption::Allowed
 pub decdn_client::session::ChainAdoption::Refused
+pub enum decdn_client::session::PoolOpen
+pub decdn_client::session::PoolOpen::Allowed
+pub decdn_client::session::PoolOpen::Refused
 pub struct decdn_client::session::ChainConfig
 pub decdn_client::session::ChainConfig::capacity_bond: core::option::Option<alloy_primitives::bits::address::Address>
 pub decdn_client::session::ChainConfig::chain_id: u64
@@ -551,6 +555,7 @@ pub const fn decdn_client::session::ChainConfig::deployment(&self) -> decdn_ince
 pub struct decdn_client::session::DepositPolicy
 pub decdn_client::session::DepositPolicy::adoption: decdn_client::session::ChainAdoption
 pub decdn_client::session::DepositPolicy::max_approve: bool
+pub decdn_client::session::DepositPolicy::open: decdn_client::session::PoolOpen
 pub decdn_client::session::DepositPolicy::working_deposit: alloy_primitives::aliases::U256
 pub struct decdn_client::session::DiscoveryOptions
 pub decdn_client::session::DiscoveryOptions::max_sources: usize

@@ -390,7 +390,9 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
 
     use crate::buyer_pool::WatermarkRow;
     use crate::lanes::{LaneDeps, LanePayer};
-    use crate::session::{ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PullSite};
+    use crate::session::{
+        ChainAdoption, ChainConfig, DepositPolicy, DiscoveryOptions, PoolOpen, PullSite,
+    };
 
     let credential = |signer: &PrivateKeySigner| -> anyhow::Result<crate::Credential> {
         let capability = decdn_incentive::Capability {
@@ -488,6 +490,7 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
             working_deposit: U256::ZERO,
             max_approve: false,
             adoption: ChainAdoption::Refused,
+            open: PoolOpen::Allowed,
         },
         namespace_id: decdn_protocol::client::NO_NAMESPACE,
         max_rate_per_mb: 0,
