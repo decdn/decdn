@@ -983,13 +983,18 @@ const REANCHOR_POOLS_PER_TICK: usize = 64;
 /// How many re-anchor `getPool` reads run at once.
 const REANCHOR_READ_CONCURRENCY: usize = 8;
 
+/// Bound on each re-anchor RPC. The reads run on the poller every watcher
+/// shares, so a hung endpoint holds it for at most two of these per tick: the
+/// block number, then one wave of reads, whose first fault stops the batch.
+const REANCHOR_RPC_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Read the pools `projection` has pending at one block and anchor them there
 /// ([`PoolProjection::reanchor`]); forget a pool the read finds `Closed`.
 ///
-/// The turn rotates: the batch starts after `cursor`, the last pool read on an
-/// earlier tick. The first fault stops the batch and leaves the rest for the
-/// next tick, so a failing endpoint costs one timeout and never puts the
-/// watcher into backoff. A pool absent at the pinned block (a backend behind
+/// The turn rotates: the batch starts after `cursor`, the last pool attempted
+/// on an earlier tick. The first fault stops the batch and leaves the rest for
+/// the next tick, so a failing endpoint costs one [`REANCHOR_RPC_TIMEOUT`]
+/// wave and never puts the watcher into backoff. A pool absent at the pinned block (a backend behind
 /// the admit read, or an open a reorg dropped) stays pending.
 async fn reanchor_pools<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -1001,7 +1006,7 @@ async fn reanchor_pools<P: Provider + Clone>(
         return;
     }
     let block = match timed(
-        None,
+        Some(REANCHOR_RPC_TIMEOUT),
         "re-anchor block number",
         contract.provider().get_block_number(),
     )
@@ -1028,7 +1033,7 @@ async fn reanchor_pools<P: Provider + Clone>(
 
 /// Read `batch` at `block`, at most [`REANCHOR_READ_CONCURRENCY`] at once and in
 /// order, stopping at the first fault. Returns the reads to anchor and the pools
-/// found `Closed`, and moves `cursor` to the last pool read.
+/// found `Closed`, and moves `cursor` to the last pool attempted.
 async fn read_reanchor_batch<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     batch: Vec<B256>,
@@ -1041,6 +1046,9 @@ async fn read_reanchor_batch<P: Provider + Clone>(
     let mut anchored = Vec::new();
     let mut closed = Vec::new();
     while let Some((pool_id, read)) = reads.next().await {
+        // A faulted pool moves the cursor too, so a pool whose read keeps
+        // failing cannot hold back the pools behind it.
+        *cursor = Some(pool_id);
         let pool = match read {
             Ok(pool) => pool,
             Err(err) => {
@@ -1053,7 +1061,6 @@ async fn read_reanchor_batch<P: Provider + Clone>(
                 break;
             }
         };
-        *cursor = Some(pool_id);
         if matches!(pool.status, PaymentPool::Status::Closed) {
             closed.push(pool_id);
         } else if let Some(lifecycle) = resolved_lifecycle(&pool) {
@@ -1084,7 +1091,7 @@ fn reanchor_batch(pending: &[B256], cursor: Option<B256>) -> Vec<B256> {
         .collect()
 }
 
-/// `getPool(pool_id)` pinned at `block`, under the default RPC bound.
+/// `getPool(pool_id)` pinned at `block`, bounded by [`REANCHOR_RPC_TIMEOUT`].
 async fn read_pool_at<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     pool_id: B256,
@@ -1092,7 +1099,7 @@ async fn read_pool_at<P: Provider + Clone>(
 ) -> Result<PaymentPool::Pool> {
     let call = contract.getPool(pool_id);
     timed(
-        None,
+        Some(REANCHOR_RPC_TIMEOUT),
         "re-anchor getPool",
         call.call().block(BlockId::Number(block.into())),
     )

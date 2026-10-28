@@ -321,6 +321,27 @@ async fn reanchor_below_a_folded_event_is_ignored() {
 }
 
 #[tokio::test]
+async fn reanchor_below_the_seed_is_ignored() {
+    let view = PoolProjection::new();
+    // A pool drained before the restart, with no lane folded yet.
+    view.record_resolved(pool(1), addr(7), 1_000, 1_000, Lifecycle::Open);
+    // A backend behind the admit read still sees nothing redeemed.
+    view.reanchor(10, &[read(pool(1), 1_000, 0)]);
+    assert_eq!(remaining(&view, pool(1)).await, 0);
+    assert_eq!(view.pending_rereads(), vec![pool(1)]);
+
+    // A deposit below the seed's is just as stale.
+    view.record_resolved(pool(2), addr(7), 3_000, 0, Lifecycle::Open);
+    view.reanchor(10, &[read(pool(2), 1_000, 0)]);
+    assert_eq!(remaining(&view, pool(2)).await, 3_000);
+    assert!(view.pending_rereads().contains(&pool(2)));
+
+    // A read that catches up anchors the pool.
+    view.reanchor(11, &[read(pool(1), 1_000, 1_000)]);
+    assert_eq!(view.pending_rereads(), vec![pool(2)]);
+}
+
+#[tokio::test]
 async fn a_redemption_without_a_block_marks_a_reread_only_when_it_advances() {
     let view = PoolProjection::new();
     view.record_resolved(pool(1), addr(7), 1_000, 600, Lifecycle::Open);

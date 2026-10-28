@@ -5269,8 +5269,10 @@ since project inception and will roll into the first tagged release.
   than a guess, so `remaining` never counts a redemption twice and errs
   toward serving until the next clean tick. The one exception is a reorg that
   drops redemptions at or below the pinned block, which keeps counting them
-  until the next re-read. A pool seeded from a read ignores replayed
-  `PoolOpened` / `PoolToppedUp` logs the read already holds.
+  until the next re-read. A re-read whose `totalRedeemed` or deposit is below
+  what the node already holds (a backend behind the admit read) is skipped
+  and retried, and a pool seeded from a read ignores replayed `PoolOpened` /
+  `PoolToppedUp` logs the read already holds.
 
 - **Node: request timestamps are bounded to the node's clock before anything
   is signed (GHSA-fjcq-8x46-cq5c).** The signed probe and stream response

@@ -456,7 +456,9 @@ async fn reanchor_pools_keeps_a_pool_absent_at_the_pinned_block() {
 }
 
 /// The first faulted read stops the batch: later pools wait for the next tick
-/// instead of each paying a timeout against a failing endpoint.
+/// instead of each paying a timeout against a failing endpoint. The faulted
+/// pool moves the cursor, so one whose read keeps failing cannot hold back the
+/// pools behind it.
 #[tokio::test]
 async fn reanchor_pools_stops_at_the_first_fault() {
     let projection = PoolProjection::new();
@@ -478,8 +480,9 @@ async fn reanchor_pools_stops_at_the_first_fault() {
 
     assert_eq!(projection.pending_rereads().len(), 4);
     assert_eq!(
-        cursor, None,
-        "a fault on the first pool keeps it first next tick"
+        cursor,
+        Some(B256::repeat_byte(0x50)),
+        "the faulted pool moves the cursor, so the next tick starts after it"
     );
 }
 

@@ -274,14 +274,18 @@ pub struct PoolRead {
 }
 
 impl PoolEntry {
-    fn status(&self) -> PoolStatus {
-        let redeemed = self.snapshot.map_or(self.total_redeemed, |snapshot| {
+    /// The projection's lower bound on on-chain `totalRedeemed`.
+    fn redeemed(&self) -> u64 {
+        self.snapshot.map_or(self.total_redeemed, |snapshot| {
             self.total_redeemed
                 .max(snapshot.redeemed.saturating_add(snapshot.since))
-        });
+        })
+    }
+
+    fn status(&self) -> PoolStatus {
         PoolStatus {
             owner: self.owner,
-            remaining: U256::from(self.deposit.saturating_sub(redeemed)),
+            remaining: U256::from(self.deposit.saturating_sub(self.redeemed())),
             lifecycle: self.lifecycle,
         }
     }
@@ -529,9 +533,14 @@ impl PoolProjection {
     /// Anchor snapshot-seeded pools at `getPool` reads pinned at `block`, in one
     /// publish: each takes its `totalRedeemed` and deposit from the read, a
     /// `Closing` lifecycle from the read, and restarts the count of advances
-    /// above it. A read is skipped for a pool folded from its `PoolOpened`, for a
-    /// pool no longer in the projection, and when `block` is below an event
-    /// already folded into the entry, which the read would then predate.
+    /// above it. A read is skipped for a pool folded from its `PoolOpened` and for
+    /// a pool no longer in the projection. A read that predates what the entry
+    /// already holds is skipped too, and the pool stays pending: `block` below a
+    /// folded event, or a `totalRedeemed` or deposit below the entry's, which on
+    /// chain only rise. That covers a lagging backend behind the admit read, whose
+    /// block is unknown. A reorg that lowers either value on chain also keeps the
+    /// pool pending, refusing toward the stale higher value, until the chain
+    /// passes it again.
     pub fn reanchor(&self, block: u64, reads: &[PoolRead]) {
         if reads.is_empty() {
             return;
@@ -541,10 +550,12 @@ impl PoolProjection {
                 let Some(entry) = pools.get_mut(&read.pool_id) else {
                     continue;
                 };
+                let stale_read =
+                    read.total_redeemed < entry.redeemed() || read.deposit < entry.deposit;
                 let Some(snapshot) = entry.snapshot.as_mut() else {
                     continue;
                 };
-                if block < snapshot.folded_through {
+                if block < snapshot.folded_through || stale_read {
                     continue;
                 }
                 *snapshot = Snapshot {
