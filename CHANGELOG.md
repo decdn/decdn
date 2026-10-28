@@ -5261,12 +5261,16 @@ since project inception and will roll into the first tagged release.
   before the restart reported its whole deposit as `remaining` for the rest of
   the node's uptime, and the admission solvency gate and the mid-stream
   re-check served it unpaid. The seed now carries `getPool.totalRedeemed`, and
-  the settlement watcher re-reads each seeded pool at a pinned block at the
-  end of its tick (at most 64 pools per tick). Redemptions folded after that
-  block count on top of the read; one on a lane the projection has no
-  baseline for triggers another re-read rather than a guess, so `remaining`
-  never counts a redemption twice and errs only toward serving, until the
-  next clean tick.
+  the settlement watcher re-reads each seeded pool at one pinned block at the
+  end of its tick (up to 64 pools per tick, eight reads at a time, in a
+  rotating order; the first faulted read stops the batch). Redemptions
+  folded after that block count on top of the read; one on a lane the
+  projection has no baseline for marks the pool for another re-read rather
+  than a guess, so `remaining` never counts a redemption twice and errs
+  toward serving until the next clean tick. The one exception is a reorg that
+  drops redemptions at or below the pinned block, which keeps counting them
+  until the next re-read. A pool seeded from a read ignores replayed
+  `PoolOpened` / `PoolToppedUp` logs the read already holds.
 
 - **Node: request timestamps are bounded to the node's clock before anything
   is signed (GHSA-fjcq-8x46-cq5c).** The signed probe and stream response

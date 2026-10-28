@@ -21,7 +21,7 @@ async fn unknown_pool_is_none() {
     let view = PoolProjection::new();
     assert!(view.status(pool(1)).await.is_none());
     // A top-up or redemption for a never-opened pool creates no entry.
-    view.record_topup(pool(1), U256::from(100u64));
+    view.record_topup(pool(1), U256::from(100u64), None);
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 50)], None);
     assert!(view.status(pool(1)).await.is_none());
 }
@@ -39,7 +39,7 @@ async fn opened_pool_reports_full_deposit() {
 async fn topup_raises_remaining() {
     let view = PoolProjection::new();
     view.record_opened(pool(1), addr(7), U256::from(1_000u64));
-    view.record_topup(pool(1), U256::from(2_500u64));
+    view.record_topup(pool(1), U256::from(2_500u64), None);
     let status = view.status(pool(1)).await.unwrap();
     assert_eq!(status.remaining, U256::from(2_500u64));
 }
@@ -217,13 +217,22 @@ async fn remaining(view: &PoolProjection, id: B256) -> u64 {
     u64::try_from(status.remaining).expect("remaining fits u64")
 }
 
+fn read(id: B256, deposit: u64, total_redeemed: u64) -> PoolRead {
+    PoolRead {
+        pool_id: id,
+        deposit,
+        total_redeemed,
+        lifecycle: Lifecycle::Open,
+    }
+}
+
 #[tokio::test]
 async fn record_resolved_counts_onchain_redemptions() {
     let view = PoolProjection::new();
     // A pool drained before the restart reads as drained from the first admission.
     view.record_resolved(pool(1), addr(7), 1_000, 1_000, Lifecycle::Open);
     assert_eq!(remaining(&view, pool(1)).await, 0);
-    assert_eq!(view.unanchored(), vec![pool(1)]);
+    assert_eq!(view.pending_rereads(), vec![pool(1)]);
 }
 
 #[tokio::test]
@@ -233,7 +242,7 @@ async fn unanchored_seed_does_not_double_count_a_lane_with_history() {
     // The lane's 450 may sit wholly inside the snapshot's 600: count neither twice.
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 450)], Some(5));
     assert_eq!(remaining(&view, pool(1)).await, 400);
-    assert_eq!(view.unanchored(), vec![pool(1)]);
+    assert_eq!(view.pending_rereads(), vec![pool(1)]);
 }
 
 #[tokio::test]
@@ -241,62 +250,87 @@ async fn anchored_snapshot_counts_a_known_lanes_advance_once() {
     let view = PoolProjection::new();
     view.record_resolved(pool(1), addr(7), 1_000, 600, Lifecycle::Open);
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 450)], Some(5));
-    view.reanchor(pool(1), 1_000, 650, Lifecycle::Open, 10);
-    assert!(view.unanchored().is_empty());
+    view.reanchor(10, &[read(pool(1), 1_000, 650)]);
+    assert!(view.pending_rereads().is_empty());
     assert_eq!(remaining(&view, pool(1)).await, 350);
     // Only the 50 the lane advanced past its folded 450 is new.
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 500)], Some(11));
     assert_eq!(remaining(&view, pool(1)).await, 300);
-    assert!(view.unanchored().is_empty());
+    assert!(view.pending_rereads().is_empty());
 }
 
 #[tokio::test]
-async fn a_lane_with_no_baseline_unanchors_until_the_next_read() {
+async fn a_lane_with_no_baseline_marks_the_snapshot_for_a_reread() {
     let view = PoolProjection::new();
     view.record_resolved(pool(1), addr(7), 1_000, 600, Lifecycle::Open);
-    view.reanchor(pool(1), 1_000, 600, Lifecycle::Open, 10);
-    // 300 may be all new or mostly history the snapshot already holds: neither
-    // count it on top of 600 nor drop the anchor silently.
+    view.reanchor(10, &[read(pool(1), 1_000, 600)]);
+    // 300 may be all new or mostly history the snapshot already holds: count
+    // neither, and ask for a re-read.
     view.record_redeemed(pool(1), addr(9), &[lane(addr(3), 300)], Some(11));
     assert_eq!(remaining(&view, pool(1)).await, 400);
-    assert_eq!(view.unanchored(), vec![pool(1)]);
-    view.reanchor(pool(1), 1_000, 900, Lifecycle::Open, 12);
+    assert_eq!(view.pending_rereads(), vec![pool(1)]);
+    view.reanchor(12, &[read(pool(1), 1_000, 900)]);
     assert_eq!(remaining(&view, pool(1)).await, 100);
-    assert!(view.unanchored().is_empty());
+    assert!(view.pending_rereads().is_empty());
+}
+
+#[tokio::test]
+async fn a_stale_snapshot_keeps_counting_advances_it_can_place() {
+    let view = PoolProjection::new();
+    // 1000 redeemed on lanes the watcher never saw.
+    view.record_resolved(pool(1), addr(7), 2_000, 1_000, Lifecycle::Open);
+    view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 100)], Some(5));
+    view.reanchor(10, &[read(pool(1), 2_000, 1_000)]);
+    // An unplaceable advance makes the snapshot stale...
+    view.record_redeemed(pool(1), addr(9), &[lane(addr(3), 50)], Some(11));
+    // ...but a known lane's advance above the anchor still counts.
+    view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 600)], Some(12));
+    // redeemed ≥ 1000 (read) + 500 (lane 2's advance); the lane fold is 650.
+    assert_eq!(remaining(&view, pool(1)).await, 500);
+    assert_eq!(view.pending_rereads(), vec![pool(1)]);
 }
 
 #[tokio::test]
 async fn replayed_redemptions_at_or_below_the_anchor_are_not_counted_again() {
     let view = PoolProjection::new();
     view.record_resolved(pool(1), addr(7), 1_000, 400, Lifecycle::Open);
-    view.reanchor(pool(1), 1_000, 400, Lifecycle::Open, 20);
+    view.reanchor(20, &[read(pool(1), 1_000, 400)]);
     // A watcher catching up from an old checkpoint folds history the read holds.
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 300)], Some(5));
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 400)], Some(20));
     assert_eq!(remaining(&view, pool(1)).await, 600);
-    assert!(view.unanchored().is_empty());
+    assert!(view.pending_rereads().is_empty());
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 450)], Some(21));
     assert_eq!(remaining(&view, pool(1)).await, 550);
 }
 
 #[tokio::test]
-async fn reanchor_below_a_folded_redemption_is_ignored() {
+async fn reanchor_below_a_folded_event_is_ignored() {
     let view = PoolProjection::new();
     view.record_resolved(pool(1), addr(7), 1_000, 600, Lifecycle::Open);
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 100)], Some(30));
     // A lagging backend's read at block 25 predates the folded block-30 event.
-    view.reanchor(pool(1), 1_000, 500, Lifecycle::Open, 25);
-    assert_eq!(view.unanchored(), vec![pool(1)]);
+    view.reanchor(25, &[read(pool(1), 1_000, 500)]);
+    assert_eq!(view.pending_rereads(), vec![pool(1)]);
     assert_eq!(remaining(&view, pool(1)).await, 400);
+
+    view.record_resolved(pool(2), addr(7), 1_000, 0, Lifecycle::Open);
+    view.record_topup(pool(2), U256::from(2_000u64), Some(30));
+    view.reanchor(25, &[read(pool(2), 1_000, 0)]);
+    assert_eq!(remaining(&view, pool(2)).await, 2_000);
 }
 
 #[tokio::test]
-async fn redemption_without_a_block_unanchors() {
+async fn a_redemption_without_a_block_marks_a_reread_only_when_it_advances() {
     let view = PoolProjection::new();
     view.record_resolved(pool(1), addr(7), 1_000, 600, Lifecycle::Open);
-    view.reanchor(pool(1), 1_000, 600, Lifecycle::Open, 10);
+    view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 100)], Some(5));
+    view.reanchor(10, &[read(pool(1), 1_000, 600)]);
+    // A replay advances no lane: nothing to re-read.
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 100)], None);
-    assert_eq!(view.unanchored(), vec![pool(1)]);
+    assert!(view.pending_rereads().is_empty());
+    view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 150)], None);
+    assert_eq!(view.pending_rereads(), vec![pool(1)]);
 }
 
 #[tokio::test]
@@ -304,23 +338,20 @@ async fn reanchor_leaves_an_event_opened_pool_alone() {
     let view = PoolProjection::new();
     view.record_opened(pool(1), addr(7), U256::from(1_000u64));
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 100)], Some(3));
-    view.reanchor(pool(1), 1_000, 999, Lifecycle::Open, 10);
+    view.reanchor(10, &[read(pool(1), 1_000, 999)]);
     assert_eq!(remaining(&view, pool(1)).await, 900);
-    assert!(view.unanchored().is_empty());
+    assert!(view.pending_rereads().is_empty());
 }
 
 #[tokio::test]
-async fn reanchor_keeps_a_folded_close_and_the_higher_deposit() {
+async fn reanchor_keeps_a_folded_close() {
     let view = PoolProjection::new();
     view.record_resolved(pool(1), addr(7), 1_000, 0, Lifecycle::Open);
-    view.record_topup(pool(1), U256::from(2_000u64));
     view.record_closing(pool(1), 1_900_000_000);
-    // A lagging read still sees the pool Open at its first deposit.
-    view.reanchor(pool(1), 1_000, 0, Lifecycle::Open, 10);
-    let status = view.status(pool(1)).await.unwrap();
-    assert_eq!(status.remaining, U256::from(2_000u64));
+    // A lagging read still sees the pool Open.
+    view.reanchor(10, &[read(pool(1), 1_000, 0)]);
     assert_eq!(
-        status.lifecycle,
+        view.status(pool(1)).await.unwrap().lifecycle,
         Lifecycle::Closing {
             deadline: 1_900_000_000
         }
@@ -328,13 +359,27 @@ async fn reanchor_keeps_a_folded_close_and_the_higher_deposit() {
 }
 
 #[tokio::test]
-async fn replayed_open_or_topup_does_not_lower_the_deposit() {
+async fn snapshot_deposit_ignores_topups_the_read_holds() {
     let view = PoolProjection::new();
-    view.record_opened(pool(1), addr(7), U256::from(1_000u64));
-    view.record_topup(pool(1), U256::from(3_000u64));
-    view.record_topup(pool(1), U256::from(2_000u64));
+    view.record_resolved(pool(1), addr(7), 3_000, 0, Lifecycle::Open);
+    // A replayed open never lowers the read's deposit.
     view.record_opened(pool(1), addr(7), U256::from(1_000u64));
     assert_eq!(remaining(&view, pool(1)).await, 3_000);
+    view.reanchor(10, &[read(pool(1), 3_000, 0)]);
+    view.record_topup(pool(1), U256::from(2_000u64), Some(5));
+    assert_eq!(remaining(&view, pool(1)).await, 3_000);
+    view.record_topup(pool(1), U256::from(4_000u64), Some(11));
+    assert_eq!(remaining(&view, pool(1)).await, 4_000);
+}
+
+#[tokio::test]
+async fn event_opened_topup_is_absolute() {
+    let view = PoolProjection::new();
+    view.record_opened(pool(1), addr(7), U256::from(1_000u64));
+    // A reorg that swaps a top-up for a smaller one lowers the deposit again.
+    view.record_topup(pool(1), U256::from(10_000u64), Some(5));
+    view.record_topup(pool(1), U256::from(6_000u64), Some(5));
+    assert_eq!(remaining(&view, pool(1)).await, 6_000);
 }
 
 #[tokio::test]
