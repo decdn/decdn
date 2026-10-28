@@ -5321,12 +5321,17 @@ since project inception and will roll into the first tagged release.
   watcher resumes at its checkpoint, so a pool opened before a restart stayed
   unknown. Its lanes were submitted even once the pool was `Closing` past its
   deadline, reverted `PoolClosed` (taking the whole `redeemMany` with them)
-  and reverted again on every sweep. Once a chunk clears the redemption
-  floor, the redeemer now reads each unknown pool with one `getPool` and
-  seeds the view from it. A lane whose pool is absent, `Closed`, past its
-  close deadline or unreadable stays out of the submit and counts on
-  `decdn_redemption_skipped_insolvent_total`. A failed read counts as a chain
-  fault, so parked lanes stay parked until a clean sweep.
+  and reverted again on every sweep. Once the candidate lanes together clear
+  the redemption floor, the redeemer now reads each unknown pool with one
+  `getPool` and seeds the view from it. A lane whose pool is past its close
+  deadline stays out of the submit and counts on
+  `decdn_redemption_skipped_insolvent_total`. A lane whose pool is absent,
+  `Closed` or unreadable stays out and counts on the new
+  `decdn_redemption_skipped_pool_unresolved_total`; an absent or `Closed`
+  pool also logs a `warn!` naming it. The first failed read stops the reads
+  for that cycle, so an RPC outage costs one round of timeouts and lanes on
+  known pools still go through. A failed read counts as a chain fault, so
+  parked lanes stay parked until a clean sweep.
 
 - **Node: the mid-stream signer cap check counts a resolved pool's
   pre-restart spend (#2711).** After a restart the projection seeds a pool it

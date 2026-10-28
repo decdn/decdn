@@ -2291,7 +2291,7 @@ fn plan_lanes(
 ) -> Vec<PlannedLane> {
     // Hold/drop lanes whose pool cannot pay, read from the event-fed projection.
     // An unknown pool passes here; the pre-submit `resolve_unknown_pools` reads it
-    // once a chunk clears the floor. A lane's signer-registration status is
+    // once the candidate lanes together clear the redemption floor. A lane's signer-registration status is
     // resolved locally below — no chain read.
     let mut snapshot: HashMap<PoolId, Option<PoolStatus>> = HashMap::new();
     for st in &states {
@@ -2950,11 +2950,18 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
 /// on a pool that is closed or closing past its deadline reverts the whole
 /// `redeemMany` (`PoolClosed`), and would revert again on every sweep.
 ///
-/// Fails closed: a pool whose read faults, or that the chain shows absent or
-/// `Closed`, drops its lanes from this cycle. Returns the kept lanes and whether
-/// a read faulted. Each pool costs one `getPool`, at most
-/// [`REANCHOR_READ_CONCURRENCY`] at once; a seeded pool is then known, so the
-/// read is paid once per pool.
+/// Fails closed: a lane whose pool is still unknown after the reads (the read
+/// faulted, was not sent, or the chain shows the pool absent or `Closed`) stays
+/// out of this cycle and counts on `redemption_skipped_pool_unresolved`. A lane
+/// whose pool resolved but cannot pay counts on `redemption_skipped_insolvent`.
+/// Returns the kept lanes and whether a read faulted.
+///
+/// Each pool costs one `getPool`, at most [`REANCHOR_READ_CONCURRENCY`] at once.
+/// The first fault stops the reads, like [`read_reanchor_batch`], so an RPC
+/// outage costs one round of read timeouts, not one per unknown pool, and the
+/// lanes on pools the projection already holds still reach the submit. A seeded
+/// pool is known from then on. An absent or `Closed` pool is not seeded, so its
+/// lanes cost one `getPool` on every cycle that reaches them.
 async fn resolve_unknown_pools<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     plans: Vec<PlannedLane>,
@@ -2995,8 +3002,10 @@ async fn resolve_unknown_pools<P: Provider + Clone>(
                         },
                     );
                 } else {
-                    debug!(
+                    let lanes = plans.iter().filter(|plan| plan.pool_id == pool_id).count();
+                    warn!(
                         %pool_id,
+                        lanes,
                         "redeemer: pool absent or closed on-chain; its lanes are not submitted"
                     );
                 }
@@ -3007,19 +3016,30 @@ async fn resolve_unknown_pools<P: Provider + Clone>(
                     stage = "resolve",
                     error = %sanitize_err_chain(&err),
                     %pool_id,
-                    "pre-redeem getPool failed; the pool's lanes wait for the next attempt"
+                    "pre-redeem getPool failed; the unread pools' lanes wait for the next attempt"
                 );
+                break;
             }
         }
     }
+    drop(reads);
     let now = unix_now();
-    let (kept, dropped): (Vec<_>, Vec<_>) = plans.into_iter().partition(|plan| {
-        pool_view
-            .snapshot(plan.pool_id)
-            .is_some_and(|status| pool_is_redeemable(Some(status), now))
-    });
-    if !dropped.is_empty() {
-        metrics.redemption_skipped_insolvent_by(dropped.len() as u64);
+    let mut kept = Vec::with_capacity(plans.len());
+    let (mut unresolved, mut insolvent) = (0u64, 0u64);
+    for plan in plans {
+        match pool_view.snapshot(plan.pool_id) {
+            None => unresolved = unresolved.saturating_add(1),
+            Some(status) if !pool_is_redeemable(Some(status), now) => {
+                insolvent = insolvent.saturating_add(1);
+            }
+            Some(_) => kept.push(plan),
+        }
+    }
+    if unresolved > 0 {
+        metrics.redemption_skipped_pool_unresolved_by(unresolved);
+    }
+    if insolvent > 0 {
+        metrics.redemption_skipped_insolvent_by(insolvent);
     }
     (kept, read_failed)
 }

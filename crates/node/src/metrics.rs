@@ -886,6 +886,14 @@ pub struct DecdnMetrics {
     /// which pools are dry. Operator-visible name:
     /// `decdn_redemption_skipped_insolvent_total`.
     pub redemption_skipped_insolvent: Counter,
+    /// Lanes the redeemer kept out of a submit because their pool stayed
+    /// unknown after its pre-submit `getPool`: the read faulted, a fault ended
+    /// the reads before this pool's, or the chain shows the pool absent or
+    /// `Closed`. A fault clears on a later cycle; an absent or `Closed` pool
+    /// logs a `warn!` naming it and stays out. Counted once per skipped lane per
+    /// cycle. Operator-visible name:
+    /// `decdn_redemption_skipped_pool_unresolved_total`.
+    pub redemption_skipped_pool_unresolved: Counter,
     /// Lanes with value owed that the redeemer skipped because the signer's
     /// capability has expired, or expires within the redeemer's landing slack
     /// (ADR 003 §Revocation). The contract pays 0 for an expired capability, so
@@ -3126,6 +3134,10 @@ recorders! {
     /// `n` lanes were held or dropped by `pool_is_redeemable` in one planning
     /// pass (ADR 003); the batched form of `redemption_skipped_insolvent`.
     redemption_skipped_insolvent_by(n: u64) => redemption_skipped_insolvent.inc_by(n);
+
+    /// `n` lanes were kept out of a submit because their pool stayed unknown
+    /// after the pre-submit `getPool` (`resolve_unknown_pools`).
+    redemption_skipped_pool_unresolved_by(n: u64) => redemption_skipped_pool_unresolved.inc_by(n);
 
     /// `n` lanes were dropped from a redeem batch by the pre-submit on-chain
     /// watermark reconciliation because the chain already shows them settled to

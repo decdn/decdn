@@ -1809,10 +1809,10 @@ fn partition_keeps_redeemable_and_counts_skips() {
     assert_eq!(kept.len(), 2);
 }
 
-/// Build a [`PlannedLane`] for a given pool/signer, with an optional
-/// capability registration, for `group_by_pool` tests.
 /// A projection that holds pools `[1; 32]` to `[4; 32]` open and funded, so a
-/// redemption cycle submits their lanes without a pre-redeem `getPool`.
+/// redemption cycle submits their lanes without a pre-redeem `getPool`. A lane
+/// on any other pool makes the cycle read that pool first, which a test's mock
+/// queue must answer.
 fn open_pools() -> PoolProjection {
     let projection = PoolProjection::new();
     for pool in 1..=4u8 {
@@ -1825,6 +1825,8 @@ fn open_pools() -> PoolProjection {
     projection
 }
 
+/// Build a [`PlannedLane`] for a given pool/signer, with an optional
+/// capability registration, for `group_by_pool` tests.
 fn planned(pool: u8, signer: u8, unredeemed: u64, register: bool) -> PlannedLane {
     let signer_addr = Address::from([signer; 20]);
     let reg = register.then(|| PaymentPool::CapabilityReg {
@@ -3572,9 +3574,112 @@ async fn a_failed_pre_redeem_pool_read_holds_the_lane() -> Result<()> {
     ensure_metric_lines(
         &metrics,
         &[
-            "decdn_redemption_skipped_insolvent_total 1",
+            "decdn_redemption_skipped_pool_unresolved_total 1",
+            "decdn_redemption_skipped_insolvent_total 0",
             "decdn_redemption_reconcile_ok_total 0",
             "decdn_onchain_tx_send_failed_total 0",
+        ],
+    )
+}
+
+/// #2692: a lane on an unknown pool that the read shows open and funded is
+/// seeded into the projection and goes on to the submit path. The flush fails
+/// on purpose, so the cycle stops after the watermark reconcile.
+#[tokio::test]
+async fn a_lane_on_an_unknown_open_pool_is_seeded_and_kept() -> Result<()> {
+    use alloy::sol_types::{SolCall, SolValue};
+
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(FailingFlushStore(
+        decdn_incentive::MemoryPoolStateStore::new(),
+    ));
+    let projection = PoolProjection::new();
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&Bytes::from(
+        pool(Address::from([7u8; 20]), PaymentPool::Status::Open, 0).abi_encode(),
+    ));
+    asserter.push_success(&Bytes::from(
+        PaymentPool::getWatermarksCall::abi_encode_returns(&vec![lane(0)]),
+    ));
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 500, false)],
+        SELLER,
+        U256::from(1u64),
+        300,
+        true,
+        &metrics,
+        &projection,
+        &test_recorder(),
+    )
+    .await;
+
+    anyhow::ensure!(!faulted, "a failed flush is not a chain fault");
+    anyhow::ensure!(
+        projection.snapshot(PoolId::from([1u8; 32])).is_some(),
+        "the read seeds the pool"
+    );
+    assert_eq!(
+        asserter.read_q().len(),
+        0,
+        "the pool and watermark were read"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_redemption_skipped_pool_unresolved_total 0",
+            "decdn_redemption_skipped_insolvent_total 0",
+            "decdn_redemption_reconcile_ok_total 1",
+        ],
+    )
+}
+
+/// #2692: a pool whose read faults keeps only its own lanes out. A lane on a
+/// pool the projection already holds still reaches the submit path in the same
+/// cycle.
+#[tokio::test]
+async fn a_faulted_pool_read_leaves_known_pools_to_redeem() -> Result<()> {
+    use alloy::sol_types::SolCall;
+
+    let metrics = Arc::new(Metrics::new());
+    let store: Arc<dyn PoolStateStore> = Arc::new(FailingFlushStore(
+        decdn_incentive::MemoryPoolStateStore::new(),
+    ));
+    let projection = PoolProjection::new();
+    projection.record_opened(PoolId::from([1u8; 32]), Address::from([1u8; 20]), U256::MAX);
+    let (contract, asserter) = mocked_contract();
+    asserter.push_failure_msg("getPool refused");
+    asserter.push_success(&Bytes::from(
+        PaymentPool::getWatermarksCall::abi_encode_returns(&vec![lane(0)]),
+    ));
+
+    let faulted = redeem_planned_lanes(
+        &contract,
+        &store,
+        vec![planned(1, 0, 500, false), planned(9, 0, 500, false)],
+        SELLER,
+        U256::from(1u64),
+        300,
+        true,
+        &metrics,
+        &projection,
+        &test_recorder(),
+    )
+    .await;
+
+    anyhow::ensure!(faulted, "the failed read is a chain fault");
+    assert_eq!(
+        asserter.read_q().len(),
+        0,
+        "the known pool's watermark was read"
+    );
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_redemption_skipped_pool_unresolved_total 1",
+            "decdn_redemption_reconcile_ok_total 1",
         ],
     )
 }
