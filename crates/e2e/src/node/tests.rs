@@ -352,3 +352,45 @@ fn line_with_all_needs_every_needle_on_one_line() {
     );
     assert_eq!(line_with_all(log, &["pool_id=1", "absent"]), None);
 }
+
+fn health_naming(node_id: &str) -> HealthResponse {
+    HealthResponse {
+        node_id: node_id.to_owned(),
+        uptime_s: 1,
+        in_flight_streams: 0,
+        binding: BindingStatus::Unknown,
+        bound_node_id: None,
+        registry_active: true,
+    }
+}
+
+/// The health wait accepts only an answer from the fixture's own daemon. An
+/// admin port held by another process's daemon answers health as a different
+/// node, and a journey that trusted it would assert against that node.
+#[test]
+fn health_from_another_node_is_refused() {
+    let own = iroh::SecretKey::from_bytes(&[0x01; 32]).public();
+    let foreign = iroh::SecretKey::from_bytes(&[0x02; 32]).public();
+    let url = "http://127.0.0.1:9944";
+
+    ensure_health_from(
+        &health_naming(&alloy::primitives::hex::encode(own.as_bytes())),
+        own,
+        url,
+    )
+    .expect("the fixture's own node must pass");
+
+    let err = ensure_health_from(
+        &health_naming(&alloy::primitives::hex::encode(foreign.as_bytes())),
+        own,
+        url,
+    )
+    .expect_err("another node on the admin port must not pass");
+    assert!(
+        err.to_string().contains("another daemon holds the port"),
+        "unexpected error: {err:#}"
+    );
+
+    ensure_health_from(&health_naming("not-hex"), own, url)
+        .expect_err("an undecodable node_id must not pass");
+}
