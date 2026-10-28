@@ -285,10 +285,6 @@ impl ActivityRecorder {
         output: &Path,
         evidence: &Arc<ReceiptEvidence>,
     ) -> anyhow::Result<Arc<Self>> {
-        super::local_http::private_dir(dir)?;
-        prune(dir, KEPT_RECORDS.saturating_sub(1));
-        let now = now_ms();
-        let pid = std::process::id();
         let kind = match uri.target {
             UriTarget::Blob => PullKind::Blob,
             UriTarget::BundleEntry(_) => PullKind::Entry,
@@ -297,13 +293,12 @@ impl ActivityRecorder {
                 files_landed: 0,
                 counts: None,
             },
-            // `UriTarget` is non-exhaustive; a target this arm does not know
-            // records bytes only, never a bundle's file progress.
-            _ => {
-                tracing::warn!("unknown URI target; recording a bytes-only (blob) run");
-                PullKind::Blob
-            }
+            _ => anyhow::bail!("unsupported URI target {:?}", uri.target),
         };
+        super::local_http::private_dir(dir)?;
+        prune(dir, KEPT_RECORDS.saturating_sub(1));
+        let now = now_ms();
+        let pid = std::process::id();
         let recorder = Arc::new(Self {
             path: dir.join(format!("{now}-{pid}.json")),
             record: Mutex::new(PullRecord {

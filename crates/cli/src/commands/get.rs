@@ -234,7 +234,8 @@ fn parse_and_check(args: &GetArgs) -> anyhow::Result<DecdnUri> {
             }
             return Ok(uri);
         }
-        _ => {}
+        UriTarget::Bundle => {}
+        _ => anyhow::bail!("unsupported URI target in {:?}", args.uri),
     }
     anyhow::ensure!(
         !is_stdout(args),

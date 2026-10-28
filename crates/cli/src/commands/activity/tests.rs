@@ -83,8 +83,7 @@ async fn a_run_writes_its_record_and_ends_it() {
 }
 
 /// Each URI target records as its own kind: a bare hash as a blob run, a
-/// trailing slash as a bundle run, an entry path as an entry run. Only a
-/// Bundle target records as a bundle.
+/// trailing slash as a bundle run, an entry path as an entry run.
 #[tokio::test]
 async fn each_uri_target_records_its_own_kind() {
     for (text, kind) in [
