@@ -1229,6 +1229,16 @@ since project inception and will roll into the first tagged release.
   queues the rest from the delivered frontier, so a source that keeps failing
   at one point cannot stop progress. ADR 003 § Funding recovery states the
   rule.
+- **Client: a fetch whose first lanes are still building runs no probe round
+  (#2677).** The acquire loop asks for a discovery when a missing range has
+  no holder to serve it. It judged that against running lanes only, so on
+  its first pass, with every lane still connecting or building, every range
+  read as uncovered. A peer-store fast-path fetch then read the registry and
+  probed every holder mid-transfer, although the store had routed it without
+  a probe. A range a lane still connecting or building covers now counts as
+  covered, so discovery runs only for a range no running or building lane
+  covers, or when no source can start. ADR 012 and ADR 039 § Source set and
+  selection state the rule.
 - **Client: a streamed fetch with no size hint keeps the pull it opened for
   the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
   fast path, or a gateway pull whose size lookup finds none), the client read

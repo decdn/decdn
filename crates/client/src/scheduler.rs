@@ -1365,12 +1365,25 @@ impl Work {
     }
 
     /// Whether a pending entry holds a chunk no running lane covers. Such a
-    /// chunk goes to any lane, which serves it by pull-through, and it keeps
-    /// discovery looking for a node that covers it.
+    /// chunk goes to any lane, which serves it by pull-through.
     fn uncovered(&self, total_bytes: u64) -> bool {
-        self.pending
-            .iter()
-            .any(|seg| !self.uncovered_part(seg, total_bytes).is_empty())
+        self.uncovered_beside(total_bytes, &[])
+    }
+
+    /// Whether a pending entry holds a chunk that no running lane covers and
+    /// no coverage in `building` covers: the lanes still connecting or
+    /// building, each over its holder's coverage. Such a chunk has no known
+    /// holder on its way to serve it, so it keeps discovery looking for a node
+    /// that covers it. A chunk a building lane covers already has its holder.
+    fn uncovered_beside(&self, total_bytes: u64, building: &[Coverage]) -> bool {
+        self.pending.iter().any(|seg| {
+            let left = self.uncovered_part(seg, total_bytes);
+            let mut held = ChunkRanges::empty();
+            for coverage in building {
+                held |= covered_part(coverage, &left, total_bytes);
+            }
+            !(left - held).is_empty()
+        })
     }
 
     /// Plan the first batch of lanes: give every lane a slot, and replace
@@ -4128,12 +4141,21 @@ where
                     continue;
                 }
             }
-            let uncovered = work.lock().await.uncovered(total_bytes);
-            if discovering.is_none()
-                && arrivals.is_none()
-                && sources.wants_discovery(now, deposit, running.len(), uncovered)
-            {
-                discovering = Some(sources.provider().discover(sources.hash()));
+            // A range a lane still connecting or building covers is not
+            // uncovered: its holder is known, and the lane serves it once
+            // built. So a store-routed fetch whose first lanes are still
+            // building asks for no probe round (ADR 039 § Source set and
+            // selection).
+            if discovering.is_none() && arrivals.is_none() {
+                let building: Vec<Coverage> = connecting_set
+                    .iter()
+                    .filter_map(|&provider| sources.holder(provider))
+                    .map(|holder| holder_coverage(holder, total_bytes))
+                    .collect();
+                let uncovered = work.lock().await.uncovered_beside(total_bytes, &building);
+                if sources.wants_discovery(now, deposit, running.len(), uncovered) {
+                    discovering = Some(sources.provider().discover(sources.hash()));
+                }
             }
             let wake = match (sources.next_wake(now), growth.retry_at) {
                 (Some(at), Some(retry)) => Some(at.min(retry)),

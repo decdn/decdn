@@ -3879,6 +3879,46 @@ fn an_entry_covered_only_by_two_lanes_together_is_not_uncovered() -> anyhow::Res
     Ok(())
 }
 
+/// A lane still connecting or building covers its holder's blocks for
+/// discovery: a range only such a lane covers is not uncovered, and a range
+/// neither a running nor a building lane covers is.
+#[test]
+fn a_building_lane_covers_its_blocks_for_discovery() -> anyhow::Result<()> {
+    use std::collections::VecDeque;
+
+    use decdn_bao_range::align_range;
+
+    use super::Work;
+
+    let total = 2 * DISCOVERY_BLOCK_BYTES;
+    let both_blocks = align_range(0, total, total)?;
+    let mut work = Work::new(VecDeque::from(vec![both_blocks]), false);
+    assert!(work.uncovered_beside(total, &[]), "no lane at all");
+    assert!(
+        work.uncovered_beside(total, &[cov(2, &[0])]),
+        "block 1 has no running or building lane"
+    );
+    assert!(
+        !work.uncovered_beside(total, &[cov(2, &[0]), cov(2, &[1])]),
+        "two building lanes cover it between them"
+    );
+    assert!(
+        !work.uncovered_beside(total, &[Coverage::full(2)]),
+        "a building lane holds the whole blob"
+    );
+    let a = work.add_lane(Some(cov(2, &[0])), total);
+    assert!(
+        !work.uncovered_beside(total, &[cov(2, &[1])]),
+        "a running lane and a building lane cover it between them"
+    );
+    work.park(a);
+    assert!(
+        work.uncovered_beside(total, &[cov(2, &[1])]),
+        "a parked lane covers nothing"
+    );
+    Ok(())
+}
+
 /// A lane barred from pull-through is never handed a range outside its
 /// coverage, and still takes the ranges it covers. Lifting the bar hands
 /// it the uncovered range again.
@@ -4904,28 +4944,30 @@ async fn a_halted_acquire_starts_no_lane_build() -> anyhow::Result<()> {
 /// usable again, so the acquire completes instead of stopping.
 #[tokio::test(start_paused = true)]
 async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyhow::Result<()> {
-    /// Static lanes whose discovery stands in for a sibling entry: from
-    /// its second call on, it tops up the shared lane context before it
-    /// answers. The first call runs as the fetch starts, before any lane
-    /// has run dry.
+    /// Static lanes whose discovery stands in for a sibling entry: once
+    /// the lane is built, each call tops up the shared lane context before
+    /// it answers. A call before then leaves the deposit as it is, so the
+    /// top-up lands only after the lane names the deposit.
     struct SiblingTopUp {
         lanes: StaticSources<ScriptedSource>,
         ctx: Arc<Mutex<PoolContext>>,
-        calls: std::sync::atomic::AtomicU32,
+        built: std::sync::atomic::AtomicBool,
+        top_ups: std::sync::atomic::AtomicU32,
     }
 
     impl crate::SourceProvider for SiblingTopUp {
         type Source = ScriptedSource;
 
         fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
-            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+            if self.built.load(std::sync::atomic::Ordering::SeqCst) {
                 self.ctx.lock().unwrap().deposit = U256::from(200u32);
+                self.top_ups
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             self.lanes.discover(hash)
         }
 
-        /// The build takes a second, so the first discovery ends before
-        /// any lane names the deposit.
+        /// The build takes a second.
         fn connect<'a>(
             &'a self,
             holder: &'a crate::Holder,
@@ -4933,7 +4975,9 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
         ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                self.lanes.connect(holder, ended).await
+                let lane = self.lanes.connect(holder, ended).await;
+                self.built.store(true, std::sync::atomic::Ordering::SeqCst);
+                lane
             })
         }
     }
@@ -4954,7 +4998,8 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
     let provider = SiblingTopUp {
         lanes: StaticSources::new(vec![candidate_ctx(a, la, Arc::clone(&ctx), None)])?,
         ctx,
-        calls: std::sync::atomic::AtomicU32::new(0),
+        built: std::sync::atomic::AtomicBool::new(false),
+        top_ups: std::sync::atomic::AtomicU32::new(0),
     };
     let mut set = SourceSet::new(&provider, root, Arc::default(), provider.lanes.holders());
     let stop = StopPolicy::new(false, Some(Duration::from_mins(5)), Arc::default());
@@ -4985,6 +5030,10 @@ async fn a_sibling_top_up_on_a_shared_lane_revives_a_priced_out_source() -> anyh
     .await?;
     store.finalize().await?;
     assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    assert!(
+        provider.top_ups.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the sibling's top-up revived the source"
+    );
     Ok(())
 }
 
@@ -6101,6 +6150,131 @@ async fn discovery_resumes_once_arrivals_end() -> anyhow::Result<()> {
     assert!(
         provider.discovers() >= 1,
         "discovery ran once arrivals ended"
+    );
+    Ok(())
+}
+
+/// Static lanes whose builds each take `build` to finish, with no arrivals,
+/// a count of discovery calls and the time of the first. Discovery returns
+/// the static holders.
+struct SlowBuilds<'a> {
+    inner: &'a StaticSources<ScriptedSource>,
+    build: Duration,
+    discovers: std::sync::atomic::AtomicUsize,
+    created: tokio::time::Instant,
+    first_discover: Mutex<Option<tokio::time::Instant>>,
+}
+
+impl<'a> SlowBuilds<'a> {
+    fn new(inner: &'a StaticSources<ScriptedSource>, build: Duration) -> Self {
+        Self {
+            inner,
+            build,
+            discovers: std::sync::atomic::AtomicUsize::new(0),
+            created: tokio::time::Instant::now(),
+            first_discover: Mutex::new(None),
+        }
+    }
+
+    fn discovers(&self) -> usize {
+        self.discovers.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How long after the provider was made the first discovery ran.
+    fn first_discover_after(&self) -> Option<Duration> {
+        let first = *self
+            .first_discover
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        first.map(|at| at.duration_since(self.created))
+    }
+}
+
+impl crate::SourceProvider for SlowBuilds<'_> {
+    type Source = ScriptedSource;
+
+    fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+        self.discovers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.first_discover
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(tokio::time::Instant::now);
+        self.inner.discover(hash)
+    }
+
+    fn connect<'b>(
+        &'b self,
+        holder: &'b crate::Holder,
+        ended: &'b tokio_util::sync::CancellationToken,
+    ) -> crate::SourceFuture<'b, StreamCandidate<ScriptedSource>> {
+        let lane = self.inner.connect(holder, ended);
+        let delay = self.build;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            lane.await
+        })
+    }
+}
+
+/// A store-routed start: every holder holds the whole blob, no probe round
+/// is pending, and every lane is still building on the first pass. The
+/// building lanes cover every missing range, so the fetch asks for no
+/// discovery (#2677).
+#[tokio::test(start_paused = true)]
+async fn full_holders_still_building_ask_for_no_discovery() -> anyhow::Result<()> {
+    let data = blob(8 * MIB as usize);
+    let (la, lb, lc) = (
+        Arc::new(PoolLedger::new(Cumulative::default())),
+        Arc::new(PoolLedger::new(Cumulative::default())),
+        Arc::new(PoolLedger::new(Cumulative::default())),
+    );
+    let a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&la));
+    let b = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lb));
+    let c = ScriptedSource::new(data.clone())?.paying(Arc::clone(&lc));
+    let (root, total) = (a.root(), a.total_bytes());
+    let lanes = StaticSources::new(vec![
+        candidate(a, la, 0xA1, None),
+        candidate(b, lb, 0xB2, None),
+        candidate(c, lc, 0xC3, None),
+    ])?;
+    let provider = SlowBuilds::new(&lanes, Duration::from_millis(200));
+    let (store, dir) = fresh_store(root, total);
+    acquire_over(&store, &provider, lanes.holders(), root, 3).await?;
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    assert_eq!(
+        provider.discovers(),
+        0,
+        "building lanes over the whole blob leave no range uncovered"
+    );
+    Ok(())
+}
+
+/// The only holder covers block 0 of a two-block blob, and its lane is still
+/// building on the first pass. No known holder covers block 1, so the fetch
+/// asks for a discovery before the lane is built.
+#[tokio::test(start_paused = true)]
+async fn a_range_no_building_lane_covers_asks_for_discovery() -> anyhow::Result<()> {
+    const B: u64 = DISCOVERY_BLOCK_BYTES;
+    let data = blob(2 * B as usize);
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    let a = ScriptedSource::new(data.clone())?.paying(Arc::clone(&la));
+    let (root, total) = (a.root(), a.total_bytes());
+    let lanes = StaticSources::new(vec![candidate(a, la, 0xA1, Some(cov(2, &[0])))])?;
+    let build = Duration::from_millis(200);
+    let provider = SlowBuilds::new(&lanes, build);
+    let (store, dir) = fresh_store(root, total);
+    acquire_over(&store, &provider, lanes.holders(), root, 1).await?;
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    assert!(
+        provider
+            .first_discover_after()
+            .is_some_and(|after| after < build),
+        "block 1 has no known holder, so discovery looks for one while the lane builds: \
+         first discovery {:?} after the start",
+        provider.first_discover_after()
     );
     Ok(())
 }
