@@ -773,21 +773,29 @@ pub(crate) async fn assert_inbound_failures_attributed(
     }
 }
 
-/// Wait until the node's encoded metrics contain `line` as a full
-/// `name value` line (the exact-match semantics of the loopback suite's
-/// `metric_line_present`). The serve task meters a stream's end after the
-/// response is on the wire, so a counter asserted right after the client
-/// reads a reply is polled up to a deadline rather than read once.
-pub(crate) async fn wait_for_metric_line(metrics: &Metrics, line: &str) -> anyhow::Result<()> {
+/// Wait until the node has recorded `completed` completed and `failed` failed
+/// inbound streams. The serve task counts a stream's end after the client sees
+/// it, and only after every other counter that stream bumps, so once both
+/// counts match, a single metrics read is settled.
+pub(crate) async fn assert_inbound_streams_ended(
+    metrics: &Metrics,
+    completed: u64,
+    failed: u64,
+) -> anyhow::Result<()> {
+    const COMPLETED: &str = "decdn_streams_completed_total{direction=\"inbound\"}";
+    const FAILED: &str = "decdn_streams_failed_total{direction=\"inbound\"}";
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let encoded = metrics.encode()?;
-        if encoded.lines().any(|l| l == line) {
+        let done = sample_value(&encoded, COMPLETED);
+        let failures = sample_value(&encoded, FAILED);
+        if done == completed && failures == failed {
             return Ok(());
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "expected metric line {line:?}:\n{encoded}"
+            "expected {completed} completed and {failed} failed inbound streams; got \
+             {done} and {failures}:\n{encoded}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

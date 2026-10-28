@@ -5421,6 +5421,7 @@ async fn client_unknown_lane_is_rejected() -> anyhow::Result<()> {
     // The wire `NotFound` is deliberately ambiguous, so the server-side
     // reason counter is the only place this is distinguishable from a cache
     // miss or owner mismatch (#876).
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -5511,6 +5512,7 @@ async fn client_underfunded_pool_is_refused_pre_serve() -> anyhow::Result<()> {
         other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
     }
 
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -5708,6 +5710,7 @@ async fn client_deposit_gate_scales_with_credit_max_when_ramp_disabled() -> anyh
         ),
         other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
     }
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -5777,6 +5780,7 @@ async fn client_spent_down_pool_is_refused_pre_serve() -> anyhow::Result<()> {
         ),
         other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
     }
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -6374,6 +6378,7 @@ async fn a_drained_signer_refused_at_admission_is_unfunded() -> anyhow::Result<(
             .is_some_and(|r| *r.error() == StreamError::Unfunded),
         "a drained signer's admission refusal is Unfunded, got: {refused:#}"
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     let encoded = metrics.encode()?;
     anyhow::ensure!(
         metric_line_present(
@@ -8288,6 +8293,7 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
         err.to_string().contains("Declined"),
         "a governance takedown must sign Declined: {err}"
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     let encoded = metrics.encode()?;
     anyhow::ensure!(
         metric_line_present(
@@ -8437,6 +8443,7 @@ async fn blacklisted_funder_is_refused_on_a_cache_miss() -> anyhow::Result<()> {
         err.to_string().contains("Declined"),
         "error should surface Declined, not NotFound: {err}"
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -8480,6 +8487,7 @@ async fn client_evicted_since_probe_is_refused() -> anyhow::Result<()> {
         err.to_string().contains("Declined"),
         "error should surface Declined: {err}"
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -8576,11 +8584,14 @@ async fn stream_request_with_skewed_timestamp_resets_without_response() -> anyho
         )
         .await?;
     }
-    support::wait_for_metric_line(
-        &metrics,
-        "decdn_serve_stream_rejected_timestamp_skew_total 2",
-    )
-    .await?;
+    support::assert_inbound_failures_attributed(&metrics, 2).await?;
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_timestamp_skew_total 2"
+        ),
+        "each skew reset must bump its reason counter"
+    );
 
     // Same handler, same blob, fresh timestamp: a signed response arrives, so
     // the resets above can only be the timestamp gate.
@@ -8690,13 +8701,13 @@ async fn the_timestamp_gate_precedes_every_signed_refusal() -> anyhow::Result<()
         StreamError::NotFound,
     )
     .await?;
-    support::wait_for_metric_line(
-        &metrics,
-        "decdn_serve_stream_rejected_timestamp_skew_total 1",
-    )
-    .await?;
-    support::wait_for_metric_line(&metrics, "decdn_serve_stream_rejected_unknown_lane_total 1")
-        .await?;
+    support::assert_inbound_failures_attributed(&metrics, 2).await?;
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&text, "decdn_serve_stream_rejected_timestamp_skew_total 1")
+            && metric_line_present(&text, "decdn_serve_stream_rejected_unknown_lane_total 1"),
+        "the skewed request counts only as a skew reset, the fresh one as an unknown lane"
+    );
     shutdown([server_task], [&client_ep, &server_ep]).await?;
 
     // Denylisted hash: held, but under a local takedown order.
@@ -8730,13 +8741,13 @@ async fn the_timestamp_gate_precedes_every_signed_refusal() -> anyhow::Result<()
         StreamError::Declined,
     )
     .await?;
-    support::wait_for_metric_line(
-        &metrics,
-        "decdn_serve_stream_rejected_timestamp_skew_total 1",
-    )
-    .await?;
-    support::wait_for_metric_line(&metrics, "decdn_serve_stream_rejected_hash_denied_total 1")
-        .await?;
+    support::assert_inbound_failures_attributed(&metrics, 2).await?;
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&text, "decdn_serve_stream_rejected_timestamp_skew_total 1")
+            && metric_line_present(&text, "decdn_serve_stream_rejected_hash_denied_total 1"),
+        "the skewed request counts only as a skew reset, the fresh one as a takedown"
+    );
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
@@ -8830,6 +8841,7 @@ async fn a_stale_stream_on_a_warm_connection_is_typed_and_refused_alone() -> any
         got.as_ref() == payload.as_slice(),
         "the connection outlives the refused stream"
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -8900,6 +8912,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
     // owner-mismatch gate is subsumed into lane resolution (a wrong signer simply
     // owns no lane). Wire-indistinguishable from a cache miss (all `NotFound`), so
     // only the reason counter proves which arm ran (#876).
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -9041,6 +9054,7 @@ async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
     // Pool model: the funder holds no lane on this delegated pool (the lane is
     // keyed by the delegate signer), so its binding resolves to no lane and the
     // refusal is the unknown-lane arm.
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -9103,6 +9117,7 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
         }
         other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
     }
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -9615,6 +9630,7 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
     // Wire-indistinguishable from an unknown lane or owner mismatch (all
     // `NotFound`); the reason counter is the only proof the cache-miss arm ran
     // (#876). No pull-through is configured, so `!filled` is deterministic.
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -10067,6 +10083,7 @@ async fn underfunded_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
         "the origin must never be contacted for a pool that cannot pay: {} hits",
         hits.load(std::sync::atomic::Ordering::SeqCst)
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     let text = metrics.encode()?;
     anyhow::ensure!(
         metric_line_present(
@@ -10205,6 +10222,7 @@ async fn spent_out_pool_never_reaches_the_paid_pull() -> anyhow::Result<()> {
         "a spent-out pool must not reach the origin despite a large gross deposit: {} hits",
         hits.load(std::sync::atomic::Ordering::SeqCst)
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
@@ -10691,6 +10709,7 @@ async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyh
         }
     }
 
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     let encoded = metrics.encode()?;
     anyhow::ensure!(
         metric_line_present(
@@ -10939,6 +10958,7 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
         "expected exactly 1 origin fetch, got {}",
         cache_metrics.origin_fetches.get()
     );
+    support::assert_inbound_streams_ended(&metrics, 1, 0).await?;
     assert_first_byte_class(&metrics, "miss")?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -11404,6 +11424,7 @@ async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Res
         "expected exactly 1 local origin fetch, got {}",
         cache_metrics.origin_fetches.get()
     );
+    support::assert_inbound_streams_ended(&metrics, 1, 0).await?;
     assert_first_byte_class(&metrics, "miss")?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -11577,6 +11598,7 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
     // airtight: a genuine absence must be metered as a cache miss and must NOT
     // trip the internal-error counter. Over-promoting clean misses would report a
     // healthy-but-empty node as broken and steer clients away from it.
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     assert_reject_reason(&metrics, 0, 1)?;
     // Authorized, but node-to-node is off: the local tier ran and missed.
     assert_one_miss_line(&spans, hash, "no_pull_through", "cache_miss")?;
@@ -11677,6 +11699,7 @@ async fn unbound_miss_refuses_on_a_throttled_no_lane_line() -> anyhow::Result<()
         "an unbound request must not reach the local origin, got {}",
         cache_metrics.origin_fetches.get()
     );
+    support::assert_inbound_failures_attributed(&metrics, 2).await?;
     assert_reject_reason(&metrics, 0, 2)?;
     let line = assert_one_miss_line(&spans, hash, "no_lane", "cache_miss")?;
     anyhow::ensure!(
@@ -12107,6 +12130,7 @@ async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> any
     // The operator-facing half: the reject is metered as an internal error, NOT as a
     // cache miss. Without this the wire assertion above still passes while the
     // dashboard reports an origin outage as an empty cache.
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     assert_reject_reason(&metrics, 1, 0)?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -12167,6 +12191,7 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
         origin_hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "the failing local origin should have been consulted before the window tier"
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     assert_reject_reason(&metrics, 1, 0)?;
     // The unprovisioned window origin has no provider to open: a clean pull-leg
     // miss, refused as `internal_error` because the local fault is latched.
@@ -12240,6 +12265,7 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
         origin_hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "the failing origin should have been consulted by the buffered tier"
     );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     assert_reject_reason(&metrics, 1, 0)?;
     assert_one_miss_line(&spans, hash, "buffered_miss", "internal_error")?;
 
@@ -12430,6 +12456,7 @@ async fn cache_hit_refused_under_egress_saturation() -> anyhow::Result<()> {
     // limiter, so moving the bump inside the `Ok(slot)` arm would pass all of
     // them while making the fleet hit-rate panel collapse under exactly the
     // pressure it exists to survive.
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     let encoded = metrics.encode()?;
     anyhow::ensure!(
         metric_line_present(&encoded, "decdn_serve_cache_hit_total 1"),
