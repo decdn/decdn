@@ -341,6 +341,16 @@ async fn resolving_status_counts_onchain_redemptions() -> Result<()> {
     Ok(())
 }
 
+/// An admit-path seed read of an `Open` pool.
+fn seed(pool_id: B256, deposit: u64, total_redeemed: u64) -> PoolRead {
+    PoolRead {
+        pool_id,
+        deposit,
+        total_redeemed,
+        lifecycle: Lifecycle::Open,
+    }
+}
+
 /// A mocked `PaymentPool` whose RPC answers come from the returned queue.
 fn mocked_contract() -> (
     PaymentPool::PaymentPoolInstance<impl Provider + Clone + 'static>,
@@ -363,7 +373,7 @@ async fn reanchor_pools_anchors_an_admit_seed() -> Result<()> {
     let owner = Address::from([7u8; 20]);
     let pool_id = B256::repeat_byte(0x46);
     let projection = PoolProjection::new();
-    projection.record_resolved(pool_id, owner, 1_000, 0, Lifecycle::Open);
+    projection.record_resolved(owner, seed(pool_id, 1_000, 0));
     let (contract, asserter) = mocked_contract();
     asserter.push_success(&alloy::primitives::U64::from(42u64));
     asserter.push_success(&Bytes::from(
@@ -374,7 +384,7 @@ async fn reanchor_pools_anchors_an_admit_seed() -> Result<()> {
         .abi_encode(),
     ));
 
-    reanchor_pools(&contract, &projection, &mut None).await;
+    reanchor_pools(&contract, &projection, &mut None, 0).await;
 
     assert!(projection.pending_rereads().is_empty());
     let status = projection
@@ -390,12 +400,12 @@ async fn reanchor_pools_anchors_an_admit_seed() -> Result<()> {
 async fn reanchor_pools_retries_a_faulted_read() {
     let pool_id = B256::repeat_byte(0x47);
     let projection = PoolProjection::new();
-    projection.record_resolved(pool_id, Address::from([7u8; 20]), 1_000, 0, Lifecycle::Open);
+    projection.record_resolved(Address::from([7u8; 20]), seed(pool_id, 1_000, 0));
     let (contract, asserter) = mocked_contract();
     asserter.push_success(&alloy::primitives::U64::from(42u64));
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
 
-    reanchor_pools(&contract, &projection, &mut None).await;
+    reanchor_pools(&contract, &projection, &mut None, 0).await;
 
     assert_eq!(projection.pending_rereads(), vec![pool_id]);
 }
@@ -405,11 +415,11 @@ async fn reanchor_pools_retries_a_faulted_read() {
 async fn reanchor_pools_retries_a_faulted_block_number() {
     let pool_id = B256::repeat_byte(0x48);
     let projection = PoolProjection::new();
-    projection.record_resolved(pool_id, Address::from([7u8; 20]), 1_000, 0, Lifecycle::Open);
+    projection.record_resolved(Address::from([7u8; 20]), seed(pool_id, 1_000, 0));
     let (contract, asserter) = mocked_contract();
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
 
-    reanchor_pools(&contract, &projection, &mut None).await;
+    reanchor_pools(&contract, &projection, &mut None, 0).await;
 
     assert_eq!(projection.pending_rereads(), vec![pool_id]);
 }
@@ -422,14 +432,14 @@ async fn reanchor_pools_forgets_a_closed_pool() {
     let owner = Address::from([7u8; 20]);
     let pool_id = B256::repeat_byte(0x49);
     let projection = PoolProjection::new();
-    projection.record_resolved(pool_id, owner, 1_000, 0, Lifecycle::Open);
+    projection.record_resolved(owner, seed(pool_id, 1_000, 0));
     let (contract, asserter) = mocked_contract();
     asserter.push_success(&alloy::primitives::U64::from(42u64));
     asserter.push_success(&Bytes::from(
         pool(owner, PaymentPool::Status::Closed, 0).abi_encode(),
     ));
 
-    reanchor_pools(&contract, &projection, &mut None).await;
+    reanchor_pools(&contract, &projection, &mut None, 0).await;
 
     assert!(projection.snapshot(pool_id).is_none());
 }
@@ -442,14 +452,14 @@ async fn reanchor_pools_keeps_a_pool_absent_at_the_pinned_block() {
 
     let pool_id = B256::repeat_byte(0x4b);
     let projection = PoolProjection::new();
-    projection.record_resolved(pool_id, Address::from([7u8; 20]), 1_000, 0, Lifecycle::Open);
+    projection.record_resolved(Address::from([7u8; 20]), seed(pool_id, 1_000, 0));
     let (contract, asserter) = mocked_contract();
     asserter.push_success(&alloy::primitives::U64::from(42u64));
     asserter.push_success(&Bytes::from(
         pool(Address::ZERO, PaymentPool::Status::Open, 0).abi_encode(),
     ));
 
-    reanchor_pools(&contract, &projection, &mut None).await;
+    reanchor_pools(&contract, &projection, &mut None, 0).await;
 
     assert!(projection.snapshot(pool_id).is_some());
     assert_eq!(projection.pending_rereads(), vec![pool_id]);
@@ -464,19 +474,21 @@ async fn reanchor_pools_stops_at_the_first_fault() {
     let projection = PoolProjection::new();
     for n in 0x50..0x54u8 {
         projection.record_resolved(
-            B256::repeat_byte(n),
             Address::from([7u8; 20]),
-            1_000,
-            0,
-            Lifecycle::Open,
+            seed(B256::repeat_byte(n), 1_000, 0),
         );
     }
     let (contract, asserter) = mocked_contract();
     asserter.push_success(&alloy::primitives::U64::from(42u64));
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+    // A good answer behind the fault: the batch has stopped, so it anchors nothing.
+    asserter.push_success(&Bytes::from({
+        use alloy::sol_types::SolValue;
+        pool(Address::from([7u8; 20]), PaymentPool::Status::Open, 0).abi_encode()
+    }));
     let mut cursor = None;
 
-    reanchor_pools(&contract, &projection, &mut cursor).await;
+    reanchor_pools(&contract, &projection, &mut cursor, 0).await;
 
     assert_eq!(projection.pending_rereads().len(), 4);
     assert_eq!(
@@ -506,6 +518,86 @@ fn reanchor_batch_rotates_after_the_cursor() {
     );
 }
 
+/// A fault after a good read keeps the good read: the first pool anchors, the
+/// faulted one stays pending, and the cursor lands on it.
+#[tokio::test]
+async fn reanchor_pools_keeps_reads_before_a_fault() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::from([7u8; 20]);
+    let (first, second) = (B256::repeat_byte(0x60), B256::repeat_byte(0x61));
+    let projection = PoolProjection::new();
+    projection.record_resolved(owner, seed(first, 1_000, 0));
+    projection.record_resolved(owner, seed(second, 1_000, 0));
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&alloy::primitives::U64::from(42u64));
+    asserter.push_success(&Bytes::from(
+        PaymentPool::Pool {
+            totalRedeemed: 100,
+            ..pool(owner, PaymentPool::Status::Open, 0)
+        }
+        .abi_encode(),
+    ));
+    asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+    let mut cursor = None;
+
+    reanchor_pools(&contract, &projection, &mut cursor, 0).await;
+
+    assert_eq!(projection.pending_rereads(), vec![second]);
+    assert_eq!(
+        projection.snapshot(first).map(|s| s.remaining),
+        Some(U256::from(900u64))
+    );
+    assert_eq!(cursor, Some(second));
+}
+
+/// A `Closing` read carries its dispute deadline into the projection.
+#[tokio::test]
+async fn reanchor_pools_reads_a_closing_pool() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::from([7u8; 20]);
+    let pool_id = B256::repeat_byte(0x62);
+    let projection = PoolProjection::new();
+    projection.record_resolved(owner, seed(pool_id, 1_000, 0));
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&alloy::primitives::U64::from(42u64));
+    asserter.push_success(&Bytes::from(
+        pool(owner, PaymentPool::Status::Closing, 1_900_000_000).abi_encode(),
+    ));
+
+    reanchor_pools(&contract, &projection, &mut None, 0).await;
+
+    assert_eq!(
+        projection.snapshot(pool_id).map(|s| s.lifecycle),
+        Some(Lifecycle::Closing {
+            deadline: 1_900_000_000
+        })
+    );
+}
+
+/// A block number below the highest log the sink applied comes from a backend
+/// behind the watcher: the tick reads no pool, and every pool stays pending.
+#[tokio::test]
+async fn reanchor_pools_skips_a_block_behind_the_watcher() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::from([7u8; 20]);
+    let pool_id = B256::repeat_byte(0x63);
+    let projection = PoolProjection::new();
+    projection.record_resolved(owner, seed(pool_id, 1_000, 0));
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&alloy::primitives::U64::from(42u64));
+    asserter.push_success(&Bytes::from(
+        pool(owner, PaymentPool::Status::Open, 0).abi_encode(),
+    ));
+
+    reanchor_pools(&contract, &projection, &mut None, 50).await;
+
+    assert_eq!(projection.pending_rereads(), vec![pool_id]);
+    assert_eq!(asserter.read_q().len(), 1, "no getPool was sent");
+}
+
 /// With nothing to re-anchor the tick costs no RPC.
 #[tokio::test]
 async fn reanchor_pools_without_seeds_reads_nothing() {
@@ -518,7 +610,7 @@ async fn reanchor_pools_without_seeds_reads_nothing() {
     let (contract, asserter) = mocked_contract();
     asserter.push_success(&alloy::primitives::U64::from(42u64));
 
-    reanchor_pools(&contract, &projection, &mut None).await;
+    reanchor_pools(&contract, &projection, &mut None, 0).await;
 
     assert_eq!(asserter.read_q().len(), 1, "no read was sent");
 }

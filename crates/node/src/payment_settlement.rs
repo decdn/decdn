@@ -533,6 +533,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             contract: contract.clone(),
             backfills: backfills.clone(),
             reanchor_cursor: None,
+            applied_through: 0,
         };
         let route = Route {
             addresses: vec![payment_pool_addr],
@@ -806,7 +807,8 @@ struct PoolSettlementSink<P: Provider + Clone> {
     /// `PoolCloseInitiated` (mark `Closing` with its deadline), and `PoolReclaimed`
     /// (drop) into the projection so a serve request reads `{owner, remaining}`
     /// in-memory rather than through a `getPool` `eth_call`. At the end of each
-    /// tick it re-anchors the pools the admit path seeded (`reanchor_pools`).
+    /// tick it re-reads the snapshot-seeded pools that are pending
+    /// (`reanchor_pools`).
     pool_view: PoolProjection,
     /// The `PaymentPool` instance; the backfill's receipt and header reads and
     /// the end-of-tick re-anchor reads ride its provider.
@@ -815,14 +817,21 @@ struct PoolSettlementSink<P: Provider + Clone> {
     /// `PoolRedeemed` whose `redeemMany` the redeemer never saw land, each on
     /// its own task; the service drains them at shutdown.
     backfills: LedgerBackfills,
-    /// The last pool `reanchor_pools` read, so the next tick starts after it and
-    /// every pending pool gets its turn.
+    /// The last pool `reanchor_pools` attempted, so the next tick starts after it
+    /// and every pending pool gets its turn.
     reanchor_cursor: Option<B256>,
+    /// The highest block of any log this sink has applied, including logs for a
+    /// pool the projection did not hold yet. A re-anchor read pinned below it
+    /// could miss such a log, so `reanchor_pools` skips it.
+    applied_through: u64,
 }
 
 impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     async fn apply(&mut self, log: Log) -> Result<()> {
+        if let Some(block) = log.block_number {
+            self.applied_through = self.applied_through.max(block);
+        }
         match log.topic0().copied() {
             Some(sig) if sig == PaymentPool::PoolOpened::SIGNATURE_HASH => {
                 // Projection-only: `PoolOpened` seeds the serve path's owner +
@@ -969,7 +978,13 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
     /// the read sees every event the projection holds; a read from a backend
     /// behind them is skipped (see `PoolProjection::reanchor`).
     async fn on_tick_complete(&mut self) -> Result<()> {
-        reanchor_pools(&self.contract, &self.pool_view, &mut self.reanchor_cursor).await;
+        reanchor_pools(
+            &self.contract,
+            &self.pool_view,
+            &mut self.reanchor_cursor,
+            self.applied_through,
+        )
+        .await;
         Ok(())
     }
 }
@@ -984,8 +999,10 @@ const REANCHOR_POOLS_PER_TICK: usize = 64;
 const REANCHOR_READ_CONCURRENCY: usize = 8;
 
 /// Bound on each re-anchor RPC. The reads run on the poller every watcher
-/// shares, so a hung endpoint holds it for at most two of these per tick: the
-/// block number, then one wave of reads, whose first fault stops the batch.
+/// shares. A hung endpoint holds it for two of these per tick: the block
+/// number, then one wave of reads, whose first fault stops the batch. A slow
+/// endpoint that still answers holds it for at most one bound per wave of
+/// [`REANCHOR_READ_CONCURRENCY`] reads.
 const REANCHOR_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Read the pools `projection` has pending at one block and anchor them there
@@ -993,18 +1010,44 @@ const REANCHOR_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// The turn rotates: the batch starts after `cursor`, the last pool attempted
 /// on an earlier tick. The first fault stops the batch and leaves the rest for
-/// the next tick, so a failing endpoint costs one [`REANCHOR_RPC_TIMEOUT`]
-/// wave and never puts the watcher into backoff. A pool absent at the pinned block (a backend behind
-/// the admit read, or an open a reorg dropped) stays pending.
+/// the next tick, so a hung endpoint costs one [`REANCHOR_RPC_TIMEOUT`] wave
+/// and never puts the watcher into backoff. A pool absent at the pinned block
+/// (a backend behind the admit read, or an open a reorg dropped) stays pending.
+///
+/// A block number below `applied_through`, the highest log block the sink has
+/// applied, comes from a backend behind the watcher: a read there could miss a
+/// redemption the watcher dropped while the pool was not yet in the projection.
+/// The tick then reads nothing and every pool stays pending.
 async fn reanchor_pools<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     projection: &PoolProjection,
     cursor: &mut Option<B256>,
+    applied_through: u64,
 ) {
     let pending = projection.pending_rereads();
     if pending.is_empty() {
         return;
     }
+    let Some(block) = reanchor_block(contract, pending.len(), applied_through).await else {
+        return;
+    };
+    let batch = reanchor_batch(&pending, *cursor);
+    let (anchored, closed) = read_reanchor_batch(contract, batch, block, cursor).await;
+    projection.reanchor(block, &anchored);
+    for pool_id in closed {
+        debug!(%pool_id, block, "pool re-anchor: pool closed; forgetting");
+        projection.forget(pool_id);
+    }
+}
+
+/// The block a re-anchor tick pins its reads at, or `None` when the read faults
+/// or the answer is behind `applied_through`; the pending pools then wait for
+/// the next tick.
+async fn reanchor_block<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    pending: usize,
+    applied_through: u64,
+) -> Option<u64> {
     let block = match timed(
         Some(REANCHOR_RPC_TIMEOUT),
         "re-anchor block number",
@@ -1016,19 +1059,20 @@ async fn reanchor_pools<P: Provider + Clone>(
         Err(err) => {
             warn!(
                 error = %sanitize_err_chain(&err),
-                pools = pending.len(),
+                pools = pending,
                 "pool re-anchor: block number read failed; retrying next tick"
             );
-            return;
+            return None;
         }
     };
-    let batch = reanchor_batch(&pending, *cursor);
-    let (anchored, closed) = read_reanchor_batch(contract, batch, block, cursor).await;
-    projection.reanchor(block, &anchored);
-    for pool_id in closed {
-        debug!(%pool_id, block, "pool re-anchor: pool closed; forgetting");
-        projection.forget(pool_id);
+    if block < applied_through {
+        debug!(
+            block,
+            applied_through, "pool re-anchor: block number behind the watcher; retrying next tick"
+        );
+        return None;
     }
+    Some(block)
 }
 
 /// Read `batch` at `block`, at most [`REANCHOR_READ_CONCURRENCY`] at once and in
@@ -1078,8 +1122,7 @@ async fn read_reanchor_batch<P: Provider + Clone>(
 }
 
 /// The pools of one re-anchor tick: up to [`REANCHOR_POOLS_PER_TICK`] of the
-/// sorted `pending`, starting after `cursor` and wrapping around. Pure, so the
-/// rotation is unit-testable.
+/// sorted `pending`, starting after `cursor` and wrapping around.
 fn reanchor_batch(pending: &[B256], cursor: Option<B256>) -> Vec<B256> {
     let start = cursor.map_or(0, |cursor| pending.partition_point(|id| *id <= cursor));
     pending
@@ -1191,9 +1234,10 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
 ///
 /// The serve gates read `{owner, remaining}` from the event-fed [`PoolProjection`]
 /// the settlement watcher folds, so the common case costs no `eth_call`. A pool
-/// the projection has not observed is the hard case: a pool opened before this
-/// node's `ColdStart::Head` anchor never appears in the forward-only `PoolOpened`
-/// scan, so its owner is absent from the projection even though the pool is live.
+/// the projection has not observed is the hard case: a pool opened before the
+/// watcher's scan start (the head on a first boot, the rewound checkpoint after a
+/// restart) never appears in the forward-only `PoolOpened` scan, so its owner is
+/// absent from the projection even though the pool is live.
 /// Rather than fail open on that gap, [`status`](crate::pool_view::PoolView::status) does ONE `getPool` at
 /// admission — a read the admission path tolerates (it may block) — seeds a
 /// servable pool into the projection with its on-chain `totalRedeemed`, and
@@ -1292,9 +1336,9 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
 impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
     /// Read `pool_id` on-chain once and record the result: seed a servable pool
     /// into the projection as an unanchored snapshot of its `deposit` and
-    /// `totalRedeemed` ([`PoolProjection::record_resolved`]), or negative-cache an absent / `Closed` pool as a
-    /// [`NegativeReason::Verdict`] and a failed read as a
-    /// [`NegativeReason::Fault`]. The caller holds the pool's [`ReadSlot::Lead`].
+    /// `totalRedeemed` ([`PoolProjection::record_resolved`]), or negative-cache
+    /// an absent / `Closed` pool as a [`NegativeReason::Verdict`] and a failed
+    /// read as a [`NegativeReason::Fault`]. The caller holds the pool's [`ReadSlot::Lead`].
     async fn resolve(&self, pool_id: B256) -> Option<PoolStatus> {
         // Bounded: the alloy HTTP provider sets no timeout of its own, so a hung
         // read times out here and takes the fault path below.
@@ -1325,11 +1369,13 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
             return None;
         };
         self.projection.record_resolved(
-            pool_id,
             pool.owner,
-            pool.deposit,
-            pool.totalRedeemed,
-            lifecycle,
+            PoolRead {
+                pool_id,
+                deposit: pool.deposit,
+                total_redeemed: pool.totalRedeemed,
+                lifecycle,
+            },
         );
         // The pool resolved: drop its lapsed negative entry. The projection
         // answers for it from here on.

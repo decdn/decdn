@@ -5267,12 +5267,13 @@ since project inception and will roll into the first tagged release.
   folded after that block count on top of the read; one on a lane the
   projection has no baseline for marks the pool for another re-read rather
   than a guess, so `remaining` never counts a redemption twice and errs
-  toward serving until the next clean tick. The one exception is a reorg that
-  drops redemptions at or below the pinned block, which keeps counting them
-  until the next re-read. A re-read whose `totalRedeemed` or deposit is below
-  what the node already holds (a backend behind the admit read) is skipped
-  and retried, and a pool seeded from a read ignores replayed `PoolOpened` /
-  `PoolToppedUp` logs the read already holds.
+  toward serving until a re-read lands. The one exception is a reorg that
+  drops a counted redemption, which stays counted until on-chain
+  `totalRedeemed` passes it again. A re-read pinned below a block the
+  watcher already applied, or whose `totalRedeemed` or deposit is below what
+  the node already holds (a backend behind the watcher or the admit read), is
+  skipped and retried. A pool seeded from a read keeps the read's deposit
+  against replayed `PoolOpened` / `PoolToppedUp` logs the read already holds.
 
 - **Node: request timestamps are bounded to the node's clock before anything
   is signed (GHSA-fjcq-8x46-cq5c).** The signed probe and stream response
