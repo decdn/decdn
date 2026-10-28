@@ -127,6 +127,16 @@ repos:
         files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|\.github/scripts/check[-_]workspace[-_]manifests\.(py|sh))$'
         pass_filenames: false
 
+      # Cargo.lock is the only pin on iroh and its QUIC crates (#2585), and a
+      # local `cargo update` moves it silently; only the anvil journeys notice.
+      # The `packaging` CI job is authoritative.
+      - id: iroh-hold
+        name: iroh and noq stay at their held versions
+        entry: .github/scripts/check-iroh-hold.sh
+        language: system
+        files: '^(Cargo\.lock|\.github/scripts/check[-_]iroh[-_]hold\.(py|sh))$'
+        pass_filenames: false
+
       # One field name per concept in tracing events: an error value is
       # `error = %e`, never the `%err`/`%e` shorthand or an `err =` field, so a
       # log query or a span attribute filter matches every site.

@@ -1202,6 +1202,16 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Transport: iroh and noq stay at 1.3.0, and CI holds them there (#2585).**
+  noq-proto 1.4 closes a connection with "too many gaps in stream buffer"
+  once the reader falls ~2.4 MiB behind, so a paid pull dies mid-leg and the
+  node's credit-window bytes go unpaid. A lockfile refresh had moved iroh,
+  iroh-base, iroh-dns and iroh-relay to 1.4.1 and noq, noq-proto and noq-udp
+  to 1.4.0; all seven are back at 1.3.0, and the other updates stay. The
+  `packaging` CI job and the `iroh-hold` pre-commit hook now fail when
+  Cargo.lock resolves any of the seven to another version
+  (`.github/scripts/check_iroh_hold.py` holds the table). The hold lifts once
+  a noq release ports quinn#2814 (n0-computer/noq#828).
 - **Client: a streamed fetch with no size hint keeps the pull it opened for
   the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
   fast path, or a gateway pull whose size lookup finds none), the client read
