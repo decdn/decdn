@@ -604,9 +604,11 @@ pub struct CacheConfig {
     /// origin backend is configured (a cache node exists to fill misses), off
     /// when one is (an origin node serves its own content). Set this explicitly
     /// to override either default. A node with it on fronts USDC egress to fill
-    /// misses, bounded by `blockchain.buyer_working_deposit_micro_usdc` and the
-    /// upstream's per-MB rate, and the serving path triggers a pull only behind
-    /// a valid, pool-bound client, so an unpaid request cannot drive egress.
+    /// misses at the upstream's per-MB rate. It escrows
+    /// `blockchain.buyer_working_deposit_micro_usdc` in a pool and refills the
+    /// pool toward it at low water, so its spend is bounded by the buyer
+    /// wallet's USDC. The serving path triggers a pull only behind a valid,
+    /// pool-bound client, so an unpaid request cannot drive egress.
     pub node_to_node_pull_through_enabled: Option<bool>,
     /// When `false`, the node serves and seeds only content its own backend
     /// holds; a foreign hash is declined like a miss. Absent resolves to a
