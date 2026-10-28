@@ -1,15 +1,18 @@
 //! Shared three-layer token-bucket rate limiter for per-request inbound
 //! traffic on authenticated QUIC handlers.
 //!
-//! This is the engine behind both the `cdn/dht/v1` limiter (ADR 022 §DHT
-//! Rate Limiting, via [`crate::dht::rate_limit::DhtRateLimiter`]) and the
+//! This is the engine behind the `cdn/dht/v1` limiter (ADR 022 §DHT Rate
+//! Limiting, via [`crate::dht::rate_limit::DhtRateLimiter`]), the
 //! `cdn/probe/v1` limiter (ADR 005 §Probe rate limiting, via
-//! [`crate::handlers::probe_rate_limit::ProbeRateLimiter`]). The two ADRs
-//! specify the identical three-layer shape — the differences are the default
+//! [`crate::handlers::probe_rate_limit::ProbeRateLimiter`]) and the
+//! `cdn/client/v1` limiter (ADR 005 §Request rate limiting, via
+//! [`crate::handlers::serve_rate_limit::ServeRateLimiter`]). The ADRs specify
+//! the identical three-layer shape — the differences are the default
 //! parameters, the operator-visible metric names, and that the DHT path
 //! additionally drives the engine's batch-token accounting
 //! ([`ThreeLayerRateLimiter::admit_batch_extra`]) while the probe path issues
-//! exactly one [`ThreeLayerRateLimiter::check`] per connection. So the
+//! exactly one [`ThreeLayerRateLimiter::check`] per connection and the serve
+//! path one per stream. So the
 //! mechanism lives here once and each path supplies its own
 //! [`RateLimitMetricsSink`].
 //!
@@ -22,9 +25,12 @@
 //!
 //! # Layered checks
 //!
-//! Layers fire **global → per-IP → per-peer** (cheapest-first ordering). A
-//! request rejected by the global cap never pays the per-IP map lookup; a
-//! per-IP rejection never pays the per-peer map lookup. The first rejection
+//! Layers fire **per-peer → per-IP → global** (narrowest-first ordering). A
+//! token is charged from a layer only after every narrower layer admitted the
+//! request, so a request one peer's own bucket refuses never spends a token of
+//! the shared global budget: one `NodeId` that floods at the global rate drains
+//! only its own bucket, and honest peers keep the global one. A per-peer
+//! rejection never pays the per-IP map lookup. The first rejection
 //! short-circuits and is the only one reported to the sink's
 //! [`RateLimitMetricsSink::rejected`] — one unlabeled Counter per layer, per
 //! the sibling-counter convention settled in #1475 (see [`RejectLayer`] below
@@ -33,7 +39,13 @@
 //! `DecdnMetrics::probe_hold_unavailable` and `DecdnMetrics::streams_active`
 //! both use. Each layer has an unrelated remedy, so no alert spans the family.
 //! Operators recover the rolled-up rate with
-//! `sum(rate({__name__=~"decdn_(probe|dht)_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
+//! `sum(rate({__name__=~"decdn_(probe|dht|serve)_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
+//!
+//! The trade-off of the narrowest-first order: a request the global cap
+//! refuses has still touched its peer's bucket, and its IP's bucket when the
+//! peer layer admitted it, so a flood of fresh `NodeId`s grows the keyed maps
+//! even while the global cap refuses it. `max_tracked_per_ip` /
+//! `max_tracked_per_peer` and the prune sweeps bound that growth.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -53,14 +65,13 @@ use crate::prune_guard::PruneGuard;
 ///
 /// A layer is disabled (its `Option<_>` limiter is `None`) when its quota is
 /// not buildable — see `make_quota`: that is `*_rate_per_sec <= 0.0`, a
-/// non-finite rate, **or** `*_burst == 0`. The intended operator opt-out sets
-/// **both** the rate to `0.0` and the burst to `0`; the config resolver
-/// (`resolve_{dht,probe}_into`) rejects the asymmetric `rate > 0, burst == 0`
-/// combination up front, so in production a layer is only ever disabled via the
-/// both-zero opt-out. A `RateLimitConfig` built directly (bypassing the
-/// resolver) with `rate > 0, burst == 0` will silently disable that layer
-/// rather than error — construct via the `From<&Resolved{Dht,Probe}>` impls or
-/// the resolver to keep that invariant.
+/// non-finite rate, **or** `*_burst == 0`. The config resolver
+/// (`resolve_{dht,probe,serve}_into`) rejects `rate > 0, burst == 0` as a
+/// deny-all, so in production a layer is disabled by a `0.0` rate, whatever its
+/// burst. A `RateLimitConfig` built directly (bypassing the resolver) with
+/// `rate > 0, burst == 0` will silently disable that layer rather than error —
+/// construct via the `From<&Resolved{Dht,Probe,Serve}>` impls or the resolver
+/// to keep that invariant.
 ///
 /// [`Default`] returns the ADR 022 DHT-layer values (the historical default of
 /// this struct). The probe path supplies its own ADR 005 defaults through the
@@ -101,7 +112,7 @@ impl Default for RateLimitConfig {
     }
 }
 
-// The resolved DHT/probe config (in `decdn-common`) and this engine config
+// The resolved DHT/probe/serve config (in `decdn-common`) and this engine config
 // hold the identical eight fields, but `common` can't depend on `node`, so the
 // engine config lives here. These `From` impls are the single mapping point
 // the runtime uses to build a limiter from resolved config, so a field added
@@ -166,6 +177,21 @@ impl From<&decdn_common::config::ResolvedProbe> for RateLimitConfig {
     }
 }
 
+impl From<&decdn_common::config::ResolvedServe> for RateLimitConfig {
+    fn from(r: &decdn_common::config::ResolvedServe) -> Self {
+        Self {
+            per_peer_rate_per_sec: r.per_peer_rate_per_sec,
+            per_peer_burst: r.per_peer_burst,
+            per_ip_rate_per_sec: r.per_ip_rate_per_sec,
+            per_ip_burst: r.per_ip_burst,
+            global_rate_per_sec: r.global_rate_per_sec,
+            global_burst: r.global_burst,
+            max_tracked_per_ip: r.max_tracked_per_ip,
+            max_tracked_per_peer: r.max_tracked_per_peer,
+        }
+    }
+}
+
 /// Layer that triggered a rejection. Used as a log/trace field and to pick
 /// the right per-layer Counter via [`RateLimitMetricsSink::rejected`].
 ///
@@ -204,7 +230,7 @@ impl RejectLayer {
 /// backend-agnostic. Implementations must be cheap and lock-free on the hot
 /// `rejected` path.
 pub trait RateLimitMetricsSink: Send + Sync {
-    /// Record a request rejected at `layer` (the cheapest-first layer that
+    /// Record a request rejected at `layer` (the narrowest-first layer that
     /// drained the budget). Called at most once per rejected request.
     fn rejected(&self, layer: RejectLayer);
     /// Record a `retain_recent` sweep of the per-IP keyed-limiter map (#645).
@@ -275,12 +301,12 @@ impl ThreeLayerRateLimiter {
     /// On rejection, calls [`RateLimitMetricsSink::rejected`] with the layer
     /// that fired and returns it. No sink call on the success path.
     ///
-    /// Cheapest-first ordering (global → per-IP → per-peer): the first layer
-    /// to reject short-circuits, so a per-peer-flooded request that would also
-    /// have failed the global cap counts as `global` (the layer that actually
-    /// drained the budget).
+    /// Narrowest-first ordering (per-peer → per-IP → global): the first layer
+    /// to reject short-circuits, so a request that would fail both its peer's
+    /// bucket and the global cap counts as `per_peer`, and spends no global
+    /// token.
     pub fn check(&self, peer_node_id: &NodeId, peer_ip: Option<IpAddr>) -> Result<(), RejectLayer> {
-        // Charge one unit cheapest-first; report the layer that drained the
+        // Charge one unit narrowest-first; report the layer that drained the
         // budget to the sink. The accounting itself lives in `try_admit_one`
         // so the batch stage-2 path (`admit_batch_extra`) can reuse it without
         // the metric bump — a partial-admit boundary is not a request
@@ -295,8 +321,8 @@ impl ThreeLayerRateLimiter {
         }
     }
 
-    /// Charge exactly one unit from each enabled layer, cheapest-first
-    /// (global → per-IP → per-peer) with short-circuit on the first exhausted
+    /// Charge exactly one unit from each enabled layer, narrowest-first
+    /// (per-peer → per-IP → global) with short-circuit on the first exhausted
     /// layer. Does **not** touch any metric — callers decide whether a failure
     /// is a rejection ([`Self::check`]) or a partial-admit boundary
     /// ([`Self::admit_batch_extra`]).
@@ -313,11 +339,15 @@ impl ThreeLayerRateLimiter {
         peer_ip: Option<IpAddr>,
         prune: bool,
     ) -> Result<(), RejectLayer> {
-        // Layer 1 — global.
-        if let Some(g) = self.global.as_ref()
-            && g.check().is_err()
-        {
-            return Err(RejectLayer::Global);
+        // Layer 1 — per-peer (NodeId).
+        if let Some(limiter) = self.per_peer.as_ref() {
+            let result = limiter.check_key(peer_node_id);
+            if prune {
+                self.maybe_prune_per_peer(limiter);
+            }
+            if result.is_err() {
+                return Err(RejectLayer::PerPeer);
+            }
         }
 
         // Layer 2 — per-IP. Skipped for relay-only connections. The key is
@@ -335,15 +365,12 @@ impl ThreeLayerRateLimiter {
             }
         }
 
-        // Layer 3 — per-peer (NodeId).
-        if let Some(limiter) = self.per_peer.as_ref() {
-            let result = limiter.check_key(peer_node_id);
-            if prune {
-                self.maybe_prune_per_peer(limiter);
-            }
-            if result.is_err() {
-                return Err(RejectLayer::PerPeer);
-            }
+        // Layer 3 — global. Charged last, so a request a keyed layer refused
+        // spends none of the shared budget.
+        if let Some(g) = self.global.as_ref()
+            && g.check().is_err()
+        {
+            return Err(RejectLayer::Global);
         }
 
         Ok(())
@@ -352,7 +379,7 @@ impl ThreeLayerRateLimiter {
     /// Stage 2 of the two-stage batch admission (ADR 022 §Batch token
     /// accounting). After [`Self::check`] has charged the stage-1 frame token,
     /// this consumes up to `extra` (= `n - 1` for a batch of `n` hashes) more
-    /// units cheapest-first, each unit identical to what one separate
+    /// units narrowest-first, each unit identical to what one separate
     /// `StoreRequest` admission would charge — so the per-second work ceiling
     /// is the same whether the publisher sends `n` separate `Store`s or one
     /// `BatchStore` of size `n` (ADR 022 AC 17).
@@ -365,9 +392,9 @@ impl ThreeLayerRateLimiter {
     /// No rejection counter is bumped: the inbound frame was already admitted
     /// at stage 1, and the over-budget tail is deferred work the publisher
     /// retries, not a rejected request. Because the per-unit charge
-    /// short-circuits cheapest-first, the terminating unit may consume a global
-    /// (and per-IP) token without a per-peer token — byte-for-byte what the
-    /// `(k+1)`-th separate `Store` would have done.
+    /// short-circuits narrowest-first, the terminating unit may consume a
+    /// per-peer (and per-IP) token without a global token — byte-for-byte what
+    /// the `(k+1)`-th separate `Store` would have done.
     #[must_use]
     pub fn admit_batch_extra(
         &self,
@@ -495,7 +522,7 @@ impl ThreeLayerRateLimiter {
 /// silently no-op on freshly-accepted connections and an attacker churning
 /// identities could bypass the layer in that race window.
 ///
-/// Shared by [`crate::dispatch`], the DHT handler, and the probe handler so
+/// Shared by [`crate::dispatch`], the DHT, probe and client handlers so
 /// "the connection's source IP" means one thing across every rate-limit layer.
 pub(crate) fn peer_ip(conn: &Connection) -> Option<IpAddr> {
     // `paths()` returns a snapshot of the *currently open* paths (closed paths

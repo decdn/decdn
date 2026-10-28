@@ -63,6 +63,7 @@ async fn bucket_refresh_stamps_clock_after_first_pass() {
         decdn_client::Connections::with_options(endpoint, decdn_protocol::ALPN_DHT, None),
         public,
         Arc::clone(&routing),
+        Arc::new(decdn_node::dht::ConfigStakerSet::empty()),
         stop_rx,
         // Short interval so the first pass completes quickly. The first
         // `interval` tick is burned at t=0; the first stamp lands ~interval

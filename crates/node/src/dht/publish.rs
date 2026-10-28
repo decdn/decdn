@@ -70,6 +70,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dht::chain_projection::with_lock;
 use crate::dht::client;
 use crate::dht::routing::{NodeId, RoutingTable};
+use crate::dht::staker_set::StakerSet;
 use decdn_protocol::ContentHash;
 use decdn_protocol::Coverage;
 use decdn_protocol::dht::MAX_BATCH_STORE_HASHES;
@@ -897,6 +898,7 @@ pub async fn run_republish(
     conns: Connections,
     self_id: PublicKey,
     routing: Arc<Mutex<RoutingTable>>,
+    staker_set: Arc<dyn StakerSet>,
     scheduler: Arc<RepublishScheduler>,
     cache: decdn_cache::CacheEngine,
     relay_foreign_namespaces: bool,
@@ -945,7 +947,7 @@ pub async fn run_republish(
                         scheduler.schedule_steady_if_absent(hash_bytes);
                         if !scheduler.is_announced(&hash_bytes) {
                             let accepted =
-                                publish_hash(&conns, self_node_id, &routing, &cache, hash_bytes)
+                                publish_hash(&conns, self_node_id, &routing, &*staker_set, &cache, hash_bytes)
                                     .await;
                             metrics.dht_store_published(accepted);
                             if accepted > 0 {
@@ -991,7 +993,7 @@ pub async fn run_republish(
             }
             _ = ticker.tick() => {
                 let (due, budget) =
-                    plan_cycle(&scheduler, &routing, now_us(), &mut last_cycle_us);
+                    plan_cycle(&scheduler, &routing, &*staker_set, now_us(), &mut last_cycle_us);
                 // ADR 022 §Content Records and TTL: "A node
                 // stops re-publishing when it evicts the blob." Keep only
                 // the still-held hashes; drop evicted ones from the
@@ -1080,6 +1082,7 @@ pub async fn run_republish(
 fn plan_cycle(
     scheduler: &RepublishScheduler,
     routing: &Mutex<RoutingTable>,
+    staker_set: &dyn StakerSet,
     now_us: u64,
     last_cycle_us: &mut Option<u64>,
 ) -> (Vec<ContentHash>, ReceiverBudget) {
@@ -1094,7 +1097,7 @@ fn plan_cycle(
     let mut budget = ReceiverBudget::default();
     let drained = scheduler.drain_cycle(now_us, horizon_us, |hash, mandatory| {
         let receivers = with_lock(routing, "dht routing table", |table| {
-            table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT)
+            table.closest_active_unbounded(hash.as_bytes(), REPUBLISH_FANOUT, staker_set)
         });
         budget.admit(*hash, &receivers, mandatory)
     });
@@ -1174,6 +1177,7 @@ async fn publish_hash(
     conns: &Connections,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
+    staker_set: &dyn StakerSet,
     cache: &decdn_cache::CacheEngine,
     hash: ContentHash,
 ) -> u64 {
@@ -1187,13 +1191,13 @@ async fn publish_hash(
         // so an attacker suppressing receivers has to take down K+3
         // hosts rather than K. The default `closest` caps at K (=
         // wire `MAX_CLOSER_NODES`), which we MUST NOT use here;
-        // `closest_unbounded` returns up to `n` peers regardless of
-        // the wire cap.
-        table.closest_unbounded(hash.as_bytes(), REPUBLISH_FANOUT)
+        // `closest_active_unbounded` returns up to `n` bonded peers
+        // regardless of the wire cap.
+        table.closest_active_unbounded(hash.as_bytes(), REPUBLISH_FANOUT, staker_set)
     });
     if targets.is_empty() {
-        // No routing-table entries yet (e.g. boot before bootstrap).
-        // Nothing to do this cycle; the scheduler will retry.
+        // No bonded routing-table entries (boot before bootstrap, or every
+        // entry unbonded). Nothing to do this cycle; the scheduler will retry.
         return 0;
     }
     let mut handles = Vec::with_capacity(targets.len());

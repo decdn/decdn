@@ -5,7 +5,7 @@
 //! [`crate::rate_limit::ThreeLayerRateLimiter`] engine: it pins the
 //! probe-specific operator-visible metric names (via a private metrics sink)
 //! and re-exports the config/reject types under probe names. The layering and
-//! cheapest-first ordering (global → per-IP → per-peer) live in the shared
+//! narrowest-first ordering (per-peer → per-IP → global) live in the shared
 //! engine — see its module docs.
 //!
 //! ## Relationship to [`crate::dispatch::ConnectionLimiter`]

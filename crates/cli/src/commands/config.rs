@@ -360,6 +360,16 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  probe.global_rate_per_sec: {}",
         resolved.probe.global_rate_per_sec
     )?;
+    writeln!(
+        w,
+        "  serve.per_peer_rate_per_sec: {}",
+        resolved.serve.per_peer_rate_per_sec
+    )?;
+    writeln!(
+        w,
+        "  serve.global_rate_per_sec: {}",
+        resolved.serve.global_rate_per_sec
+    )?;
     // Download-receipt audit log (#802). The log lives at a fixed filename
     // inside data_dir; surface the resolved path so an operator can confirm
     // where receipts land without reading the daemon source, alongside the
@@ -1100,6 +1110,16 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # global_burst = 2000                       # global inbound probe burst capacity
 # max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map (#645); 0 = unbounded
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
+
+[serve.rate_limit]
+# per_peer_rate_per_sec = 100.0             # inbound cdn/client/v1 requests per peer (NodeId), sustained (ADR 005); 0.0 disables
+# per_peer_burst = 400                      # per-peer burst capacity; required > 0 when the rate is > 0
+# per_ip_rate_per_sec = 200.0               # per-IP sustained rate; 0.0 disables
+# per_ip_burst = 800                        # per-IP burst capacity
+# global_rate_per_sec = 2000.0              # global inbound request sustained rate; 0.0 disables
+# global_burst = 5000                       # global inbound request burst capacity
+# max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map; 0 = unbounded
+# max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map; 0 = unbounded
 
 [receipts]
 # max_file_bytes = 134217728                # rotate the download-receipt log at this size (#802); default 128 MiB

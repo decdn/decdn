@@ -595,6 +595,83 @@ async fn concurrent_first_streams_on_one_lane_count_it_once() {
     );
 }
 
+/// A store whose `record` stalls before it writes, so a racing first stream
+/// reaches `register_lane` while the winner is still recording, and counts
+/// every record it is asked to make.
+struct SlowRecordStore {
+    inner: decdn_incentive::MemoryPoolStateStore,
+    records: std::sync::atomic::AtomicUsize,
+}
+
+impl PoolStateStore for SlowRecordStore {
+    fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
+        self.inner.load_all()
+    }
+
+    fn record(&self, state: &LaneState) -> Result<(), StoreError> {
+        self.records.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        self.inner.record(state)
+    }
+
+    fn forget(&self, key: LaneKey) -> Result<(), StoreError> {
+        self.inner.forget(key)
+    }
+
+    fn get(&self, key: LaneKey) -> Result<Option<LaneState>, StoreError> {
+        self.inner.get(key)
+    }
+}
+
+/// #2701: only the stream that wins the lane's vacant slot records the fresh
+/// zero lane. A racing first stream that recorded too would overwrite a voucher
+/// the winner's lane recorded in between, and roll the stored frontier back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_first_streams_record_the_fresh_lane_once() {
+    let metrics = Arc::new(Metrics::new());
+    let store = Arc::new(SlowRecordStore {
+        inner: decdn_incentive::MemoryPoolStateStore::new(),
+        records: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (handler, _dir) =
+        handler_over_store(&metrics, Arc::clone(&store) as Arc<dyn PoolStateStore>).await;
+    let lane = LaneKey {
+        pool_id: B256::repeat_byte(0xA2),
+        signer: Address::repeat_byte(0x12),
+        provider: Address::repeat_byte(0x23),
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut join = Vec::new();
+    for _ in 0..8 {
+        let handler = Arc::clone(&handler);
+        let barrier = Arc::clone(&barrier);
+        join.push(tokio::spawn(async move {
+            let state = LaneState::hydrate(
+                lane.pool_id,
+                lane.signer,
+                lane.provider,
+                U256::from(10u64),
+                u64::MAX,
+                U256::ZERO,
+                U256::ZERO,
+                None,
+                decdn_incentive::LaneChain::NONE,
+            );
+            barrier.wait().await;
+            handler.register_lane(state).expect("register");
+        }));
+    }
+    for handle in join {
+        handle.await.expect("register task join");
+    }
+    assert_eq!(
+        store.records.load(Ordering::SeqCst),
+        1,
+        "only the vacant-slot winner records the fresh lane"
+    );
+    assert_eq!(handler.lane_count.load(Ordering::Relaxed), 1);
+}
+
 /// Floor-`M` serving policy: the pool serves a full credit window while
 /// `remaining − M` covers it and stops the instant it cannot. `M` is the
 /// refundable minimum the pool owner is guaranteed to keep.
@@ -772,12 +849,21 @@ async fn handler_with_projection_view(
     crate::pool_view::PoolProjection,
     tempfile::TempDir,
 ) {
+    let projection = crate::pool_view::PoolProjection::new();
+    let (handler, dir) = handler_with_pool_view(metrics, Arc::new(projection.clone())).await;
+    (handler, projection, dir)
+}
+
+/// A handler whose pool view is `view`.
+async fn handler_with_pool_view(
+    metrics: &Arc<Metrics>,
+    view: Arc<dyn crate::pool_view::PoolView>,
+) -> (Arc<ClientHandler>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
         .await
         .expect("cache");
     let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
-    let projection = crate::pool_view::PoolProjection::new();
     let mut deps = ClientHandlerDeps::new(
         iroh::SecretKey::generate().public(),
         Arc::clone(metrics),
@@ -805,9 +891,9 @@ async fn handler_with_projection_view(
         U256::ZERO,
         always_admit_shed(),
     );
-    deps.pool_view = Some(Arc::new(projection.clone()));
+    deps.pool_view = Some(view);
     let handler = ClientHandler::new(deps).expect("handler");
-    (Arc::new(handler), projection, dir)
+    (Arc::new(handler), dir)
 }
 
 /// Fix 1 (security): capability intake verifies the owner signature against
@@ -1724,6 +1810,83 @@ async fn midstream_signer_recheck_trips_when_signer_drains_at_other_nodes() -> a
             .signer_cap_drained_midstream(pool, signer, held_cap, TEST_RATE)
             .await,
         "a signer drained to its full cap across providers must stop the stream"
+    );
+    Ok(())
+}
+
+/// #2711: after a restart the projection seeds a pool from one `getPool` and
+/// counts only what the signer redeems after the seed. The mid-stream re-check
+/// still sees the spend the admit-path `getAuthorization` read held, so a signer
+/// that spent most of its cap before the restart stops the stream once other
+/// nodes drain the rest.
+#[tokio::test]
+async fn midstream_signer_recheck_counts_a_resolved_pools_pre_restart_spend() -> anyhow::Result<()>
+{
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+    use alloy::sol_types::SolValue;
+    use decdn_incentive::payment_pool::PaymentPool;
+
+    use crate::pool_view::PoolView;
+
+    let metrics = Arc::new(Metrics::new());
+    let pool = B256::repeat_byte(0x52);
+    let signer = Address::new([0xa2; 20]);
+    let projection = crate::pool_view::PoolProjection::new();
+    let asserter = Asserter::new();
+    let view = Arc::new(crate::payment_settlement::ResolvingPoolView::new(
+        PaymentPool::new(
+            Address::ZERO,
+            ProviderBuilder::new().connect_mocked_client(asserter.clone()),
+        ),
+        projection.clone(),
+        Arc::clone(&metrics),
+    ));
+    let (handler, _dir) = handler_with_pool_view(&metrics, Arc::clone(&view) as _).await;
+    let one_window = decdn_incentive::min_payment(handler.credit_window(CHUNK_BYTES, 0), TEST_RATE);
+    let ow = u64::try_from(one_window).expect("one window fits u64");
+    let cap = ow.saturating_mul(10);
+
+    // Before the restart the signer spent eight windows at other nodes. The
+    // seed carries that spend in the pool's `totalRedeemed` only.
+    projection.record_resolved(
+        Address::new([0x07; 20]),
+        crate::pool_view::PoolRead {
+            pool_id: pool,
+            deposit: u64::MAX,
+            total_redeemed: ow.saturating_mul(8),
+            lifecycle: crate::pool_view::Lifecycle::Open,
+        },
+    );
+    asserter.push_success(&alloy::primitives::Bytes::from(
+        PaymentPool::Authorization {
+            cap,
+            expiry: u64::MAX,
+            spent: ow.saturating_mul(8),
+        }
+        .abi_encode(),
+    ));
+    // Admission reads the authorization: two windows of headroom remain.
+    anyhow::ensure!(view.signer_authorization(pool, signer).await.is_some());
+    anyhow::ensure!(
+        !handler
+            .signer_cap_drained_midstream(pool, signer, U256::from(cap), TEST_RATE)
+            .await,
+        "two windows of headroom keep the stream serving"
+    );
+
+    // Another node redeems the signer's last two windows.
+    projection.record_redeemed(
+        pool,
+        Address::new([0xc2; 20]),
+        &[lane_settled(signer, ow.saturating_mul(2))],
+        None,
+    );
+    anyhow::ensure!(
+        handler
+            .signer_cap_drained_midstream(pool, signer, U256::from(cap), TEST_RATE)
+            .await,
+        "the pre-restart spend plus the drain since admission stops the stream"
     );
     Ok(())
 }

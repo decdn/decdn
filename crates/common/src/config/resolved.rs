@@ -675,6 +675,54 @@ impl Default for ResolvedProbe {
     }
 }
 
+/// Resolved inbound `cdn/client/v1` settings (ADR 005 §Request rate
+/// limiting).
+///
+/// Mirrors [`ResolvedProbe`] in shape; `Default` returns the ADR 005 request
+/// defaults so hand-built `ResolvedConfig` test sites can write
+/// `ResolvedServe::default()`. The production `resolve_serve_into` path
+/// threads the defaults through the resolver bag.
+#[derive(Debug, Clone)]
+pub struct ResolvedServe {
+    /// Token refill rate for the per-peer (`NodeId`) limiter, in
+    /// requests/second.
+    pub per_peer_rate_per_sec: f64,
+    /// Bucket capacity for the per-peer limiter: how many requests one peer
+    /// may open back to back before the refill rate binds. `0` alongside a
+    /// `0.0` rate disables the layer; `0` against a nonzero rate is rejected
+    /// as a deny-all. The same pairing rule holds for the two below.
+    pub per_peer_burst: u32,
+    /// Token refill rate for the per-source-IP limiter, in requests/second.
+    pub per_ip_rate_per_sec: f64,
+    /// Bucket capacity for the per-IP limiter.
+    pub per_ip_burst: u32,
+    /// Token refill rate for the handler-wide limiter, in requests/second.
+    /// Applies across all peers and all source IPs together.
+    pub global_rate_per_sec: f64,
+    /// Bucket capacity for the handler-wide limiter.
+    pub global_burst: u32,
+    /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
+    pub max_tracked_per_ip: usize,
+    /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
+    /// => unbounded.
+    pub max_tracked_per_peer: usize,
+}
+
+impl Default for ResolvedServe {
+    fn default() -> Self {
+        Self {
+            per_peer_rate_per_sec: 100.0,
+            per_peer_burst: 400,
+            per_ip_rate_per_sec: 200.0,
+            per_ip_burst: 800,
+            global_rate_per_sec: 2000.0,
+            global_burst: 5000,
+            max_tracked_per_ip: 4096,
+            max_tracked_per_peer: 4096,
+        }
+    }
+}
+
 /// Resolved security / rate-limiting fields.
 #[derive(Debug, Clone)]
 pub struct ResolvedSecurity {
@@ -790,6 +838,8 @@ pub struct ResolvedConfig {
     pub dht: ResolvedDht,
     /// `cdn/probe/v1` settings (ADR 005).
     pub probe: ResolvedProbe,
+    /// Inbound `cdn/client/v1` settings (ADR 005).
+    pub serve: ResolvedServe,
     /// Download-receipt log settings.
     pub receipts: ResolvedReceipts,
     /// Local content denylist (ADR 011).

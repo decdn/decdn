@@ -32,7 +32,8 @@ use decdn_incentive::{LaneKey, LaneState, PoolStateStore, SettlementLedger, Sett
 
 pub use crate::handlers::client::LaneActivityClock;
 use jsonrpsee::core::{RpcResult, async_trait};
-use jsonrpsee::server::{Server, ServerConfig};
+use jsonrpsee::server::middleware::http::HostFilterLayer;
+use jsonrpsee::server::{BatchRequestConfig, Server, ServerConfig};
 use jsonrpsee::types::ErrorObjectOwned;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
@@ -50,6 +51,7 @@ use crate::payment_settlement::{RedeemSchedule, capability_expired, unix_now};
 
 use crate::runtime::RuntimeReloadState;
 
+mod origin_guard;
 pub mod pool_owners;
 
 /// Cap concurrent admin connections. The surface is local-operator-only,
@@ -1260,7 +1262,19 @@ pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     Ok(listener)
 }
 
+/// The `Host` values the admin server answers: the loopback names, on any port.
+/// A DNS-rebinding page reaches the loopback listener under its own domain,
+/// which it cannot make one of these. Any port, so an SSH tunnel or a container
+/// port mapping onto another local port still reaches the server.
+const ADMIN_ALLOWED_HOSTS: [&str; 2] = ["127.0.0.1:*", "localhost:*"];
+
 /// Serve admin RPC methods on `listener` until `shutdown` fires.
+///
+/// The server answers a request only when its `Host` is a loopback name
+/// (`ADMIN_ALLOWED_HOSTS`) and it carries no `Origin` header
+/// (`origin_guard`), so a web page the operator opens cannot drive it, by
+/// DNS rebinding or otherwise. It accepts no batch requests: every admin
+/// client sends one call per request.
 ///
 /// Concurrency is capped via `ServerConfig::max_connections`; shutdown
 /// is signalled by calling `ServerHandle::stop()`, then we await
@@ -1282,11 +1296,19 @@ pub async fn serve(
 
     let config = ServerConfig::builder()
         .max_connections(MAX_ADMIN_CONNECTIONS)
+        .set_batch_request_config(BatchRequestConfig::Disabled)
         .http_only()
         .build();
+    let host_filter = HostFilterLayer::new(ADMIN_ALLOWED_HOSTS)
+        .map_err(|e| anyhow::anyhow!("build admin RPC host filter: {e}"))?;
 
     let server = Server::builder()
         .set_config(config)
+        .set_http_middleware(
+            tower::ServiceBuilder::new()
+                .layer(host_filter)
+                .layer(origin_guard::RejectOriginLayer),
+        )
         .build_from_tcp(std_listener)
         .map_err(|e| anyhow::anyhow!("build admin RPC server: {e}"))?;
 
