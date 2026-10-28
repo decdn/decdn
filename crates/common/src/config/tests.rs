@@ -1455,6 +1455,77 @@ fn resolve_cache_relay_foreign_namespaces_explicit_true_overrides_origin_default
     Ok(())
 }
 
+/// A cache with an HTTP origin backend, and `pull_through` as its explicit
+/// node-to-node pull-through setting.
+fn origin_cache(pull_through: Option<bool>) -> types::CacheConfig {
+    types::CacheConfig {
+        origin: Some(types::OriginConfig::Http {
+            url: "https://origin.example/".to_string(),
+            decompress: None,
+        }),
+        node_to_node_pull_through_enabled: pull_through,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn resolve_cache_pull_through_defaults_on_without_origin() -> anyhow::Result<()> {
+    // Role-derived default (#2603): a node with no origin backend is a cache
+    // node, which exists to fill its misses from peers.
+    let resolved = resolve_cache(
+        &empty_cache_args(),
+        Some(&types::CacheConfig::default()),
+        Path::new("/tmp"),
+    )?;
+    anyhow::ensure!(
+        resolved.node_to_node_pull_through_enabled,
+        "a node with no origin configured must default to pull-through on"
+    );
+    Ok(())
+}
+
+#[test]
+fn resolve_cache_pull_through_defaults_off_with_origin() -> anyhow::Result<()> {
+    // An origin node serves its own content and refuses foreign hashes, so
+    // absent an explicit override it does not buy from peers.
+    let resolved = resolve_cache(
+        &empty_cache_args(),
+        Some(&origin_cache(None)),
+        Path::new("/tmp"),
+    )?;
+    anyhow::ensure!(
+        !resolved.node_to_node_pull_through_enabled,
+        "a node with an origin configured must default to pull-through off"
+    );
+    Ok(())
+}
+
+#[test]
+fn resolve_cache_pull_through_explicit_value_overrides_either_default() -> anyhow::Result<()> {
+    let on_with_origin = resolve_cache(
+        &empty_cache_args(),
+        Some(&origin_cache(Some(true))),
+        Path::new("/tmp"),
+    )?;
+    anyhow::ensure!(
+        on_with_origin.node_to_node_pull_through_enabled,
+        "an explicit `true` must override the origin node's default"
+    );
+    let off_without_origin = resolve_cache(
+        &empty_cache_args(),
+        Some(&types::CacheConfig {
+            node_to_node_pull_through_enabled: Some(false),
+            ..Default::default()
+        }),
+        Path::new("/tmp"),
+    )?;
+    anyhow::ensure!(
+        !off_without_origin.node_to_node_pull_through_enabled,
+        "an explicit `false` must override the cache node's default"
+    );
+    Ok(())
+}
+
 #[test]
 fn resolve_cache_accepts_duplicate_origins_without_erroring() -> anyhow::Result<()> {
     // A duplicate records a notice but must not fail config

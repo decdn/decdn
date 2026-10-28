@@ -1933,7 +1933,10 @@ fn resolve_cache_into(
 
     let node_to_node_pull_through_enabled = file
         .and_then(|c| c.node_to_node_pull_through_enabled)
-        .unwrap_or(false);
+        // Role-derived default: a node with no origin is a cache node and
+        // fills its misses from peers; an origin node serves its own content.
+        // Explicit config overrides either way.
+        .unwrap_or(origins.is_empty());
     let relay_foreign_namespaces = file
         .and_then(|c| c.relay_foreign_namespaces)
         // Role-derived default: an origin node (a backend is configured) serves only

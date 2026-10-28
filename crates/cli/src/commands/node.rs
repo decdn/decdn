@@ -918,6 +918,24 @@ fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
     )
 }
 
+/// The `pull_through=` status line (#2603): whether the node fills its misses
+/// from peers, and what its buyer wallet holds to pay for them. An empty
+/// wallet is flagged, because the node then cannot open or top up the pool
+/// its cache-miss pulls pay from.
+fn pull_through_line(pull_through: Option<&decdn_common::admin::PullThroughStatus>) -> String {
+    match pull_through {
+        None => "pull_through=(unknown)".to_owned(),
+        Some(p) if !p.enabled => "pull_through=off".to_owned(),
+        Some(p) => match p.buyer_wallet_micro_usdc {
+            None => "pull_through=on buyer_wallet_usdc=(not read yet)".to_owned(),
+            Some(0) => "pull_through=on buyer_wallet_usdc=0.000000 (unfunded: the node cannot \
+                        open or top up the pool its cache-miss pulls pay from)"
+                .to_owned(),
+            Some(micro) => format!("pull_through=on buyer_wallet_usdc={}", format_usdc(micro)),
+        },
+    }
+}
+
 /// Format a micro-USDC amount as a `"N.NNNNNN"` USDC string. USDC has 6
 /// decimals (ADR 003), so 1 USDC == `1_000_000` micro-USDC. Trailing
 /// fractional zeros are kept fixed-width (six places) so columns align and
@@ -1347,6 +1365,7 @@ fn write_status(
         s.republish.scheduled_records
     )?;
     writeln!(w, "chain_denied_origins={}", s.chain_denied_origins)?;
+    writeln!(w, "{}", pull_through_line(s.pull_through.as_ref()))?;
     writeln!(w, "{}", earnings_summary_line(earnings))?;
 
     if s.routing.buckets.is_empty() {

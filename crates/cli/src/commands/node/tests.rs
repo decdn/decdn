@@ -247,6 +247,10 @@ fn mk_status(last_refresh_us: Option<u64>) -> StatusResponse {
             scheduled_records: 5,
         },
         chain_denied_origins: 3,
+        pull_through: Some(decdn_common::admin::PullThroughStatus {
+            enabled: true,
+            buyer_wallet_micro_usdc: Some(12_500_000),
+        }),
     }
 }
 
@@ -276,12 +280,43 @@ fn write_status_renders_summary_and_bucket_table() -> anyhow::Result<()> {
     assert!(s.contains("record_store records=50000/100000 (50%)"), "{s}");
     assert!(s.contains("republish scheduled_records=5"), "{s}");
     assert!(s.contains("chain_denied_origins=3"), "{s}");
+    assert!(
+        s.contains("pull_through=on buyer_wallet_usdc=12.500000\n"),
+        "{s}"
+    );
     // Bucket table: header + a full bucket at 100%.
     assert!(s.contains("BUCKET"), "{s}");
     assert!(s.contains("FILL%"), "{s}");
     assert!(s.contains("20/20"), "{s}");
     assert!(s.contains("100%"), "{s}");
     Ok(())
+}
+
+/// The `pull_through=` line names each state an operator acts on
+/// differently, and flags an empty buyer wallet (#2603).
+#[test]
+fn pull_through_line_names_each_state() {
+    use decdn_common::admin::PullThroughStatus;
+    let on = |usdc| {
+        pull_through_line(Some(&PullThroughStatus {
+            enabled: true,
+            buyer_wallet_micro_usdc: usdc,
+        }))
+    };
+    assert_eq!(pull_through_line(None), "pull_through=(unknown)");
+    assert_eq!(
+        pull_through_line(Some(&PullThroughStatus {
+            enabled: false,
+            buyer_wallet_micro_usdc: Some(0),
+        })),
+        "pull_through=off"
+    );
+    assert_eq!(on(None), "pull_through=on buyer_wallet_usdc=(not read yet)");
+    assert!(on(Some(0)).contains("buyer_wallet_usdc=0.000000 (unfunded"));
+    assert_eq!(
+        on(Some(2_000_001)),
+        "pull_through=on buyer_wallet_usdc=2.000001"
+    );
 }
 
 /// A node that reports no resolvable operator address (no chain wiring)

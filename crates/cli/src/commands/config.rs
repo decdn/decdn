@@ -279,8 +279,10 @@ pub fn write_validate_summary<W: std::io::Write>(
             resolved.cache.node_pull_stall_window_sec,
             resolved.cache.node_pull_min_throughput_bps
         )?;
-    } else {
+    } else if resolved.cache.origins.is_empty() {
         writeln!(w, "  node_to_node_pull:        disabled")?;
+    } else {
+        writeln!(w, "  node_to_node_pull:        disabled (origin node)")?;
     }
     if resolved.cache.relay_foreign_namespaces {
         writeln!(w, "  relay_foreign_namespaces: true")?;
@@ -430,17 +432,20 @@ fn write_notices<W: std::io::Write>(
 ///
 /// Role is implied by `--origin`, not a separate flag: presence of an origin
 /// backend IS the role signal, exactly mirroring the runtime's role-derived
-/// `cache.relay_foreign_namespaces` default — so the generated config and the
-/// resolver agree by construction. `--client` is a distinct role, not the
+/// `cache.relay_foreign_namespaces` and `cache.node_to_node_pull_through_enabled`
+/// defaults — so the generated config and the resolver agree by construction. `--client` is a distinct role, not the
 /// absence of the others: a consumer that fetches and pays, with none of the
 /// serving sections.
 #[derive(Debug)]
 pub enum Role {
     /// No role flag: a serving node with no origin backend — relays foreign
-    /// namespaces for pay (`relay_foreign_namespaces` derives to `true`).
+    /// namespaces for pay and fills its misses from peers
+    /// (`relay_foreign_namespaces` and `node_to_node_pull_through_enabled`
+    /// derive to `true`).
     Relay,
     /// `--origin <URL>`: a serving node with an active `[cache.origin]`
-    /// backend (`relay_foreign_namespaces` derives to `false`, origin-only).
+    /// backend (`relay_foreign_namespaces` and
+    /// `node_to_node_pull_through_enabled` derive to `false`, origin-only).
     Origin(OriginSpec),
     /// `--client`: a fetch-only consumer — identity + chain coordinates,
     /// none of the cache/origin/serving sections.
@@ -592,8 +597,8 @@ pub fn config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
             }
         };
         println!(
-            "origin backend: {backend} — cache.relay_foreign_namespaces derives to false \
-             (origin-only)"
+            "origin backend: {backend} — cache.relay_foreign_namespaces and \
+             cache.node_to_node_pull_through_enabled derive to false (origin-only)"
         );
     }
     Ok(())
@@ -833,10 +838,13 @@ fn insert_origin_block(template: &str, spec: &OriginSpec) -> anyhow::Result<Stri
     let block = format!(
         "# --- Origin backend (written by `decdn config init --origin`) ---\n\
          # An active origin backend makes this an ORIGIN node: the runtime derives\n\
-         # relay_foreign_namespaces = false (serve own namespaces only). Uncomment the\n\
-         # next line to override the derived value — set true to also relay foreign\n\
-         # content for pay while running an origin backend.\n\
+         # relay_foreign_namespaces = false (serve own namespaces only) and\n\
+         # node_to_node_pull_through_enabled = false (buy no misses from peers).\n\
+         # Uncomment a line to override its derived value — set true to also relay\n\
+         # foreign content for pay, or to fill misses from peers, while running an\n\
+         # origin backend.\n\
          # relay_foreign_namespaces = false\n\
+         # node_to_node_pull_through_enabled = false\n\
          {backend}\
          \n"
     );
@@ -1025,7 +1033,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # eviction_tick_secs = 1                   # LRU driver wakeup cadence in seconds (#1173); bounds [1,60]
 # max_probe_holds = 256                    # probe eviction-hold budget (ADR 005 §Hold budget); 0 disables has_blob:true
 # stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
-# node_to_node_pull_through_enabled = false # paid cache-miss pull from upstream nodes (#831, ADR 001/022); OFF by default
+# node_to_node_pull_through_enabled = true # paid cache-miss pull from upstream nodes (#831, ADR 001/022); default is role-derived — off when a [cache.origin]/[[cache.origins]] backend is configured, on when none is; set explicitly to override
 # relay_foreign_namespaces = true          # relay content this node's own backend does not hold (#1759); default is role-derived — origin-only (false) when a [cache.origin]/[[cache.origins]] backend is configured, relay (true) when none is; set explicitly to override
 # node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
 # node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the pool open, which has its own 5s budget. The overall pull-through deadline is derived from this, the pool-open budget, and the stall window, so every ranked upstream can be tried before falling back (#831, #859)

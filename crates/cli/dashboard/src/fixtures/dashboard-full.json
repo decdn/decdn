@@ -203,7 +203,11 @@
           "scheduled_records": 1204
         },
         "chain_denied_origins": 0,
-        "operator_address": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2"
+        "operator_address": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+        "pull_through": {
+          "enabled": true,
+          "buyer_wallet_micro_usdc": 12500000
+        }
       }
     },
     "metrics": {

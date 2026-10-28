@@ -362,6 +362,23 @@ pub struct StatusResponse {
     /// matching how [`HealthResponse::bound_node_id`] degrades. The address is
     /// public; no key material is ever exposed here.
     pub operator_address: Option<String>,
+    /// Node-to-node pull-through and the buyer wallet that pays for it
+    /// (#2603). `None` when no buyer leg is wired (unit tests, cache-only
+    /// nodes).
+    pub pull_through: Option<PullThroughStatus>,
+}
+
+/// Node-to-node pull-through on `admin_v1_status` (#2603): whether the node
+/// fills its cache misses from peers, and what its buyer wallet holds to pay
+/// for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullThroughStatus {
+    /// Whether `cache.node_to_node_pull_through_enabled` resolved on.
+    pub enabled: bool,
+    /// The buyer wallet's USDC balance in micro-USDC, as the node last read
+    /// it: at bootstrap, then once per reclaim sweep. `None` before the first
+    /// read succeeds. Saturates at `u64::MAX`.
+    pub buyer_wallet_micro_usdc: Option<u64>,
 }
 
 /// JSON view of one lane this node provides against a `PaymentPool`,

@@ -889,6 +889,41 @@ async fn status_reports_operator_address_when_wired() {
     assert_eq!(resp.operator_address, None);
 }
 
+/// The buyer wallet wired via `with_buyer_wallet` reports pull-through and
+/// the wallet's last-read balance, `None` before any read; an `AdminState`
+/// with no wallet reports no `pull_through` (#2603).
+#[tokio::test]
+async fn status_reports_pull_through_from_the_buyer_wallet() {
+    use decdn_common::admin::PullThroughStatus;
+
+    let wallet = Arc::new(crate::buyer_pool::BuyerWallet::new(true));
+    let (state, _tmp) = state_with().await;
+    let rpc = AdminRpcImpl::new(
+        state
+            .with_dht(seeded_dht_handles())
+            .with_buyer_wallet(Arc::clone(&wallet)),
+    );
+    assert_eq!(
+        rpc.status().await.expect("status ok").pull_through,
+        Some(PullThroughStatus {
+            enabled: true,
+            buyer_wallet_micro_usdc: None,
+        })
+    );
+    wallet.record(U256::from(7_500_000u64));
+    assert_eq!(
+        rpc.status().await.expect("status ok").pull_through,
+        Some(PullThroughStatus {
+            enabled: true,
+            buyer_wallet_micro_usdc: Some(7_500_000),
+        })
+    );
+
+    let (state, _tmp) = state_with().await;
+    let rpc = AdminRpcImpl::new(state.with_dht(seeded_dht_handles()));
+    assert_eq!(rpc.status().await.expect("status ok").pull_through, None);
+}
+
 /// A zero refresh clock (no bucket-refresh pass has completed yet)
 /// must surface as `last_refresh_us: None`, not `Some(0)`.
 #[tokio::test]

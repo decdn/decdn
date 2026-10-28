@@ -5152,3 +5152,63 @@ async fn a_row_replaced_mid_settle_leaves_the_escrow_untracked() {
     assert_eq!(counter(&svc.metrics, "decdn_buyer_topup_ok_total"), 0);
     assert_eq!(counter(&svc.metrics, "decdn_buyer_topup_failure_total"), 1);
 }
+
+/// Each buyer-wallet read records the balance for `admin_v1_status`, and an
+/// empty wallet warns only on a node with pull-through on (#2603). A failed
+/// read records nothing, so the status does not report a zero it never read.
+#[tokio::test]
+async fn an_empty_buyer_wallet_warns_only_with_pull_through_on() -> anyhow::Result<()> {
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+    use alloy::sol_types::SolValue;
+
+    const UNFUNDED: &str = "the buyer wallet holds no USDC";
+    for (pull_through, balance, warns) in [
+        (true, Some(0u64), true),
+        (true, Some(5), false),
+        (false, Some(0), false),
+        (true, None, false),
+    ] {
+        let case = format!("pull_through={pull_through} balance={balance:?}");
+        let asserter = Asserter::new();
+        match balance {
+            Some(b) => asserter.push_success(&U256::from(b).abi_encode()),
+            None => asserter.push_failure_msg("balanceOf faulted"),
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let wallet = BuyerWallet::new(pull_through);
+        let log = CapturedLog::default();
+        let sink = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            publish_buyer_wallet_usdc(
+                &provider,
+                Address::repeat_byte(0x22),
+                Address::repeat_byte(0x44),
+                &Arc::new(Metrics::new()),
+                &wallet,
+            )
+            .await;
+        }
+        let text = String::from_utf8(
+            log.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )?;
+        anyhow::ensure!(
+            wallet.usdc() == balance.map(U256::from),
+            "{case}: recorded {:?}",
+            wallet.usdc()
+        );
+        anyhow::ensure!(
+            text.contains(UNFUNDED) == warns,
+            "{case}: warns={warns}: {text}"
+        );
+    }
+    Ok(())
+}

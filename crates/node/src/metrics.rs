@@ -430,8 +430,9 @@ pub struct DecdnMetrics {
     /// matters — by up to that long.
     ///
     /// Zero is meaningful only on a node with
-    /// `cache.node_to_node_pull_through_enabled` on; a cache-only node never
-    /// opens a pool and has no reason to hold USDC.
+    /// `cache.node_to_node_pull_through_enabled` on, the default for a node
+    /// with no origin backend; a node with it off never opens a pool and has
+    /// no reason to hold USDC.
     pub buyer_wallet_usdc: Gauge,
     /// `decdn_buyer_lane_seed_failures_total`: this node could not establish a
     /// lane's already-paid watermark, so it refused the pull rather than

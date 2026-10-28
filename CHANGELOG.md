@@ -28,6 +28,25 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Config: `cache.node_to_node_pull_through_enabled` defaults by role
+  (#2603).** Absent, it resolves on for a node with no origin backend and off
+  for a node that configures one, the same derivation as
+  `cache.relay_foreign_namespaces`. It was off everywhere, so a node started
+  from `decdn config init` or the README refused every miss it could not fill
+  from its own backend. A node with no origin and no explicit value now buys
+  its misses from peers and spends USDC from its buyer wallet. It escrows
+  `blockchain.buyer_working_deposit_micro_usdc` (10 USDC) in a pool and
+  refills the pool toward it whenever it falls below low water, so its spend
+  is bounded by the wallet's USDC, not by the working deposit. Set the field
+  to `false` to keep the old behaviour.
+  - Admin wire: `StatusResponse` carries `pull_through`
+    (`PullThroughStatus { enabled, buyer_wallet_micro_usdc }`), and `decdn node
+    status` prints it on a `pull_through=` line that flags an empty buyer
+    wallet. The field is required, so a `decdn` CLI at this release reads
+    `admin_v1_status` only from a daemon at this release.
+  - A node with pull-through on logs a warning at each read of an empty buyer
+    wallet: at bootstrap, then once per hourly reclaim sweep.
+
 - **Admin wire: `BuyerPoolSnapshot` carries `spent_micro_usdc`.** The field
   is the pool's spend as the store knows it (every tracked lane plus the
   spend other signers redeemed). It is a lower bound, so deposit less spend

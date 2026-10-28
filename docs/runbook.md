@@ -539,8 +539,10 @@ action is required.
 against content the fleet already holds; the node serves inbound requests
 normally, so nothing else alerts. `DecdnNodePullNeverSucceeds` fires after 6h.
 
-The node pulls from peers only with `cache.node_to_node_pull_through_enabled =
-true`, which is off by default. With it off, the node never opens a buyer pool
+The node pulls from peers only with `cache.node_to_node_pull_through_enabled`
+on. Absent, it is on for a node with no origin backend and off for an origin
+node; `decdn node status` prints the resolved value on its `pull_through=`
+line. With it off, the node never opens a buyer pool
 or spends USDC on pulls, and the symptoms above do not apply. The buyer service
 still starts. With `blockchain.buyer_max_approve = true` (the default), it gives
 the `PaymentPool` an unlimited USDC allowance at startup, sending the `approve`
@@ -559,8 +561,11 @@ the ERC-20 transfer, so the node can pay no provider and every cache miss falls
 through to origin.
 
 1. Read `decdn_buyer_wallet_usdc`, and
-   `decdn_pool_open_failures_insufficient_deposit_total` beside it. The gauge is
-   refreshed once per reclaim sweep, so allow up to an hour after funding.
+   `decdn_pool_open_failures_insufficient_deposit_total` beside it, or the
+   `pull_through=` line of `decdn node status`, which flags an empty wallet
+   `(unfunded …)`. With pull-through on, the node also logs a warning at each
+   read of an empty wallet. The balance is read once per reclaim sweep, so
+   allow up to an hour after funding.
 2. Send USDC to the operator address. Circle's Sepolia faucet is the testnet
    source (see [Testnet faucet](#testnet-faucet)); `decdn whoami` prints the
    address, given the keystore password.

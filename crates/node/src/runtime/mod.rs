@@ -2135,6 +2135,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let buyer_ensure_max_approval = cfg.blockchain.buyer_max_approve;
     let buyer_signer_address = infra.eth_signer.address();
     let pull_through_enabled = cfg.cache.node_to_node_pull_through_enabled;
+    let buyer_wallet = Arc::new(crate::buyer_pool::BuyerWallet::new(pull_through_enabled));
+    let buyer_wallet_for_buyer = Arc::clone(&buyer_wallet);
     let node_origin_self_id = crate::dht::NodeId::from_bytes(*infra.secret_key.public().as_bytes());
     let node_origin_slash_domain = ch.slash_domain.clone();
     // #1117: the `CapacityBond` bind domain this node signs its node→node client
@@ -2199,6 +2201,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 buyer_working_deposit,
                 buyer_ensure_max_approval,
                 node_metrics_for_buyer,
+                buyer_wallet_for_buyer,
             ) => match res {
                 Ok(service) => Arc::new(service),
                 Err(err) => {
@@ -2357,6 +2360,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // what the daemon believes — the only read path to `buyer.redb` while
         // this process holds redb's exclusive lock on it.
         .with_buyer_pools(Arc::clone(&buyer_pool_store_for_admin))
+        // Pull-through and the buyer wallet for `admin_v1_status` (#2603): the
+        // SAME handle the buyer pool service records each balance read into.
+        .with_buyer_wallet(Arc::clone(&buyer_wallet))
         // Slash-detection introspection for `admin_v1_slashes` (#1032). Shares
         // the in-memory store the watcher appends to — read-only here.
         .with_slash_detection(admin::SlashStatusHandles {

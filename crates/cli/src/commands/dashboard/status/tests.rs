@@ -231,6 +231,10 @@ fn node_up() -> NodeSection {
             },
             chain_denied_origins: 0,
             operator_address: Some(OPERATOR.to_owned()),
+            pull_through: Some(decdn_common::admin::PullThroughStatus {
+                enabled: true,
+                buyer_wallet_micro_usdc: Some(12_500_000),
+            }),
         }),
         metrics: ok(NodeMetrics {
             snapshot: Snapshot {
