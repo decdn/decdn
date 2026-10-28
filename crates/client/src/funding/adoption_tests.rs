@@ -1653,12 +1653,13 @@ fn answer_a_replacement_open(asserter: &Asserter) {
 /// Queue a `topUp` gas estimate that reverts `PoolNotOpen`: a code-3
 /// "execution reverted" error whose data is the error's 4-byte selector.
 fn answer_a_top_up_reverting_pool_not_open(asserter: &Asserter) {
-    let selector = alloy::primitives::keccak256("PoolNotOpen()");
+    use alloy::sol_types::SolError;
+    use decdn_incentive::pool_open_error::PoolNotOpen;
     asserter.push_failure(
         serde_json::from_value::<alloy_json_rpc::ErrorPayload>(serde_json::json!({
             "code": 3,
             "message": "execution reverted",
-            "data": format!("0x{}", alloy::primitives::hex::encode(&selector[..4])),
+            "data": alloy::primitives::hex::encode_prefixed(PoolNotOpen::SELECTOR),
         }))
         .unwrap(),
     );
