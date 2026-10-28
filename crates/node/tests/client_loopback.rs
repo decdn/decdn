@@ -6873,6 +6873,123 @@ async fn drained_pool_stops_stream_after_its_floor_is_repaid() -> anyhow::Result
     Ok(())
 }
 
+/// #2664: a mid-stream `PoolExhausted` follows proofs the node accepted, and
+/// the real client keeps its last proof on it
+/// (`VoucherRejectReason::refuses_proof`, #2662). The node writes the reason
+/// from its mid-stream solvency re-check, which runs only at a voucher boundary
+/// where it collected a proof.
+///
+/// The pool drains as soon as the client has paid a voucher, and it drains to
+/// zero with `M = 0`, so the next re-check (ZERO interval) stops the stream.
+/// The client's ledger must cover the lane the node holds. Once the pool reads
+/// funded again, a resumed fetch on the same ledger completes with no rebase
+/// heal: before #2662 the client sat one `chunk_price` below the node and drew
+/// `AmountRegression`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mid_stream_pool_exhausted_keeps_the_proofs_the_node_accepted() -> anyhow::Result<()> {
+    // 16 MiB = 4 intervals, so the boundary after the drain is `!done`.
+    let payload: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i % 239) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (target, server_ep, server_task, metrics) = spawn_handler_server_with_draining_pool(
+        cache,
+        Arc::clone(&store),
+        deposit,
+        U256::ZERO,
+        Arc::clone(&drained),
+        Duration::ZERO,
+        U256::ZERO,
+    )
+    .await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let sd = slash_domain();
+    let deadlines = PullDeadlines::whole_transfer(Duration::from_secs(15));
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let fetch = |ts: u64| {
+        stream_fetch_shared(
+            &client_ep,
+            target.clone(),
+            &ctx,
+            &ledger,
+            &sd,
+            operator_addr(),
+            *hash.as_bytes(),
+            0,
+            ts,
+            deadlines,
+            0,
+            0,
+        )
+    };
+
+    // Drain the pool once the client has paid: the node admitted the stream,
+    // so its next re-check runs at a boundary where it collected a proof.
+    let drain = tokio::spawn({
+        let ledger = Arc::clone(&ledger);
+        let drained = Arc::clone(&drained);
+        async move {
+            while ledger.committed().amount.is_zero() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            drained.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    let err = fetch(0x2664_0001)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("the drained pool must stop the fetch"))?;
+    drain.abort();
+    let rejected = err
+        .downcast_ref::<UpstreamVoucherRejected>()
+        .ok_or_else(|| anyhow::anyhow!("expected UpstreamVoucherRejected, got: {err:?}"))?;
+    anyhow::ensure!(
+        rejected.reason == VoucherRejectReason::PoolExhausted,
+        "expected PoolExhausted, got {:?}",
+        rejected.reason
+    );
+    anyhow::ensure!(
+        counter(
+            &metrics,
+            "decdn_serve_stream_midstream_pool_exhausted_total"
+        )? == 1,
+        "the mid-stream re-check stopped the stream"
+    );
+    let node_claim = store
+        .load_all()?
+        .first()
+        .map(LaneState::owed)
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
+    anyhow::ensure!(
+        !node_claim.is_zero(),
+        "the node accepted a proof before the stop"
+    );
+    let kept = ledger.committed().amount;
+    anyhow::ensure!(
+        kept >= node_claim,
+        "the client keeps every proof the node accepted: ledger {kept} vs node claim \
+         {node_claim}"
+    );
+
+    // Funded again: the resumed fetch continues the lane where the node left
+    // it, with no rebase.
+    drained.store(false, std::sync::atomic::Ordering::Relaxed);
+    let generation = ledger.generation();
+    let got = fetch(0x2664_0002)
+        .await
+        .map_err(|e| anyhow::anyhow!("resumed fetch: {e:#}"))?;
+    anyhow::ensure!(got.as_ref() == payload.as_slice(), "resumed bytes match");
+    anyhow::ensure!(
+        ledger.generation() == generation,
+        "the resumed fetch needs no heal: generation {generation} -> {}",
+        ledger.generation()
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// Live handles for the wall-clock recheck-cadence tests, produced by
 /// [`setup_recheck_holder_and_driven`]. `_send_a`/`_recv_a` keep the holder lane
 /// (A) open so it stays PARKED holding its floor reservation while a test drives B.
