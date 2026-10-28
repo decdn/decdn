@@ -532,24 +532,25 @@ async fn gc_per_source_drops_refilled_buckets() {
 /// bucket check (#1788 item 2). In production the sweep is offloaded to a
 /// `spawn_blocking` task; here there is no tokio runtime, so `dispatch_prune`
 /// runs the SAME single-flighted `retain_recent` sweep inline — which lets
-/// this test assert the outcome deterministically. Fast refill (rate=1000/s,
-/// burst=1) so an idle bucket returns to its fresh baseline within the wait,
-/// and `retain_recent` drops every bucket except the one the triggering
-/// accept just used.
+/// this test assert the outcome deterministically. The refill (rate=10/s,
+/// burst=1) takes 100ms: long enough that no bucket refills while the
+/// populate loop runs on a loaded runner, short enough that every idle bucket
+/// is back at its fresh baseline after the wait. `retain_recent` then drops
+/// every bucket except the one the triggering accept just used.
 #[test]
 fn over_cap_accept_prunes_refilled_keyspace() {
     let metrics = Arc::new(Metrics::new());
     let cfg = ResolvedSecurity {
         max_concurrent_handlers: u32::MAX,
-        per_source_rate_per_sec: 1000.0,
+        per_source_rate_per_sec: 10.0,
         per_source_burst: 1,
         // Small cap so a handful of distinct sources trips cap + cap/10 (== 2).
         max_tracked_sources: 2,
     };
     let limiter = ConnectionLimiter::new(&cfg, Arc::clone(&metrics));
-    // Populate 8 distinct per-source buckets, well past cap + cap/10. In this
-    // tight synchronous loop no bucket has time to refill, so the over-cap
-    // sweeps that fire during it drop nothing and the keyspace grows to 8.
+    // Populate 8 distinct per-source buckets, well past cap + cap/10. The
+    // loop finishes far inside one 100ms refill, so the over-cap sweeps that
+    // fire during it drop nothing and the keyspace grows to 8.
     for i in 0..8u8 {
         let _ = limiter.acquire_inner(Some(ip(10, 0, 0, i)));
     }
@@ -558,8 +559,8 @@ fn over_cap_accept_prunes_refilled_keyspace() {
         8,
         "every distinct source should be tracked before the refill window"
     );
-    // Let every populated bucket refill to its fresh baseline (~1ms each).
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Let every populated bucket refill to its fresh baseline (100ms each).
+    std::thread::sleep(std::time::Duration::from_millis(400));
     // One more over-cap accept from a fresh source. Its bucket is now
     // non-baseline (a token was just drawn), so the sweep keeps it and drops
     // the 8 refilled buckets.

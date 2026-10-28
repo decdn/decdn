@@ -1295,6 +1295,11 @@ since project inception and will roll into the first tagged release.
   saw a dry-run `evict` report `was_present: false` for a blob its node held.
   The wait now keeps polling until its own daemon answers. If that daemon exits
   first, the error names the node that held the port.
+- **`decdn-node` tests: `over_cap_accept_prunes_refilled_keyspace` holds on
+  a loaded runner (#2733).** The test fills 8 per-source buckets and expects
+  none to refill before the loop ends. A 1 ms refill gave the loop a 1 ms
+  margin, so a preempted loop lost a bucket to the over-cap sweep. The refill
+  is now 100 ms and the wait 400 ms.
 - **Client: a streamed fetch with no size hint keeps the pull it opened for
   the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
   fast path, or a gateway pull whose size lookup finds none), the client read
