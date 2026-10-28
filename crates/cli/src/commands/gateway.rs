@@ -1190,7 +1190,9 @@ enum PullError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Present {
     /// On the gateway origin: active types as plain text, a bundle as a list
-    /// of `decdn:` links.
+    /// of `decdn:` links. The origin has no site policy, so a blob response
+    /// carries `Content-Security-Policy: sandbox`: a type
+    /// [`is_active_type`] misses still cannot run on the gateway's origin.
     Bare,
     /// On a site origin: each type as itself, `decdn:` URIs in HTML and CSS
     /// rewritten, a bundle as its `index.html` or a list of relative links.
@@ -2446,9 +2448,6 @@ impl Gateway {
                 ),
             )
             .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
-        // The bare origin carries no site policy, so a blob served inline is
-        // sandboxed: even a type the neutralisation misses cannot run on the
-        // gateway's origin.
         if present == Present::Bare {
             response = response.header(header::CONTENT_SECURITY_POLICY, "sandbox");
         }
@@ -3130,21 +3129,19 @@ fn with_cors(mut response: Response<Body>, origin: Option<&str>) -> Response<Bod
     response
 }
 
-/// Types a browser runs or renders as a document, beyond the `*/*+xml`
-/// suffix [`is_active_type`] matches. The gateway serves them as plain text,
-/// so fetched content never runs on the gateway's origin.
+/// The types with no `+xml` suffix that a browser runs or renders as a
+/// document. [`is_active_type`] checks them along with every `+xml` type.
 const ACTIVE_TYPES: &[&str] = &[
-    "application/xhtml+xml",
-    "image/svg+xml",
     "application/xml",
     "application/javascript",
     "application/ecmascript",
 ];
 
 /// Whether a browser runs or renders `essence` as a document: a type in
-/// [`ACTIVE_TYPES`], or any `*/*+xml` type — a browser renders every XML
-/// MIME type as an XML document, which can embed and run an
-/// XHTML-namespaced `<script>`.
+/// [`ACTIVE_TYPES`], or any `+xml` type. A browser renders every XML type as
+/// an XML document, which can embed and run an XHTML-namespaced `<script>`.
+/// The gateway serves an active type as plain text, so fetched content never
+/// runs on the gateway's origin.
 fn is_active_type(essence: &str) -> bool {
     ACTIVE_TYPES.contains(&essence) || essence.ends_with("+xml")
 }
@@ -3359,8 +3356,7 @@ fn blob_type(present: Present, name: &str) -> String {
 
 /// A `HEAD` answer: the type, the length when known (and with it that ranges
 /// are taken), and the blob's hash as the entity tag, with no body. A bare
-/// response carries the same `sandbox` policy its `GET` does
-/// ([`Gateway::stream`]).
+/// response carries the `sandbox` policy its `GET` does ([`Present::Bare`]).
 fn head_response(
     content_type: &str,
     size: Option<u64>,
