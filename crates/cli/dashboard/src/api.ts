@@ -248,6 +248,11 @@ export interface RepublishHealth {
   scheduled_records: number;
 }
 
+export interface PullThroughStatus {
+  enabled: boolean;
+  buyer_wallet_micro_usdc: number | null;
+}
+
 export interface StatusResponse {
   node_id: string;
   routing: RoutingHealth;
@@ -256,6 +261,7 @@ export interface StatusResponse {
   republish: RepublishHealth;
   chain_denied_origins: number;
   operator_address: string | null;
+  pull_through: PullThroughStatus | null;
 }
 
 export interface LaneSnapshot {

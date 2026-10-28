@@ -224,7 +224,7 @@ to update a bundle in place: the pull replaces the files that changed and skips 
 
 `get` probes bonded nodes and picks one that holds the blob. When none does, it tries
 bonded non-holders nearest first. Each fills the miss from its own origin, or from a peer
-if it enables pull-through. A node with neither answers not-found, and `get` moves to
+if it has pull-through on. A node with neither answers not-found, and `get` moves to
 the next. One pool pays every provider, so there is no per-provider setup. Use
 `decdn pool {…}` to inspect, close, or reclaim a pool.
 
@@ -265,8 +265,10 @@ bonds, registers the node, and prints a go/no-go summary
   [contact page](https://decdn.org/#contact).
 - **USDC.** The node's own buyer pool pays for cache-miss pulls from peers (10 USDC working
   deposit by default). The node spends it only with
-  `cache.node_to_node_pull_through_enabled = true`, which is off by default. With it off,
-  a cache miss the node cannot serve from its own backend returns not-found
+  `cache.node_to_node_pull_through_enabled` on, which is the default for a node with no
+  origin backend and off for an origin node. `decdn node status` shows the setting and the
+  buyer wallet's balance. With it off, or with no USDC to open the pool, a cache miss the
+  node cannot serve from its own backend returns not-found
   ([runbook](docs/runbook.md#node-to-node-pulls-never-succeed-buyer-wallet-or-pool)).
   Circle's [testnet faucet](https://faucet.circle.com) dispenses it.
 - **Keystore password.** Set `DECDN_KEYSTORE_PASSWORD` or pass `--keystore-password-file`
@@ -339,8 +341,8 @@ cargo nextest run -p decdn-e2e --features anvil-e2e
   stream content, and pay each node with signed vouchers drawn against one pool deposit
   ([ADR 012](adr/012-client.md), [ADR 003](adr/003-payments.md)).
 - **On a cache miss**, a node fills from its own origin backend if it has one. With node-to-node
-  pull-through enabled (off by default), it can also pull from a peer and stream to the
-  client at the same time. The node pays for that upstream pull from its own pool, like
+  pull-through on (the default for a node with no origin backend), it can also pull from a
+  peer and stream to the client at the same time. The node pays for that upstream pull from its own pool, like
   any other client: every byte transfer is paid.
 - **Origin backends** (S3, R2, B2, HTTP, filesystem) are private per-node config. No
   origin URL is ever exposed ([ADR 002](adr/002-content-addressing.md)).

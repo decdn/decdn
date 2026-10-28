@@ -597,15 +597,16 @@ pub struct CacheConfig {
     /// no end-client probe takes a hold slot, regardless of current usage.
     pub stake_lane_reserved_holds: Option<u64>,
     /// Enable node-to-node paid cache-miss pull-through (#831, ADR 001/022).
-    /// Absent / `false` (the default) → a cache miss serves `NotFound`.
-    /// When `true` *and* the buyer pool service bootstrapped, a
-    /// miss triggers DHT provider discovery → probe → ranked paid pull from an
-    /// upstream node, which populates the cache and is then served. OFF by
-    /// default for the initial network: enabling it makes the node front USDC
-    /// egress to fill misses (bounded by `blockchain.buyer_working_deposit_micro_usdc`
-    /// and the upstream's per-MB rate), and the serving path only triggers it
-    /// behind a valid, pool-bound client so an unpaid request cannot drive
-    /// egress.
+    /// When on *and* the buyer pool service bootstrapped, a miss triggers DHT
+    /// provider discovery → probe → ranked paid pull from an upstream node,
+    /// which populates the cache and is then served. When off, a cache miss
+    /// serves `NotFound`. Absent resolves to a role-derived default: on when no
+    /// origin backend is configured (a cache node exists to fill misses), off
+    /// when one is (an origin node serves its own content). Set this explicitly
+    /// to override either default. A node with it on fronts USDC egress to fill
+    /// misses, bounded by `blockchain.buyer_working_deposit_micro_usdc` and the
+    /// upstream's per-MB rate, and the serving path triggers a pull only behind
+    /// a valid, pool-bound client, so an unpaid request cannot drive egress.
     pub node_to_node_pull_through_enabled: Option<bool>,
     /// When `false`, the node serves and seeds only content its own backend
     /// holds; a foreign hash is declined like a miss. Absent resolves to a

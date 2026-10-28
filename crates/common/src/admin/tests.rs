@@ -55,6 +55,10 @@ fn status_response_round_trips() {
         },
         chain_denied_origins: 3,
         operator_address: Some("0x52908400098527886E0F7030069857D2E4169EE7".to_string()),
+        pull_through: Some(PullThroughStatus {
+            enabled: true,
+            buyer_wallet_micro_usdc: Some(12_500_000),
+        }),
     };
     let json = serde_json::to_string(&resp).expect("serialize StatusResponse");
     let back: StatusResponse = serde_json::from_str(&json).expect("deserialize StatusResponse");
@@ -62,6 +66,7 @@ fn status_response_round_trips() {
     assert_eq!(back.routing.total_peers, 21);
     assert_eq!(back.routing.buckets.len(), 2);
     assert_eq!(back.routing.bucket_capacity, 20);
+    assert_eq!(back.pull_through, resp.pull_through);
     assert_eq!(back.routing.last_refresh_us, Some(1_700_000_000_000_000));
     assert_eq!(back.known_stakers, 7);
     assert_eq!(back.record_store.capacity, 100_000);

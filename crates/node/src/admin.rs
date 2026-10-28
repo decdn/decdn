@@ -121,6 +121,11 @@ pub struct AdminState {
     /// tracks nothing and a node that owns no pools call for opposite operator
     /// responses.
     buyer_pools: Option<BuyerPoolHandle>,
+    /// The buyer leg's wallet view backing `admin_v1_status`'s
+    /// `pull_through` (#2603), attached via [`AdminState::with_buyer_wallet`].
+    /// The SAME handle the buyer pool service records each balance read into.
+    /// `None` reports no `pull_through`.
+    buyer_wallet: Option<Arc<crate::buyer_pool::BuyerWallet>>,
     /// Slash-detection handles backing `admin_v1_slashes` (#1032), attached via
     /// [`AdminState::with_slash_detection`]. `None` (no `slash_judge_address`
     /// wired / unit tests) → `slashes` returns [`SLASH_DETECTION_UNAVAILABLE_CODE`].
@@ -414,6 +419,7 @@ impl AdminState {
             dht: None,
             lanes: None,
             buyer_pools: None,
+            buyer_wallet: None,
             earnings: None,
             slash_detection: None,
             binding: BindingReport::unknown(),
@@ -494,6 +500,14 @@ impl AdminState {
     #[must_use]
     pub fn with_buyer_pools(mut self, buyer_pools: Arc<dyn BuyerPoolStore>) -> Self {
         self.buyer_pools = Some(BuyerPoolHandle(buyer_pools));
+        self
+    }
+
+    /// Attach the buyer leg's wallet view, so `admin_v1_status` reports
+    /// whether pull-through is on and what the buyer wallet holds (#2603).
+    #[must_use]
+    pub fn with_buyer_wallet(mut self, wallet: Arc<crate::buyer_pool::BuyerWallet>) -> Self {
+        self.buyer_wallet = Some(wallet);
         self
     }
 
@@ -822,6 +836,12 @@ impl AdminRpcServer for AdminRpcImpl {
             // rendering the lane snapshots use. Sampled once at bring-up (no
             // chain read here); `None` when no operator was wired in.
             operator_address: self.state.operator_address.map(|a| a.to_string()),
+            pull_through: self.state.buyer_wallet.as_deref().map(|wallet| {
+                decdn_common::admin::PullThroughStatus {
+                    enabled: wallet.pull_through(),
+                    buyer_wallet_micro_usdc: wallet.usdc().map(|usdc| usdc.saturating_to()),
+                }
+            }),
         })
     }
 

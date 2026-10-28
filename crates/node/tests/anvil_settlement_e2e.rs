@@ -1295,6 +1295,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         U256::from(DEPOSIT_MICRO_USDC), // working_deposit
         true, // fresh buyer identity → issue the one-time max USDC approval
         Arc::new(Metrics::new()),
+        Arc::new(decdn_node::buyer_pool::BuyerWallet::new(true)),
     )
     .await?;
 

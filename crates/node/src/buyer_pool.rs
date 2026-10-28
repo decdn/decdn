@@ -1336,6 +1336,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
         working_deposit: U256,
         ensure_max_approval: bool,
         metrics: Arc<Metrics>,
+        wallet: Arc<BuyerWallet>,
     ) -> Result<Self> {
         let payment_pool_addr = deployment.payment_pool;
         let contract = PaymentPool::new(payment_pool_addr, provider.clone());
@@ -1375,7 +1376,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             "BuyerPoolService bootstrap complete"
         );
 
-        publish_buyer_wallet_usdc(&provider, token, owner, &metrics).await;
+        publish_buyer_wallet_usdc(&provider, token, owner, &metrics, &wallet).await;
 
         let reclaimer = tokio::spawn(reclaim_loop(
             contract.clone(),
@@ -1383,6 +1384,7 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
             owner,
             token,
             Arc::clone(&metrics),
+            wallet,
         ));
 
         Ok(Self {
@@ -3769,13 +3771,58 @@ async fn reclaim_loop<P: Provider + Clone>(
     owner: Address,
     token: Address,
     metrics: Arc<Metrics>,
+    wallet: Arc<BuyerWallet>,
 ) {
     let mut ticker = tokio::time::interval(RECLAIM_SWEEP_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
         reclaim_once(&contract, &store, owner, &metrics).await;
-        publish_buyer_wallet_usdc(contract.provider(), token, owner, &metrics).await;
+        publish_buyer_wallet_usdc(contract.provider(), token, owner, &metrics, &wallet).await;
+    }
+}
+
+/// What the buyer leg knows about its own wallet, shared with
+/// `admin_v1_status` (#2603): whether node-to-node pull-through is on, and
+/// the wallet's USDC as last read (`publish_buyer_wallet_usdc`).
+#[derive(Debug, Default)]
+pub struct BuyerWallet {
+    pull_through: bool,
+    usdc: Mutex<Option<U256>>,
+}
+
+impl BuyerWallet {
+    /// A wallet not read yet, on a node whose pull-through is `pull_through`.
+    #[must_use]
+    pub const fn new(pull_through: bool) -> Self {
+        Self {
+            pull_through,
+            usdc: Mutex::new(None),
+        }
+    }
+
+    /// Whether `cache.node_to_node_pull_through_enabled` resolved on.
+    #[must_use]
+    pub const fn pull_through(&self) -> bool {
+        self.pull_through
+    }
+
+    /// The wallet's USDC balance in base units as last read, or `None` before
+    /// the first read succeeds.
+    #[must_use]
+    pub fn usdc(&self) -> Option<U256> {
+        *self
+            .usdc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a balance read.
+    pub(crate) fn record(&self, balance: U256) {
+        *self
+            .usdc
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(balance);
     }
 }
 
@@ -3789,14 +3836,31 @@ async fn reclaim_loop<P: Provider + Clone>(
 ///
 /// Best-effort: a failed read leaves the previous value standing rather than
 /// publishing a zero the operator would read as an empty wallet.
+///
+/// A node with pull-through on and an empty wallet warns at each read, so
+/// once an hour: the node cannot open or top up the pool its cache-miss pulls
+/// pay from, and those misses end `NotFound` once the pool it holds runs dry.
 async fn publish_buyer_wallet_usdc<P: Provider>(
     provider: &P,
     token: Address,
     owner: Address,
     metrics: &Arc<Metrics>,
+    wallet: &BuyerWallet,
 ) {
     match Erc20::new(token, provider).balanceOf(owner).call().await {
-        Ok(balance) => metrics.set_buyer_wallet_usdc(balance),
+        Ok(balance) => {
+            metrics.set_buyer_wallet_usdc(balance);
+            wallet.record(balance);
+            if wallet.pull_through() && balance.is_zero() {
+                warn!(
+                    %owner,
+                    %token,
+                    "node-to-node pull-through is on, but the buyer wallet holds no USDC: the \
+                     node cannot open or top up the pool its cache-miss pulls pay from. Fund \
+                     the wallet with at least blockchain.buyer_working_deposit_micro_usdc"
+                );
+            }
+        }
         Err(err) => {
             debug!(%token, %owner, error = %sanitize_error_sources(&err), "could not read the buyer wallet's USDC balance");
         }

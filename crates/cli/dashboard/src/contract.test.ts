@@ -38,6 +38,7 @@ import type {
   PoolSnapshot,
   PullFields,
   PullRecord,
+  PullThroughStatus,
   Pulls,
   RecordStoreHealth,
   RepublishHealth,
@@ -275,6 +276,11 @@ const NODE_STATUS: Keys<StatusResponse> = {
   republish: true,
   chain_denied_origins: true,
   operator_address: true,
+  pull_through: true,
+};
+const PULL_THROUGH: Keys<PullThroughStatus> = {
+  enabled: true,
+  buyer_wallet_micro_usdc: true,
 };
 const ROUTING: Keys<RoutingHealth> = {
   total_peers: true,
@@ -451,6 +457,9 @@ function expectNode(n: NodeSection) {
     s.routing.buckets.forEach((b) => expectShape(b, BUCKET_STAT, "buckets[]"));
     expectShape(s.record_store, RECORD_STORE, "status.record_store");
     expectShape(s.republish, REPUBLISH, "status.republish");
+    if (s.pull_through) {
+      expectShape(s.pull_through, PULL_THROUGH, "status.pull_through");
+    }
   });
   expectPart(n.metrics, "node.metrics", (m) => {
     expectShape(m, METRICS, "metrics");
