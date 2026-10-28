@@ -1447,6 +1447,45 @@ async fn a_registered_read_adds_the_spent_folded_since() {
     );
 }
 
+/// #2711: on a pool seeded from one `getPool`, the projection counts only what
+/// the signer redeems after the seed. The mid-stream read adds the spend the
+/// admit-path `getAuthorization` saw, so a signer that spent most of its cap
+/// before a restart shows its whole spend once other nodes drain the rest.
+#[tokio::test]
+async fn the_midstream_read_counts_a_resolved_pools_pre_seed_spend() {
+    use crate::pool_view::PoolView;
+
+    let pool_id = B256::repeat_byte(0x48);
+    let signer = Address::from([6u8; 20]);
+    let (view, _asserter) = mocked_getauth_view(&[authz(1_000, 900)]);
+    view.projection
+        .record_resolved(Address::from([1u8; 20]), seed(pool_id, 5_000, 900));
+    assert_eq!(
+        view.signer_spent_cached(pool_id, signer).await,
+        Some(0),
+        "with no read held, the seeded projection alone answers"
+    );
+    assert_eq!(
+        view.signer_authorization(pool_id, signer).await,
+        Some(registered(1_000, 900))
+    );
+    view.projection.record_redeemed(
+        pool_id,
+        Address::from([9u8; 20]),
+        &[PaymentPool::LaneSettled {
+            signer,
+            newPaidCumulative: 100,
+            bytesPaid: 0,
+        }],
+        None,
+    );
+    assert_eq!(
+        view.signer_spent_cached(pool_id, signer).await,
+        Some(1_000),
+        "the pre-seed spend plus the drain since the read"
+    );
+}
+
 /// A fault after a cached `Unregistered` read has aged past the TTL refuses
 /// the signer: a registration may have landed since, with its cap spent.
 #[tokio::test]

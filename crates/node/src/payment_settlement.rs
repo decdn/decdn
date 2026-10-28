@@ -1439,10 +1439,16 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
     }
 
     async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
-        // The mid-stream signer cap-headroom re-check: projection ONLY, never a
-        // `getAuthorization`. A signer that drains its shared `cap` at another node
-        // shows up here as the settlement watcher folds that node's `PoolRedeemed`.
-        Some(self.projection.signer_spent(pool_id, signer))
+        // The mid-stream signer cap-headroom re-check: the admit-path read and the
+        // projection, never a fresh `getAuthorization`. A registered read carries
+        // everything the signer spent before it, which the projection lacks on a
+        // pool it seeded from one `getPool`; the fold since the read adds the
+        // drain at other nodes as the settlement watcher folds their
+        // `PoolRedeemed`. Admission reads the same number.
+        match self.lookup_auth(pool_id, signer) {
+            CachedAuth::Fresh(SignerAuthorization::Registered { spent, .. }) => Some(spent),
+            _ => Some(self.projection.signer_spent(pool_id, signer)),
+        }
     }
 
     async fn signer_authorization(

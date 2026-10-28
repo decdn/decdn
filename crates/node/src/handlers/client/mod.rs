@@ -1675,8 +1675,8 @@ impl ClientHandler {
     }
 
     /// The signer's total on-chain `spent` across every provider in `pool_id`, read
-    /// from the event-fed projection ONLY (never a `getAuthorization`), for the
-    /// mid-stream signer cap-headroom re-check. `None` when no pool-view is wired
+    /// from what the pool view already holds (never a fresh `getAuthorization`),
+    /// for the mid-stream signer cap-headroom re-check. `None` when no pool-view is wired
     /// (dev/test, no chain) or the view holds no projection — the re-check then skips
     /// and delivery continues, matching how [`Self::pool_view_status_cached`] fails
     /// open. See [`crate::pool_view::PoolView::signer_spent_cached`].
@@ -1695,16 +1695,20 @@ impl ClientHandler {
     /// — the node would eat the delivered bytes, unbounded for a large blob.
     ///
     /// `held_cap` is the `cap` the node already holds on the lane (the admit-time
-    /// capability), and `spent` is read from the event-fed projection. The floor is
-    /// one ramp-start credit window, the SAME quantity the admit-time gate confirms
-    /// (`ClientHandler::serve_stream`), so the mid-stream threshold matches admission.
+    /// capability). `spent` is the admit-time `getAuthorization` read (#1958) plus
+    /// what the projection has folded for the signer since, the same number the
+    /// admit-time gate reads; with no registered read held it is the projection's
+    /// fold alone. The floor is one ramp-start credit window, the SAME quantity the
+    /// admit-time gate confirms (`ClientHandler::serve_stream`), so the mid-stream
+    /// threshold matches admission.
     ///
-    /// Fails toward SERVING: `signer_spent_cached` returning `None` (no projection)
-    /// skips the stop, and a projection that has not yet folded the signer's
-    /// pre-admission spend only UNDER-counts `spent`, over-stating headroom. That is
-    /// acceptable — the admit-time `getAuthorization` (#1958) already caught an
-    /// already-exhausted signer authoritatively, so this only catches drain SINCE
-    /// admit, and the on-chain `redeemMany` `min(desired, cap − spent)` is the
+    /// Error bounds: a lane's first fold after the read counts its whole
+    /// cumulative, so `spent` can run high by at most the read's `spent`, which
+    /// stops a stream early near the cap and never over-delivers. With no projection
+    /// wired, `signer_spent_cached` returns `None` and the stop is skipped; with no
+    /// registered read held (evicted from the bounded cache, or the signer was
+    /// unregistered at admit) the fold alone can run low by the spend before
+    /// admission. The on-chain `redeemMany` `min(desired, cap − spent)` is the
     /// backstop; this re-check only BOUNDS over-delivery, it is not a correctness
     /// gate. The caller ends the stream as `Stopped { SignerCapExhausted }`, which
     /// the dispatch sink counts on the mid-stream metric.

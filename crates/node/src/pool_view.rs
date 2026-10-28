@@ -148,23 +148,25 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
     }
 
     /// The mid-stream signer-drain read: a `signer`'s total on-chain `spent` across
-    /// every provider in `pool_id`, from the event-fed projection ONLY — never a
+    /// every provider in `pool_id`, from what the node already holds — never a
     /// chain call. The serve loop pairs it with the `cap` the node already holds on
     /// the lane to test `held_cap − spent` headroom at the [`POOL_RECHECK_INTERVAL`]
     /// cadence, so a signer draining its shared `cap` at another node mid-stream stops
     /// this stream before it over-delivers unredeemable bytes (ADR 003 §Pool
     /// solvency).
     ///
-    /// - `Some(spent)` — the folded cross-provider total, `0` for a signer that has
+    /// - `Some(spent)` — the cross-provider total, `0` for a signer that has
     ///   redeemed nothing in a pool the projection knows.
     /// - `None` — no projection is wired (a chain-free test double), so the re-check
     ///   is skipped and delivery continues; the on-chain `redeemMany` `min(desired,
     ///   cap − spent)` remains the backstop.
     ///
-    /// The default returns `None`. [`PoolProjection`] and the production wrapper
-    /// ([`crate::payment_settlement::ResolvingPoolView`]) override it to read the
-    /// projection, matching how [`Self::cached_status`] reads a pool's `remaining`
-    /// without blocking.
+    /// The default returns `None`. [`PoolProjection`] overrides it to read its
+    /// per-signer fold. The production wrapper
+    /// ([`crate::payment_settlement::ResolvingPoolView`]) answers from its cached
+    /// admit-path `getAuthorization` read brought up to that fold, and reads the
+    /// fold alone only when it holds no registered read for the signer. Both match
+    /// how [`Self::cached_status`] reads a pool's `remaining` without blocking.
     async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
         let _ = (pool_id, signer);
         None
@@ -608,11 +610,11 @@ impl PoolProjection {
     /// a scan of the lane map here would cost `streams × lanes` on a busy pool.
     ///
     /// `0` for a pool the projection has not folded, or one in which the signer has
-    /// redeemed nothing — both make the re-check's `held_cap − spent` headroom its
-    /// widest, so the re-check fails toward serving on a projection gap (the
-    /// admit-time `getAuthorization` already caught an already-exhausted signer
-    /// authoritatively; this only bounds drain SINCE admit). The folded total cannot
-    /// exceed `total_redeemed`, which is itself bounded by the deposit.
+    /// redeemed nothing. On a pool seeded from one `getPool`
+    /// ([`Self::record_resolved`]) the total counts only redemptions folded after
+    /// the seed, so it misses the signer's earlier spend; the production view adds
+    /// that spend from its admit-path `getAuthorization` read. The folded total
+    /// cannot exceed `total_redeemed`, which is itself bounded by the deposit.
     #[must_use]
     pub fn signer_spent(&self, pool_id: B256, signer: Address) -> u64 {
         self.pools.load().get(&pool_id).map_or(0, |entry| {

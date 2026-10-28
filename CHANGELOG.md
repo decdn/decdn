@@ -5254,6 +5254,16 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: the mid-stream signer cap check counts a resolved pool's
+  pre-restart spend (#2711).** After a restart the projection seeds a pool it
+  has not folded from one `getPool`, and it counts a signer's spend only from
+  the redemptions it folds after the seed. The mid-stream check read that
+  count alone, so a signer that spent most of its cap before the restart kept
+  being served after other nodes drained the rest. The check now reads the
+  admit-path `getAuthorization` result brought up to the fold, the same
+  number admission reads, and falls back to the fold alone only when it holds
+  no registered read for the signer.
+
 - **Node: racing first streams on a new lane no longer roll its stored voucher
   frontier back (#2701).** `register_lane` recorded the fresh zero lane before
   it claimed the lane's slot in the live map, so two first streams could both
