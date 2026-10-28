@@ -2911,36 +2911,30 @@ async fn resume_after_a_funding_stop(
     (source, delivered, whole_wire)
 }
 
-/// An `AmountRegression` whose bundle states the node's watermark one group
-/// in, signed by `ctx`'s own key: the node holds vouchers for exactly the
-/// first group's wire.
-fn one_group_in(ctx: &PoolContext, one_group_wire: u64) -> anyhow::Error {
-    rejected_with_bundle(
-        VoucherRejectReason::AmountRegression,
-        ctx,
-        (1, one_group_wire),
-        None,
-    )
+/// An `AmountRegression` whose bundle states the node's watermark `bytes`,
+/// signed by `ctx`'s own key: the node holds vouchers our ledger lost.
+fn node_holds(ctx: &PoolContext, bytes: u64) -> anyhow::Error {
+    rejected_with_bundle(VoucherRejectReason::AmountRegression, ctx, (1, bytes), None)
 }
 
-/// A reseed moves the ledger up to the proofs the node accepted, and no
-/// further. A funding stop leaves delivered bytes past the node's watermark,
-/// because delivery runs ahead of payment by up to a credit window. When the
-/// resumed lane's first open draws an `AmountRegression` whose bundle states a
-/// watermark one group in, the next leg opens at that group and bills the rest
-/// of the delivered tail. Treating the delivered frontier as paid would skip
-/// billing it (#2629), and opening below the group would pay it twice.
+/// A reseed moves the ledger up to vouchers the node holds and our record
+/// lost, and nothing ties them to this leg's content. A funding stop leaves
+/// delivered bytes unpaid. When the resumed lane's first open draws an
+/// `AmountRegression` whose bundle states a watermark one group in, the jump
+/// pays for none of the delivered tail: the next leg opens at the leg's start
+/// and bills the whole blob. Counting the jump as this leg's payment, or
+/// treating the delivered frontier as paid, would skip billing it (#2629).
 #[tokio::test(start_paused = true)]
 async fn a_reseed_does_not_mark_the_delivered_tail_paid() {
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let (source, _delivered, whole_wire) =
-        resume_after_a_funding_stop(&ledger, |ctx, wire| vec![one_group_in(ctx, wire)]).await;
+        resume_after_a_funding_stop(&ledger, |ctx, wire| vec![node_holds(ctx, wire)]).await;
 
     let opened = source.opened_ranges();
     assert_eq!(
         opened.get(1).map(|&(start, _)| start),
-        Some(GROUP),
-        "the leg after the reseed opens at the node's watermark: {opened:?}"
+        Some(0),
+        "the leg after the reseed opens at its own start: {opened:?}"
     );
     assert!(
         ledger.committed().bytes >= U256::from(whole_wire),
@@ -2951,25 +2945,80 @@ async fn a_reseed_does_not_mark_the_delivered_tail_paid() {
 
 /// A stale heal moves no watermark, so it says nothing about the delivered
 /// tail either. Here a second `AmountRegression` at the bundle the ledger
-/// already reached heals stale, and the next leg still opens at the node's
-/// watermark rather than the delivered frontier.
+/// already reached heals stale, and the next leg still opens at the leg's
+/// start rather than the delivered frontier.
 #[tokio::test(start_paused = true)]
 async fn a_stale_heal_does_not_mark_the_delivered_tail_paid() {
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let (source, _delivered, whole_wire) = resume_after_a_funding_stop(&ledger, |ctx, wire| {
-        vec![one_group_in(ctx, wire), one_group_in(ctx, wire)]
+        vec![node_holds(ctx, wire), node_holds(ctx, wire)]
     })
     .await;
 
     let opened = source.opened_ranges();
     assert_eq!(
         opened.get(1).map(|&(start, _)| start),
-        Some(GROUP),
-        "the leg after the stale heal opens at the node's watermark: {opened:?}"
+        Some(0),
+        "the leg after the stale heal opens at its own start: {opened:?}"
     );
     assert!(
         ledger.committed().bytes >= U256::from(whole_wire),
         "the lane paid for every wire byte of the blob: {:?} < {whole_wire}",
+        ledger.committed()
+    );
+}
+
+/// A restarted payer whose store trails the node's watermark from earlier
+/// blobs. A small blob delivers all but its last byte inside the credit
+/// window, unpaid, and only then does the leg draw an `AmountRegression` whose
+/// bundle states that far larger, older watermark. The reseed's jump pays for
+/// none of this blob, so the drive re-opens it from the start and pays for it
+/// above the node's watermark. Counting the jump as this leg's payment would
+/// mark the delivered bytes paid and bill only the rest.
+#[tokio::test(start_paused = true)]
+async fn a_reseed_to_an_older_watermark_pays_for_the_delivered_bytes() {
+    let total = 2 * GROUP;
+    let (root, plaintext, _outboard) = synth_blob(total as usize);
+    let store = fresh_store(root, total);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let whole_wire = align_range(0, 0, total).expect("align").wire_len();
+    let history = 100 * whole_wire;
+    let ctx = healthy_ctx();
+    let rejecting = ctx.clone();
+    let source = ScriptedSource::new(plaintext)
+        .expect("source")
+        .paying(Arc::clone(&ledger))
+        .fault_once_after(whole_wire as usize - 1, move || {
+            node_holds(&rejecting, history)
+        });
+
+    drive(
+        &store,
+        &source,
+        &BudgetPacer::new(),
+        &Arc::new(Mutex::new(ctx)),
+        &ledger,
+        root,
+        0,
+        0,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("the reseeded lane completes the fetch");
+    assert!(store.is_complete().await.expect("is_complete"));
+
+    let opened = source.opened_ranges();
+    assert_eq!(
+        opened.iter().map(|&(start, _)| start).collect::<Vec<_>>(),
+        vec![0, 0],
+        "the blob is opened again from its start after the reseed: {opened:?}"
+    );
+    assert!(
+        ledger.committed().bytes >= U256::from(history + whole_wire),
+        "the lane paid for the blob above the node's watermark: {:?}",
         ledger.committed()
     );
 }

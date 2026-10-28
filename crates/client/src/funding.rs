@@ -547,10 +547,12 @@ where
     /// Other signers share the pool, such as another data dir on the wallet
     /// ([`decdn_incentive::lane_signer`]). Their redemptions reach the run only
     /// from chain, and can land while the run is going. So the step reads
-    /// `getPool` and counts at least `totalRedeemed` as spent
-    /// ([`BuyerPoolState::reconcile_with_chain`]). Without it, a pool drained
-    /// by another signer reads full here, the step only settles, and the run
-    /// ends "funding needed" with a funded wallet.
+    /// `getPool` and counts at least `totalRedeemed` as spent, and takes the
+    /// larger of the recorded and the on-chain deposit
+    /// ([`BuyerPoolState::reconcile_with_chain`]). Without the first, a pool
+    /// drained by another signer reads full here, the step only settles, and
+    /// the run ends "funding needed" with a funded wallet. Without the second,
+    /// a lagging read from before a credited top-up invents an overdraft.
     ///
     /// The lanes can sign vouchers past the deposit. A node's mid-stream
     /// solvency check reads the on-chain remaining deposit, which moves only
@@ -573,7 +575,10 @@ where
                     .pool_spent()
                     .unwrap_or(U256::ZERO)
                     .max(U256::from(pool.totalRedeemed));
-                let deposit = U256::from(pool.deposit);
+                // A lagging RPC can answer from before a top-up the store has
+                // credited, so neither deposit moves the other down.
+                let deposit = U256::from(pool.deposit)
+                    .max(self.recorded_deposit(pool_id).unwrap_or(U256::ZERO));
                 (
                     remaining.min(deposit.saturating_sub(spent)),
                     spent.saturating_sub(deposit),
@@ -604,19 +609,25 @@ where
     /// The run's own view of the pool's overdraft: its lanes' spend past the
     /// deposit the buyer store records. Zero when either is unknown.
     fn local_overdraft(&self, pool_id: PoolId) -> U256 {
-        let Some(spent) = self.funding.pool_spent() else {
-            return U256::ZERO;
-        };
+        match (self.funding.pool_spent(), self.recorded_deposit(pool_id)) {
+            (Some(spent), Some(deposit)) => spent.saturating_sub(deposit),
+            _ => U256::ZERO,
+        }
+    }
+
+    /// The deposit the buyer store records for `pool_id`, or `None` when it
+    /// holds no row or cannot be read.
+    fn recorded_deposit(&self, pool_id: PoolId) -> Option<U256> {
         match self.store.get_by_pool_id(pool_id) {
-            Ok(Some(row)) => spent.saturating_sub(row.deposit),
-            Ok(None) => U256::ZERO,
+            Ok(row) => row.map(|row| row.deposit),
             Err(error) => {
                 tracing::warn!(
                     %pool_id,
                     %error,
-                    "could not read the buyer pool's row; the funding step adds no overdraft"
+                    "could not read the buyer pool's row; the funding step uses the chain's \
+                     deposit alone"
                 );
-                U256::ZERO
+                None
             }
         }
     }

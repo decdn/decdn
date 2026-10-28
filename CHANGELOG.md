@@ -1146,9 +1146,11 @@ since project inception and will roll into the first tagged release.
   marked the whole delivered frontier paid, so the bytes delivered past the
   node's watermark (up to one credit window) were never billed. The client now
   rewinds a proof only when the reason refuses it
-  (`VoucherRejectReason::refuses_proof`, new in `decdn-protocol`). A reseed or
-  a stale heal keeps the leg's anchor, so the next leg re-delivers and bills
-  everything past the node's watermark.
+  (`VoucherRejectReason::refuses_proof`, new in `decdn-protocol`). A reseed's
+  jump no longer counts as payment for the leg it interrupts, since it can be
+  the node's watermark from earlier blobs, and a stale heal keeps the leg's
+  anchor. The next leg re-delivers and bills what the leg's own vouchers did
+  not pay for.
 - **Client: a funding recovery top-up covers the pool's overdraft (#2629).**
   The node's mid-stream solvency check reads the on-chain balance, which moves
   only on redemption, and runs on a cadence, so a fast stream can sign
@@ -1156,9 +1158,10 @@ since project inception and will roll into the first tagged release.
   topped up only toward the working deposit, and the node then redeemed the
   overdraft out of that top-up and kept refusing the pool, so the fetch ended
   "funding needed" with a funded wallet. The step now adds the overdraft (the
-  pool's spend past its on-chain deposit) to the top-up. When the pool read
-  fails, it takes the overdraft from the run's own lanes and the stored
-  deposit.
+  pool's spend past its on-chain deposit) to the top-up, taking the larger of
+  the recorded and the on-chain deposit so a lagging read invents none. When
+  the pool read fails, it takes the overdraft from the run's own lanes and the
+  stored deposit.
 - **Gateway: the first request for a raw blob has its length, `HEAD` and
   `Range` too (#2645, #2616).** A raw blob that no pull on the gateway had
   verified streamed with no `Content-Length`, ignored `Range`, and its
