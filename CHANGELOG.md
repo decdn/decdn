@@ -5254,6 +5254,15 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Node: the admin JSON-RPC server refuses requests a web page can send
+  (#2690).** It answered any request on its loopback port. A page that the
+  operator opened could reach that port through DNS rebinding and call
+  `evict` (persisted across restarts) or `drain` (shuts the node down). The
+  server now answers only requests whose `Host` is `127.0.0.1` or
+  `localhost` (any port), refuses any request that carries an `Origin`
+  header with `403`, and refuses batch requests. `decdn node …`, the
+  dashboard and an SSH tunnel to the admin port are unaffected.
+
 - **Node: after a restart, the redeemer reads a pool it does not know before
   it submits that pool's lanes (#2692).** The redeemer's pool view learns a
   pool only from the events it folds and the admit path's reads, and the

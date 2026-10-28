@@ -41,6 +41,9 @@ Response format:
 Transport shape:
 
 - Binds on `127.0.0.1:<port>` only. Never on a public interface.
+- Answers a request only when its `Host` header names `127.0.0.1` or `localhost`, on any port. Any other `Host` gets `403`.
+- Refuses with `403` any request that carries an `Origin` header.
+- Refuses batch requests. Every admin client sends one call per request.
 - Uses [`jsonrpsee`](https://github.com/paritytech/jsonrpsee) (server + http-client + macros) so the trait is the single source of truth for both wire sides — no hand-rolled routing or JSON parsing.
 - Per-connection concurrency capped via `ServerBuilder::max_connections`; shutdown via `ServerHandle::stop()` from the existing runtime shutdown sequence.
 
@@ -79,6 +82,7 @@ CLI shape:
 ### Why no authentication (for now)?
 
 - The server binds on `127.0.0.1` only, so any caller is already on the same host as the node process; on a single-operator host, filesystem permissions on the node's data dir are the effective trust boundary.
+- A web page that the operator opens also runs on the same host. Through DNS rebinding, it can point its own domain at `127.0.0.1` and send same-origin requests to the admin port. The browser then sends the page's domain as `Host`, and an `Origin` header. The `Host` and `Origin` checks refuse such a request before any method runs, so a page cannot call `evict` or `drain`. The `Host` check allows any port, so an SSH tunnel or a container port mapping onto another local port still works.
 - Multi-tenant hosts are explicitly **not** a PoC target. If they become one, a follow-up ADR can layer a shared-secret `Authorization: Bearer <token>` header on the same transport — no wire-shape change required.
 
 ## Consequences

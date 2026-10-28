@@ -1257,3 +1257,117 @@ async fn earnings_unavailable_without_handles() -> anyhow::Result<()> {
     join.await?;
     Ok(())
 }
+
+/// An admin server on a fresh loopback port, for the request-filter checks.
+async fn spawn_plain_admin() -> anyhow::Result<(
+    SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+)> {
+    let (cache, tmp) = test_cache().await?;
+    let state = AdminState::new(
+        [0u8; 32],
+        Instant::now(),
+        cache,
+        None,
+        Arc::new(DrainTrigger::new()),
+        Arc::new(Metrics::new()),
+    );
+    let (listener, addr) = bind_loopback().await?;
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let join = tokio::spawn(async move {
+        admin::serve(listener, state, stop_rx).await.ok();
+    });
+    Ok((addr, stop_tx, join, tmp))
+}
+
+/// POST `body` to the admin server at `addr` with the extra `headers`, and
+/// return the status and the body.
+async fn post_admin(
+    addr: SocketAddr,
+    body: &'static str,
+    headers: &[(reqwest::header::HeaderName, String)],
+) -> anyhow::Result<(reqwest::StatusCode, String)> {
+    decdn_common::tls::install_crypto_provider();
+    let mut request = reqwest::Client::new()
+        .post(format!("http://{addr}"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    Ok((status, response.text().await?))
+}
+
+const HEALTH_CALL: &str = r#"{"jsonrpc":"2.0","id":1,"method":"admin_v1_health","params":[]}"#;
+
+/// #2690: the admin server answers only loopback `Host` names, so a page that
+/// reaches the loopback port through DNS rebinding, under its own domain, is
+/// refused. Both loopback names pass on any port.
+#[tokio::test]
+async fn admin_rpc_refuses_a_foreign_host() -> anyhow::Result<()> {
+    let (addr, stop_tx, join, _tmp) = spawn_plain_admin().await?;
+    let port = addr.port();
+    let host = reqwest::header::HOST;
+
+    let (status, _) = post_admin(
+        addr,
+        HEALTH_CALL,
+        &[(host.clone(), format!("evil.example:{port}"))],
+    )
+    .await?;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    for allowed in [format!("localhost:{port}"), "127.0.0.1:19191".to_owned()] {
+        let (status, body) = post_admin(addr, HEALTH_CALL, &[(host.clone(), allowed)]).await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert!(body.contains("\"result\""), "{body}");
+    }
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
+/// #2690: a request that carries an `Origin` header comes from a browser, and
+/// the admin server refuses it whatever its `Host`.
+#[tokio::test]
+async fn admin_rpc_refuses_a_request_with_an_origin() -> anyhow::Result<()> {
+    let (addr, stop_tx, join, _tmp) = spawn_plain_admin().await?;
+
+    let (status, _) = post_admin(
+        addr,
+        HEALTH_CALL,
+        &[(reqwest::header::ORIGIN, "http://evil.example".to_owned())],
+    )
+    .await?;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+    let (status, _) = post_admin(addr, HEALTH_CALL, &[]).await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
+
+/// #2690: the admin server takes one call per request and refuses a batch.
+#[tokio::test]
+async fn admin_rpc_refuses_a_batch() -> anyhow::Result<()> {
+    let (addr, stop_tx, join, _tmp) = spawn_plain_admin().await?;
+
+    let (_, body) = post_admin(
+        addr,
+        r#"[{"jsonrpc":"2.0","id":1,"method":"admin_v1_health","params":[]},
+            {"jsonrpc":"2.0","id":2,"method":"admin_v1_drain","params":[]}]"#,
+        &[],
+    )
+    .await?;
+    let reply: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(reply["error"]["code"], -32005, "{body}");
+
+    let _ = stop_tx.send(());
+    join.await?;
+    Ok(())
+}
