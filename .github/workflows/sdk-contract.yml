@@ -69,7 +69,7 @@ jobs:
           make-default: false
       # foundry-toolchain directly, not ./.github/actions/foundry-setup: that
       # action saves the shared solc cache, and the SDK's code runs here.
-      - uses: foundry-rs/foundry-toolchain@v1.9.1
+      - uses: foundry-rs/foundry-toolchain@v1.9.2
         with:
           version: v1.7.1
           cache: false
