@@ -773,6 +773,26 @@ pub(crate) async fn assert_inbound_failures_attributed(
     }
 }
 
+/// Wait until the node's encoded metrics contain `line` as a full
+/// `name value` line (the exact-match semantics of the loopback suite's
+/// `metric_line_present`). The serve task meters a stream's end after the
+/// response is on the wire, so a counter asserted right after the client
+/// reads a reply is polled up to a deadline rather than read once.
+pub(crate) async fn wait_for_metric_line(metrics: &Metrics, line: &str) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let encoded = metrics.encode()?;
+        if encoded.lines().any(|l| l == line) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "expected metric line {line:?}:\n{encoded}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Read one length-framed [`ClientMessage`] from `recv`. Mirrors the requester's
 /// private `decdn_client::read_client_message`, exposed for the raw fake
 /// clients/servers the `cdn/client/v1` integration binaries hand-roll.

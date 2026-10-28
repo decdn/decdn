@@ -6479,11 +6479,11 @@ async fn a_closing_pool_is_unfunded_to_its_lane_and_not_found_to_anyone_else() -
         "an unbound requester must hear NotFound, got {:?}",
         unbound_ext.error
     );
-    let encoded = metrics.encode()?;
-    anyhow::ensure!(
-        metric_line_present(&encoded, "decdn_serve_stream_rejected_pool_closing_total 2"),
-        "both refusals must count as pool_closing:\n{encoded}"
-    );
+    // The server meters the pool_closing reason when its serve task ends,
+    // after the refusal is on the wire, so both counts are polled rather than
+    // read once.
+    support::wait_for_metric_line(&metrics, "decdn_serve_stream_rejected_pool_closing_total 2")
+        .await?;
 
     stranger.close(0u32.into(), b"done");
     shutdown([server_task], [&client_ep, &server_ep]).await?;
