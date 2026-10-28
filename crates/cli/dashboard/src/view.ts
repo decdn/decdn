@@ -149,7 +149,7 @@ export interface LivePullRow {
   expected: number | null;
   /** The share received; null until the run knows its size. */
   done: number | null;
-  /** A bundle's blobs landed of those started; null for one blob. */
+  /** A bundle run's blobs landed of those started; null for a blob or entry run. */
   files: string | null;
   paidMicro: number;
   nodes: number;

@@ -6,6 +6,7 @@ import type {
   NodeSection,
   NodeState,
   PullFields,
+  PullTarget,
   Pulls,
   RunningPull,
 } from "./api";
@@ -257,28 +258,33 @@ describe("severity", () => {
   });
 });
 
-function fields(overrides: Partial<PullFields> = {}): PullFields {
+type Overrides = Partial<Omit<PullFields, "kind">>;
+
+function fields(
+  overrides: Overrides = {},
+  target: PullTarget = { kind: "blob" },
+): PullFields {
   return {
     uri: "decdn:aa",
-    kind: "blob",
     output: "out",
     pid: 7,
     started_unix_ms: 1_000_000,
     updated_unix_ms: 1_030_000,
     received_bytes: 0,
     expected_bytes: null,
-    files_started: 0,
-    files_landed: 0,
     paid: { amount_micro_usdc: 0, bytes: 0 },
     nodes: [],
-    bundle: null,
     stale: false,
     ...overrides,
+    ...target,
   };
 }
 
-const record = (overrides: Partial<PullFields> = {}): RunningPull => ({
-  ...fields(overrides),
+const record = (
+  overrides: Overrides = {},
+  target?: PullTarget,
+): RunningPull => ({
+  ...fields(overrides, target),
   state: "running",
 });
 
@@ -299,18 +305,23 @@ describe("livePulls", () => {
     const rows = livePulls(
       pulls({
         active: [
-          record({
-            kind: "bundle",
-            received_bytes: 250,
-            expected_bytes: 1_000,
-            files_started: 4,
-            files_landed: 3,
-            nodes: [
-              { provider: "0xbb", amount_micro_usdc: 5, bytes: 9 },
-              { provider: "0xcc", amount_micro_usdc: 5, bytes: 9 },
-            ],
-            paid: { amount_micro_usdc: 10, bytes: 18 },
-          }),
+          record(
+            {
+              received_bytes: 250,
+              expected_bytes: 1_000,
+              nodes: [
+                { provider: "0xbb", amount_micro_usdc: 5, bytes: 9 },
+                { provider: "0xcc", amount_micro_usdc: 5, bytes: 9 },
+              ],
+              paid: { amount_micro_usdc: 10, bytes: 18 },
+            },
+            {
+              kind: "bundle",
+              files_started: 4,
+              files_landed: 3,
+              counts: null,
+            },
+          ),
         ],
       }),
     );

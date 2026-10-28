@@ -10,6 +10,9 @@
       {
         "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262/",
         "kind": "bundle",
+        "files_started": 12,
+        "files_landed": 9,
+        "counts": null,
         "output": "/home/me/site",
         "pid": 4242,
         "started_unix_ms": 1793000570000,
@@ -17,8 +20,6 @@
         "state": "running",
         "received_bytes": 734003200,
         "expected_bytes": 1073741824,
-        "files_started": 12,
-        "files_landed": 9,
         "paid": {
           "amount_micro_usdc": 7340,
           "bytes": 736100352
@@ -30,7 +31,6 @@
             "bytes": 736100352
           }
         ],
-        "bundle": null,
         "stale": false
       },
       {
@@ -43,8 +43,6 @@
         "state": "running",
         "received_bytes": 734003200,
         "expected_bytes": 1073741824,
-        "files_started": 12,
-        "files_landed": 9,
         "paid": {
           "amount_micro_usdc": 7340,
           "bytes": 736100352
@@ -56,7 +54,6 @@
             "bytes": 736100352
           }
         ],
-        "bundle": null,
         "stale": true
       }
     ],
@@ -64,28 +61,9 @@
       {
         "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262/",
         "kind": "bundle",
-        "output": "/home/me/site",
-        "pid": 4242,
-        "started_unix_ms": 1793000300000,
-        "updated_unix_ms": 1793000342000,
-        "state": "done",
-        "finished_unix_ms": 1793000342000,
-        "received_bytes": 734003200,
-        "expected_bytes": 1073741824,
         "files_started": 12,
         "files_landed": 9,
-        "paid": {
-          "amount_micro_usdc": 7340,
-          "bytes": 736100352
-        },
-        "nodes": [
-          {
-            "provider": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
-            "amount_micro_usdc": 7340,
-            "bytes": 736100352
-          }
-        ],
-        "bundle": {
+        "counts": {
           "fetched": 9,
           "linked": 1,
           "skipped": 2,
@@ -96,6 +74,25 @@
           "resumed_bytes": 0,
           "reused_bytes": 4096
         },
+        "output": "/home/me/site",
+        "pid": 4242,
+        "started_unix_ms": 1793000300000,
+        "updated_unix_ms": 1793000342000,
+        "state": "done",
+        "finished_unix_ms": 1793000342000,
+        "received_bytes": 734003200,
+        "expected_bytes": 1073741824,
+        "paid": {
+          "amount_micro_usdc": 7340,
+          "bytes": 736100352
+        },
+        "nodes": [
+          {
+            "provider": "0xB2B2b2b2B2b2b2b2B2b2b2b2b2b2B2b2b2B2b2B2",
+            "amount_micro_usdc": 7340,
+            "bytes": 736100352
+          }
+        ],
         "stale": false
       },
       {
@@ -109,8 +106,6 @@
         "finished_unix_ms": 1793000242000,
         "received_bytes": 734003200,
         "expected_bytes": 1073741824,
-        "files_started": 12,
-        "files_landed": 9,
         "paid": {
           "amount_micro_usdc": 7340,
           "bytes": 736100352
@@ -122,7 +117,6 @@
             "bytes": 736100352
           }
         ],
-        "bundle": null,
         "stale": false
       },
       {
@@ -137,8 +131,6 @@
         "error": "no node holds the blob",
         "received_bytes": 734003200,
         "expected_bytes": 1073741824,
-        "files_started": 12,
-        "files_landed": 9,
         "paid": {
           "amount_micro_usdc": 7340,
           "bytes": 736100352
@@ -150,7 +142,6 @@
             "bytes": 736100352
           }
         ],
-        "bundle": null,
         "stale": false
       }
     ],

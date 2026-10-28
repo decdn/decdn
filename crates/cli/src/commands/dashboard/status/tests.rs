@@ -74,7 +74,15 @@ enum End {
     GaveUp,
 }
 
-fn pull(started: u64, kind: PullKind, end: End) -> PullView {
+/// What a fixture's run pulls.
+#[derive(Clone, Copy)]
+enum Kind {
+    Blob,
+    Bundle,
+    Entry,
+}
+
+fn pull(started: u64, kind: Kind, end: End) -> PullView {
     let finished_unix_ms = started + 42_000;
     let error = "no node holds the blob".to_owned();
     let state = match end {
@@ -91,13 +99,31 @@ fn pull(started: u64, kind: PullKind, end: End) -> PullView {
         },
     };
     let ended = end != End::Running;
+    let (uri, kind) = match kind {
+        Kind::Blob => (format!("decdn:{HASH}"), PullKind::Blob),
+        Kind::Entry => (format!("decdn:{HASH}/docs/index.html"), PullKind::Entry),
+        Kind::Bundle => (
+            format!("decdn:{HASH}/"),
+            PullKind::Bundle {
+                files_started: 12,
+                files_landed: 9,
+                counts: ended.then_some(BundleCounts {
+                    fetched: 9,
+                    linked: 1,
+                    skipped: 2,
+                    excluded: 0,
+                    failed: 0,
+                    not_run: 0,
+                    downloaded: 734_003_200,
+                    resumed_bytes: 0,
+                    reused_bytes: 4_096,
+                }),
+            },
+        ),
+    };
     PullView {
         record: PullRecord {
-            uri: match kind {
-                PullKind::Blob => format!("decdn:{HASH}"),
-                PullKind::Bundle => format!("decdn:{HASH}/"),
-                PullKind::Entry => format!("decdn:{HASH}/docs/index.html"),
-            },
+            uri,
             kind,
             output: "/home/me/site".to_owned(),
             pid: 4242,
@@ -110,8 +136,6 @@ fn pull(started: u64, kind: PullKind, end: End) -> PullView {
             state,
             received_bytes: 734_003_200,
             expected_bytes: Some(1_073_741_824),
-            files_started: 12,
-            files_landed: 9,
             paid: Paid {
                 amount_micro_usdc: 7_340,
                 bytes: 736_100_352,
@@ -123,17 +147,6 @@ fn pull(started: u64, kind: PullKind, end: End) -> PullView {
                     bytes: 736_100_352,
                 },
             }],
-            bundle: (kind == PullKind::Bundle && ended).then_some(BundleCounts {
-                fetched: 9,
-                linked: 1,
-                skipped: 2,
-                excluded: 0,
-                failed: 0,
-                not_run: 0,
-                downloaded: 734_003_200,
-                resumed_bytes: 0,
-                reused_bytes: 4_096,
-            }),
         },
         stale: false,
     }
@@ -310,16 +323,13 @@ fn a_full_status_keeps_its_shape() {
     // fixtures; the page's tests splice those in here.
     let gateway = serde_json::json!({ "pinned_by": "status-loopback.json" });
     let mut status = base(GatewayState::Up { status: gateway }, node_up());
-    let mut stopped = pull(NOW_MS - 120_000, PullKind::Blob, End::Running);
+    let mut stopped = pull(NOW_MS - 120_000, Kind::Blob, End::Running);
     stopped.stale = true;
-    status.pulls.active = vec![
-        pull(NOW_MS - 30_000, PullKind::Bundle, End::Running),
-        stopped,
-    ];
+    status.pulls.active = vec![pull(NOW_MS - 30_000, Kind::Bundle, End::Running), stopped];
     status.pulls.recent = vec![
-        pull(NOW_MS - 300_000, PullKind::Bundle, End::Done),
-        pull(NOW_MS - 400_000, PullKind::Entry, End::Interrupted),
-        pull(NOW_MS - 500_000, PullKind::Blob, End::Failed),
+        pull(NOW_MS - 300_000, Kind::Bundle, End::Done),
+        pull(NOW_MS - 400_000, Kind::Entry, End::Interrupted),
+        pull(NOW_MS - 500_000, Kind::Blob, End::Failed),
     ];
     status.pulls.unreadable = 1;
     pin("dashboard-full.json", &status);
@@ -335,7 +345,7 @@ fn a_status_with_nothing_running_keeps_its_shape() {
             message: "admin at http://127.0.0.1:9191 refused the connection".to_owned(),
         },
     };
-    status.pulls.recent = vec![pull(NOW_MS - 300_000, PullKind::Blob, End::GaveUp)];
+    status.pulls.recent = vec![pull(NOW_MS - 300_000, Kind::Blob, End::GaveUp)];
     pin("dashboard-alone.json", &status);
 }
 

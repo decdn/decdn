@@ -19,12 +19,22 @@ fn record(started: u64, state: PullState) -> PullRecord {
         state,
         received_bytes: 0,
         expected_bytes: None,
-        files_started: 0,
-        files_landed: 0,
         paid: Paid::default(),
         nodes: Vec::new(),
-        bundle: None,
     }
+}
+
+/// A bundle record's file progress and counts.
+fn bundle_of(record: &PullRecord) -> (u64, u64, Option<BundleCounts>) {
+    match record.kind {
+        PullKind::Bundle {
+            files_started,
+            files_landed,
+            counts,
+        } => Some((files_started, files_landed, counts)),
+        _ => None,
+    }
+    .expect("a bundle record")
 }
 
 fn write(dir: &Path, record: &PullRecord) {
@@ -135,9 +145,8 @@ async fn a_bundle_blob_reports_its_whole_position_not_a_delta() {
     recorder.file_landed();
     recorder.finish(&Ok(()), None).await;
     let record = only(dir.path());
-    assert_eq!(record.kind, PullKind::Bundle);
     assert_eq!(record.received_bytes, 35);
-    assert_eq!((record.files_started, record.files_landed), (2, 1));
+    assert_eq!(bundle_of(&record), (2, 1, None));
 }
 
 /// A second pass after a pool replacement starts a blob again: it counts
@@ -154,7 +163,7 @@ async fn a_blob_started_again_counts_once() {
     recorder.finish(&Ok(()), None).await;
     let record = only(dir.path());
     assert_eq!(record.received_bytes, 60);
-    assert_eq!(record.files_started, 1);
+    assert_eq!(bundle_of(&record).0, 1);
 }
 
 /// A bundle's counts reach the record with its end, never while it runs.
@@ -168,9 +177,9 @@ async fn bundle_counts_land_with_the_end() {
         ..BundleCounts::default()
     });
     recorder.write().unwrap();
-    assert_eq!(only(dir.path()).bundle, None);
+    assert_eq!(bundle_of(&only(dir.path())).2, None);
     recorder.finish(&Ok(()), None).await;
-    assert_eq!(only(dir.path()).bundle.map(|c| c.fetched), Some(3));
+    assert_eq!(bundle_of(&only(dir.path())).2.map(|c| c.fetched), Some(3));
 }
 
 /// A live run's record follows it before it ends: the heartbeat writes what
@@ -244,6 +253,61 @@ fn records_read_newest_first_and_skip_what_does_not_parse() {
     let started: Vec<_> = records.iter().map(|r| r.started_unix_ms).collect();
     assert_eq!(started, [3, 2, 1]);
     assert_eq!(unreadable, 1);
+}
+
+/// An entry written to a file runs the bundle path, which reports file
+/// progress and counts: its record keeps the bytes and none of the rest.
+#[tokio::test]
+async fn an_entry_run_records_no_bundle_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = start(dir.path(), &format!("{BLOB}/docs/a.bin"));
+    let file = recorder.file_started(&["a.bin".to_owned()], Arc::new(Quiet));
+    file.delivered(20, 20);
+    recorder.file_landed();
+    recorder.bundle_counts(BundleCounts {
+        fetched: 1,
+        ..BundleCounts::default()
+    });
+    recorder.finish(&Ok(()), None).await;
+    let record = only(dir.path());
+    assert_eq!(record.kind, PullKind::Entry);
+    assert_eq!(record.received_bytes, 20);
+    let json = serde_json::to_value(&record).unwrap();
+    for field in ["files_started", "files_landed", "counts", "bundle"] {
+        assert!(json.get(field).is_none(), "{field} in {json}");
+    }
+}
+
+/// A blob record carries no bundle field; a bundle record carries them all
+/// beside its kind, its counts as `null` until it has them, and reads back as
+/// itself.
+#[test]
+fn only_a_bundle_record_carries_bundle_fields() {
+    let blob = serde_json::to_value(record(1, done())).unwrap();
+    assert_eq!(blob["kind"], "blob");
+    for field in ["files_started", "files_landed", "counts", "bundle"] {
+        assert!(blob.get(field).is_none(), "{field} in {blob}");
+    }
+    let mut bundle = record(1, done());
+    bundle.kind = PullKind::Bundle {
+        files_started: 2,
+        files_landed: 1,
+        counts: Some(BundleCounts::default()),
+    };
+    let json = serde_json::to_value(&bundle).unwrap();
+    assert_eq!(json["kind"], "bundle");
+    assert_eq!(json["files_started"], 2);
+    assert_eq!(json["files_landed"], 1);
+    assert_eq!(json["counts"]["fetched"], 0);
+    assert_eq!(serde_json::from_value::<PullRecord>(json).unwrap(), bundle);
+    bundle.kind = PullKind::Bundle {
+        files_started: 2,
+        files_landed: 1,
+        counts: None,
+    };
+    let json = serde_json::to_value(&bundle).unwrap();
+    assert!(json["counts"].is_null(), "{json}");
+    assert_eq!(serde_json::from_value::<PullRecord>(json).unwrap(), bundle);
 }
 
 #[test]

@@ -50,16 +50,26 @@ pub(crate) fn pulls_dir() -> Option<PathBuf> {
     decdn_common::cli::common::default_data_dir().map(|d| d.join("activity").join("pulls"))
 }
 
-/// What a `decdn get` URI names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// What a `decdn get` URI names. A bundle run carries its file progress and,
+/// once it ended, its counts; a blob or entry run carries neither, even an
+/// entry written to a file, which runs the bundle path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PullKind {
     /// One blob.
     Blob,
-    /// A whole bundle.
-    Bundle,
     /// One entry of a bundle.
     Entry,
+    /// A whole bundle.
+    Bundle {
+        /// Distinct blobs the run started.
+        files_started: u64,
+        /// Blobs the run landed.
+        files_landed: u64,
+        /// The run's counts, once it ended with a summary; `None` while it
+        /// runs or when it ended before one.
+        counts: Option<BundleCounts>,
+    },
 }
 
 /// Where a run is. A run that ended carries when, and a run that failed or
@@ -195,7 +205,8 @@ impl BundleCounts {
 pub(crate) struct PullRecord {
     /// The URI the run pulls.
     pub(crate) uri: String,
-    /// What the URI names.
+    /// What the URI names, with a bundle run's progress and counts.
+    #[serde(flatten)]
     pub(crate) kind: PullKind,
     /// Where the run writes: a file, a directory, or `-` for stdout.
     pub(crate) output: String,
@@ -212,16 +223,10 @@ pub(crate) struct PullRecord {
     pub(crate) received_bytes: u64,
     /// The content bytes the run plans to fetch; `None` until known.
     pub(crate) expected_bytes: Option<u64>,
-    /// Distinct blobs a bundle run started.
-    pub(crate) files_started: u64,
-    /// Blobs a bundle run landed.
-    pub(crate) files_landed: u64,
     /// What the run paid so far, over every node.
     pub(crate) paid: Paid,
     /// What each node was paid, merged per node.
     pub(crate) nodes: Vec<NodePaid>,
-    /// A bundle run's counts, once it ended.
-    pub(crate) bundle: Option<BundleCounts>,
 }
 
 impl PullRecord {
@@ -244,7 +249,7 @@ pub(crate) struct ActivityRecorder {
     /// replace, never add.
     files: Mutex<HashMap<String, u64>>,
     /// A bundle run's counts, held until [`Self::finish`] writes them with
-    /// the run's end.
+    /// the run's end; an entry run's are dropped there.
     counts: Mutex<Option<BundleCounts>>,
     evidence: Arc<ReceiptEvidence>,
     ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -287,7 +292,11 @@ impl ActivityRecorder {
         let kind = match uri.target {
             UriTarget::Blob => PullKind::Blob,
             UriTarget::BundleEntry(_) => PullKind::Entry,
-            _ => PullKind::Bundle,
+            _ => PullKind::Bundle {
+                files_started: 0,
+                files_landed: 0,
+                counts: None,
+            },
         };
         let recorder = Arc::new(Self {
             path: dir.join(format!("{now}-{pid}.json")),
@@ -301,11 +310,8 @@ impl ActivityRecorder {
                 state: PullState::Running,
                 received_bytes: 0,
                 expected_bytes: None,
-                files_started: 0,
-                files_landed: 0,
                 paid: Paid::default(),
                 nodes: Vec::new(),
-                bundle: None,
             }),
             received: AtomicU64::new(0),
             files: Mutex::new(HashMap::new()),
@@ -363,7 +369,8 @@ impl ActivityRecorder {
 
     /// A bundle blob that lands at `paths` starts; the returned observer
     /// reports its position here and to `inner`. A blob started again, in a
-    /// second pass, counts once.
+    /// second pass, counts once. An entry run, which takes this path when it
+    /// writes to a file, records the position only.
     pub(crate) fn file_started(
         self: &Arc<Self>,
         paths: &[String],
@@ -377,7 +384,11 @@ impl ActivityRecorder {
             .insert(key.clone(), 0)
             .is_none();
         if first {
-            self.update(|r| r.files_started = r.files_started.saturating_add(1));
+            self.update(|r| {
+                if let PullKind::Bundle { files_started, .. } = &mut r.kind {
+                    *files_started = files_started.saturating_add(1);
+                }
+            });
         }
         Arc::new(RecordedFile {
             recorder: Arc::clone(self),
@@ -386,12 +397,17 @@ impl ActivityRecorder {
         })
     }
 
-    /// A bundle blob landed.
+    /// A bundle blob landed. An entry run ignores it.
     pub(crate) fn file_landed(&self) {
-        self.update(|r| r.files_landed = r.files_landed.saturating_add(1));
+        self.update(|r| {
+            if let PullKind::Bundle { files_landed, .. } = &mut r.kind {
+                *files_landed = files_landed.saturating_add(1);
+            }
+        });
     }
 
-    /// A bundle run's counts, which [`Self::finish`] writes with its end.
+    /// A bundle run's counts, which [`Self::finish`] writes with its end. An
+    /// entry run's record keeps none.
     pub(crate) fn bundle_counts(&self, counts: BundleCounts) {
         *self.counts.lock().unwrap_or_else(PoisonError::into_inner) = Some(counts);
     }
@@ -442,7 +458,9 @@ impl ActivityRecorder {
             .take();
         let now = now_ms();
         self.update(|r| {
-            r.bundle = counts;
+            if let PullKind::Bundle { counts: kept, .. } = &mut r.kind {
+                *kept = counts;
+            }
             r.state = PullState::ended(result, now);
         });
         if let Err(e) = self.write() {
