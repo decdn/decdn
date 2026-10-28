@@ -7,7 +7,8 @@
 //!
 //! A manifest written by hand into the output root's manifest cache stands in
 //! for one a paid pull cached: a load accepts any file whose BLAKE3 equals the
-//! hash in its name. With the manifest cached, the dry run quotes the plan.
+//! hash in its name. With the manifest cached, the dry run quotes a non-empty
+//! plan.
 //! `common::decdn_command`'s sealed environment holds no chain config, so the
 //! quote stops at chain resolution, before it binds an endpoint. It prints
 //! `warning: quote unavailable: …` on stderr and the run still exits 0.
@@ -68,9 +69,10 @@ fn dry_run(home: &Path, out: &Path, hex: &str, filters: &[&str]) -> Output {
         .expect("run decdn binary")
 }
 
-// With a cached manifest, the dry run lists the filtered plan on stdout and
-// prints one warning, with its `**/` hint, on stderr for the one pattern that
-// matched no entry. A pattern that matches gets no warning.
+/// With a cached manifest, the dry run lists the filtered plan on stdout and
+/// prints one warning, with its `**/` hint, on stderr for the one pattern that
+/// matched no entry. A pattern that matches gets no warning. The quote fails
+/// before it reaches the network, so the run stays offline.
 #[test]
 fn cached_manifest_warns_unmatched_exclude_on_stderr() {
     let home = TempDir::new().unwrap();
@@ -115,10 +117,14 @@ fn cached_manifest_warns_unmatched_exclude_on_stderr() {
         1,
         "stderr: {stderr}"
     );
+    assert!(
+        stderr.contains("warning: quote unavailable"),
+        "stderr: {stderr}"
+    );
 }
 
-// An `--include` that matches no entry empties the plan: stderr carries its
-// warning and hint, and stdout reports that the filters left nothing.
+/// An `--include` that matches no entry empties the plan: stderr carries its
+/// warning and hint, and stdout reports that the filters left nothing.
 #[test]
 fn cached_manifest_warns_unmatched_include_on_stderr() {
     let home = TempDir::new().unwrap();
@@ -145,9 +151,9 @@ fn cached_manifest_warns_unmatched_include_on_stderr() {
     );
 }
 
-// Without a cached manifest there are no entries to match, so the dry run
-// reports that the patterns apply only once a pull caches the manifest — on
-// stdout, with no unmatched-pattern warning on stderr.
+/// Without a cached manifest there are no entries to match, so the dry run
+/// reports that the patterns apply only once a pull caches the manifest — on
+/// stdout, with no unmatched-pattern warning on stderr.
 #[test]
 fn no_cached_manifest_notes_deferred_filters_without_warning() {
     let home = TempDir::new().unwrap();
