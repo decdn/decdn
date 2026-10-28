@@ -1300,6 +1300,12 @@ since project inception and will roll into the first tagged release.
   none to refill before the loop ends. A 1 ms refill gave the loop a 1 ms
   margin, so a preempted loop lost a bucket to the over-cap sweep. The refill
   is now 100 ms and the wait 400 ms.
+- **`decdn-e2e`: the G-NODE-07 iroh rotation stops the daemon before it
+  rotates (#2727).** The journey rotated with the daemon running, then
+  restarted it with SIGKILL. A pre-rotation voucher the hint path had not sent
+  yet then waited for the restarted daemon's next full redeem interval, past
+  the 90 s settlement poll. The journey now sends SIGTERM first, as the
+  runbook's "Stop" step does, so the final redeem sweep settles it.
 - **Client: a streamed fetch with no size hint keeps the pull it opened for
   the size (#2644).** With no size hint (`decdn get -o -` on the peer-store
   fast path, or a gateway pull whose size lookup finds none), the client read

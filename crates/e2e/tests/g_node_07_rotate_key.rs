@@ -22,10 +22,13 @@
 //! **What the settlement leg does and does not pin.** The node redeems on its
 //! own schedule once a claim passes `redeem_threshold_micro_usdc`, so whether
 //! the pre-rotation voucher settles before or after the rebinding is a race this
-//! journey does not try to win. Asserting the *outcome* after the rotation and
-//! restart is what is meaningful and what is stable: the operator can still
-//! redeem vouchers signed against the old identity. A second paid fetch after
-//! the restart covers the other half — the new identity can be paid at all.
+//! journey does not try to win. The journey stops the daemon before the real
+//! rotation, as the runbook's "Stop" step does, so the graceful shutdown's final
+//! redeem sweep settles whatever the hint path has not sent yet. Asserting the
+//! *outcome* after the rotation and restart is what is meaningful and what is
+//! stable: the operator can still redeem vouchers signed against the old
+//! identity. A second paid fetch after the restart covers the other half — the
+//! new identity can be paid at all.
 //!
 //! Two more tests sit on the same fixtures. The second covers the negative the
 //! issue names: a key swapped without a matching `bindNodeId` leaves the node
@@ -65,6 +68,11 @@ const MIB: usize = 1024 * 1024;
 /// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule) for the
 /// iroh-rotation and unbound-key legs; anvil launch + forge deploy dominate.
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
+
+/// Bound on the daemon's graceful stop before the real rotation: generous
+/// enough for the final redeem sweep against anvil, the lane and receipt
+/// flushes, and the cache close on a loaded runner.
+const STOP_BUDGET: Duration = Duration::from_secs(60);
 
 /// Payload size for the paid leg. 2 MiB at the fixture's 10 micro-USDC/MiB is
 /// a 20 micro-USDC claim, above the fixture's 10 micro-USDC redeem threshold, so
@@ -171,7 +179,17 @@ async fn run_rotation() -> anyhow::Result<()> {
         "a preview must not move the on-chain binding"
     );
 
-    // ---- 2b. The real rotation.
+    // ---- 2b. The real rotation, with the daemon stopped as the runbook's "Stop"
+    // step says (adr/appendix-operator-key-rotation.md). SIGTERM runs the final
+    // redeem sweep, so the step-1 voucher settles even if the hint path had not
+    // sent it yet. A SIGKILL skips that sweep, and the restarted daemon redeems
+    // only at its next full interval, well past step 7's poll. A stopped daemon
+    // also sends nothing from the operator key while the CLI sends `bindNodeId`.
+    let (status, took) = node.terminate(STOP_BUDGET).await?;
+    anyhow::ensure!(
+        status.success(),
+        "the node must exit successfully on SIGTERM, got {status} after {took:?}"
+    );
     let rotated = run_node_cli(&node, &["rotate-key", "--key", "iroh", "--yes", "--json"]).await?;
     let receipt = last_json_line(&rotated)?;
     assert_eq!(json_bool(&receipt, "submitted"), Some(true));
@@ -230,9 +248,9 @@ async fn run_rotation() -> anyhow::Result<()> {
         "firstBondedAt anchors the governance age ramp; an iroh rotation must not reset it"
     );
 
-    // ---- 5. The daemon picks up the new identity on restart (the node key is
-    // not hot-reloadable, so this is the only way it can), and agrees with the
-    // chain about it again.
+    // ---- 5. The daemon, stopped in step 2b, picks up the new identity on
+    // restart (the node key is not hot-reloadable, so this is the only way it
+    // can), and agrees with the chain about it again.
     node.restart().await?;
     let live_id = node.current_node_id().await?;
     assert_eq!(
