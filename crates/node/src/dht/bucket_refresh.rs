@@ -25,7 +25,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use decdn_client::Connections;
 use iroh::{EndpointAddr, PublicKey};
@@ -35,6 +35,7 @@ use tokio::sync::oneshot;
 use crate::dht::chain_projection::with_lock;
 use crate::dht::client;
 use crate::dht::routing::{KEYSPACE_BITS, NodeId, RoutingTable, bucket_index};
+use crate::dht::staker_set::StakerSet;
 
 /// Bucket-refresh tick interval. ADR 022 §Routing Table specifies "1
 /// hour" as the refresh interval **per bucket** — we run *every*
@@ -61,10 +62,15 @@ pub const BUCKET_REFRESH_TICK: Duration = Duration::from_hours(1);
 /// Each pass also counts its failed bucket refreshes into
 /// `decdn_dht_bucket_refresh_failures_total` and publishes the table's size
 /// as `decdn_dht_routing_table_size`.
+///
+/// A response names whatever ids its sender likes, so only the ones
+/// `staker_set` holds as bonded enter the table.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_bucket_refresh(
     conns: Connections,
     self_id: PublicKey,
     routing: Arc<Mutex<RoutingTable>>,
+    staker_set: Arc<dyn StakerSet>,
     mut stop_rx: oneshot::Receiver<()>,
     interval: Duration,
     refresh_clock: Arc<AtomicU64>,
@@ -84,7 +90,8 @@ pub async fn run_bucket_refresh(
             }
             _ = ticker.tick() => {
                 let failures =
-                    refresh_all_non_empty_buckets(&conns, self_node_id, &routing).await;
+                    refresh_all_non_empty_buckets(&conns, self_node_id, &routing, &staker_set)
+                        .await;
                 for _ in 0..failures {
                     metrics.dht_bucket_refresh_failure();
                 }
@@ -135,9 +142,10 @@ async fn refresh_all_non_empty_buckets(
     conns: &Connections,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
+    staker_set: &Arc<dyn StakerSet>,
 ) -> usize {
     let picks: Vec<BucketPick> = with_lock(routing, "dht routing table", |table| {
-        all_non_empty_picks(table)
+        all_non_empty_picks(table, staker_set.as_ref())
     });
     if picks.is_empty() {
         return 0;
@@ -146,8 +154,9 @@ async fn refresh_all_non_empty_buckets(
     for pick in picks {
         let conns = conns.clone();
         let routing_cloned = Arc::clone(routing);
+        let staker_set = Arc::clone(staker_set);
         handles.push(tokio::spawn(async move {
-            refresh_one_bucket(&conns, self_node_id, &routing_cloned, pick).await
+            refresh_one_bucket(&conns, self_node_id, &routing_cloned, &*staker_set, pick).await
         }));
     }
     let mut failures = 0;
@@ -160,13 +169,18 @@ async fn refresh_all_non_empty_buckets(
     failures
 }
 
-/// Snapshot all non-empty buckets as `BucketPick`s. Returns one pick
-/// per non-empty bucket; the caller fans the corresponding `FindNode`
-/// RPCs out in parallel.
-fn all_non_empty_picks(table: &RoutingTable) -> Vec<BucketPick> {
+/// Snapshot all non-empty buckets as `BucketPick`s. Returns one pick per
+/// bucket that holds a bonded entry, aimed at its most-recently-seen bonded
+/// entry; the caller fans the corresponding `FindNode` RPCs out in parallel.
+fn all_non_empty_picks(table: &RoutingTable, staker_set: &dyn StakerSet) -> Vec<BucketPick> {
     (0..KEYSPACE_BITS)
         .filter_map(|idx| {
-            let peer = bucket_iter(table, idx).last().copied()?;
+            // The bucket's most-recently-seen bonded entry: an entry that
+            // unbonded since it entered is not a peer to ask.
+            let peer = bucket_iter(table, idx)
+                .filter(|peer| staker_set.is_active(peer))
+                .last()
+                .copied()?;
             let target = random_target_in_bucket(table.self_id(), idx);
             Some(BucketPick {
                 bucket_index: idx,
@@ -186,6 +200,7 @@ async fn refresh_one_bucket(
     conns: &Connections,
     self_node_id: NodeId,
     routing: &Arc<Mutex<RoutingTable>>,
+    staker_set: &dyn StakerSet,
     pick: BucketPick,
 ) -> bool {
     let BucketPick {
@@ -207,16 +222,19 @@ async fn refresh_one_bucket(
     let addr = EndpointAddr::new(target_pk);
     match client::find_node(conns, addr, target, self_node_id).await {
         Ok(resp) => {
-            // Insert any new peers from the response into the routing
+            // Insert the bonded peers from the response into the routing
             // table. The bucket's freshness is updated by virtue of
             // these inserts moving entries to MRU. These are
             // response-learned ids (not the authenticated peer), inserted
             // as Kademlia probe candidates by design — distinct from the
             // `AuthenticatedNodeId`-gated recency refresh in the handler.
+            // An unbonded id is refused: the responder names whatever it
+            // likes.
+            let now = Instant::now();
             with_lock(routing, "dht routing table", |table| {
                 for nid in resp.closer_nodes.into_inner() {
                     if nid != self_node_id {
-                        table.insert(nid);
+                        table.insert_active(nid, staker_set, now);
                     }
                 }
             });

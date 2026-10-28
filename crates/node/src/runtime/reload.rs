@@ -1068,6 +1068,7 @@ impl RuntimeReloadState {
             load_shed: decdn_common::config::ResolvedLoadShed::default(),
             dht: decdn_common::config::ResolvedDht::default(),
             probe: decdn_common::config::ResolvedProbe::default(),
+            serve: decdn_common::config::ResolvedServe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
             content: decdn_common::config::ResolvedContent::default(),
         };
@@ -1333,6 +1334,11 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         // `probe.rate_limit` is read once at startup; changing it requires
         // a restart (same footing as `dht.*`).
         warn_ignored("probe.* (rate_limit)");
+    }
+    if file.serve.is_some() {
+        // `serve.rate_limit` is read once at startup; changing it requires
+        // a restart (same footing as `probe.*`).
+        warn_ignored("serve.* (rate_limit)");
     }
     if file.receipts.is_some() {
         // `receipts.*` (rotation cap, retained backups) is read once when

@@ -434,6 +434,7 @@ fn build_config(
         content: decdn_common::config::ResolvedContent::default(),
         dht: ResolvedDht::default(),
         probe: ResolvedProbe::default(),
+        serve: decdn_common::config::ResolvedServe::default(),
         receipts: ResolvedReceipts::default(),
     }
 }

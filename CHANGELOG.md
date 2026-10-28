@@ -5267,6 +5267,107 @@ since project inception and will roll into the first tagged release.
   `bad-request`, `internal-error`) is now the gate's own error, answered
   `500` and logged at warn, not a silent `403` refusal (#2719).
 
+- **Node: a peer's own rate-limit bucket refuses it before the shared
+  global one is charged.** The three-layer limiter behind `cdn/probe/v1` and
+  `cdn/dht/v1` charged the global bucket first, so a
+  request that the peer's own bucket then refused had already spent a global
+  token. One `NodeId` flooding at the global rate drained the node-wide
+  budget for every other requester, even though its own cap let only a small
+  part of the flood through. The layers now fire per-peer → per-IP → global,
+  so a refused request spends no global token, and the new `cdn/client/v1`
+  limiter uses the same order. A request that both its own
+  bucket and the global cap would refuse now counts on the `per_peer` (or
+  `per_ip`) rejection counter instead of `global`. ADR 005 and ADR 022 state
+  the order.
+
+- **Node: unbound requests read no pool on-chain, and admission reads are
+  capped (#2706).** At admission, an unseen `pool_id` cost one `getPool` and
+  an unseen signer one `getAuthorization`, with no global bound, so a stream
+  of requests for fresh random pool ids could spend the operator's RPC quota
+  until the blacklist watcher stalled and the node refused every serve. A
+  request with no verified client binding can name no lane, so the node now
+  refuses it `NotFound` before any chain read, and before an origin-only
+  node's backend `HEAD` (it counts on
+  `decdn_serve_stream_rejected_owner_mismatch_total`). Admission `getPool` and
+  `getAuthorization` reads hold one of 16 node-wide slots. A read waits up to
+  5 s for a slot and its own timeout starts once it holds one; a request that
+  finds no slot in time is refused without caching a fault against its pool,
+  so the pool's next request reads again, and counts on
+  `decdn_serve_admit_read_slot_timeouts_total`. Bound requests are bounded by these
+  slots and by the `[serve.rate_limit]` limiter.
+
+- **Node: inbound `cdn/client/v1` requests pass a three-layer rate limiter
+  before they are read (#2694).** The only gates on `cdn/client/v1` were the
+  per-connection limiter and the stream cap. Most refusals after the request
+  is read sign a response, and an origin-only node sent its backend a `HEAD` for each unseen
+  hash before any lane or payment check, so a flood of unpaid requests spent
+  node CPU and origin requests without limit. A new `[serve.rate_limit]`
+  section (per-peer 100/s burst 400, per-IP 200/s burst 800, global 2000/s
+  burst 5000; a rate of 0 turns a layer off) is checked once per stream,
+  after the stream permit and before the request is read. A refused stream is
+  reset with `RATE_LIMITED` and no signed response, and counts on
+  `decdn_serve_rate_limit_rejected_{per_peer,per_ip,global}_total`. Those
+  three counters are inbound failure reasons, so the devops "Unattributed
+  stream failures" panels need them too. `decdn-client` reads the reset as
+  back-off. ADR 005 § Request rate limiting describes the layers.
+
+- **Node: the DHT routing table admits bonded peers only (#2708).** ADR 022
+  restricts the routing pool to bonded operators, but the table admitted every
+  peer that contacted the node and every id a `closer_nodes` answer named, and
+  a full bucket evicted its oldest entry unconditionally. Free NodeIds could
+  therefore push out the bonded entries, so publish fan-out and lookup seeds
+  went to non-participants, and discovery fell back to the on-chain origin
+  directory. Every routing-table insert now checks the active staker set. The
+  `FindNode` / `FindValue` answers, lookup seeds and publish fan-out skip an
+  entry that has unbonded since it entered. A full bucket evicts an unbonded
+  or dial-cooling entry before the least-recently-seen bonded one.
+
+- **Node: the admin JSON-RPC server refuses requests a web page can send
+  (#2690).** It answered any request on its loopback port. A page that the
+  operator opened could reach that port through DNS rebinding and call
+  `evict` (persisted across restarts) or `drain` (shuts the node down). The
+  server now answers only requests whose `Host` is `127.0.0.1` or
+  `localhost` (any port), refuses any request that carries an `Origin`
+  header with `403`, and refuses batch requests. `decdn node …`, the
+  dashboard and an SSH tunnel to the admin port are unaffected.
+
+- **Node: after a restart, the redeemer reads a pool it does not know before
+  it submits that pool's lanes (#2692).** The redeemer's pool view learns a
+  pool only from the events it folds and the admit path's reads, and the
+  watcher resumes at its checkpoint, so a pool opened before a restart stayed
+  unknown. Its lanes were submitted even once the pool was `Closing` past its
+  deadline, reverted `PoolClosed` (taking the whole `redeemMany` with them)
+  and reverted again on every sweep. Once the candidate lanes together clear
+  the redemption floor, the redeemer now reads each unknown pool with one
+  `getPool` and seeds the view from it. A lane whose pool is past its close
+  deadline stays out of the submit and counts on
+  `decdn_redemption_skipped_insolvent_total`. A lane whose pool is absent,
+  `Closed` or unreadable stays out and counts on the new
+  `decdn_redemption_skipped_pool_unresolved_total`; an absent or `Closed`
+  pool also logs a `warn!` naming it. The first failed read stops the reads
+  for that cycle, so an RPC outage costs one round of timeouts and lanes on
+  known pools still go through. A failed read counts as a chain fault, so
+  parked lanes stay parked until a clean sweep.
+
+- **Node: the mid-stream signer cap check counts a resolved pool's
+  pre-restart spend (#2711).** After a restart the projection seeds a pool it
+  has not folded from one `getPool`, and it counts a signer's spend only from
+  the redemptions it folds after the seed. The mid-stream check read that
+  count alone, so a signer that spent most of its cap before the restart kept
+  being served after other nodes drained the rest. The check now reads the
+  admit-path `getAuthorization` result brought up to the fold, the same
+  number admission reads, and falls back to the fold alone only when it holds
+  no registered read for the signer.
+
+- **Node: racing first streams on a new lane keep its stored voucher frontier
+  (#2701).** `register_lane` recorded the fresh zero lane before
+  it claimed the lane's slot in the live map, so two first streams could both
+  record it, and the second record could overwrite a voucher the first
+  stream's lane had recorded in between. A restart in that window rehydrated
+  the lane at zero, and the redeemer found no signature to submit. Only the
+  stream that claims the slot now records the fresh lane, under the slot's
+  guard.
+
 - **Node: a pool resolved from chain counts its on-chain redemptions toward
   its remaining deposit (GHSA-9x5g-h559-vp5m).** After a restart the pool
   projection is empty, so the admit path reads a pool it has not folded with

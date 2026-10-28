@@ -5,7 +5,7 @@
 //! [`crate::rate_limit::ThreeLayerRateLimiter`] engine: it pins the
 //! DHT-specific operator-visible metric names (via a private metrics sink)
 //! and re-exports the config/reject types under their historical DHT names.
-//! The layering, cheapest-first ordering, keyspace bound, and batch-token
+//! The layering, narrowest-first ordering, keyspace bound, and batch-token
 //! accounting all live in the shared engine — see its
 //! module docs.
 

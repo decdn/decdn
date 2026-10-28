@@ -187,7 +187,13 @@ pub async fn find_providers(
         cfg,
         metrics,
     };
-    let mut state = LookupState::new(routing_table, &target, requester_id, cfg);
+    let mut state = LookupState::new(
+        routing_table,
+        staker_set.as_ref(),
+        &target,
+        requester_id,
+        cfg,
+    );
 
     let mut rounds_run: u32 = 0;
     for round in 0..MAX_LOOKUP_ROUNDS {
@@ -537,6 +543,7 @@ struct LookupState {
 impl LookupState {
     fn new(
         routing_table: &Arc<Mutex<RoutingTable>>,
+        staker_set: &dyn StakerSet,
         target: &Hash,
         requester_id: NodeId,
         cfg: LookupConfig,
@@ -559,14 +566,22 @@ impl LookupState {
         // the skip list describe one table state. The seed is the nearest
         // `seed_count` peers that are NOT cooling: the table is read past the
         // seed count by the number of cooling peers, so cooling peers near the
-        // target cannot crowd a live peer out of the seed.
+        // target cannot crowd a live peer out of the seed. Only bonded peers
+        // seed it: an entry that unbonded since it entered the table is
+        // skipped like any non-participant.
         let seed_count = cfg.alpha.get().saturating_mul(4);
         let now = Instant::now();
         let (seed, cooling, skipped) = match routing_table.lock() {
-            Ok(mut t) => Self::seed_from(&mut t, target, seed_count, now),
+            Ok(mut t) => Self::seed_from(&mut t, staker_set, target, seed_count, now),
             Err(poisoned) => {
                 warn!("dht lookup: routing table mutex poisoned; recovering inner state");
-                Self::seed_from(&mut poisoned.into_inner(), target, seed_count, now)
+                Self::seed_from(
+                    &mut poisoned.into_inner(),
+                    staker_set,
+                    target,
+                    seed_count,
+                    now,
+                )
             }
         };
         state.cooling = cooling;
@@ -577,18 +592,19 @@ impl LookupState {
         state
     }
 
-    /// The nearest `seed_count` peers to `target` that are not cooling at
-    /// `now`, the cooling snapshot itself, and how many cooling peers the
+    /// The nearest `seed_count` bonded peers to `target` that are not cooling
+    /// at `now`, the cooling snapshot itself, and how many cooling peers the
     /// seed passed over on its way to that count.
     fn seed_from(
         table: &mut RoutingTable,
+        staker_set: &dyn StakerSet,
         target: &Hash,
         seed_count: usize,
         now: Instant,
     ) -> (Vec<NodeId>, HashSet<NodeId>, u32) {
         let cooling = table.cooling_peers(now);
         let reach = seed_count.saturating_add(cooling.len());
-        let nearest = table.closest_unbounded(target.as_bytes(), reach);
+        let nearest = table.closest_active_unbounded(target.as_bytes(), reach, staker_set);
         let mut seed = Vec::with_capacity(seed_count);
         let mut skipped: u32 = 0;
         for peer in nearest {

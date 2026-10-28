@@ -674,7 +674,8 @@ async fn find_providers_converges_via_closer_nodes_second_round() -> anyhow::Res
 
     // The seed holds no record but knows the holder — its FindValue
     // response carries `holder` in `closer_nodes`, driving round 2.
-    let seed = spin_up_server(HashSet::new()).await?;
+    // The holder is bonded at the seed, so the seed names it.
+    let seed = spin_up_server(HashSet::from([holder_bytes])).await?;
     let seed_id = NodeId::from_bytes(*seed.id.as_bytes());
     seed.routing.lock().unwrap().insert(holder_id);
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &seed).await?;
@@ -740,7 +741,8 @@ async fn find_providers_skips_a_dead_referral_on_the_next_lookup() -> anyhow::Re
     let target: [u8; 32] = holder_bytes;
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &holder).await?;
 
-    let seed = spin_up_server(HashSet::new()).await?;
+    // The holder is bonded at the seed, so the seed names it.
+    let seed = spin_up_server(HashSet::from([holder_bytes])).await?;
     let seed_id = NodeId::from_bytes(*seed.id.as_bytes());
     seed.routing.lock().unwrap().insert(holder_id);
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &seed).await?;

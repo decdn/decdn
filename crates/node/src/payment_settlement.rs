@@ -173,6 +173,21 @@ const UNREGISTERED_AUTH_TTL: Duration = Duration::from_mins(1);
 /// admit.
 const AUTH_CACHE_MAX: usize = 4096;
 
+/// How many admit-path chain reads (`getPool`, `getAuthorization`) may be in
+/// flight at once, across every pool and signer. Each distinct key coalesces to
+/// one read, but a flood of distinct pool ids or signers would otherwise send
+/// one read each at once and spend the operator's RPC quota, and a stalled
+/// watcher then refuses every serve. A read's own timeout starts once it holds
+/// a slot.
+const ADMIT_CHAIN_READ_CONCURRENCY: usize = 16;
+
+/// How long an admit-path read waits for a free slot
+/// ([`ADMIT_CHAIN_READ_CONCURRENCY`]) before the node refuses the request. A wait
+/// that runs out says this node is busy, not that the pool or signer faulted,
+/// so it is not negative-cached: the next request reads again. Shorter than
+/// the 10 s read timeout, so a refused request waits less than one read could.
+const ADMIT_CHAIN_READ_SLOT_WAIT: Duration = Duration::from_secs(5);
+
 /// One admit-path `getAuthorization` read held in the signer-auth cache.
 ///
 /// A `Registered` read never goes stale. Its `cap` and `expiry` are write-once,
@@ -1265,6 +1280,10 @@ impl<P: Provider + Clone + 'static> PoolSettlementSink<P> {
 /// keeps a `Registered` answer for good (see `AuthRead`); only an
 /// `Unregistered` answer is re-read. Those reads are coalesced per pair the same
 /// way.
+///
+/// Every read, of either kind, first takes one of
+/// `ADMIT_CHAIN_READ_CONCURRENCY` node-wide slots; a request that finds none
+/// within `ADMIT_CHAIN_READ_SLOT_WAIT` is refused and nothing is cached.
 pub struct ResolvingPoolView<P: Provider + Clone> {
     /// The wallet/RPC-backed `PaymentPool` binding for the admit-path reads
     /// (`getPool`, `getAuthorization`).
@@ -1289,6 +1308,8 @@ pub struct ResolvingPoolView<P: Provider + Clone> {
     /// `(pool_id, signer)` → a receiver for the in-flight admit
     /// `getAuthorization` of that pair. See [`ReadSlot`].
     auth_inflight: InflightReads<(B256, Address), Option<SignerAuthorization>>,
+    /// Slots for admit-path chain reads; see [`ADMIT_CHAIN_READ_CONCURRENCY`].
+    chain_reads: tokio::sync::Semaphore,
     /// Counts each signer confirm by what the cache held for it.
     metrics: Arc<Metrics>,
 }
@@ -1318,8 +1339,25 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
             inflight: Mutex::new(HashMap::new()),
             auth_cache: Mutex::new(HashMap::new()),
             auth_inflight: Mutex::new(HashMap::new()),
+            chain_reads: tokio::sync::Semaphore::new(ADMIT_CHAIN_READ_CONCURRENCY),
             metrics,
         }
+    }
+
+    /// A slot for one admit-path chain read, or `None` when none frees up
+    /// within [`ADMIT_CHAIN_READ_SLOT_WAIT`]. A wait that runs out counts on
+    /// `serve_admit_read_slot_timeouts`, so an operator can tell a busy node
+    /// from pools that fail to resolve. The semaphore is never closed, so the
+    /// only `None` is a wait that ran out.
+    async fn read_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        let slot = tokio::time::timeout(ADMIT_CHAIN_READ_SLOT_WAIT, self.chain_reads.acquire())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if slot.is_none() {
+            self.metrics.serve_admit_read_slot_timeout();
+        }
+        slot
     }
 
     /// What the signer-auth cache holds for `(pool_id, signer)` now.
@@ -1338,8 +1376,14 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
     /// into the projection as an unanchored snapshot of its `deposit` and
     /// `totalRedeemed` ([`PoolProjection::record_resolved`]), or negative-cache
     /// an absent / `Closed` pool as a [`NegativeReason::Verdict`] and a failed
-    /// read as a [`NegativeReason::Fault`]. The caller holds the pool's [`ReadSlot::Lead`].
+    /// read as a [`NegativeReason::Fault`]. A read that finds no admit-read slot
+    /// within [`ADMIT_CHAIN_READ_SLOT_WAIT`] caches nothing and answers `None`.
+    /// The caller holds the pool's [`ReadSlot::Lead`].
     async fn resolve(&self, pool_id: B256) -> Option<PoolStatus> {
+        let Some(_slot) = self.read_slot().await else {
+            debug!(%pool_id, "admit getPool: no read slot free; refusing without caching");
+            return None;
+        };
         // Bounded: the alloy HTTP provider sets no timeout of its own, so a hung
         // read times out here and takes the fault path below.
         let pool = match timed(None, "admit getPool", self.contract.getPool(pool_id).call()).await {
@@ -1439,10 +1483,16 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
     }
 
     async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
-        // The mid-stream signer cap-headroom re-check: projection ONLY, never a
-        // `getAuthorization`. A signer that drains its shared `cap` at another node
-        // shows up here as the settlement watcher folds that node's `PoolRedeemed`.
-        Some(self.projection.signer_spent(pool_id, signer))
+        // The mid-stream signer cap-headroom re-check: the admit-path read and the
+        // projection, never a fresh `getAuthorization`. A registered read carries
+        // everything the signer spent before it, which the projection lacks on a
+        // pool it seeded from one `getPool`; the fold since the read adds the
+        // drain at other nodes as the settlement watcher folds their
+        // `PoolRedeemed`. Admission reads the same number.
+        match self.lookup_auth(pool_id, signer) {
+            CachedAuth::Fresh(SignerAuthorization::Registered { spent, .. }) => Some(spent),
+            _ => Some(self.projection.signer_spent(pool_id, signer)),
+        }
     }
 
     async fn signer_authorization(
@@ -1491,7 +1541,12 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
         pool_id: B256,
         signer: Address,
     ) -> Option<SignerAuthorization> {
-        // The baseline is taken before the read is sent; see `AuthRead`.
+        let Some(_slot) = self.read_slot().await else {
+            debug!(%pool_id, %signer, "admit getAuthorization: no read slot free; refusing");
+            return None;
+        };
+        // The baseline is taken once the slot is held, just before the read is
+        // sent; see `AuthRead`.
         let folded_at_read = self.projection.signer_spent(pool_id, signer);
         // Bounded: a hung read times out here and takes the fault path below.
         let auth = match timed(
@@ -1926,9 +1981,10 @@ fn chunk_redemptions(
 }
 
 /// Redemption policy: whether a lane whose pool has this `status` is worth
-/// submitting now. Fails OPEN on an unknown pool (`None`) — a projection gap
+/// submitting now. An unknown pool (`None`) passes planning: a projection gap
 /// (cold start, reorg, an unfolded event) must never hold a lane and strand real
-/// money; only a positive zero-`remaining` holds. A drained `Open` pool is held
+/// money, and [`resolve_unknown_pools`] reads the pool before any submit. Only a
+/// positive zero-`remaining` holds. A drained `Open` pool is held
 /// (a top-up re-drives it); a drained `Closing` pool is dropped (it cannot be
 /// topped up, so `remaining == 0` is irreversible); a funded `Closing` pool is
 /// redeemable only while its deadline lies more than [`REDEEM_LANDING_SLACK_SECS`]
@@ -1953,7 +2009,7 @@ fn pool_is_redeemable(status: Option<PoolStatus>, now: u64) -> bool {
 
 /// Split candidate lanes into the ones whose pool can pay now and a count of the
 /// ones held/dropped by [`pool_is_redeemable`]. A pool absent from `snapshot` is
-/// `None` (fail open).
+/// `None` and passes, for [`resolve_unknown_pools`] to read before a submit.
 fn partition_redeemable(
     states: Vec<LaneState>,
     snapshot: &HashMap<PoolId, Option<PoolStatus>>,
@@ -2246,9 +2302,10 @@ fn plan_lanes(
     pool_view: &PoolProjection,
     now: u64,
 ) -> Vec<PlannedLane> {
-    // The redeemer's only on-chain-derived gate: hold/drop lanes whose pool cannot
-    // pay, read from the event-fed projection. Fail open on an unknown pool. A
-    // lane's signer-registration status is resolved locally below — no chain read.
+    // Hold/drop lanes whose pool cannot pay, read from the event-fed projection.
+    // An unknown pool passes here; the pre-submit `resolve_unknown_pools` reads it
+    // once the candidate lanes together clear the redemption floor. A lane's signer-registration status is
+    // resolved locally below — no chain read.
     let mut snapshot: HashMap<PoolId, Option<PoolStatus>> = HashMap::new();
     for st in &states {
         snapshot
@@ -2365,6 +2422,7 @@ async fn redeem_one<P: Provider + Clone>(
         max_vouchers,
         true,
         metrics,
+        pool_view,
         recorder,
     )
     .await;
@@ -2428,6 +2486,7 @@ async fn redeem_sweep<P: Provider + Clone>(
         max_vouchers,
         strict_flush,
         metrics,
+        pool_view,
         recorder,
     )
     .await
@@ -2896,6 +2955,108 @@ fn holds_unredeemed(states: &[LaneState], pool_id: PoolId, provider: Address) ->
     })
 }
 
+/// Read every pool of `plans` the projection does not hold, seed the ones that
+/// can still be redeemed ([`PoolProjection::record_resolved`]), and drop each
+/// lane whose pool cannot pay now ([`pool_is_redeemable`]). The projection learns
+/// pools only from the events it folds and the admit path's reads, so after a
+/// restart a pool opened before it is unknown until one of them reads it. A lane
+/// on a pool that is closed or closing past its deadline reverts the whole
+/// `redeemMany` (`PoolClosed`), and would revert again on every sweep.
+///
+/// Fails closed: a lane whose pool is still unknown after the reads (the read
+/// faulted, was not sent, or the chain shows the pool absent or `Closed`) stays
+/// out of this cycle and counts on `redemption_skipped_pool_unresolved`. A lane
+/// whose pool resolved but cannot pay counts on `redemption_skipped_insolvent`.
+/// Returns the kept lanes and whether a read faulted.
+///
+/// Each pool costs one `getPool`, at most [`REANCHOR_READ_CONCURRENCY`] at once.
+/// The first fault stops the reads, like [`read_reanchor_batch`], so an RPC
+/// outage costs one round of read timeouts, not one per unknown pool, and the
+/// lanes on pools the projection already holds still reach the submit. A seeded
+/// pool is known from then on. An absent or `Closed` pool is not seeded, so its
+/// lanes cost one `getPool` on every cycle that reaches them.
+async fn resolve_unknown_pools<P: Provider + Clone>(
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    plans: Vec<PlannedLane>,
+    pool_view: &PoolProjection,
+    metrics: &Arc<Metrics>,
+) -> (Vec<PlannedLane>, bool) {
+    let unknown: Vec<PoolId> = plans
+        .iter()
+        .map(|plan| plan.pool_id)
+        .filter(|pool_id| pool_view.snapshot(*pool_id).is_none())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut read_failed = false;
+    let mut reads = futures_util::stream::iter(unknown)
+        .map(|pool_id| async move {
+            let call = contract.getPool(pool_id);
+            let read = timed(
+                Some(REANCHOR_RPC_TIMEOUT),
+                "pre-redeem getPool",
+                call.call(),
+            )
+            .await;
+            (pool_id, read)
+        })
+        .buffer_unordered(REANCHOR_READ_CONCURRENCY);
+    while let Some((pool_id, read)) = reads.next().await {
+        match read {
+            Ok(pool) => {
+                if let Some(lifecycle) = resolved_lifecycle(&pool) {
+                    pool_view.record_resolved(
+                        pool.owner,
+                        PoolRead {
+                            pool_id,
+                            deposit: pool.deposit,
+                            total_redeemed: pool.totalRedeemed,
+                            lifecycle,
+                        },
+                    );
+                } else {
+                    let lanes = plans.iter().filter(|plan| plan.pool_id == pool_id).count();
+                    warn!(
+                        %pool_id,
+                        lanes,
+                        "redeemer: pool absent or closed on-chain; its lanes are not submitted"
+                    );
+                }
+            }
+            Err(err) => {
+                read_failed = true;
+                warn!(
+                    stage = "resolve",
+                    error = %sanitize_err_chain(&err),
+                    %pool_id,
+                    "pre-redeem getPool failed; the unread pools' lanes wait for the next attempt"
+                );
+                break;
+            }
+        }
+    }
+    drop(reads);
+    let now = unix_now();
+    let mut kept = Vec::with_capacity(plans.len());
+    let (mut unresolved, mut insolvent) = (0u64, 0u64);
+    for plan in plans {
+        match pool_view.snapshot(plan.pool_id) {
+            None => unresolved = unresolved.saturating_add(1),
+            Some(status) if !pool_is_redeemable(Some(status), now) => {
+                insolvent = insolvent.saturating_add(1);
+            }
+            Some(_) => kept.push(plan),
+        }
+    }
+    if unresolved > 0 {
+        metrics.redemption_skipped_pool_unresolved_by(unresolved);
+    }
+    if insolvent > 0 {
+        metrics.redemption_skipped_insolvent_by(insolvent);
+    }
+    (kept, read_failed)
+}
+
 /// Chunk planned lanes under the per-chunk floor + voucher-count cap and submit
 /// each chunk. Every caller passes the configured
 /// `blockchain.redeem_threshold_micro_usdc`, which config keeps above zero, so a
@@ -2939,16 +3100,22 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     max_vouchers: usize,
     strict_flush: bool,
     metrics: &Arc<Metrics>,
+    pool_view: &PoolProjection,
     recorder: &SettlementRecorder,
 ) -> bool {
     // Apply the floor on the cached total before any chain read.
     if plans.is_empty() || sum_unredeemed(&plans) < floor {
         return false;
     }
+    // Every submitted lane's pool must be known to the projection and able to
+    // pay: a lane on a pool that is closed, or closing past its deadline,
+    // reverts its whole `redeemMany`.
+    let (plans, resolve_failed) = resolve_unknown_pools(contract, plans, pool_view, metrics).await;
     // Last check before spending gas: reconcile against the on-chain watermark
     // and drop lanes the chain already shows settled, so a lagging cache or a
     // concurrent redeemer can never cost a no-op `redeemMany`.
     let (plans, read_failed) = reconcile_onchain_watermarks(contract, plans, metrics).await;
+    let read_failed = read_failed || resolve_failed;
     let chunks = chunk_redemptions(plans, floor, max_vouchers);
     if chunks.is_empty() {
         return read_failed;

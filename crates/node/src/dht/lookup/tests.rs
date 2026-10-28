@@ -1,5 +1,5 @@
 use super::*;
-use crate::dht::staker_set::ConfigStakerSet;
+use crate::dht::staker_set::{AllStaked, ConfigStakerSet};
 use std::collections::HashSet as StdHashSet;
 
 fn nid(byte: u8) -> NodeId {
@@ -73,7 +73,7 @@ fn lookup_state_pick_returns_closest_alpha_marks_queried() {
         k: nz(20),
         round_timeout: Duration::from_secs(1),
     };
-    let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
+    let mut state = LookupState::new(&routing, &AllStaked, &target, nid(0xFF), cfg);
     state.add_candidate(nid(0x10));
     state.add_candidate(nid(0x02));
     state.add_candidate(nid(0x40));
@@ -91,7 +91,7 @@ fn lookup_state_add_candidate_tracks_strictly_closer() {
     let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
     let target = h(0);
     let cfg = LookupConfig::default();
-    let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
+    let mut state = LookupState::new(&routing, &AllStaked, &target, nid(0xFF), cfg);
 
     // best_queried_distance starts at 0xFF…FF, so any peer wins.
     assert!(state.add_candidate(nid(0x80)));
@@ -105,7 +105,7 @@ fn lookup_state_add_candidate_tracks_strictly_closer() {
 fn lookup_state_record_provider_dedupes() {
     let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
     let cfg = LookupConfig::default();
-    let mut state = LookupState::new(&routing, &h(0), nid(0xFF), cfg);
+    let mut state = LookupState::new(&routing, &AllStaked, &h(0), nid(0xFF), cfg);
     state.record_provider(nid(1), cov());
     state.record_provider(nid(2), cov());
     state.record_provider(nid(1), cov());
@@ -131,7 +131,7 @@ fn into_randomised_providers_truncates_to_k_and_shuffles() {
             k: nz(10),
             round_timeout: Duration::from_secs(1),
         };
-        let mut state = LookupState::new(&routing, &h(0), nid(0xFF), cfg);
+        let mut state = LookupState::new(&routing, &AllStaked, &h(0), nid(0xFF), cfg);
         for &p in &canonical {
             state.record_provider(p, cov());
         }
@@ -163,7 +163,7 @@ fn fold_response_negative_cache_does_not_drop_closer_nodes() {
     let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
     let target = h(0);
     let cfg = LookupConfig::default();
-    let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
+    let mut state = LookupState::new(&routing, &AllStaked, &target, nid(0xFF), cfg);
 
     let staked: StdHashSet<NodeId> = [nid(0x05), nid(0x10), nid(0x20)].into_iter().collect();
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
@@ -205,7 +205,7 @@ fn fold_response_records_providers_even_when_no_closer_node() {
     let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
     let target = h(0);
     let cfg = LookupConfig::default();
-    let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
+    let mut state = LookupState::new(&routing, &AllStaked, &target, nid(0xFF), cfg);
 
     let staked: StdHashSet<NodeId> = [nid(0x05), nid(0x07)].into_iter().collect();
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(staked));
@@ -250,7 +250,7 @@ fn fold_response_all_filters_compose() {
 
     let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
     let cfg = LookupConfig::default();
-    let mut state = LookupState::new(&routing, &target, requester, cfg);
+    let mut state = LookupState::new(&routing, &AllStaked, &target, requester, cfg);
 
     let staked: StdHashSet<NodeId> = [requester, responder, nid(0x10), nid(0x12)]
         .into_iter()
@@ -308,7 +308,7 @@ fn have_enough_providers_is_inclusive_at_k() {
         k: nz(2),
         round_timeout: Duration::from_secs(1),
     };
-    let mut state = LookupState::new(&routing, &h(0), nid(0xFF), cfg);
+    let mut state = LookupState::new(&routing, &AllStaked, &h(0), nid(0xFF), cfg);
     assert!(!state.have_enough_providers());
     state.record_provider(nid(1), cov());
     assert!(!state.have_enough_providers());
@@ -327,7 +327,7 @@ fn lookup_state_rejects_self_in_candidates_and_providers() {
     let routing = Arc::new(Mutex::new(RoutingTable::new(nid(0))));
     let cfg = LookupConfig::default();
     let me = nid(0xAA);
-    let mut state = LookupState::new(&routing, &h(0), me, cfg);
+    let mut state = LookupState::new(&routing, &AllStaked, &h(0), me, cfg);
 
     // Both methods silently no-op for self.
     assert!(!state.add_candidate(me));
@@ -355,7 +355,13 @@ fn lookup_state_skips_cooling_peers_from_the_seed_and_from_responses() {
         assert!(t.mark_unreachable(nid(0x02), Instant::now()));
     }
     let target = h(0);
-    let mut state = LookupState::new(&routing, &target, nid(0xFF), LookupConfig::default());
+    let mut state = LookupState::new(
+        &routing,
+        &AllStaked,
+        &target,
+        nid(0xFF),
+        LookupConfig::default(),
+    );
     assert_eq!(
         state.pick_round_batch(),
         vec![nid(0x10)],
@@ -393,7 +399,7 @@ fn lookup_state_seed_is_the_nearest_peers_that_are_not_cooling() {
         12,
         "the scenario is sized to the seed count"
     );
-    let mut state = LookupState::new(&routing, &target, nid(0xFF), cfg);
+    let mut state = LookupState::new(&routing, &AllStaked, &target, nid(0xFF), cfg);
     assert_eq!(
         state.pick_round_batch(),
         vec![live],
@@ -414,7 +420,13 @@ fn lookup_state_rejects_a_cooling_referral_that_is_not_in_the_table() {
         assert!(t.mark_unreachable(nid(0x02), Instant::now()));
     }
     let target = h(0);
-    let mut state = LookupState::new(&routing, &target, nid(0xFF), LookupConfig::default());
+    let mut state = LookupState::new(
+        &routing,
+        &AllStaked,
+        &target,
+        nid(0xFF),
+        LookupConfig::default(),
+    );
     assert_eq!(state.pick_round_batch(), vec![nid(0x10)]);
     assert!(!state.add_candidate(nid(0x02)));
     assert_eq!(state.cooling_skipped, 1);
@@ -434,7 +446,13 @@ fn lookup_state_seeds_a_peer_whose_cooldown_lapsed() {
         assert!(t.mark_unreachable(nid(0x02), long_ago));
     }
     let target = h(0);
-    let mut state = LookupState::new(&routing, &target, nid(0xFF), LookupConfig::default());
+    let mut state = LookupState::new(
+        &routing,
+        &AllStaked,
+        &target,
+        nid(0xFF),
+        LookupConfig::default(),
+    );
     assert_eq!(state.pick_round_batch(), vec![nid(0x02)]);
     assert_eq!(state.cooling_skipped, 0);
 }

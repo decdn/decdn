@@ -39,7 +39,7 @@ Several subsystems classify a failure into a small closed set of reasons. The co
 | Family | Series |
 |--------|--------|
 | Connection dispatch rejection (`RejectReason`) | `decdn_dispatch_rejected_global_total`, `decdn_dispatch_rejected_per_source_total` |
-| Rate-limit rejection (`RejectLayer`, shared by the probe and DHT paths) | `decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total` and `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total` |
+| Rate-limit rejection (`RejectLayer`, shared by the probe, DHT and serve paths) | `decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total`, `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total` and `decdn_serve_rate_limit_rejected_{per_peer,per_ip,global}_total` |
 | Buyer pool-open failure (`PoolOpenFailureReason`) | `decdn_pool_open_failures_insufficient_deposit_total`, `decdn_pool_open_failures_contract_revert_total`, `decdn_pool_open_failures_rpc_error_total` (plus the aggregate `decdn_node_pull_pool_open_failures_total`) |
 
 Siblings are the default because each reason in these families has an **unrelated operator remedy**, so no single alert spans the family and a shared label buys nothing; a sibling also needs no typed `EncodeLabelSet` and no pre-materialization to keep a series exporting at zero.
@@ -181,6 +181,13 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | `decdn_probe_rate_limit_prune_sweeps_per_peer_total` | Counter | R | live | — | Sweeps that expired idle per-peer buckets. |
 | `decdn_probe_rate_limit_tracked_per_ip` | Gauge | R | live | — | Live per-IP buckets. Unbounded growth against a flat sweep rate is a memory-exhaustion signal. |
 | `decdn_probe_rate_limit_tracked_per_peer` | Gauge | R | live | — | Live per-peer buckets. Same reading as the per-IP gauge. |
+| `decdn_serve_rate_limit_rejected_per_peer_total` | Counter | R | live | — | `cdn/client/v1` streams reset by the per-peer token bucket before their request was read. |
+| `decdn_serve_rate_limit_rejected_per_ip_total` | Counter | R | live | — | `cdn/client/v1` streams reset by the per-IP token bucket. It does not see relay-only connections. |
+| `decdn_serve_rate_limit_rejected_global_total` | Counter | R | live | — | `cdn/client/v1` streams reset by the node-wide ceiling. Rising while the per-peer and per-IP siblings stay flat means aggregate load, or one source that cycles node IDs over the relay. |
+| `decdn_serve_rate_limit_prune_sweeps_per_ip_total` | Counter | R | live | — | Sweeps that expired idle per-IP request buckets. |
+| `decdn_serve_rate_limit_prune_sweeps_per_peer_total` | Counter | R | live | — | Sweeps that expired idle per-peer request buckets. |
+| `decdn_serve_rate_limit_tracked_per_ip` | Gauge | R | live | — | Live per-IP request buckets. Unbounded growth against a flat sweep rate is a memory-exhaustion signal. |
+| `decdn_serve_rate_limit_tracked_per_peer` | Gauge | R | live | — | Live per-peer request buckets. Same reading as the per-IP gauge. |
 | `decdn_probe_cache_misses_total` | Counter | R | live | — | Cache-miss pulls that ran a fresh DHT lookup + probe. Counts an entry that was absent, expired, **or fully suppressed** (every cached provider negative-cached, wedged, no longer an active staker, or otherwise unselectable). On the ranged pull leg it also counts an entry whose providers do not cover every block of the blob ([ADR 001 § Probe cache](001-network.md#probe-cache)). Each case costs the same network work, which is what this measures. |
 
 > The probe-hold capacity counter `decdn_probe_hold_unavailable_total{reason}`
@@ -282,7 +289,7 @@ Per [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) (`cd
 | `decdn_dht_republish_seed_store_walk_failures_total` | Counter | R | live | — | Bulk republish seeds (boot cold start or lag sweep) that could not walk the local blob store and covered only the origin-held half. |
 | `decdn_dht_republish_seed_origin_probe_failures_total` | Counter | R | live | — | Stored hashes a bulk republish seed could not put to its origin — the ownership test an origin-only node applies to every blob in its store, answered neither way. The origin-side twin of the store-walk counter above: an unconfirmable hash is left out of the announce set rather than advertised, so an unreachable remote origin shrinks the announce set of a node that holds the content. Distinct from `decdn_cache_origin_probe_failures_total`, which counts the rescan's probes rather than the seed's. |
 
-Both rate-limit trios come from the same `RejectLayer` enum and the same shared limiter (`crates/node/src/rate_limit.rs`); the probe copies are in [§ Probe Metrics](#probe-metrics-cdnprobev1). They are **sibling counters, not a `layer` label**, per [§ Reason splits](#reason-splits-sibling-counters-not-labels) — recover the rolled-up rate with `sum(rate({__name__=~"decdn_dht_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))` (a `__name__` regex, not shell-style brace expansion — PromQL has no such syntax; the braces elsewhere in this appendix are naming shorthand for a family, never a query). [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting) and [ADR 022 § DHT Rate Limiting](022-content-discovery.md#dht-rate-limiting) specify these sibling trios; no single labelled `*_rejections_total` counter exists.
+All three rate-limit trios (probe, DHT, serve) come from the same `RejectLayer` enum and the same shared limiter (`crates/node/src/rate_limit.rs`); the probe copies are in [§ Probe Metrics](#probe-metrics-cdnprobev1). They are **sibling counters, not a `layer` label**, per [§ Reason splits](#reason-splits-sibling-counters-not-labels) — recover the rolled-up rate with `sum(rate({__name__=~"decdn_dht_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))` (a `__name__` regex, not shell-style brace expansion — PromQL has no such syntax; the braces elsewhere in this appendix are naming shorthand for a family, never a query). [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting), [ADR 005 § Request rate limiting](005-protocol.md#request-rate-limiting) and [ADR 022 § DHT Rate Limiting](022-content-discovery.md#dht-rate-limiting) specify these sibling trios; no single labelled `*_rejections_total` counter exists.
 
 ##### Active-Staker Set Watcher Metrics
 

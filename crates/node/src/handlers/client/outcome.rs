@@ -16,6 +16,7 @@
 use super::ServeRejectReason;
 use super::wire::{ClientPaymentFault, PaidProgress, is_peer_attributable};
 use crate::metrics::Metrics;
+use crate::rate_limit::RejectLayer;
 use tracing::Span;
 
 /// How one serve stream ended.
@@ -46,6 +47,9 @@ pub(super) enum ServeEnd {
 pub(super) enum ResetCause {
     /// The per-connection stream cap was full (`RATE_LIMITED`).
     StreamCapFull,
+    /// The `[serve.rate_limit]` limiter refused the stream at this layer
+    /// (`RATE_LIMITED`, ADR 005 §Request rate limiting).
+    RateLimited(RejectLayer),
     /// The client binding failed to verify (`MALFORMED_MESSAGE`).
     BadBinding,
     /// The request's `timestamp_us` was beyond the clock-skew bound
@@ -64,6 +68,7 @@ impl ResetCause {
     const fn as_str(self) -> &'static str {
         match self {
             Self::StreamCapFull => "stream_cap_full",
+            Self::RateLimited(_) => "rate_limited",
             Self::BadBinding => "bad_binding",
             Self::TimestampSkew => "timestamp_skew",
             Self::RequestUnreadable => "request_unreadable",
@@ -162,6 +167,15 @@ impl ServeEnd {
             },
             Self::Reset(cause) => match cause {
                 ResetCause::StreamCapFull => metrics.serve_stream_rejected_stream_cap_full(),
+                ResetCause::RateLimited(RejectLayer::PerPeer) => {
+                    metrics.serve_rate_limit_rejected_per_peer();
+                }
+                ResetCause::RateLimited(RejectLayer::PerIp) => {
+                    metrics.serve_rate_limit_rejected_per_ip();
+                }
+                ResetCause::RateLimited(RejectLayer::Global) => {
+                    metrics.serve_rate_limit_rejected_global();
+                }
                 ResetCause::BadBinding => metrics.serve_stream_rejected_bad_binding(),
                 ResetCause::TimestampSkew => metrics.serve_stream_rejected_timestamp_skew(),
                 ResetCause::RequestUnreadable => metrics.serve_stream_request_unreadable(),
