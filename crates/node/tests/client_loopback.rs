@@ -72,7 +72,7 @@ use decdn_protocol::client::{
 use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_frame, write_frame};
 use iroh::endpoint::{
     ApplicationClose, Connection, ConnectionError, ReadError, ReadToEndError, RecvStream,
-    SendStream, VarInt,
+    SendStream, VarInt, WriteError,
 };
 use iroh::protocol::ProtocolHandler as _;
 use iroh::{Endpoint, EndpointAddr};
@@ -13324,9 +13324,19 @@ async fn over_cap_stream_is_reset_without_signing_a_response() -> anyhow::Result
         byte_len: 0,
         timestamp_us: now_us(),
     };
-    write_frame(&mut send2, &encode_stream_request(&req, Some(&ext))?)
-        .await
-        .map_err(|e| anyhow::anyhow!("write second request: {e}"))?;
+    // One write: the node sheds the stream before it reads anything, so a
+    // prefix written on its own lets the shed land before the payload. The shed
+    // can still beat this write, and a STOP_SENDING that carries RATE_LIMITED
+    // is the signal under test, so the write accepts it.
+    let payload2 = encode_stream_request(&req, Some(&ext))?;
+    let mut frame2 = support::frame_len_prefix(u32::try_from(payload2.len())?);
+    frame2.extend_from_slice(&payload2);
+    match send2.write_all(&frame2).await {
+        Ok(()) => {}
+        Err(WriteError::Stopped(code))
+            if code == VarInt::from_u32(decdn_protocol::APP_ERR_RATE_LIMITED) => {}
+        Err(e) => anyhow::bail!("write second request: {e}"),
+    }
     assert_stream_reset(&mut recv2, decdn_protocol::APP_ERR_RATE_LIMITED).await?;
     support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
@@ -13414,6 +13424,7 @@ async fn over_cap_stream_is_reset_before_its_request_is_read() -> anyhow::Result
     )
     .await
     .map_err(|_| anyhow::anyhow!("the over-cap stream waited on its request body"))??;
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         counter(
             &metrics,
