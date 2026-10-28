@@ -198,7 +198,7 @@ jobs:
           save-if: false
 
       - name: Install tools
-        uses: taiki-e/install-action@v2.87.29
+        uses: taiki-e/install-action@v2.87.31
         with:
           tool: git-cliff,cargo-nextest
 
@@ -427,7 +427,7 @@ jobs:
 
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@v2.87.29
+        uses: taiki-e/install-action@v2.87.31
         with:
           tool: cross
 
