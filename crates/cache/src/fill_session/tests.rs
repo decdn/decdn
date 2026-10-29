@@ -111,7 +111,10 @@ async fn leaf_node_loads_none_without_awaiting() {
     let session = FillSession::new(h(1), small);
     let mut reader = session.outboard_reader();
     let tree = BaoTree::new(small, IROH_BLOCK_SIZE);
-    let root = tree.root();
+    let root = tree
+        .pre_order_nodes_iter()
+        .next()
+        .expect("a tree has a root");
     assert!(
         tree.pre_order_offset(root).is_none(),
         "a one-group tree's root is a leaf"

@@ -5229,7 +5229,13 @@ async fn a_dead_reader_reads_a_node_over_held_content_from_the_store() {
 
     let mut bare = session.outboard_reader();
     assert!(
-        bare.load(tree.root()).await.is_err(),
+        bare.load(
+            tree.pre_order_nodes_iter()
+                .next()
+                .expect("a tree has a root")
+        )
+        .await
+        .is_err(),
         "without the fallback a dead node fails"
     );
 
@@ -5292,7 +5298,10 @@ async fn admit_bao_stream_captures_a_leafs_proof_before_the_admit_finishes() {
         bao_tree::blake3::Hash::from_bytes(wire[..32].try_into().unwrap()),
         bao_tree::blake3::Hash::from_bytes(wire[32..64].try_into().unwrap()),
     );
-    let root_node = bao_tree::BaoTree::new(total, crate::range_pull::IROH_BLOCK_SIZE).root();
+    let root_node = bao_tree::BaoTree::new(total, crate::range_pull::IROH_BLOCK_SIZE)
+        .pre_order_nodes_iter()
+        .next()
+        .expect("a tree has a root");
 
     let session = crate::FillSession::new(bao_tree::blake3::Hash::from(root), total);
     let mut outboard_reader = session.outboard_reader();
@@ -6349,4 +6358,47 @@ async fn evict_mid_serve_lets_coalesced_readers_finish_then_reclaims() {
         served_b, expected,
         "serve leg B delivered the full range intact"
     );
+}
+
+/// iroh-blobs closes an export the store stopped sending with an
+/// `UnexpectedEof` it builds itself. [`export_cut_short`] tells that one from
+/// the `UnexpectedEof` of a short data file, which proves corruption, by its
+/// message alone. Shutting a store down mid-export produces the real error,
+/// so a reworded upstream message fails here instead of quarantining held
+/// blobs on a store fault.
+#[tokio::test]
+async fn a_cut_short_export_is_not_a_short_file() -> anyhow::Result<()> {
+    use bao_tree::io::EncodeError;
+    use iroh_blobs::api::proto::ExportBaoRequest;
+
+    let store = iroh_blobs::store::mem::MemStore::new();
+    let data: Vec<u8> = (0..8u32 << 20).map(|i| (i % 251) as u8).collect();
+    let tt = store.add_slice(&data).temp_tag().await?;
+    let request = ExportBaoRequest {
+        hash: tt.hash(),
+        ranges: bao_tree::ChunkRanges::all(),
+    };
+    // A one-item channel keeps the export from finishing before the shutdown.
+    let mut stream = std::pin::pin!(store.export_bao_with_opts(request, 1).stream());
+    let mut seen = 0;
+    let mut last = None;
+    while let Some(item) = stream.next().await {
+        seen += 1;
+        if seen == 3 {
+            store.shutdown().await?;
+        }
+        last = Some(item);
+    }
+    let Some(EncodedItem::Error(EncodeError::Io(err))) = last else {
+        anyhow::bail!("a shut-down export must end with an io error, got {last:?}");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert!(
+        export_cut_short(&err),
+        "unrecognised cut-short export: {err}"
+    );
+
+    let short_file = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+    assert!(!export_cut_short(&short_file));
+    Ok(())
 }

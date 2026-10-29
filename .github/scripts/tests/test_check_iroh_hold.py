@@ -131,7 +131,7 @@ def test_wrapper_fails_and_explains_on_drift(tmp_path):
     assert result.returncode == 1, result
     assert "noq-proto" in result.stderr
     assert "#2585" in result.stderr
-    assert "noq/pull/828" in result.stderr
+    assert "noq/pull/866" in result.stderr
     assert "HELD" in result.stderr
 
 
