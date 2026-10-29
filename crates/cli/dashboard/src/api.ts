@@ -119,7 +119,7 @@ export interface NodePaid extends Paid {
   provider: string;
 }
 
-/** An ended bundle run's counts, as its summary prints them. */
+/** An ended bundle or entry run's counts, as its summary prints them. */
 export interface BundleCounts {
   fetched: number;
   linked: number;
@@ -133,11 +133,16 @@ export interface BundleCounts {
 
 /**
  * What a run pulls. A bundle run carries its file progress and, once it
- * ended, its counts; a blob or entry run carries neither.
+ * ended, its counts. An entry run carries its counts and no file progress.
+ * A blob run carries neither.
  */
 export type PullTarget =
   | { kind: "blob" }
-  | { kind: "entry" }
+  | {
+      kind: "entry";
+      /** Set once the run ended with a summary; null while it runs, when it ended before one, or when it streamed to stdout. */
+      counts: BundleCounts | null;
+    }
   | {
       kind: "bundle";
       /** Distinct blobs the run started. */

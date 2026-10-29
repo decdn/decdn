@@ -30,7 +30,7 @@ function Besides(props: { row: RecentPullRow }) {
   );
 }
 
-/** A bundle run's counts, the failed and not-run ones in the critical tone. */
+/** A bundle or entry run's counts, the failed and not-run ones in the critical tone. */
 function Counts(props: { parts: CountPart[] }) {
   return props.parts.map((part, i) => (
     <span key={part.text}>
@@ -83,9 +83,9 @@ export function RecentPulls(props: { rows: RecentPullRow[] }) {
               <Cell>{formatUsdc(p.paidMicro)} USDC</Cell>
               <Cell>{p.nodes}</Cell>
             </tr>,
-            // A bundle run's counts read under it, as its summary line does,
-            // so a run that skipped every file does not read as one that did
-            // nothing.
+            // A bundle or entry run's counts read under it, as its summary
+            // line does, so a run that skipped every file does not read as
+            // one that did nothing.
             p.counts ? (
               <tr key={`${p.key}-counts`}>
                 <td

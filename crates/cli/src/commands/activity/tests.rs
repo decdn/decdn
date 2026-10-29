@@ -99,7 +99,7 @@ async fn each_uri_target_records_its_own_kind() {
                 counts: None,
             },
         ),
-        (format!("{BLOB}/a/b"), PullKind::Entry),
+        (format!("{BLOB}/a/b"), PullKind::Entry { counts: None }),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let recorder = start(dir.path(), &text);
@@ -419,10 +419,10 @@ fn a_record_that_cannot_be_read_is_named() {
 }
 
 /// An entry written to a file runs the bundle path, which reports file
-/// progress, landings and counts: its record keeps the bytes and none of
-/// the rest.
+/// progress, landings and counts: its record keeps the bytes and the counts,
+/// and no file progress.
 #[tokio::test]
-async fn an_entry_run_records_no_bundle_fields() {
+async fn an_entry_run_keeps_its_counts_and_no_file_progress() {
     let dir = tempfile::tempdir().unwrap();
     let recorder = start(dir.path(), &format!("{BLOB}/docs/a.bin"));
     recorder.plan([("docs/a.bin".to_owned(), HASH_A)]);
@@ -436,16 +436,21 @@ async fn an_entry_run_records_no_bundle_fields() {
         spliced: 70,
         resumed: 8,
     });
-    recorder.bundle_counts(
-        BundleCounts {
-            fetched: 1,
-            ..BundleCounts::default()
-        },
-        0,
-    );
+    let counts = BundleCounts {
+        fetched: 1,
+        ..BundleCounts::default()
+    };
+    recorder.bundle_counts(counts, 0);
+    recorder.write().unwrap();
+    assert_eq!(only(dir.path()).kind, PullKind::Entry { counts: None });
     recorder.finish(&Ok(()), None).await;
     let record = only(dir.path());
-    assert_eq!(record.kind, PullKind::Entry);
+    assert_eq!(
+        record.kind,
+        PullKind::Entry {
+            counts: Some(counts)
+        }
+    );
     assert_eq!(
         (
             record.received_bytes,
@@ -456,9 +461,27 @@ async fn an_entry_run_records_no_bundle_fields() {
         (100, 22, 8, 70)
     );
     let json = serde_json::to_value(&record).unwrap();
-    for field in ["files_started", "files_landed", "counts", "bundle"] {
+    assert_eq!(json["kind"], "entry");
+    assert_eq!(json["counts"]["fetched"], 1);
+    for field in ["files_started", "files_landed", "bundle"] {
         assert!(json.get(field).is_none(), "{field} in {json}");
     }
+    assert_eq!(serde_json::from_value::<PullRecord>(json).unwrap(), record);
+}
+
+/// An entry run that ends with no counts, as a stream to stdout does,
+/// records `counts` as `null`.
+#[tokio::test]
+async fn an_entry_run_with_no_counts_records_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorder = start(dir.path(), &format!("{BLOB}/docs/a.bin"));
+    recorder.progress(100, 100);
+    recorder.finish(&Ok(()), None).await;
+    let record = only(dir.path());
+    assert_eq!(record.kind, PullKind::Entry { counts: None });
+    let json = serde_json::to_value(&record).unwrap();
+    assert!(json["counts"].is_null(), "{json}");
+    assert!(json.get("files_started").is_none(), "{json}");
 }
 
 /// A blob record carries no bundle field; a bundle record carries them all
@@ -507,6 +530,57 @@ fn prune_keeps_the_newest_records() {
         .map(|r| r.started_unix_ms)
         .collect();
     assert_eq!(started, [5, 4]);
+}
+
+/// Prune ranks and deletes only files named as a record. Any other `*.json`
+/// stays, does not count toward the kept records, and still lists as
+/// unreadable.
+#[test]
+fn prune_leaves_a_json_that_is_not_named_as_a_record() {
+    let dir = tempfile::tempdir().unwrap();
+    for started in 1..=5 {
+        write(dir.path(), &record(started, done()));
+    }
+    let others = ["notes.json", "9-notes.json", "5.json"];
+    for name in others {
+        std::fs::write(dir.path().join(name), b"{}").unwrap();
+    }
+    prune(dir.path(), 2);
+    let (records, unreadable) = read_records(dir.path()).unwrap();
+    let started: Vec<_> = records.iter().map(|r| r.started_unix_ms).collect();
+    assert_eq!(started, [5, 4]);
+    let mut kept: Vec<_> = unreadable
+        .iter()
+        .map(|u| {
+            Path::new(&u.path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    kept.sort();
+    let mut expected = others.map(str::to_owned).to_vec();
+    expected.sort();
+    assert_eq!(kept, expected);
+}
+
+#[test]
+fn a_record_name_is_its_start_and_its_pid() {
+    for (name, start) in [
+        ("1700000000000-4242.json", Some(1_700_000_000_000)),
+        ("0-0.json", Some(0)),
+        ("notes.json", None),
+        ("5.json", None),
+        ("9-notes.json", None),
+        ("notes-9.json", None),
+        ("1-2-3.json", None),
+        ("1-.json", None),
+        ("-1.json", None),
+        ("1-99999999999.json", None),
+    ] {
+        assert_eq!(record_start(Path::new(name)), start, "{name}");
+    }
 }
 
 /// A run that starts in a full directory keeps it at [`KEPT_RECORDS`], its

@@ -202,10 +202,10 @@ const PULL_FIELDS: Keys<PullFields> = {
   nodes: true,
   stale: true,
 };
-/** Only a bundle run carries bundle fields. */
+/** Only a bundle run carries file progress; a bundle or entry run carries counts. */
 const PULL_KIND: KindVariants<PullFields> = {
   blob: {},
-  entry: {},
+  entry: { counts: true },
   bundle: { files_started: true, files_landed: true, counts: true },
 };
 const PULL_RECORD: Variants<PullRecord> = {
@@ -561,7 +561,7 @@ describe("the dashboard's /_status fixtures", () => {
         0,
         4_096,
       ],
-      [null, 734_003_200, 0, 0],
+      [["1 not run"], 734_003_200, 0, 0],
       [null, 465_567_744, 268_435_456, 0],
     ]);
     expect(livePulls(s.pulls).map((p) => p.resumed)).toEqual([0, 268_435_456]);

@@ -137,6 +137,15 @@
       {
         "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262/docs/index.html",
         "kind": "entry",
+        "counts": {
+          "fetched": 0,
+          "linked": 0,
+          "skipped": 0,
+          "reused": 0,
+          "excluded": 0,
+          "failed": 0,
+          "not_run": 1
+        },
         "output": "/home/me/site",
         "pid": 4242,
         "started_unix_ms": 1793000200000,
