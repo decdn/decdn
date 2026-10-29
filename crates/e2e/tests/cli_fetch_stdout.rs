@@ -22,6 +22,9 @@
 //!      included) — each stream was paid for and settled.
 //!   3. The run reads the keystore password once, though the entry form
 //!      fetches twice.
+//!   4. The run leaves a `done` dashboard record for `-`: every verified byte
+//!      of the blob received, and the wire bytes of each stream paid to the
+//!      holder alone.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a prior build of both `decdn` and `decdn-node`:
@@ -47,8 +50,9 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use anyhow::Context;
 use decdn_cache::Hash;
+use decdn_cache::range_pull::{align_range, bao_encoded_size};
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
+use decdn_e2e::cli::{check_pull_record, decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
@@ -200,6 +204,26 @@ async fn run(target: Target) -> anyhow::Result<()> {
         "the run read the keystore password {reads} times, expected once; stderr:\n{stderr}"
     );
 
+    // (4) The run's dashboard record shows the streamed bytes: the stdout tee
+    // reports every verified byte, and the record pays each stream's wire
+    // bytes. The manifest fetch pays but reports no content bytes.
+    let blob_len = u64::try_from(blob.len())?;
+    let (kind, wire) = match target {
+        Target::Blob => ("blob", whole_blob_wire_bytes(blob_len)),
+        Target::Entry => (
+            "entry",
+            whole_blob_wire_bytes(blob_len) + whole_blob_wire_bytes(u64::try_from(manifest.len())?),
+        ),
+    };
+    check_pull_record(
+        client_dir.path(),
+        kind,
+        std::path::Path::new("-"),
+        blob_len,
+        U256::from(wire),
+        holder.operator_addr(),
+    )?;
+
     drop(holder);
     Ok(())
 }
@@ -237,6 +261,16 @@ async fn run_fetch_until_streamed(
             String::from_utf8_lossy(&output.stderr)
         );
         tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+}
+
+/// The exact wire bytes a whole-blob paid pull vouchers for: the bao-encoded
+/// size of the 16 KiB chunk-group-aligned whole range (ADR 038), the quantity
+/// the buyer records as the lane watermark.
+fn whole_blob_wire_bytes(total: u64) -> u64 {
+    match align_range(0, 0, total) {
+        Ok(aligned) => bao_encoded_size(total, aligned.chunk_ranges()),
+        Err(_) => total,
     }
 }
 
