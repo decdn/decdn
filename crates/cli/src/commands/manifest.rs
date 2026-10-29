@@ -153,7 +153,7 @@ fn keep_entry(rel: &Path, is_dir: bool, excluder: &GlobSet) -> bool {
 /// moves no file and a refused import writes no blob.
 ///
 /// The entries are sorted by path bytes so the emitted manifest — and therefore
-/// its own BLAKE3 — is byte-stable across runs.
+/// its own BLAKE3 — is byte-stable across runs. `per_file` runs in that order.
 pub(crate) fn walk_and_collect<F>(
     root: &Path,
     follow_symlinks: bool,
@@ -246,6 +246,12 @@ where
         kept.push((canonical, rel_str));
     }
 
+    // Sort by path bytes — deterministic and matches the byte order any verifier
+    // would use when independently rebuilding the manifest from the same tree.
+    // Sorting before the collision check also names a colliding pair in that
+    // order, whatever order the walk met them in.
+    kept.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+
     if let Some((first, second)) = path_collision(kept.iter().map(|(_, rel)| rel.as_str())) {
         bail!(
             "two paths in the tree name one file on a case- or normalization-insensitive file \
@@ -270,10 +276,6 @@ where
             chunks,
         });
     }
-
-    // Sort by path bytes — deterministic and matches the byte order any verifier
-    // would use when independently rebuilding the manifest from the same tree.
-    entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
 
     Ok(WalkOutput {
         entries,
