@@ -34,6 +34,25 @@ fn validate_relpath_rejects_empty() {
 }
 
 #[test]
+fn validate_relpath_rejects_an_unportable_component() {
+    for (rel, bad) in [
+        ("dir/README.", "README."),
+        // After a plain component: at the front, Windows parses `a:` as a drive.
+        ("dir/a:b/c", "a:b"),
+        ("x/\u{1b}[2J", "\u{1b}[2J"),
+        ("NUL", "NUL"),
+    ] {
+        let err = validate_relpath(Path::new(rel)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("rejected component {bad:?}")),
+            "{rel:?}: {msg}"
+        );
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+    }
+}
+
+#[test]
 fn validate_relpath_joins_with_posix_slash() {
     let p = PathBuf::from("a").join("b").join("c.txt");
     let s = validate_relpath(&p).unwrap();

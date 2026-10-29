@@ -115,7 +115,7 @@ A hint is advisory, but its syntax is not. A chunk list whose sizes do
 not sum to the entry `size` is a wrong hint, not a bad hash: the client
 ignores the hints and fetches the whole file. A reader also rejects a
 manifest with two entry paths that name one file (§ Path-safety rules,
-rule 7).
+rule 7), or with a path segment that is not a portable file name (rule 8).
 
 ## Path-safety rules (creation-time invariants)
 
@@ -158,6 +158,30 @@ on read.
    bad hash (§ Hash format). A pull of entries that a caller builds
    without this check fails each colliding entry. It writes none of
    them.
+8. **Portable segments.** Each segment of a path must be a file name
+   that names one file on every supported platform. The rule applies on
+   every platform, so a manifest reads the same on all of them. A
+   segment must not:
+   - contain a control character (C0, DEL or C1). A terminal that
+     prints the path interprets it.
+   - contain a character that Windows reserves: `\ : * ? " < > |`. A
+     `:` names an NTFS stream, so `README::$DATA` is `README`.
+   - end in `.` or a space. Windows removes them, so `README.`, and
+     `README` with a trailing space, are `README`.
+   - have a Windows device name as its stem, the part before the first
+     `.`: `CON`, `PRN`, `AUX`, `NUL`, `COM0` to `COM9`, `LPT0` to
+     `LPT9`, or `COM` or `LPT` with a superscript `¹`, `²` or `³`, in any
+     case. Windows opens the device, not a file.
+   - have a stem that ends in `~` and digits after at least one other
+     character, for example `LONGFI~1.TXT`. This is the form of an 8.3
+     short name. Windows resolves it to the long name it was made for,
+     which another entry can hold.
+
+   `origin import` refuses such a tree and moves or writes nothing. A
+   reader rejects the whole manifest, the same as a bad hash. A pull of
+   entries that a caller builds without this check fails each such
+   entry. The CLI also escapes control characters in every entry path
+   that it prints.
 
 ## Determinism
 

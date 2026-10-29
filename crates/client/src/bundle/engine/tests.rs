@@ -3595,6 +3595,105 @@ fn path_collision_names_the_earliest_repeat() {
     assert_eq!(super::super::path_collision(["a", "b", "c"]), None);
 }
 
+/// Segments that Windows joins with another name, opens as a device or
+/// stream, or that would drive a terminal, are refused on every platform
+/// (#2746, #2705). Names that only look like them are not.
+const UNPORTABLE_SEGMENTS: [&str; 18] = [
+    "README.",
+    "README ",
+    "README::$DATA",
+    "a:b",
+    "a\\b",
+    "a|b",
+    "what?",
+    "x\u{1b}[31m",
+    "line\nbreak",
+    "c1\u{9b}",
+    "con",
+    "NUL.txt",
+    "com1.tar.gz",
+    "LPT9 .log",
+    "COM\u{b9}",
+    "lpt\u{b3}.txt",
+    "LONGFI~1.TXT",
+    "dir~12",
+];
+const PORTABLE_SEGMENTS: [&str; 13] = [
+    "README",
+    "README.md",
+    ".hidden",
+    "..foo",
+    "v1.2",
+    "console.txt",
+    "com.txt",
+    "COM10",
+    "COM\u{b9}\u{b2}",
+    "foo~bar",
+    "file~",
+    "~1",
+    "caf\u{e9} \u{1f600}.txt",
+];
+
+#[test]
+fn path_segment_problem_refuses_unportable_names_only() {
+    for seg in ["", ".", ".."].into_iter().chain(UNPORTABLE_SEGMENTS) {
+        assert!(
+            super::super::path_segment_problem(seg).is_some(),
+            "{seg:?} must be refused"
+        );
+    }
+    for seg in PORTABLE_SEGMENTS {
+        assert_eq!(
+            super::super::path_segment_problem(seg),
+            None,
+            "{seg:?} must be accepted"
+        );
+    }
+}
+
+/// An entry path with an unportable segment, at any depth, makes the whole
+/// manifest [`MalformedManifest`], and the error escapes the segment.
+#[test]
+fn parse_manifest_rejects_an_unportable_path_segment() {
+    let good = format_hash([0xab; 32]);
+    for seg in UNPORTABLE_SEGMENTS {
+        for path in [seg.to_string(), format!("dir/{seg}/file")] {
+            let manifest = serde_json::json!({"version": 1, "entries": [
+                {"path": "ok", "hash": good},
+                {"path": path, "hash": good},
+            ]});
+            let err = parse_json(&manifest).unwrap_err();
+            assert!(err.is::<MalformedManifest>(), "{manifest}: {err:#}");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!("unsafe path segment {seg:?}")),
+                "{manifest}: {msg}"
+            );
+            assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        }
+    }
+    let portable: Vec<_> = PORTABLE_SEGMENTS
+        .iter()
+        .map(|seg| serde_json::json!({"path": format!("d/{seg}"), "hash": good}))
+        .collect();
+    let parsed = parse_json(&serde_json::json!({"version": 1, "entries": portable}))
+        .expect("portable names parse");
+    assert_eq!(parsed.entries.len(), PORTABLE_SEGMENTS.len());
+}
+
+/// A manifest built without `parse` still cannot land an unportable path:
+/// [`safe_join`] refuses it.
+#[test]
+fn safe_join_rejects_an_unportable_segment() {
+    for seg in UNPORTABLE_SEGMENTS {
+        let err = safe_join(Path::new("/out"), &format!("dir/{seg}")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&format!("{seg:?}")),
+            "{seg:?}: {err:#}"
+        );
+    }
+}
+
 /// The version gate runs before any hash parses: a manifest of another
 /// version is [`NotAManifest`] for its version,
 /// whatever its hashes look like.

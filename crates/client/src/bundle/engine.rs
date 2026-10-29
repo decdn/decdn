@@ -4303,16 +4303,20 @@ impl EntryOutcome {
 }
 
 /// Resolve a bundle entry's POSIX relative `path` to a filesystem path under
-/// `root`, rejecting anything that isn't a sequence of plain filename
+/// `root`, rejecting anything that isn't a sequence of plain, portable filename
 /// components — absolute paths, `.`/`..`, drive prefixes, empty components
-/// (leading/trailing/double slash). With `..` rejected, the result cannot
-/// escape `root`. (`appendix-bundles.md` § Path-safety rules.)
+/// (leading/trailing/double slash), and every segment
+/// [`super::path_segment_problem`] refuses. With `..` rejected, the result
+/// cannot escape `root`. (`appendix-bundles.md` § Path-safety rules.)
 pub(super) fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     if rel.is_empty() {
         bail!("empty entry path");
     }
     let mut out = root.to_path_buf();
     for seg in rel.split('/') {
+        if let Some(why) = super::path_segment_problem(seg) {
+            bail!("rejected unsafe component {seg:?} in entry path {rel:?}: {why}");
+        }
         // Each `/`-split segment must be exactly one `Normal` path component.
         // This rejects "", ".", "..", "/", and a Windows drive prefix uniformly
         // and cross-platform.

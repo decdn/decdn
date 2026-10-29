@@ -447,6 +447,83 @@ fn directory_import_refuses_paths_that_name_one_file() {
     }
 }
 
+// A tree holding a name Windows strips (`README `) or opens as a stream
+// (`a:b`) is refused before anything is imported: every reader rejects its
+// manifest (#2746). With `--move`, every source file stays where it is.
+// Unix only: a Windows file system cannot hold either name.
+#[cfg(unix)]
+#[test]
+fn directory_import_refuses_an_unportable_name() {
+    for (bad, move_source) in [("README ", false), ("README ", true), ("a:b", true)] {
+        let src = TempDir::new().unwrap();
+        let origin = TempDir::new().unwrap();
+        let out = TempDir::new().unwrap();
+        fs::create_dir(src.path().join("dir")).unwrap();
+        let names = [format!("dir/{bad}"), "other".to_string()];
+        for name in &names {
+            fs::write(src.path().join(name), name).unwrap();
+        }
+
+        let out_bundle = out.path().join("out.json");
+        let mut args = import_args(src.path(), origin.path());
+        args.bundle = Some(out_bundle.clone());
+        args.move_source = move_source;
+        let err = rt().block_on(origin_import(&args)).unwrap_err();
+
+        let case = format!("{bad:?} move={move_source}");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("rejected component {bad:?}")),
+            "{case}: {msg}"
+        );
+        for name in &names {
+            assert_eq!(
+                fs::read(src.path().join(name)).unwrap(),
+                name.as_bytes(),
+                "{case}: the source file {name} stays"
+            );
+        }
+        assert_eq!(files_under(origin.path()), Vec::<PathBuf>::new(), "{case}");
+        assert!(!out_bundle.exists(), "{case}: no manifest is written");
+    }
+}
+
+// An optimized single-file import keys its one manifest entry by the file's
+// name, so a name no reader accepts is refused before the import: with or
+// without `--move`, the source stays and the store gets no blob.
+#[cfg(unix)]
+#[test]
+fn optimized_single_file_import_refuses_an_unportable_name() {
+    for move_source in [false, true] {
+        let src = TempDir::new().unwrap();
+        let origin = TempDir::new().unwrap();
+        let out = TempDir::new().unwrap();
+        let file = src.path().join("README.");
+        fs::write(&file, b"readme").unwrap();
+
+        let out_bundle = out.path().join("out.json");
+        let mut args = import_args(&file, origin.path());
+        args.bundle = Some(out_bundle.clone());
+        args.move_source = move_source;
+        args.optimize = true;
+        let err = rt().block_on(origin_import(&args)).unwrap_err();
+
+        let case = format!("move={move_source}");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(r#"rejected component "README.""#),
+            "{case}: {msg}"
+        );
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            b"readme",
+            "{case}: the source stays"
+        );
+        assert_eq!(files_under(origin.path()), Vec::<PathBuf>::new(), "{case}");
+        assert!(!out_bundle.exists(), "{case}: no manifest is written");
+    }
+}
+
 fn hash_from_hex(hex: &str) -> (Hash, String) {
     let mut raw = [0u8; 32];
     for (i, slot) in raw.iter_mut().enumerate() {
