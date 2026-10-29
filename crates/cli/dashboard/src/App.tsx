@@ -20,6 +20,7 @@ import { Empty, Group } from "./components/Panel";
 import { RecentPulls } from "./components/RecentPulls";
 import { SectionBoundary } from "./components/SectionBoundary";
 import { TokenForm } from "./components/TokenForm";
+import { UnreadableRecords } from "./components/UnreadableRecords";
 import { formatDuration, shortHex } from "./format";
 import {
   adoptToken,
@@ -38,6 +39,7 @@ import {
   recentPulls,
   staleSecs,
   stalestSecs,
+  unreadableView,
 } from "./view";
 
 const POLL_MS = 2_000;
@@ -154,11 +156,7 @@ function PullsGroup(props: { pulls: Pulls; now: number }) {
           ⛔ The records cannot be read: {p.error}
         </p>
       ) : null}
-      {p.unreadable > 0 ? (
-        <p role="alert" className="text-sm text-critical-ink">
-          ⚠ {p.unreadable} file(s) in the directory did not read as a record.
-        </p>
-      ) : null}
+      <UnreadableRecords view={unreadableView(p)} />
       <LivePulls rows={livePulls(p)} />
       <RecentPulls rows={recentPulls(p)} />
     </Group>

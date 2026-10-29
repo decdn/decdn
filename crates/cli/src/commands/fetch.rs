@@ -1635,9 +1635,10 @@ fn annotate_with(err: anyhow::Error, ctx: &Mutex<PoolContext>) -> anyhow::Error 
 }
 
 /// Copy a [`decdn_client::VerifiedReader`]'s verified bytes to `sink`,
-/// feeding `on_progress` the cumulative content bytes drained. Returns the total
-/// drained. Only bao-verified bytes ever leave the reader, so `sink` (stdout or
-/// a writer) is safe to pipe.
+/// feeding `on_progress` the cumulative content bytes drained, from `0` before
+/// the first read: a stream resumes nothing. Returns the total drained. Only
+/// bao-verified bytes ever leave the reader, so `sink` (stdout or a writer)
+/// is safe to pipe.
 async fn copy_verified<R, W>(
     reader: &mut R,
     sink: &mut W,
@@ -1652,6 +1653,9 @@ where
 
     let mut buf = vec![0u8; 256 * 1024];
     let mut drained: u64 = 0;
+    if let Some(cb) = on_progress {
+        cb(0, total_bytes);
+    }
     loop {
         let n = reader
             .read(&mut buf)

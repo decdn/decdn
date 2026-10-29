@@ -19,6 +19,9 @@
         "updated_unix_ms": 1793000570600,
         "state": "running",
         "received_bytes": 734003200,
+        "downloaded_bytes": 734003200,
+        "resumed_bytes": 0,
+        "reused_bytes": 0,
         "expected_bytes": 1073741824,
         "paid": {
           "amount_micro_usdc": 7340,
@@ -42,6 +45,9 @@
         "updated_unix_ms": 1793000480600,
         "state": "running",
         "received_bytes": 734003200,
+        "downloaded_bytes": 465567744,
+        "resumed_bytes": 268435456,
+        "reused_bytes": 0,
         "expected_bytes": 1073741824,
         "paid": {
           "amount_micro_usdc": 7340,
@@ -61,18 +67,48 @@
       {
         "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262/",
         "kind": "bundle",
+        "files_started": 0,
+        "files_landed": 0,
+        "counts": {
+          "fetched": 0,
+          "linked": 0,
+          "skipped": 11,
+          "reused": 0,
+          "excluded": 9,
+          "failed": 0,
+          "not_run": 0
+        },
+        "output": "/home/me/site",
+        "pid": 4242,
+        "started_unix_ms": 1793000400000,
+        "updated_unix_ms": 1793000442000,
+        "state": "done",
+        "finished_unix_ms": 1793000442000,
+        "received_bytes": 0,
+        "downloaded_bytes": 0,
+        "resumed_bytes": 0,
+        "reused_bytes": 0,
+        "expected_bytes": 0,
+        "paid": {
+          "amount_micro_usdc": 0,
+          "bytes": 0
+        },
+        "nodes": [],
+        "stale": false
+      },
+      {
+        "uri": "decdn:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262/",
+        "kind": "bundle",
         "files_started": 12,
         "files_landed": 9,
         "counts": {
           "fetched": 9,
           "linked": 1,
           "skipped": 2,
+          "reused": 1,
           "excluded": 0,
           "failed": 0,
-          "not_run": 0,
-          "downloaded": 734003200,
-          "resumed_bytes": 0,
-          "reused_bytes": 4096
+          "not_run": 0
         },
         "output": "/home/me/site",
         "pid": 4242,
@@ -81,6 +117,9 @@
         "state": "done",
         "finished_unix_ms": 1793000342000,
         "received_bytes": 734003200,
+        "downloaded_bytes": 734003200,
+        "resumed_bytes": 0,
+        "reused_bytes": 4096,
         "expected_bytes": 1073741824,
         "paid": {
           "amount_micro_usdc": 7340,
@@ -105,6 +144,9 @@
         "state": "interrupted",
         "finished_unix_ms": 1793000242000,
         "received_bytes": 734003200,
+        "downloaded_bytes": 734003200,
+        "resumed_bytes": 0,
+        "reused_bytes": 0,
         "expected_bytes": 1073741824,
         "paid": {
           "amount_micro_usdc": 7340,
@@ -130,6 +172,9 @@
         "finished_unix_ms": 1793000142000,
         "error": "no node holds the blob",
         "received_bytes": 734003200,
+        "downloaded_bytes": 465567744,
+        "resumed_bytes": 268435456,
+        "reused_bytes": 0,
         "expected_bytes": 1073741824,
         "paid": {
           "amount_micro_usdc": 7340,
@@ -145,7 +190,12 @@
         "stale": false
       }
     ],
-    "unreadable": 1,
+    "unreadable": [
+      {
+        "path": "/home/me/.decdn/activity/pulls/1761700000000-77.json",
+        "error": "missing field `resumed_bytes` at line 1 column 402"
+      }
+    ],
     "error": null
   },
   "gateway": {

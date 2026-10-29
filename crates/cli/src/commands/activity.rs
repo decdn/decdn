@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::primitives::Address;
 use anyhow::Context as _;
 use decdn_client::GaveUp;
-use decdn_client::bundle::{BundleReport, FileObserver};
+use decdn_client::bundle::{BundleReport, EntryLanded, FileObserver};
 use decdn_client::receipt::{ReceiptAmount, ReceiptEvidence, ReceiptLane, ReceiptSummary};
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::redact::sanitize_err_chain;
@@ -39,6 +39,12 @@ const PAID_EVERY: u32 = 5;
 /// A `running` record whose heartbeat is older than this belongs to a run that
 /// exited without its last write.
 pub(crate) const STALE_AFTER: Duration = Duration::from_secs(10);
+
+/// The resume base of a blob that has not reported a position.
+const NO_BASE: u64 = u64::MAX;
+
+/// The key a blob run's one blob is recorded under.
+const BLOB_KEY: &str = "";
 
 /// How many records the directory keeps. A run prunes the oldest when it
 /// starts.
@@ -158,8 +164,7 @@ pub(crate) struct NodePaid {
     pub(crate) paid: Paid,
 }
 
-/// A finished bundle run's entry counts and byte tallies, as its summary
-/// prints them.
+/// A finished bundle run's entry counts, as its summary prints them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BundleCounts {
     /// Distinct blobs fetched.
@@ -168,18 +173,14 @@ pub(crate) struct BundleCounts {
     pub(crate) linked: u64,
     /// Entries already on disk.
     pub(crate) skipped: u64,
+    /// Distinct blobs materialized from a whole file already on disk.
+    pub(crate) reused: u64,
     /// Entries the filter or `--select` dropped.
     pub(crate) excluded: u64,
     /// Entries whose fetch failed.
     pub(crate) failed: u64,
     /// Entries the run ended before their fetch ended.
     pub(crate) not_run: u64,
-    /// Content bytes downloaded.
-    pub(crate) downloaded: u64,
-    /// Content bytes earlier runs fetched and this one resumed.
-    pub(crate) resumed_bytes: u64,
-    /// Bytes reused from files already on disk, whole or spliced.
-    pub(crate) reused_bytes: u64,
 }
 
 impl BundleCounts {
@@ -190,12 +191,10 @@ impl BundleCounts {
             fetched: report.fetched,
             linked: report.linked,
             skipped: report.skipped,
+            reused: report.reused,
             excluded,
             failed: report.failed,
             not_run: report.not_run,
-            downloaded: report.downloaded,
-            resumed_bytes: report.resumed_bytes,
-            reused_bytes: report.reused_bytes.saturating_add(report.spliced_bytes),
         }
     }
 }
@@ -219,8 +218,16 @@ pub(crate) struct PullRecord {
     /// Where the run is.
     #[serde(flatten)]
     pub(crate) state: PullState,
-    /// Content bytes verified so far.
+    /// Content bytes verified so far, the resumed ones included.
     pub(crate) received_bytes: u64,
+    /// Content bytes this run fetched and paid for.
+    pub(crate) downloaded_bytes: u64,
+    /// Content bytes earlier, interrupted runs fetched that this run resumed
+    /// rather than fetched again.
+    pub(crate) resumed_bytes: u64,
+    /// Bytes taken from files already on disk, whole or spliced: neither
+    /// fetched nor paid for.
+    pub(crate) reused_bytes: u64,
     /// The content bytes the run plans to fetch; `None` until known.
     pub(crate) expected_bytes: Option<u64>,
     /// What the run paid so far, over every node.
@@ -242,12 +249,15 @@ impl PullRecord {
 pub(crate) struct ActivityRecorder {
     path: PathBuf,
     record: Mutex<PullRecord>,
-    received: AtomicU64,
-    /// Each started blob's last reported position, by the first path it
-    /// lands at. A bundle blob reports its whole position on every fetch, and
-    /// a second pass after a pool replacement starts it again, so positions
-    /// replace, never add.
-    files: Mutex<HashMap<String, u64>>,
+    /// Each started blob's bytes: a blob run's under [`BLOB_KEY`], a bundle
+    /// blob's under its hash when [`Self::plan`] named it, else under the
+    /// first path it lands at.
+    files: Mutex<HashMap<String, BlobBytes>>,
+    /// The hash of each manifest path the run pulls ([`Self::plan`]).
+    hashes: Mutex<HashMap<String, [u8; 32]>>,
+    /// The bytes a bundle run took from whole files already on disk, which
+    /// fetch nothing and so start no blob.
+    whole_file_reused: AtomicU64,
     /// A bundle run's counts, held until [`Self::finish`] writes them with
     /// the run's end; an entry run's are dropped there.
     counts: Mutex<Option<BundleCounts>>,
@@ -310,12 +320,16 @@ impl ActivityRecorder {
                 updated_unix_ms: now,
                 state: PullState::Running,
                 received_bytes: 0,
+                downloaded_bytes: 0,
+                resumed_bytes: 0,
+                reused_bytes: 0,
                 expected_bytes: None,
                 paid: Paid::default(),
                 nodes: Vec::new(),
             }),
-            received: AtomicU64::new(0),
             files: Mutex::new(HashMap::new()),
+            hashes: Mutex::new(HashMap::new()),
+            whole_file_reused: AtomicU64::new(0),
             counts: Mutex::new(None),
             evidence: Arc::clone(evidence),
             ticker: Mutex::new(None),
@@ -359,8 +373,18 @@ impl ActivityRecorder {
 
     /// A blob run's position: `received` of `expected` content bytes.
     pub(crate) fn progress(&self, received: u64, expected: u64) {
-        self.received.store(received, Ordering::Relaxed);
+        self.file_delivered(BLOB_KEY, received);
         self.update(|r| r.expected_bytes = Some(expected));
+    }
+
+    /// The `(path, hash)` of each manifest entry a bundle run pulls, so a
+    /// blob that starts at a path and one that lands by hash meet in one
+    /// record.
+    pub(crate) fn plan(&self, entries: impl IntoIterator<Item = (String, [u8; 32])>) {
+        self.hashes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(entries);
     }
 
     /// A bundle run starts on `download_total` content bytes.
@@ -377,13 +401,31 @@ impl ActivityRecorder {
         paths: &[String],
         inner: Arc<dyn FileObserver>,
     ) -> Arc<dyn FileObserver> {
-        let key = paths.first().cloned().unwrap_or_default();
-        let first = self
+        let path = paths.first().cloned().unwrap_or_default();
+        let key = match self
+            .hashes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&path)
+        {
+            Some(hash) => blob_key(*hash),
+            None => path,
+        };
+        let first = match self
             .files
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(key.clone(), 0)
-            .is_none();
+            .entry(key.clone())
+        {
+            std::collections::hash_map::Entry::Occupied(mut blob) => {
+                blob.get_mut().started_again();
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(blob) => {
+                blob.insert(BlobBytes::default());
+                true
+            }
+        };
         if first {
             self.update(|r| {
                 if let PullKind::Bundle { files_started, .. } = &mut r.kind {
@@ -398,8 +440,15 @@ impl ActivityRecorder {
         })
     }
 
-    /// A bundle blob landed. An entry run ignores it.
-    pub(crate) fn file_landed(&self) {
+    /// A bundle blob landed, with what it fetched, spliced and resumed. An
+    /// entry run records the bytes and no file count.
+    pub(crate) fn file_landed(&self, landed: Landed) {
+        self.files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(blob_key(landed.hash))
+            .or_default()
+            .landed(landed);
         self.update(|r| {
             if let PullKind::Bundle { files_landed, .. } = &mut r.kind {
                 *files_landed = files_landed.saturating_add(1);
@@ -407,17 +456,22 @@ impl ActivityRecorder {
         });
     }
 
-    /// A bundle run's counts, which [`Self::finish`] writes with its end. An
-    /// entry run's record keeps none.
-    pub(crate) fn bundle_counts(&self, counts: BundleCounts) {
+    /// A bundle run's counts, which [`Self::finish`] writes with its end, and
+    /// the `whole_file_reused` bytes it took from whole files already on disk.
+    /// An entry run's record keeps the bytes and no counts.
+    pub(crate) fn bundle_counts(&self, counts: BundleCounts, whole_file_reused: u64) {
+        self.whole_file_reused
+            .store(whole_file_reused, Ordering::Relaxed);
         *self.counts.lock().unwrap_or_else(PoisonError::into_inner) = Some(counts);
     }
 
     fn file_delivered(&self, key: &str, received: u64) {
-        let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
-        files.insert(key.to_owned(), received);
-        let total = files.values().fold(0u64, |acc, n| acc.saturating_add(*n));
-        self.received.store(total, Ordering::Relaxed);
+        self.files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key.to_owned())
+            .or_default()
+            .delivered(received);
     }
 
     /// End the record: the run's `result`, and what its receipt `summary`
@@ -484,8 +538,19 @@ impl ActivityRecorder {
     /// Write the record through a temp file in its directory and a rename.
     fn write(&self) -> anyhow::Result<()> {
         let record = {
+            let bytes = self
+                .files
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .values()
+                .fold(RunBytes::default(), RunBytes::add);
             let mut record = self.record.lock().unwrap_or_else(PoisonError::into_inner);
-            record.received_bytes = self.received.load(Ordering::Relaxed);
+            record.received_bytes = bytes.received;
+            record.downloaded_bytes = bytes.downloaded;
+            record.resumed_bytes = bytes.resumed;
+            record.reused_bytes = bytes
+                .reused
+                .saturating_add(self.whole_file_reused.load(Ordering::Relaxed));
             record.updated_unix_ms = now_ms();
             record.clone()
         };
@@ -497,6 +562,114 @@ impl ActivityRecorder {
         tmp.persist(&self.path)
             .with_context(|| format!("write {}", self.path.display()))?;
         Ok(())
+    }
+}
+
+/// The key a bundle blob is recorded under: its hash, in hex.
+fn blob_key(hash: [u8; 32]) -> String {
+    blake3::Hash::from_bytes(hash).to_hex().to_string()
+}
+
+/// One blob's bytes, as the run's record counts them. A blob that landed
+/// counts what the pull says it fetched, spliced and resumed. A blob that did
+/// not counts its positions: its lowest position is what its store held
+/// before this run fetched (a fetch reports that first; a stream to stdout
+/// reports `0`; a pass that drops what the store held reports from `0`
+/// again), and the rest up to its last position is what the run fetched.
+#[derive(Debug, Clone, Copy)]
+struct BlobBytes {
+    /// The lowest position the blob reported; [`NO_BASE`] before its first.
+    base: u64,
+    /// The blob's last reported position.
+    position: u64,
+    /// The blob's landing, once it landed.
+    landed: Option<Landed>,
+}
+
+/// A bundle blob that landed, and what it fetched, spliced and resumed. No
+/// byte counts in more than one of `paid`, `spliced` and `resumed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Landed {
+    /// The blob's hash.
+    pub(crate) hash: [u8; 32],
+    /// The blob's size.
+    pub(crate) size: u64,
+    /// The content bytes the run fetched and paid for.
+    pub(crate) paid: u64,
+    /// The bytes spliced from a file already on disk.
+    pub(crate) spliced: u64,
+    /// The bytes an earlier, interrupted run fetched, which this run resumed.
+    pub(crate) resumed: u64,
+}
+
+impl From<&EntryLanded> for Landed {
+    fn from(landed: &EntryLanded) -> Self {
+        Self {
+            hash: landed.hash,
+            size: landed.size,
+            paid: landed.paid,
+            spliced: landed.spliced,
+            resumed: landed.resumed,
+        }
+    }
+}
+
+impl Default for BlobBytes {
+    fn default() -> Self {
+        Self {
+            base: NO_BASE,
+            position: 0,
+            landed: None,
+        }
+    }
+}
+
+impl BlobBytes {
+    /// The blob reached `position`. A blob reports its whole position on
+    /// every fetch, so positions replace, never add.
+    fn delivered(&mut self, position: u64) {
+        self.position = position;
+        self.base = self.base.min(position);
+    }
+
+    /// A second pass starts the blob again: it reports its whole position
+    /// anew, and lands again.
+    const fn started_again(&mut self) {
+        self.position = 0;
+        self.landed = None;
+    }
+
+    /// The blob landed.
+    fn landed(&mut self, landed: Landed) {
+        self.position = self.position.max(landed.size);
+        self.landed = Some(landed);
+    }
+}
+
+/// A run's byte tallies over its blobs.
+#[derive(Debug, Clone, Copy, Default)]
+struct RunBytes {
+    received: u64,
+    downloaded: u64,
+    resumed: u64,
+    reused: u64,
+}
+
+impl RunBytes {
+    /// These tallies with `blob`'s added.
+    const fn add(self, blob: &BlobBytes) -> Self {
+        let (downloaded, resumed, reused) = if let Some(l) = blob.landed {
+            (l.paid, l.resumed, l.spliced)
+        } else {
+            let base = if blob.base == NO_BASE { 0 } else { blob.base };
+            (blob.position.saturating_sub(base), base, 0)
+        };
+        Self {
+            received: self.received.saturating_add(blob.position),
+            downloaded: self.downloaded.saturating_add(downloaded),
+            resumed: self.resumed.saturating_add(resumed),
+            reused: self.reused.saturating_add(reused),
+        }
     }
 }
 
@@ -562,28 +735,39 @@ impl FileObserver for RecordedFile {
     }
 }
 
-/// Every record in `dir`, newest first, and how many files there did not
-/// read as one. A directory that does not exist holds none.
+/// A file in the records directory that did not read as a [`PullRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Unreadable {
+    /// The file's path.
+    pub(crate) path: String,
+    /// Why it did not read: the read error, or what in it does not parse.
+    pub(crate) error: String,
+}
+
+/// Every record in `dir`, newest first, and the `*.json` files there that
+/// did not read as one, sorted by path. A directory that does not exist holds
+/// none.
 ///
 /// # Errors
 ///
 /// The directory exists but cannot be listed.
-pub(crate) fn read_records(dir: &Path) -> std::io::Result<(Vec<PullRecord>, usize)> {
+pub(crate) fn read_records(dir: &Path) -> std::io::Result<(Vec<PullRecord>, Vec<Unreadable>)> {
     let mut records = Vec::new();
-    let mut unreadable = 0;
+    let mut unreadable = Vec::new();
     for path in record_files(dir)? {
         let read = std::fs::read(&path)
             .map_err(anyhow::Error::from)
             .and_then(|bytes| Ok(serde_json::from_slice::<PullRecord>(&bytes)?));
         match read {
             Ok(record) => records.push(record),
-            Err(e) => {
-                tracing::debug!("{} is no pull record: {e:#}", path.display());
-                unreadable += 1;
-            }
+            Err(e) => unreadable.push(Unreadable {
+                path: path.display().to_string(),
+                error: format!("{e:#}"),
+            }),
         }
     }
     records.sort_by_key(|r| std::cmp::Reverse(r.started_unix_ms));
+    unreadable.sort_by(|a, b| a.path.cmp(&b.path));
     Ok((records, unreadable))
 }
 
@@ -645,5 +829,10 @@ fn millis(d: Duration) -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests;

@@ -4513,12 +4513,20 @@ since project inception and will roll into the first tagged release.
   `http://127.0.0.1:8485/#token=<token>` link hands the page the token. The
   page only reads. It is a Vite app in `crates/cli/dashboard/`, embedded by
   `decdn-cli`'s build script; a build with no Node toolchain embeds a page
-  that says how to build it, and no release ships that page. See
+  that says how to build it, and no release ships that page. A finished
+  pull shows the bytes it downloaded apart from those it resumed or reused,
+  and a bundle pull its entry counts (`11 skipped, 9 excluded`), failed and
+  not-run counts in red (#2638, #2639). A file in the records directory that
+  is not a record shows with its path and why (#2666). See
   [`adr/appendix-binaries.md` § Dashboard](https://github.com/decdn/decdn/blob/main/adr/appendix-binaries.md#dashboard).
 - **CLI: every `decdn get` run keeps a record for the dashboard.** A run
   writes `~/.decdn/activity/pulls/<start-ms>-<pid>.json`, whatever its
   `--data-dir`, and rewrites it every second: the URI, the destination, the
-  bytes verified, what each node was paid, and at the end the result. A run
+  bytes verified, split into downloaded, resumed from an earlier run's
+  `.partial`, and reused from files on disk (an interrupted run's
+  unfinished blobs included), what each node was paid, and at the end the
+  result, with a bundle run's entry counts (also when it has nothing to
+  fetch). A run
   that cannot write its record pulls on, and warns once. A run prunes the
   directory to the newest 200 records when it starts. `--dry-run` writes
   none.

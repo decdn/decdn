@@ -93,9 +93,10 @@ fn a_stdout_give_up_keeps_its_type() {
     assert!(write_err.to_string().contains("broken pipe"));
 }
 
-/// `copy_verified` drains every byte to the sink in order and reports the
-/// final cumulative position as the blob's total — the stdout stream's bar
-/// signal (#1848 4b).
+/// `copy_verified` drains every byte to the sink in order, reports `0`
+/// before the first read (a stream resumes nothing), and reports the final
+/// cumulative position as the blob's total — the stdout stream's bar signal
+/// (#1848 4b).
 #[tokio::test]
 async fn copy_verified_streams_all_bytes_and_reports_final_total() -> anyhow::Result<()> {
     let data = vec![7u8; 5000];
@@ -103,10 +104,10 @@ async fn copy_verified_streams_all_bytes_and_reports_final_total() -> anyhow::Re
     let mut reader: &[u8] = &data;
     let mut sink: Vec<u8> = Vec::new();
 
-    let last = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let observed = Arc::clone(&last);
+    let positions = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&positions);
     let cb = move |pos: u64, _total: u64| {
-        observed.store(pos, std::sync::atomic::Ordering::SeqCst);
+        observed.lock().unwrap().push(pos);
     };
     let cb_ref: &dyn Fn(u64, u64) = &cb;
 
@@ -114,9 +115,11 @@ async fn copy_verified_streams_all_bytes_and_reports_final_total() -> anyhow::Re
 
     assert_eq!(drained, total, "every byte is drained");
     assert_eq!(sink, data, "the sink receives the bytes in order");
+    let positions = positions.lock().unwrap();
+    assert_eq!(positions.first(), Some(&0), "the first report is no byte");
     assert_eq!(
-        last.load(std::sync::atomic::Ordering::SeqCst),
-        total,
+        positions.last(),
+        Some(&total),
         "the final progress report reaches the blob's total"
     );
     Ok(())

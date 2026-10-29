@@ -19,6 +19,9 @@
         "finished_unix_ms": 1793000342000,
         "error": "gave up: no verified byte for 2m",
         "received_bytes": 734003200,
+        "downloaded_bytes": 734003200,
+        "resumed_bytes": 0,
+        "reused_bytes": 0,
         "expected_bytes": 1073741824,
         "paid": {
           "amount_micro_usdc": 7340,
@@ -34,7 +37,7 @@
         "stale": false
       }
     ],
-    "unreadable": 0,
+    "unreadable": [],
     "error": null
   },
   "gateway": {

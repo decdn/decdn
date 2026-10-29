@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type {
+  BundleCounts,
   EarningsPeriod,
   GatewayStatus,
   EndedPull,
@@ -26,6 +27,7 @@ import {
   severity,
   staleSecs,
   stalestSecs,
+  unreadableView,
 } from "./view";
 
 const signer = "0xAbCdEf0000000000000000000000000000000001";
@@ -271,6 +273,9 @@ function fields(
     started_unix_ms: 1_000_000,
     updated_unix_ms: 1_030_000,
     received_bytes: 0,
+    downloaded_bytes: 0,
+    resumed_bytes: 0,
+    reused_bytes: 0,
     expected_bytes: null,
     paid: { amount_micro_usdc: 0, bytes: 0 },
     nodes: [],
@@ -294,7 +299,7 @@ function pulls(overrides: Partial<Pulls> = {}): Pulls {
     updated_unix_ms: 1_060_000,
     active: [],
     recent: [],
-    unreadable: 0,
+    unreadable: [],
     error: null,
     ...overrides,
   };
@@ -339,7 +344,48 @@ describe("livePulls", () => {
     const rows = livePulls(pulls({ active: [record({ stale: true })] }));
     expect(rows[0]).toMatchObject({ done: null, files: null, stale: true });
   });
+
+  it("keeps a resumed run's bar on its whole position, and names what it resumed", () => {
+    const rows = livePulls(
+      pulls({
+        active: [
+          record({
+            received_bytes: 800,
+            resumed_bytes: 300,
+            expected_bytes: 1_000,
+          }),
+        ],
+      }),
+    );
+    expect(rows[0]).toMatchObject({ done: 0.8, received: 800, resumed: 300 });
+  });
 });
+
+const COUNTS: BundleCounts = {
+  fetched: 0,
+  linked: 0,
+  skipped: 0,
+  reused: 0,
+  excluded: 0,
+  failed: 0,
+  not_run: 0,
+};
+
+function endedBundle(
+  counts: BundleCounts | null,
+  overrides: Overrides = {},
+): EndedPull {
+  return {
+    ...fields(overrides, {
+      kind: "bundle",
+      files_started: 0,
+      files_landed: 0,
+      counts,
+    }),
+    state: "done",
+    finished_unix_ms: 1_042_000,
+  };
+}
 
 describe("recentPulls", () => {
   it("names each outcome, and times a run to its end", () => {
@@ -370,6 +416,115 @@ describe("recentPulls", () => {
       ["Interrupted", "muted", null],
     ]);
     expect(rows.map((r) => r.durationSecs)).toEqual([42, 5, 90, 1]);
+  });
+
+  it("names a skip-only bundle run's counts, so it does not read as one that did nothing", () => {
+    const [row] = recentPulls(
+      pulls({
+        recent: [endedBundle({ ...COUNTS, skipped: 11, excluded: 9 })],
+      }),
+    );
+    expect(row).toMatchObject({ outcome: "✓ Done", downloaded: 0 });
+    expect(row?.counts).toEqual([
+      { text: "11 skipped", critical: false },
+      { text: "9 excluded", critical: false },
+    ]);
+  });
+
+  it("names failed and not-run entries in the critical tone, in the summary's order", () => {
+    const [row] = recentPulls(
+      pulls({
+        recent: [
+          endedBundle({
+            ...COUNTS,
+            not_run: 4,
+            failed: 1,
+            linked: 2,
+            fetched: 3,
+          }),
+        ],
+      }),
+    );
+    expect(row?.counts).toEqual([
+      { text: "3 fetched", critical: false },
+      { text: "2 linked", critical: false },
+      { text: "1 failed", critical: true },
+      { text: "4 not run", critical: true },
+    ]);
+  });
+
+  it("names a run whose every file was reused from disk, not nothing to fetch", () => {
+    const [row] = recentPulls(
+      pulls({
+        recent: [endedBundle({ ...COUNTS, reused: 3 }, { reused_bytes: 900 })],
+      }),
+    );
+    expect(row?.counts).toEqual([{ text: "3 reused", critical: false }]);
+    expect(row).toMatchObject({ downloaded: 0, reused: 900 });
+  });
+
+  it("says a bundle run with every count zero had nothing to fetch", () => {
+    const [row] = recentPulls(pulls({ recent: [endedBundle(COUNTS)] }));
+    expect(row?.counts).toEqual([
+      { text: "nothing to fetch", critical: false },
+    ]);
+  });
+
+  it("names no counts for a blob run, or a bundle run that ended before its summary", () => {
+    const rows = recentPulls(
+      pulls({
+        recent: [
+          endedBundle(null),
+          { ...fields(), state: "done", finished_unix_ms: 1_042_000 },
+        ],
+      }),
+    );
+    expect(rows.map((r) => r.counts)).toEqual([null, null]);
+  });
+
+  it("shows a run's downloaded, resumed and reused bytes apart, as its record splits them", () => {
+    const [row] = recentPulls(
+      pulls({
+        recent: [
+          endedBundle(null, {
+            received_bytes: 2_900,
+            downloaded_bytes: 1_700,
+            resumed_bytes: 1_100,
+            reused_bytes: 100,
+          }),
+        ],
+      }),
+    );
+    expect(row).toMatchObject({
+      downloaded: 1_700,
+      resumed: 1_100,
+      reused: 100,
+      counts: null,
+    });
+  });
+});
+
+describe("unreadableView", () => {
+  it("lists the first few unreadable files, and says how many more", () => {
+    const unreadable = Array.from({ length: 7 }, (_, i) => ({
+      path: `/pulls/${i}.json`,
+      error: "EOF while parsing",
+    }));
+    const view = unreadableView(pulls({ unreadable }));
+    expect(view.count).toBe(7);
+    expect(view.shown.map((u) => u.path)).toEqual(
+      unreadable.slice(0, 5).map((u) => u.path),
+    );
+    expect(view.more).toBe(2);
+  });
+
+  it("lists every file when there are few", () => {
+    const unreadable = [{ path: "/pulls/1.json", error: "missing field" }];
+    expect(unreadableView(pulls({ unreadable }))).toEqual({
+      count: 1,
+      shown: unreadable,
+      more: 0,
+    });
   });
 });
 
