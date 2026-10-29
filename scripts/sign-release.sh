@@ -19,9 +19,11 @@
 #                         gpg.conf's default-key is not read. Whatever it
 #                         resolves to must be published in KEYS.
 #   DECDN_MINISIGN_KEY    the minisign secret key that signs SHA256SUMS for
-#                         `decdn self-update` (default: ~/.minisign/minisign.key).
+#                         `decdn self-update` and each archive for
+#                         `cargo binstall` (default: ~/.minisign/minisign.key).
 #                         Its public half must be one of crates/cli/minisign*.pub,
-#                         the keys the released binary embeds.
+#                         the keys the released binary embeds, and the `pubkey`
+#                         the binstall crates name at the tag.
 #   DECDN_SKIP_IMAGE_TAGS set to 1 to publish without creating ANY pullable
 #                         image tag — the release then ships with only the
 #                         signed digests in the *-image-digest.txt files
@@ -95,8 +97,10 @@ declare -A DOCKERHUB_IMAGE=(
   [sponsord-onramp]="docker.io/${DOCKERHUB_OWNER}/sponsord-onramp"
 )
 
-# The files a signature covers. SHA256SUMS transitively covers every archive,
-# so the archives carry no individual .asc.
+# The files a GPG signature covers. SHA256SUMS transitively covers every
+# archive, so the archives carry no individual .asc. Each archive does carry a
+# .minisig, for `cargo binstall`, which never reads SHA256SUMS (see ARCHIVES
+# below).
 SIGN_TARGETS=( "SHA256SUMS" )
 for img in "${IMAGES[@]}"; do
   SIGN_TARGETS+=( "${img}-image-digest.txt" "${img}-${VERSION}-sbom.spdx.json" )
@@ -475,6 +479,61 @@ for img in "${IMAGES[@]}"; do
   DIGEST[$img]="${digest_ref#*@}"
 done
 
+# ---- signing keys --------------------------------------------------------
+
+# Read from the TAG's tree before anything is signed, so a missing or
+# mismatched key stops the script before either passphrase prompt.
+#
+# The minisign keys `decdn self-update` trusts: the public keys committed in
+# the TAG's tree, which are the keys the binary being released embeds, not the
+# working tree's. SHA256SUMS.minisig is verified against them below, so a
+# secret key whose public half that binary does not carry stops there instead
+# of shipping a release no client accepts. A placeholder key (one whose comment
+# line says so) means the real key never landed; nothing is signed with it.
+TAG_PUBS=()
+while IFS= read -r f; do
+  [[ -n "$f" ]] || continue
+  git -C "$REPO_ROOT" show "${TAG}:${f}" > "$KEYS_HOME/${f##*/}" ||
+    die "cannot read $f from the $TAG tree"
+  ! grep -qi 'placeholder' "$KEYS_HOME/${f##*/}" || die \
+    "$f at $TAG is a placeholder key; the released binary would trust no real key.
+Commit your minisign public key first (RELEASING.md § The minisign keys)."
+  TAG_PUBS+=( "$f" )
+done < <(git -C "$REPO_ROOT" ls-tree --name-only "$TAG" -- crates/cli/ | grep -E '^crates/cli/minisign[^/]*\.pub$' || true)
+(( ${#TAG_PUBS[@]} > 0 )) || die \
+  "the $TAG tree holds no crates/cli/minisign*.pub; the released binary would trust no key"
+
+# The key `cargo binstall` verifies each <archive>.minisig under: the single
+# `pubkey` of the crate's [package.metadata.binstall.signing]. binstall never
+# reads SHA256SUMS, and it takes the key from the Cargo.toml crates.io serves
+# for this version, so the key is read from the TAG's tree. sed reads every
+# crates/*/Cargo.toml there and all of them must agree;
+# check-binstall-metadata.sh holds each binstall crate to that one-line form,
+# and publish-crates.sh runs it at the tag before anything reaches crates.io.
+# Whether $MINISIGN_KEY is this key is known only once the archives are signed
+# (the verify loop below).
+BINSTALL_PUBS=()
+while IFS= read -r f; do
+  [[ -n "$f" ]] || continue
+  pub=$(git -C "$REPO_ROOT" show "${TAG}:${f}" | sed -n 's/^pubkey = "\([^"]*\)"$/\1/p') ||
+    die "cannot read $f from the $TAG tree"
+  [[ -z "$pub" ]] || BINSTALL_PUBS+=( "$pub" )
+done < <(git -C "$REPO_ROOT" ls-tree -r --name-only "$TAG" -- crates/ | grep -E '^crates/[^/]+/Cargo\.toml$' || true)
+mapfile -t BINSTALL_PUBS < <(printf '%s\n' "${BINSTALL_PUBS[@]}" | sort -u | sed '/^$/d')
+case ${#BINSTALL_PUBS[@]} in
+  1) BINSTALL_PUB="${BINSTALL_PUBS[0]}" ;;
+  0) die "no crate at $TAG names a [package.metadata.binstall.signing] pubkey" ;;
+  *) die "the crates at $TAG name ${#BINSTALL_PUBS[@]} different binstall signing keys:
+$(printf '  %s\n' "${BINSTALL_PUBS[@]}")
+cargo binstall checks each crate's archives under its own; they must be one key." ;;
+esac
+
+# Every archive SHA256SUMS names. `sha256sum --check` and the coverage check
+# under "download and check" together proved those are exactly the archives on
+# the draft. `NF` skips a blank line, which --strict lets through.
+mapfile -t ARCHIVES < <(awk 'NF {print $2}' SHA256SUMS)
+(( ${#ARCHIVES[@]} > 0 )) || die "SHA256SUMS names no archive"
+
 # ---- sign ----------------------------------------------------------------
 
 echo "==> Signing"
@@ -489,31 +548,21 @@ for f in "${SIGN_TARGETS[@]}"; do
   echo "    signed $f"
 done
 
-# SHA256SUMS.minisig: the signature `decdn self-update` checks. Verified
-# against the public keys committed in the TAG's tree, which are the keys the
-# binary being released embeds, not the working tree's, so a secret key whose
-# public half that binary does not carry stops here instead of shipping a
-# release no client accepts. A placeholder key (one whose comment line says
-# so) means the real key never landed; nothing is signed with it.
-TAG_PUBS=()
-while IFS= read -r f; do
-  [[ -n "$f" ]] || continue
-  git -C "$REPO_ROOT" show "${TAG}:${f}" > "$KEYS_HOME/${f##*/}" ||
-    die "cannot read $f from the $TAG tree"
-  ! grep -qi 'placeholder' "$KEYS_HOME/${f##*/}" || die \
-    "$f at $TAG is a placeholder key; the released binary would trust no real key.
-Commit your minisign public key first (RELEASING.md § The minisign keys)."
-  TAG_PUBS+=( "$f" )
-done < <(git -C "$REPO_ROOT" ls-tree --name-only "$TAG" -- crates/cli/ | grep -E '^crates/cli/minisign[^/]*\.pub$' || true)
-(( ${#TAG_PUBS[@]} > 0 )) || die \
-  "the $TAG tree holds no crates/cli/minisign*.pub; the released binary would trust no key"
-rm -f SHA256SUMS.minisig
-minisign -S -s "$MINISIGN_KEY" -m SHA256SUMS -x SHA256SUMS.minisig ||
-  die "failed to minisign SHA256SUMS (password problem?); nothing has been published"
+# SHA256SUMS.minisig, the signature `decdn self-update` checks, and one
+# <archive>.minisig per archive, the signatures `cargo binstall` checks. One
+# invocation, so one password prompt. Without -x, minisign writes each
+# signature to <file>.minisig.
+rm -f SHA256SUMS.minisig "${ARCHIVES[@]/%/.minisig}"
+minisign -S -s "$MINISIGN_KEY" -m SHA256SUMS "${ARCHIVES[@]}" ||
+  die "failed to minisign SHA256SUMS and the archives (password problem?); nothing has been published"
+# Every verification passes -H: it accepts only the prehashed signature format,
+# the one `decdn self-update` and cargo binstall accept. A minisign that signs
+# in the legacy format stops here instead of shipping signatures no client
+# accepts.
 MINISIGN_PUB=""
 MINISIGN_ERR=""
 for f in "${TAG_PUBS[@]}"; do
-  if MINISIGN_ERR=$(minisign -V -q -p "$KEYS_HOME/${f##*/}" -m SHA256SUMS -x SHA256SUMS.minisig 2>&1); then
+  if MINISIGN_ERR=$(minisign -V -H -p "$KEYS_HOME/${f##*/}" -m SHA256SUMS -x SHA256SUMS.minisig 2>&1); then
     MINISIGN_PUB="$f"
     break
   fi
@@ -542,7 +591,7 @@ fi
 if (( ${#PREV_PUBS[@]} > 0 )); then
   PREV_OK=""
   for f in "${PREV_PUBS[@]}"; do
-    if minisign -V -q -p "$KEYS_HOME/prev-${f##*/}" -m SHA256SUMS -x SHA256SUMS.minisig >/dev/null 2>&1; then
+    if minisign -V -H -q -p "$KEYS_HOME/prev-${f##*/}" -m SHA256SUMS -x SHA256SUMS.minisig >/dev/null 2>&1; then
       PREV_OK="$f"
       break
     fi
@@ -554,18 +603,28 @@ committed at $PREV_TAG; a key new in $TAG signs from the next release (RELEASING
 fi
 echo "    signed SHA256SUMS.minisig ($MINISIGN_PUB)"
 
+for a in "${ARCHIVES[@]}"; do
+  MINISIGN_ERR=$(minisign -V -H -P "$BINSTALL_PUB" -m "$a" -x "${a}.minisig" 2>&1) || die \
+    "${a}.minisig does not verify under the binstall signing key the crates name at $TAG ($BINSTALL_PUB).
+$MINISIGN_KEY is not that key; cargo binstall would refuse every archive. A release signed by
+another maintainer's key changes the crates' pubkey before tagging (RELEASING.md § The minisign keys).
+minisign said: ${MINISIGN_ERR:-nothing}"
+done
+echo "    signed ${#ARCHIVES[@]} archives for cargo binstall"
+
 # ---- publish -------------------------------------------------------------
 
 # Only the signatures just produced. `gh release download` fetched every asset,
 # so a bare ./*.asc glob would also re-upload any stray signature left on the
 # draft by an earlier or abandoned run, unverified.
 echo "==> Uploading signatures"
-gh release upload "$TAG" --repo "$REPO" --clobber "${SIGN_TARGETS[@]/%/.asc}" SHA256SUMS.minisig ||
+gh release upload "$TAG" --repo "$REPO" --clobber "${SIGN_TARGETS[@]/%/.asc}" SHA256SUMS.minisig \
+    "${ARCHIVES[@]/%/.minisig}" ||
   die "failed to upload signatures; the release is still a draft. Re-run this script."
 
 for stray in ./*.asc ./*.minisig; do
   [[ -e "$stray" ]] || continue
-  case " ${SIGN_TARGETS[*]/%/.asc} SHA256SUMS.minisig " in
+  case " ${SIGN_TARGETS[*]/%/.asc} SHA256SUMS.minisig ${ARCHIVES[*]/%/.minisig} " in
     *" ${stray#./} "*) ;;
     *) echo "warning: draft carries an unrecognised signature: ${stray#./}" >&2 ;;
   esac

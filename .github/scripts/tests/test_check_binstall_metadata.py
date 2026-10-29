@@ -40,10 +40,17 @@ pkg-fmt = "tgz"
 bin-dir = "{ bin }{ binary-ext }"
 disabled-strategies = ["quick-install"]
 
+[package.metadata.binstall.signing]
+algorithm = "minisign"
+pubkey = "RWQKEYONE"
+file = "{ url }.minisig"
+
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
 pkg-url = "{ repo }/releases/download/v{ version }/tool-{ version }-{ target }.zip"
 pkg-fmt = "zip"
 """
+
+KEYS = {"minisign-one.pub": "RWQKEYONE", "minisign-two.pub": "RWQKEYTWO"}
 
 CRATE = """\
 [package]
@@ -114,6 +121,7 @@ def make_repo(
     builds: str = "tool-cli:tool",
     text: str | None = None,
     extra_members: dict[str, str] | None = None,
+    keys: dict[str, str] = KEYS,
 ) -> Path:
     members = ["crates/tool", *(f"crates/{d}" for d in (extra_members or {}))]
     root = ROOT.replace('["crates/tool"]', repr(members).replace("'", '"'))
@@ -124,6 +132,9 @@ def make_repo(
     for directory, manifest in (extra_members or {}).items():
         (tmp_path / "crates" / directory).mkdir(parents=True)
         (tmp_path / "crates" / directory / "Cargo.toml").write_text(manifest)
+    (tmp_path / "crates/cli").mkdir(exist_ok=True)
+    for file, key in keys.items():
+        (tmp_path / "crates/cli" / file).write_text(f"untrusted comment: {file}\n{key}\n")
     wf = tmp_path / ".github/workflows/release.yml"
     wf.parent.mkdir(parents=True)
     wf.write_text(text if text is not None else workflow(builds))
@@ -374,13 +385,17 @@ pkg-url = "x"
         ("jobs:\n  other:\n    runs-on: x\n", "no `build-binaries` job"),
         ("jobs:\n  build-binaries:\n    runs-on: x\n", "has no `matrix.include`"),
         (
-            "jobs:\n  build-binaries:\n    strategy:\n      matrix:\n        include:\n"
-            "          - runner: x\n            target: y\n",
+            (
+                "jobs:\n  build-binaries:\n    strategy:\n      matrix:\n        include:\n"
+                "          - runner: x\n            target: y\n"
+            ),
             "opens with `runner:`",
         ),
         (
-            "jobs:\n  build-binaries:\n    strategy:\n      matrix:\n        include:\n"
-            "          - target: x86_64-unknown-linux-gnu\n            archive: tar.gz\n",
+            (
+                "jobs:\n  build-binaries:\n    strategy:\n      matrix:\n        include:\n"
+                "          - target: x86_64-unknown-linux-gnu\n            archive: tar.gz\n"
+            ),
             "has no builds",
         ),
     ],
@@ -448,3 +463,129 @@ def test_an_unsupported_include_line_is_refused(lines, offending):
     _, errors = cbm.parse_build_matrix(MATRIX_HEAD + lines + "    steps:\n      - run: x\n")
     # Each case names its own line, so it passes through the check it names.
     assert errors_containing(errors, f"line {offending!r} is not a `key: value` scalar"), errors
+
+
+# --- signing ---------------------------------------------------------------
+
+
+def test_missing_signing_fails(tmp_path):
+    binstall = BINSTALL.replace("[package.metadata.binstall.signing]", "[package.metadata.x]")
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert errors_containing(errors, "no [package.metadata.binstall.signing]")
+
+
+def test_another_algorithm_fails(tmp_path):
+    binstall = BINSTALL.replace('algorithm = "minisign"', 'algorithm = "gpg"')
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert errors_containing(errors, '`algorithm` must be "minisign"')
+
+
+def test_the_default_sig_file_fails(tmp_path):
+    binstall = BINSTALL.replace('file = "{ url }.minisig"\n', "")
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert errors_containing(errors, "signing `file` must be '{ url }.minisig'")
+
+
+def test_a_key_no_maintainer_holds_fails(tmp_path):
+    binstall = BINSTALL.replace("RWQKEYONE", "RWQSTRANGER")
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert errors_containing(errors, "is not the key line of any crates/cli/minisign*.pub")
+
+
+def test_any_maintainer_key_passes(tmp_path):
+    binstall = BINSTALL.replace("RWQKEYONE", "RWQKEYTWO")
+    assert cbm.check(make_repo(tmp_path, binstall=binstall)) == []
+
+
+def test_crates_naming_different_keys_fail(tmp_path):
+    other = (
+        CRATE.format(binstall=BINSTALL.replace("RWQKEYONE", "RWQKEYTWO"))
+        .replace('name = "tool-cli"', 'name = "tool-node"')
+        .replace('name = "tool"', 'name = "tool-node"')
+        .replace("tool-{ version }", "tool-node-{ version }")
+    )
+    errors = cbm.check(
+        make_repo(
+            tmp_path, builds="tool-cli:tool tool-node:tool-node", extra_members={"node": other}
+        )
+    )
+    assert errors_containing(errors, "`pubkey` differs between crates")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'pubkey  = "RWQKEYONE"',
+        "pubkey = 'RWQKEYONE'",
+        'pubkey = "RWQKEYONE"  # the maintainer key',
+    ],
+)
+def test_a_pubkey_line_sign_release_cannot_read_fails(tmp_path, line):
+    binstall = BINSTALL.replace('pubkey = "RWQKEYONE"', line)
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert errors_containing(errors, 'exactly `pubkey = "<key>"`')
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        '\n[package.metadata.other]\npubkey = "RWQKEYTWO"\n',
+        # Forms sign-release.sh's sed skips: only the any-assignment rule sees them.
+        '\n[package.metadata.other]\npubkey="RWQKEYTWO"\n',
+        '\n[package.metadata.other]\nsigning.pubkey = "RWQKEYTWO"\n',
+        '\n[package.metadata.other]\nsigning = { pubkey = "RWQKEYTWO" }\n',
+    ],
+    ids=["exact", "no-spaces", "dotted", "inline"],
+)
+def test_a_second_pubkey_assignment_fails(tmp_path, extra):
+    crate = CRATE.format(binstall=BINSTALL) + extra
+    repo = make_repo(tmp_path)
+    (repo / "crates/tool/Cargo.toml").write_text(crate)
+    errors = cbm.check(repo)
+    assert errors_containing(errors, "assign `pubkey` nowhere else"), errors
+
+
+def test_a_crlf_pubkey_line_fails(tmp_path):
+    # sign-release.sh's sed does not match `pubkey = "…"\r`.
+    repo = make_repo(tmp_path)
+    path = repo / "crates/tool/Cargo.toml"
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    errors = cbm.check(repo)
+    assert errors_containing(errors, 'exactly `pubkey = "<key>"`'), errors
+
+
+def test_a_missing_algorithm_fails(tmp_path):
+    binstall = BINSTALL.replace('algorithm = "minisign"\n', "")
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert errors_containing(errors, '`algorithm` must be "minisign"')
+
+
+@pytest.mark.parametrize(
+    "signing",
+    [
+        (
+            "\n[package.metadata.binstall.overrides.x86_64-pc-windows-msvc.signing]\n"
+            + 'algorithm = "minisign"\nfile = "{ url }.minisig"\n'
+        ),
+        'signing = { algorithm = "minisign", file = "{ url }.sig" }\n',
+        'signing.file = "{ url }.sig"\n',
+    ],
+    ids=["table", "inline", "dotted"],
+)
+def test_signing_in_an_override_is_refused(tmp_path, signing):
+    # binstall lets an override's `signing` replace the base table for that
+    # target; none of these assign `pubkey`, so only this rule sees them.
+    if signing.startswith("\n"):
+        binstall = BINSTALL + signing
+    else:
+        binstall = BINSTALL.replace('pkg-fmt = "zip"\n', 'pkg-fmt = "zip"\n' + signing)
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert errors_containing(errors, "override 'x86_64-pc-windows-msvc' carries `signing`"), errors
+
+
+def test_a_pubkey_in_a_crate_without_binstall_metadata_fails(tmp_path):
+    other = '[package]\nname = "lib"\nversion.workspace = true\n\n[package.metadata.x]\npubkey = "RWQKEYONE"\n'
+    errors = cbm.check(make_repo(tmp_path, extra_members={"lib": other}))
+    assert errors_containing(
+        errors, "crates/lib/Cargo.toml: assigns `pubkey` but has no binstall"
+    ), errors

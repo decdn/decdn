@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if a crate's `cargo binstall` metadata does not name its release archive.
+"""Fail if a crate's `cargo binstall` metadata does not match its release archives.
 
 `cargo binstall <crate>` reads `[package.metadata.binstall]` from the manifest
 published on crates.io and downloads the archive its `pkg-url` names. The
@@ -42,6 +42,25 @@ that name and layout (ARCHIVE_STEP_LINES), so a rename there fails here too.
 
 And the other way: a member with binstall metadata is built by the matrix.
 
+Every member with binstall metadata also carries
+`[package.metadata.binstall.signing]`, which binstall checks each archive
+against:
+
+* `algorithm = "minisign"` and `file = "{ url }.minisig"`, the
+  `<archive>.minisig` that scripts/sign-release.sh uploads;
+* `pubkey` is the same in every crate, and is one of the maintainer keys in
+  `crates/cli/minisign*.pub` (the key line of the file). sign-release.sh signs
+  every archive with one maintainer key and verifies each signature under the
+  one `pubkey` it reads from the crates;
+* no override carries `signing`: binstall lets an override's `signing` replace
+  the base table for that target, and sign-release.sh never reads it.
+
+sign-release.sh reads the key with `sed`, from every `crates/*/Cargo.toml` at
+the tag. So in every one of those files, a binstall crate's `pubkey` sits on
+a line of its own, exactly `pubkey = "<key>"` with LF line endings, and no
+other line assigns `pubkey` in any form (dotted, inline, quoted); a crate
+without binstall metadata assigns it nowhere.
+
 release.yml is read line by line, not as YAML: the `packaging` job runs this
 with the standard library only. The test suite parses the real file with
 pyyaml and compares, so the line reader cannot drift into a quiet false pass.
@@ -79,6 +98,12 @@ ARCHIVE_STEP_LINES = (
     'Compress-Archive -Path "target/$env:TARGET/release/$bin.exe" `',
     '-DestinationPath "$bin-$env:VERSION-$env:TARGET.zip"',
 )
+MINISIGN_PUBS = "crates/cli/minisign*.pub"
+SIGNATURE_FILE = "{ url }.minisig"
+# The line scripts/sign-release.sh's sed reads the key from.
+PUBKEY_LINE = re.compile(r'^pubkey = "([^"]*)"$', re.MULTILINE)
+# Any uncommented assignment to a `pubkey` key: bare, dotted, inline or quoted.
+PUBKEY_ANY = re.compile(r"""^[^#\n]*\bpubkey\b["']?\s*=""", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -336,8 +361,10 @@ def check(repo_root: Path) -> list[str]:
             }
             expected = {
                 "pkg-url": (
-                    f"{common['repo']}/releases/download/v{version}/"
-                    f"{binary}-{version}-{build.target}.{build.archive}",
+                    (
+                        f"{common['repo']}/releases/download/v{version}/"
+                        f"{binary}-{version}-{build.target}.{build.archive}"
+                    ),
                     pkg_url_values(common, build.archive),
                 ),
                 "pkg-fmt": (archive_fmt, [{}]),
@@ -378,6 +405,83 @@ def check(repo_root: Path) -> list[str]:
                     "cargo-binstall releases before cfg support ignore a cfg(…) key and use "
                     "the base settings"
                 )
+    errors.extend(check_signing(repo_root, manifests))
+    return errors
+
+
+def maintainer_keys(repo_root: Path) -> dict[str, str]:
+    """The key line of each `crates/cli/minisign*.pub`, mapped to its file."""
+    keys: dict[str, str] = {}
+    for path in sorted(repo_root.glob(MINISIGN_PUBS)):
+        lines = path.read_text().splitlines()
+        if len(lines) >= 2:
+            keys[lines[1].strip()] = str(path.relative_to(repo_root))
+    return keys
+
+
+def check_signing(repo_root: Path, manifests: dict[str, tuple[Path, dict]]) -> list[str]:
+    """Each binstall crate's signing table, and the `pubkey` lines sign-release.sh reads."""
+    errors: list[str] = []
+    keys = maintainer_keys(repo_root)
+    pubkeys: dict[str, list[str]] = {}
+    binstall_rels = set()
+    for _, (rel, manifest) in sorted(manifests.items()):
+        binstall = manifest.get("package", {}).get("metadata", {}).get("binstall")
+        if binstall is None:
+            continue
+        binstall_rels.add(rel)
+        for target, override in binstall.get("overrides", {}).items():
+            if isinstance(override, dict) and "signing" in override:
+                errors.append(
+                    f"{rel}: binstall override {target!r} carries `signing`, which replaces "
+                    "the base signing table for that target; sign-release.sh never reads it"
+                )
+        signing = binstall.get("signing")
+        if signing is None:
+            errors.append(
+                f"{rel}: no [package.metadata.binstall.signing]; binstall would install "
+                "the archive without checking its signature"
+            )
+            continue
+        if signing.get("algorithm") != "minisign":
+            errors.append(f'{rel}: binstall signing `algorithm` must be "minisign"')
+        if signing.get("file") != SIGNATURE_FILE:
+            errors.append(
+                f"{rel}: binstall signing `file` must be {SIGNATURE_FILE!r}, the "
+                "<archive>.minisig sign-release.sh uploads"
+            )
+        pubkey = signing.get("pubkey")
+        if not isinstance(pubkey, str):
+            errors.append(f"{rel}: binstall signing has no `pubkey`")
+            continue
+        pubkeys.setdefault(pubkey, []).append(str(rel))
+        if pubkey not in keys:
+            errors.append(
+                f"{rel}: binstall signing `pubkey` is not the key line of any "
+                f"{MINISIGN_PUBS}; sign-release.sh signs only with a maintainer key"
+            )
+        # Bytes, not read_text(): universal newlines would hide a CRLF line that
+        # sign-release.sh's sed does not match.
+        text = (repo_root / rel).read_bytes().decode()
+        if PUBKEY_LINE.findall(text) != [pubkey] or len(PUBKEY_ANY.findall(text)) != 1:
+            errors.append(
+                f'{rel}: write the binstall key as one line, exactly `pubkey = "<key>"`, '
+                "and assign `pubkey` nowhere else; that is the only form sign-release.sh reads"
+            )
+    # sign-release.sh's sed reads every crates/*/Cargo.toml, not only binstall crates.
+    for path in sorted(repo_root.glob("crates/*/Cargo.toml")):
+        rel = path.relative_to(repo_root)
+        if rel not in binstall_rels and PUBKEY_ANY.search(path.read_bytes().decode()):
+            errors.append(
+                f"{rel}: assigns `pubkey` but has no binstall metadata; sign-release.sh reads "
+                "`pubkey` from every crates/*/Cargo.toml and would refuse the release"
+            )
+    if len(pubkeys) > 1:
+        listing = "; ".join(f"{k} in {', '.join(v)}" for k, v in sorted(pubkeys.items()))
+        errors.append(
+            f"binstall signing `pubkey` differs between crates ({listing}); "
+            "sign-release.sh signs every archive with one key"
+        )
     return errors
 
 

@@ -4511,6 +4511,21 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Release: `cargo binstall` verifies each archive's minisign signature (#2765).**
+  `sign-release.sh` now signs every archive with the maintainer minisign key,
+  in the same run as `SHA256SUMS.minisig`, and uploads `<archive>.minisig`
+  beside it. The four binary crates' `[package.metadata.binstall.signing]`
+  names that key, so binstall refuses an archive whose signature is missing or
+  does not verify. `sign-release.sh` reads the key from the tag's manifests
+  before it signs anything, verifies every minisign signature with `-H` (the
+  prehashed format `decdn self-update` and binstall accept), and refuses a
+  release whose archives do not verify under the key. `publish-crates.sh`
+  refuses a release missing an archive `SHA256SUMS` names or its `.minisig`,
+  and runs `check_binstall_metadata.py` at the tag before the first upload.
+  `check-binstall-metadata.sh` also checks that the crates name the same key,
+  that it is one of `crates/cli/minisign-*.pub`, that it sits on the one line
+  form `sign-release.sh` reads, and that no override carries its own
+  `signing`. The key follows whoever signs: RELEASING.md § The minisign keys.
 - **Release: `cargo binstall` installs the release archives (#2764).** `decdn-cli`,
   `decdn-node`, `sponsord` and `sponsord-onramp` carry
   `[package.metadata.binstall]`, so `cargo binstall <crate>` downloads the

@@ -49,6 +49,9 @@ ids out of band the first time you verify a release, as you do the GPG
 fingerprints. A new or rotated key reaches installed binaries inside a release
 signed by a key they already trust (RELEASING.md § The minisign keys).
 
+Each archive also carries `<archive>.minisig`, made with the same maintainer
+minisign key, for `cargo binstall` (below).
+
 ### Verify a release tag
 
 ```bash
@@ -194,12 +197,24 @@ back to a third-party build; `--strategies` overrides that. When no release
 archive downloads for your target, it runs `cargo install` instead. Pass
 `--locked` so that build uses the published `Cargo.lock`.
 
-binstall checks no maintainer signature. It trusts the URL in the crates.io
-manifest, which carries no signature either (above), and the TLS connection to
-GitHub. What it installs is whatever that URL serves at download time.
-binstall keeps only the binary, not the archive. To verify the binary,
-download the same archive from the release, verify it against the signed
-`SHA256SUMS` (§ Verify a binary archive), and compare hashes:
+Before it installs the archive, binstall verifies `<archive>.minisig` under the
+minisign key in the crate's `[package.metadata.binstall.signing] pubkey`. It
+refuses an archive whose signature is missing or does not verify, and builds
+from source instead; `--skip-signatures` turns the check off. That key is the
+key line (the second line) of the releasing maintainer's
+`crates/cli/minisign-<maintainer>.pub`. binstall reads it from the
+`Cargo.toml` on crates.io, so this check trusts crates.io for the key, not the
+GPG-signed tag. To check the key, compare the `pubkey` in the published crate
+with the second line of that file in the tag you verified:
+
+```bash
+tar xzOf decdn-cli-<version>.crate decdn-cli-<version>/Cargo.toml | grep '^pubkey'
+git show v<version>:crates/cli/minisign-<maintainer>.pub | sed -n 2p
+```
+
+Or verify the binary against the GPG-signed `SHA256SUMS`. binstall keeps only
+the binary, not the archive, so download the same archive from the release,
+verify it (§ Verify a binary archive), and compare hashes:
 
 ```bash
 sha256sum ~/.cargo/bin/decdn
