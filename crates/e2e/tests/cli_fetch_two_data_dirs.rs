@@ -40,7 +40,7 @@ use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_cache::range_pull::{align_range, bao_encoded_size};
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
+use decdn_e2e::cli::{check_pull_record, decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
@@ -112,7 +112,14 @@ async fn run() -> anyhow::Result<()> {
         "A's first fetch must record exactly its own {wire} wire bytes, got {}",
         lane_a.progress
     );
-    check_pull_record(dir_a.path(), blob.len() as u64, wire, provider)?;
+    check_pull_record(
+        dir_a.path(),
+        "blob",
+        &dir_a.path().join("a1.bin"),
+        blob.len() as u64,
+        wire,
+        provider,
+    )?;
 
     // B has no pool row, so it adopts A's pool from chain and signs on its own
     // lane, which starts at zero.
@@ -241,46 +248,6 @@ fn whole_blob_wire_bytes(total: u64) -> u64 {
         Ok(aligned) => bao_encoded_size(total, aligned.chunk_ranges()),
         Err(_) => total,
     }
-}
-
-/// The run that landed left a `done` record for `decdn dashboard` under its
-/// `HOME`, `home`: the blob's `len` bytes verified, and `wire` bytes paid to
-/// `provider` alone.
-fn check_pull_record(home: &Path, len: u64, wire: U256, provider: Address) -> anyhow::Result<()> {
-    let dir = home.join(".decdn/activity/pulls");
-    let records: Vec<serde_json::Value> = std::fs::read_dir(&dir)
-        .with_context(|| format!("read {}", dir.display()))?
-        .filter_map(Result::ok)
-        .filter_map(|e| std::fs::read(e.path()).ok())
-        .filter_map(|bytes| serde_json::from_slice(&bytes).ok())
-        .collect();
-    let done = records
-        .iter()
-        .find(|r| r["state"] == "done")
-        .with_context(|| format!("no done record among {records:?}"))?;
-    anyhow::ensure!(done["kind"] == "blob", "{done}");
-    anyhow::ensure!(done["received_bytes"] == len, "{done}");
-    anyhow::ensure!(
-        done["downloaded_bytes"] == len && done["resumed_bytes"] == 0,
-        "a fresh fetch downloads every byte and resumes none: {done}"
-    );
-    anyhow::ensure!(done["finished_unix_ms"].is_u64(), "{done}");
-    anyhow::ensure!(
-        U256::from(done["paid"]["bytes"].as_u64().unwrap_or(0)) == wire,
-        "the record pays {wire} wire bytes: {done}"
-    );
-    anyhow::ensure!(
-        done["paid"]["amount_micro_usdc"]
-            .as_u64()
-            .is_some_and(|a| a > 0),
-        "{done}"
-    );
-    anyhow::ensure!(
-        done["nodes"].as_array().map(Vec::len) == Some(1)
-            && done["nodes"][0]["provider"] == provider.to_checksum(None),
-        "one node, {provider}: {done}"
-    );
-    Ok(())
 }
 
 /// Run `decdn get` once in `data_dir`, failing with its stderr.
