@@ -1421,7 +1421,7 @@ impl CacheEngine {
     /// lose to a hostile-origin amplification window.
     ///
     /// **Why iroh-blobs drives the loop instead of us:** the sweep
-    /// function (`gc::gc_run_once`) lives in iroh-blobs 0.103's private
+    /// function (`gc::gc_run_once`) lives in iroh-blobs 0.104's private
     /// `store::gc` module and is not re-exported, and `Blobs::delete`
     /// is `pub(crate)`. The only externally-reachable trigger is
     /// `Options::gc`. #520 tracks switching to a runtime-driven loop
@@ -1497,7 +1497,7 @@ impl CacheEngine {
         // last cycle and the snapshot taken this cycle is exactly the
         // hash set the previous sweep deleted (the cache crate has no
         // other public delete path: `Blobs::delete` is `pub(crate)` in
-        // iroh-blobs 0.103). Bytes for that diff is what the previous
+        // iroh-blobs 0.104). Bytes for that diff is what the previous
         // sweep reclaimed; we attribute it on the *current* cb fire.
         // First-cycle fires bump the runs counter but emit zero on
         // the reclaim counter because there is no prior snapshot.
@@ -3087,7 +3087,9 @@ impl CacheEngine {
     /// Three errors can prove it:
     /// - `LeafHashMismatch` and `ParentHashMismatch` fail the hash check.
     /// - `Io` with `UnexpectedEof` means a data or outboard file is shorter
-    ///   than the size the store recorded.
+    ///   than the size the store recorded. The same kind marks an export the
+    ///   store stopped sending before its last item; that one is a store fault,
+    ///   not a short file, so [`export_cut_short`] leaves it out.
     ///
     /// Each counts only over content the store holds. A partial blob's data
     /// file is sparse, so an absent range reads back as zeros or ends early,
@@ -3114,7 +3116,9 @@ impl CacheEngine {
                 ChunkRanges::from(*start..ChunkNum(start.0.saturating_add(1 << chunk_log)))
             }
             EncodeError::ParentHashMismatch(node) => ChunkRanges::from(node.chunk_range()),
-            EncodeError::Io(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            EncodeError::Io(err)
+                if err.kind() == std::io::ErrorKind::UnexpectedEof && !export_cut_short(err) =>
+            {
                 requested.clone()
             }
             _ => return,
@@ -4920,8 +4924,11 @@ impl CacheEngine {
             .export_bao(hash, aligned.chunk_ranges().clone())
             .stream();
         // Serialize the header-less wire form: Parent → 64 bytes (left‖right
-        // hashes), Leaf → its data; skip the `Size` item (the header) and stop on
-        // `Done`. Mirrors iroh-blobs' `ExportBaoProgress::write` minus the header.
+        // hashes), Leaf → its data; skip the `Size` item (the header). The stream
+        // ends after the leaf that completes the requested ranges, and a store
+        // that stops short of it yields a terminal `Error` instead of ending, so
+        // `None` is a complete export. Mirrors iroh-blobs'
+        // `ExportBaoProgress::write` minus the header.
         //
         // The `bool` in the unfold state is "this stream is finished" — set after
         // yielding a terminal error so the consumer cannot poll past it into a
@@ -4949,7 +4956,7 @@ impl CacheEngine {
                             Some(EncodedItem::Leaf(leaf)) => {
                                 return Some((Ok(leaf.data), (stream, false)));
                             }
-                            Some(EncodedItem::Done) => return None,
+                            Some(EncodedItem::Done) | None => return None,
                             Some(EncodedItem::Error(cause)) => {
                                 engine
                                     .quarantine_on_mismatch(hash, &cause, &requested)
@@ -4957,19 +4964,6 @@ impl CacheEngine {
                                 let err = CacheError::Store(
                                     anyhow::Error::from(cause).context("export_bao stream failed"),
                                 );
-                                return Some((Err(err), (stream, true)));
-                            }
-                            // The store's item channel closing without a terminal
-                            // `Done`/`Error` (actor crash / shutdown race) would
-                            // otherwise yield a silently TRUNCATED wire that the serve
-                            // path bills the client for and the client rejects as a
-                            // short delivery — with no server-side signal. Refuse
-                            // instead (#915 review).
-                            None => {
-                                let err = CacheError::Store(anyhow::anyhow!(
-                                    "export_bao stream for {hash} ended without Done; \
-                                 refusing truncated export"
-                                ));
                                 return Some((Err(err), (stream, true)));
                             }
                         }
@@ -5794,6 +5788,20 @@ enum StreamCommitOutcome {
 /// cap resident memory (a handful of `cdn/client/v1` chunks), large enough that the
 /// store import and the decode overlap rather than ping-ponging one item at a time.
 const ADMIT_BAO_LOCAL_UPDATE_CAP: usize = 8;
+
+/// The message iroh-blobs' `ExportBaoProgress::stream` gives the `UnexpectedEof`
+/// it yields when the store's item channel closes before the item that
+/// completes the requested ranges (an actor shutdown or a dead export task).
+const EXPORT_CUT_SHORT: &str = "export bao stream ended before all requested data was sent";
+
+/// Whether `err` is the error iroh-blobs synthesizes for an export the store
+/// stopped sending, rather than one the store sent. Both have kind
+/// `UnexpectedEof`, and only the message tells them apart; the
+/// `a_cut_short_export_is_not_a_short_file` test pins it against the real
+/// stream.
+fn export_cut_short(err: &std::io::Error) -> bool {
+    err.to_string() == EXPORT_CUT_SHORT
+}
 
 /// Classify the `io::Error` [`CacheEngine::admit_bao_stream`]'s decoder surfaces. A
 /// genuine bao verify rejection (chunk-group or parent hash mismatch) is an

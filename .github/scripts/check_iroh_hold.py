@@ -6,8 +6,8 @@ whole connection with INTERNAL_ERROR "too many gaps in stream buffer" past it.
 The cap counts unread buffers, not gaps, so a client that falls ~2.4 MiB
 behind the node trips it on a gap-free stream. The paid leg then dies mid-pull
 with the node's credit-window bytes delivered and unpaid (#2585). This is
-quinn#2809, which quinn fixes in quinn#2814; noq has not ported the fix yet
-(n0-computer/noq#828).
+quinn#2809, which quinn fixes in quinn#2814. noq ports the fix in
+n0-computer/noq#866 but has not released it yet.
 
 iroh and its QUIC crates therefore stay at the baseline ADR 000 records. The
 committed Cargo.lock is the only pin: `Cargo.toml` asks for `iroh = "1"`, and
@@ -51,7 +51,7 @@ HOW_TO_FIX = """\
 iroh and its QUIC crates are held because noq-proto 1.4 closes client pulls
 mid-leg with "too many gaps in stream buffer" (#2585,
 https://github.com/decdn/decdn/issues/2585). The upstream fix is quinn#2814;
-noq has not released its port yet (https://github.com/n0-computer/noq/pull/828).
+noq has not released its port yet (https://github.com/n0-computer/noq/pull/866).
 
 To restore the hold, put back only the held crates' `version` and `checksum`
 lines in Cargo.lock (plus any dependency line their bump added or removed).

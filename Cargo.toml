@@ -92,7 +92,7 @@ sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.2.0" }
 # is the true pin; these caret constraints just bound the major. Upgrades are
 # deliberate — bump Cargo.lock and record the new baseline in ADR 000.
 iroh = "1.3"
-iroh-blobs = { version = "0.103", features = ["fs-store"] }
+iroh-blobs = { version = "0.104", features = ["fs-store"] }
 iroh-metrics = "1"
 # `noq-proto` is iroh 1.x's QUIC protocol crate (its quinn-proto fork). The node
 # depends on it directly for one reason: to name `congestion::Bbr3Config` and
@@ -104,18 +104,18 @@ iroh-metrics = "1"
 # rest of the iroh ecosystem (ADR 000); `default-features = false` mirrors iroh's
 # own dependency on it.
 noq-proto = { version = "1", default-features = false }
-# bao verified-range codec (#823). Pinned to the version `iroh-blobs` 0.103
-# carries transitively (0.16) so the on-disk outboard / interleaved-stream
+# bao verified-range codec (#823). Pinned to the version `iroh-blobs` 0.104
+# carries transitively (0.17) so the on-disk outboard / interleaved-stream
 # encoding the cache produces is byte-identical to what `import_bao_bytes`
 # consumes — ADR 038 treats this codec as part of the protocol contract, so the
 # pin is deliberate. `positioned-io` is bao-tree's `ReadAt` data-source trait.
-bao-tree = "0.16"
+bao-tree = "0.17"
 positioned-io = "0.3"
 # `AsyncStreamReader` — the reader trait `bao-tree`'s INCREMENTAL decoder
 # (`io::fsm::ResponseDecoder`, behind its `tokio_fsm` feature) drives. Needed
 # by name to implement the trait over a live paid pull, and bao-tree re-exports
 # only `AsyncSliceReader`/`AsyncSliceWriter`, not this one. Pinned to what
-# bao-tree 0.16 carries. Unrelated to `iroh-blobs` — depending on it does not
+# bao-tree 0.17 carries. Unrelated to `iroh-blobs` — depending on it does not
 # regress the CLI's iroh-blobs-free invariant (#578).
 iroh-io = { version = "0.6", default-features = false }
 

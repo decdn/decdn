@@ -155,7 +155,7 @@ async fn a_mid_export_fault_propagates() -> anyhow::Result<()> {
         // and the fault's `queue.clear()` would be unobservable.
         Ok(Bytes::from(vec![7u8; 1500])),
         Err(CacheError::Store(anyhow::anyhow!(
-            "export_bao stream for deadbeef ended without Done; refusing truncated export"
+            "export_bao stream failed: export bao stream ended before all requested data was sent"
         ))),
     ]));
     let mut framer = ChunkFramer::new(stream, Hash::new(b"fault-test"));
@@ -173,7 +173,7 @@ async fn a_mid_export_fault_propagates() -> anyhow::Result<()> {
         }
     };
     anyhow::ensure!(
-        format!("{err:#}").contains("refusing truncated export"),
+        format!("{err:#}").contains("ended before all requested data was sent"),
         "fault lost its cause: {err:#}"
     );
 

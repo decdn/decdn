@@ -1225,7 +1225,7 @@ since project inception and will roll into the first tagged release.
   `packaging` CI job and the `iroh-hold` pre-commit hook now fail when
   Cargo.lock resolves any of the seven to another version
   (`.github/scripts/check_iroh_hold.py` holds the table). The hold lifts once
-  a noq release ports quinn#2814 (n0-computer/noq#828).
+  a noq release ships its quinn#2814 port (n0-computer/noq#866).
 - **Client: a stream that a lost connection, a stall or a cancel ends bills
   its delivered tail when the lane resumes (#2718, #2722).** The node streams
   up to one credit window ahead of the voucher that pays for it. Only a
@@ -3875,6 +3875,14 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **Cache: iroh-blobs 0.104 and bao-tree 0.17.** iroh-blobs ends an
+  `export_bao` stream after the leaf that completes the requested ranges and
+  no longer sends `Done`, so the serve path reads the end of the stream as a
+  complete export. An export the store stops sending early arrives as an
+  `UnexpectedEof` error from iroh-blobs instead. That error fails the serve
+  but does not quarantine the blob, because it is a store fault and not a
+  short data file. iroh and its QUIC crates stay at 1.3.0: the noq gap-cap
+  fix (n0-computer/noq#866) is merged but not yet released.
 - **Dev builds carry line tables only, and dependencies no debuginfo.**
   `[profile.dev]` sets `debug = "line-tables-only"` and
   `[profile.dev.package."*"]` sets `debug = false`, so a panic backtrace and a
