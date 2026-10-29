@@ -28,6 +28,12 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **sponsord-onramp: `ONRAMP_DECDN_RELEASE` must be v0.3.0 or later
+  (#2683).** The installers run `decdn get` without `-o` for a bundle or
+  entry URI so that it keeps its overwrite and hidden-path guards. v0.2.x's
+  `decdn get` has no hidden-path guard (GHSA-rff9-95mx-xpw9), so the onramp
+  refuses to start with a pin below v0.3.0, a pre-release of it included.
+
 - **CLI: a whole-bundle `decdn get decdn:<hash>/` without `-o` pulls into
   `./<hash>/` (lowercase hex), not `.`, and a pull into a default
   destination refuses hidden entry paths (GHSA-rff9-95mx-xpw9).** Without
@@ -5378,6 +5384,20 @@ since project inception and will roll into the first tagged release.
   Contributor tooling only — no runtime, wire, config, or ABI impact.
 
 ### Security
+
+- **sponsord-onramp: clients behind the documented proxy no longer share one
+  rate-limit budget (GHSA-674v-whmr-xvmw, #2693).** The deploy binds the
+  onramp to localhost behind a reverse proxy, but the env example left
+  `ONRAMP_CLIENT_IP_HEADER` unset. Every request was keyed to the proxy's
+  address, so about four waiting installers filled the poll budget, and one
+  client could spend the fund budget for everyone. The env example now sets
+  `ONRAMP_CLIENT_IP_HEADER=X-Forwarded-For`. The limits count an IPv6 client
+  by its /64, not its full address, and an IPv4-mapped address as its IPv4
+  address. The limiter tracks at most 100,000 clients per minute; any more
+  share one budget, so a flood of addresses can neither grow its memory nor
+  get around the limits. Installer contract: `decdn.sh` and `decdn.ps1` now
+  wait out a `429` from `GET /v1/capability` and retry, the wait doubling from
+  2 s up to 30 s for up to 600 s, instead of failing the run.
 
 - **sponsord-onramp: a Turnstile token is bound to the onramp's hostname and
   action (GHSA-jr93-46mf-88wx).** The gate decoded only `success` from the

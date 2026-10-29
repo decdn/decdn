@@ -37,12 +37,10 @@ pub struct ReleasePin {
 
 /// The oldest decdn release the installers work with. They run `decdn get`
 /// without `-o` so that it picks the destination and keeps its overwrite and
-/// hidden-path guards, which an explicit `-o` turns off. `get -o` became
-/// optional in decdn v0.2.0 (decdn#2466, decdn#2476): v0.1.x's `decdn get`
-/// refuses the command. The hidden-path guard is newer than this floor: a pin
-/// of a release older than the guard serves installers whose `decdn get`
-/// lacks it.
-pub const MIN_DECDN_RELEASE: (u64, u64, u64) = (0, 2, 0);
+/// hidden-path guards, which an explicit `-o` turns off. v0.3.0 is the oldest
+/// `decdn get` that both picks the destination without `-o` and refuses a
+/// hidden (`.`-prefixed) path on such a pull (GHSA-rff9-95mx-xpw9).
+pub const MIN_DECDN_RELEASE: (u64, u64, u64) = (0, 3, 0);
 
 impl ReleasePin {
     /// All three values are interpolated into the POSIX and PowerShell
@@ -68,7 +66,8 @@ impl ReleasePin {
         anyhow::ensure!(
             at_least(version, MIN_DECDN_RELEASE),
             "release tag {tag:?} is below {RELEASE_TAG_PREFIX}{min_major}.{min_minor}.{min_patch}, \
-             the oldest decdn whose `get` picks the destination when the installers pass no `-o`"
+             the oldest decdn whose `get` picks the destination and refuses hidden paths \
+             when the installers pass no `-o`"
         );
         anyhow::ensure!(
             sums_sha256.len() == 64
@@ -199,12 +198,13 @@ pub struct Args {
     /// only when every request comes through exactly that one proxy.
     #[arg(long, env = "ONRAMP_CLIENT_IP_HEADER")]
     pub client_ip_header: Option<HeaderName>,
-    /// `POST /v1/fund` requests allowed per client address per minute; 0
-    /// disables the limit.
+    /// `POST /v1/fund` requests allowed per client (an IPv4 address or an
+    /// IPv6 /64) per minute; 0 disables the limit.
     #[arg(long, env = "ONRAMP_FUND_RATE_PER_MIN", default_value_t = 10)]
     pub fund_rate_per_min: u32,
-    /// `GET /v1/capability` polls allowed per client address per minute (the
-    /// installer polls every 2 s); 0 disables the limit.
+    /// `GET /v1/capability` polls allowed per client (an IPv4 address or an
+    /// IPv6 /64) per minute (the installer polls every 2 s); 0 disables the
+    /// limit.
     #[arg(long, env = "ONRAMP_POLL_RATE_PER_MIN", default_value_t = 120)]
     pub poll_rate_per_min: u32,
 
@@ -284,11 +284,11 @@ pub struct OnrampConfig {
     /// Where the requester's address comes from: the TCP peer, or the
     /// `ONRAMP_CLIENT_IP_HEADER` a trusted proxy sets.
     pub client_ip: ClientIpSource,
-    /// `POST /v1/fund` requests allowed per client address per minute; 0
-    /// disables the limit (`ONRAMP_FUND_RATE_PER_MIN`).
+    /// `POST /v1/fund` requests allowed per client (an IPv4 address or an
+    /// IPv6 /64) per minute; 0 disables the limit (`ONRAMP_FUND_RATE_PER_MIN`).
     pub fund_rate_per_min: u32,
-    /// `GET /v1/capability` polls allowed per client address per minute; 0
-    /// disables the limit (`ONRAMP_POLL_RATE_PER_MIN`).
+    /// `GET /v1/capability` polls allowed per client (an IPv4 address or an
+    /// IPv6 /64) per minute; 0 disables the limit (`ONRAMP_POLL_RATE_PER_MIN`).
     pub poll_rate_per_min: u32,
     /// Base URL of the release downloads, without a trailing `/`.
     pub releases_base: String,

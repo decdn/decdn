@@ -53,7 +53,7 @@ on another host needs it.
 | `ONRAMP_CAPACITY_BOND_ADDR` | required | `CapacityBond` contract, for node discovery |
 | `ONRAMP_TURNSTILE_SECRET` / `_FILE` | required (Turnstile gate) | Cloudflare Turnstile secret |
 | `ONRAMP_TURNSTILE_SITEKEY` | required (Turnstile gate) | Cloudflare Turnstile sitekey |
-| `ONRAMP_DECDN_RELEASE`, `ONRAMP_DECDN_SUMS_SHA256` | required | `decdn` release the installers install (`v0.2.0` or later; the onramp refuses an older one), and the SHA-256 of its `SHA256SUMS` |
+| `ONRAMP_DECDN_RELEASE`, `ONRAMP_DECDN_SUMS_SHA256` | required | `decdn` release the installers install (`v0.3.0` or later; the onramp refuses an older one), and the SHA-256 of its `SHA256SUMS` |
 | `ONRAMP_BIND` | `127.0.0.1:8080` | Listen address |
 | `ONRAMP_DAEMON_URL` | `http://127.0.0.1:8090` | The daemon |
 | `ONRAMP_SPENDING_CAP_MICRO_USDC` | daemon maximum | Cap requested per capability |
@@ -63,8 +63,8 @@ on another host needs it.
 | `ONRAMP_BRAND_NAME` | `deCDN` | Name on the gate page |
 | `ONRAMP_GATE_TEMPLATE` | built-in | Your own gate page (below) |
 | `ONRAMP_CLIENT_IP_HEADER` | TCP peer | Header your reverse proxy puts the client address in |
-| `ONRAMP_FUND_RATE_PER_MIN` | `10` | `POST /v1/fund` per client address per minute; 0 = off |
-| `ONRAMP_POLL_RATE_PER_MIN` | `120` | `GET /v1/capability` per client address per minute; 0 = off |
+| `ONRAMP_FUND_RATE_PER_MIN` | `10` | `POST /v1/fund` per client (IPv4 address or IPv6 /64) per minute; 0 = off |
+| `ONRAMP_POLL_RATE_PER_MIN` | `120` | `GET /v1/capability` per client (IPv4 address or IPv6 /64) per minute; 0 = off |
 | `ONRAMP_RELEASES_BASE` | `https://github.com/decdn` | Where installers download releases from |
 
 The onramp refuses to start if the daemon is unreachable, or if its
@@ -83,8 +83,17 @@ users reach. Its host must be the host the browser shows on the gate page,
 with no redirect to another host: Turnstile tokens are bound to it. If the proxy is the only way in, set `ONRAMP_CLIENT_IP_HEADER`
 so rate limits and the gate see the real client address: `CF-Connecting-IP`
 behind Cloudflare, or `X-Forwarded-For` (the right-most address counts,
-the one your proxy appended). Don't set it if clients can reach the onramp
-directly, since they could then choose their own address.
+the one your proxy appended). Without it, every request comes from the
+proxy's address and all clients share one rate-limit budget. A few waiting
+installers then exhaust it. `compose.yaml` and the systemd unit bind the
+onramp to localhost, so the env example sets `X-Forwarded-For`. Don't set it
+if clients can reach the onramp directly, since they could then choose their
+own address.
+
+The rate limits count an IPv4 address or an IPv6 /64 as one client. The
+onramp counts up to 100,000 clients each minute one by one. Past that, the
+rest share one budget, so a flood of addresses can neither grow its memory
+nor get around the limits. The installers wait out a 429 and retry.
 
 ### Your own gate page
 

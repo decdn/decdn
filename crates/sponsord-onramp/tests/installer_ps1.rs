@@ -1,8 +1,8 @@
 //! `assets/decdn.ps1` as the onramp serves it, run in Windows PowerShell
 //! against that onramp over HTTP (fake daemon and gate), a release served
 //! over HTTP and a stub `decdn.exe` compiled for the test: `get` passes the
-//! gate and runs `decdn` with the capability, and a failed download resumes
-//! without the gate.
+//! gate and runs `decdn` with the capability, a failed download resumes
+//! without the gate, and a rate limit is waited out.
 //!
 //! The installer adds its bin dir to the user's PATH in the registry, so
 //! these tests run only where `CI` is set, on a throwaway runner.
@@ -19,10 +19,15 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use axum::extract::Path as UrlPath;
+use axum::extract::{Path as UrlPath, Request};
 use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::IntoResponse;
+use sponsord_api::ErrorCode;
 use sponsord_onramp::test_support::{FakeOptions, Fakes, app_state_with_options, test_config};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -92,7 +97,7 @@ fn powershell(command: &str) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
-/// Publish `<root>/decdn/releases/download/v0.2.0/` with the stub in a zip
+/// Publish `<root>/decdn/releases/download/v0.3.0/` with the stub in a zip
 /// per Windows target, and return the `SHA256SUMS` digest.
 fn publish(root: &Path) -> String {
     let stage = root.join("stage");
@@ -106,12 +111,12 @@ fn publish(root: &Path) -> String {
         .unwrap();
     assert!(status.success(), "rustc stub");
 
-    let dir = root.join("decdn/releases/download/v0.2.0");
+    let dir = root.join("decdn/releases/download/v0.3.0");
     fs::create_dir_all(&dir).unwrap();
     powershell(&format!(
         "$ErrorActionPreference = 'Stop'; Set-Location -LiteralPath '{dir}'; \
          foreach ($t in 'x86_64', 'aarch64') {{ \
-           Compress-Archive -Force -LiteralPath '{exe}' -DestinationPath \"decdn-0.2.0-$t-pc-windows-msvc.zip\" }}; \
+           Compress-Archive -Force -LiteralPath '{exe}' -DestinationPath \"decdn-0.3.0-$t-pc-windows-msvc.zip\" }}; \
          $lines = Get-ChildItem *.zip | ForEach-Object {{ \
            (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower() + '  ' + $_.Name }}; \
          [IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS'), ($lines -join \"`n\") + \"`n\"); \
@@ -127,6 +132,8 @@ struct Fixture {
     script: PathBuf,
     onramp: String,
     fakes: Fakes,
+    /// `GET /v1/capability` requests still to answer with 429.
+    busy: Arc<AtomicUsize>,
 }
 
 impl Fixture {
@@ -161,7 +168,23 @@ impl Fixture {
             ..FakeOptions::default()
         })
         .await;
-        let app = sponsord_onramp::http::router(state);
+        let busy = Arc::new(AtomicUsize::new(0));
+        let left = Arc::clone(&busy);
+        let app = sponsord_onramp::http::router(state).layer(axum::middleware::from_fn(
+            move |req: Request, next: Next| {
+                let left = Arc::clone(&left);
+                async move {
+                    if req.uri().path() == "/v1/capability"
+                        && left
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok()
+                    {
+                        return ErrorCode::RateLimited.into_response();
+                    }
+                    next.run(req).await
+                }
+            },
+        ));
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -185,6 +208,7 @@ impl Fixture {
             script,
             onramp,
             fakes,
+            busy,
         }
     }
 
@@ -265,7 +289,7 @@ async fn get_passes_the_gate_and_resumes_a_failed_download_without_it() {
     let (ok, stdout, stderr) = fx.get(&args, "3").await;
     let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(!ok, "a failed decdn fails the run\n{both}");
-    assert!(stdout.contains("Installing decdn v0.2.0"), "{both}");
+    assert!(stdout.contains("Installing decdn v0.3.0"), "{both}");
     assert!(
         stdout.contains("Open this link to start the download:"),
         "{both}"
@@ -279,7 +303,7 @@ async fn get_passes_the_gate_and_resumes_a_failed_download_without_it() {
     let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(ok, "{both}");
     assert!(
-        stdout.contains("decdn v0.2.0 is already installed."),
+        stdout.contains("decdn v0.3.0 is already installed."),
         "{both}"
     );
     assert!(
@@ -308,6 +332,24 @@ async fn get_passes_the_gate_and_resumes_a_failed_download_without_it() {
         fs::read_to_string(fx.stub.join("keys")).unwrap().trim(),
         "1"
     );
+}
+
+#[tokio::test]
+async fn a_rate_limited_capability_check_is_retried() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    let fx = Fixture::new("rate_limited").await;
+    // The first check, before the gate link, and its first retry.
+    fx.busy.store(2, Ordering::SeqCst);
+
+    let (ok, stdout, stderr) = fx.get(&format!("'decdn:{HASH}/'"), "0").await;
+    let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(ok, "{both}");
+    assert_eq!(fx.busy.load(Ordering::SeqCst), 0, "{both}");
+    assert_eq!(both.matches("is busy; retrying").count(), 1, "{both}");
+    assert_eq!(fx.fakes.source.issued_count(), 1);
+    assert_eq!(fx.calls().len(), 1, "{:?}", fx.calls());
 }
 
 #[tokio::test]
