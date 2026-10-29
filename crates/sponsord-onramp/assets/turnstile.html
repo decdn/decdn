@@ -9,6 +9,8 @@
   body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 4rem auto; padding: 0 1rem; }
   #done { display: none; }
   #expired { display: none; }
+  #refused { display: none; color: #b00020; }
+  #busy { display: none; color: #b00020; }
   #error { display: none; color: #b00020; }
 </style>
 </head>
@@ -20,7 +22,9 @@
 
 <p id="done">You can return to your terminal.</p>
 <p id="expired">This key's allowance has expired and cannot be renewed. Start the download again with a fresh key.</p>
-<p id="error">Something went wrong. Please refresh and try again.</p>
+<p id="refused">Verification was not accepted. Please refresh and try again.</p>
+<p id="busy">Too many attempts. Wait a minute, then refresh and try again.</p>
+<p id="error">The service is having a problem. Please try again later.</p>
 
 <script>
   const CLIENT = "{{CLIENT}}";
@@ -36,6 +40,10 @@
           document.getElementById("done").style.display = "block";
         } else if (resp.status === 409) {
           document.getElementById("expired").style.display = "block";
+        } else if (resp.status === 403) {
+          document.getElementById("refused").style.display = "block";
+        } else if (resp.status === 429) {
+          document.getElementById("busy").style.display = "block";
         } else {
           document.getElementById("error").style.display = "block";
         }
