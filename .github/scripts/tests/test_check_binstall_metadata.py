@@ -40,7 +40,7 @@ pkg-fmt = "tgz"
 bin-dir = "{ bin }{ binary-ext }"
 disabled-strategies = ["quick-install"]
 
-[package.metadata.binstall.overrides.'cfg(target_os = "windows")']
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
 pkg-url = "{ repo }/releases/download/v{ version }/tool-{ version }-{ target }.zip"
 pkg-fmt = "zip"
 """
@@ -82,9 +82,29 @@ jobs:
       - uses: actions/checkout@v7
         with:
           target: not-a-matrix-row
-  upload-assets:
+{archive_steps}  upload-assets:
     runs-on: ubuntu-latest
 """
+
+# release.yml's archive steps, which name each archive and lay it out.
+ARCHIVE_STEPS = """\
+      - run: |
+          for build in $BUILDS; do
+            bin="${build#*:}"
+            tar czf "${bin}-${VERSION}-${TARGET}.tar.gz" -C "target/$TARGET/release" "$bin"
+          done
+      - shell: pwsh
+        run: |
+          foreach ($build in $env:BUILDS -split ' ') {
+            $bin = ($build -split ':')[1]
+            Compress-Archive -Path "target/$env:TARGET/release/$bin.exe" `
+              -DestinationPath "$bin-$env:VERSION-$env:TARGET.zip"
+          }
+"""
+
+
+def workflow(builds: str = "tool-cli:tool", archive_steps: str = ARCHIVE_STEPS) -> str:
+    return WORKFLOW.format(builds=builds, archive_steps=archive_steps)
 
 
 def make_repo(
@@ -92,7 +112,7 @@ def make_repo(
     *,
     binstall: str = BINSTALL,
     builds: str = "tool-cli:tool",
-    workflow: str | None = None,
+    text: str | None = None,
     extra_members: dict[str, str] | None = None,
 ) -> Path:
     members = ["crates/tool", *(f"crates/{d}" for d in (extra_members or {}))]
@@ -106,7 +126,7 @@ def make_repo(
         (tmp_path / "crates" / directory / "Cargo.toml").write_text(manifest)
     wf = tmp_path / ".github/workflows/release.yml"
     wf.parent.mkdir(parents=True)
-    wf.write_text(workflow if workflow is not None else WORKFLOW.format(builds=builds))
+    wf.write_text(text if text is not None else workflow(builds))
     return tmp_path
 
 
@@ -145,7 +165,7 @@ def test_a_matching_crate_passes(tmp_path):
 
 
 def test_the_line_reader_skips_comments_and_stops_at_steps(tmp_path):
-    builds, errors = cbm.parse_build_matrix(WORKFLOW.format(builds="tool-cli:tool"))
+    builds, errors = cbm.parse_build_matrix(workflow())
     assert errors == []
     assert [b.target for b in builds] == ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
     assert builds[1].archive == "zip"
@@ -186,13 +206,19 @@ def test_a_missing_windows_override_fails(tmp_path):
     assert errors_containing(windows, "`pkg-fmt` resolves to 'tgz'")
 
 
-def test_an_exact_target_override_beats_cfg(tmp_path):
-    binstall = (
-        BINSTALL
-        + """
-[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
-pkg-fmt = "tgz"
-"""
+def test_a_cfg_override_is_refused_once_per_crate(tmp_path):
+    binstall = BINSTALL.replace(
+        "overrides.x86_64-pc-windows-msvc]", "overrides.'cfg(target_os = \"windows\")']"
+    )
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert len(errors_containing(errors, "key overrides by exact target triple")) == 1
+    # And the guard models what an older binstall does: the base settings.
+    assert errors_containing(errors, "(x86_64-pc-windows-msvc): binstall `pkg-fmt` resolves to")
+
+
+def test_a_misspelled_override_triple_leaves_the_target_on_the_base(tmp_path):
+    binstall = BINSTALL.replace(
+        "overrides.x86_64-pc-windows-msvc]", "overrides.x86_64-pc-windows-msv]"
     )
     errors = cbm.check(make_repo(tmp_path, binstall=binstall))
     assert errors_containing(
@@ -200,16 +226,26 @@ pkg-fmt = "tgz"
     )
 
 
-def test_an_unevaluable_cfg_override_is_refused(tmp_path):
+def test_an_override_for_an_unbuilt_target_is_ignored(tmp_path):
     binstall = (
         BINSTALL
         + """
-[package.metadata.binstall.overrides.'cfg(all(windows, target_arch = "aarch64"))']
-pkg-fmt = "zip"
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "nowhere"
 """
     )
+    assert cbm.check(make_repo(tmp_path, binstall=binstall)) == []
+
+
+def test_an_override_merges_with_the_base_key_by_key(tmp_path):
+    # The override sets pkg-url and pkg-fmt correctly; its bad bin-dir must
+    # still be caught, and only for the target it applies to.
+    binstall = BINSTALL.replace(
+        'pkg-fmt = "zip"\n', 'pkg-fmt = "zip"\nbin-dir = "tool-{ target }/{ bin }{ binary-ext }"\n'
+    )
     errors = cbm.check(make_repo(tmp_path, binstall=binstall))
-    assert errors_containing(errors, "only exact targets and cfg(target_os")
+    assert len(errors) == 1, errors
+    assert errors_containing(errors, "(x86_64-pc-windows-msvc): binstall `bin-dir` resolves to")
 
 
 def test_a_bin_dir_inside_a_folder_fails(tmp_path):
@@ -233,7 +269,75 @@ def test_an_unknown_placeholder_fails(tmp_path):
     errors = cbm.check(
         make_repo(tmp_path, binstall=BINSTALL.replace("{ target }.tar.gz", "{ triple }.tar.gz"))
     )
-    assert errors_containing(errors, "unknown placeholder 'triple'")
+    assert errors_containing(errors, "uses placeholder 'triple', which binstall does not offer")
+
+
+def test_bin_in_pkg_url_is_refused(tmp_path):
+    # Renders to the right URL, but binstall offers `pkg-url` no `{ bin }`: it
+    # fails to render the template and compiles from source.
+    binstall = BINSTALL.replace("tool-{ version }", "{ bin }-{ version }")
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert len(errors_containing(errors, "`pkg-url` uses placeholder 'bin'")) == 2, errors
+
+
+def test_an_archive_placeholder_in_bin_dir_is_refused(tmp_path):
+    binstall = BINSTALL.replace('"{ bin }{ binary-ext }"', '"{ bin }{ archive-suffix }"')
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert len(errors_containing(errors, "`bin-dir` uses placeholder 'archive-suffix'")) == 2
+
+
+def test_format_in_bin_dir_is_the_binary_extension(tmp_path):
+    binstall = BINSTALL.replace('"{ bin }{ binary-ext }"', '"{ bin }{ format }"')
+    assert cbm.check(make_repo(tmp_path, binstall=binstall)) == []
+
+
+def test_a_tgz_archive_format_may_be_spelled_tar_gz(tmp_path):
+    # binstall tries both `tgz` and `tar.gz` as the format of a tgz archive.
+    binstall = BINSTALL.replace("{ target }.tar.gz", "{ target }.{ archive-format }", 1)
+    assert cbm.check(make_repo(tmp_path, binstall=binstall)) == []
+
+
+@pytest.mark.parametrize("key", ["pkg-url", "pkg-fmt", "bin-dir"])
+def test_a_missing_base_key_fails(tmp_path, key):
+    binstall = (
+        "\n".join(
+            line for line in BINSTALL.split("\n\n")[0].splitlines() if not line.startswith(key)
+        )
+        + "\n"
+        + BINSTALL.split("\n\n", 1)[1]
+    )
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    missing = errors_containing(errors, f"binstall `{key}` is not set")
+    # The Windows override still sets pkg-url and pkg-fmt.
+    assert len(missing) == (2 if key == "bin-dir" else 1), errors
+    assert errors_containing(missing, "(x86_64-unknown-linux-gnu)")
+
+
+def test_disabled_strategies_as_a_string_fails(tmp_path):
+    binstall = BINSTALL.replace('["quick-install"]', '"quick-install"')
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert errors_containing(errors, "`disabled-strategies` must be a list")
+
+
+def test_an_empty_matrix_fails(tmp_path):
+    text = "jobs:\n  build-binaries:\n    strategy:\n      matrix:\n        include:\n" + (
+        "    steps:\n      - run: x\n"
+    )
+    # The reader finds no rows and no error; check() is what refuses it.
+    assert cbm.parse_build_matrix(text) == ([], [])
+    errors = cbm.check(make_repo(tmp_path, text=text))
+    assert errors_containing(errors, "matrix is empty; checked nothing")
+
+
+@pytest.mark.parametrize("line", cbm.ARCHIVE_STEP_LINES)
+def test_a_changed_archive_step_fails(tmp_path, line):
+    steps = "\n".join(
+        raw.replace(line, "echo renamed") if raw.strip() == line else raw
+        for raw in ARCHIVE_STEPS.split("\n")
+    )
+    assert steps != ARCHIVE_STEPS
+    errors = cbm.check(make_repo(tmp_path, text=workflow(archive_steps=steps)))
+    assert errors_containing(errors, f"no longer contains the archive step line {line!r}"), errors
 
 
 def test_a_binary_the_crate_does_not_build_fails(tmp_path):
@@ -265,7 +369,7 @@ pkg-url = "x"
 
 
 @pytest.mark.parametrize(
-    "workflow, needle",
+    "text, needle",
     [
         ("jobs:\n  other:\n    runs-on: x\n", "no `build-binaries` job"),
         ("jobs:\n  build-binaries:\n    runs-on: x\n", "has no `matrix.include`"),
@@ -281,21 +385,21 @@ pkg-url = "x"
         ),
     ],
 )
-def test_an_unreadable_matrix_fails(tmp_path, workflow, needle):
-    errors = cbm.check(make_repo(tmp_path, workflow=workflow))
+def test_an_unreadable_matrix_fails(tmp_path, text, needle):
+    errors = cbm.check(make_repo(tmp_path, text=text))
     assert errors_containing(errors, needle), errors
 
 
 def test_an_unknown_archive_format_fails(tmp_path):
-    workflow = WORKFLOW.format(builds="tool-cli:tool").replace("archive: zip", "archive: 7z")
-    errors = cbm.check(make_repo(tmp_path, workflow=workflow))
+    text = workflow().replace("archive: zip", "archive: 7z")
+    errors = cbm.check(make_repo(tmp_path, text=text))
     assert errors_containing(errors, "archive '7z'")
 
 
 def test_a_flow_style_row_is_refused_not_skipped(tmp_path):
     # The Linux row is correct; the Windows row, if skipped, would go unchecked
     # and the check would pass.
-    workflow = WORKFLOW.format(builds="tool-cli:tool").replace(
+    text = workflow().replace(
         """          - target: x86_64-pc-windows-msvc
             runner: windows-latest
             builds: tool-cli:tool
@@ -304,7 +408,7 @@ def test_a_flow_style_row_is_refused_not_skipped(tmp_path):
         """          - {target: x86_64-pc-windows-msvc, builds: "tool-cli:tool", archive: zip}
 """,
     )
-    errors = cbm.check(make_repo(tmp_path, workflow=workflow))
+    errors = cbm.check(make_repo(tmp_path, text=text))
     assert errors_containing(errors, "is not a `key: value` scalar"), errors
 
 
@@ -317,23 +421,30 @@ ROW = (
 
 
 @pytest.mark.parametrize(
-    "lines",
+    "lines, offending",
     [
         # A key before the first row.
-        "          runner: ubuntu-latest\n" + ROW,
+        ("          runner: ubuntu-latest\n" + ROW, "runner: ubuntu-latest"),
         # A nested map under a row key.
-        ROW + "            env:\n              target: aarch64-apple-darwin\n",
+        (ROW + "            env:\n              target: aarch64-apple-darwin\n", "env:"),
         # A block scalar.
-        ROW.replace("builds: tool-cli:tool", "builds: >-\n              tool-cli:tool"),
+        (
+            ROW.replace("builds: tool-cli:tool", "builds: >-\n              tool-cli:tool"),
+            "builds: >-",
+        ),
         # A flow sequence.
-        ROW.replace("builds: tool-cli:tool", "builds: [tool-cli:tool]"),
+        (
+            ROW.replace("builds: tool-cli:tool", "builds: [tool-cli:tool]"),
+            "builds: [tool-cli:tool]",
+        ),
         # A key indented off the row's keys.
-        ROW + "              archive: zip\n",
+        (ROW + "              archive: zip\n", "archive: zip"),
         # A line that is not `key: value` at all.
-        ROW + "          - x86_64-apple-darwin\n",
+        (ROW + "          - x86_64-apple-darwin\n", "- x86_64-apple-darwin"),
     ],
     ids=["key-before-row", "nested-map", "block-scalar", "flow-seq", "off-indent", "bare-item"],
 )
-def test_an_unsupported_include_line_is_refused(lines):
+def test_an_unsupported_include_line_is_refused(lines, offending):
     _, errors = cbm.parse_build_matrix(MATRIX_HEAD + lines + "    steps:\n      - run: x\n")
-    assert errors_containing(errors, "is not a `key: value` scalar"), errors
+    # Each case names its own line, so it passes through the check it names.
+    assert errors_containing(errors, f"line {offending!r} is not a `key: value` scalar"), errors

@@ -165,8 +165,9 @@ pub enum Command {
     Appeal(AppealArgs),
     /// Replace this binary with the latest signed release. The release's
     /// `SHA256SUMS.minisig` must verify against a minisign key this build
-    /// embeds; a binary `cargo install` placed, or one in a directory this
-    /// user cannot write, is refused with the command to run instead.
+    /// embeds; a binary in a cargo bin directory (`cargo install`,
+    /// `cargo binstall`), or one in a directory this user cannot write, is
+    /// refused with the command to run instead.
     SelfUpdate(SelfUpdateArgs),
 }
 

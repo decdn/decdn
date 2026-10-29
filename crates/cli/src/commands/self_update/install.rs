@@ -43,10 +43,13 @@ pub(crate) fn classify(
     }
 }
 
-/// The directories `cargo install` and `cargo binstall` write binaries to:
-/// `~/.cargo/bin`, and `$CARGO_HOME/bin` and `$CARGO_INSTALL_ROOT/bin` when
-/// set. Each one that exists is canonicalised, so it compares with the
-/// canonical path of the running binary even through a symlinked cargo home.
+/// The bin directories a default `cargo install` or `cargo binstall` lands
+/// in: `$CARGO_INSTALL_ROOT/bin`, else `$CARGO_HOME/bin`, else `~/.cargo/bin`.
+/// All of them are returned, since the environment at install time is not
+/// known. An install under `--root`, cargo's `install.root` or binstall's
+/// `--install-path` is not recognised. Each one that exists is canonicalised,
+/// so it compares with the canonical path of the running binary even through
+/// a symlinked cargo home.
 pub(crate) fn cargo_bin_dirs(
     home: &Path,
     cargo_home: Option<&Path>,

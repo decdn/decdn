@@ -3,26 +3,42 @@
 
 `cargo binstall <crate>` reads `[package.metadata.binstall]` from the manifest
 published on crates.io and downloads the archive its `pkg-url` names. The
-archives themselves are named by release.yml's `build-binaries` matrix:
-`<binary>-<version>-<target>.<archive>`, attached to the tag `v<version>`.
-Nothing links the two. A renamed archive, a new target or a new binary still
-releases green, and binstall then 404s; with `quick-install` disabled it
-compiles from source, so the only symptom is a slow install.
+archives themselves are named by release.yml's `build-binaries` job:
+`<binary>-<version>-<target>.<archive>`, with the binary at the archive root,
+attached to the tag `v<version>`. Nothing else links the two. A renamed
+archive, a moved binary or a new archive format still releases green; binstall
+then fails to find the archive and, with `quick-install` disabled, compiles
+from source, so the only symptom is a slow install. A binary crate with no
+metadata at all falls through to cargo-quickinstall's third-party build.
 
 For every `package:binary` pair the matrix builds, on every target it builds:
 
 * the package is a workspace member with a `[[bin]]` of that name (or no
   `[[bin]]` and the package's own name), and it carries
   `[package.metadata.binstall]`;
-* `pkg-url`, with the target's override applied (an exact target key wins over
-  `cfg(target_os = "…")`; any other key is refused, since this check cannot
-  evaluate it), renders to
+* `pkg-url`, with the target's override applied, renders to
   `<repository>/releases/download/v<version>/<binary>-<version>-<target>.<archive>`;
 * `pkg-fmt` is `tgz` for a `tar.gz` archive and `zip` for a `zip`;
-* `bin-dir` renders to the bare binary, `.exe` on Windows: the archives carry
-  it at their root;
-* `disabled-strategies` includes `quick-install`, so binstall never falls back
-  to a third-party build.
+* `bin-dir` renders to the bare binary, `.exe` on Windows;
+* `disabled-strategies` is a list that includes `quick-install`, so binstall
+  never falls back to a third-party build unless the user overrides it with
+  `--strategies`.
+
+Each template is filled from the placeholders binstall offers that key, and no
+others: `pkg-url` has no `{ bin }`, `bin-dir` has no archive placeholders, and
+`{ format }` means the archive format in one and the binary extension in the
+other. An unknown placeholder is an error, as binstall fails to render it too.
+For a `tgz` archive binstall tries both `tgz` and `tar.gz` as the format, so
+either spelling passes.
+
+Overrides are keyed by exact target triples. A `cfg(…)` key is refused:
+cargo-binstall releases before cfg support ignore it, so those users would
+silently get the base settings. A key that names a target the matrix does not
+build is ignored, as binstall ignores it; the base settings are then checked
+for every built target.
+
+The archive steps of `build-binaries` must contain the lines that produce
+that name and layout (ARCHIVE_STEP_LINES), so a rename there fails here too.
 
 And the other way: a member with binstall metadata is built by the matrix.
 
@@ -49,9 +65,20 @@ import tomllib  # noqa: E402  (must follow the version guard)
 RELEASE_WORKFLOW = Path(".github/workflows/release.yml")
 BUILD_JOB = "build-binaries"
 PKG_FMT = {"tar.gz": "tgz", "zip": "zip"}
+# Every format spelling binstall tries for an archive, by release.yml archive.
+FORMAT_SPELLINGS = {"tar.gz": ("tgz", "tar.gz"), "zip": ("zip",)}
 OVERRIDABLE = ("pkg-url", "pkg-fmt", "bin-dir")
 PLACEHOLDER = re.compile(r"\{\s*([a-z-]+)\s*\}")
-CFG_TARGET_OS = re.compile(r'^cfg\(\s*target_os\s*=\s*"([a-z]+)"\s*\)$')
+# The lines in `build-binaries` that name each archive and put the bare binary
+# at its root, as `pkg-url` and `bin-dir` expect. `$bin` is the binary half of
+# a `package:binary` pair.
+ARCHIVE_STEP_LINES = (
+    'bin="${build#*:}"',
+    'tar czf "${bin}-${VERSION}-${TARGET}.tar.gz" -C "target/$TARGET/release" "$bin"',
+    "$bin = ($build -split ':')[1]",
+    'Compress-Archive -Path "target/$env:TARGET/release/$bin.exe" `',
+    '-DestinationPath "$bin-$env:VERSION-$env:TARGET.zip"',
+)
 
 
 @dataclass(frozen=True)
@@ -75,6 +102,38 @@ def _value(raw: str) -> str:
     return raw
 
 
+def job_lines(text: str) -> list[tuple[int, str]] | None:
+    """The `build-binaries` job's lines with their 1-based numbers, or None."""
+    lines = text.splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if re.fullmatch(rf"  {BUILD_JOB}:\s*", line)), None
+    )
+    if start is None:
+        return None
+    body: list[tuple[int, str]] = []
+    for lineno, line in enumerate(lines[start + 1 :], start + 2):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and _indent(line) <= 2:
+            break  # the next job
+        body.append((lineno, line))
+    return body
+
+
+def check_archive_steps(text: str) -> list[str]:
+    """An error for each ARCHIVE_STEP_LINES entry `build-binaries` lacks."""
+    body = job_lines(text)
+    if body is None:
+        return []  # parse_build_matrix reports the missing job
+    present = {line.strip() for _, line in body}
+    return [
+        f"{RELEASE_WORKFLOW}: `{BUILD_JOB}` no longer contains the archive step line "
+        f"{want!r}; binstall's `pkg-url` and `bin-dir` expect the archive name and layout "
+        "it produces. Change both together, then update ARCHIVE_STEP_LINES"
+        for want in ARCHIVE_STEP_LINES
+        if want not in present
+    ]
+
+
 def parse_build_matrix(text: str) -> tuple[list[Build], list[str]]:
     """The `build-binaries` job's `matrix.include` rows, and any parse errors.
 
@@ -84,23 +143,18 @@ def parse_build_matrix(text: str) -> tuple[list[Build], list[str]]:
     list, a block scalar, an empty value) is an error, never skipped: a row
     this reader passed over would leave its target unchecked.
     """
-    lines = text.splitlines()
     errors: list[str] = []
-    start = next(
-        (i for i, line in enumerate(lines) if re.fullmatch(rf"  {BUILD_JOB}:\s*", line)), None
-    )
-    if start is None:
+    body = job_lines(text)
+    if body is None:
         return [], [f"{RELEASE_WORKFLOW}: no `{BUILD_JOB}` job"]
 
     rows: list[dict[str, str]] = []
     include_indent: int | None = None
     key_indent: int | None = None  # where the current row's keys sit
-    for lineno, line in enumerate(lines[start + 1 :], start + 2):
+    for lineno, line in body:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if _indent(line) <= 2:
-            break  # the next job
         if include_indent is None:
             if stripped == "include:":
                 include_indent = _indent(line)
@@ -168,44 +222,31 @@ def workspace_members(repo_root: Path, manifest: dict) -> list[Path]:
     return members
 
 
-def target_os(target: str) -> str | None:
-    """The `target_os` cfg value of a target triple this matrix builds."""
-    if "-windows-" in target:
-        return "windows"
-    if target.endswith("-apple-darwin"):
-        return "macos"
-    if "-linux-" in target:
-        return "linux"
-    return None
-
-
 def render(template: str, values: dict[str, str]) -> str:
     """Fill binstall's `{ name }` placeholders; an unknown one raises KeyError."""
     return PLACEHOLDER.sub(lambda m: values[m.group(1)], template)
 
 
-def effective(binstall: dict, target: str) -> tuple[dict, list[str]]:
-    """The binstall settings for `target`, its override applied."""
+def pkg_url_values(common: dict[str, str], archive: str) -> list[dict[str, str]]:
+    """The placeholder sets binstall fills `pkg-url` from, one per format spelling."""
+    return [
+        {**common, "archive-format": fmt, "format": fmt, "archive-suffix": f".{fmt}"}
+        for fmt in FORMAT_SPELLINGS[archive]
+    ]
+
+
+def bin_dir_values(common: dict[str, str], bin_name: str) -> dict[str, str]:
+    """The placeholders binstall fills `bin-dir` from: `{ format }` is the binary extension."""
+    return {**common, "bin": bin_name, "format": common["binary-ext"]}
+
+
+def effective(binstall: dict, target: str) -> dict:
+    """The binstall settings for `target`: the base table, with the override keyed
+    by exactly `target` applied key by key."""
     settings = {k: binstall[k] for k in OVERRIDABLE if k in binstall}
-    errors: list[str] = []
-    exact: dict | None = None
-    by_os: dict | None = None
-    for key, override in binstall.get("overrides", {}).items():
-        m = CFG_TARGET_OS.match(key)
-        if key == target:
-            exact = override
-        elif m:
-            if m.group(1) == target_os(target):
-                by_os = override
-        elif "(" in key:
-            errors.append(
-                f'override {key!r}: only exact targets and cfg(target_os = "…") are '
-                "checked; write the override in one of those forms"
-            )
-    for override in (by_os, exact):  # exact last, so it wins
-        if override:
-            settings.update({k: override[k] for k in OVERRIDABLE if k in override})
-    return settings, errors
+    override = binstall.get("overrides", {}).get(target, {})
+    settings.update({k: override[k] for k in OVERRIDABLE if k in override})
+    return settings
 
 
 def check(repo_root: Path) -> list[str]:
@@ -213,8 +254,10 @@ def check(repo_root: Path) -> list[str]:
     workflow = repo_root / RELEASE_WORKFLOW
     if not workflow.is_file():
         return [f"{RELEASE_WORKFLOW}: not found"]
-    builds, parse_errors = parse_build_matrix(workflow.read_text())
+    text = workflow.read_text()
+    builds, parse_errors = parse_build_matrix(text)
     errors.extend(parse_errors)
+    errors.extend(check_archive_steps(text))
     if not builds:
         errors.append(f"{RELEASE_WORKFLOW}: the `{BUILD_JOB}` matrix is empty; checked nothing")
         return errors
@@ -244,13 +287,7 @@ def check(repo_root: Path) -> list[str]:
                 f"{', '.join(PKG_FMT)}"
             )
             continue
-        os_name = target_os(build.target)
-        if os_name is None:
-            errors.append(
-                f"{RELEASE_WORKFLOW}: matrix row {build.target}: unknown target_os; "
-                "teach target_os() this triple"
-            )
-            continue
+        ext = ".exe" if "-windows-" in build.target else ""
         for package, binary in build.builds:
             built.add(package)
             if package not in manifests:
@@ -274,13 +311,14 @@ def check(repo_root: Path) -> list[str]:
                     "[package.metadata.binstall]; `cargo binstall` would not find them"
                 )
                 continue
-            if "quick-install" not in binstall.get("disabled-strategies", []):
+            strategies = binstall.get("disabled-strategies", [])
+            if not isinstance(strategies, list) or "quick-install" not in strategies:
                 errors.append(
-                    f'{rel}: binstall `disabled-strategies` must include "quick-install"; '
-                    "otherwise a missing archive installs a third-party build"
+                    f"{rel}: binstall `disabled-strategies` must be a list that includes "
+                    '"quick-install"; otherwise a missing archive installs a third-party '
+                    "build (and a non-list fails to parse in binstall)"
                 )
-            settings, override_errors = effective(binstall, build.target)
-            errors.extend(f"{rel}: {e}" for e in override_errors)
+            settings = effective(binstall, build.target)
 
             package_table = manifest["package"]
             repository = package_table.get("repository")
@@ -289,48 +327,57 @@ def check(repo_root: Path) -> list[str]:
             if not isinstance(repository, str):
                 errors.append(f"{rel}: no `repository`, so binstall's {{ repo }} is empty")
                 continue
-            ext = ".exe" if os_name == "windows" else ""
-            values = {
+            common = {
                 "repo": repository.rstrip("/"),
                 "name": package,
                 "version": version,
                 "target": build.target,
-                "bin": binary,
                 "binary-ext": ext,
-                "archive-format": archive_fmt,
-                "archive-suffix": f".{build.archive}",
-                "format": archive_fmt,
             }
             expected = {
                 "pkg-url": (
-                    f"{values['repo']}/releases/download/v{version}/"
-                    f"{binary}-{version}-{build.target}.{build.archive}"
+                    f"{common['repo']}/releases/download/v{version}/"
+                    f"{binary}-{version}-{build.target}.{build.archive}",
+                    pkg_url_values(common, build.archive),
                 ),
-                "pkg-fmt": archive_fmt,
-                "bin-dir": f"{binary}{ext}",
+                "pkg-fmt": (archive_fmt, [{}]),
+                "bin-dir": (f"{binary}{ext}", [bin_dir_values(common, binary)]),
             }
-            for key, want in expected.items():
+            for key, (want, value_sets) in expected.items():
                 template = settings.get(key)
                 if template is None:
                     errors.append(f"{where}: binstall `{key}` is not set")
                     continue
                 try:
-                    got = render(template, values)
+                    got = [render(template, values) for values in value_sets]
                 except KeyError as e:
-                    errors.append(f"{where}: binstall `{key}` uses unknown placeholder {e}")
-                    continue
-                if got != want:
                     errors.append(
-                        f"{where}: binstall `{key}` resolves to {got!r}, but release.yml "
+                        f"{where}: binstall `{key}` uses placeholder {e}, which binstall does "
+                        "not offer that key"
+                    )
+                    continue
+                if want not in got:
+                    errors.append(
+                        f"{where}: binstall `{key}` resolves to {got[0]!r}, but release.yml "
                         f"ships {want!r}"
                     )
 
     for name, (rel, manifest) in sorted(manifests.items()):
-        if "binstall" in manifest.get("package", {}).get("metadata", {}) and name not in built:
+        binstall = manifest.get("package", {}).get("metadata", {}).get("binstall")
+        if binstall is None:
+            continue
+        if name not in built:
             errors.append(
                 f"{rel}: has [package.metadata.binstall] but release.yml's `{BUILD_JOB}` "
                 "matrix builds no archive for it"
             )
+        for key in binstall.get("overrides", {}):
+            if key.startswith("cfg("):
+                errors.append(
+                    f"{rel}: binstall override {key!r}: key overrides by exact target triple; "
+                    "cargo-binstall releases before cfg support ignore a cfg(…) key and use "
+                    "the base settings"
+                )
     return errors
 
 
