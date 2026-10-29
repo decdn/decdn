@@ -39,6 +39,9 @@ pub struct KnownChain {
     /// `eth_getLogs` takes L2 numbers. Update it with the manifest on a
     /// redeploy, from the earliest contract creation block on the explorer.
     pub l2_start_block: u64,
+    /// Where an operator gets this chain's payment token, for a chain that has
+    /// a public faucet. `decdn setup` points an unfunded buyer wallet here.
+    pub usdc_faucet: Option<&'static str>,
     /// The embedded `deployments/<chainId>.json` manifest — the sole source of
     /// this chain's contract addresses.
     manifest_json: &'static str,
@@ -54,6 +57,7 @@ pub const KNOWN_CHAINS: &[KnownChain] = &[KnownChain {
     chain_id: 421_614,
     public_rpc: "https://sepolia-rollup.arbitrum.io/rpc",
     l2_start_block: 310_903_026,
+    usdc_faucet: Some("https://faucet.circle.com"),
     manifest_json: include_str!("../deployments/421614.json"),
 }];
 

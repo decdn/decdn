@@ -941,7 +941,7 @@ fn pull_through_line(pull_through: Option<&decdn_common::admin::PullThroughStatu
 /// decimals (ADR 003), so 1 USDC == `1_000_000` micro-USDC. Trailing
 /// fractional zeros are kept fixed-width (six places) so columns align and
 /// a script parsing the value sees a stable shape.
-fn format_usdc(micro: u64) -> String {
+pub(crate) fn format_usdc(micro: u64) -> String {
     let whole = micro / 1_000_000;
     let frac = micro % 1_000_000;
     format!("{whole}.{frac:06}")

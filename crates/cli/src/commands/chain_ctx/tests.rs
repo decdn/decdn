@@ -85,6 +85,7 @@ fn file_with(bc: FileBlockchain) -> FileConfig {
         blockchain: Some(bc),
         identity: None,
         network: None,
+        cache: None,
     }
 }
 
@@ -92,6 +93,42 @@ fn file_with(bc: FileBlockchain) -> FileConfig {
 fn bind_port_reads_the_network_section() {
     let file: FileConfig = toml::from_str("[network]\nbind_port = 5000\n").unwrap();
     assert_eq!(file.network.and_then(|n| n.bind_port), Some(5000));
+}
+
+/// Pull-through resolves by the daemon's role rule: on with no origin, off with
+/// one, and an explicit value wins either way. Both origin forms count.
+#[test]
+fn pull_through_follows_the_role_rule() {
+    let parse = |body: &str| toml::from_str::<FileConfig>(body).unwrap().pull_through();
+    assert!(parse(""), "no [cache] at all is a cache node");
+    assert!(parse("[cache]\ncache_size_mb = 10\n"), "no origin");
+    assert!(!parse("[cache.origin]\nkind = \"fs\"\npath = \"/o\"\n"));
+    assert!(!parse("[[cache.origins]]\nkind = \"fs\"\npath = \"/o\"\n"));
+    assert!(parse(
+        "[cache]\nnode_to_node_pull_through_enabled = true\n[cache.origin]\nkind = \"fs\"\n"
+    ));
+    assert!(!parse(
+        "[cache]\nnode_to_node_pull_through_enabled = false\n"
+    ));
+}
+
+/// The origin tables are read for presence only: a shape the full resolver
+/// would reject still parses here and still counts as an origin.
+#[test]
+fn pull_through_ignores_the_origin_tables_contents() {
+    let file: FileConfig = toml::from_str("[cache]\norigin = 7\n").unwrap();
+    assert!(!file.pull_through());
+}
+
+#[test]
+fn buyer_working_deposit_defaults_and_reads_the_file() {
+    assert_eq!(
+        FileConfig::default().buyer_working_deposit_micro_usdc(),
+        decdn_common::config::DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC
+    );
+    let file: FileConfig =
+        toml::from_str("[blockchain]\nbuyer_working_deposit_micro_usdc = 2500000\n").unwrap();
+    assert_eq!(file.buyer_working_deposit_micro_usdc(), 2_500_000);
 }
 
 #[test]
@@ -110,6 +147,7 @@ fn flags_override_config() {
         slash_appeal_address: None,
         payment_pool_address: None,
         get_logs_max_block_span: None,
+        buyer_working_deposit_micro_usdc: None,
     });
     let r = resolve(&chain, &file).unwrap();
     assert_eq!(r.rpc_url, "http://flag:8545");
@@ -130,6 +168,7 @@ fn config_fills_unset_flags() {
         slash_appeal_address: None,
         payment_pool_address: None,
         get_logs_max_block_span: None,
+        buyer_working_deposit_micro_usdc: None,
     });
     let r = resolve(&chain, &file).unwrap();
     assert_eq!(r.rpc_url, "http://config:8545");
@@ -152,6 +191,7 @@ fn keystore_defaults_under_data_dir() {
         slash_appeal_address: None,
         payment_pool_address: None,
         get_logs_max_block_span: None,
+        buyer_working_deposit_micro_usdc: None,
     });
     let r = resolve(&chain, &file).unwrap();
     assert_eq!(r.keystore, PathBuf::from("/tmp/decdn-test/keystore.json"));
@@ -288,6 +328,7 @@ fn resolve_publish_flag_beats_config() {
         slash_appeal_address: None,
         payment_pool_address: None,
         get_logs_max_block_span: None,
+        buyer_working_deposit_micro_usdc: None,
     });
     let r = resolve_publish(&args, &file).unwrap();
     assert_eq!(r.rpc_url, "http://flag:8545");

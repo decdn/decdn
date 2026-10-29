@@ -4481,6 +4481,15 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: `decdn setup` checks the buyer wallet's USDC on a pull-through node
+  (#2676).** A node with pull-through on buys its cache misses from peers and
+  escrows `blockchain.buyer_working_deposit_micro_usdc` (10 USDC by default)
+  in a `PaymentPool` pool. Setup now prints a `buyer_usdc` pre-flight row with
+  the working deposit and the wallet's USDC (`PaymentPool.usdc()`). Below the
+  deposit, the row warns with the shortfall, the address to fund and, on the
+  testnet, the USDC faucet. The row never fails the run. `--json` reports it as
+  `preflight.buyer_usdc`, `null` when pull-through is off. The keyless dry run
+  prints it too.
 - **Node: metrics for the settlement re-anchor path (#2710).** The settlement
   watcher re-reads each pool that it seeded from one `getPool` after a restart,
   at a pinned block. Before, it reported the outcomes only in logs, so a pool

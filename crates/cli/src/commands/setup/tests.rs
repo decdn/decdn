@@ -129,6 +129,7 @@ fn pf_with(skew: Option<i64>, token: u64, shortfall: u64, native: u64, gas: u64)
         shortfall: U256::from(shortfall),
         native_balance: U256::from(native),
         gas_needed: U256::from(gas),
+        buyer_usdc: None,
     }
 }
 
@@ -170,6 +171,126 @@ fn all_ok_requires_every_blocking_check() {
     let mut pf = pf_with(Some(0), 100, 10, 100, 10);
     pf.signing_chain_id = 1;
     assert!(!pf.all_ok());
+}
+
+fn buyer(working_deposit: u64, balance: Result<u64, &str>) -> BuyerUsdc {
+    BuyerUsdc {
+        working_deposit,
+        balance: balance.map_err(str::to_owned),
+    }
+}
+
+/// The wallet must cover the whole working deposit; anything less, or an
+/// unread balance, warns. The row never fails.
+#[test]
+fn buyer_usdc_status_warns_below_the_working_deposit() {
+    assert_eq!(buyer(10, Ok(10)).status(), CheckStatus::Ok);
+    assert_eq!(buyer(10, Ok(11)).status(), CheckStatus::Ok);
+    assert_eq!(buyer(10, Ok(9)).status(), CheckStatus::Warn);
+    assert_eq!(buyer(10, Ok(0)).status(), CheckStatus::Warn);
+    assert_eq!(buyer(10, Err("rpc down")).status(), CheckStatus::Warn);
+    assert_eq!(buyer(10, Ok(4)).shortfall(), Some(6));
+    assert_eq!(buyer(10, Ok(40)).shortfall(), Some(0));
+    assert_eq!(buyer(10, Err("rpc down")).shortfall(), None);
+}
+
+/// An unfunded buyer wallet warns but does not gate the live run: the node
+/// serves without it.
+#[test]
+fn all_ok_ignores_an_unfunded_buyer_wallet() {
+    let mut pf = pf_with(Some(0), 100, 10, 100, 10);
+    pf.buyer_usdc = Some(buyer(10_000_000, Ok(0)));
+    assert!(pf.all_ok());
+    pf.buyer_usdc = Some(buyer(10_000_000, Err("rpc down")));
+    assert!(pf.all_ok());
+}
+
+/// The shortfall row names the deposit, the balance, the shortfall, where to
+/// send USDC and the faucet: what the operator needs to fund the node.
+#[test]
+fn buyer_usdc_detail_names_the_shortfall_and_the_funding_pointer() {
+    let operator = Address::repeat_byte(0x42);
+    let detail = buyer_usdc_detail(
+        &buyer(10_000_000, Ok(2_500_000)),
+        Some(operator),
+        Some("https://faucet.example"),
+    );
+    assert!(
+        detail.contains("working deposit 10.000000 USDC"),
+        "{detail}"
+    );
+    assert!(detail.contains("hold 2.500000"), "{detail}");
+    assert!(detail.contains("short 7.500000"), "{detail}");
+    assert!(detail.contains(&format!("{operator:#x}")), "{detail}");
+    assert!(
+        detail.contains("(faucet: https://faucet.example)"),
+        "{detail}"
+    );
+
+    // An unknown chain has no faucet; the keyless run has no address yet.
+    let detail = buyer_usdc_detail(&buyer(10_000_000, Ok(0)), None, None);
+    assert!(detail.contains("short 10.000000"), "{detail}");
+    assert!(detail.contains("decdn whoami"), "{detail}");
+    assert!(!detail.contains("faucet"), "{detail}");
+
+    let funded = buyer_usdc_detail(&buyer(10_000_000, Ok(10_000_000)), Some(operator), None);
+    assert_eq!(
+        funded,
+        "pull-through on: working deposit 10.000000 USDC, hold 10.000000"
+    );
+
+    let unread = buyer_usdc_detail(&buyer(10_000_000, Err("rpc down")), Some(operator), None);
+    assert!(
+        unread.contains("could not read the wallet's USDC (rpc down)"),
+        "{unread}"
+    );
+}
+
+/// `preflight.buyer_usdc` is `null` with pull-through off, and otherwise
+/// carries the deposit, the balance, the shortfall, `ok`, and the read error.
+#[test]
+fn build_summary_reports_the_buyer_usdc_row() {
+    let summary = |pf: &Preflight| {
+        build_summary(
+            pf,
+            false,
+            &sample_plan(),
+            &bond::Outcome::default(),
+            None,
+            true,
+            None,
+            None,
+            None,
+            "US",
+            0,
+        )
+    };
+    let mut pf = pf_with(None, 0, 0, 0, 0);
+    assert!(summary(&pf)["preflight"]["buyer_usdc"].is_null());
+
+    pf.buyer_usdc = Some(buyer(10_000_000, Ok(4_000_000)));
+    assert_eq!(
+        summary(&pf)["preflight"]["buyer_usdc"],
+        serde_json::json!({
+            "working_deposit_micro_usdc": 10_000_000,
+            "balance_micro_usdc": 4_000_000,
+            "shortfall_micro_usdc": 6_000_000,
+            "ok": false,
+            "error": null,
+        })
+    );
+
+    pf.buyer_usdc = Some(buyer(10_000_000, Err("rpc down")));
+    assert_eq!(
+        summary(&pf)["preflight"]["buyer_usdc"],
+        serde_json::json!({
+            "working_deposit_micro_usdc": 10_000_000,
+            "balance_micro_usdc": null,
+            "shortfall_micro_usdc": null,
+            "ok": false,
+            "error": "rpc down",
+        })
+    );
 }
 
 #[test]

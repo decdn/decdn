@@ -20,7 +20,8 @@ use decdn_incentive::eth_identity::{self, PasswordSource, PasswordUse, ResolvedP
 use serde::Deserialize;
 
 /// Partial deserializer for the TOML config — only the `[blockchain]`,
-/// `[identity]`, and `network.bind_port` fields these commands need.
+/// `[identity]`, `network.bind_port`, and `[cache]` pull-through fields these
+/// commands need.
 /// Deliberately partial (like `node.rs`'s `AdminPortConfig`) so an operator's
 /// typo in an unrelated section can't block onboarding; serde-toml ignores
 /// unknown fields.
@@ -29,6 +30,7 @@ pub struct FileConfig {
     blockchain: Option<FileBlockchain>,
     identity: Option<FileIdentity>,
     network: Option<FileNetwork>,
+    cache: Option<FileCache>,
 }
 
 impl FileConfig {
@@ -55,6 +57,26 @@ impl FileConfig {
             .and_then(|b| b.payment_pool_address.as_deref())
     }
 
+    /// `blockchain.buyer_working_deposit_micro_usdc`, or its default: what the
+    /// node escrows when it opens the pool its cache-miss pulls pay from.
+    pub fn buyer_working_deposit_micro_usdc(&self) -> u64 {
+        self.blockchain
+            .as_ref()
+            .and_then(|b| b.buyer_working_deposit_micro_usdc)
+            .unwrap_or(decdn_common::config::DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC)
+    }
+
+    /// Whether `cache.node_to_node_pull_through_enabled` resolves on, by the
+    /// daemon's rule ([`decdn_common::config::role_derived_pull_through`]):
+    /// the explicit value, else on exactly when no origin backend is set.
+    pub fn pull_through(&self) -> bool {
+        let cache = self.cache.as_ref();
+        decdn_common::config::role_derived_pull_through(
+            cache.and_then(|c| c.node_to_node_pull_through_enabled),
+            cache.is_some_and(|c| c.origin.is_some() || c.origins.is_some()),
+        )
+    }
+
     /// `blockchain.get_logs_max_block_span`, when the file sets it.
     pub fn get_logs_max_block_span(&self) -> Option<u64> {
         self.blockchain
@@ -68,6 +90,15 @@ struct FileNetwork {
     bind_port: Option<u16>,
 }
 
+/// The `[cache]` fields that decide pull-through. The origin tables are read
+/// for presence only, so a malformed origin cannot fail the parse.
+#[derive(Debug, Default, Deserialize)]
+struct FileCache {
+    node_to_node_pull_through_enabled: Option<bool>,
+    origin: Option<serde::de::IgnoredAny>,
+    origins: Option<serde::de::IgnoredAny>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct FileBlockchain {
     rpc_url: Option<String>,
@@ -79,6 +110,7 @@ struct FileBlockchain {
     slash_appeal_address: Option<String>,
     payment_pool_address: Option<String>,
     get_logs_max_block_span: Option<u64>,
+    buyer_working_deposit_micro_usdc: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

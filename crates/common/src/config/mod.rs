@@ -1952,12 +1952,10 @@ fn resolve_cache_into(
             usize::try_from(v).unwrap_or(usize::MAX)
         });
 
-    let node_to_node_pull_through_enabled = file
-        .and_then(|c| c.node_to_node_pull_through_enabled)
-        // Role-derived default: a node with no origin is a cache node and
-        // fills its misses from peers; an origin node serves its own content.
-        // Explicit config overrides either way.
-        .unwrap_or(origins.is_empty());
+    let node_to_node_pull_through_enabled = role_derived_pull_through(
+        file.and_then(|c| c.node_to_node_pull_through_enabled),
+        !origins.is_empty(),
+    );
     let relay_foreign_namespaces = file
         .and_then(|c| c.relay_foreign_namespaces)
         // Role-derived default: an origin node (a backend is configured) serves only
@@ -2172,6 +2170,21 @@ fn resolve_cache_into(
             warming_budget: se_warming_budget,
             warming_refill: se_warming_refill,
         },
+    }
+}
+
+/// Resolve `cache.node_to_node_pull_through_enabled` from its explicit value
+/// and whether the node has an origin backend. The default is role-derived: a
+/// node with no origin is a cache node and fills its misses from peers; an
+/// origin node serves its own content. An explicit value overrides either way.
+///
+/// `pub` so `decdn setup`, which reads a partial config rather than resolving
+/// the whole file, derives pull-through by the same rule as the daemon.
+#[must_use]
+pub const fn role_derived_pull_through(explicit: Option<bool>, has_origin: bool) -> bool {
+    match explicit {
+        Some(enabled) => enabled,
+        None => !has_origin,
     }
 }
 
