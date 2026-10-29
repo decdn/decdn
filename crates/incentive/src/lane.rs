@@ -684,7 +684,8 @@ impl LaneState {
     /// - signature recovers to `self.signer`
     /// - `voucher.amount > self.last_amount`
     /// - `voucher.bytes_delivered >= self.last_bytes_delivered`
-    /// - `voucher.amount <= self.cap`
+    /// - `voucher.amount <= self.cap`, and on a voucher that repeats the live
+    ///   root, `voucher.amount + verified_index × voucher.chunk_price <= self.cap`
     ///
     /// Expiry (`now < self.expiry`) is checked by the node handler, which holds
     /// the clock; this method is time-agnostic.
@@ -882,6 +883,17 @@ impl LaneState {
             // the root, and the handler has already refused a price that is not
             // this node's quote, so adopting it keeps the two in step.
             next.chain.chunk_price = signed.voucher.chunk_price;
+            // The kept frontier still counts toward the claim, so the cap binds
+            // `amount` plus the frontier at the adopted price, exactly as it
+            // binds a reveal ([`Self::advance_preimage`]). Checking `amount`
+            // alone would credit up to a whole chain past the cap.
+            let claimed = signed.voucher.amount.saturating_add(next.chain.accrued());
+            if claimed > self.cap {
+                return Err(PoolError::CapExceeded {
+                    cap: self.cap,
+                    got: claimed,
+                });
+            }
         } else {
             // The fold binds both axes (ADR 003 §Rollover): a voucher that pays
             // the whole claim but signs fewer bytes than the frontier proved
