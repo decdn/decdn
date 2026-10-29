@@ -8752,6 +8752,91 @@ async fn the_timestamp_gate_precedes_every_signed_refusal() -> anyhow::Result<()
     Ok(())
 }
 
+/// The timestamp gate also runs before the stale-chain refusal, which the node
+/// signs when it has not read the chain within its grace window. A skewed
+/// request resets with `TIMESTAMP_SKEW`; the same request with a fresh
+/// timestamp draws the signed `ChainStale` refusal. That refusal goes out as
+/// `NotFound`, so the `chain_stale` counter is what names it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_timestamp_gate_precedes_the_stale_chain_refusal() -> anyhow::Result<()> {
+    let payload = b"a blob behind a stale chain view".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, _owner, _deposit) = seeded_store()?;
+    let (target, server_ep, server_task, metrics) =
+        spawn_handler_server_with_stale_chain(cache, store).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let request_at = |timestamp_us| StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us,
+    };
+    expect_skew_reset(
+        &client_ep,
+        target.clone(),
+        &request_at(stale_timestamp_us()),
+        None,
+    )
+    .await?;
+    expect_signed_refusal(
+        &client_ep,
+        target,
+        &request_at(now_us()),
+        None,
+        StreamError::NotFound,
+    )
+    .await?;
+    support::assert_inbound_failures_attributed(&metrics, 2).await?;
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&text, "decdn_serve_stream_rejected_timestamp_skew_total 1")
+            && metric_line_present(&text, "decdn_serve_stream_rejected_chain_stale_total 1"),
+        "the skewed request counts only as a skew reset, the fresh one as a stale chain"
+    );
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// [`spawn_handler_server_with_metrics`] with a chain-freshness handle that is
+/// never stamped, so the handler reads its chain view as stale and refuses
+/// every request with a signed `ChainStale`.
+async fn spawn_handler_server_with_stale_chain(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_limited_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        16,
+        |deps| {
+            deps.chain_freshness = Some(decdn_node::chain_freshness::ChainFreshness::new(
+                Duration::from_mins(30),
+            ));
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_ep, server_task, metrics))
+}
+
 /// Send `req` and assert the node answers with a signed `ok: false`
 /// `StreamResponse` carrying `expected`.
 async fn expect_signed_refusal(
