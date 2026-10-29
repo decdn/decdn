@@ -12,25 +12,25 @@
 //!   1. A real on-chain `topUp` receipt. `decdn_client::buyer_pool::top_up`
 //!      submits and awaits `get_receipt()`; here that transaction actually mines
 //!      and raises the pool's escrow.
-//!   2. The upstream's chain-watcher lag. The serving seeder refuses to serve the
+//!   2. The upstream's chain-watcher lag. The serving provider refuses to serve the
 //!      resumed leg until ITS watcher observes the raised deposit
 //!      (`event_poll_interval_ms`, 500ms in this fixture), so the resume budget
 //!      is spent against a real watcher rather than an immediately-accepting
 //!      double.
 //!   3. The seller-side pre-serve deposit gate (#1518), which is what the whole
-//!      buyer↔seeder handshake rides through as the deposit is topped up.
+//!      buyer↔provider handshake rides through as the deposit is topped up.
 //!
 //! This is the FIRST node-to-node paid-pull top-up e2e; `cli_fetch_topup.rs` is
 //! its CLI-buyer twin. The topology mirrors `node_to_node_coalesce.rs` (a cold
 //! pull-through SERVER that holds nothing, satisfying a client miss only by a
-//! paid pull from a SEEDER that holds the blob), with two differences that force
+//! paid pull from a PROVIDER that holds the blob), with two differences that force
 //! the reactive branch:
 //!
 //!   * the SERVER's `buyer_working_deposit_micro_usdc` is shrunk BELOW the blob's
 //!     wire cost, so its upstream pull exhausts the deposit mid-stream; and
 //!   * both hops price at the same rate, because the ADR 041 buy-margin gate
 //!     (`serve_economics.policy = "margin"`, the default) caps the SERVER's
-//!     upstream buy at its own sell rate — a higher seeder rate is refused as
+//!     upstream buy at its own sell rate — a higher provider rate is refused as
 //!     below-margin, so the CLI test's `HIGH_RATE` trick does not transfer to the
 //!     node-to-node leg. The blob is made expensive by size, not by an
 //!     asymmetric rate.
@@ -77,10 +77,10 @@ const CHUNK_GROUP: usize = 16 * 1024;
 /// 0.001 USDC/MB (1000 µUSDC/MB, at the wire cap `MAX_RATE_PER_MB`), priced
 /// identically on BOTH hops. The ADR 041 buy-margin gate
 /// (`serve_economics.policy = "margin"`, the default) caps the SERVER's upstream
-/// buy at its own sell rate, so an equal seeder rate clears the gate in the
+/// buy at its own sell rate, so an equal provider rate clears the gate in the
 /// market regime while a higher one would be refused as below-margin.
 ///
-/// The rate, the seeder's refundable floor `M` ([`SEEDER_MIN_REMAINING`]), and
+/// The rate, the provider's refundable floor `M` ([`PROVIDER_MIN_REMAINING`]), and
 /// the SERVER's working deposit ([`SERVER_WORKING_DEPOSIT`]) are sized together
 /// under `MAX_RATE_PER_MB` (1000) so the open-gate and exhaust-mid-blob
 /// inequalities hold for this node-to-node exhaust-mid-pull scenario.
@@ -89,12 +89,12 @@ const RATE_PER_MB: u64 = 1000;
 /// The SERVER's node-to-node buyer working deposit, shrunk to 8000 `µUSDC` — far
 /// below the blob's ~9040 `µUSDC` wire cost, so the upstream pull exhausts it
 /// mid-stream and one funding recovery step tops it up: the top-up restores the
-/// working deposit, which covers the rest of the blob. Sized above the seeder's pre-serve floor with room
-/// to spare: the seeder admits the SERVER's pool only while `remaining − M` covers
+/// working deposit, which covers the rest of the blob. Sized above the provider's pre-serve floor with room
+/// to spare: the provider admits the SERVER's pool only while `remaining − M` covers
 /// the reserved credit window (#1518), and this journey sets `M` to
 /// [`POOL_MIN_REMAINING`] (2000 `µUSDC`), so the 6000 `µUSDC` of headroom
 /// (8000 − 2000) here also absorbs the several concurrent one-chunk floor
-/// reservations the gap-driven pull holds on the seeder side at once.
+/// reservations the gap-driven pull holds on the provider side at once.
 const SERVER_WORKING_DEPOSIT: u64 = 8_000;
 
 /// The refundable floor `M` for this journey, sized with the rate and deposit so
@@ -102,7 +102,7 @@ const SERVER_WORKING_DEPOSIT: u64 = 8_000;
 /// 8000 − 2000 = 6000 ≥ 1000. It is set on BOTH nodes,
 /// because `M` has two roles here that must agree at the same value:
 ///
-///   * On the SEEDER it is the seller-side pre-serve floor: the seeder admits the
+///   * On the PROVIDER it is the seller-side pre-serve floor: the provider admits the
 ///     SERVER's buyer pool only while `remaining − M` covers the reserved credit
 ///     window (#1518).
 ///   * On the SERVER it is its own seller-side floor, which this journey never
@@ -114,14 +114,14 @@ const SERVER_WORKING_DEPOSIT: u64 = 8_000;
 const POOL_MIN_REMAINING: u64 = 2_000;
 
 /// USDC (base units) minted to the SERVER operator so its buyer pool to the
-/// seeder can open at [`SERVER_WORKING_DEPOSIT`] and fund a full recovery top-up
+/// provider can open at [`SERVER_WORKING_DEPOSIT`] and fund a full recovery top-up
 /// with headroom to spare. Mirrors `node_to_node_coalesce.rs`.
 const SERVER_BUYER_USDC: u64 = 1_000_000_000;
 
 /// The blob under test: 9 MiB of content. At [`RATE_PER_MB`] its whole-blob wire
 /// cost (content + interleaved bao proof, ADR 038) is ~9040 `µUSDC` — strictly above
 /// the 8000 `µUSDC` working deposit, so the pull must top up. The buy clears the ADR
-/// 041 margin gate in the market regime: the SERVER checks the seeder's warming
+/// 041 margin gate in the market regime: the SERVER checks the provider's warming
 /// allowance (`serve_economics.warming_budget`, 5 USDC, starting full) before each
 /// pull run and debits it only after the run, and the warm-up's 1 MB debit
 /// (1000 `µUSDC`) leaves it positive when the blob's pull starts.
@@ -141,18 +141,18 @@ fn make_blob(len: usize) -> Vec<u8> {
     v
 }
 
-/// Poll the SEEDER's lane store for the buyer pool funded by the SERVER operator
+/// Poll the PROVIDER's lane store for the buyer pool funded by the SERVER operator
 /// and return its `pool_id`, so the journey can read the SERVER's upstream pool
-/// escrow on-chain. A lane appears only once the seeder has intaken the SERVER's
+/// escrow on-chain. A lane appears only once the provider has intaken the SERVER's
 /// first voucher (the warm-up delivery), so this resolves promptly after set-up.
 async fn server_upstream_pool_id(
-    seeder: &NodeFixture,
+    provider: &NodeFixture,
     server_operator: alloy::primitives::Address,
 ) -> anyhow::Result<B256> {
-    let admin = seeder.admin_client()?;
+    let admin = provider.admin_client()?;
     let payer_hex = server_operator.to_string();
     // A node buyer signs with its operator key, so find the lane by signer, then
-    // check the seeder names the same key as the pool's owner.
+    // check the provider names the same key as the pool's owner.
     let lane = decdn_e2e::poll(Duration::from_secs(30), || async {
         let resp = admin.lanes().await.context("admin lanes")?;
         Ok(resp
@@ -161,7 +161,7 @@ async fn server_upstream_pool_id(
             .find(|s| s.voucher_signer.eq_ignore_ascii_case(&payer_hex)))
     })
     .await?
-    .with_context(|| format!("seeder never reported a buyer lane signed by {payer_hex}"))?;
+    .with_context(|| format!("provider never reported a buyer lane signed by {payer_hex}"))?;
     anyhow::ensure!(
         lane.counterparty
             .as_deref()
@@ -171,7 +171,7 @@ async fn server_upstream_pool_id(
     );
     lane.pool_id
         .parse::<B256>()
-        .with_context(|| format!("seeder lane pool_id is not a B256: {}", lane.pool_id))
+        .with_context(|| format!("provider lane pool_id is not a B256: {}", lane.pool_id))
 }
 
 /// A client fetch whose node-to-node pull costs more than the SERVER's working
@@ -206,33 +206,33 @@ async fn run() -> anyhow::Result<()> {
     let chain = ChainFixture::launch().await?;
 
     // A small warm-up blob and the multi-MB blob under test. BOTH live only on
-    // the SEEDER (cache-warmed at launch); the SERVER holds neither, so every
-    // client fetch is a server miss that only a paid pull from the seeder can
-    // satisfy. The warm-up is what resolves the seeder's on-chain view of the
+    // the PROVIDER (cache-warmed at launch); the SERVER holds neither, so every
+    // client fetch is a server miss that only a paid pull from the provider can
+    // satisfy. The warm-up is what resolves the provider's on-chain view of the
     // SERVER's freshly-opened buyer pool BEFORE the deposit-exhausting fetch, so
-    // that fetch is not racing the seeder's pool-view catch-up.
+    // that fetch is not racing the provider's pool-view catch-up.
     let warm = make_blob(3 * CHUNK_GROUP + 7);
     let blob = make_blob(BLOB_BYTES);
 
-    let (seeder, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[&warm, &blob]).await?;
+    let (provider, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[&warm, &blob]).await?;
     let (warm_hash, blob_hash) = {
         let mut it = hashes.into_iter();
-        let warm_hash = it.next().context("seeder missing warm hash")?;
-        let blob_hash = it.next().context("seeder missing blob hash")?;
+        let warm_hash = it.next().context("provider missing warm hash")?;
+        let blob_hash = it.next().context("provider missing blob hash")?;
         (warm_hash, blob_hash)
     };
-    seeder.set_rate_per_mb(RATE_PER_MB).await?;
-    // The seeder admits the SERVER's buyer pull pool only while its remaining
+    provider.set_rate_per_mb(RATE_PER_MB).await?;
+    // The provider admits the SERVER's buyer pull pool only while its remaining
     // deposit minus the refundable floor `M` covers the reserved credit window
     // (#1518). Scale `M` down by the same factor as the rate and deposit so the
     // scaled 8000 µUSDC deposit still clears the open gate. (The SERVER's own `M`
     // is scaled to match below, since its pacer uses it as the upstream-reserve
     // estimate it must not spend into.)
-    seeder
+    provider
         .set_pool_min_remaining_deposit(POOL_MIN_REMAINING)
         .await?;
 
-    // Seat the seeder as an authorized origin for a fresh namespace so the
+    // Seat the provider as an authorized origin for a fresh namespace so the
     // SERVER's on-chain `OriginAssignment` directory fallback resolves it on a
     // cache miss. Seated BEFORE the server launches so the server enumerates it
     // at directory bring-up.
@@ -240,23 +240,23 @@ async fn run() -> anyhow::Result<()> {
     chain.vet_publisher(publisher.address()).await?;
     let namespace = chain.create_namespace(&publisher).await?;
     chain
-        .add_origin(&publisher, namespace, seeder.operator_addr())
+        .add_origin(&publisher, namespace, provider.operator_addr())
         .await?;
 
     // The SERVER: an empty bonded cache node whose misses use paid node-to-node
-    // pull-through. It is given the seeder as an iroh discovery peer, priced at
-    // the same rate as the seeder (so its buy clears the ADR 041 margin gate),
+    // pull-through. It is given the provider as an iroh discovery peer, priced at
+    // the same rate as the provider (so its buy clears the ADR 041 margin gate),
     // and its buyer working deposit is shrunk below the blob's wire cost so the
     // upstream pull must top up through its funding recovery step. Finally it is funded as a buyer so
     // that top-up can actually escrow USDC.
-    let server = NodeFixture::launch_pull_through_cache(&chain, "US", &[&seeder]).await?;
+    let server = NodeFixture::launch_pull_through_cache(&chain, "US", &[&provider]).await?;
     server.set_rate_per_mb(RATE_PER_MB).await?;
     server
         .set_buyer_working_deposit(SERVER_WORKING_DEPOSIT)
         .await?;
     // The SERVER's pull pacer holds back its estimate of the upstream's refundable
     // floor `M` before funding each voucher, and takes that estimate from its own
-    // `pool_min_remaining_deposit`. Scale it to match the seeder's `M`: at the
+    // `pool_min_remaining_deposit`. Scale it to match the provider's `M`: at the
     // default (1 USDC) the pacer would reserve 1_000_000 µUSDC out of the 8000 µUSDC
     // deposit and never fund the first voucher.
     server
@@ -270,8 +270,8 @@ async fn run() -> anyhow::Result<()> {
 
     // Warm-up: a node-to-node miss for the small blob. `open_session_in_namespace`
     // retries until the server's serve path delivers, which requires the server's
-    // own upstream pull from the seeder to succeed — so on return, the server's
-    // buyer pool is open AND the seeder has served it at least once (its pool-view
+    // own upstream pull from the provider to succeed — so on return, the server's
+    // buyer pool is open AND the provider has served it at least once (its pool-view
     // is warm). The warm blob is tiny relative to the working deposit, so this
     // costs a rounding error and never itself trips the recovery top-up.
     let (mut session, warm_got) = client
@@ -293,9 +293,9 @@ async fn run() -> anyhow::Result<()> {
         .await?;
 
     // The proof: fetch the blob whose wire cost exceeds the server's working
-    // deposit. The server misses, pulls from the seeder, exhausts its deposit
+    // deposit. The server misses, pulls from the provider, exhausts its deposit
     // mid-stream, tops up on-chain, and resumes at the paid frontier to complete
-    // — all inside this one client fetch. The seeder's pool-view is already warm
+    // — all inside this one client fetch. The provider's pool-view is already warm
     // (from the warm-up), so a single `fetch_once` suffices: any error here is a
     // real verdict, not a readiness race.
     let got = client
@@ -352,7 +352,7 @@ async fn run() -> anyhow::Result<()> {
     // `totalRedeemed`), so a value above the opening deposit can only mean a
     // `topUp` mined — the property the loopback double, which raises an in-memory
     // cell, can never establish.
-    let pool_id = server_upstream_pool_id(&seeder, server.operator_addr()).await?;
+    let pool_id = server_upstream_pool_id(&provider, server.operator_addr()).await?;
     // Any signer builds a valid read-only provider; `getPool` needs no funds or
     // gas, so reuse the publisher rather than the client's `Arc`-wrapped key.
     let pool = PaymentPool::new(chain.addrs().payment_pool, chain.provider_for(&publisher));
@@ -369,6 +369,6 @@ async fn run() -> anyhow::Result<()> {
     );
 
     drop(server);
-    drop(seeder);
+    drop(provider);
     Ok(())
 }
