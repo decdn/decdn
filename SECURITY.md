@@ -184,3 +184,24 @@ original alongside it as `Cargo.toml.orig`.
 tar xzOf decdn-cli-<version>.crate decdn-cli-<version>/.cargo_vcs_info.json
 git rev-parse v<version>^{commit}
 ```
+
+### `cargo binstall`
+
+`cargo binstall decdn-cli` (also `decdn-node`, `sponsord`, `sponsord-onramp`)
+installs the GitHub Release archive for your target, at the URL the crate's
+`[package.metadata.binstall]` names on crates.io. By default it does not fall
+back to a third-party build; `--strategies` overrides that. When no release
+archive downloads for your target, it runs `cargo install` instead. Pass
+`--locked` so that build uses the published `Cargo.lock`.
+
+binstall checks no maintainer signature. It trusts the URL in the crates.io
+manifest, which carries no signature either (above), and the TLS connection to
+GitHub. What it installs is whatever that URL serves at download time.
+binstall keeps only the binary, not the archive. To verify the binary,
+download the same archive from the release, verify it against the signed
+`SHA256SUMS` (§ Verify a binary archive), and compare hashes:
+
+```bash
+sha256sum ~/.cargo/bin/decdn
+tar xzOf decdn-<version>-<target>.tar.gz | sha256sum
+```

@@ -16,7 +16,7 @@ embedded from the
 [`minisign-*.pub`](https://github.com/decdn/decdn/tree/main/crates/cli) files.
 
 ```sh
-cargo install decdn-cli
+cargo binstall --locked decdn-cli    # or: cargo install --locked decdn-cli
 decdn config init --chain arbitrum-sepolia
 ```
 

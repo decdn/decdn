@@ -307,10 +307,13 @@ jobs:
               # each beside its regression tests; a PR that touches no scripts
               # has nothing for that job to verify. docker/ holds the Docker Hub
               # overviews, whose format and links scripts/tests checks.
+              # release.yml is read by check_binstall_metadata.py's line reader,
+              # which a test cross-checks against a YAML parse of the real file.
               - '.github/scripts/**'
               - 'scripts/**'
               - 'docker/**'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
             dashboard:
               # Gates `dashboard`: the `decdn dashboard` Vite app and the action
               # that builds it.
@@ -1315,6 +1318,13 @@ jobs:
       # half at tag time; this catches both on every PR.
       - name: Every member inherits the workspace version and lints
         run: .github/scripts/check-workspace-manifests.sh
+
+      # `cargo binstall` downloads the archive a crate's binstall `pkg-url`
+      # names, and release.yml's build job names the archives. A drift between
+      # them releases green and binstall quietly compiles from source, or
+      # installs a third-party build.
+      - name: cargo binstall metadata names the release archives
+        run: .github/scripts/check-binstall-metadata.sh
 
       # Cargo.lock is the only pin on iroh and its QUIC crates: noq-proto 1.4
       # closes client pulls mid-leg (#2585). Dependabot ignores them, but a

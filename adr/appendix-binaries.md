@@ -202,8 +202,9 @@ first and refuses a `decdn` binary that holds it.
   refuses a release that no embedded key verifies. It then checks the
   archive against the manifest, unpacks it, and swaps the new binary
   in for the old one.
-  It replaces only a binary the user can write and that
-  `cargo install` did not place. It never applies a downgrade or a
+  It replaces only a binary the user can write and that is not in
+  a cargo bin directory, where `cargo install` and `cargo binstall`
+  put it. It never applies a downgrade or a
   pre-release. Once a day, after a command succeeds on a terminal,
   `decdn` prints one line when a newer release exists;
   `[self_update] check` and `DECDN_SELF_UPDATE_CHECK` turn that off.

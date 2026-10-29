@@ -7,8 +7,8 @@ use clap::Args;
 /// The release's `SHA256SUMS.minisig` must verify against a minisign key this
 /// build embeds, and the archive must match the signed manifest, before any
 /// byte of the running binary changes. Only a binary the user can write and
-/// that `cargo install` did not place is replaced; the command names the path
-/// and the reason otherwise.
+/// that is not in a cargo bin directory (`cargo install`, `cargo binstall`) is
+/// replaced; the command names the path and the reason otherwise.
 #[derive(Args, Debug)]
 pub struct SelfUpdateArgs {
     /// Report whether a newer signed release exists and whether this install

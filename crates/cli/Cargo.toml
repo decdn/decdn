@@ -31,6 +31,27 @@ include = [
   "/dashboard/src/fixtures/**",
 ]
 
+# Where `cargo binstall` finds this binary: the archive release.yml's
+# `build-binaries` job attaches to the GitHub Release. Prebuilt binaries from
+# anywhere else (cargo-quickinstall) are refused unless the user passes
+# `--strategies`; a target with no archive compiles from source. Overrides are
+# keyed by exact target triple, which every binstall release reads.
+# .github/scripts/check_binstall_metadata.py holds these names to the release
+# matrix.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/decdn-{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/decdn-{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/decdn-{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
 [[bin]]
 name = "decdn"
 path = "src/main.rs"

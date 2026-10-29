@@ -127,6 +127,16 @@ repos:
         files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|\.github/scripts/check[-_]workspace[-_]manifests\.(py|sh))$'
         pass_filenames: false
 
+      # Each binary crate's `cargo binstall` metadata names the archive
+      # release.yml's build matrix ships. The `packaging` CI job is
+      # authoritative.
+      - id: binstall-metadata
+        name: cargo binstall metadata names the release archives
+        entry: .github/scripts/check-binstall-metadata.sh
+        language: system
+        files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|\.github/workflows/release\.yml|\.github/scripts/check[-_]binstall[-_]metadata\.(py|sh))$'
+        pass_filenames: false
+
       # Cargo.lock is the only pin on iroh and its QUIC crates (#2585), and a
       # local `cargo update` moves it silently; only the anvil journeys notice.
       # The `packaging` CI job is authoritative.
