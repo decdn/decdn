@@ -4481,6 +4481,18 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Node: metrics for the settlement re-anchor path (#2710).** The settlement
+  watcher re-reads each pool that it seeded from one `getPool` after a restart,
+  at a pinned block. Before, it reported the outcomes only in logs, so a pool
+  that stayed pending for good was invisible. A reorg that dropped the open,
+  a reorg that lowered `totalRedeemed` or the deposit, or a read that keeps
+  failing are such cases. New series:
+  `decdn_settlement_reanchor_pending_pools` (gauge, set each tick), and the
+  counters `decdn_settlement_reanchor_{block_read_failures,
+  behind_watcher, pool_read_failures, absent, skipped_below_folded,
+  skipped_lower_redeemed, skipped_lower_deposit, anchored}_total`. A skipped
+  read now also logs a `warn!` that names the pool, the held value and the read
+  value. See `adr/appendix-observability.md`.
 - **Gateway: `GET /_status`.** `/_status` is one JSON document of what the
   gateway holds and did: its counters, the pulls in flight, the
   capabilities, a public gateway's allowance buckets and pointers, and the

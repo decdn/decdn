@@ -277,6 +277,49 @@ pub struct PoolRead {
     pub lifecycle: Lifecycle,
 }
 
+/// What one [`PoolProjection::reanchor`] did with its reads. A read for a pool
+/// no longer in the projection, or folded from its `PoolOpened`, is in neither
+/// field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReanchorReport {
+    /// The reads that anchored their pool.
+    pub anchored: usize,
+    /// The reads skipped as older than what the projection holds, in read
+    /// order.
+    pub skipped: Vec<ReanchorSkip>,
+}
+
+/// A read [`PoolProjection::reanchor`] skipped because it predates what the
+/// projection already holds for the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReanchorSkip {
+    /// The skipped read.
+    pub read: PoolRead,
+    /// What the read is older than.
+    pub reason: ReanchorStale,
+}
+
+/// What a skipped re-anchor read is older than. Checked in this order, and only
+/// the first that applies is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReanchorStale {
+    /// The read's block is below the last event the entry folded.
+    BelowFolded {
+        /// The block of the last event the entry folded.
+        folded_through: u64,
+    },
+    /// The read's `totalRedeemed` is below the entry's.
+    LowerRedeemed {
+        /// The entry's `totalRedeemed`.
+        held: u64,
+    },
+    /// The read's deposit is below the entry's.
+    LowerDeposit {
+        /// The entry's deposit.
+        held: u64,
+    },
+}
+
 impl PoolEntry {
     /// The projection's lower bound on on-chain `totalRedeemed`.
     fn redeemed(&self) -> u64 {
@@ -333,8 +376,10 @@ impl PoolProjection {
 
     /// Clone the current map, let `mutate` apply one write to it, and publish the
     /// result. `rcu` retries `mutate` under a compare-and-swap so an update is never
-    /// lost when the admit path seeds a pool while the settlement sink folds.
-    fn update(&self, mutate: impl Fn(&mut HashMap<B256, PoolEntry>)) {
+    /// lost when the admit path seeds a pool while the settlement sink folds. A
+    /// `mutate` that also collects output resets it first, because only the last
+    /// run's map is published.
+    fn update(&self, mut mutate: impl FnMut(&mut HashMap<B256, PoolEntry>)) {
         self.pools.rcu(|current| {
             let mut next = HashMap::clone(current);
             mutate(&mut next);
@@ -545,21 +590,44 @@ impl PoolProjection {
     /// `totalRedeemed` above the chain's refuses early, and a held deposit above
     /// the chain's serves past the pool's funds, which the on-chain `redeem`
     /// caps.
-    pub fn reanchor(&self, block: u64, reads: &[PoolRead]) {
+    ///
+    /// Reports how many reads anchored their pool and which were skipped as
+    /// older than the entry, so the caller can count them: a pool that stays
+    /// pending this way can stay pending for good.
+    pub fn reanchor(&self, block: u64, reads: &[PoolRead]) -> ReanchorReport {
+        let mut report = ReanchorReport::default();
         if reads.is_empty() {
-            return;
+            return report;
         }
         self.update(|pools| {
+            report = ReanchorReport::default();
             for read in reads {
                 let Some(entry) = pools.get_mut(&read.pool_id) else {
                     continue;
                 };
-                let stale_read =
-                    read.total_redeemed < entry.redeemed() || read.deposit < entry.deposit;
+                let held_redeemed = entry.redeemed();
+                let held_deposit = entry.deposit;
                 let Some(snapshot) = entry.snapshot.as_mut() else {
                     continue;
                 };
-                if block < snapshot.folded_through || stale_read {
+                let stale = if block < snapshot.folded_through {
+                    Some(ReanchorStale::BelowFolded {
+                        folded_through: snapshot.folded_through,
+                    })
+                } else if read.total_redeemed < held_redeemed {
+                    Some(ReanchorStale::LowerRedeemed {
+                        held: held_redeemed,
+                    })
+                } else if read.deposit < held_deposit {
+                    Some(ReanchorStale::LowerDeposit { held: held_deposit })
+                } else {
+                    None
+                };
+                if let Some(reason) = stale {
+                    report.skipped.push(ReanchorSkip {
+                        read: *read,
+                        reason,
+                    });
                     continue;
                 }
                 *snapshot = Snapshot {
@@ -575,8 +643,10 @@ impl PoolProjection {
                 if matches!(read.lifecycle, Lifecycle::Closing { .. }) {
                     entry.lifecycle = read.lifecycle;
                 }
+                report.anchored += 1;
             }
         });
+        report
     }
 
     /// The snapshot-seeded pools the settlement watcher reads again, in pool-id

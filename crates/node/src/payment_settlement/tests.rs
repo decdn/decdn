@@ -364,6 +364,76 @@ fn mocked_contract() -> (
     (PaymentPool::new(Address::ZERO, provider), asserter)
 }
 
+/// The value `decdn_settlement_reanchor_<suffix>` exports, if it is exported.
+fn reanchor_metric(metrics: &Metrics, suffix: &str) -> Option<i64> {
+    let prefix = format!("decdn_settlement_reanchor_{suffix} ");
+    metrics
+        .encode()
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix)?.parse().ok())
+}
+
+/// Each reason a stale re-anchor read is skipped has its own counter.
+#[test]
+fn count_reanchor_skip_counts_each_reason_apart() {
+    let read = seed(B256::repeat_byte(0x64), 1_000, 0);
+    let metrics = Metrics::new();
+    for (reason, count) in [
+        (ReanchorStale::BelowFolded { folded_through: 9 }, 1),
+        (ReanchorStale::LowerRedeemed { held: 5 }, 2),
+        (ReanchorStale::LowerDeposit { held: 2_000 }, 3),
+    ] {
+        for _ in 0..count {
+            count_reanchor_skip(&ReanchorSkip { read, reason }, 8, &metrics);
+        }
+    }
+    assert_eq!(
+        reanchor_metric(&metrics, "skipped_below_folded_total"),
+        Some(1)
+    );
+    assert_eq!(
+        reanchor_metric(&metrics, "skipped_lower_redeemed_total"),
+        Some(2)
+    );
+    assert_eq!(
+        reanchor_metric(&metrics, "skipped_lower_deposit_total"),
+        Some(3)
+    );
+}
+
+/// A read whose `totalRedeemed` is below the seed's (a reorg that lowered it,
+/// or a backend behind the admit read) is skipped and counted, and the pool
+/// stays pending and in the gauge.
+#[tokio::test]
+async fn reanchor_pools_counts_a_stale_read_and_keeps_the_pool_pending() {
+    use alloy::sol_types::SolValue;
+
+    let owner = Address::from([7u8; 20]);
+    let pool_id = B256::repeat_byte(0x65);
+    let projection = PoolProjection::new();
+    projection.record_resolved(owner, seed(pool_id, 1_000, 500));
+    let (contract, asserter) = mocked_contract();
+    asserter.push_success(&alloy::primitives::U64::from(42u64));
+    asserter.push_success(&Bytes::from(
+        PaymentPool::Pool {
+            totalRedeemed: 300,
+            ..pool(owner, PaymentPool::Status::Open, 0)
+        }
+        .abi_encode(),
+    ));
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
+
+    assert_eq!(projection.pending_rereads(), vec![pool_id]);
+    assert_eq!(
+        reanchor_metric(&metrics, "skipped_lower_redeemed_total"),
+        Some(1)
+    );
+    assert_eq!(reanchor_metric(&metrics, "anchored_total"), Some(0));
+    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
+}
+
 /// The end-of-tick re-anchor reads the block number, then `getPool` at it, and
 /// anchors the seed there.
 #[tokio::test]
@@ -384,7 +454,11 @@ async fn reanchor_pools_anchors_an_admit_seed() -> Result<()> {
         .abi_encode(),
     ));
 
-    reanchor_pools(&contract, &projection, &mut None, 0).await;
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
+
+    assert_eq!(reanchor_metric(&metrics, "anchored_total"), Some(1));
+    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(0));
 
     assert!(projection.pending_rereads().is_empty());
     let status = projection
@@ -405,7 +479,14 @@ async fn reanchor_pools_retries_a_faulted_read() {
     asserter.push_success(&alloy::primitives::U64::from(42u64));
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
 
-    reanchor_pools(&contract, &projection, &mut None, 0).await;
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
+
+    assert_eq!(
+        reanchor_metric(&metrics, "pool_read_failures_total"),
+        Some(1)
+    );
+    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
 
     assert_eq!(projection.pending_rereads(), vec![pool_id]);
 }
@@ -419,7 +500,14 @@ async fn reanchor_pools_retries_a_faulted_block_number() {
     let (contract, asserter) = mocked_contract();
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
 
-    reanchor_pools(&contract, &projection, &mut None, 0).await;
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
+
+    assert_eq!(
+        reanchor_metric(&metrics, "block_read_failures_total"),
+        Some(1)
+    );
+    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
 
     assert_eq!(projection.pending_rereads(), vec![pool_id]);
 }
@@ -439,7 +527,11 @@ async fn reanchor_pools_forgets_a_closed_pool() {
         pool(owner, PaymentPool::Status::Closed, 0).abi_encode(),
     ));
 
-    reanchor_pools(&contract, &projection, &mut None, 0).await;
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
+
+    assert_eq!(reanchor_metric(&metrics, "anchored_total"), Some(0));
+    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(0));
 
     assert!(projection.snapshot(pool_id).is_none());
 }
@@ -459,7 +551,11 @@ async fn reanchor_pools_keeps_a_pool_absent_at_the_pinned_block() {
         pool(Address::ZERO, PaymentPool::Status::Open, 0).abi_encode(),
     ));
 
-    reanchor_pools(&contract, &projection, &mut None, 0).await;
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
+
+    assert_eq!(reanchor_metric(&metrics, "absent_total"), Some(1));
+    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
 
     assert!(projection.snapshot(pool_id).is_some());
     assert_eq!(projection.pending_rereads(), vec![pool_id]);
@@ -488,7 +584,14 @@ async fn reanchor_pools_stops_at_the_first_fault() {
     }));
     let mut cursor = None;
 
-    reanchor_pools(&contract, &projection, &mut cursor, 0).await;
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut cursor, 0, &metrics).await;
+
+    assert_eq!(
+        reanchor_metric(&metrics, "pool_read_failures_total"),
+        Some(1)
+    );
+    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(4));
 
     assert_eq!(projection.pending_rereads().len(), 4);
     assert_eq!(
@@ -541,7 +644,15 @@ async fn reanchor_pools_keeps_reads_before_a_fault() {
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
     let mut cursor = None;
 
-    reanchor_pools(&contract, &projection, &mut cursor, 0).await;
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut cursor, 0, &metrics).await;
+
+    assert_eq!(reanchor_metric(&metrics, "anchored_total"), Some(1));
+    assert_eq!(
+        reanchor_metric(&metrics, "pool_read_failures_total"),
+        Some(1)
+    );
+    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
 
     assert_eq!(projection.pending_rereads(), vec![second]);
     assert_eq!(
@@ -566,7 +677,8 @@ async fn reanchor_pools_reads_a_closing_pool() {
         pool(owner, PaymentPool::Status::Closing, 1_900_000_000).abi_encode(),
     ));
 
-    reanchor_pools(&contract, &projection, &mut None, 0).await;
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
 
     assert_eq!(
         projection.snapshot(pool_id).map(|s| s.lifecycle),
@@ -592,7 +704,11 @@ async fn reanchor_pools_skips_a_block_behind_the_watcher() {
         pool(owner, PaymentPool::Status::Open, 0).abi_encode(),
     ));
 
-    reanchor_pools(&contract, &projection, &mut None, 50).await;
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut None, 50, &metrics).await;
+
+    assert_eq!(reanchor_metric(&metrics, "behind_watcher_total"), Some(1));
+    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(1));
 
     assert_eq!(projection.pending_rereads(), vec![pool_id]);
     assert_eq!(asserter.read_q().len(), 1, "no getPool was sent");
@@ -610,7 +726,10 @@ async fn reanchor_pools_without_seeds_reads_nothing() {
     let (contract, asserter) = mocked_contract();
     asserter.push_success(&alloy::primitives::U64::from(42u64));
 
-    reanchor_pools(&contract, &projection, &mut None, 0).await;
+    let metrics = Metrics::new();
+    reanchor_pools(&contract, &projection, &mut None, 0, &metrics).await;
+
+    assert_eq!(reanchor_metric(&metrics, "pending_pools"), Some(0));
 
     assert_eq!(asserter.read_q().len(), 1, "no read was sent");
 }
