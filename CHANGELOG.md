@@ -4522,9 +4522,11 @@ since project inception and will roll into the first tagged release.
 - **CLI: every `decdn get` run keeps a record for the dashboard.** A run
   writes `~/.decdn/activity/pulls/<start-ms>-<pid>.json`, whatever its
   `--data-dir`, and rewrites it every second: the URI, the destination, the
-  bytes verified, the bytes resumed from an earlier run's `.partial`, what
-  each node was paid, and at the end the result, with a bundle run's entry
-  counts (also when it has nothing to fetch). A run
+  bytes verified, split into downloaded, resumed from an earlier run's
+  `.partial`, and reused from files on disk (an interrupted run's
+  unfinished blobs included), what each node was paid, and at the end the
+  result, with a bundle run's entry counts (also when it has nothing to
+  fetch). A run
   that cannot write its record pulls on, and warns once. A run prunes the
   directory to the newest 200 records when it starts. `--dry-run` writes
   none.

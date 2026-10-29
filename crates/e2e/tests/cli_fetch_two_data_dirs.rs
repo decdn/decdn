@@ -261,8 +261,8 @@ fn check_pull_record(home: &Path, len: u64, wire: U256, provider: Address) -> an
     anyhow::ensure!(done["kind"] == "blob", "{done}");
     anyhow::ensure!(done["received_bytes"] == len, "{done}");
     anyhow::ensure!(
-        done["resumed_bytes"] == 0,
-        "a fresh fetch resumed nothing: {done}"
+        done["downloaded_bytes"] == len && done["resumed_bytes"] == 0,
+        "a fresh fetch downloads every byte and resumes none: {done}"
     );
     anyhow::ensure!(done["finished_unix_ms"].is_u64(), "{done}");
     anyhow::ensure!(

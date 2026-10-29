@@ -273,7 +273,9 @@ function fields(
     started_unix_ms: 1_000_000,
     updated_unix_ms: 1_030_000,
     received_bytes: 0,
+    downloaded_bytes: 0,
     resumed_bytes: 0,
+    reused_bytes: 0,
     expected_bytes: null,
     paid: { amount_micro_usdc: 0, bytes: 0 },
     nodes: [],
@@ -367,8 +369,6 @@ const COUNTS: BundleCounts = {
   excluded: 0,
   failed: 0,
   not_run: 0,
-  downloaded: 0,
-  reused_bytes: 0,
 };
 
 function endedBundle(
@@ -456,7 +456,7 @@ describe("recentPulls", () => {
   it("names a run whose every file was reused from disk, not nothing to fetch", () => {
     const [row] = recentPulls(
       pulls({
-        recent: [endedBundle({ ...COUNTS, reused: 3, reused_bytes: 900 })],
+        recent: [endedBundle({ ...COUNTS, reused: 3 }, { reused_bytes: 900 })],
       }),
     );
     expect(row?.counts).toEqual([{ text: "3 reused", critical: false }]);
@@ -482,33 +482,25 @@ describe("recentPulls", () => {
     expect(rows.map((r) => r.counts)).toEqual([null, null]);
   });
 
-  it("shows a resumed blob run's downloaded and resumed bytes apart", () => {
+  it("shows a run's downloaded, resumed and reused bytes apart, as its record splits them", () => {
     const [row] = recentPulls(
       pulls({
         recent: [
-          {
-            ...fields({ received_bytes: 2_900, resumed_bytes: 1_100 }),
-            state: "done",
-            finished_unix_ms: 1_042_000,
-          },
+          endedBundle(null, {
+            received_bytes: 2_900,
+            downloaded_bytes: 1_700,
+            resumed_bytes: 1_100,
+            reused_bytes: 100,
+          }),
         ],
       }),
     );
-    expect(row).toMatchObject({ downloaded: 1_800, resumed: 1_100, reused: 0 });
-  });
-
-  it("takes a bundle run's downloaded and reused bytes from its counts", () => {
-    const [row] = recentPulls(
-      pulls({
-        recent: [
-          endedBundle(
-            { ...COUNTS, fetched: 2, downloaded: 500, reused_bytes: 64 },
-            { received_bytes: 700, resumed_bytes: 200 },
-          ),
-        ],
-      }),
-    );
-    expect(row).toMatchObject({ downloaded: 500, resumed: 200, reused: 64 });
+    expect(row).toMatchObject({
+      downloaded: 1_700,
+      resumed: 1_100,
+      reused: 100,
+      counts: null,
+    });
   });
 });
 

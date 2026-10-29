@@ -1126,6 +1126,7 @@ async fn pull_manifest(
     if !args.json {
         print_estimate(puller, &manifest, &args.common);
     }
+    observer.plan(&manifest);
 
     // The first Ctrl-C cancels the pull, which stops every fetch where it is
     // and still reports what landed.
@@ -1240,7 +1241,15 @@ impl PullObserver {
     /// not pull.
     fn record_counts(&self, report: &BundleReport, excluded: u64) {
         if let Some(activity) = &self.activity {
-            activity.bundle_counts(BundleCounts::of(report, excluded), report.resumed_bytes);
+            activity.bundle_counts(BundleCounts::of(report, excluded), report.reused_bytes);
+        }
+    }
+
+    /// Name each blob `manifest` pulls to the run's record, so the record
+    /// meets a blob's progress and its landing under one key.
+    fn plan(&self, manifest: &BundleManifest) {
+        if let Some(activity) = &self.activity {
+            activity.plan(manifest.entries.iter().map(|e| (e.path.clone(), e.hash)));
         }
     }
 
@@ -1303,7 +1312,7 @@ impl BundleObserver for PullObserver {
 
     fn entry_landed(&self, landed: &EntryLanded) {
         if let Some(activity) = &self.activity {
-            activity.file_landed();
+            activity.file_landed(landed.into());
         }
         let bytes = EntryBytes {
             paid: landed.paid,

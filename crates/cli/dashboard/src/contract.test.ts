@@ -194,7 +194,9 @@ const PULL_FIELDS: Keys<PullFields> = {
   started_unix_ms: true,
   updated_unix_ms: true,
   received_bytes: true,
+  downloaded_bytes: true,
   resumed_bytes: true,
+  reused_bytes: true,
   expected_bytes: true,
   paid: true,
   nodes: true,
@@ -227,8 +229,6 @@ const BUNDLE_COUNTS: Keys<BundleCounts> = {
   excluded: true,
   failed: true,
   not_run: true,
-  downloaded: true,
-  reused_bytes: true,
 };
 const UNREADABLE: Keys<UnreadableRecord> = { path: true, error: true };
 const GATEWAY_BASE = { url: true, updated_unix_ms: true, state: true } as const;

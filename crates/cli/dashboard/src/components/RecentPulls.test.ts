@@ -36,8 +36,6 @@ describe("RecentPulls", () => {
         excluded: 0,
         failed: 1,
         not_run: 0,
-        downloaded: 10,
-        reused_bytes: 0,
       },
     } as EndedPull;
     const html = draw({ ...pulls, recent: [failing] });

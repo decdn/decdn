@@ -1703,7 +1703,8 @@ async fn a_run_with_nothing_to_fetch_records_its_excluded_entries() {
 }
 
 /// A bundle run reports to its dashboard record through the observer: the
-/// planned download, each blob's position, and the counts at its end.
+/// planned download, each blob's position, and the counts and whole-file
+/// reuse at its end.
 #[tokio::test]
 async fn the_observer_feeds_the_runs_record() {
     use std::str::FromStr as _;
@@ -1716,20 +1717,28 @@ async fn the_observer_feeds_the_runs_record() {
         ActivityRecorder::start_in(dir.path(), &uri, &text, Path::new("."), &evidence).unwrap();
     let observer = PullObserver::new(true, "pull".to_owned(), Some(Arc::clone(&activity)));
     observer.run_started(Some(100), Some(120));
-    observer
-        .file_started(&["a.bin".to_owned()], 60, 0)
-        .delivered(40, 60);
+    let file = observer.file_started(&["a.bin".to_owned()], 60, 0);
+    file.delivered(10, 60);
+    file.delivered(40, 60);
     let mut report = BundleReport::default();
     report.fetched = 1;
     report.reused = 3;
-    report.resumed_bytes = 20;
+    report.reused_bytes = 7;
     observer.record_counts(&report, 2);
     activity.finish(&Ok(()), None).await;
 
     let (records, _) = crate::commands::activity::read_records(dir.path()).unwrap();
     let record = records.first().unwrap();
     assert_eq!(record.expected_bytes, Some(100));
-    assert_eq!((record.received_bytes, record.resumed_bytes), (40, 20));
+    assert_eq!(
+        (
+            record.received_bytes,
+            record.downloaded_bytes,
+            record.resumed_bytes,
+            record.reused_bytes
+        ),
+        (40, 30, 10, 7)
+    );
     let crate::commands::activity::PullKind::Bundle {
         files_started,
         counts,

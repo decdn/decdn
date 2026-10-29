@@ -117,11 +117,14 @@ fn pull(started: u64, kind: Kind, end: End) -> PullView {
                     excluded: 0,
                     failed: 0,
                     not_run: 0,
-                    downloaded: 734_003_200,
-                    reused_bytes: 4_096,
                 }),
             },
         ),
+    };
+    let reused_bytes = if matches!(kind, PullKind::Bundle { .. }) && ended {
+        4_096
+    } else {
+        0
     };
     PullView {
         record: PullRecord {
@@ -137,7 +140,9 @@ fn pull(started: u64, kind: Kind, end: End) -> PullView {
             },
             state,
             received_bytes: 734_003_200,
+            downloaded_bytes: 734_003_200,
             resumed_bytes: 0,
+            reused_bytes,
             expected_bytes: Some(1_073_741_824),
             paid: Paid {
                 amount_micro_usdc: 7_340,
@@ -335,6 +340,8 @@ fn skip_only(started: u64) -> PullView {
         }),
     };
     view.record.received_bytes = 0;
+    view.record.downloaded_bytes = 0;
+    view.record.reused_bytes = 0;
     view.record.expected_bytes = Some(0);
     view.record.paid = Paid::default();
     view.record.nodes = Vec::new();
@@ -354,8 +361,10 @@ fn a_full_status_keeps_its_shape() {
     let mut stopped = pull(NOW_MS - 120_000, Kind::Blob, End::Running);
     stopped.stale = true;
     stopped.record.resumed_bytes = 268_435_456;
+    stopped.record.downloaded_bytes = 734_003_200 - 268_435_456;
     let mut resumed = pull(NOW_MS - 500_000, Kind::Blob, End::Failed);
     resumed.record.resumed_bytes = 268_435_456;
+    resumed.record.downloaded_bytes = 734_003_200 - 268_435_456;
     status.pulls.active = vec![pull(NOW_MS - 30_000, Kind::Bundle, End::Running), stopped];
     status.pulls.recent = vec![
         skip_only(NOW_MS - 200_000),

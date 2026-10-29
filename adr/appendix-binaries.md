@@ -116,10 +116,14 @@ ledger, no DHT) shows as not configured, not as an error.
 
 Each `decdn get` run writes one JSON file for itself, named
 `<start in Unix ms>-<pid>.json`. The record holds the URI, the destination,
-the state, the bytes verified, the bytes that the run resumed from an
-earlier run, what the run paid to each node and, at the end, the result.
-The record of a bundle run also holds its entry counts when the run ends
-with a summary. A run with nothing to fetch holds them too. The run writes the whole file again every second, through a
+the state, the bytes verified, what the run paid to each node and, at the
+end, the result. The record divides the verified bytes into three parts: the
+bytes that the run downloaded, the bytes that it resumed from an earlier
+run, and the bytes that it reused from files on disk. A blob that landed
+gives the values from its pull. A blob that did not land gives the values
+from its positions. The record of a bundle run also holds its entry counts
+when the run ends with a summary. A run with nothing to fetch holds them
+too. The run writes the whole file again every second, through a
 temporary file and a rename. Thus a reader never sees a partial record. The
 directory is the same for every `--data-dir`, so one page shows every run on
 the host. A run that cannot write its record continues the pull, and warns

@@ -129,8 +129,6 @@ export interface BundleCounts {
   excluded: number;
   failed: number;
   not_run: number;
-  downloaded: number;
-  reused_bytes: number;
 }
 
 /**
@@ -163,12 +161,12 @@ export type PullFields = PullTarget & {
   updated_unix_ms: number;
   /** The content position, the resumed bytes included. */
   received_bytes: number;
-  /**
-   * What earlier, interrupted runs fetched and this run resumed; 0 until
-   * known. A blob run knows it at its first position, a bundle run only at
-   * its end.
-   */
+  /** What this run fetched and paid for. */
+  downloaded_bytes: number;
+  /** What earlier, interrupted runs fetched and this run resumed. */
   resumed_bytes: number;
+  /** What came from files already on disk, whole or spliced. */
+  reused_bytes: number;
   /** Null until the run knows what it fetches. */
   expected_bytes: number | null;
   paid: Paid;

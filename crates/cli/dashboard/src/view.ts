@@ -148,8 +148,7 @@ export interface LivePullRow {
   kind: PullKind;
   output: string;
   received: number;
-  /** Of `received`, what earlier runs fetched and this one resumed: a blob
-   * run's; a bundle run's is known only at its end. */
+  /** Of `received`, what earlier runs fetched and this one resumed. */
   resumed: number;
   expected: number | null;
   /** The share received; null until the run knows its size. */
@@ -237,12 +236,11 @@ export interface RecentPullRow {
   tone: Tone;
   uri: string;
   output: string;
-  /** What this run downloaded: neither resumed nor reused. A bundle run
-   * that ended before its summary has no tally, so its position stands in. */
+  /** What this run downloaded: neither resumed nor reused. */
   downloaded: number;
   /** What earlier runs fetched and this one resumed. */
   resumed: number;
-  /** A bundle run's bytes taken from files already on disk. */
+  /** What came from files already on disk, whole or spliced. */
   reused: number;
   /** A bundle run's counts; null for a blob or entry run, or a bundle run
    * that ended before its summary. */
@@ -262,10 +260,9 @@ export function recentPulls(pulls: Pulls): RecentPullRow[] {
       ...OUTCOME[p.state],
       uri: p.uri,
       output: p.output,
-      downloaded:
-        counts?.downloaded ?? Math.max(0, p.received_bytes - p.resumed_bytes),
+      downloaded: p.downloaded_bytes,
       resumed: p.resumed_bytes,
-      reused: counts?.reused_bytes ?? 0,
+      reused: p.reused_bytes,
       counts: counts === null ? null : countParts(counts),
       durationSecs: (p.finished_unix_ms - p.started_unix_ms) / 1000,
       paidMicro: p.paid.amount_micro_usdc,
