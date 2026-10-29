@@ -103,9 +103,6 @@ async fn run() -> anyhow::Result<()> {
     .into_bytes();
     let hash_manifest = Hash::new(&manifest);
 
-    // The exact wire bytes each whole-blob pull vouchers for: bao content plus its
-    // interleaved proof over the 16 KiB chunk-group-aligned whole range (ADR 038),
-    // the same quantity the node meters and persists as the lane watermark.
     let wire_a = whole_blob_wire_bytes(blob_a.len() as u64)?;
     let wire_b = whole_blob_wire_bytes(blob_b.len() as u64)?;
     let wire_manifest = whole_blob_wire_bytes(manifest.len() as u64)?;
