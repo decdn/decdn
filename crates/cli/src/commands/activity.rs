@@ -47,7 +47,7 @@ const NO_BASE: u64 = u64::MAX;
 const BLOB_KEY: &str = "";
 
 /// How many records the directory keeps. A run prunes the oldest when it
-/// starts.
+/// starts; a `*.json` not named as a record does not count, and stays.
 const KEPT_RECORDS: usize = 200;
 
 /// The directory every run writes its record to: `~/.decdn/activity/pulls`.
@@ -57,15 +57,21 @@ pub(crate) fn pulls_dir() -> Option<PathBuf> {
 }
 
 /// What a `decdn get` URI names. A bundle run carries its file progress and,
-/// once it ended, its counts; a blob or entry run carries neither, even an
-/// entry written to a file, which runs the bundle path.
+/// once it ended, its counts. An entry written to a file runs the bundle path
+/// and carries its counts too, but no file progress. A blob run carries
+/// neither.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PullKind {
     /// One blob.
     Blob,
     /// One entry of a bundle.
-    Entry,
+    Entry {
+        /// The run's counts, once it ended with a summary; `None` while it
+        /// runs, when it ended before one, or when it streamed to stdout,
+        /// which prints none.
+        counts: Option<BundleCounts>,
+    },
     /// A whole bundle.
     Bundle {
         /// Distinct blobs the run started.
@@ -258,8 +264,8 @@ pub(crate) struct ActivityRecorder {
     /// The bytes a bundle run took from whole files already on disk, which
     /// fetch nothing and so start no blob.
     whole_file_reused: AtomicU64,
-    /// A bundle run's counts, held until [`Self::finish`] writes them with
-    /// the run's end; an entry run's are dropped there.
+    /// A bundle or entry run's counts, held until [`Self::finish`] writes
+    /// them with the run's end.
     counts: Mutex<Option<BundleCounts>>,
     evidence: Arc<ReceiptEvidence>,
     ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -297,7 +303,7 @@ impl ActivityRecorder {
     ) -> anyhow::Result<Arc<Self>> {
         let kind = match uri.target {
             UriTarget::Blob => PullKind::Blob,
-            UriTarget::BundleEntry(_) => PullKind::Entry,
+            UriTarget::BundleEntry(_) => PullKind::Entry { counts: None },
             UriTarget::Bundle => PullKind::Bundle {
                 files_started: 0,
                 files_landed: 0,
@@ -456,9 +462,9 @@ impl ActivityRecorder {
         });
     }
 
-    /// A bundle run's counts, which [`Self::finish`] writes with its end, and
-    /// the `whole_file_reused` bytes it took from whole files already on disk.
-    /// An entry run's record keeps the bytes and no counts.
+    /// A bundle or entry run's counts, which [`Self::finish`] writes with its
+    /// end, and the `whole_file_reused` bytes it took from whole files
+    /// already on disk.
     pub(crate) fn bundle_counts(&self, counts: BundleCounts, whole_file_reused: u64) {
         self.whole_file_reused
             .store(whole_file_reused, Ordering::Relaxed);
@@ -513,7 +519,9 @@ impl ActivityRecorder {
             .take();
         let now = now_ms();
         self.update(|r| {
-            if let PullKind::Bundle { counts: kept, .. } = &mut r.kind {
+            if let PullKind::Bundle { counts: kept, .. } | PullKind::Entry { counts: kept } =
+                &mut r.kind
+            {
                 *kept = counts;
             }
             r.state = PullState::ended(result, now);
@@ -787,11 +795,15 @@ fn record_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 /// Delete all but the newest `keep` records in `dir`, by the start time
-/// their names begin with. A file that cannot be deleted stays, with a
-/// warning.
+/// their names begin with. Only a file named as a record ([`record_start`])
+/// counts and can be deleted; any other `*.json` stays, and the dashboard
+/// still lists it. A file that cannot be deleted stays, with a warning.
 fn prune(dir: &Path, keep: usize) {
     let mut files: Vec<(u64, PathBuf)> = match record_files(dir) {
-        Ok(files) => files.into_iter().map(|p| (started_of(&p), p)).collect(),
+        Ok(files) => files
+            .into_iter()
+            .filter_map(|p| record_start(&p).map(|start| (start, p)))
+            .collect(),
         Err(e) => {
             tracing::warn!("cannot list {} to prune it: {e}", dir.display());
             return;
@@ -808,13 +820,12 @@ fn prune(dir: &Path, keep: usize) {
     }
 }
 
-/// The start time a record's name begins with; `0` for a name that does not.
-fn started_of(path: &Path) -> u64 {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .and_then(|s| s.split('-').next())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+/// The start time in the name of a record file, `<start-ms>-<pid>.json`;
+/// `None` for a file not named so.
+fn record_start(path: &Path) -> Option<u64> {
+    let (start, pid) = path.file_stem()?.to_str()?.split_once('-')?;
+    pid.parse::<u32>().ok()?;
+    start.parse().ok()
 }
 
 /// The current Unix time in milliseconds; `0` on a clock set before 1970.

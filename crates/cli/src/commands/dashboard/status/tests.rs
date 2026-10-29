@@ -103,7 +103,22 @@ fn pull(started: u64, kind: Kind, end: End) -> PullView {
     let ended = end != End::Running;
     let (uri, kind) = match kind {
         Kind::Blob => (format!("decdn:{HASH}"), PullKind::Blob),
-        Kind::Entry => (format!("decdn:{HASH}/docs/index.html"), PullKind::Entry),
+        Kind::Entry => (
+            format!("decdn:{HASH}/docs/index.html"),
+            PullKind::Entry {
+                counts: ended.then_some(if end == End::Done {
+                    BundleCounts {
+                        fetched: 1,
+                        ..BundleCounts::default()
+                    }
+                } else {
+                    BundleCounts {
+                        not_run: 1,
+                        ..BundleCounts::default()
+                    }
+                }),
+            },
+        ),
         Kind::Bundle => (
             format!("decdn:{HASH}/"),
             PullKind::Bundle {

@@ -387,6 +387,14 @@ function endedBundle(
   };
 }
 
+function endedEntry(counts: BundleCounts | null): EndedPull {
+  return {
+    ...fields({}, { kind: "entry", counts }),
+    state: "done",
+    finished_unix_ms: 1_042_000,
+  };
+}
+
 describe("recentPulls", () => {
   it("names each outcome, and times a run to its end", () => {
     const rows = recentPulls(
@@ -431,6 +439,14 @@ describe("recentPulls", () => {
     ]);
   });
 
+  it("names a skip-only entry run's outcome, so it does not read as one that did nothing", () => {
+    const [row] = recentPulls(
+      pulls({ recent: [endedEntry({ ...COUNTS, skipped: 1 })] }),
+    );
+    expect(row).toMatchObject({ outcome: "✓ Done", downloaded: 0 });
+    expect(row?.counts).toEqual([{ text: "1 skipped", critical: false }]);
+  });
+
   it("names failed and not-run entries in the critical tone, in the summary's order", () => {
     const [row] = recentPulls(
       pulls({
@@ -470,16 +486,17 @@ describe("recentPulls", () => {
     ]);
   });
 
-  it("names no counts for a blob run, or a bundle run that ended before its summary", () => {
+  it("names no counts for a blob run, or a run that ended before its summary or streamed to stdout", () => {
     const rows = recentPulls(
       pulls({
         recent: [
           endedBundle(null),
+          endedEntry(null),
           { ...fields(), state: "done", finished_unix_ms: 1_042_000 },
         ],
       }),
     );
-    expect(rows.map((r) => r.counts)).toEqual([null, null]);
+    expect(rows.map((r) => r.counts)).toEqual([null, null, null]);
   });
 
   it("shows a run's downloaded, resumed and reused bytes apart, as its record splits them", () => {

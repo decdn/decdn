@@ -3875,6 +3875,15 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **CLI: a pull record prune deletes only records, and an entry run's record
+  keeps its counts (#2754, #2753).** A `decdn get` run prunes only files named
+  `<start-ms>-<pid>.json` in `~/.decdn/activity/pulls/`. Any other `*.json`
+  there stays, does not count toward the 200 kept records, and the dashboard
+  still lists it. The record of a bundle entry written to a
+  file (`decdn get decdn:<hash>/<path> -o FILE`) holds its entry counts, as a
+  bundle run's does, so its dashboard row says whether the entry was fetched,
+  skipped, reused, failed or not run. An entry streamed to stdout records
+  `counts: null`.
 - **Cache: iroh-blobs 0.104 and bao-tree 0.17.** iroh-blobs ends an
   `export_bao` stream after the leaf that completes the requested ranges and
   no longer sends `Done`, so the serve path reads the end of the stream as a

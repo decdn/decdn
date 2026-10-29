@@ -201,7 +201,7 @@ const OUTCOME: Record<EndedPull["state"], { outcome: string; tone: Tone }> = {
   gave_up: { outcome: "⚠ Gave up", tone: "critical" },
 };
 
-/** One of a bundle run's counts, as its summary line names it. */
+/** One of a bundle or entry run's counts, as its summary line names it. */
 export interface CountPart {
   text: string;
   /** Entries that failed, or that the run ended before. */
@@ -209,7 +209,7 @@ export interface CountPart {
 }
 
 /**
- * A bundle run's non-zero counts, in its summary line's order; one
+ * A bundle or entry run's non-zero counts, in its summary line's order; one
  * "nothing to fetch" part when every count is zero.
  */
 export function countParts(c: BundleCounts): CountPart[] {
@@ -242,8 +242,8 @@ export interface RecentPullRow {
   resumed: number;
   /** What came from files already on disk, whole or spliced. */
   reused: number;
-  /** A bundle run's counts; null for a blob or entry run, or a bundle run
-   * that ended before its summary. */
+  /** A bundle or entry run's counts; null for a blob run, or a run that
+   * ended before its summary or streamed to stdout. */
   counts: CountPart[] | null;
   durationSecs: number;
   paidMicro: number;
@@ -254,7 +254,7 @@ export interface RecentPullRow {
 /** The `decdn get` runs that ended, newest first. */
 export function recentPulls(pulls: Pulls): RecentPullRow[] {
   return pulls.recent.map((p) => {
-    const counts = p.kind === "bundle" ? p.counts : null;
+    const counts = p.kind === "bundle" || p.kind === "entry" ? p.counts : null;
     return {
       key: pullKey(p),
       ...OUTCOME[p.state],
