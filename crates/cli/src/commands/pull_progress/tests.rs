@@ -16,6 +16,24 @@ fn file_label_multi_path_appends_more_count() {
     assert_eq!(file_label(&paths), "models/a.bin (+2 more)");
 }
 
+/// A path a publisher wrote never drives the terminal: its control
+/// characters print escaped, and everything else prints as it is (#2705).
+#[test]
+fn terminal_safe_escapes_control_characters_only() {
+    assert_eq!(
+        terminal_safe("Bob's \"caf\u{e9}\".txt"),
+        "Bob's \"caf\u{e9}\".txt"
+    );
+    assert_eq!(
+        terminal_safe("a\u{1b}[31mb\nc\u{9b}"),
+        "a\\u{1b}[31mb\\nc\\u{9b}"
+    );
+    assert_eq!(
+        file_label(&["x\u{1b}]0;pwn\u{7}".to_string(), "y".to_string()]),
+        "x\\u{1b}]0;pwn\\u{7} (+1 more)"
+    );
+}
+
 #[test]
 fn file_label_empty_is_placeholder() {
     assert_eq!(file_label(&[]), "(entry)");

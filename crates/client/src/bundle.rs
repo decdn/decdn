@@ -125,8 +125,9 @@ impl BundleManifest {
     ///
     /// Each entry `path` must name its own file ([`path_collision`]): a pull
     /// fails every entry whose path names the same file as another's, and
-    /// writes none of them. [`BundleManifest::parse`] rejects such a manifest
-    /// outright.
+    /// writes none of them. A pull also fails an entry whose path holds a
+    /// segment [`path_segment_problem`] refuses. [`BundleManifest::parse`]
+    /// rejects such a manifest outright.
     #[must_use]
     pub const fn new(hash: [u8; 32], entries: Vec<ManifestEntry>) -> Self {
         Self { hash, entries }
@@ -146,9 +147,11 @@ impl BundleManifest {
     ///
     /// [`NotAManifest`] when the bytes are not a manifest or name a version
     /// other than 1. [`MalformedManifest`] when a v1 manifest holds an entry
-    /// or chunk hash that does not parse, or two entries whose paths name one
-    /// file on a case- or normalization-insensitive file system
-    /// ([`path_collision`]). One bad entry makes the whole manifest invalid. A retry cannot fix either error: the bytes are
+    /// or chunk hash that does not parse, an entry path with a segment that is
+    /// not a portable file name ([`path_segment_problem`]), or two entries
+    /// whose paths name one file on a case- or normalization-insensitive file
+    /// system ([`path_collision`]). One bad entry makes the whole manifest
+    /// invalid. A retry cannot fix either error: the bytes are
     /// content-addressed, so every read of them gets the same answer.
     pub fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         let manifest: ManifestV1 = serde_json::from_slice(bytes)
@@ -238,6 +241,69 @@ pub fn path_collision<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<(&
         .find_map(|path| seen.insert(path_key(path), path).map(|first| (first, path)))
 }
 
+/// Why `segment`, one `/`-separated segment of a bundle entry path, is not a
+/// file name that names one file on every supported platform, or `None` when
+/// it is (`appendix-bundles.md` § Path-safety rules, rules 2 and 8).
+///
+/// Refused on every platform, so a manifest that parses on one reads the same
+/// on all of them:
+/// - an empty segment, `.` or `..`;
+/// - a control character (C0, DEL or C1), which a terminal that prints the
+///   path would interpret;
+/// - a character Windows reserves: `\ : * ? " < > |` (`:` names an NTFS
+///   stream, as in `README::$DATA`);
+/// - a trailing `.` or space, which Windows strips, so `README.` and
+///   `README ` name `README`;
+/// - a Windows device name as the stem (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`9`,
+///   `LPT0`–`9`, in any case and with any extension);
+/// - a stem that ends in `~` and digits, the form of an 8.3 short name
+///   (`LONGFI~1.TXT`), which Windows resolves to whichever long name it was
+///   generated for.
+#[must_use]
+pub fn path_segment_problem(segment: &str) -> Option<&'static str> {
+    if segment.is_empty() {
+        return Some("empty segment");
+    }
+    if segment == "." || segment == ".." {
+        return Some("relative-directory segment");
+    }
+    if segment.chars().any(char::is_control) {
+        return Some("control character");
+    }
+    if segment.contains(['\\', ':', '*', '?', '"', '<', '>', '|']) {
+        return Some("character Windows reserves");
+    }
+    if segment.ends_with(['.', ' ']) {
+        return Some("trailing dot or space");
+    }
+    // Windows also strips spaces before the extension: `CON .txt` is `CON`.
+    let stem = segment
+        .split('.')
+        .next()
+        .unwrap_or(segment)
+        .trim_end_matches(' ');
+    if is_device_name(stem) {
+        return Some("Windows device name");
+    }
+    if let Some((base, digits)) = stem.rsplit_once('~')
+        && !base.is_empty()
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Some("8.3 short-name form");
+    }
+    None
+}
+
+fn is_device_name(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    match upper.as_bytes() {
+        b"CON" | b"PRN" | b"AUX" | b"NUL" => true,
+        [b'C', b'O', b'M', d] | [b'L', b'P', b'T', d] => d.is_ascii_digit(),
+        _ => false,
+    }
+}
+
 /// The entries of `manifest` whose path under `out_dir` holds something that
 /// a pull of the same entry may replace without the user's say: a file,
 /// directory or link that no record in the skip-cache in `out_dir` vouches
@@ -324,8 +390,10 @@ impl std::fmt::Display for NotAManifest {
 
 impl std::error::Error for NotAManifest {}
 
-/// A v1 bundle manifest with an entry or chunk hash that does not parse, or
-/// two entry paths that name one file ([`path_collision`]):
+/// A v1 bundle manifest with an entry or chunk hash that does not parse, an
+/// entry path segment that is not a portable file name
+/// ([`path_segment_problem`]), or two entry paths that name one file
+/// ([`path_collision`]):
 /// [`BundleManifest::parse`]'s error for a manifest its publisher wrote wrong.
 /// Fetching the raw blob only returns the same manifest bytes; only a fixed
 /// manifest, under a new hash, serves the entries.
@@ -394,6 +462,14 @@ impl WireEntry {
                 "bundle entry {path:?} has a malformed {what}: {e:#}"
             ))
         };
+        if let Some((segment, why)) = path
+            .split('/')
+            .find_map(|seg| path_segment_problem(seg).map(|why| (seg, why)))
+        {
+            return Err(MalformedManifest(format!(
+                "bundle entry {path:?} has an unsafe path segment {segment:?}: {why}"
+            )));
+        }
         let hash = parse_hash(&hash).map_err(|e| malformed("hash", e))?;
         let chunks = chunks
             .map(|chunks| {

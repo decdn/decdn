@@ -137,6 +137,7 @@ pub fn decdn_client::bundle::foreign_paths(&decdn_client::bundle::BundleManifest
 pub fn decdn_client::bundle::format_hash([u8; 32]) -> alloc::string::String
 pub fn decdn_client::bundle::parse_hash(&str) -> anyhow::Result<[u8; 32]>
 pub fn decdn_client::bundle::path_collision<'a>(impl core::iter::traits::collect::IntoIterator<Item = &'a str>) -> core::option::Option<(&'a str, &'a str)>
+pub fn decdn_client::bundle::path_segment_problem(&str) -> core::option::Option<&'static str>
 pub fn decdn_client::bundle::planned_downloads(&[decdn_client::bundle::ManifestEntry]) -> alloc::vec::Vec<decdn_client::bundle::PlannedBlob>
 pub async fn decdn_client::bundle::select_nodes(&decdn_client::session::ChainConfig, &decdn_client::session::PullSite, &decdn_client::session::DiscoveryOptions) -> anyhow::Result<decdn_client::bundle::NodeSelection>
 pub mod decdn_client::buyer_pool

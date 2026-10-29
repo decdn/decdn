@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
-use decdn_client::bundle::path_collision;
+use decdn_client::bundle::{path_collision, path_segment_problem};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 use walkdir::WalkDir;
@@ -285,7 +285,8 @@ where
 }
 
 /// Build the POSIX-`/`-joined relative path string from a `Path`, rejecting any
-/// non-`Normal` component. Defensive — `strip_prefix` on canonical paths
+/// non-`Normal` component and any component that is not a portable file name
+/// ([`path_segment_problem`]). Defensive — `strip_prefix` on canonical paths
 /// shouldn't produce these segments — but the manifest's `path` field is the
 /// contract verifiers re-validate against, so we assert here rather than
 /// trusting the upstream walker.
@@ -298,6 +299,12 @@ pub(crate) fn validate_relpath(rel: &Path) -> anyhow::Result<String> {
                 let s = os
                     .to_str()
                     .ok_or_else(|| anyhow!("non-UTF-8 path component in {}", rel.display()))?;
+                if let Some(why) = path_segment_problem(s) {
+                    bail!(
+                        "rejected component {s:?} in {:?}: {why}",
+                        rel.display().to_string()
+                    );
+                }
                 if !empty {
                     out.push('/');
                 }

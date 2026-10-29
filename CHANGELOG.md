@@ -5393,6 +5393,24 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **client: a bundle entry path must be a portable file name, and the CLI
+  escapes control characters in the paths it prints (GHSA-jr93-46mf-88wx,
+  #2746, #2705).** Windows joins `README`, `README.` and `README` with a
+  trailing space into one file, and also resolves a `:` stream name, a device name (`NUL.txt`) and an
+  8.3 short name (`LONGFI~1.TXT`) to something other than the path suggests,
+  so two entries could still land at one file there after #2691. A publisher
+  could also put terminal escape sequences in a path and have `decdn get`
+  print them raw. `BundleManifest::parse` now fails with `MalformedManifest`
+  for a path segment that holds a control character or a character Windows
+  reserves (`\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`), ends in `.` or a space,
+  has a Windows device name as its stem, or has the 8.3 short-name stem form (`decdn_client::bundle::path_segment_problem`). The
+  rule applies on every platform. A pull of a manifest built with
+  `BundleManifest::new` fails each such entry, and `decdn origin import`
+  refuses such a tree before it imports, moves or writes any file. The
+  dry-run listing, the `failed:` lines and the progress labels escape control
+  characters. A published bundle with such a path no longer pulls; republish
+  it with the file renamed.
+
 - **client: a bundle manifest with two entry paths that name one file is
   rejected (GHSA-3c38-gqx6-v7fm, #2691).** A manifest could hold `{p → A}`
   and `{p → B}`, or paths that differ only in case or Unicode normalization.

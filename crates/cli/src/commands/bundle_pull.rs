@@ -1535,9 +1535,12 @@ async fn dry_run(
                 .as_ref()
                 .map(|c| format!(", {} chunks", c.len()))
                 .unwrap_or_default();
+            // Escaped: a manifest that reached here without `parse` can still
+            // carry a control character, which the terminal would interpret.
+            let path = pull_progress::terminal_safe(&e.path);
             match e.size {
-                Some(n) => println!("  {} ({n} bytes{chunks})", e.path),
-                None => println!("  {}{}", e.path, chunks),
+                Some(n) => println!("  {path} ({n} bytes{chunks})"),
+                None => println!("  {path}{chunks}"),
             }
         }
         if let Some(view) = view {
@@ -1577,7 +1580,11 @@ fn report(rep: &BundleReport, excluded: u64, output: &Path, json: bool) -> anyho
         // A per-entry failure is a command result the user needs, not
         // routing narration: keep it on stderr (unconditional, and clear
         // of the `--json` report on stdout) rather than behind logging.
-        eprintln!("failed: {}: {}", failure.path, failure.error);
+        eprintln!(
+            "failed: {}: {}",
+            pull_progress::terminal_safe(&failure.path),
+            failure.error
+        );
     }
     for line in &rep.warnings {
         eprintln!("warning: {line}");

@@ -45,6 +45,7 @@
 //! callback `None` — when stderr is not a terminal or the run is `--json`, so
 //! piped and scripted output carries no progress-bar bytes.
 
+use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,9 +61,29 @@ use super::tab_progress::TabProgress;
 pub(crate) fn file_label(paths: &[String]) -> String {
     match paths {
         [] => "(entry)".to_string(),
-        [only] => only.clone(),
-        [first, rest @ ..] => format!("{first} (+{} more)", rest.len()),
+        [only] => terminal_safe(only).into_owned(),
+        [first, rest @ ..] => format!("{} (+{} more)", terminal_safe(first), rest.len()),
     }
+}
+
+/// `path` with each control character escaped (`\u{1b}`, `\n`), so a path a
+/// publisher wrote cannot drive the terminal that prints it. Every other
+/// character, quotes and non-ASCII included, prints as it is.
+pub(crate) fn terminal_safe(path: &str) -> Cow<'_, str> {
+    if !path.chars().any(char::is_control) {
+        return Cow::Borrowed(path);
+    }
+    Cow::Owned(
+        path.chars()
+            .map(|c| {
+                if c.is_control() {
+                    c.escape_default().to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Steady-tick cadence shared by every bar.
