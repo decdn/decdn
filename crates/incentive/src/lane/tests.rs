@@ -1298,6 +1298,67 @@ fn a_reveal_past_the_spending_cap_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A voucher that repeats the live root keeps the frontier, so its claim is
+/// `amount + verified_index × chunk_price`, and the cap binds that whole claim,
+/// as it binds a reveal. An amount bump under the cap whose frontier carries the
+/// claim past it is refused; the same bump that lands exactly on the cap is not.
+#[test]
+fn a_same_root_voucher_whose_frontier_crosses_the_cap_is_refused() -> anyhow::Result<()> {
+    let (signer, _, domain, store) = fixture();
+    let anchor = 1_000u64;
+    // Two reveals on top of the anchor, then a bump of `PRICE`: the claim is
+    // `anchor + PRICE + 2 × PRICE`.
+    let bumped = anchor + PRICE;
+    let claim = bumped + 2 * PRICE;
+    let lane = |cap: u64| -> anyhow::Result<LaneState> {
+        let mut state = LaneState::hydrate(
+            POOL_ID,
+            signer.address(),
+            PROVIDER,
+            U256::from(cap),
+            u64::MAX,
+            U256::ZERO,
+            U256::ZERO,
+            None,
+            LaneChain::NONE,
+        );
+        state.apply_voucher(
+            &build_metering(signer.address(), anchor, 0, root(), PRICE).sign(&signer, &domain)?,
+            &domain,
+            &store,
+        )?;
+        Ok(state.advance_preimage(root(), 2, reveal(2))?.0)
+    };
+    let bump = build_metering(signer.address(), bumped, 0, root(), PRICE).sign(&signer, &domain)?;
+
+    let (at_cap, _) = lane(claim)?.advance_presigned(&bump)?;
+    anyhow::ensure!(
+        at_cap.owed() == U256::from(claim),
+        "a bump whose claim lands exactly ON the cap is still payable"
+    );
+
+    let err = err_of(lane(claim - 1)?.advance_presigned(&bump))?;
+    anyhow::ensure!(
+        matches!(
+            err,
+            PoolError::CapExceeded { cap, got }
+                if cap == U256::from(claim - 1) && got == U256::from(claim)
+        ),
+        "an amount under the cap must not carry the frontier past it: {err:?}"
+    );
+
+    // The adopted price counts: the same amount at a higher price re-values
+    // the kept frontier past the cap.
+    let repriced =
+        build_metering(signer.address(), bumped, 0, root(), PRICE + 1).sign(&signer, &domain)?;
+    let err = err_of(lane(claim)?.advance_presigned(&repriced))?;
+    anyhow::ensure!(
+        matches!(err, PoolError::CapExceeded { .. }),
+        "a price bump that re-values the frontier past the cap must be refused: {err:?}"
+    );
+    Ok(())
+}
+
 /// A lane that has never accepted a voucher holds no claim and is owed
 /// nothing — there is no signature to submit, whatever reveals arrive.
 #[test]
