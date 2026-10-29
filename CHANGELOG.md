@@ -5393,6 +5393,14 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **incentive: a voucher that repeats the live root can no longer credit a
+  lane past its spending cap (GHSA-jr93-46mf-88wx, #2700).** Such a voucher
+  keeps the verified frontier and adopts its own `chunk_price`, so its claim is
+  `amount + verified_index × chunk_price`. The node checked only `amount`
+  against the cap, so a bump just under the cap credited up to one chain of
+  chunks past it, which the contract never pays. The voucher path now refuses
+  the full claim above the cap with `CapExceeded`, as a reveal already is.
+
 - **client: a bundle manifest with two entry paths that name one file is
   rejected (GHSA-3c38-gqx6-v7fm, #2691).** A manifest could hold `{p → A}`
   and `{p → B}`, or paths that differ only in case or Unicode normalization.
