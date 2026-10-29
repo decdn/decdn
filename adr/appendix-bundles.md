@@ -169,8 +169,9 @@ on read.
    - end in `.` or a space. Windows removes them, so `README.`, and
      `README` with a trailing space, are `README`.
    - have a Windows device name as its stem, the part before the first
-     `.`: `CON`, `PRN`, `AUX`, `NUL`, `COM0` to `COM9` or `LPT0` to
-     `LPT9`, in any case. Windows opens the device, not a file.
+     `.`: `CON`, `PRN`, `AUX`, `NUL`, `COM0` to `COM9`, `LPT0` to
+     `LPT9`, or `COM` or `LPT` with a superscript `¹`, `²` or `³`, in any
+     case. Windows opens the device, not a file.
    - have a stem that ends in `~` and digits after at least one other
      character, for example `LONGFI~1.TXT`. This is the form of an 8.3
      short name. Windows resolves it to the long name it was made for,

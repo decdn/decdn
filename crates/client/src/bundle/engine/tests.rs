@@ -3598,7 +3598,7 @@ fn path_collision_names_the_earliest_repeat() {
 /// Segments that Windows joins with another name, opens as a device or
 /// stream, or that would drive a terminal, are refused on every platform
 /// (#2746, #2705). Names that only look like them are not.
-const UNPORTABLE_SEGMENTS: [&str; 16] = [
+const UNPORTABLE_SEGMENTS: [&str; 18] = [
     "README.",
     "README ",
     "README::$DATA",
@@ -3613,10 +3613,12 @@ const UNPORTABLE_SEGMENTS: [&str; 16] = [
     "NUL.txt",
     "com1.tar.gz",
     "LPT9 .log",
+    "COM\u{b9}",
+    "lpt\u{b3}.txt",
     "LONGFI~1.TXT",
     "dir~12",
 ];
-const PORTABLE_SEGMENTS: [&str; 12] = [
+const PORTABLE_SEGMENTS: [&str; 13] = [
     "README",
     "README.md",
     ".hidden",
@@ -3625,6 +3627,7 @@ const PORTABLE_SEGMENTS: [&str; 12] = [
     "console.txt",
     "com.txt",
     "COM10",
+    "COM\u{b9}\u{b2}",
     "foo~bar",
     "file~",
     "~1",

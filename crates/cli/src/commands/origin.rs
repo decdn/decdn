@@ -444,14 +444,14 @@ fn import_single_optimized(ctx: &ImportCtx, input: &Path) -> anyhow::Result<Impo
         .sizes
         .as_ref()
         .ok_or_else(|| anyhow!("internal: optimize without chunk sizes"))?;
-    let (hash_hex, total_size, chunks) = import_optimized_file(ctx, input, sizes)?;
-
     // Key the one entry by the file's own name, validated to the same POSIX
-    // path rules a directory entry obeys.
+    // path rules a directory entry obeys. Validated before the import, so a
+    // name no reader accepts moves nothing and writes no blob.
     let name = input
         .file_name()
         .ok_or_else(|| anyhow!("--input {} has no file name", input.display()))?;
     let path = validate_relpath(Path::new(name))?;
+    let (hash_hex, total_size, chunks) = import_optimized_file(ctx, input, sizes)?;
     let chunks_total =
         u64::try_from(chunks.len()).map_err(|_| anyhow!("chunk count exceeds u64"))?;
     let entry = BundleEntry {

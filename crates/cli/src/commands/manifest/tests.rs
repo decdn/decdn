@@ -37,7 +37,8 @@ fn validate_relpath_rejects_empty() {
 fn validate_relpath_rejects_an_unportable_component() {
     for (rel, bad) in [
         ("dir/README.", "README."),
-        ("a:b/c", "a:b"),
+        // After a plain component: at the front, Windows parses `a:` as a drive.
+        ("dir/a:b/c", "a:b"),
         ("x/\u{1b}[2J", "\u{1b}[2J"),
         ("NUL", "NUL"),
     ] {

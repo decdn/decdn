@@ -255,7 +255,8 @@ pub fn path_collision<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<(&
 /// - a trailing `.` or space, which Windows strips, so `README.` and
 ///   `README ` name `README`;
 /// - a Windows device name as the stem (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`9`,
-///   `LPT0`–`9`, in any case and with any extension);
+///   `LPT0`–`9`, and `COM` / `LPT` with a superscript `¹`, `²` or `³`, in any
+///   case and with any extension);
 /// - a stem that ends in `~` and digits, the form of an 8.3 short name
 ///   (`LONGFI~1.TXT`), which Windows resolves to whichever long name it was
 ///   generated for.
@@ -295,13 +296,24 @@ pub fn path_segment_problem(segment: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether `stem` is a Windows device name, in any case: `CON`, `PRN`, `AUX`,
+/// `NUL`, or `COM` / `LPT` and one digit, superscript `¹`, `²` and `³` included.
 fn is_device_name(stem: &str) -> bool {
     let upper = stem.to_ascii_uppercase();
-    match upper.as_bytes() {
-        b"CON" | b"PRN" | b"AUX" | b"NUL" => true,
-        [b'C', b'O', b'M', d] | [b'L', b'P', b'T', d] => d.is_ascii_digit(),
-        _ => false,
+    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
     }
+    let Some(port) = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut chars = port.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+    )
 }
 
 /// The entries of `manifest` whose path under `out_dir` holds something that
