@@ -6,7 +6,9 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use alloy::primitives::{Address, U256};
 use anyhow::Context;
+use serde_json::Value;
 
 /// The `RUST_LOG` a journey sets on one `decdn` invocation whose stderr its
 /// money assertions print on failure. The paid-pull client at `debug` logs every
@@ -146,62 +148,76 @@ pub(crate) fn hermetic_command(
     Ok(cmd)
 }
 
-/// Check that the `decdn get` run that landed left a `done` record for
-/// `decdn dashboard` under its `HOME`, `home`: a `kind` run writing to
-/// `output`, with the blob's `len` content bytes verified and downloaded, none
-/// resumed, and `wire` bytes paid to `provider` alone.
+/// Check the dashboard record of the one `decdn get` run that succeeded under
+/// the `HOME` `home`: a `kind` run writing to `output`, with the blob's `len`
+/// content bytes expected, verified and downloaded, none resumed or reused,
+/// and `wire` bytes paid to `provider` alone. Every record in the directory
+/// must parse, and exactly one may be `done`: the runs a journey retried end
+/// `failed`.
 pub fn check_pull_record(
     home: &Path,
     kind: &str,
     output: &Path,
     len: u64,
-    wire: alloy::primitives::U256,
-    provider: alloy::primitives::Address,
+    wire: U256,
+    provider: Address,
 ) -> anyhow::Result<()> {
     let dir = home.join(".decdn/activity/pulls");
-    let records: Vec<serde_json::Value> = std::fs::read_dir(&dir)
-        .with_context(|| format!("read {}", dir.display()))?
-        .filter_map(Result::ok)
-        .filter_map(|e| std::fs::read(e.path()).ok())
-        .filter_map(|bytes| serde_json::from_slice(&bytes).ok())
-        .collect();
-    let done = records
-        .iter()
-        .find(|r| r["state"] == "done")
-        .with_context(|| format!("no done record among {records:?}"))?;
+    let mut records = Vec::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = entry
+            .with_context(|| format!("list {}", dir.display()))?
+            .path();
+        // The writer's temp files carry no `.json` extension until the rename.
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let record: Value =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        records.push(record);
+    }
+    let done: Vec<&Value> = records.iter().filter(|r| r["state"] == "done").collect();
+    let [done] = done.as_slice() else {
+        anyhow::bail!("expected exactly one done record among {records:?}");
+    };
+    let u64_at = |pointer: &str| {
+        done.pointer(pointer)
+            .and_then(Value::as_u64)
+            .with_context(|| format!("{pointer} is not a u64: {done}"))
+    };
     anyhow::ensure!(done["kind"] == kind, "a {kind} run: {done}");
     anyhow::ensure!(
         done["output"] == output.display().to_string(),
         "a run writing to {}: {done}",
         output.display()
     );
-    anyhow::ensure!(done["received_bytes"] == len, "{done}");
     anyhow::ensure!(
-        done["downloaded_bytes"] == len && done["resumed_bytes"] == 0,
-        "a fresh fetch downloads every byte and resumes none: {done}"
-    );
-    anyhow::ensure!(done["finished_unix_ms"].is_u64(), "{done}");
-    anyhow::ensure!(
-        alloy::primitives::U256::from(
-            done.pointer("/paid/bytes")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-        ) == wire,
-        "the record pays {wire} wire bytes: {done}"
-    );
-    anyhow::ensure!(
-        done.pointer("/paid/amount_micro_usdc")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|a| a > 0),
+        done["expected_bytes"] == len && done["received_bytes"] == len,
         "{done}"
     );
     anyhow::ensure!(
+        done["downloaded_bytes"] == len && done["resumed_bytes"] == 0 && done["reused_bytes"] == 0,
+        "a fresh fetch downloads every byte and resumes or reuses none: {done}"
+    );
+    anyhow::ensure!(done["finished_unix_ms"].is_u64(), "{done}");
+    let paid_bytes = u64_at("/paid/bytes")?;
+    anyhow::ensure!(
+        U256::from(paid_bytes) == wire,
+        "the record pays {wire} wire bytes: {done}"
+    );
+    let paid_amount = u64_at("/paid/amount_micro_usdc")?;
+    anyhow::ensure!(paid_amount > 0, "{done}");
+    anyhow::ensure!(
         done["nodes"].as_array().map(Vec::len) == Some(1)
-            && done
-                .pointer("/nodes/0/provider")
-                .and_then(serde_json::Value::as_str)
+            && done.pointer("/nodes/0/provider").and_then(Value::as_str)
                 == Some(provider.to_checksum(None).as_str()),
         "one node, {provider}: {done}"
+    );
+    anyhow::ensure!(
+        u64_at("/nodes/0/bytes")? == paid_bytes
+            && u64_at("/nodes/0/amount_micro_usdc")? == paid_amount,
+        "the one node is paid the whole run: {done}"
     );
     Ok(())
 }

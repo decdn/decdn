@@ -204,9 +204,9 @@ async fn run(target: Target) -> anyhow::Result<()> {
         "the run read the keystore password {reads} times, expected once; stderr:\n{stderr}"
     );
 
-    // (4) The run's dashboard record shows the streamed bytes: the stdout tee
-    // reports every verified byte, and the record pays each stream's wire
-    // bytes. The manifest fetch pays but reports no content bytes.
+    // (4) The run's dashboard record shows the streamed bytes: the stream's
+    // progress callback reports every verified byte, and the record pays each
+    // stream's wire bytes. The manifest fetch pays but reports no content bytes.
     let blob_len = u64::try_from(blob.len())?;
     let (kind, wire) = match target {
         Target::Blob => ("blob", whole_blob_wire_bytes(blob_len)),
@@ -228,8 +228,9 @@ async fn run(target: Target) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run `decdn get ... -o -` until one invocation streams the whole blob to
-/// stdout, returning that invocation's stdout bytes and stderr text.
+/// Run `decdn get ... -o -` until one invocation succeeds, returning its
+/// stdout bytes and stderr text. Only a failed invocation retries: one that
+/// succeeds without streaming the whole blob to stdout fails the journey.
 async fn run_fetch_until_streamed(
     data_dir: &std::path::Path,
     args: &[String],
@@ -243,7 +244,13 @@ async fn run_fetch_until_streamed(
             .output()
             .await
             .context("spawn decdn get -o -")?;
-        if output.status.success() && output.stdout.len() == expected_len {
+        if output.status.success() {
+            anyhow::ensure!(
+                output.stdout.len() == expected_len,
+                "`decdn get -o -` succeeded with {} of {expected_len} bytes on stdout; stderr:\n{}",
+                output.stdout.len(),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return Ok((
                 output.stdout,
                 String::from_utf8_lossy(&output.stderr).into_owned(),
