@@ -2953,6 +2953,7 @@ dependencies = [
  "decdn-incentive",
  "decdn-protocol",
  "futures-util",
+ "icu_normalizer",
  "insta",
  "iroh",
  "iroh-io",

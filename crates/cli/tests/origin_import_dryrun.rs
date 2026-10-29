@@ -178,30 +178,15 @@ fn determinism_with_non_ascii_and_large_file() {
     assert_eq!(big_entry["size"].as_u64().unwrap(), big.len() as u64);
 }
 
-// Bytewise sort puts ASCII uppercase before lowercase ('A' = 0x41,
-// 'a' = 0x61), which a Unicode-collation sort would reorder. Skipped on
-// case-insensitive filesystems (macOS APFS, NTFS), where `A.txt` and
-// `a.txt` collapse to a single directory entry so the pair can't be
-// observed (#697). The contract this guards still runs on case-sensitive
-// Linux CI.
+// Bytewise sort puts ASCII uppercase before lowercase ('B' = 0x42,
+// 'a' = 0x61), which a case-insensitive or Unicode-collation sort would
+// reorder.
 #[test]
-#[expect(
-    clippy::print_stderr,
-    reason = "test harness diagnostic surfaced in the nextest log"
-)]
 fn determinism_mixed_case_bytewise_sort() {
     let dir = TempDir::new().unwrap();
     let src = dir.path().join("src");
     fs::create_dir(&src).unwrap();
-    if !is_case_sensitive(&src) {
-        eprintln!(
-            "skipping determinism_mixed_case_bytewise_sort: \
-             case-insensitive filesystem collapses A.txt/a.txt"
-        );
-        return;
-    }
-
-    write_files(&src, &[("A.txt", b"upper"), ("a.txt", b"lower")]);
+    write_files(&src, &[("B.txt", b"upper"), ("a.txt", b"lower")]);
     let out = dry_run(&src, &[], false);
     assert!(
         out.status.success(),
@@ -216,7 +201,39 @@ fn determinism_mixed_case_bytewise_sort() {
         .iter()
         .map(|e| e["path"].as_str().unwrap())
         .collect();
-    assert_eq!(paths, vec!["A.txt", "a.txt"]);
+    assert_eq!(paths, vec!["B.txt", "a.txt"]);
+}
+
+// Two paths that differ only in case name one file on macOS and Windows, so
+// a dry run refuses the tree and prints no manifest (#2691). Skipped on
+// case-insensitive filesystems (macOS APFS, NTFS), where `A.txt` and `a.txt`
+// collapse to a single directory entry so the pair can't be observed (#697).
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "test harness diagnostic surfaced in the nextest log"
+)]
+fn dry_run_refuses_paths_that_differ_only_in_case() {
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir(&src).unwrap();
+    if !is_case_sensitive(&src) {
+        eprintln!(
+            "skipping dry_run_refuses_paths_that_differ_only_in_case: \
+             case-insensitive filesystem collapses A.txt/a.txt"
+        );
+        return;
+    }
+
+    write_files(&src, &[("A.txt", b"upper"), ("a.txt", b"lower")]);
+    let out = dry_run(&src, &[], false);
+    assert!(!out.status.success(), "a colliding tree must be refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(r#"so no reader accepts a bundle of it: "A.txt" and "a.txt""#),
+        "stderr: {stderr}"
+    );
+    assert!(out.stdout.is_empty(), "no manifest is printed");
 }
 
 // Empty directory produces a valid empty-entries manifest — the canonical

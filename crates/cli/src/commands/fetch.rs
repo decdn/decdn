@@ -481,7 +481,7 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
 pub(crate) const MAX_MANIFEST_BYTES: usize = 64 << 20;
 
 /// The context of a [`MalformedManifest`] error: the raw blob is the same
-/// broken JSON, so only the publisher can fix it.
+/// manifest bytes, so only the publisher can fix it.
 pub(crate) const MALFORMED_MANIFEST: &str =
     "the bundle's manifest is malformed; its publisher must publish a fixed manifest";
 

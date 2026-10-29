@@ -3546,6 +3546,55 @@ fn parse_manifest_rejects_a_malformed_entry_or_chunk_hash() {
     );
 }
 
+/// Two entries whose paths name one file on a case- or
+/// normalization-insensitive file system make the whole manifest
+/// [`MalformedManifest`], and the error names both paths (#2691).
+#[test]
+fn parse_manifest_rejects_paths_that_name_one_file() {
+    let good = format_hash([0xab; 32]);
+    let other = format_hash([0xcd; 32]);
+    for (first, second) in [
+        ("p", "p"),
+        ("README", "readme"),
+        ("a/B", "a/b"),
+        ("caf\u{e9}", "cafe\u{301}"),
+        ("stra\u{df}e", "STRASSE"),
+        ("STRA\u{1e9e}E", "strasse"),
+        ("\u{390}", "\u{3aa}\u{301}"),
+    ] {
+        let manifest = serde_json::json!({"version": 1, "entries": [
+            {"path": first, "hash": good},
+            {"path": "between", "hash": good},
+            {"path": second, "hash": other},
+        ]});
+        let err = parse_json(&manifest).unwrap_err();
+        assert!(err.is::<MalformedManifest>(), "{manifest}: {err:#}");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("{first:?} and {second:?}")),
+            "{manifest}: {msg}"
+        );
+    }
+    let distinct = parse_json(&serde_json::json!({"version": 1, "entries": [
+        {"path": "a/x", "hash": good},
+        {"path": "A/y", "hash": good},
+        {"path": "a/xx", "hash": good},
+    ]}))
+    .expect("paths that name distinct files parse");
+    assert_eq!(distinct.entries.len(), 3);
+}
+
+/// [`path_collision`] pairs the earliest path whose key repeats with the
+/// earlier path it repeats, not the first and last of a set.
+#[test]
+fn path_collision_names_the_earliest_repeat() {
+    assert_eq!(
+        super::super::path_collision(["a", "b", "B", "A"]),
+        Some(("b", "B"))
+    );
+    assert_eq!(super::super::path_collision(["a", "b", "c"]), None);
+}
+
 /// The version gate runs before any hash parses: a manifest of another
 /// version is [`NotAManifest`] for its version,
 /// whatever its hashes look like.
@@ -3664,6 +3713,17 @@ fn group_transfer_skips_and_fails_contribute_nothing() {
     assert_eq!(t.reconstructed, 0);
 }
 
+/// A pre-pass result that confirms each of `entries` on disk, so each skips.
+fn skipping(entries: &[ManifestEntry]) -> DiskState {
+    DiskState {
+        skip: entries
+            .iter()
+            .map(|en| (en.path.clone(), en.hash))
+            .collect(),
+        ..DiskState::default()
+    }
+}
+
 /// An unchunked, unsized entry at `path` whose hash is `[hash; 32]`.
 fn entry(path: &str, hash: u8) -> ManifestEntry {
     ManifestEntry {
@@ -3714,7 +3774,7 @@ fn plan_slots_classifies_each_destination_independently() {
     std::fs::write(out.join("present.txt"), b"x").unwrap();
     let entries = [entry("present.txt", 0x0a), entry("absent.txt", 0x0a)];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
-    let skip = HashSet::from(["present.txt".to_string()]);
+    let skip = skipping(&entries[..1]);
 
     let landing = Landing::open(out).unwrap();
     let slots = plan_slots(&refs, &landing, false, &skip);
@@ -3724,6 +3784,77 @@ fn plan_slots_classifies_each_destination_independently() {
     let slots = plan_slots(&refs, &landing, true, &skip);
     assert!(matches!(slots[0], Slot::Write { .. }));
     assert!(matches!(slots[1], Slot::Write { .. }));
+}
+
+/// A path confirmed on disk for one blob does not skip an entry at that path
+/// with another blob: the skip set is keyed by path and hash (#2691).
+#[test]
+fn plan_slots_skips_only_the_entry_whose_blob_is_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let landing = Landing::open(dir.path()).unwrap();
+    let skip = skipping(&[entry("p", 0x0a)]);
+
+    let held = [entry("p", 0x0a)];
+    let slots = plan_slots(&held.iter().collect::<Vec<_>>(), &landing, false, &skip);
+    assert!(matches!(slots[0], Slot::Skip), "{:?}", slots[0]);
+
+    let other = [entry("p", 0x0b)];
+    let slots = plan_slots(&other.iter().collect::<Vec<_>>(), &landing, false, &skip);
+    assert!(matches!(slots[0], Slot::Write { .. }), "{:?}", slots[0]);
+}
+
+/// A manifest built by hand, so it skips the parse check: `{p → A}` and
+/// `{p → B}` (or `{P → B}`) with A already at `p`, so a path-keyed skip would
+/// pass both. Every colliding entry fails before any fetch, with and without
+/// `overwrite`; an entry beside them is unaffected (#2691).
+#[tokio::test]
+async fn plan_slots_fails_every_entry_whose_path_collides() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let out = tmp.path();
+    let body = b"blob a";
+    std::fs::write(out.join("p"), body).expect("write");
+    let a = *blake3::hash(body).as_bytes();
+    let landing = Landing::open(out).unwrap();
+    for twin in ["p", "P"] {
+        let entries = [
+            ManifestEntry::new("p", a, None),
+            ManifestEntry::new(twin, [0x0b; 32], None),
+            entry("q", 0x0c),
+        ];
+        let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        for overwrite in [false, true] {
+            let disk =
+                resolve_disk_state(&entries, &SavedManifest::default(), out, overwrite).await;
+            assert!(disk.skip.is_empty(), "{twin} overwrite={overwrite}");
+            let slots = plan_slots(&refs, &landing, overwrite, &disk);
+            for (slot, path) in slots.iter().zip(["p", twin]) {
+                assert!(
+                    matches!(slot, Slot::Failed(EntryOutcome::Failed { path: p, err })
+                        if p == path && err.contains("names the same file")),
+                    "{twin} overwrite={overwrite}: {slot:?}"
+                );
+            }
+            assert!(matches!(slots[2], Slot::Write { .. }), "{:?}", slots[2]);
+        }
+    }
+}
+
+/// Two entries that [`ManifestEntry::land_at`] moves to one path collide on
+/// the landed path, and both fail.
+#[tokio::test]
+async fn plan_slots_fails_entries_landed_at_one_path() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let entries = [
+        entry("a/config.json", 0x0a).land_at("config.json"),
+        entry("b/config.json", 0x0b).land_at("config.json"),
+    ];
+    let refs: Vec<&ManifestEntry> = entries.iter().collect();
+    let disk = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
+    let slots = plan_slots(&refs, &Landing::open(tmp.path()).unwrap(), false, &disk);
+    assert!(
+        slots.iter().all(|slot| matches!(slot, Slot::Failed(_))),
+        "{slots:?}"
+    );
 }
 
 /// A path that escapes `out_root` is a per-destination failure, not a fetch.
@@ -3736,7 +3867,7 @@ fn plan_slots_marks_unsafe_paths_failed() {
         &refs,
         &Landing::open(dir.path()).unwrap(),
         false,
-        &HashSet::new(),
+        &DiskState::default(),
     );
     assert!(matches!(slots[0], Slot::Failed(_)));
 }
@@ -3753,7 +3884,7 @@ fn plan_slots_rejects_the_reserved_staging_dir() {
         &refs,
         &Landing::open(dir.path()).unwrap(),
         false,
-        &HashSet::new(),
+        &DiskState::default(),
     );
     assert!(matches!(slots[0], Slot::Failed(_)));
 }
@@ -3773,7 +3904,7 @@ fn plan_slots_rejects_the_pull_state_paths() {
         &refs,
         &Landing::open(dir.path()).unwrap(),
         false,
-        &HashSet::new(),
+        &DiskState::default(),
     );
     assert!(matches!(slots[0], Slot::Failed(_)));
     assert!(matches!(slots[1], Slot::Failed(_)));
@@ -3792,7 +3923,7 @@ fn plan_slots_fails_an_entry_whose_parent_leads_out_of_the_root() {
     let entries = [entry("link/escape.bin", 0x0a), entry("safe.bin", 0x0a)];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
 
-    let slots = plan_slots(&refs, &landing, false, &HashSet::new());
+    let slots = plan_slots(&refs, &landing, false, &DiskState::default());
 
     assert!(
         matches!(&slots[0], Slot::Failed(EntryOutcome::Failed { path, err })
@@ -3815,12 +3946,12 @@ fn plan_slots_skips_a_present_entry_before_it_checks_its_parent_chain() {
     let landing = Landing::open(out.path()).unwrap();
     let entries = [entry("link/file", 0x0a)];
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
-    let skip = HashSet::from(["link/file".to_string()]);
+    let skip = skipping(&entries);
 
     let slots = plan_slots(&refs, &landing, false, &skip);
     assert!(matches!(slots[0], Slot::Skip), "{:?}", slots[0]);
 
-    let slots = plan_slots(&refs, &landing, true, &HashSet::new());
+    let slots = plan_slots(&refs, &landing, true, &DiskState::default());
     assert!(matches!(slots[0], Slot::Failed(_)), "{:?}", slots[0]);
 }
 
@@ -4062,7 +4193,7 @@ async fn resolve_disk_state_skips_matching_file_by_rehash() {
     }];
     // Empty saved manifest → falls to the re-hash gate, still skips (content matches).
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
-    assert!(st.skip.contains("a.txt"));
+    assert!(st.skip.contains_key("a.txt"));
 }
 
 /// The fast path skips WITHOUT re-hashing when a saved record's hash, size,
@@ -4111,7 +4242,7 @@ async fn resolve_disk_state_fast_skips_on_matching_record_without_rehash() {
     }];
     let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
     // Skipped on the record alone; a re-hash of the (non-matching) bytes would fetch.
-    assert!(st.skip.contains("a.txt"));
+    assert!(st.skip.contains_key("a.txt"));
 }
 
 /// An entry whose blob landed at a size other than its manifest's is
@@ -4149,7 +4280,7 @@ async fn a_mismatched_entry_is_not_refetched_on_rerun() {
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
-    assert!(st.skip.contains("a.bin"), "accepted by its hash");
+    assert!(st.skip.contains_key("a.bin"), "accepted by its hash");
 }
 
 /// A file whose mtime drifted but whose content is unchanged is NOT
@@ -4197,7 +4328,7 @@ async fn resolve_disk_state_rehash_confirms_touched_but_identical_file() {
     }];
     let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
     // Re-hash confirmed the content is identical → skip, no re-fetch.
-    assert!(st.skip.contains("a.txt"));
+    assert!(st.skip.contains_key("a.txt"));
 }
 
 /// A changed file (content no longer matches the new manifest hash) is never
@@ -4215,7 +4346,7 @@ async fn resolve_disk_state_fetches_changed_file() {
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
-    assert!(!st.skip.contains("a.txt")); // hash mismatch → fetch
+    assert!(!st.skip.contains_key("a.txt")); // hash mismatch → fetch
 }
 
 /// An absent file always fetches — nothing to re-hash, no fast-skip possible.
@@ -4230,7 +4361,7 @@ async fn resolve_disk_state_absent_file_fetches() {
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
-    assert!(!st.skip.contains("missing.txt"));
+    assert!(!st.skip.contains_key("missing.txt"));
 }
 
 /// `--overwrite` bypasses the pre-pass entirely: nothing is ever skipped.
@@ -4337,13 +4468,46 @@ async fn resolve_disk_state_excludes_will_write_path_from_whole_file_index() {
 
     let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
     assert!(
-        !st.skip.contains("changed.bin"),
+        !st.skip.contains_key("changed.bin"),
         "changed content must fetch"
     );
     assert_eq!(
         st.whole_file.get(&old_hash),
         None,
         "a will-write path must never be indexed as a whole-file donor"
+    );
+}
+
+/// A saved record at `readme` is no whole-file donor while this run writes
+/// `README`: on a case-insensitive file system the two are one file, so the
+/// write could replace the donor's bytes between its re-hash and its link.
+#[tokio::test]
+async fn resolve_disk_state_excludes_a_case_variant_of_a_will_write_path() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let donor_body = vec![9u8; 32];
+    std::fs::write(tmp.path().join("readme"), &donor_body).expect("write donor");
+    let donor_hash = *blake3::hash(&donor_body).as_bytes();
+    let old_entries = [ManifestEntry::new("readme", donor_hash, Some(32))];
+    let updates = build_completed_updates(
+        &old_entries.iter().collect::<Vec<_>>(),
+        &[EntryOutcome::Fetched(32)],
+        TEST_BUNDLE,
+        tmp.path(),
+    );
+    skip_cache::merge_and_write(tmp.path(), SavedManifest::default(), updates)
+        .expect("write saved");
+    let saved = skip_cache::load(tmp.path());
+
+    let written = ManifestEntry::new("README", *blake3::hash(&[1u8; 32]).as_bytes(), Some(32));
+    let copy = ManifestEntry::new("copy.bin", donor_hash, Some(32));
+    let st = resolve_disk_state(&[written, copy.clone()], &saved, tmp.path(), false).await;
+    assert_eq!(st.whole_file.get(&donor_hash), None);
+
+    // Without the case-variant write, the same record is a donor.
+    let st = resolve_disk_state(&[copy], &saved, tmp.path(), false).await;
+    assert_eq!(
+        st.whole_file.get(&donor_hash),
+        Some(&tmp.path().join("readme"))
     );
 }
 
@@ -4397,7 +4561,7 @@ async fn resolve_disk_state_does_not_skip_a_symlink() {
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
-    assert!(!st.skip.contains("link.txt"));
+    assert!(!st.skip.contains_key("link.txt"));
     assert!(st.seed.is_empty());
 }
 
@@ -4420,7 +4584,7 @@ async fn resolve_disk_state_seeds_unchanged_and_old_chunks() {
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
-    assert!(st.skip.contains("u.bin"));
+    assert!(st.skip.contains_key("u.bin"));
     assert_eq!(st.seed.len(), 1);
     assert_eq!(st.seed[0].offset, 0);
     assert_eq!(st.seed[0].len, 20);
@@ -4472,7 +4636,7 @@ async fn resolve_disk_state_seeds_old_chunks_of_a_changed_file() {
     }];
 
     let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
-    assert!(!st.skip.contains("c.bin"), "changed content must fetch");
+    assert!(!st.skip.contains_key("c.bin"), "changed content must fetch");
     // The per-entry "changed" branch and the whole-root records pass both
     // seed this same donor (harmless duplication, see resolve_disk_state's
     // doc comment) — assert every seed entry present matches, rather than
@@ -5044,7 +5208,7 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
         ManifestEntry::new("donor.bin", [3; 32], Some(300)),
     ];
     let mut disk = DiskState::default();
-    disk.skip.insert("present.bin".to_string());
+    disk.skip.insert("present.bin".to_string(), [2; 32]);
     disk.whole_file
         .insert([3; 32], tmp.path().join("elsewhere.bin"));
     let plan = build_fetch_plan(&entries);
@@ -5074,4 +5238,28 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
     )
     .await;
     assert_eq!(all.len(), 3, "an overwriting pull fetches every group");
+}
+
+/// Colliding entries plan no work, overwrite or not: they fail before their
+/// fetch, so the run never quotes or pays for their bytes.
+#[tokio::test]
+async fn planned_work_leaves_out_colliding_entries() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let entries = vec![
+        ManifestEntry::new("p", [1; 32], Some(100)),
+        ManifestEntry::new("P", [2; 32], Some(200)),
+        ManifestEntry::new("q", [3; 32], Some(300)),
+    ];
+    let plan = build_fetch_plan(&entries);
+    let landing = Landing::open(tmp.path()).unwrap();
+    for overwrite in [false, true] {
+        let disk =
+            resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), overwrite).await;
+        let work = planned_work(&entries, &landing, overwrite, &plan, &disk).await;
+        assert_eq!(
+            work.keys().collect::<Vec<_>>(),
+            vec![&[3; 32]],
+            "overwrite={overwrite}"
+        );
+    }
 }

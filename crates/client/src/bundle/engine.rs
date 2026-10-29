@@ -89,7 +89,7 @@ use super::skip_cache::{self, SavedManifest, SavedMtime};
 use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
     FileObserver, ManifestEntry, NodeSelection, STAGING_DIR, Selection, format_hash,
-    manifest_cache, parse_hash,
+    manifest_cache, parse_hash, path_key,
 };
 use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
@@ -196,13 +196,18 @@ struct SeedDonor {
 }
 
 /// The result of inspecting the output tree against the new manifest and the
-/// saved skip-cache before fetching: which in-scope paths to skip, and the
-/// on-disk chunk donors to seed.
+/// saved skip-cache before fetching: which in-scope paths collide, which to
+/// skip, and the on-disk chunk donors to seed.
 #[derive(Default)]
 struct DiskState {
-    /// In-scope manifest paths whose on-disk file already matches the new
-    /// manifest hash (fast-skip or re-hash-confirmed) — not fetched.
-    skip: HashSet<String>,
+    /// Entry paths that name the same file as another entry's path on a case-
+    /// or normalization-insensitive file system ([`path_key`]). Every one
+    /// fails: no entry of the set is the right one to write or skip.
+    collides: HashSet<String>,
+    /// In-scope manifest paths whose on-disk file already holds an entry's
+    /// blob (fast-skip or re-hash-confirmed), each with that blob's hash.
+    /// Only the entry whose own hash it is skips ([`DiskState::skips`]).
+    skip: HashMap<String, [u8; 32]>,
     /// On-disk chunk donors to seed into the run's [`ChunkIndex`].
     seed: Vec<SeedDonor>,
     /// Whole-file donors already on disk anywhere in the root: target blob hash
@@ -214,6 +219,30 @@ struct DiskState {
     /// still fetches, its planned download, and the prefix an earlier run
     /// left in its `.partial`. Filled after the pre-pass.
     work: HashMap<[u8; 32], PlannedWork>,
+}
+
+impl DiskState {
+    /// Whether the file at `en`'s path already holds `en`'s own blob, so the
+    /// entry is skipped. A path confirmed for another entry's blob does not
+    /// skip this one.
+    fn skips(&self, en: &ManifestEntry) -> bool {
+        self.skip.get(&en.path) == Some(&en.hash)
+    }
+}
+
+/// Every entry path that names the same file as another entry's path
+/// ([`path_key`]): each member of a colliding set, not only the later ones.
+fn colliding_paths(entries: &[ManifestEntry]) -> HashSet<String> {
+    let mut by_key: HashMap<String, Vec<&str>> = HashMap::new();
+    for en in entries {
+        by_key.entry(path_key(&en.path)).or_default().push(&en.path);
+    }
+    by_key
+        .into_values()
+        .filter(|paths| paths.len() > 1)
+        .flatten()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// One group's planned download, and the bytes an earlier run already
@@ -242,7 +271,7 @@ async fn planned_work(
     let mut work = HashMap::new();
     for group in group_by_hash(&refs) {
         let hash = group.hash;
-        let writes = plan_slots(&group.entries, landing, overwrite, &disk.skip)
+        let writes = plan_slots(&group.entries, landing, overwrite, disk)
             .iter()
             .any(|slot| matches!(slot, Slot::Write { .. }));
         if !writes || disk.whole_file.contains_key(&hash) {
@@ -271,18 +300,27 @@ async fn planned_work(
 /// skip-cache: fast-skip on a matching saved record (hash + size + mtime), else
 /// re-hash the on-disk bytes against the new manifest hash, else fetch. With
 /// `overwrite` nothing is skipped. The whole-file `hash` is authoritative, so a
-/// stale or absent saved record only costs a re-hash, never correctness.
+/// stale or absent saved record only costs a re-hash, never correctness. An
+/// entry whose path collides with another's is never skipped and its file is
+/// never a whole-file donor: it fails in [`plan_slots`], with or without
+/// `overwrite`.
 async fn resolve_disk_state(
     entries: &[ManifestEntry],
     saved: &SavedManifest,
     out_root: &Path,
     overwrite: bool,
 ) -> DiskState {
-    let mut state = DiskState::default();
+    let mut state = DiskState {
+        collides: colliding_paths(entries),
+        ..DiskState::default()
+    };
     if overwrite {
         return state;
     }
     for en in entries {
+        if state.collides.contains(&en.path) {
+            continue;
+        }
         let Ok(dest) = safe_join(out_root, &en.path) else {
             continue; // a bad path fails later in plan_slots; not skippable
         };
@@ -308,7 +346,7 @@ async fn resolve_disk_state(
             .get(&en.path)
             .is_some_and(|rec| rec.holds(en.hash) && rec.still_matches(&meta));
         if fast {
-            state.skip.insert(en.path.clone());
+            state.skip.insert(en.path.clone(), en.hash);
             seed_new_chunks(&mut state, en, &dest);
             continue;
         }
@@ -318,7 +356,7 @@ async fn resolve_disk_state(
         if let Ok(Ok(got)) = got
             && got == en.hash
         {
-            state.skip.insert(en.path.clone());
+            state.skip.insert(en.path.clone(), en.hash);
             seed_new_chunks(&mut state, en, &dest);
             continue;
         }
@@ -347,18 +385,20 @@ async fn resolve_disk_state(
     // (spliced under the existing per-chunk re-hash guard). This is what lets a
     // file shared across bundles at different paths be reused.
     //
-    // A path this run will overwrite (an in-scope entry not already in
-    // `state.skip`) is excluded from `whole_file` only: its bytes can be
-    // atomically replaced by its own group between the whole-file link's
-    // re-hash and its link/copy (TOCTOU), which would silently corrupt the
-    // link's destination with no post-link verification to catch it. Chunk
-    // donors from the same record stay in `state.seed` — a spliced range is
-    // always covered by the final whole-file re-verification, so the race
-    // there is harmless.
-    let will_write: HashSet<&str> = entries
+    // A path this run may overwrite (an in-scope entry that does not skip,
+    // one that fails on a collision included) is excluded from `whole_file`
+    // only: its bytes can be atomically replaced by its own group between the
+    // whole-file link's re-hash and its link/copy (TOCTOU), which would
+    // silently corrupt the link's destination with no post-link verification
+    // to catch it. Paths compare by [`path_key`], so a record at `readme` is
+    // no donor while this run writes `README`: on a case-insensitive file
+    // system the two are one file. Chunk donors from the same record stay in
+    // `state.seed` — a spliced range is always covered by the final
+    // whole-file re-verification, so the race there is harmless.
+    let will_write: HashSet<String> = entries
         .iter()
-        .map(|e| e.path.as_str())
-        .filter(|p| !state.skip.contains(*p))
+        .filter(|e| !state.skips(e))
+        .map(|e| path_key(&e.path))
         .collect();
     for (path, rec) in saved.records() {
         let Ok(src) = safe_join(out_root, path) else {
@@ -373,7 +413,7 @@ async fn resolve_disk_state(
         if !meta.is_file() {
             continue; // symlink / non-regular → never a donor
         }
-        if !will_write.contains(path)
+        if !will_write.contains(&path_key(path))
             && let Ok(h) = parse_hash(&rec.hash)
         {
             state.whole_file.entry(h).or_insert_with(|| src.clone());
@@ -441,27 +481,36 @@ pub(super) fn writable_dest(out_root: &Path, path: &str) -> anyhow::Result<PathB
 }
 
 /// Resolve each entry's on-disk destination and classify it — a resolve failure,
-/// a path to skip, or a path to write — before any fetch. `skip` is the
-/// [`resolve_disk_state`] pre-pass result: a path lands in it on a matching
-/// saved-manifest record (fast-skip) or, failing that, on a re-hash of the
-/// on-disk bytes against the new manifest hash. A path whose content changed
-/// is written, not silently kept. Evaluated **per destination**, so one path
-/// of a duplicated blob can be skipped while another is written. With
-/// `overwrite` set, `skip` is empty and every destination is written. A path
-/// to write whose parent chain already cannot take it ([`Landing::check`])
-/// fails here, before its fetch is paid for. A path to skip is not checked:
-/// nothing is written to it.
+/// a path to skip, or a path to write — before any fetch. `disk` is the
+/// [`resolve_disk_state`] pre-pass result: an entry skips when its own hash is
+/// confirmed at its path by a matching saved-manifest record (fast-skip) or,
+/// failing that, by a re-hash of the on-disk bytes. A path whose content
+/// changed is written, not silently kept. Evaluated **per destination**, so
+/// one path of a duplicated blob can be skipped while another is written.
+/// With `overwrite` set, nothing skips and every destination is written. A
+/// path that collides with another entry's ([`DiskState::collides`]) fails,
+/// overwrite or not, and so does a path to write whose parent chain already
+/// cannot take it ([`Landing::check`]), both before a fetch is paid for. A
+/// path to skip is not checked: nothing is written to it.
 fn plan_slots<'a>(
     entries: &[&'a ManifestEntry],
     landing: &Landing,
     overwrite: bool,
-    skip: &HashSet<String>,
+    disk: &DiskState,
 ) -> Vec<Slot<'a>> {
     entries
         .iter()
         .map(|en| match writable_dest(landing.root(), &en.path) {
             Err(e) => Slot::Failed(EntryOutcome::failed(&en.path, &e)),
-            Ok(_) if !overwrite && skip.contains(en.path.as_str()) => Slot::Skip,
+            Ok(_) if disk.collides.contains(&en.path) => Slot::Failed(EntryOutcome::failed(
+                &en.path,
+                &anyhow!(
+                    "another entry names the same file on a case- or normalization-insensitive \
+                     file system: {:?}",
+                    en.path
+                ),
+            )),
+            Ok(_) if !overwrite && disk.skips(en) => Slot::Skip,
             Ok(dest) => match landing.check(&dest) {
                 Ok(()) => Slot::Write {
                     label: en.path.as_str(),
@@ -2657,7 +2706,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // `pull_all` removes it once every recipient has had its chance.
         let is_donor = hints.as_ref().is_some_and(|h| !h.is_empty());
 
-        let slots = plan_slots(&group.entries, landing, overwrite, &disk.skip);
+        let slots = plan_slots(&group.entries, landing, overwrite, disk);
 
         // Every destination already present (or failed to resolve) → no fetch, no
         // payment. This is the whole point of the group: a duplicate path that is

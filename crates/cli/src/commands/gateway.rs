@@ -1088,7 +1088,7 @@ enum NotManifest {
 impl NotManifest {
     /// The verdict on bytes whose parse failed with `err`. A malformed
     /// manifest's error names its publisher and no raw blob: the raw blob is
-    /// the same broken JSON.
+    /// the same manifest bytes.
     fn unparsed(err: anyhow::Error) -> Self {
         if err.is::<MalformedManifest>() {
             Self::Plain(clip(format!("{:#}", err.context(MALFORMED_MANIFEST))))
