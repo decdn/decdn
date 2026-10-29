@@ -142,7 +142,13 @@ async fn page_carries_sitekey_client_and_escaped_brand() {
     assert!(html.contains(&CLIENT.to_string()));
     assert!(html.contains("Acme &lt;Models&gt;"));
     assert!(!html.contains("{{"));
-    // It posts to the fund route and tells an expired key apart.
+    // It posts to the fund route and tells an expired key, a refused
+    // verification, a rate limit and a service fault apart.
     assert!(html.contains("fetch(\"/v1/fund\""));
-    assert!(html.contains("id=\"expired\"") && html.contains("409"));
+    assert!(html.contains("id=\"expired\"") && html.contains("resp.status === 409"));
+    assert!(html.contains("id=\"refused\"") && html.contains("resp.status === 403"));
+    assert!(html.contains("id=\"busy\"") && html.contains("resp.status === 429"));
+    assert!(html.contains("Verification was not accepted."));
+    assert!(html.contains("Too many attempts."));
+    assert!(html.contains("The service is having a problem. Please try again later."));
 }

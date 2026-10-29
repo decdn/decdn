@@ -110,7 +110,10 @@ These placeholders are substituted:
 Once the widget passes, the page must `POST /v1/fund` with
 `{"client": "{{CLIENT}}", "proof": "<turnstile token>"}`. A `200` means the
 person can return to their terminal; `409` means the key has expired and the
-download must be started again. The built-in page is
+download must be started again. A `403` means the check refused the token, and
+a `429` means the address sent too many requests this minute; a refresh and a
+new check can pass after either. Any other status means the request or the
+service failed, and a refresh does not fix it. The built-in page is
 [`crates/sponsord-onramp/assets/turnstile.html`](../../crates/sponsord-onramp/assets/turnstile.html).
 For a different kind of check, see [integrator.md](integrator.md).
 

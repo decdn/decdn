@@ -1208,6 +1208,14 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **sponsord-onramp: the gate page tells a refused check apart from a service
+  fault (#2720).** The built-in page showed "Something went wrong. Please
+  refresh and try again." for every failed `POST /v1/fund` other than a `409`.
+  It now asks for a refresh on a `403` (the check refused the token), asks the
+  person to wait a minute on a `429`, and says the service has a problem on
+  any other status or a network failure, where a refresh does not help.
+  `docs/sponsord/operator.md` lists the statuses a custom gate page handles.
+
 - **Tests: three load-sensitive tests model the node and the planner exactly
   (#2663, #2723).** `cli_bundle_pull_stripes_a_complement_across_two_holders`
   seeds `a` on one holder, so the planner never splits it across both lanes
