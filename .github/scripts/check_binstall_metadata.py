@@ -361,8 +361,10 @@ def check(repo_root: Path) -> list[str]:
             }
             expected = {
                 "pkg-url": (
-                    f"{common['repo']}/releases/download/v{version}/"
-                    f"{binary}-{version}-{build.target}.{build.archive}",
+                    (
+                        f"{common['repo']}/releases/download/v{version}/"
+                        f"{binary}-{version}-{build.target}.{build.archive}"
+                    ),
                     pkg_url_values(common, build.archive),
                 ),
                 "pkg-fmt": (archive_fmt, [{}]),

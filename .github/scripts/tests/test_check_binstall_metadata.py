@@ -385,13 +385,17 @@ pkg-url = "x"
         ("jobs:\n  other:\n    runs-on: x\n", "no `build-binaries` job"),
         ("jobs:\n  build-binaries:\n    runs-on: x\n", "has no `matrix.include`"),
         (
-            "jobs:\n  build-binaries:\n    strategy:\n      matrix:\n        include:\n"
-            "          - runner: x\n            target: y\n",
+            (
+                "jobs:\n  build-binaries:\n    strategy:\n      matrix:\n        include:\n"
+                "          - runner: x\n            target: y\n"
+            ),
             "opens with `runner:`",
         ),
         (
-            "jobs:\n  build-binaries:\n    strategy:\n      matrix:\n        include:\n"
-            "          - target: x86_64-unknown-linux-gnu\n            archive: tar.gz\n",
+            (
+                "jobs:\n  build-binaries:\n    strategy:\n      matrix:\n        include:\n"
+                "          - target: x86_64-unknown-linux-gnu\n            archive: tar.gz\n"
+            ),
             "has no builds",
         ),
     ],
@@ -559,8 +563,10 @@ def test_a_missing_algorithm_fails(tmp_path):
 @pytest.mark.parametrize(
     "signing",
     [
-        "\n[package.metadata.binstall.overrides.x86_64-pc-windows-msvc.signing]\n"
-        'algorithm = "minisign"\nfile = "{ url }.minisig"\n',
+        (
+            "\n[package.metadata.binstall.overrides.x86_64-pc-windows-msvc.signing]\n"
+            + 'algorithm = "minisign"\nfile = "{ url }.minisig"\n'
+        ),
         'signing = { algorithm = "minisign", file = "{ url }.sig" }\n',
         'signing.file = "{ url }.sig"\n',
     ],
