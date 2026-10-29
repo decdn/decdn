@@ -78,8 +78,11 @@ def _value(raw: str) -> str:
 def parse_build_matrix(text: str) -> tuple[list[Build], list[str]]:
     """The `build-binaries` job's `matrix.include` rows, and any parse errors.
 
-    Reads only the shape release.yml uses: each row opens with `- target:` and
-    carries `builds:` and `archive:` as plain scalars.
+    Reads only the shape release.yml uses: block-style rows, each opening with
+    `- target:` and carrying one `key: value` scalar per line at the row's
+    indent. Any other line inside `include:` (a flow-style row, a nested map or
+    list, a block scalar, an empty value) is an error, never skipped: a row
+    this reader passed over would leave its target unchecked.
     """
     lines = text.splitlines()
     errors: list[str] = []
@@ -91,7 +94,8 @@ def parse_build_matrix(text: str) -> tuple[list[Build], list[str]]:
 
     rows: list[dict[str, str]] = []
     include_indent: int | None = None
-    for line in lines[start + 1 :]:
+    key_indent: int | None = None  # where the current row's keys sit
+    for lineno, line in enumerate(lines[start + 1 :], start + 2):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -103,19 +107,31 @@ def parse_build_matrix(text: str) -> tuple[list[Build], list[str]]:
             continue
         if _indent(line) <= include_indent:
             break  # past `include:`
-        m = re.fullmatch(r"(- )?([a-z_-]+):\s*(.*)", stripped)
-        if not m:
+        m = re.fullmatch(r"(- )?([A-Za-z0-9_-]+):\s*(.*)", stripped)
+        item, key, value = m.groups() if m else (None, "", "")
+        if item:
+            key_indent = _indent(line) + len(item)
+        if (
+            not m
+            or not value
+            or value[0] in "{[|>&*!"
+            or (not item and _indent(line) != key_indent)
+        ):
+            errors.append(
+                f"{RELEASE_WORKFLOW}:{lineno}: `{BUILD_JOB}` matrix.include line {stripped!r} "
+                "is not a `key: value` scalar of a block-style row; this check reads only rows "
+                "written as `- target: …` with one `key: value` per line"
+            )
             continue
-        item, key, value = m.groups()
         if item:
             if key != "target":
                 errors.append(
-                    f"{RELEASE_WORKFLOW}: a `{BUILD_JOB}` matrix row opens with `{key}:`, "
-                    "not `target:`; this check reads only rows that open with `- target:`"
+                    f"{RELEASE_WORKFLOW}:{lineno}: a `{BUILD_JOB}` matrix row opens with "
+                    f"`{key}:`, not `target:`; this check reads only rows that open with "
+                    "`- target:`"
                 )
             rows.append({})
-        if rows:
-            rows[-1][key] = _value(value)
+        rows[-1][key] = _value(value)
 
     if include_indent is None:
         errors.append(f"{RELEASE_WORKFLOW}: `{BUILD_JOB}` has no `matrix.include`")

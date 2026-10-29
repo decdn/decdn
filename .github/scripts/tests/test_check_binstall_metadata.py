@@ -290,3 +290,50 @@ def test_an_unknown_archive_format_fails(tmp_path):
     workflow = WORKFLOW.format(builds="tool-cli:tool").replace("archive: zip", "archive: 7z")
     errors = cbm.check(make_repo(tmp_path, workflow=workflow))
     assert errors_containing(errors, "archive '7z'")
+
+
+def test_a_flow_style_row_is_refused_not_skipped(tmp_path):
+    # The Linux row is correct; the Windows row, if skipped, would go unchecked
+    # and the check would pass.
+    workflow = WORKFLOW.format(builds="tool-cli:tool").replace(
+        """          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            builds: tool-cli:tool
+            archive: zip
+""",
+        """          - {target: x86_64-pc-windows-msvc, builds: "tool-cli:tool", archive: zip}
+""",
+    )
+    errors = cbm.check(make_repo(tmp_path, workflow=workflow))
+    assert errors_containing(errors, "is not a `key: value` scalar"), errors
+
+
+MATRIX_HEAD = "jobs:\n  build-binaries:\n    strategy:\n      matrix:\n        include:\n"
+ROW = (
+    "          - target: x86_64-unknown-linux-gnu\n"
+    "            builds: tool-cli:tool\n"
+    "            archive: tar.gz\n"
+)
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        # A key before the first row.
+        "          runner: ubuntu-latest\n" + ROW,
+        # A nested map under a row key.
+        ROW + "            env:\n              target: aarch64-apple-darwin\n",
+        # A block scalar.
+        ROW.replace("builds: tool-cli:tool", "builds: >-\n              tool-cli:tool"),
+        # A flow sequence.
+        ROW.replace("builds: tool-cli:tool", "builds: [tool-cli:tool]"),
+        # A key indented off the row's keys.
+        ROW + "              archive: zip\n",
+        # A line that is not `key: value` at all.
+        ROW + "          - x86_64-apple-darwin\n",
+    ],
+    ids=["key-before-row", "nested-map", "block-scalar", "flow-seq", "off-indent", "bare-item"],
+)
+def test_an_unsupported_include_line_is_refused(lines):
+    _, errors = cbm.parse_build_matrix(MATRIX_HEAD + lines + "    steps:\n      - run: x\n")
+    assert errors_containing(errors, "is not a `key: value` scalar"), errors
