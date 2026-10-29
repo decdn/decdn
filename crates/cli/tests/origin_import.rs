@@ -372,6 +372,81 @@ fn directory_import_subfolder_prefixes_manifest_entries() {
     );
 }
 
+// Whether `dir` lives on a case-sensitive file system: a lowercase file is
+// written, and its uppercase name must not resolve to it.
+fn is_case_sensitive(dir: &Path) -> bool {
+    let lower = dir.join("decdn_case_probe");
+    fs::write(&lower, b"x").unwrap();
+    let sensitive = !dir.join("DECDN_CASE_PROBE").exists();
+    fs::remove_file(&lower).unwrap();
+    sensitive
+}
+
+// Every regular file under `dir`, at any depth.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
+}
+
+// A tree holding two paths that name one file on a case-insensitive file
+// system is refused before anything is imported: every reader rejects its
+// manifest (#2691). With `--move`, every source file stays where it is,
+// the one beside the colliding pair included, and the store gets no blob.
+// Skipped on a case-insensitive file system, which cannot hold both files.
+#[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "test harness diagnostic surfaced in the nextest log"
+)]
+fn directory_import_refuses_paths_that_name_one_file() {
+    for (move_source, optimize) in [(false, false), (true, false), (true, true)] {
+        let src = TempDir::new().unwrap();
+        if !is_case_sensitive(src.path()) {
+            eprintln!(
+                "skipping directory_import_refuses_paths_that_name_one_file: \
+                 case-insensitive filesystem collapses README/readme"
+            );
+            return;
+        }
+        let origin = TempDir::new().unwrap();
+        let out = TempDir::new().unwrap();
+        for name in ["README", "readme", "other"] {
+            fs::write(src.path().join(name), name).unwrap();
+        }
+
+        let out_bundle = out.path().join("out.json");
+        let mut args = import_args(src.path(), origin.path());
+        args.bundle = Some(out_bundle.clone());
+        args.move_source = move_source;
+        args.optimize = optimize;
+        let err = rt().block_on(origin_import(&args)).unwrap_err();
+
+        let case = format!("move={move_source} optimize={optimize}");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(r#"no reader accepts a bundle of it: "README" and "readme""#),
+            "{case}: {msg}"
+        );
+        for name in ["README", "readme", "other"] {
+            assert_eq!(
+                fs::read(src.path().join(name)).unwrap(),
+                name.as_bytes(),
+                "{case}: the source file {name} stays"
+            );
+        }
+        assert_eq!(files_under(origin.path()), Vec::<PathBuf>::new(), "{case}");
+        assert!(!out_bundle.exists(), "{case}: no manifest is written");
+    }
+}
+
 fn hash_from_hex(hex: &str) -> (Hash, String) {
     let mut raw = [0u8; 32];
     for (i, slot) in raw.iter_mut().enumerate() {

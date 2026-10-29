@@ -113,7 +113,9 @@ invalid. A retry does not help. The manifest is content-addressed, so
 every read gets the same bytes. This rule applies to a chunk hash too.
 A hint is advisory, but its syntax is not. A chunk list whose sizes do
 not sum to the entry `size` is a wrong hint, not a bad hash: the client
-ignores the hints and fetches the whole file.
+ignores the hints and fetches the whole file. A reader also rejects a
+manifest with two entry paths that name one file (§ Path-safety rules,
+rule 7).
 
 ## Path-safety rules (creation-time invariants)
 
@@ -142,6 +144,20 @@ on read.
 6. **Directory state.** Empty input directory is valid and produces
    `entries: []`. Missing or non-directory `--input` errors before
    walking.
+7. **Unique paths.** Two entries must not name one file. By default,
+   macOS and Windows file systems ignore case. macOS also ignores
+   Unicode normalization. On these systems, `README` and `readme` are
+   one file. A composed `é` and a decomposed `é` are also one file.
+   Two paths name one file when their keys are equal. The key of a
+   path is its NFD form, mapped to lower case, then to upper case,
+   then to lower case again, then put in NFC form. The key joins `ẞ`,
+   `ß` and `ss`. It also joins some pairs that a file system keeps
+   apart, for example dotless `ı` and `i`. `origin import` checks the
+   paths before it imports a file. It refuses such a tree and moves or
+   writes nothing. A reader rejects the whole manifest, the same as a
+   bad hash (§ Hash format). A pull of entries that a caller builds
+   without this check fails each colliding entry. It writes none of
+   them.
 
 ## Determinism
 

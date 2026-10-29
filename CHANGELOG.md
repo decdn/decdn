@@ -5393,6 +5393,20 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **client: a bundle manifest with two entry paths that name one file is
+  rejected (GHSA-3c38-gqx6-v7fm, #2691).** A manifest could hold `{p → A}`
+  and `{p → B}`, or paths that differ only in case or Unicode normalization.
+  With A already at `p`, the pull skipped B too and reported success while
+  `p` kept bytes B never matched. `BundleManifest::parse` now fails with
+  `MalformedManifest` when two paths name one file on a case- or
+  normalization-insensitive file system (`decdn_client::bundle::path_collision`:
+  NFD, lower then upper then lower case, NFC), so `decdn get` and the gateway
+  refuse the bundle. A pull of a manifest built with `BundleManifest::new`
+  fails every colliding entry and writes none of them. A saved file whose path
+  names the same file as one the pull writes is no longer a whole-file donor.
+  `decdn origin import` refuses a tree that holds such a pair (`README` and
+  `readme`) before it imports, moves or writes any file.
+
 - **sponsord-onramp: clients behind the documented proxy no longer share one
   rate-limit budget (GHSA-674v-whmr-xvmw, #2693).** The deploy binds the
   onramp to localhost behind a reverse proxy, but the env example left

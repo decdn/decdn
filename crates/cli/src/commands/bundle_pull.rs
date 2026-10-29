@@ -1397,8 +1397,8 @@ fn report_nothing_to_fetch(reason: NothingReason) {
 
 /// The hint for a bundle URI whose hash names a blob that is not a manifest:
 /// the trailing `/` asked for a bundle, and dropping it fetches the raw blob.
-/// A malformed manifest gets no such hint: its raw blob is the same broken
-/// JSON. Every other error passes through unchanged.
+/// A malformed manifest gets no such hint: its raw blob is the same manifest
+/// bytes. Every other error passes through unchanged.
 fn not_a_manifest_hint(err: anyhow::Error) -> anyhow::Error {
     if chain_has::<NotAManifest>(&err) {
         err.context(

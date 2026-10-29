@@ -202,6 +202,9 @@ bytes = "1"
 # Beneath-root landing of bundle entries: `decdn-client` resolves every
 # destination through the output directory's handle (#2439).
 cap-std = "4"
+# Bundle manifest path collisions compare NFC-normalized paths (#2691). Already
+# in the graph through `url` → `idna`.
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 indexmap = "2"
 rand = "0.10"
 rpassword = "7"

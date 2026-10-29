@@ -28,6 +28,7 @@
 //! The pull future is not `Send`: every entry and lane runs on the task that
 //! awaits it. Await it in place, or on a `tokio::task::LocalSet`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,6 +122,11 @@ impl BundleManifest {
     /// A manifest of `entries` whose blob has the BLAKE3 hash `hash`. A pull
     /// records `hash` as the source of each file it writes, so a wrong one
     /// makes a later pull of the same entry see its own files as foreign.
+    ///
+    /// Each entry `path` must name its own file ([`path_collision`]): a pull
+    /// fails every entry whose path names the same file as another's, and
+    /// writes none of them. [`BundleManifest::parse`] rejects such a manifest
+    /// outright.
     #[must_use]
     pub const fn new(hash: [u8; 32], entries: Vec<ManifestEntry>) -> Self {
         Self { hash, entries }
@@ -140,8 +146,9 @@ impl BundleManifest {
     ///
     /// [`NotAManifest`] when the bytes are not a manifest or name a version
     /// other than 1. [`MalformedManifest`] when a v1 manifest holds an entry
-    /// or chunk hash that does not parse: one malformed hash makes the whole
-    /// manifest invalid. A retry cannot fix either: the bytes are
+    /// or chunk hash that does not parse, or two entries whose paths name one
+    /// file on a case- or normalization-insensitive file system
+    /// ([`path_collision`]). One bad entry makes the whole manifest invalid. A retry cannot fix either error: the bytes are
     /// content-addressed, so every read of them gets the same answer.
     pub fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         let manifest: ManifestV1 = serde_json::from_slice(bytes)
@@ -153,11 +160,18 @@ impl BundleManifest {
             ))
             .into());
         }
-        let entries = manifest
+        let entries: Vec<ManifestEntry> = manifest
             .entries
             .into_iter()
             .map(WireEntry::parse)
             .collect::<Result<_, _>>()?;
+        if let Some((first, second)) = path_collision(entries.iter().map(|en| en.path.as_str())) {
+            return Err(MalformedManifest(format!(
+                "two bundle entries name the same file on a case- or normalization-insensitive \
+                 file system: {first:?} and {second:?}"
+            ))
+            .into());
+        }
         Ok(Self {
             hash: *blake3::hash(bytes).as_bytes(),
             entries,
@@ -190,6 +204,38 @@ impl BundleManifest {
     pub fn cache_path(out_dir: &Path, hash: [u8; 32]) -> PathBuf {
         manifest_cache::cache_path(out_dir, hash)
     }
+}
+
+/// The key under which two entry paths name the same file on a file system
+/// that ignores case or Unicode normalization (by default, macOS ignores both
+/// and Windows ignores case), close to the canonical caseless match of Unicode
+/// § 3.13. The path is decomposed (NFD), folded to lower case, then upper
+/// case, then lower case again, and composed (NFC). The fold joins `ẞ`, `ß` and `ss`, as full case
+/// folding does. It also joins a few pairs full case folding keeps apart, such
+/// as dotless `ı` and `i`; such a pair is refused, not written over.
+fn path_key(path: &str) -> String {
+    let decomposed = icu_normalizer::DecomposingNormalizerBorrowed::new_nfd().normalize(path);
+    let folded = decomposed.to_lowercase().to_uppercase().to_lowercase();
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize(&folded)
+        .into_owned()
+}
+
+/// Two of `paths` that name the same file on a file system that ignores case
+/// or Unicode normalization: the earliest path whose key repeats an earlier
+/// path's, paired with that earlier path. `None` when every path names its own
+/// file. The key is NFD, then lower, upper and lower case, then NFC, so
+/// `README` and `readme`, `straße` and `STRASSE`, and a composed and a
+/// decomposed `é` each collide.
+///
+/// [`BundleManifest::parse`] rejects a manifest with such a pair, and a pull
+/// fails every entry of one. A publisher checks its paths with it before it
+/// writes anything.
+pub fn path_collision<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<(&'a str, &'a str)> {
+    let mut seen: HashMap<String, &'a str> = HashMap::new();
+    paths
+        .into_iter()
+        .find_map(|path| seen.insert(path_key(path), path).map(|first| (first, path)))
 }
 
 /// The entries of `manifest` whose path under `out_dir` holds something that
@@ -278,10 +324,11 @@ impl std::fmt::Display for NotAManifest {
 
 impl std::error::Error for NotAManifest {}
 
-/// A v1 bundle manifest with an entry or chunk hash that does not parse:
-/// [`BundleManifest::parse`]'s error for a manifest its publisher wrote
-/// wrong. Fetching the raw blob only returns the same broken JSON; only a
-/// fixed manifest, under a new hash, serves the entries.
+/// A v1 bundle manifest with an entry or chunk hash that does not parse, or
+/// two entry paths that name one file ([`path_collision`]):
+/// [`BundleManifest::parse`]'s error for a manifest its publisher wrote wrong.
+/// Fetching the raw blob only returns the same manifest bytes; only a fixed
+/// manifest, under a new hash, serves the entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MalformedManifest(String);
 
@@ -389,7 +436,8 @@ impl ManifestEntry {
     /// its manifest path. The pull records the manifest path as the source of
     /// the file it writes. A second `land_at` keeps the first manifest path.
     /// Setting the `path` field directly makes the pull record that path as
-    /// the manifest path.
+    /// the manifest path. A pull fails every entry that lands at the same file
+    /// as another ([`path_collision`]).
     #[must_use]
     pub fn land_at(mut self, path: impl Into<String>) -> Self {
         let manifest_path = std::mem::replace(&mut self.path, path.into());

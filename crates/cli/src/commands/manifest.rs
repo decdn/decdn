@@ -15,9 +15,10 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
+use decdn_client::bundle::path_collision;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 use walkdir::WalkDir;
@@ -146,6 +147,11 @@ fn keep_entry(rel: &Path, is_dir: bool, excluder: &GlobSet) -> bool {
 /// `origin import` (without `--dry-run`) hashes **and** writes the blob; a
 /// plain (non-chunking) caller always returns `None` for the third element.
 ///
+/// The whole tree is walked before the first `per_file` call. A tree holding
+/// two paths that name one file on a case- or normalization-insensitive file
+/// system ([`path_collision`]) is refused then, so a refused `--move` import
+/// moves no file and a refused import writes no blob.
+///
 /// The entries are sorted by path bytes so the emitted manifest — and therefore
 /// its own BLAKE3 — is byte-stable across runs.
 pub(crate) fn walk_and_collect<F>(
@@ -157,9 +163,8 @@ pub(crate) fn walk_and_collect<F>(
 where
     F: FnMut(&Path, &str) -> anyhow::Result<(String, u64, Option<Vec<Chunk>>)>,
 {
-    let mut entries: Vec<BundleEntry> = Vec::new();
+    let mut kept: Vec<(PathBuf, String)> = Vec::new();
     let mut skipped_symlinks: u64 = 0;
-    let mut total_size: u64 = 0;
 
     // Skip / prune excluded entries *lexically*, before any canonicalize.
     // `filter_entry` runs on every yielded entry including the root: when the
@@ -238,7 +243,19 @@ where
         if excluder.is_match(&rel_str) {
             continue;
         }
+        kept.push((canonical, rel_str));
+    }
 
+    if let Some((first, second)) = path_collision(kept.iter().map(|(_, rel)| rel.as_str())) {
+        bail!(
+            "two paths in the tree name one file on a case- or normalization-insensitive file \
+             system, so no reader accepts a bundle of it: {first:?} and {second:?}"
+        );
+    }
+
+    let mut entries: Vec<BundleEntry> = Vec::with_capacity(kept.len());
+    let mut total_size: u64 = 0;
+    for (canonical, rel_str) in kept {
         let (hash, size, chunks) = per_file(&canonical, &rel_str)
             .with_context(|| format!("processing {}", canonical.display()))?;
 

@@ -55,6 +55,9 @@ bytes = { workspace = true }
 # A bundle pull lands every entry beneath the output directory's handle, so a
 # symlink in an entry's parent chain cannot move the write outside it (#2439).
 cap-std = { workspace = true }
+# Two manifest paths that differ only in Unicode normalization name one file on
+# macOS, so a manifest holding both is rejected (#2691).
+icu_normalizer = { workspace = true }
 iroh = { workspace = true }
 # `discovery::select_candidates` shuffles the probe sample (#1988).
 rand = { workspace = true }

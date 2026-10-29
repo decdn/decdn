@@ -22,8 +22,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail};
+use anyhow::{Context as _, anyhow, bail};
 use decdn_bao_range::{EncodedOutboard, encode_outboard, shard_prefix};
+use decdn_client::bundle::BundleManifest;
 use decdn_common::cli::{OriginArgs, OriginCommand, OriginImportArgs};
 use serde::Serialize;
 
@@ -527,6 +528,11 @@ fn emit_manifest(
         }
     }
     let bundle_bytes = serialize_canonical(&entries)?;
+    // The walk already refused a tree whose paths collide. Parsing the bytes
+    // as a reader does keeps a manifest no reader accepts from being imported,
+    // written or printed, whatever rule it breaks.
+    BundleManifest::parse(&bundle_bytes)
+        .context("internal error: origin import built a manifest that readers reject")?;
 
     if ctx.write
         && let Some(base) = ctx.base.as_deref()
