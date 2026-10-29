@@ -3821,6 +3821,74 @@ async fn an_owed_span_whose_bill_faults_stays_owed() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A leg that faults leaves its delivered bytes owed, so the next leg opens
+/// at the same start and re-delivers them. When that leg faults at the same
+/// point, it made no byte present: its fault line says `landed=0` though its
+/// unit verified the whole re-delivered span, and it re-queues what the first
+/// fault re-queued.
+#[tokio::test(start_paused = true)]
+async fn a_leg_that_only_re_delivers_lands_nothing() -> anyhow::Result<()> {
+    let data = blob(1024 * 1024);
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    // Two readers fault at the same wire offset; the third finishes the blob.
+    let a = ScriptedSource::new(data.clone())?
+        .paying(Arc::clone(&la))
+        .fault_times_after(2, 256 * 1024, || anyhow::anyhow!("connection reset"));
+    let (root, total) = (a.root(), a.total_bytes());
+    let (store, dir) = fresh_store(root, total);
+    let provider = StaticSources::new(vec![candidate(a.clone(), Arc::clone(&la), 0xA1, None)])?;
+    let log = CapturedLog::default();
+    let sink = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    // `set_default` is per-thread: `acquire` polls every worker on this one.
+    let guard = tracing::subscriber::set_default(subscriber);
+    acquire_under(&store, &provider, root, &no_funding(), &RecoveryGate::new()).await?;
+    drop(guard);
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+    let text = log.text();
+    let num = |fault: &str, key: &str| -> anyhow::Result<u64> {
+        fault
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .ok_or_else(|| anyhow::anyhow!("no {key} in {fault}"))?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{key} in {fault}: {e}"))
+    };
+    let faults: Vec<&str> = text
+        .lines()
+        .filter_map(|l| Some(l.split_once("a lane faulted; its remainder")?.1))
+        .collect();
+    let [first, second] = faults.as_slice() else {
+        anyhow::bail!("two lane faults: {text}");
+    };
+    assert_eq!(
+        (num(first, "offset")?, num(second, "offset")?),
+        (0, 0),
+        "the second leg opens where the first did: {text}"
+    );
+    assert!(
+        num(first, "landed")? > 0,
+        "the first leg landed bytes: {text}"
+    );
+    assert_eq!(
+        num(second, "landed")?,
+        0,
+        "the second leg only re-delivered: {text}"
+    );
+    assert_eq!(
+        num(second, "requeued")?,
+        num(first, "requeued")?,
+        "the second leg leaves the store as the first left it: {text}"
+    );
+    Ok(())
+}
+
 /// A leg that a lost connection ends after the credit window let it deliver
 /// verified bytes unpaid leaves the lane owing them (#2718, #2722). The lane's
 /// restart reopens at the paid frontier, not the delivered one, and bills the
@@ -7966,6 +8034,30 @@ async fn a_capability_refused_with_headroom_left_reads_as_revoked() -> anyhow::R
 /// An extra stream's fault line is at debug when nothing landed. Otherwise
 /// it follows the fault's class (#2331). The error field is sanitized: a
 /// lane build's chain error names the RPC URL, which may carry a key.
+/// A fault's `landed` reads the store, not the unit's verified counter: a
+/// byte the store held at the pick does not count, and a byte two legs
+/// delivered, as a healed leg or an owed span re-delivers, counts once.
+#[test]
+fn landed_counts_each_new_byte_of_the_held_range_once() {
+    const K: u64 = 1024;
+    // The pick [0, 64K) found [0, 16K) present; a steal left [0, 48K) held.
+    let pick_missing = [(16 * K, 48 * K)];
+    // 8K of the held range is still missing: 24K is new, however often
+    // the legs delivered it, and the present prefix counts for nothing.
+    assert_eq!(
+        super::landed_within(&pick_missing, 0, 48 * K, 8 * K),
+        24 * K
+    );
+    // Every missing byte of the held range still missing: nothing landed,
+    // even when a leg re-delivered the present prefix.
+    assert_eq!(super::landed_within(&pick_missing, 0, 48 * K, 32 * K), 0);
+    // Two missing runs, the held range ending inside the second.
+    assert_eq!(
+        super::landed_within(&[(0, 8 * K), (32 * K, 32 * K)], 0, 48 * K, 0),
+        24 * K
+    );
+}
+
 #[test]
 fn extra_stream_fault_level_follows_landed_and_class() {
     let range = |landed| crate::source_set::LaneRange {
@@ -7974,6 +8066,7 @@ fn extra_stream_fault_level_follows_landed_and_class() {
         picked_offset: 0,
         picked_len: 1024,
         landed,
+        verified: landed,
         requeued: 0,
         past_end: false,
         uncovered: true,

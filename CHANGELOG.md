@@ -3888,8 +3888,10 @@ since project inception and will roll into the first tagged release.
   range to end at the split, and the stolen tail is the stealer's. The
   "a lane faulted" line logs that held range as `offset`/`len`, the missing
   bytes of it that go back to the queue as `requeued`, and the range as the
-  lane picked it as `picked_offset`/`picked_len`. For a range the store held
-  no byte of at the pick, `landed` and `requeued` add up to `len`. A
+  lane picked it as `picked_offset`/`picked_len`. `landed` counts each byte
+  the lane made present once, so a byte a healed leg or an owed span
+  delivered again does not count twice. For a range the store held no byte
+  of at the pick, `landed` and `requeued` add up to `len`. A
   `NotFound` from a partial holder counts toward the blocks of the held
   range only. The "stole the tail of a lane's missing remainder" line
   carries `hash` at debug and at info, so a steal matches the fault it

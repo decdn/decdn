@@ -2078,6 +2078,20 @@ where
     }))
 }
 
+/// The bytes of `(start, len)` that a unit made present: those in
+/// `pick_missing`, the runs the store missed when the unit picked its range,
+/// less `still_missing`, the bytes of `(start, len)` the store misses now. A
+/// byte never leaves the store, so each byte the unit landed counts once,
+/// however many legs delivered it.
+fn landed_within(pick_missing: &[(u64, u64)], start: u64, len: u64, still_missing: u64) -> u64 {
+    let end = start.saturating_add(len);
+    pick_missing
+        .iter()
+        .map(|&(s, l)| s.saturating_add(l).min(end).saturating_sub(s.max(start)))
+        .fold(0, u64::saturating_add)
+        .saturating_sub(still_missing)
+}
+
 /// What [`requeue_missing`] put back.
 struct Requeued {
     /// The `(start, len)` range the worker held, trimmed by any steal.
@@ -2377,6 +2391,7 @@ where
                         picked_offset: start,
                         picked_len: len,
                         landed: 0,
+                        verified: 0,
                         requeued: 0,
                         past_end: false,
                         uncovered: false,
@@ -2544,7 +2559,8 @@ where
         let rebills: Vec<u64> = owed.iter().map(|&(start, _)| start).collect();
         let gaps = crate::ledger::merge_spans(
             missing_gaps
-                .into_iter()
+                .iter()
+                .copied()
                 .chain(owed)
                 .map(|(start, len)| (start, start.saturating_add(len)))
                 .collect(),
@@ -2701,7 +2717,8 @@ where
             }
         }
 
-        // The unit's verified bytes across its gaps, for the fault's log line.
+        // The unit's verified bytes across its gaps, a byte delivered again
+        // counted each time.
         let landed = unit.progress.verified.load(Ordering::Relaxed);
         if landed > 0 {
             work.lock().await.record_rate(i, unit.rate());
@@ -2773,11 +2790,19 @@ where
                 let from = owed_from.filter(|_| !retired(engine.credentials, &lane));
                 // The range the lane held when it faulted: a peer's steal can
                 // have trimmed the picked range, and the stolen tail is the
-                // stealer's. A worker that held nothing reports its pick.
-                let ((offset, len), requeued) = requeue_from(store, work, i, from).await?.map_or(
-                    ((r_start, r_len), 0),
-                    |Requeued { held, missing, .. }| (held, missing),
-                );
+                // stealer's. A worker that held nothing re-queued nothing, and
+                // reports its pick and what the store still misses of it.
+                let ((offset, len), requeued, still_missing) =
+                    match requeue_from(store, work, i, from).await? {
+                        Some(Requeued { held, missing, .. }) => (held, missing, missing),
+                        None => (
+                            (r_start, r_len),
+                            0,
+                            missing_bytes(store, r_start, r_len).await?,
+                        ),
+                    };
+                // What the lane made present in that range, each byte once.
+                let distinct = landed_within(&missing_gaps, offset, len, still_missing);
                 {
                     let mut w = work.lock().await;
                     if extra {
@@ -2792,7 +2817,8 @@ where
                     len,
                     picked_offset: r_start,
                     picked_len: r_len,
-                    landed,
+                    landed: distinct,
+                    verified: landed,
                     requeued,
                     // The loop knows the first claim; it sets this.
                     past_end: false,
@@ -2903,12 +2929,13 @@ fn log_extra_fault(
         picked_offset,
         picked_len,
         landed,
+        verified,
         requeued,
         past_end: _,
         uncovered,
     } = range;
     let error = decdn_common::redact::sanitize_err_chain(err);
-    if landed > 0 {
+    if verified > 0 {
         let fault = crate::fault::classify(err);
         crate::fault::warn_or_info!(
             fault.warns(),

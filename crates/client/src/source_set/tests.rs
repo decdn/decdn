@@ -476,6 +476,7 @@ const fn block1(uncovered: bool) -> super::LaneRange {
         picked_offset: 64 << 20,
         picked_len: 64 << 20,
         landed: 0,
+        verified: 0,
         requeued: 0,
         past_end: false,
         uncovered,
@@ -490,6 +491,7 @@ const fn block0() -> super::LaneRange {
         picked_offset: 0,
         picked_len: 64 << 20,
         landed: 0,
+        verified: 0,
         requeued: 0,
         past_end: false,
         uncovered: false,
@@ -648,6 +650,7 @@ async fn a_mid_range_refusal_counts_only_the_blocks_after_what_landed() {
         picked_offset: 0,
         picked_len: 128 << 20,
         landed: 64 << 20,
+        verified: 64 << 20,
         requeued: 0,
         past_end: false,
         uncovered: false,
@@ -1096,6 +1099,7 @@ async fn the_lane_fault_line_names_the_holder_record() {
     let trimmed = super::LaneRange {
         len: 24 << 20,
         landed: 8 << 20,
+        verified: 8 << 20,
         requeued: 16 << 20,
         ..block0()
     };
@@ -1180,6 +1184,7 @@ async fn overshoot_refusals_never_mark_a_non_holder_absent() {
         picked_offset: 64 << 20,
         picked_len: 64 << 20,
         landed: 0,
+        verified: 0,
         requeued: 0,
         past_end: true,
         uncovered: false,
@@ -1433,8 +1438,10 @@ async fn a_timestamp_refusal_after_bytes_landed_is_an_ordinary_source_fault() {
     );
     let skewed =
         anyhow::Error::new(crate::UpstreamTimestampRejected { label: None }).context("read chunk");
+    // Verified bytes arrived, all of them bytes the store held: the guard
+    // reads what the provider sent, not what was new.
     let mid_range = super::LaneRange {
-        landed: 1024,
+        verified: 1024,
         ..block0()
     };
     let now = Instant::now();

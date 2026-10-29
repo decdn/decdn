@@ -84,13 +84,19 @@ pub struct LaneRange {
     /// The length in bytes of the range as the lane picked it. A steal
     /// leaves it longer than `len`.
     pub picked_len: u64,
-    /// The bytes of the held range that verified before the fault.
+    /// The bytes of the held range that the lane made present before the
+    /// fault, each byte once: a byte a leg delivered again, after a heal or
+    /// in an owed span, counts once, and a byte the store held at the pick
+    /// does not count. A verified span the lane did not pay for counts: the
+    /// store holds it, and the lane bills it when it runs again.
     pub landed: u64,
+    /// The verified bytes the lane's legs reported, a byte delivered again
+    /// counted each time. Not zero means the provider sent the lane verified
+    /// bytes, even when they were all bytes the store held.
+    pub verified: u64,
     /// The missing bytes of the held range that the fault put back in the
     /// queue: what the other lanes still fetch. For a range the store held
-    /// no byte of at the pick, `landed` and `requeued` add up to `len`. A
-    /// verified span the lane did not pay for counts in `landed`: the store
-    /// holds it, and the lane bills it when it runs again.
+    /// no byte of at the pick, `landed` and `requeued` add up to `len`.
     pub requeued: u64,
     /// The piece that faulted starts at or past the end the fetch knows: the
     /// proven size, or with none proven the smaller of the first size claim
@@ -688,6 +694,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             picked_offset,
             picked_len,
             landed,
+            verified: _,
             requeued,
             past_end,
             uncovered,
@@ -735,7 +742,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             // source fault.
             Fault::Source
                 if crate::fault::refuses_timestamp(err)
-                    && range.as_ref().is_none_or(|r| r.landed == 0) =>
+                    && range.as_ref().is_none_or(|r| r.verified == 0) =>
             {
                 self.record_declined(provider, DeclineReason::ClockSkew, None)
             }
@@ -960,10 +967,10 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         range: &LaneRange,
         at: Instant,
     ) {
-        // The bytes before `landed` verified: only the part after them is
+        // The bytes before `verified` verified: only the part after them is
         // refused. The count goes to the held range: a steal's tail is the
         // stealer's, and a refusal of it counts on the stealer's lane.
-        let refused_from = range.offset.saturating_add(range.landed);
+        let refused_from = range.offset.saturating_add(range.verified);
         let refused_end = range.offset.saturating_add(range.len);
         let until = at.checked_add(PULL_THROUGH_BAR).unwrap_or(at);
         let mut dropped = Vec::new();
