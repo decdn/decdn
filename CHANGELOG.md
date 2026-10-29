@@ -4482,14 +4482,18 @@ since project inception and will roll into the first tagged release.
 ### Added
 
 - **CLI: `decdn setup` checks the buyer wallet's USDC on a pull-through node
-  (#2676).** A node with pull-through on buys its cache misses from peers and
-  escrows `blockchain.buyer_working_deposit_micro_usdc` (10 USDC by default)
-  in a `PaymentPool` pool. Setup now prints a `buyer_usdc` pre-flight row with
-  the working deposit and the wallet's USDC (`PaymentPool.usdc()`). Below the
-  deposit, the row warns with the shortfall, the address to fund and, on the
-  testnet, the USDC faucet. The row never fails the run. `--json` reports it as
-  `preflight.buyer_usdc`, `null` when pull-through is off. The keyless dry run
-  prints it too.
+  (#2676).** A node with pull-through on buys its cache misses from peers.
+  Opening the pool those pulls pay from escrows
+  `blockchain.buyer_working_deposit_micro_usdc` (10 USDC by default). Setup
+  now prints a `buyer_usdc` pre-flight row with the working deposit and the
+  wallet's USDC (`PaymentPool.usdc()`). Below the deposit, the row warns with
+  the shortfall, the address to fund and, on the testnet, the USDC faucet. It
+  reads the pool as `decdn-node` does (`DECDN_PAYMENT_POOL_ADDRESS`, else
+  `blockchain.payment_pool_address`) and flags a missing or zero pool address
+  or a zero deposit, which the node refuses to start with. The row never fails
+  the run. `--json` reports it as `preflight.buyer_usdc`: `null` when
+  pull-through is off, else an object whose `state` is `covered`, `short`,
+  `no_wallet` (the keyless dry run), `config_error` or `read_error`.
 - **Node: metrics for the settlement re-anchor path (#2710).** The settlement
   watcher re-reads each pool that it seeded from one `getPool` after a restart,
   at a pinned block. Before, it reported the outcomes only in logs, so a pool

@@ -173,25 +173,49 @@ fn all_ok_requires_every_blocking_check() {
     assert!(!pf.all_ok());
 }
 
-fn buyer(working_deposit: u64, balance: Result<u64, &str>) -> BuyerUsdc {
+fn buyer(working_deposit: u64, balance: BuyerBalance) -> BuyerUsdc {
     BuyerUsdc {
         working_deposit,
-        balance: balance.map_err(str::to_owned),
+        balance,
     }
 }
 
-/// The wallet must cover the whole working deposit; anything less, or an
-/// unread balance, warns. The row never fails.
+fn read(balance: u64) -> BuyerBalance {
+    BuyerBalance::Read(balance)
+}
+
+fn read_error(reason: &str) -> BuyerBalance {
+    BuyerBalance::ReadError(reason.to_owned())
+}
+
+fn file(body: &str) -> chain_ctx::FileConfig {
+    toml::from_str(body).unwrap()
+}
+
+/// The wallet must cover the whole working deposit; anything less, a wallet
+/// not created yet, or no balance at all warns. The row never fails.
 #[test]
 fn buyer_usdc_status_warns_below_the_working_deposit() {
-    assert_eq!(buyer(10, Ok(10)).status(), CheckStatus::Ok);
-    assert_eq!(buyer(10, Ok(11)).status(), CheckStatus::Ok);
-    assert_eq!(buyer(10, Ok(9)).status(), CheckStatus::Warn);
-    assert_eq!(buyer(10, Ok(0)).status(), CheckStatus::Warn);
-    assert_eq!(buyer(10, Err("rpc down")).status(), CheckStatus::Warn);
-    assert_eq!(buyer(10, Ok(4)).shortfall(), Some(6));
-    assert_eq!(buyer(10, Ok(40)).shortfall(), Some(0));
-    assert_eq!(buyer(10, Err("rpc down")).shortfall(), None);
+    assert_eq!(buyer(10, read(10)).status(), CheckStatus::Ok);
+    assert_eq!(buyer(10, read(11)).status(), CheckStatus::Ok);
+    assert_eq!(buyer(10, read(9)).status(), CheckStatus::Warn);
+    assert_eq!(buyer(10, read(0)).status(), CheckStatus::Warn);
+    assert_eq!(
+        buyer(10, BuyerBalance::NoWallet).status(),
+        CheckStatus::Warn
+    );
+    assert_eq!(
+        buyer(10, read_error("rpc down")).status(),
+        CheckStatus::Warn
+    );
+    assert_eq!(
+        buyer(10, BuyerBalance::ConfigError("x".to_owned())).status(),
+        CheckStatus::Warn
+    );
+    assert_eq!(buyer(10, read(4)).shortfall(), Some(6));
+    assert_eq!(buyer(10, read(40)).shortfall(), Some(0));
+    assert_eq!(buyer(10, BuyerBalance::NoWallet).shortfall(), Some(10));
+    assert_eq!(buyer(10, read_error("rpc down")).shortfall(), None);
 }
 
 /// An unfunded buyer wallet warns but does not gate the live run: the node
@@ -199,19 +223,21 @@ fn buyer_usdc_status_warns_below_the_working_deposit() {
 #[test]
 fn all_ok_ignores_an_unfunded_buyer_wallet() {
     let mut pf = pf_with(Some(0), 100, 10, 100, 10);
-    pf.buyer_usdc = Some(buyer(10_000_000, Ok(0)));
+    pf.buyer_usdc = Some(buyer(10_000_000, read(0)));
     assert!(pf.all_ok());
-    pf.buyer_usdc = Some(buyer(10_000_000, Err("rpc down")));
+    pf.buyer_usdc = Some(buyer(10_000_000, read_error("rpc down")));
     assert!(pf.all_ok());
 }
 
 /// The shortfall row names the deposit, the balance, the shortfall, where to
-/// send USDC and the faucet: what the operator needs to fund the node.
+/// send USDC and the faucet: what the operator needs to fund the node. It also
+/// says that an open pool draws only refills, so a re-run on a working node
+/// does not read as a node that cannot buy.
 #[test]
 fn buyer_usdc_detail_names_the_shortfall_and_the_funding_pointer() {
     let operator = Address::repeat_byte(0x42);
     let detail = buyer_usdc_detail(
-        &buyer(10_000_000, Ok(2_500_000)),
+        &buyer(10_000_000, read(2_500_000)),
         Some(operator),
         Some("https://faucet.example"),
     );
@@ -221,6 +247,7 @@ fn buyer_usdc_detail_names_the_shortfall_and_the_funding_pointer() {
     );
     assert!(detail.contains("hold 2.500000"), "{detail}");
     assert!(detail.contains("short 7.500000"), "{detail}");
+    assert!(detail.contains("draws only refills"), "{detail}");
     assert!(detail.contains(&format!("{operator:#x}")), "{detail}");
     assert!(
         detail.contains("(faucet: https://faucet.example)"),
@@ -228,26 +255,45 @@ fn buyer_usdc_detail_names_the_shortfall_and_the_funding_pointer() {
     );
 
     // An unknown chain has no faucet; the keyless run has no address yet.
-    let detail = buyer_usdc_detail(&buyer(10_000_000, Ok(0)), None, None);
+    let detail = buyer_usdc_detail(&buyer(10_000_000, BuyerBalance::NoWallet), None, None);
+    assert!(detail.contains("hold nothing (no keys yet)"), "{detail}");
     assert!(detail.contains("short 10.000000"), "{detail}");
-    assert!(detail.contains("decdn whoami"), "{detail}");
+    assert!(
+        detail.contains("`decdn whoami`'s `eth address:` line"),
+        "{detail}"
+    );
     assert!(!detail.contains("faucet"), "{detail}");
 
-    let funded = buyer_usdc_detail(&buyer(10_000_000, Ok(10_000_000)), Some(operator), None);
+    let funded = buyer_usdc_detail(&buyer(10_000_000, read(10_000_000)), Some(operator), None);
     assert_eq!(
         funded,
         "pull-through on: working deposit 10.000000 USDC, hold 10.000000"
     );
 
-    let unread = buyer_usdc_detail(&buyer(10_000_000, Err("rpc down")), Some(operator), None);
+    let unread = buyer_usdc_detail(&buyer(10_000_000, read_error("rpc down")), None, None);
     assert!(
         unread.contains("could not read the wallet's USDC (rpc down)"),
         "{unread}"
     );
+    assert!(unread.contains("re-run setup"), "{unread}");
+
+    let config = buyer_usdc_detail(
+        &buyer(
+            10_000_000,
+            BuyerBalance::ConfigError("pool unset".to_owned()),
+        ),
+        None,
+        None,
+    );
+    assert!(
+        config.contains("pool unset: decdn-node refuses to start"),
+        "{config}"
+    );
 }
 
-/// `preflight.buyer_usdc` is `null` with pull-through off, and otherwise
-/// carries the deposit, the balance, the shortfall, `ok`, and the read error.
+/// `preflight.buyer_usdc` is present and `null` with pull-through off, and
+/// otherwise carries the state, the deposit, the balance, the shortfall, `ok`,
+/// and the reason.
 #[test]
 fn build_summary_reports_the_buyer_usdc_row() {
     let summary = |pf: &Preflight| {
@@ -266,12 +312,17 @@ fn build_summary_reports_the_buyer_usdc_row() {
         )
     };
     let mut pf = pf_with(None, 0, 0, 0, 0);
-    assert!(summary(&pf)["preflight"]["buyer_usdc"].is_null());
+    assert_eq!(
+        summary(&pf)["preflight"].get("buyer_usdc"),
+        Some(&serde_json::Value::Null),
+        "the key is present and null with pull-through off"
+    );
 
-    pf.buyer_usdc = Some(buyer(10_000_000, Ok(4_000_000)));
+    pf.buyer_usdc = Some(buyer(10_000_000, read(4_000_000)));
     assert_eq!(
         summary(&pf)["preflight"]["buyer_usdc"],
         serde_json::json!({
+            "state": "short",
             "working_deposit_micro_usdc": 10_000_000,
             "balance_micro_usdc": 4_000_000,
             "shortfall_micro_usdc": 6_000_000,
@@ -280,10 +331,21 @@ fn build_summary_reports_the_buyer_usdc_row() {
         })
     );
 
-    pf.buyer_usdc = Some(buyer(10_000_000, Err("rpc down")));
+    pf.buyer_usdc = Some(buyer(10_000_000, read(10_000_000)));
+    assert_eq!(
+        summary(&pf)["preflight"]["buyer_usdc"]["state"],
+        serde_json::json!("covered")
+    );
+    assert_eq!(
+        summary(&pf)["preflight"]["buyer_usdc"]["ok"],
+        serde_json::json!(true)
+    );
+
+    pf.buyer_usdc = Some(buyer(10_000_000, read_error("rpc down")));
     assert_eq!(
         summary(&pf)["preflight"]["buyer_usdc"],
         serde_json::json!({
+            "state": "read_error",
             "working_deposit_micro_usdc": 10_000_000,
             "balance_micro_usdc": null,
             "shortfall_micro_usdc": null,
@@ -291,6 +353,139 @@ fn build_summary_reports_the_buyer_usdc_row() {
             "error": "rpc down",
         })
     );
+}
+
+/// The keyless dry run reports a wallet not created yet, distinct in `--json`
+/// from a chain read of an empty wallet.
+#[test]
+fn keyless_buyer_usdc_reports_no_wallet_without_a_read() {
+    assert!(keyless_buyer_usdc(BuyerUsdcPlan::Off).is_none());
+    let row = keyless_buyer_usdc(BuyerUsdcPlan::Read {
+        working_deposit: 10_000_000,
+        pool: Address::repeat_byte(0x11),
+    })
+    .unwrap();
+    assert_eq!(
+        buyer_usdc_json(Some(&row)),
+        serde_json::json!({
+            "state": "no_wallet",
+            "working_deposit_micro_usdc": 10_000_000,
+            "balance_micro_usdc": 0,
+            "shortfall_micro_usdc": 10_000_000,
+            "ok": false,
+            "error": null,
+        })
+    );
+    // A config error is not hidden behind the missing wallet.
+    let settled = keyless_buyer_usdc(buyer_usdc_plan(&file(""), None)).unwrap();
+    assert_eq!(
+        buyer_usdc_json(Some(&settled))["state"],
+        serde_json::json!("config_error")
+    );
+}
+
+const POOL_A: &str = "0x00000000000000000000000000000000000000A1";
+const POOL_B: &str = "0x00000000000000000000000000000000000000B2";
+
+fn plan_pool(plan: &BuyerUsdcPlan) -> Option<Address> {
+    match plan {
+        BuyerUsdcPlan::Read { pool, .. } => Some(*pool),
+        BuyerUsdcPlan::Off | BuyerUsdcPlan::Settled(_) => None,
+    }
+}
+
+fn plan_error(plan: &BuyerUsdcPlan) -> Option<&str> {
+    match plan {
+        BuyerUsdcPlan::Settled(row) => row.error(),
+        BuyerUsdcPlan::Off | BuyerUsdcPlan::Read { .. } => None,
+    }
+}
+
+/// The pool resolves as `decdn-node` resolves it: the env var, else the
+/// config. A missing, zero or zero-deposit config settles the row as a config
+/// error; pull-through off plans no row at all.
+#[test]
+fn buyer_usdc_plan_resolves_the_pool_like_the_daemon() {
+    let with_pool = file(&format!(
+        "[blockchain]\npayment_pool_address = \"{POOL_A}\"\n"
+    ));
+    let plan = buyer_usdc_plan(&with_pool, None);
+    assert_eq!(plan_pool(&plan), Some(POOL_A.parse().unwrap()));
+    assert!(matches!(
+        plan,
+        BuyerUsdcPlan::Read {
+            working_deposit: 10_000_000,
+            ..
+        }
+    ));
+
+    // The env var wins over the file, as the daemon's clap `env` does.
+    let plan = buyer_usdc_plan(&with_pool, Some(POOL_B));
+    assert_eq!(plan_pool(&plan), Some(POOL_B.parse().unwrap()));
+
+    // No pool anywhere: the daemon refuses to start. No known-chain fallback,
+    // even on a known chain.
+    let unset = file("[blockchain]\nchain_id = 421614\n");
+    let plan = buyer_usdc_plan(&unset, None);
+    let reason = plan_error(&plan).unwrap();
+    assert!(
+        reason.contains("blockchain.payment_pool_address is not set"),
+        "{reason}"
+    );
+    assert!(reason.contains(PAYMENT_POOL_ENV), "{reason}");
+
+    let zero = file(&format!(
+        "[blockchain]\npayment_pool_address = \"{}\"\n",
+        Address::ZERO
+    ));
+    let reason = plan_error(&buyer_usdc_plan(&zero, None))
+        .map(str::to_owned)
+        .unwrap();
+    assert!(reason.contains("zero address"), "{reason}");
+
+    let zero_deposit = file(&format!(
+        "[blockchain]\npayment_pool_address = \"{POOL_A}\"\nbuyer_working_deposit_micro_usdc = 0\n"
+    ));
+    let reason = plan_error(&buyer_usdc_plan(&zero_deposit, None))
+        .map(str::to_owned)
+        .unwrap();
+    assert!(reason.contains("must be > 0"), "{reason}");
+
+    let off = file("[cache]\nnode_to_node_pull_through_enabled = false\n");
+    assert!(matches!(
+        buyer_usdc_plan(&off, Some(POOL_B)),
+        BuyerUsdcPlan::Off
+    ));
+}
+
+/// A failed chain read is a reason, not an abort, and the reason never echoes
+/// the RPC URL: it reaches stdout past `main`'s sanitizer (#954).
+#[tokio::test]
+async fn read_wallet_usdc_redacts_a_failed_read() {
+    decdn_common::tls::install_crypto_provider();
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let url = format!("http://127.0.0.1:{port}/v3/SECRETKEY123");
+    let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+    let reason = read_wallet_usdc(
+        &provider,
+        Address::repeat_byte(0x11),
+        Address::repeat_byte(0x22),
+    )
+    .await
+    .unwrap_err();
+    assert!(reason.contains("PaymentPool.usdc()"), "{reason}");
+    assert!(!reason.contains("SECRETKEY123"), "{reason}");
+    assert!(!reason.contains(&format!("127.0.0.1:{port}")), "{reason}");
+}
+
+/// The testnet row points at its faucet; an unknown chain (anvil) gets none.
+#[test]
+fn usdc_faucet_follows_the_known_chain() {
+    assert!(usdc_faucet(421_614).is_some());
+    assert!(usdc_faucet(31_337).is_none());
 }
 
 #[test]

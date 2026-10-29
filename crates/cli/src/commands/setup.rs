@@ -129,37 +129,88 @@ impl Preflight {
 }
 
 /// The buyer wallet's USDC against the working deposit, on a node whose
-/// pull-through resolves on. Such a node buys its cache misses from peers: it
-/// escrows the working deposit in a `PaymentPool` pool and refills the pool
-/// toward it, so with less than that in the wallet `openPool` reverts. The node
-/// still serves without it, so the row warns and never blocks.
+/// pull-through resolves on. Such a node buys its cache misses from peers.
+/// Opening the pool those pulls pay from escrows the full working deposit, so
+/// `openPool` reverts until the wallet holds it; once the pool is open, the
+/// wallet funds only refills toward the deposit. The node still serves without
+/// it, so the row warns and never blocks.
 struct BuyerUsdc {
     /// `blockchain.buyer_working_deposit_micro_usdc`.
     working_deposit: u64,
-    /// The operator's USDC in micro-USDC, or why it could not be read. The
-    /// reason is already redacted: it is printed as is, past `main`'s
-    /// sanitizer.
-    balance: Result<u64, String>,
+    /// What the row knows about the wallet.
+    balance: BuyerBalance,
+}
+
+/// The wallet side of the buyer-USDC row. Every reason string is already
+/// redacted: it is printed as is, past `main`'s sanitizer.
+enum BuyerBalance {
+    /// The wallet's USDC as read from the chain, in micro-USDC.
+    Read(u64),
+    /// The keyless dry run: the keys do not exist yet, so the wallet holds
+    /// nothing. No chain read happens.
+    NoWallet,
+    /// The config the row needs is one `decdn-node` refuses to start with: a
+    /// missing or invalid `PaymentPool` address, or a zero working deposit.
+    ConfigError(String),
+    /// The chain read failed.
+    ReadError(String),
 }
 
 impl BuyerUsdc {
-    /// `Ok` when the wallet covers the working deposit, else `Warn`. An unread
-    /// balance warns too.
-    const fn status(&self) -> CheckStatus {
+    /// What the wallet lacks to cover the working deposit: all of it for a
+    /// wallet that does not exist yet, `None` when the row has no balance.
+    const fn shortfall(&self) -> Option<u64> {
         match self.balance {
-            Ok(balance) if balance >= self.working_deposit => CheckStatus::Ok,
+            BuyerBalance::Read(balance) => Some(self.working_deposit.saturating_sub(balance)),
+            BuyerBalance::NoWallet => Some(self.working_deposit),
+            BuyerBalance::ConfigError(_) | BuyerBalance::ReadError(_) => None,
+        }
+    }
+
+    /// `Ok` when the wallet covers the working deposit, else `Warn`. Never
+    /// `Fail`: the row does not block.
+    const fn status(&self) -> CheckStatus {
+        match self.shortfall() {
+            Some(0) => CheckStatus::Ok,
             _ => CheckStatus::Warn,
         }
     }
 
-    /// What the wallet lacks to cover the working deposit, `None` when the
-    /// balance is unread.
-    fn shortfall(&self) -> Option<u64> {
-        self.balance
-            .as_ref()
-            .ok()
-            .map(|balance| self.working_deposit.saturating_sub(*balance))
+    /// The `state` discriminant of the `--json` value.
+    const fn state(&self) -> &'static str {
+        match (&self.balance, self.shortfall()) {
+            (BuyerBalance::NoWallet, _) => "no_wallet",
+            (BuyerBalance::ConfigError(_), _) => "config_error",
+            (BuyerBalance::ReadError(_), _) => "read_error",
+            (BuyerBalance::Read(_), Some(0)) => "covered",
+            (BuyerBalance::Read(_), _) => "short",
+        }
     }
+
+    /// The redacted reason the row has no balance, if it has none.
+    const fn error(&self) -> Option<&str> {
+        match &self.balance {
+            BuyerBalance::ConfigError(reason) | BuyerBalance::ReadError(reason) => {
+                Some(reason.as_str())
+            }
+            BuyerBalance::Read(_) | BuyerBalance::NoWallet => None,
+        }
+    }
+}
+
+/// What the config decides about the buyer-USDC row, before any chain read.
+enum BuyerUsdcPlan {
+    /// Pull-through resolves off: no row.
+    Off,
+    /// The config alone settles the row (a config error).
+    Settled(BuyerUsdc),
+    /// Read the wallet's USDC through this `PaymentPool`.
+    Read {
+        /// `blockchain.buyer_working_deposit_micro_usdc`.
+        working_deposit: u64,
+        /// The `PaymentPool` whose `usdc()` is the wallet's token.
+        pool: Address,
+    },
 }
 
 /// Entry point for `decdn setup`.
@@ -246,7 +297,20 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         .await
         .context("failed to read gas price")?;
     let clock_skew = measure_clock_skew(&resolved.rpc_url).await;
-    let buyer_usdc = read_buyer_usdc(&provider, &file, resolved.chain_id, operator).await;
+    let buyer_usdc = match buyer_usdc_plan(&file, payment_pool_env().as_deref()) {
+        BuyerUsdcPlan::Off => None,
+        BuyerUsdcPlan::Settled(row) => Some(row),
+        BuyerUsdcPlan::Read {
+            working_deposit,
+            pool,
+        } => Some(BuyerUsdc {
+            working_deposit,
+            balance: match read_wallet_usdc(&provider, pool, operator).await {
+                Ok(balance) => BuyerBalance::Read(balance),
+                Err(reason) => BuyerBalance::ReadError(reason),
+            },
+        }),
+    };
 
     // The bond-phase transactions. Over-estimate is the safe direction.
     let gas_needed = U256::from(PREFLIGHT_GAS_UNITS) * U256::from(gas_price);
@@ -698,8 +762,9 @@ async fn read_readiness<P: Provider + Clone>(
 /// reads only the operator-independent curve through a read-only provider and
 /// reports what *would* run. It still validates the tier band so an out-of-band
 /// `--mbps` is flagged here exactly as `build_plan` would on the keyed path.
-/// On a pull-through node it also prints the buyer-USDC row: the wallet does
-/// not exist yet, so it holds nothing and the row reads no balance.
+/// On a pull-through node it also prints the buyer-USDC row: the keys do not
+/// exist yet, so the row reports a wallet that holds nothing, without a chain
+/// read.
 async fn dry_run_without_keys(
     resolved: &chain_ctx::Resolved,
     file: &chain_ctx::FileConfig,
@@ -745,10 +810,7 @@ async fn dry_run_without_keys(
         .await
         .context("failed to read minBond")?;
     let target = min_bond.max(required);
-    let buyer_usdc = file.pull_through().then(|| BuyerUsdc {
-        working_deposit: file.buyer_working_deposit_micro_usdc(),
-        balance: Ok(0),
-    });
+    let buyer_usdc = keyless_buyer_usdc(buyer_usdc_plan(file, payment_pool_env().as_deref()));
     if json {
         let value = serde_json::json!({
             "dry_run": true,
@@ -825,21 +887,75 @@ fn clock_detail(skew: Option<i64>) -> String {
     }
 }
 
-/// Read the buyer wallet's USDC for the pre-flight row, or `None` when
-/// pull-through resolves off. The token is `PaymentPool.usdc()`, as the node's
-/// own buyer path reads it. A failed read becomes the row's reason rather than
-/// an abort: the row never blocks.
-async fn read_buyer_usdc<P: Provider>(
-    provider: &P,
-    file: &chain_ctx::FileConfig,
-    chain_id: u64,
-    operator: Address,
-) -> Option<BuyerUsdc> {
+/// The env var `decdn-node` reads `PaymentPool`'s address from ahead of the
+/// config file. Setup honours it the same way, so a deployment that sets the
+/// address there gets the row for the pool the node uses. An empty value counts
+/// as unset, as it does for the daemon's flag.
+const PAYMENT_POOL_ENV: &str = "DECDN_PAYMENT_POOL_ADDRESS";
+
+/// [`PAYMENT_POOL_ENV`], when set and not empty.
+fn payment_pool_env() -> Option<String> {
+    std::env::var(PAYMENT_POOL_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// Decide the buyer-USDC row from the config, as `decdn-node` resolves it:
+/// pull-through by the daemon's role rule, the working deposit, and the
+/// `PaymentPool` address from `pool_env` ([`PAYMENT_POOL_ENV`]) else
+/// `blockchain.payment_pool_address`. A value the daemon refuses to start
+/// with settles the row as a config error.
+fn buyer_usdc_plan(file: &chain_ctx::FileConfig, pool_env: Option<&str>) -> BuyerUsdcPlan {
     if !file.pull_through() {
-        return None;
+        return BuyerUsdcPlan::Off;
     }
-    let balance = async {
-        let pool = payment_pool_address(file, chain_id)?;
+    let working_deposit = file.buyer_working_deposit_micro_usdc();
+    let config_error = |reason: String| {
+        BuyerUsdcPlan::Settled(BuyerUsdc {
+            working_deposit,
+            balance: BuyerBalance::ConfigError(reason),
+        })
+    };
+    if working_deposit == 0 {
+        return config_error("blockchain.buyer_working_deposit_micro_usdc must be > 0".to_owned());
+    }
+    let Some(raw) = pool_env.or_else(|| file.payment_pool_address()) else {
+        return config_error(format!(
+            "blockchain.payment_pool_address is not set (nor {PAYMENT_POOL_ENV})"
+        ));
+    };
+    match chain_ctx::parse_nonzero_address(raw, "payment_pool_address") {
+        Ok(pool) => BuyerUsdcPlan::Read {
+            working_deposit,
+            pool,
+        },
+        Err(err) => config_error(sanitize_err_chain(&err)),
+    }
+}
+
+/// The keyless dry run's buyer-USDC row: no wallet yet, so no chain read.
+fn keyless_buyer_usdc(plan: BuyerUsdcPlan) -> Option<BuyerUsdc> {
+    match plan {
+        BuyerUsdcPlan::Off => None,
+        BuyerUsdcPlan::Settled(row) => Some(row),
+        BuyerUsdcPlan::Read {
+            working_deposit, ..
+        } => Some(BuyerUsdc {
+            working_deposit,
+            balance: BuyerBalance::NoWallet,
+        }),
+    }
+}
+
+/// Read `operator`'s USDC in micro-USDC. The token is `PaymentPool.usdc()`, as
+/// the node's own buyer path reads it. A failure comes back as a redacted
+/// reason for the row rather than an abort: the row never blocks.
+async fn read_wallet_usdc<P: Provider>(
+    provider: &P,
+    pool: Address,
+    operator: Address,
+) -> Result<u64, String> {
+    async {
         let token = PaymentPool::new(pool, provider)
             .usdc()
             .call()
@@ -853,31 +969,7 @@ async fn read_buyer_usdc<P: Provider>(
         anyhow::Ok(balance.saturating_to::<u64>())
     }
     .await
-    .map_err(|err| sanitize_err_chain(&err));
-    Some(BuyerUsdc {
-        working_deposit: file.buyer_working_deposit_micro_usdc(),
-        balance,
-    })
-}
-
-/// `blockchain.payment_pool_address`, else the known deployment's pool for
-/// `chain_id` — the fallback `decdn node earnings` uses.
-fn payment_pool_address(file: &chain_ctx::FileConfig, chain_id: u64) -> anyhow::Result<Address> {
-    let raw = match file.payment_pool_address() {
-        Some(raw) => raw.to_owned(),
-        None => {
-            known_chains::by_chain_id(chain_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "payment_pool_address not set for chain {chain_id} (set \
-                         blockchain.payment_pool_address)"
-                    )
-                })?
-                .addresses()?
-                .payment_pool
-        }
-    };
-    chain_ctx::parse_nonzero_address(&raw, "payment_pool_address")
+    .map_err(|err| sanitize_err_chain(&err))
 }
 
 /// The known chain's USDC faucet, for the buyer-USDC row's funding pointer.
@@ -885,48 +977,66 @@ fn usdc_faucet(chain_id: u64) -> Option<&'static str> {
     known_chains::by_chain_id(chain_id).and_then(|chain| chain.usdc_faucet)
 }
 
-/// Human-readable buyer-USDC detail: the working deposit and the balance, and
-/// on a shortfall what it costs the node and where to fund it. `operator` is
-/// `None` on the keyless dry run, before the wallet exists.
+/// Human-readable buyer-USDC detail: the working deposit and the balance; on a
+/// shortfall, what it costs the node and where to fund it; with no balance,
+/// why and what to do. `operator` is `None` on the keyless dry run, before the
+/// wallet exists.
 fn buyer_usdc_detail(buyer: &BuyerUsdc, operator: Option<Address>, faucet: Option<&str>) -> String {
     let deposit = format!(
         "pull-through on: working deposit {} USDC",
         format_usdc(buyer.working_deposit)
     );
     let balance = match &buyer.balance {
-        Ok(balance) => *balance,
-        Err(reason) => return format!("{deposit}; could not read the wallet's USDC ({reason})"),
+        BuyerBalance::Read(balance) => format_usdc(*balance),
+        BuyerBalance::NoWallet => "nothing (no keys yet)".to_owned(),
+        BuyerBalance::ConfigError(reason) => {
+            return format!("{deposit}; {reason}: decdn-node refuses to start until it is fixed");
+        }
+        BuyerBalance::ReadError(reason) => {
+            return format!(
+                "{deposit}; could not read the wallet's USDC ({reason}); re-run setup, or read \
+                 `decdn node status` once the node runs"
+            );
+        }
     };
-    let shortfall = buyer.working_deposit.saturating_sub(balance);
-    if shortfall == 0 {
-        return format!("{deposit}, hold {}", format_usdc(balance));
-    }
+    let shortfall = match buyer.shortfall() {
+        Some(0) | None => return format!("{deposit}, hold {balance}"),
+        Some(shortfall) => shortfall,
+    };
     let to = operator.map_or_else(
-        || "the operator address once keys exist (`decdn whoami` prints it)".to_owned(),
+        || "the operator address once keys exist (`decdn whoami`'s `eth address:` line)".to_owned(),
         |operator| format!("{operator:#x}"),
     );
     let faucet = faucet.map_or_else(String::new, |faucet| format!(" (faucet: {faucet})"));
     format!(
-        "{deposit}, hold {}, short {} — the node cannot open the pool its cache-miss pulls pay \
-         from; send USDC to {to}{faucet}",
-        format_usdc(balance),
+        "{deposit}, hold {balance}, short {} — opening the pool the node's cache-miss pulls pay \
+         from escrows the full deposit (a pool already open draws only refills; `decdn node \
+         pools` lists it); send USDC to {to}{faucet}",
         format_usdc(shortfall),
     )
 }
 
 /// The `preflight.buyer_usdc` `--json` value: `null` when pull-through
-/// resolves off, else the deposit, the balance and its shortfall (`null` when
-/// unread), whether the wallet covers the deposit, and the read error.
+/// resolves off. Otherwise `state` is `covered`, `short`, `no_wallet` (the
+/// keyless dry run: no read, zero balance), `config_error` or `read_error`;
+/// `ok` is `state == "covered"`; the balance and shortfall are `null` and
+/// `error` carries the reason for the two error states.
 fn buyer_usdc_json(buyer: Option<&BuyerUsdc>) -> serde_json::Value {
     let Some(buyer) = buyer else {
         return serde_json::Value::Null;
     };
+    let balance = match buyer.balance {
+        BuyerBalance::Read(balance) => Some(balance),
+        BuyerBalance::NoWallet => Some(0),
+        BuyerBalance::ConfigError(_) | BuyerBalance::ReadError(_) => None,
+    };
     serde_json::json!({
+        "state": buyer.state(),
         "working_deposit_micro_usdc": buyer.working_deposit,
-        "balance_micro_usdc": buyer.balance.as_ref().ok(),
+        "balance_micro_usdc": balance,
         "shortfall_micro_usdc": buyer.shortfall(),
         "ok": buyer.status() == CheckStatus::Ok,
-        "error": buyer.balance.as_ref().err(),
+        "error": buyer.error(),
     })
 }
 

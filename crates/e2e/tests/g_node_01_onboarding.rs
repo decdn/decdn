@@ -95,8 +95,8 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 const TARGET_MBPS: u64 = 100;
 
 /// USDC the operator holds for the buyer-USDC pre-flight step: below the
-/// 10 USDC default working deposit, and not zero, so the row's balance and
-/// shortfall are both read rather than defaulted.
+/// 10 USDC default working deposit, and not zero, so the asserted balance and
+/// shortfall can only come from the chain read.
 const BUYER_USDC_MICRO: u64 = 2_500_000;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -170,9 +170,10 @@ async fn run_journey() -> anyhow::Result<()> {
         .max(chain.bond_required(TARGET_MBPS).await?);
     chain.transfer_token(operator, target_bond).await?;
 
-    // ---- 2a. The buyer-USDC pre-flight row (#2676). The fixture pins
-    // pull-through off, so a dry run against a copy of its config with
-    // pull-through on shows the row a no-origin node gets. The wallet holds
+    // ---- 2a. The buyer-USDC pre-flight row (#2676). The fixture has an
+    // origin and pins pull-through off, so a dry run against a copy of its
+    // config with the flag set explicitly shows the row any pull-through node
+    // gets. The wallet holds
     // 2.5 USDC against the 10 USDC default working deposit: the row warns with
     // the 7.5 USDC shortfall, and the warning does not fail the run.
     chain
@@ -251,9 +252,10 @@ async fn run_journey() -> anyhow::Result<()> {
             "pre-flight gate `{gate}` must pass: {summary}"
         );
     }
-    assert!(
-        summary["preflight"]["buyer_usdc"].is_null(),
-        "the fixture's pull-through is off, so there is no buyer_usdc row: {summary}"
+    assert_eq!(
+        summary["preflight"].get("buyer_usdc"),
+        Some(&serde_json::Value::Null),
+        "the fixture's pull-through is off, so buyer_usdc is present and null: {summary}"
     );
     for tx in ["approve_tx", "bond_tx", "declare_tx"] {
         assert!(

@@ -20,11 +20,13 @@ use decdn_incentive::eth_identity::{self, PasswordSource, PasswordUse, ResolvedP
 use serde::Deserialize;
 
 /// Partial deserializer for the TOML config — only the `[blockchain]`,
-/// `[identity]`, `network.bind_port`, and `[cache]` pull-through fields these
-/// commands need.
+/// `[identity]`, `network.bind_port`, and `[cache]` pull-through flag and
+/// origin-table presence these commands need.
 /// Deliberately partial (like `node.rs`'s `AdminPortConfig`) so an operator's
 /// typo in an unrelated section can't block onboarding; serde-toml ignores
-/// unknown fields.
+/// unknown fields. A field read here is typed, so a wrongly typed value in it
+/// (a quoted number, a `"yes"` flag) fails the parse, as it fails the
+/// daemon's.
 #[derive(Debug, Default, Deserialize)]
 pub struct FileConfig {
     blockchain: Option<FileBlockchain>,
@@ -91,7 +93,10 @@ struct FileNetwork {
 }
 
 /// The `[cache]` fields that decide pull-through. The origin tables are read
-/// for presence only, so a malformed origin cannot fail the parse.
+/// for presence only, so a malformed origin cannot fail the parse. Presence
+/// and the daemon's resolved origins disagree only on configs the daemon
+/// refuses to start with (`origins = []`, both tables set, a malformed
+/// origin), so presence is enough here.
 #[derive(Debug, Default, Deserialize)]
 struct FileCache {
     node_to_node_pull_through_enabled: Option<bool>,
