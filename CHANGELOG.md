@@ -3883,6 +3883,19 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **client: the lane-fault line reports the range the lane held after a
+  steal and the bytes it re-queued (#2376).** A steal trims the victim's
+  range to end at the split, and the stolen tail is the stealer's. The
+  "a lane faulted" line logs that held range as `offset`/`len`, the missing
+  bytes of it that go back to the queue as `requeued`, and the range as the
+  lane picked it as `picked_offset`/`picked_len`. `landed` counts each byte
+  the lane made present once, so a byte a healed leg or an owed span
+  delivered again does not count twice. For a range the store held no byte
+  of at the pick, `landed` and `requeued` add up to `len`. A
+  `NotFound` from a partial holder counts toward the blocks of the held
+  range only. The "stole the tail of a lane's missing remainder" line
+  carries `hash` at debug and at info, so a steal matches the fault it
+  precedes without offset arithmetic.
 - **CLI: a pull record prune deletes only records, and an entry run's record
   keeps its counts (#2754, #2753).** A `decdn get` run prunes only files named
   `<start-ms>-<pid>.json` in `~/.decdn/activity/pulls/`. Any other `*.json`

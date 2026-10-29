@@ -473,7 +473,11 @@ const fn block1(uncovered: bool) -> super::LaneRange {
     super::LaneRange {
         offset: 64 << 20,
         len: 64 << 20,
+        picked_offset: 64 << 20,
+        picked_len: 64 << 20,
         landed: 0,
+        verified: 0,
+        requeued: 0,
         past_end: false,
         uncovered,
     }
@@ -484,7 +488,11 @@ const fn block0() -> super::LaneRange {
     super::LaneRange {
         offset: 0,
         len: 64 << 20,
+        picked_offset: 0,
+        picked_len: 64 << 20,
         landed: 0,
+        verified: 0,
+        requeued: 0,
         past_end: false,
         uncovered: false,
     }
@@ -639,7 +647,11 @@ async fn a_mid_range_refusal_counts_only_the_blocks_after_what_landed() {
     let spanning = super::LaneRange {
         offset: 0,
         len: 128 << 20,
+        picked_offset: 0,
+        picked_len: 128 << 20,
         landed: 64 << 20,
+        verified: 64 << 20,
+        requeued: 0,
         past_end: false,
         uncovered: false,
     };
@@ -1057,7 +1069,8 @@ async fn a_partial_holder_refusing_the_blob_as_too_large_loses_only_pull_through
 /// `uncovered=false` alone does not say that the node holds the range: a
 /// non-holder's lane covers the whole blob (#2339). Its level follows the
 /// fault's class: warn for a source fault, info for a chain-side retry
-/// (#2331).
+/// (#2331). It names the held range, the bytes it re-queued and the range
+/// as the lane picked it (#2376).
 #[tokio::test(start_paused = true)]
 async fn the_lane_fault_line_names_the_holder_record() {
     #[derive(Clone, Default)]
@@ -1082,6 +1095,14 @@ async fn the_lane_fault_line_names_the_holder_record() {
         vec![non_holder(A, 10.0), partial(B, 20.0, &[0, 2, 3])],
     );
     let now = Instant::now();
+    // A steal trimmed the lane's 64 MiB pick to 24 MiB, of which 8 MiB landed.
+    let trimmed = super::LaneRange {
+        len: 24 << 20,
+        landed: 8 << 20,
+        verified: 8 << 20,
+        requeued: 16 << 20,
+        ..block0()
+    };
     let log = CapturedLog::default();
     let sink = log.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -1090,7 +1111,7 @@ async fn the_lane_fault_line_names_the_holder_record() {
         .with_writer(move || sink.clone())
         .finish();
     tracing::subscriber::with_default(subscriber, || {
-        set.record_fault(A, &not_found(), Some(block0()), now, U256::ZERO);
+        set.record_fault(A, &not_found(), Some(trimmed), now, U256::ZERO);
         set.record_fault(B, &not_found(), Some(block0()), now, U256::ZERO);
         set.record_fault(B, &anyhow::anyhow!("reset"), None, now, U256::ZERO);
         // A lane build's chain error names the RPC URL, whose path may carry a key.
@@ -1130,6 +1151,13 @@ async fn the_lane_fault_line_names_the_holder_record() {
     );
     assert!(a_line.contains("a lane faulted"), "{text}");
     assert!(a_line.contains(&format!("provider={A}")), "{text}");
+    assert!(
+        a_line.contains(
+            "offset=0 len=25165824 landed=8388608 requeued=16777216 picked_offset=0 \
+             picked_len=67108864"
+        ),
+        "the held range, what it re-queued, and the pick: {text}"
+    );
     assert!(a_line.contains("uncovered=false"), "{text}");
     assert!(a_line.contains("probed_holder=false"), "{text}");
     assert!(a_line.contains("coverage=whole blob"), "{text}");
@@ -1153,7 +1181,11 @@ async fn overshoot_refusals_never_mark_a_non_holder_absent() {
     let overshoot = super::LaneRange {
         offset: 64 << 20,
         len: 64 << 20,
+        picked_offset: 64 << 20,
+        picked_len: 64 << 20,
         landed: 0,
+        verified: 0,
+        requeued: 0,
         past_end: true,
         uncovered: false,
     };
@@ -1406,8 +1438,10 @@ async fn a_timestamp_refusal_after_bytes_landed_is_an_ordinary_source_fault() {
     );
     let skewed =
         anyhow::Error::new(crate::UpstreamTimestampRejected { label: None }).context("read chunk");
+    // Verified bytes arrived, all of them bytes the store held: the guard
+    // reads what the provider sent, not what was new.
     let mid_range = super::LaneRange {
-        landed: 1024,
+        verified: 1024,
         ..block0()
     };
     let now = Instant::now();
