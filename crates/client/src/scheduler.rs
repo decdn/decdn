@@ -965,11 +965,13 @@ struct Work {
     /// offset order, so the earliest missing range is always the one it waits
     /// on.
     front_first: bool,
+    /// The blob the work fetches. Steal logs name it.
+    hash: [u8; 32],
 }
 
 impl Work {
-    /// A work-state with no lanes and `pending` queued.
-    const fn new(pending: VecDeque<AlignedRange>, front_first: bool) -> Self {
+    /// A work-state for blob `hash` with no lanes and `pending` queued.
+    const fn new(pending: VecDeque<AlignedRange>, hash: [u8; 32], front_first: bool) -> Self {
         Self {
             pending,
             in_flight: Vec::new(),
@@ -985,6 +987,7 @@ impl Work {
             providers: Vec::new(),
             no_uncovered: Vec::new(),
             front_first,
+            hash,
         }
     }
 
@@ -1734,10 +1737,12 @@ impl Work {
         let victim_provider = self.providers.get(victim).copied().flatten();
         let victim_range = self.in_flight.get(victim).copied().flatten();
         let victim_rate = victim_unit.rate();
+        let hash = blake3::Hash::from_bytes(self.hash).to_hex();
         match kind {
             StealKind::CoveredSuffix => tracing::debug!(
                 stealer = ?stealer,
                 victim = ?victim_provider,
+                %hash,
                 kind = kind.as_str(),
                 split = tail.fetch_start(),
                 stolen = tail.fetch_len(),
@@ -1752,6 +1757,7 @@ impl Work {
             StealKind::SlowVictim => tracing::info!(
                 stealer = ?stealer,
                 victim = ?victim_provider,
+                %hash,
                 kind = kind.as_str(),
                 split = tail.fetch_start(),
                 stolen = tail.fetch_len(),
@@ -2044,6 +2050,8 @@ where
     let total_bytes = store.total_bytes();
     let missing = store_missing(store, held.0, held.1).await?;
     let mut remainder = contiguous_byte_ranges(&missing, total_bytes);
+    let sum = |runs: &[(u64, u64)]| runs.iter().map(|&(_, l)| l).fold(0, u64::saturating_add);
+    let missing_bytes = sum(&remainder);
     // A paid frontier sits at or below the delivered frontier, so no missing
     // run holds it. Should one do so, the run would overlap the extended one,
     // and the requeue keeps the missing bytes alone.
@@ -2056,17 +2064,18 @@ where
         let end = run.0.saturating_add(run.1);
         *run = (paid_from, end.saturating_sub(paid_from));
     }
-    let bytes = remainder
-        .iter()
-        .map(|&(_, l)| l)
-        .fold(0, u64::saturating_add);
+    let bytes = sum(&remainder);
     if !remainder.is_empty() {
         let mut w = work.lock().await;
         for (s, l) in remainder {
             w.pending.push_back(align_range(s, l, total_bytes)?);
         }
     }
-    Ok(Some(Requeued { held, bytes }))
+    Ok(Some(Requeued {
+        held,
+        bytes,
+        missing: missing_bytes,
+    }))
 }
 
 /// What [`requeue_missing`] put back.
@@ -2076,6 +2085,9 @@ struct Requeued {
     /// The bytes re-queued to `pending`: the missing bytes of `held`, and the
     /// owed span [`requeue_from`] started a run at.
     bytes: u64,
+    /// The missing bytes of `held`: what another leg still fetches. The owed
+    /// span is in the store, and only the lane that owes it bills it again.
+    missing: u64,
 }
 
 /// A worker's [`PacingWait`] under consumption pacing: the shared consumer wait,
@@ -2358,10 +2370,14 @@ where
                 provider,
                 end: LaneEnd::Faulted {
                     err: Some(err),
+                    // An owed span is present and stays owed: nothing re-queues.
                     range: crate::source_set::LaneRange {
                         offset: start,
                         len,
+                        picked_offset: start,
+                        picked_len: len,
                         landed: 0,
+                        requeued: 0,
                         past_end: false,
                         uncovered: false,
                     },
@@ -2738,7 +2754,9 @@ where
             // cannot sign, so its remainder re-queues from the missing bytes.
             Some(UnitOutcome::Cancelled) => {
                 let from = owed_from.filter(|_| !retired(engine.credentials, &lane));
-                if let Some(Requeued { held, bytes }) = requeue_from(store, work, i, from).await? {
+                if let Some(Requeued { held, bytes, .. }) =
+                    requeue_from(store, work, i, from).await?
+                {
                     tracing::debug!(
                         %provider,
                         held_start = held.0,
@@ -2753,7 +2771,13 @@ where
             Some(UnitOutcome::Faulted(err)) => {
                 let faulted_at = Instant::now();
                 let from = owed_from.filter(|_| !retired(engine.credentials, &lane));
-                requeue_from(store, work, i, from).await?;
+                // The range the lane held when it faulted: a peer's steal can
+                // have trimmed the picked range, and the stolen tail is the
+                // stealer's. A worker that held nothing reports its pick.
+                let ((offset, len), requeued) = requeue_from(store, work, i, from).await?.map_or(
+                    ((r_start, r_len), 0),
+                    |Requeued { held, missing, .. }| (held, missing),
+                );
                 {
                     let mut w = work.lock().await;
                     if extra {
@@ -2764,9 +2788,12 @@ where
                 }
                 wake();
                 let range = crate::source_set::LaneRange {
-                    offset: r_start,
-                    len: r_len,
+                    offset,
+                    len,
+                    picked_offset: r_start,
+                    picked_len: r_len,
                     landed,
+                    requeued,
                     // The loop knows the first claim; it sets this.
                     past_end: false,
                     uncovered,
@@ -2873,7 +2900,10 @@ fn log_extra_fault(
     let crate::source_set::LaneRange {
         offset,
         len,
+        picked_offset,
+        picked_len,
         landed,
+        requeued,
         past_end: _,
         uncovered,
     } = range;
@@ -2887,6 +2917,9 @@ fn log_extra_fault(
             offset,
             len,
             landed,
+            requeued,
+            picked_offset,
+            picked_len,
             uncovered,
             ?fault,
             %error,
@@ -2898,6 +2931,9 @@ fn log_extra_fault(
             %hash,
             offset,
             len,
+            requeued,
+            picked_offset,
+            picked_len,
             uncovered,
             %error,
             "an extra stream of a lane faulted before any verified byte; its range goes back \
@@ -3596,7 +3632,7 @@ where
     // The planned work rests on a claim that may be inflated, so it narrows
     // the fetch and never refuses it.
     let mut one_stream = cap > 0 && needs > cap;
-    let work = AsyncMutex::new(Work::new(pending, env.pacing.is_some()));
+    let work = AsyncMutex::new(Work::new(pending, hash, env.pacing.is_some()));
     let progress_wake = Notify::new();
 
     // The pool deposit every lane draws on, as the loop last saw it. Each built

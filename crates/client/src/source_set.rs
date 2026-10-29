@@ -66,24 +66,41 @@ pub struct Holder {
 }
 
 /// The range a lane held when it faulted ([`SourceSet::record_fault`]).
+///
+/// A lane picks a range, and a peer's steal can then trim its end to the
+/// split. `offset` and `len` are the range the lane held when it faulted,
+/// after any trim: the stolen tail belongs to the stealer, and the lane
+/// never fetches it. `picked_offset` and `picked_len` are the range as the
+/// lane picked it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct LaneRange {
-    /// The range's first byte.
+    /// The held range's first byte.
     pub offset: u64,
-    /// The range's length in bytes.
+    /// The held range's length in bytes, after any steal trimmed its end.
     pub len: u64,
-    /// The bytes of the range that verified before the fault.
+    /// The first byte of the range as the lane picked it.
+    pub picked_offset: u64,
+    /// The length in bytes of the range as the lane picked it. A steal
+    /// leaves it longer than `len`.
+    pub picked_len: u64,
+    /// The bytes of the held range that verified before the fault.
     pub landed: u64,
+    /// The missing bytes of the held range that the fault put back in the
+    /// queue: what the other lanes still fetch. For a range the store held
+    /// no byte of at the pick, `landed` and `requeued` add up to `len`. A
+    /// verified span the lane did not pay for counts in `landed`: the store
+    /// holds it, and the lane bills it when it runs again.
+    pub requeued: u64,
     /// The piece that faulted starts at or past the end the fetch knows: the
     /// proven size, or with none proven the smaller of the first size claim
     /// and the bound. The bound can overshoot the blob, so a `NotFound` for
     /// such a piece is an overshoot refusal: it cools the provider and never
     /// counts toward marking it absent ([`ABSENT_AFTER_NOT_FOUND`]).
     pub past_end: bool,
-    /// The range holds a chunk outside the coverage of the lane that held
-    /// it: the lane took it for its node to serve that part by pull-through,
-    /// as a pending chunk no running lane covers or as a slow-victim steal's
+    /// The range as the lane picked it holds a chunk outside the coverage of
+    /// the lane: the lane took it for its node to serve that part by
+    /// pull-through, as a pending chunk no running lane covers or as a slow-victim steal's
     /// tail. A `NotFound` for such a range from a probed partial holder
     /// counts toward barring that holder from pull-through
     /// ([`SourceSet::no_pull_through`]).
@@ -634,9 +651,10 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     /// Each fault is logged where it is recorded, at warn for a fault an
     /// operator watches for ([`Fault::Source`], [`Fault::Fatal`]) and at info
     /// for a deposit wait or a chain-side retry (see `Fault::warns`). The line
-    /// carries the provider, the blob, the lane's `range` and the bytes of it
-    /// that landed when the lane held one, the error, and the provider's
-    /// record in the set when the fault is logged: `probed_holder` and its
+    /// carries the provider, the blob, the lane's `range` when it held one
+    /// (the held range after any steal, the bytes of it that landed and the
+    /// bytes it re-queued, and the range as the lane picked it), the error,
+    /// and the provider's record in the set when the fault is logged: `probed_holder` and its
     /// `coverage` as block runs (`whole blob` with none measured, `unknown`
     /// for a provider the set has no record of). A rediscovery can change the record after the lane
     /// started. A fetch that recovers reports no lane fault, so this line is
@@ -667,7 +685,10 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         if let Some(LaneRange {
             offset,
             len,
+            picked_offset,
+            picked_len,
             landed,
+            requeued,
             past_end,
             uncovered,
         }) = range
@@ -679,6 +700,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 offset,
                 len,
                 landed,
+                requeued,
+                picked_offset,
+                picked_len,
                 past_end,
                 uncovered,
                 probed_holder,
@@ -936,7 +960,9 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         range: &LaneRange,
         at: Instant,
     ) {
-        // The bytes before `landed` verified: only the part after them is refused.
+        // The bytes before `landed` verified: only the part after them is
+        // refused. The count goes to the held range: a steal's tail is the
+        // stealer's, and a refusal of it counts on the stealer's lane.
         let refused_from = range.offset.saturating_add(range.landed);
         let refused_end = range.offset.saturating_add(range.len);
         let until = at.checked_add(PULL_THROUGH_BAR).unwrap_or(at);

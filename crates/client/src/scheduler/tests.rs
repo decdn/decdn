@@ -941,7 +941,7 @@ fn park_keeps_every_pending_entry() -> anyhow::Result<()> {
     let total = 2 * DISCOVERY_BLOCK_BYTES;
     let in_block0 = align_range(0, 1, total)?;
     let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, 1, total)?;
-    let mut work = Work::new(VecDeque::from(vec![in_block0, in_block1]), false);
+    let mut work = Work::new(VecDeque::from(vec![in_block0, in_block1]), [0; 32], false);
     let a = work.add_lane(Some(cov(2, &[0])), total);
     let b = work.add_lane(Some(cov(2, &[1])), total);
 
@@ -987,6 +987,7 @@ fn one_victim_work(total: u64, coverage: &Coverage) -> super::Work {
         providers: vec![None; 3],
         no_uncovered: vec![false; 3],
         front_first: false,
+        hash: [0; 32],
     }
 }
 
@@ -1647,6 +1648,115 @@ async fn a_slow_victim_is_stolen_from_once() -> anyhow::Result<()> {
         at = offset.saturating_add(*len);
     }
     assert_eq!(at, total, "the completed extents tile the blob: {text}");
+    Ok(())
+}
+
+/// #2376: the slow source of [`a_slow_victim_is_stolen_from_once`] faults
+/// after the fast one stole its tail. The fault line names the range the
+/// lane held after the trim, which ends at the steal's split, and the bytes
+/// it re-queued: the missing bytes of that range, with the verified ones
+/// `landed`. The range the lane picked runs past the split, so the stolen
+/// tail never reads as re-queued. The steal line names the blob.
+#[tokio::test(start_paused = true)]
+async fn a_fault_after_a_steal_logs_the_range_the_lane_held() -> anyhow::Result<()> {
+    let data = blob(128 * MIB as usize);
+    let total = data.len() as u64;
+    let ledger_fast = Arc::new(PoolLedger::new(Cumulative::default()));
+    let ledger_slow = Arc::new(PoolLedger::new(Cumulative::default()));
+    let fast = ScriptedSource::new(data.clone())?
+        .throttled(Duration::from_millis(1))
+        .paying(Arc::clone(&ledger_fast));
+    // The fast source finishes its 64 MiB half when the slow one has
+    // delivered about 16 MiB, and the steal leaves the slow one about
+    // 26 MiB. The fault lands between the two.
+    let slow = ScriptedSource::new(data.clone())?
+        .throttled(Duration::from_millis(4))
+        .paying(Arc::clone(&ledger_slow))
+        .with_fault_after(20 * MIB as usize, || anyhow::anyhow!("scripted fault"));
+    let root = fast.root();
+    let (store, dir) = fresh_store(root, total);
+    let provider = StaticSources::new(vec![
+        candidate(fast.clone(), ledger_fast, 0xA1, None),
+        candidate(slow.clone(), ledger_slow, 0xB2, None),
+    ])?;
+    let (pacer, funder) = (BudgetPacer::new(), no_funding());
+    let log = CapturedLog::default();
+    let sink = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    // `set_default` is per-thread: `acquire` polls every worker on this one.
+    let guard = tracing::subscriber::set_default(subscriber);
+    tokio::time::timeout(
+        Duration::from_mins(5),
+        run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the fetch stalled"))??;
+    drop(guard);
+    store.finalize().await?;
+    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+
+    let text = log.text();
+    // The event's own fields follow its message; a span's precede it.
+    let field = |fields: &str, key: &str| -> Option<String> {
+        fields
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_owned)
+    };
+    let num = |fields: &str, key: &str| -> anyhow::Result<u64> {
+        field(fields, key)
+            .ok_or_else(|| anyhow::anyhow!("no {key} in {fields}"))?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{key} in {fields}: {e}"))
+    };
+    let hash = blake3::Hash::from_bytes(root).to_hex().to_string();
+    let slow_addr = Address::repeat_byte(0xB2).to_string().to_lowercase();
+
+    let steal_message = "stole the tail of a lane's missing remainder";
+    let steals: Vec<&str> = text
+        .lines()
+        .filter_map(|l| Some(l.split_once(steal_message)?.1))
+        .filter(|fields| {
+            field(fields, "victim").is_some_and(|v| v.to_lowercase().contains(&slow_addr))
+        })
+        .collect();
+    let [steal] = steals.as_slice() else {
+        anyhow::bail!("one steal from the slow source: {text}");
+    };
+    assert_eq!(field(steal, "hash"), Some(hash.clone()), "{text}");
+    let split = num(steal, "split")?;
+
+    let faults: Vec<&str> = text
+        .lines()
+        .filter_map(|l| Some(l.split_once("a lane faulted; its remainder")?.1))
+        .filter(|fields| fields.to_lowercase().contains(&slow_addr))
+        .collect();
+    let [fault] = faults.as_slice() else {
+        anyhow::bail!("one fault of the slow source: {text}");
+    };
+    let (offset, len) = (num(fault, "offset")?, num(fault, "len")?);
+    let (landed, requeued) = (num(fault, "landed")?, num(fault, "requeued")?);
+    let (picked_offset, picked_len) = (num(fault, "picked_offset")?, num(fault, "picked_len")?);
+    assert_eq!(
+        offset.saturating_add(len),
+        split,
+        "the held range ends at the split: {text}"
+    );
+    assert!(landed > 0 && requeued > 0, "{text}");
+    assert_eq!(
+        landed.saturating_add(requeued),
+        len,
+        "what landed and what re-queued make up the held range: {text}"
+    );
+    assert_eq!(picked_offset, offset, "{text}");
+    assert!(
+        picked_len > len,
+        "the pick runs past the split into the stolen tail: {text}"
+    );
     Ok(())
 }
 
@@ -3867,7 +3977,7 @@ fn an_entry_covered_only_by_two_lanes_together_is_not_uncovered() -> anyhow::Res
 
     let total = 2 * DISCOVERY_BLOCK_BYTES;
     let both_blocks = align_range(0, total, total)?;
-    let mut work = Work::new(VecDeque::from(vec![both_blocks]), false);
+    let mut work = Work::new(VecDeque::from(vec![both_blocks]), [0; 32], false);
     let a = work.add_lane(Some(cov(2, &[0])), total);
     let b = work.add_lane(Some(cov(2, &[1])), total);
     assert!(!work.uncovered(total), "a and b cover it between them");
@@ -3892,7 +4002,7 @@ fn a_building_lane_covers_its_blocks_for_discovery() -> anyhow::Result<()> {
 
     let total = 2 * DISCOVERY_BLOCK_BYTES;
     let both_blocks = align_range(0, total, total)?;
-    let mut work = Work::new(VecDeque::from(vec![both_blocks]), false);
+    let mut work = Work::new(VecDeque::from(vec![both_blocks]), [0; 32], false);
     assert!(work.uncovered_beside(total, &[]), "no lane at all");
     assert!(
         work.uncovered_beside(total, &[cov(2, &[0])]),
@@ -3933,7 +4043,7 @@ fn a_barred_lane_takes_only_what_it_covers() -> anyhow::Result<()> {
     let total = 2 * DISCOVERY_BLOCK_BYTES;
     let in_block0 = align_range(0, DISCOVERY_BLOCK_BYTES, total)?;
     let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, DISCOVERY_BLOCK_BYTES, total)?;
-    let mut work = Work::new(VecDeque::from(vec![in_block1, in_block0]), false);
+    let mut work = Work::new(VecDeque::from(vec![in_block1, in_block0]), [0; 32], false);
     let a_cov = cov(2, &[0]);
     let a = work.add_lane(Some(a_cov.clone()), total);
     let b = work.add_lane(Some(cov(2, &[1])), total);
@@ -3987,7 +4097,7 @@ fn set_coverage_narrows_and_restores_a_probed_lane_and_its_extras() -> anyhow::R
 
     let total = 2 * DISCOVERY_BLOCK_BYTES;
     let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, DISCOVERY_BLOCK_BYTES, total)?;
-    let mut work = Work::new(VecDeque::from(vec![in_block1]), false);
+    let mut work = Work::new(VecDeque::from(vec![in_block1]), [0; 32], false);
     let a = work.add_lane(Some(cov(2, &[0, 1])), total);
     let x = work.add_extra(a);
     let b = work.add_lane(None, total);
@@ -4028,7 +4138,7 @@ fn a_remainder_only_the_faulted_lane_covered_goes_to_a_busy_lanes_extra() -> any
     let total = 2 * DISCOVERY_BLOCK_BYTES;
     let in_block0 = align_range(0, DISCOVERY_BLOCK_BYTES, total)?;
     let in_block1 = align_range(DISCOVERY_BLOCK_BYTES, DISCOVERY_BLOCK_BYTES, total)?;
-    let mut work = Work::new(VecDeque::from(vec![in_block0, in_block1]), false);
+    let mut work = Work::new(VecDeque::from(vec![in_block0, in_block1]), [0; 32], false);
     let (a_cov, b_cov) = (cov(2, &[0]), cov(2, &[1]));
     let a = work.add_lane(Some(a_cov.clone()), total);
     let b = work.add_lane(Some(b_cov.clone()), total);
@@ -5415,7 +5525,7 @@ fn a_proven_size_clips_pending_and_in_flight_work() -> anyhow::Result<()> {
         align_range(60 * MIB, 20 * MIB, old)?,
         align_range(100 * MIB, 20 * MIB, old)?,
     ]);
-    let mut work = super::Work::new(pending, false);
+    let mut work = super::Work::new(pending, [0; 32], false);
     let past = work.add_lane(None, old);
     let across = work.add_lane(None, old);
     if let Some(slot) = work.in_flight.get_mut(past) {
@@ -7861,7 +7971,10 @@ fn extra_stream_fault_level_follows_landed_and_class() {
     let range = |landed| crate::source_set::LaneRange {
         offset: 0,
         len: 1024,
+        picked_offset: 0,
+        picked_len: 1024,
         landed,
+        requeued: 0,
         past_end: false,
         uncovered: true,
     };
