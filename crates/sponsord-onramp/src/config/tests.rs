@@ -17,7 +17,7 @@ fn args(overrides: &[&str]) -> Result<Args, clap::Error> {
         ),
         ("--turnstile-secret", "s"),
         ("--turnstile-sitekey", "0x4AAA-key_1"),
-        ("--decdn-release", "v0.2.0"),
+        ("--decdn-release", "v0.3.0"),
         ("--decdn-sums-sha256", &ab),
     ];
     for pair in overrides.chunks(2) {
@@ -40,8 +40,8 @@ fn reads_required_and_defaults() {
     assert_eq!(cfg.releases_base, "https://github.com/decdn");
     assert_eq!(cfg.spending_cap, None);
     assert_eq!(cfg.ttl_secs, None);
-    assert_eq!(cfg.decdn_release.tag, "v0.2.0");
-    assert_eq!(cfg.decdn_release.version, "0.2.0");
+    assert_eq!(cfg.decdn_release.tag, "v0.3.0");
+    assert_eq!(cfg.decdn_release.version, "0.3.0");
     assert!(!format!("{cfg:?}").contains("\"tok\""));
 }
 
@@ -147,9 +147,9 @@ fn sitekey_must_be_a_plain_token() {
 fn release_pin_accepts_semver_tags_and_hex_digests() {
     let digest = "0123456789abcdef".repeat(4);
     for (tag, version) in [
-        ("v0.2.0", "0.2.0"),
-        ("v0.2.1", "0.2.1"),
-        ("v0.3.0-rc.1", "0.3.0-rc.1"),
+        ("v0.3.0", "0.3.0"),
+        ("v0.3.1", "0.3.1"),
+        ("v0.4.0-rc.1", "0.4.0-rc.1"),
         ("v10.20.30", "10.20.30"),
         ("v1.0.0-rc.1", "1.0.0-rc.1"),
         ("v1.0.0-beta-2", "1.0.0-beta-2"),
@@ -159,46 +159,55 @@ fn release_pin_accepts_semver_tags_and_hex_digests() {
     }
 }
 
-/// The installers run `decdn get` without `-o`, which v0.1.x refuses, so a
-/// pin below v0.2.0 (a pre-release of it included) is refused at startup
-/// rather than served to every download.
+/// The installers run `decdn get` without `-o`, which v0.1.x refuses and
+/// v0.2.x runs without the hidden-path guard, so a pin below v0.3.0 (a
+/// pre-release of it included) is refused at startup rather than served to
+/// every download.
 #[test]
 fn release_pin_refuses_a_decdn_below_the_installers_minimum() {
     let digest = "ab".repeat(32);
-    for tag in ["v0.1.0", "v0.1.9", "v0.0.4", "v0.2.0-rc.1", "v0.2.0-beta-2"] {
+    for tag in [
+        "v0.1.0",
+        "v0.1.9",
+        "v0.0.4",
+        "v0.2.0",
+        "v0.2.9",
+        "v0.3.0-rc.1",
+        "v0.3.0-beta-2",
+    ] {
         let err = ReleasePin::new(tag, &digest).unwrap_err().to_string();
-        assert!(err.contains("below v0.2.0"), "{tag}: {err}");
+        assert!(err.contains("below v0.3.0"), "{tag}: {err}");
     }
-    let parsed = args(&["--decdn-release", "v0.1.0"]).unwrap();
+    let parsed = args(&["--decdn-release", "v0.2.0"]).unwrap();
     let err = OnrampConfig::from_args(parsed).unwrap_err().to_string();
     assert!(err.contains("ONRAMP_DECDN_RELEASE"), "{err}");
-    assert!(err.contains("below v0.2.0"), "{err}");
+    assert!(err.contains("below v0.3.0"), "{err}");
 }
 
 #[test]
 fn release_pin_refuses_per_crate_tags() {
     let digest = "ab".repeat(32);
-    assert!(ReleasePin::new("decdn-cli-v0.2.0", &digest).is_err());
-    assert!(ReleasePin::new("sponsord-v0.2.0", &digest).is_err());
+    assert!(ReleasePin::new("decdn-cli-v0.3.0", &digest).is_err());
+    assert!(ReleasePin::new("sponsord-v0.3.0", &digest).is_err());
 }
 
 #[test]
 fn release_pin_rejects_anything_a_script_could_misread() {
     let digest = "ab".repeat(32);
     for tag in [
-        "0.2.0",
+        "0.3.0",
         "v0.2",
-        "v0.2.0.1",
+        "v0.3.0.1",
         "v0..0",
-        "v0.2.0-",
-        "v0.2.0 ",
-        "v0.2.0;rm",
-        "v0.2.0$(id)",
-        "v0.2.0'",
+        "v0.3.0-",
+        "v0.3.0 ",
+        "v0.3.0;rm",
+        "v0.3.0$(id)",
+        "v0.3.0'",
     ] {
         assert!(ReleasePin::new(tag, &digest).is_err(), "{tag:?}");
     }
     for bad in [&"AB".repeat(32), &"ab".repeat(31), &"zz".repeat(32)] {
-        assert!(ReleasePin::new("v0.2.0", bad).is_err(), "{bad}");
+        assert!(ReleasePin::new("v0.3.0", bad).is_err(), "{bad}");
     }
 }

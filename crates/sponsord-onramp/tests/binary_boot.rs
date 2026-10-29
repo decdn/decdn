@@ -30,7 +30,7 @@ fn the_binary_reaches_the_daemon_read_and_names_an_unreachable_daemon() {
         )
         .env("ONRAMP_TURNSTILE_SITEKEY", "KEY")
         .env("ONRAMP_TURNSTILE_SECRET", "secret")
-        .env("ONRAMP_DECDN_RELEASE", "v0.2.0")
+        .env("ONRAMP_DECDN_RELEASE", "v0.3.0")
         .env("ONRAMP_DECDN_SUMS_SHA256", "ab".repeat(32))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

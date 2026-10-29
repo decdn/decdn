@@ -53,9 +53,11 @@ SPONSORED="${DECDN_DIR}/sponsored"
 DECDN="${BINDIR}/decdn"
 
 # How often, and for how long, to ask the onramp for the capability while the
-# person passes the gate.
+# person passes the gate. A rate-limited ask (429) is retried, the wait
+# doubling from POLL_EVERY up to RETRY_MAX, for up to POLL_TIMEOUT.
 POLL_EVERY=2
 POLL_TIMEOUT=600
+RETRY_MAX=30
 
 # A saved capability this close to expiry is replaced, together with its key
 # (a key's terms are frozen on-chain at its first redemption): a default node
@@ -242,12 +244,29 @@ ensure_key() {
 
 # get_capability: ask the onramp for the capability issued to ADDRESS. Sets
 # TOKEN and EXPIRY and returns 0 when there is one, returns 1 while there is
-# none yet.
+# none yet. Waits out a rate limit.
 get_capability() {
   body="${WORK}/capability.json"
-  code="$(curl -sS -o "$body" -w '%{http_code}' \
-    "${ONRAMP_URL}/v1/capability?client=${ADDRESS}")" ||
-    die "could not reach ${ONRAMP_URL}"
+  backoff="$POLL_EVERY"
+  limited_until=""
+  while :; do
+    code="$(curl -sS -o "$body" -w '%{http_code}' \
+      "${ONRAMP_URL}/v1/capability?client=${ADDRESS}")" ||
+      die "could not reach ${ONRAMP_URL}"
+    [ "$code" = 429 ] || break
+    if [ -z "$limited_until" ]; then
+      limited_until=$(($(date +%s) + POLL_TIMEOUT))
+    fi
+    if [ -z "${BUSY_NOTED:-}" ]; then
+      BUSY_NOTED=1
+      echo "decdn: ${ONRAMP_URL} is busy; retrying" >&2
+    fi
+    [ "$(date +%s)" -lt "$limited_until" ] ||
+      die "${ONRAMP_URL} stayed busy for ${POLL_TIMEOUT} s"
+    sleep "$backoff"
+    backoff=$((backoff * 2))
+    [ "$backoff" -le "$RETRY_MAX" ] || backoff="$RETRY_MAX"
+  done
   case "$code" in
     200) ;;
     204) return 1 ;;

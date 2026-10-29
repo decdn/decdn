@@ -3,7 +3,8 @@
 //! `decdn`: the install skips binaries already at the pin, it says how to
 //! put `~/.local/bin` on PATH when it is missing, and `get` passes
 //! the gate once per download, resumes a failed one without it, replaces a
-//! capability near expiry, and refuses a second run of the same download.
+//! capability near expiry, waits out a rate limit, and refuses a second run
+//! of the same download.
 
 #![cfg(unix)]
 #![allow(
@@ -18,7 +19,14 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+use axum::extract::Request;
+use axum::middleware::Next;
+use axum::response::IntoResponse;
+use sponsord_api::ErrorCode;
 
 use sponsord_onramp::test_support::{
     FakeOptions, Fakes, STUB_DECDN, app_state_with_options, publish_release, test_config,
@@ -54,6 +62,8 @@ struct Fixture {
     script: PathBuf,
     onramp: String,
     fakes: Fakes,
+    /// `GET /v1/capability` requests still to answer with 429.
+    busy: Arc<AtomicUsize>,
 }
 
 impl Fixture {
@@ -67,7 +77,7 @@ impl Fixture {
         let stub = root.join("stub");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&stub).unwrap();
-        let sums = publish_release(&releases, "decdn", "decdn", "v0.2.0", "0.2.0", STUB_DECDN);
+        let sums = publish_release(&releases, "decdn", "decdn", "v0.3.0", "0.3.0", STUB_DECDN);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let onramp = format!("http://{}", listener.local_addr().unwrap());
@@ -80,7 +90,23 @@ impl Fixture {
             ..FakeOptions::default()
         })
         .await;
-        let app = sponsord_onramp::http::router(state);
+        let busy = Arc::new(AtomicUsize::new(0));
+        let left = Arc::clone(&busy);
+        let app = sponsord_onramp::http::router(state).layer(axum::middleware::from_fn(
+            move |req: Request, next: Next| {
+                let left = Arc::clone(&left);
+                async move {
+                    if req.uri().path() == "/v1/capability"
+                        && left
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok()
+                    {
+                        return ErrorCode::RateLimited.into_response();
+                    }
+                    next.run(req).await
+                }
+            },
+        ));
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -105,6 +131,7 @@ impl Fixture {
             script,
             onramp,
             fakes,
+            busy,
         }
     }
 
@@ -205,7 +232,7 @@ impl Fixture {
 async fn a_second_run_with_the_same_pin_downloads_nothing() {
     let fx = Fixture::new("same_pin").await;
     let first = fx.run_ok(&[], &[]).await;
-    assert!(first.contains("Installing decdn v0.2.0"), "{first}");
+    assert!(first.contains("Installing decdn v0.3.0"), "{first}");
     assert!(first.contains("decdn is installed at"), "{first}");
     assert!(fx.bin("decdn").exists() && fx.marker("decdn").exists());
 
@@ -214,7 +241,7 @@ async fn a_second_run_with_the_same_pin_downloads_nothing() {
     let second = fx.run_ok(&[], &[]).await;
     assert!(!second.contains("Installing"), "{second}");
     assert!(
-        second.contains("decdn v0.2.0 is already installed."),
+        second.contains("decdn v0.3.0 is already installed."),
         "{second}"
     );
 }
@@ -226,11 +253,11 @@ async fn a_missing_marker_or_binary_reinstalls() {
 
     fs::remove_file(fx.marker("decdn")).unwrap();
     let out = fx.run_ok(&[], &[]).await;
-    assert!(out.contains("Installing decdn v0.2.0"), "{out}");
+    assert!(out.contains("Installing decdn v0.3.0"), "{out}");
 
     fs::remove_file(fx.bin("decdn")).unwrap();
     let out = fx.run_ok(&[], &[]).await;
-    assert!(out.contains("Installing decdn v0.2.0"), "{out}");
+    assert!(out.contains("Installing decdn v0.3.0"), "{out}");
     assert!(fx.bin("decdn").exists());
 }
 
@@ -241,7 +268,7 @@ async fn a_changed_pin_reinstalls() {
     // A marker from another release, as after the onramp moves its pin.
     fs::write(fx.marker("decdn"), "00 x86_64-unknown-linux-gnu\n").unwrap();
     let out = fx.run_ok(&[], &[]).await;
-    assert!(out.contains("Installing decdn v0.2.0"), "{out}");
+    assert!(out.contains("Installing decdn v0.3.0"), "{out}");
 }
 
 #[tokio::test]
@@ -315,6 +342,24 @@ async fn get_passes_the_gate_and_runs_decdn_with_the_capability() {
             .join(format!("downloads/{HASH}.lock"))
             .exists()
     );
+}
+
+#[tokio::test]
+async fn a_rate_limited_capability_check_is_retried() {
+    let fx = Fixture::new("rate_limited").await;
+    // The first check, before the gate link, and its first retry.
+    fx.busy.store(2, Ordering::SeqCst);
+    let run = fx.run_with(&GET, &[]).await;
+    assert!(run.ok, "stdout:\n{}\nstderr:\n{}", run.stdout, run.stderr);
+    assert_eq!(fx.busy.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        run.stderr.matches("is busy; retrying").count(),
+        1,
+        "{}",
+        run.stderr
+    );
+    assert_eq!(fx.fakes.source.issued_count(), 1);
+    assert_eq!(fx.calls().len(), 1, "{:?}", fx.calls());
 }
 
 #[tokio::test]

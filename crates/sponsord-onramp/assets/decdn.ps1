@@ -56,9 +56,12 @@
     $SlashJudge = '{{SLASH_JUDGE}}'
 
     # How often, and for how long, to ask the onramp for the capability
-    # while the person passes the gate.
+    # while the person passes the gate. A rate-limited ask (429) is retried,
+    # the wait doubling from $PollEverySecs up to $RetryMaxSecs, for up to
+    # $PollTimeoutSecs.
     $PollEverySecs = 2
     $PollTimeoutSecs = 600
+    $RetryMaxSecs = 30
 
     # A saved capability this close to expiry is replaced, together with its
     # key (a key's terms are frozen on-chain at its first redemption): a
@@ -178,14 +181,34 @@
     }
 
     # The capability issued to $Address: an object with `token` and `expiry`,
-    # or $null while there is none yet.
+    # or $null while there is none yet. Waits out a rate limit.
+    $Busy = @{ Noted = $false }
     $GetCapability = {
       param($Address)
       $Uri = "$OnrampUrl/v1/capability?client=$Address"
-      try {
-        $Resp = Invoke-WebRequest -UseBasicParsing -Uri $Uri
-      } catch {
-        throw "decdn: $Uri failed: $($_.Exception.Message)"
+      $Backoff = $PollEverySecs
+      $LimitedUntil = $null
+      while ($true) {
+        try {
+          $Resp = Invoke-WebRequest -UseBasicParsing -Uri $Uri
+          break
+        } catch {
+          $Status = $_.Exception.Response.StatusCode
+          if ($null -eq $Status -or [int]$Status -ne 429) {
+            throw "decdn: $Uri failed: $($_.Exception.Message)"
+          }
+        }
+        $Now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        if ($null -eq $LimitedUntil) { $LimitedUntil = $Now + $PollTimeoutSecs }
+        if (-not $Busy.Noted) {
+          $Busy.Noted = $true
+          Write-Host "decdn: $OnrampUrl is busy; retrying"
+        }
+        if ($Now -ge $LimitedUntil) {
+          throw "decdn: $OnrampUrl stayed busy for $PollTimeoutSecs s"
+        }
+        Start-Sleep -Seconds $Backoff
+        $Backoff = [Math]::Min($Backoff * 2, $RetryMaxSecs)
       }
       if ($Resp.StatusCode -eq 204) { return $null }
       $Body = $Resp.Content | ConvertFrom-Json
