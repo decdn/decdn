@@ -25,7 +25,7 @@
 //!      `prior + accrued`, so a lane resumed from zero signs cumulatives at or
 //!      below the contract's watermark, which `_applyVoucher` treats as
 //!      transient-empty. The node would stream real bytes and buy none of them;
-//!      only a real seeder redeeming real vouchers shows that.
+//!      only a real provider redeeming real vouchers shows that.
 //!   4. **An operator can read any of it.** `redb` holds an exclusive lock on
 //!      `buyer.redb` for the daemon's lifetime, so the read has to cross the
 //!      admin RPC — a mocked store proves nothing about that. An operator who
@@ -34,7 +34,7 @@
 //!      opened second store produces (#2078).
 //!
 //! Topology mirrors `node_pull_topup.rs`: a cold pull-through SERVER that holds
-//! nothing, satisfying a client miss only by a paid pull from a SEEDER that
+//! nothing, satisfying a client miss only by a paid pull from a PROVIDER that
 //! holds the blob.
 //!
 //! Run the daemons with `DECDN_NODE_LOG="warn,decdn_node=debug"` to see their
@@ -121,7 +121,7 @@ async fn run() -> anyhow::Result<()> {
 
     let chain = ChainFixture::launch().await?;
 
-    // Two blobs, both only on the SEEDER. The first drives the pull that opens
+    // Two blobs, both only on the PROVIDER. The first drives the pull that opens
     // the SERVER's pool and advances a lane; the second is fetched after the
     // store loss, so it can only be served if the adopted pool still buys.
     // `second` is deliberately SMALLER than `first`. The reseed is what makes the
@@ -133,29 +133,30 @@ async fn run() -> anyhow::Result<()> {
     let first = make_blob(6 * CHUNK_GROUP + 37);
     let second = make_blob(2 * CHUNK_GROUP + 11);
 
-    let (seeder, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[&first, &second]).await?;
+    let (provider, hashes) =
+        NodeFixture::launch_with_blobs(&chain, "US", &[&first, &second]).await?;
     let (first_hash, second_hash) = {
         let mut it = hashes.into_iter();
-        let a = it.next().context("seeder missing first hash")?;
-        let b = it.next().context("seeder missing second hash")?;
+        let a = it.next().context("provider missing first hash")?;
+        let b = it.next().context("provider missing second hash")?;
         (a, b)
     };
-    seeder.set_rate_per_mb(RATE_PER_MB).await?;
-    seeder
+    provider.set_rate_per_mb(RATE_PER_MB).await?;
+    provider
         .set_pool_min_remaining_deposit(POOL_MIN_REMAINING)
         .await?;
 
-    // Seat the seeder as an authorized origin so the SERVER's on-chain
+    // Seat the provider as an authorized origin so the SERVER's on-chain
     // `OriginAssignment` directory resolves it on a miss. Before the server
     // launches, so the server enumerates it at directory bring-up.
     let publisher = PrivateKeySigner::random();
     chain.vet_publisher(publisher.address()).await?;
     let namespace = chain.create_namespace(&publisher).await?;
     chain
-        .add_origin(&publisher, namespace, seeder.operator_addr())
+        .add_origin(&publisher, namespace, provider.operator_addr())
         .await?;
 
-    let server = NodeFixture::launch_pull_through_cache(&chain, "US", &[&seeder]).await?;
+    let server = NodeFixture::launch_pull_through_cache(&chain, "US", &[&provider]).await?;
     server.set_rate_per_mb(RATE_PER_MB).await?;
     server
         .set_buyer_working_deposit(SERVER_WORKING_DEPOSIT)
@@ -170,8 +171,8 @@ async fn run() -> anyhow::Result<()> {
     let client = ClientFixture::new(&chain).await?;
 
     // First fetch: the SERVER misses, opens its buyer pool, pulls from the
-    // seeder and pays it. On return the pool exists on chain and its lane to the
-    // seeder carries a non-zero cumulative.
+    // provider and pays it. On return the pool exists on chain and its lane to the
+    // provider carries a non-zero cumulative.
     let (mut session, got_first) = client
         .open_session_in_namespace(&chain, &server, first_hash, namespace)
         .await
@@ -201,18 +202,18 @@ async fn run() -> anyhow::Result<()> {
 
     // The lane the SERVER paid on must have a non-zero on-chain watermark before
     // the store is destroyed — otherwise the reseed below proves nothing, and a
-    // zero here would mean the seeder never redeemed and the journey is not
+    // zero here would mean the provider never redeemed and the journey is not
     // actually exercising a paid lane.
     let watermark = decdn_e2e::poll(Duration::from_mins(1), || async {
         let w = pool_contract
-            .getWatermark(original_pool, owner, seeder.operator_addr())
+            .getWatermark(original_pool, owner, provider.operator_addr())
             .call()
             .await
             .context("read the SERVER's lane watermark")?;
         Ok((w.amount > 0).then_some(w))
     })
     .await?
-    .context("the seeder never redeemed the SERVER's first voucher")?;
+    .context("the provider never redeemed the SERVER's first voucher")?;
 
     // Destroy the buyer store, exactly as a reset data dir would, and restart.
     // Everything else — keystore, on-chain registration, cache — survives, which
@@ -239,9 +240,9 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // (2) The second fetch completes. It can only do so if the adopted pool pays
-    // the seeder, which requires the lane to have resumed above the contract's
+    // the provider, which requires the lane to have resumed above the contract's
     // watermark: a lane resumed from zero signs cumulatives `_applyVoucher`
-    // treats as transient-empty, so the seeder would be served nothing it could
+    // treats as transient-empty, so the provider would be served nothing it could
     // cash and would stop serving.
     let got_second = client
         .fetch_once(&mut session, second_hash, 0, namespace)
@@ -259,7 +260,7 @@ async fn run() -> anyhow::Result<()> {
     // them against vouchers that pay nothing.
     let advanced = decdn_e2e::poll(Duration::from_mins(1), || async {
         let w = pool_contract
-            .getWatermark(original_pool, owner, seeder.operator_addr())
+            .getWatermark(original_pool, owner, provider.operator_addr())
             .call()
             .await
             .context("re-read the SERVER's lane watermark")?;
