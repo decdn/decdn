@@ -1014,6 +1014,48 @@ pub struct DecdnMetrics {
     /// Each is also a `warn!`. Operator-visible name:
     /// `decdn_settlement_ledger_skipped_rows_total`.
     pub settlement_ledger_skipped_rows: Counter,
+    /// Snapshot-seeded pools the settlement watcher still has to re-read at a
+    /// pinned block (`PoolProjection::pending_rereads`), set at the end of every
+    /// watcher tick. A value that never falls is a pool stuck pending: a seed
+    /// whose open a reorg dropped, a read always skipped as stale, or a read
+    /// that keeps faulting. Each costs one `getPool` per rotation. Operator-visible
+    /// name: `decdn_settlement_reanchor_pending_pools`.
+    pub settlement_reanchor_pending_pools: Gauge,
+    /// Re-anchor ticks whose block-number read failed, so no pool was read.
+    /// Operator-visible name: `decdn_settlement_reanchor_block_read_failures_total`.
+    pub settlement_reanchor_block_read_failures: Counter,
+    /// Re-anchor ticks whose block number was below the highest log block the
+    /// settlement sink applied: a backend behind the watcher, so no pool was
+    /// read. Operator-visible name:
+    /// `decdn_settlement_reanchor_behind_watcher_total`.
+    pub settlement_reanchor_behind_watcher: Counter,
+    /// Re-anchor `getPool` reads that failed; the rest of the tick's batch waits
+    /// for the next tick. A steady rate with no RPC outage points at ABI drift on
+    /// `getPool`. Operator-visible name:
+    /// `decdn_settlement_reanchor_pool_read_failures_total`.
+    pub settlement_reanchor_pool_read_failures: Counter,
+    /// Re-anchor reads that found no pool at the pinned block: a backend behind
+    /// the admit read, or an open a reorg dropped, which stays served from its
+    /// seed. Operator-visible name: `decdn_settlement_reanchor_absent_total`.
+    pub settlement_reanchor_absent: Counter,
+    /// Re-anchor reads skipped because their block is below an event the
+    /// projection already folded for the pool. Operator-visible name:
+    /// `decdn_settlement_reanchor_skipped_below_folded_total`.
+    pub settlement_reanchor_skipped_below_folded: Counter,
+    /// Re-anchor reads skipped because their `totalRedeemed` is below the one
+    /// the projection holds. A steady rate on a quiet pool means a reorg lowered
+    /// it on chain, and the node refuses the pool early. Operator-visible name:
+    /// `decdn_settlement_reanchor_skipped_lower_redeemed_total`.
+    pub settlement_reanchor_skipped_lower_redeemed: Counter,
+    /// Re-anchor reads skipped because their deposit is below the one the
+    /// projection holds. A steady rate means a reorg lowered it on chain, and
+    /// the node serves past the pool's funds. Operator-visible name:
+    /// `decdn_settlement_reanchor_skipped_lower_deposit_total`.
+    pub settlement_reanchor_skipped_lower_deposit: Counter,
+    /// Re-anchor reads that anchored their pool: the denominator for the
+    /// failure and skip rates above. Operator-visible name:
+    /// `decdn_settlement_reanchor_anchored_total`.
+    pub settlement_reanchor_anchored: Counter,
     /// Slashes detected against this node's operator by the slash watcher
     /// (`SlashJudge.Slashed`), counting each distinct `slashId` once across the
     /// bring-up backfill and the live stream (#1032). A non-zero value means the
@@ -3233,6 +3275,37 @@ recorders! {
     /// than paying nothing (`settlement_ledger.rs`). Pairs with a per-site
     /// `warn!`.
     settlement_ledger_skipped_row => settlement_ledger_skipped_rows.inc();
+
+    /// Publish how many snapshot-seeded pools still wait for a re-anchor read
+    /// (`payment_settlement.rs`).
+    settlement_reanchor_pending(pools: usize) => settlement_reanchor_pending_pools.set(sat(pools));
+
+    /// A re-anchor tick's block-number read failed. Pairs with the `warn!`
+    /// "pool re-anchor: block number read failed".
+    settlement_reanchor_block_read_failure => settlement_reanchor_block_read_failures.inc();
+
+    /// A re-anchor tick's block number was behind the settlement watcher.
+    settlement_reanchor_behind_watcher => settlement_reanchor_behind_watcher.inc();
+
+    /// A re-anchor `getPool` read failed. Pairs with the `warn!` "pool
+    /// re-anchor: getPool failed".
+    settlement_reanchor_pool_read_failure => settlement_reanchor_pool_read_failures.inc();
+
+    /// A re-anchor read found no pool at the pinned block.
+    settlement_reanchor_absent => settlement_reanchor_absent.inc();
+
+    /// A re-anchor read was skipped as below a folded event. Pairs with a `warn!`.
+    settlement_reanchor_skipped_below_folded => settlement_reanchor_skipped_below_folded.inc();
+
+    /// A re-anchor read was skipped for a lower `totalRedeemed`. Pairs with a
+    /// `warn!`.
+    settlement_reanchor_skipped_lower_redeemed => settlement_reanchor_skipped_lower_redeemed.inc();
+
+    /// A re-anchor read was skipped for a lower deposit. Pairs with a `warn!`.
+    settlement_reanchor_skipped_lower_deposit => settlement_reanchor_skipped_lower_deposit.inc();
+
+    /// `n` re-anchor reads anchored their pools.
+    settlement_reanchor_anchored_by(n: u64) => settlement_reanchor_anchored.inc_by(n);
 
     /// A distinct slash against this node's operator was detected by the slash
     /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).

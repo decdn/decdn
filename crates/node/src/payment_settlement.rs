@@ -100,7 +100,9 @@ use crate::chain_events::{REORG_MARGIN_BLOCKS, timed};
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
-use crate::pool_view::{Lifecycle, PoolProjection, PoolRead, PoolStatus};
+use crate::pool_view::{
+    Lifecycle, PoolProjection, PoolRead, PoolStatus, ReanchorSkip, ReanchorStale,
+};
 use crate::settlement_ledger::{LedgerBackfills, SettlementRecorder};
 use decdn_incentive::payment_pool::SignerAuthorization;
 
@@ -998,6 +1000,7 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
             &self.pool_view,
             &mut self.reanchor_cursor,
             self.applied_through,
+            &self.metrics,
         )
         .await;
         Ok(())
@@ -1033,25 +1036,74 @@ const REANCHOR_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 /// applied, comes from a backend behind the watcher: a read there could miss a
 /// redemption the watcher dropped while the pool was not yet in the projection.
 /// The tick then reads nothing and every pool stays pending.
+///
+/// Every outcome is counted in `metrics`, and the tick ends by publishing how
+/// many pools are still pending: a pool that stays pending for good shows only
+/// there.
 async fn reanchor_pools<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     projection: &PoolProjection,
     cursor: &mut Option<B256>,
     applied_through: u64,
+    metrics: &Metrics,
 ) {
     let pending = projection.pending_rereads();
     if pending.is_empty() {
+        metrics.settlement_reanchor_pending(0);
         return;
     }
-    let Some(block) = reanchor_block(contract, pending.len(), applied_through).await else {
-        return;
-    };
-    let batch = reanchor_batch(&pending, *cursor);
-    let (anchored, closed) = read_reanchor_batch(contract, batch, block, cursor).await;
-    projection.reanchor(block, &anchored);
-    for pool_id in closed {
-        debug!(%pool_id, block, "pool re-anchor: pool closed; forgetting");
-        projection.forget(pool_id);
+    if let Some(block) = reanchor_block(contract, pending.len(), applied_through, metrics).await {
+        let batch = reanchor_batch(&pending, *cursor);
+        let (reads, closed) = read_reanchor_batch(contract, batch, block, cursor, metrics).await;
+        let report = projection.reanchor(block, &reads);
+        metrics.settlement_reanchor_anchored_by(u64::try_from(report.anchored).unwrap_or(u64::MAX));
+        for skip in &report.skipped {
+            count_reanchor_skip(skip, block, metrics);
+        }
+        for pool_id in closed {
+            debug!(%pool_id, block, "pool re-anchor: pool closed; forgetting");
+            projection.forget(pool_id);
+        }
+    }
+    metrics.settlement_reanchor_pending(projection.pending_rereads().len());
+}
+
+/// Count and log one re-anchor read the projection skipped as stale. Its pool
+/// stays pending; a reorg that lowered the value on chain keeps it so until the
+/// chain passes the held value again.
+fn count_reanchor_skip(skip: &ReanchorSkip, block: u64, metrics: &Metrics) {
+    let ReanchorSkip { read, reason } = skip;
+    let pool_id = read.pool_id;
+    match *reason {
+        ReanchorStale::BelowFolded { folded_through } => {
+            metrics.settlement_reanchor_skipped_below_folded();
+            warn!(
+                %pool_id,
+                block,
+                folded_through,
+                "pool re-anchor: read is below a folded event; pool stays pending"
+            );
+        }
+        ReanchorStale::LowerRedeemed { held } => {
+            metrics.settlement_reanchor_skipped_lower_redeemed();
+            warn!(
+                %pool_id,
+                block,
+                held,
+                read = read.total_redeemed,
+                "pool re-anchor: read totalRedeemed is below the held one; pool stays pending"
+            );
+        }
+        ReanchorStale::LowerDeposit { held } => {
+            metrics.settlement_reanchor_skipped_lower_deposit();
+            warn!(
+                %pool_id,
+                block,
+                held,
+                read = read.deposit,
+                "pool re-anchor: read deposit is below the held one; pool stays pending"
+            );
+        }
     }
 }
 
@@ -1062,6 +1114,7 @@ async fn reanchor_block<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     pending: usize,
     applied_through: u64,
+    metrics: &Metrics,
 ) -> Option<u64> {
     let block = match timed(
         Some(REANCHOR_RPC_TIMEOUT),
@@ -1072,6 +1125,7 @@ async fn reanchor_block<P: Provider + Clone>(
     {
         Ok(block) => block,
         Err(err) => {
+            metrics.settlement_reanchor_block_read_failure();
             warn!(
                 error = %sanitize_err_chain(&err),
                 pools = pending,
@@ -1081,6 +1135,7 @@ async fn reanchor_block<P: Provider + Clone>(
         }
     };
     if block < applied_through {
+        metrics.settlement_reanchor_behind_watcher();
         debug!(
             block,
             applied_through, "pool re-anchor: block number behind the watcher; retrying next tick"
@@ -1098,6 +1153,7 @@ async fn read_reanchor_batch<P: Provider + Clone>(
     batch: Vec<B256>,
     block: u64,
     cursor: &mut Option<B256>,
+    metrics: &Metrics,
 ) -> (Vec<PoolRead>, Vec<B256>) {
     let mut reads = futures_util::stream::iter(batch)
         .map(|pool_id| async move { (pool_id, read_pool_at(contract, pool_id, block).await) })
@@ -1111,6 +1167,7 @@ async fn read_reanchor_batch<P: Provider + Clone>(
         let pool = match read {
             Ok(pool) => pool,
             Err(err) => {
+                metrics.settlement_reanchor_pool_read_failure();
                 warn!(
                     error = %sanitize_err_chain(&err),
                     %pool_id,
@@ -1130,6 +1187,7 @@ async fn read_reanchor_batch<P: Provider + Clone>(
                 lifecycle,
             });
         } else {
+            metrics.settlement_reanchor_absent();
             debug!(%pool_id, block, "pool re-anchor: pool absent at the pinned block; retrying");
         }
     }

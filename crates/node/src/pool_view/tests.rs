@@ -250,7 +250,14 @@ async fn anchored_snapshot_counts_a_known_lanes_advance_once() {
     let view = PoolProjection::new();
     view.record_resolved(addr(7), read(pool(1), 1_000, 600));
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 450)], Some(5));
-    view.reanchor(10, &[read(pool(1), 1_000, 650)]);
+    let report = view.reanchor(10, &[read(pool(1), 1_000, 650)]);
+    assert_eq!(
+        report,
+        ReanchorReport {
+            anchored: 1,
+            skipped: vec![]
+        }
+    );
     assert!(view.pending_rereads().is_empty());
     assert_eq!(remaining(&view, pool(1)).await, 350);
     // Only the 50 the lane advanced past its folded 450 is new.
@@ -314,13 +321,25 @@ async fn reanchor_below_a_folded_event_is_ignored() {
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 100)], Some(30));
     // A lagging backend's read at block 25 predates the folded block-30 event.
     // Its values pass the value guard, so only the block order rejects it.
-    view.reanchor(25, &[read(pool(1), 1_000, 650)]);
+    let report = view.reanchor(25, &[read(pool(1), 1_000, 650)]);
+    assert_eq!(
+        report.skipped,
+        vec![ReanchorSkip {
+            read: read(pool(1), 1_000, 650),
+            reason: ReanchorStale::BelowFolded { folded_through: 30 },
+        }]
+    );
+    assert_eq!(report.anchored, 0);
     assert_eq!(view.pending_rereads(), vec![pool(1)]);
     assert_eq!(remaining(&view, pool(1)).await, 400);
 
     view.record_resolved(addr(7), read(pool(2), 1_000, 0));
     view.record_topup(pool(2), U256::from(2_000u64), Some(30));
-    view.reanchor(25, &[read(pool(2), 2_500, 0)]);
+    let report = view.reanchor(25, &[read(pool(2), 2_500, 0)]);
+    assert_eq!(
+        report.skipped.first().map(|skip| skip.reason),
+        Some(ReanchorStale::BelowFolded { folded_through: 30 })
+    );
     assert_eq!(remaining(&view, pool(2)).await, 2_000);
     assert!(view.pending_rereads().contains(&pool(2)));
 }
@@ -331,18 +350,33 @@ async fn reanchor_below_the_seed_is_ignored() {
     // A pool drained before the restart, with no lane folded yet.
     view.record_resolved(addr(7), read(pool(1), 1_000, 1_000));
     // A backend behind the admit read still sees nothing redeemed.
-    view.reanchor(10, &[read(pool(1), 1_000, 0)]);
+    let report = view.reanchor(10, &[read(pool(1), 1_000, 0)]);
+    assert_eq!(
+        report.skipped.first().map(|skip| skip.reason),
+        Some(ReanchorStale::LowerRedeemed { held: 1_000 })
+    );
     assert_eq!(remaining(&view, pool(1)).await, 0);
     assert_eq!(view.pending_rereads(), vec![pool(1)]);
 
     // A deposit below the seed's is just as stale.
     view.record_resolved(addr(7), read(pool(2), 3_000, 0));
-    view.reanchor(10, &[read(pool(2), 1_000, 0)]);
+    let report = view.reanchor(10, &[read(pool(2), 1_000, 0)]);
+    assert_eq!(
+        report.skipped.first().map(|skip| skip.reason),
+        Some(ReanchorStale::LowerDeposit { held: 3_000 })
+    );
     assert_eq!(remaining(&view, pool(2)).await, 3_000);
     assert!(view.pending_rereads().contains(&pool(2)));
 
     // A read that catches up anchors the pool.
-    view.reanchor(11, &[read(pool(1), 1_000, 1_000)]);
+    let report = view.reanchor(11, &[read(pool(1), 1_000, 1_000)]);
+    assert_eq!(
+        report,
+        ReanchorReport {
+            anchored: 1,
+            skipped: vec![]
+        }
+    );
     assert_eq!(view.pending_rereads(), vec![pool(2)]);
 }
 
@@ -364,7 +398,11 @@ async fn reanchor_leaves_an_event_opened_pool_alone() {
     let view = PoolProjection::new();
     view.record_opened(pool(1), addr(7), U256::from(1_000u64));
     view.record_redeemed(pool(1), addr(9), &[lane(addr(2), 100)], Some(3));
-    view.reanchor(10, &[read(pool(1), 1_000, 999)]);
+    // Neither anchored nor stale: the pool has no snapshot to anchor.
+    assert_eq!(
+        view.reanchor(10, &[read(pool(1), 1_000, 999)]),
+        ReanchorReport::default()
+    );
     assert_eq!(remaining(&view, pool(1)).await, 900);
     assert!(view.pending_rereads().is_empty());
 }
