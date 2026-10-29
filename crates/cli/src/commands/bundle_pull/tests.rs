@@ -421,6 +421,47 @@ fn a_selection_adds_its_dropped_entries_to_the_excluded_count() {
     assert_eq!(kept.excluded, 4);
 }
 
+/// A selection that drops every entry plans nothing, and keeps the filter's
+/// and the selection's drops as the excluded count the run records.
+#[test]
+fn deselecting_every_entry_plans_nothing_with_every_entry_excluded() {
+    let offered = u64::try_from(sample().len()).unwrap();
+    let kept = Kept {
+        manifest: BundleManifest::new([0; 32], sample()),
+        excluded: 2,
+    };
+    let kept = apply_selection(kept, |_| Ok(Vec::new())).unwrap();
+    assert!(matches!(
+        Planned::of(kept, NothingReason::Deselected),
+        Planned::Nothing { excluded, .. } if excluded == 2 + offered
+    ));
+}
+
+/// A filter that keeps no entry plans nothing with its excluded count; one
+/// that keeps any plans the pull.
+#[test]
+fn a_plan_with_no_entry_is_nothing() {
+    let nothing = Kept {
+        manifest: BundleManifest::new([0; 32], Vec::new()),
+        excluded: 5,
+    };
+    assert!(matches!(
+        Planned::of(nothing, NothingReason::Filtered),
+        Planned::Nothing {
+            reason: NothingReason::Filtered,
+            excluded: 5
+        }
+    ));
+    let some = Kept {
+        manifest: BundleManifest::new([0; 32], sample()),
+        excluded: 5,
+    };
+    assert!(matches!(
+        Planned::of(some, NothingReason::Filtered),
+        Planned::Pull(_)
+    ));
+}
+
 /// The run-end scan counts the staging files of blobs the run did not
 /// use, once per blob, totals the disk space they take, and ignores the
 /// run's own blobs, the manifest blob, and names that are not a blob's
@@ -1121,16 +1162,16 @@ fn guard_selection_refuses_hidden_paths_even_under_overwrite() {
         manifest: BundleManifest::new([0xab; 32], vec![sel_entry(".decdn/node.toml", 3)]),
         excluded: 0,
     };
-    let (args, parsed) = get_args(&uri, &["--overwrite"]);
+    let (args, _) = get_args(&uri, &["--overwrite"]);
     let dest = default_dest(Path::new("./out"), None);
-    let err = super::guard_selection(&args, &dest, &parsed, kept()).unwrap_err();
+    let err = super::guard_selection(&args, &dest, kept()).unwrap_err();
     assert!(format!("{err:#}").contains(".decdn/node.toml"), "{err:#}");
 
     let (args, parsed) = get_args(&uri, &["-o", "dir"]);
     let dest = Destination::of(&args, &parsed);
-    let through = super::guard_selection(&args, &dest, &parsed, kept())
-        .unwrap()
-        .expect("an explicit -o keeps the entries");
+    let Planned::Pull(through) = super::guard_selection(&args, &dest, kept()).unwrap() else {
+        panic!("an explicit -o keeps the entries");
+    };
     assert_eq!(through.manifest.entries.len(), 1);
 }
 
@@ -1307,7 +1348,7 @@ async fn a_hidden_path_is_refused_before_a_foreign_file() {
         ),
         excluded: 0,
     };
-    let err = super::guard_selection(&args, &dest, &parsed, kept).unwrap_err();
+    let err = super::guard_selection(&args, &dest, kept).unwrap_err();
     assert!(
         format!("{err:#}").contains("refusing to pull hidden path"),
         "{err:#}"
@@ -1622,6 +1663,45 @@ fn offline_config() -> std::path::PathBuf {
     dir.path().join("config.toml")
 }
 
+/// A bundle run with nothing to fetch ends `done` with counts in its record:
+/// every entry it dropped as excluded, nothing fetched or resumed.
+#[tokio::test]
+async fn a_run_with_nothing_to_fetch_records_its_excluded_entries() {
+    use std::str::FromStr as _;
+
+    let records = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let text = format!("decdn:{}/", "ab".repeat(32));
+    let uri = DecdnUri::from_str(&text).unwrap();
+    let evidence = Arc::new(ReceiptEvidence::new());
+    let activity =
+        ActivityRecorder::start_in(records.path(), &uri, &text, out.path(), &evidence).unwrap();
+    let observer = PullObserver::new(true, "pull".to_owned(), Some(Arc::clone(&activity)));
+    observer.nothing_to_fetch(NothingReason::Filtered, 9, out.path(), uri.hash);
+    activity.finish(&Ok(()), None).await;
+
+    let (records, _) = crate::commands::activity::read_records(records.path()).unwrap();
+    let record = records.first().unwrap();
+    assert!(
+        matches!(
+            record.state,
+            crate::commands::activity::PullState::Done { .. }
+        ),
+        "{record:?}"
+    );
+    let crate::commands::activity::PullKind::Bundle { counts, .. } = record.kind else {
+        unreachable!("a bundle run records a bundle: {:?}", record.kind);
+    };
+    assert_eq!(
+        counts,
+        Some(BundleCounts {
+            excluded: 9,
+            ..BundleCounts::default()
+        })
+    );
+    assert_eq!(record.resumed_bytes, 0);
+}
+
 /// A bundle run reports to its dashboard record through the observer: the
 /// planned download, each blob's position, and the counts at its end.
 #[tokio::test]
@@ -1641,13 +1721,15 @@ async fn the_observer_feeds_the_runs_record() {
         .delivered(40, 60);
     let mut report = BundleReport::default();
     report.fetched = 1;
+    report.reused = 3;
+    report.resumed_bytes = 20;
     observer.record_counts(&report, 2);
     activity.finish(&Ok(()), None).await;
 
     let (records, _) = crate::commands::activity::read_records(dir.path()).unwrap();
     let record = records.first().unwrap();
     assert_eq!(record.expected_bytes, Some(100));
-    assert_eq!(record.received_bytes, 40);
+    assert_eq!((record.received_bytes, record.resumed_bytes), (40, 20));
     let crate::commands::activity::PullKind::Bundle {
         files_started,
         counts,
@@ -1658,5 +1740,5 @@ async fn the_observer_feeds_the_runs_record() {
     };
     assert_eq!(files_started, 1);
     let counts = counts.unwrap();
-    assert_eq!((counts.fetched, counts.excluded), (1, 2));
+    assert_eq!((counts.fetched, counts.reused, counts.excluded), (1, 3, 2));
 }

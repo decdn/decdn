@@ -56,6 +56,35 @@ struct Kept {
     excluded: u64,
 }
 
+/// What a run pulls once the filter and `--select` ran.
+#[derive(Debug)]
+enum Planned {
+    /// The kept entries.
+    Pull(Kept),
+    /// No entry is left: the bundle is empty, or the filter or `--select`
+    /// dropped every entry. [`PullObserver::nothing_to_fetch`] ends the run.
+    Nothing {
+        /// Why no entry is left.
+        reason: NothingReason,
+        /// Entries the filter or `--select` dropped.
+        excluded: u64,
+    },
+}
+
+impl Planned {
+    /// `kept` as a plan: nothing, for `reason`, when it keeps no entry.
+    fn of(kept: Kept, reason: NothingReason) -> Self {
+        if kept.manifest.entries.is_empty() {
+            Self::Nothing {
+                reason,
+                excluded: kept.excluded,
+            }
+        } else {
+            Self::Pull(kept)
+        }
+    }
+}
+
 /// The run label for the progress header: the output directory's final component,
 /// or its whole path when it has none (a bare root).
 fn run_label(output: &Path) -> String {
@@ -409,24 +438,19 @@ fn refuse_hidden(dest: &Destination, manifest: &BundleManifest) -> anyhow::Resul
 /// entries the pull writes: apply `--select`, then refuse hidden landed paths
 /// ([`refuse_hidden`]) and foreign files ([`refuse_foreign`]) in a default
 /// destination, then a `--receipt` path an entry lands at
-/// ([`refuse_receipt_collision`]), in that order. `Ok(None)` means the user
-/// deselected every file ([`report_nothing_to_fetch`] already ran). Every
-/// live pull runs this guard; nothing may bypass it. `dry_run`, which takes
-/// no `--select`, applies the same two default-destination refusals to its
-/// cached plan.
-fn guard_selection(
-    args: &GetArgs,
-    dest: &Destination,
-    uri: &DecdnUri,
-    kept: Kept,
-) -> anyhow::Result<Option<Kept>> {
-    let Some(kept) = maybe_select(args, &dest.path, uri, kept)? else {
-        return Ok(None);
+/// ([`refuse_receipt_collision`]), in that order. [`Planned::Nothing`] means
+/// the user deselected every file. Every live pull runs this guard; nothing
+/// may bypass it. `dry_run`, which takes no `--select`, applies the same two
+/// default-destination refusals to its cached plan.
+fn guard_selection(args: &GetArgs, dest: &Destination, kept: Kept) -> anyhow::Result<Planned> {
+    let kept = match maybe_select(args, kept)? {
+        Planned::Pull(kept) => kept,
+        nothing @ Planned::Nothing { .. } => return Ok(nothing),
     };
     refuse_hidden(dest, &kept.manifest)?;
     refuse_foreign(args, dest, &kept.manifest)?;
     refuse_receipt_collision(args, &dest.path, &kept.manifest)?;
-    Ok(Some(kept))
+    Ok(Planned::Pull(kept))
 }
 
 /// Mark in `hits` every pattern of `set` that matches `path`, and return
@@ -569,23 +593,16 @@ fn parse_selection(
 
 /// Apply the interactive `--select` step to a finalized manifest, or pass it
 /// through unchanged when `--select` is off. Each deselected entry adds to the
-/// excluded count. `Ok(None)` means the user deselected every file:
-/// [`report_nothing_to_fetch`] was already called, so the run is done.
-fn maybe_select(
-    args: &GetArgs,
-    out: &Path,
-    uri: &DecdnUri,
-    mut kept: Kept,
-) -> anyhow::Result<Option<Kept>> {
-    if args.select {
-        kept = apply_selection(kept, select_entries)?;
-        if kept.manifest.entries.is_empty() {
-            report_nothing_to_fetch(NothingReason::Deselected);
-            warn_leftover_partials(out, &[], uri.hash);
-            return Ok(None);
-        }
+/// excluded count. [`Planned::Nothing`] means the user deselected every
+/// file.
+fn maybe_select(args: &GetArgs, kept: Kept) -> anyhow::Result<Planned> {
+    if !args.select {
+        return Ok(Planned::Pull(kept));
     }
-    Ok(Some(kept))
+    Ok(Planned::of(
+        apply_selection(kept, select_entries)?,
+        NothingReason::Deselected,
+    ))
 }
 
 /// Replace `kept`'s entries with the ones `select` keeps, and add each entry it
@@ -1083,25 +1100,27 @@ async fn pull_manifest(
     (filter, filters_given): (&EntryFilter, bool),
 ) -> anyhow::Result<()> {
     let out = dest.path.as_path();
-    // Obtain the manifest: the bundle blob fetched and filtered here. `None` =>
-    // filtered to empty (already reported). `--select`: let the user trim the
-    // (already glob-filtered) list in their editor. Everything deselected ends
-    // the run (reported) like an empty filter. `guard_selection` then applies
-    // `--select` and the pre-pull refusals.
+    // Obtain the manifest: the bundle blob fetched and filtered here.
+    // `--select`: let the user trim the (already glob-filtered) list in their
+    // editor. Everything deselected ends the run like an empty filter.
+    // `guard_selection` then applies `--select` and the pre-pull refusals.
     let selected = async {
         let fetch = obtain_manifest(puller, (args, out), uri, filter, filters_given);
-        let Some(kept) = until_interrupted(fetch, interrupt).await? else {
-            return Ok(None);
-        };
-        guard_selection(args, dest, uri, kept)
+        match until_interrupted(fetch, interrupt).await? {
+            Planned::Pull(kept) => guard_selection(args, dest, kept),
+            nothing @ Planned::Nothing { .. } => Ok(nothing),
+        }
     }
     .await;
     // The manifest fetch is paid, so a run that ends here still owes the
     // wallet-shortfall warning the summary below prints otherwise.
-    let Some(Kept { manifest, excluded }) = selected.inspect_err(|_| warn_shortfall(puller))?
-    else {
-        warn_shortfall(puller);
-        return Ok(());
+    let Kept { manifest, excluded } = match selected.inspect_err(|_| warn_shortfall(puller))? {
+        Planned::Pull(kept) => kept,
+        Planned::Nothing { reason, excluded } => {
+            observer.nothing_to_fetch(reason, excluded, out, uri.hash);
+            warn_shortfall(puller);
+            return Ok(());
+        }
     };
 
     if !args.json {
@@ -1169,16 +1188,15 @@ async fn until_interrupted<T>(
 
 /// The kept manifest for the run: the bundle blob fetched and filtered here.
 /// The fetch reads the output root's manifest cache first, unless
-/// `--overwrite`. `Ok(None)` means the manifest is empty after filtering —
-/// [`report_nothing_to_fetch`] was already called, so the caller returns
-/// `Ok(())`.
+/// `--overwrite`. [`Planned::Nothing`] means the manifest is empty after
+/// filtering.
 async fn obtain_manifest(
     puller: &BundlePuller,
     (args, out): (&GetArgs, &Path),
     uri: &DecdnUri,
     filter: &EntryFilter,
     filters_given: bool,
-) -> anyhow::Result<Option<Kept>> {
+) -> anyhow::Result<Planned> {
     let mut m = puller
         .fetch_manifest(uri.hash, out, !args.overwrite)
         .await
@@ -1186,15 +1204,13 @@ async fn obtain_manifest(
     let raw_empty = m.entries.is_empty();
     let (entries, excluded) = filter.apply_and_warn(m.entries)?;
     m.entries = entries;
-    if m.entries.is_empty() {
-        report_nothing_to_fetch(NothingReason::from_filter(filters_given, raw_empty));
-        warn_leftover_partials(out, &[], uri.hash);
-        return Ok(None);
-    }
-    Ok(Some(Kept {
-        manifest: m,
-        excluded,
-    }))
+    Ok(Planned::of(
+        Kept {
+            manifest: m,
+            excluded,
+        },
+        NothingReason::from_filter(filters_given, raw_empty),
+    ))
 }
 
 /// The CLI's [`BundleObserver`]: the multi-bar progress renderer, built once
@@ -1224,8 +1240,23 @@ impl PullObserver {
     /// not pull.
     fn record_counts(&self, report: &BundleReport, excluded: u64) {
         if let Some(activity) = &self.activity {
-            activity.bundle_counts(BundleCounts::of(report, excluded));
+            activity.bundle_counts(BundleCounts::of(report, excluded), report.resumed_bytes);
         }
+    }
+
+    /// End a run that has nothing to fetch, for `reason`: say so, warn of
+    /// the `.partial` files earlier runs left under `out`, and record the
+    /// `excluded` entries, so the run's record shows how many it dropped.
+    fn nothing_to_fetch(
+        &self,
+        reason: NothingReason,
+        excluded: u64,
+        out: &Path,
+        bundle_hash: [u8; 32],
+    ) {
+        report_nothing_to_fetch(reason);
+        warn_leftover_partials(out, &[], bundle_hash);
+        self.record_counts(&BundleReport::default(), excluded);
     }
 
     /// Clear the bars at the end of the run; the command then prints its
@@ -1359,7 +1390,7 @@ fn entry_done_line(
 /// [`report_nothing_to_fetch`] prints, so the operator learns the actual cause
 /// (an empty bundle, globs that matched nothing, or a fully deselected list)
 /// rather than mistaking one for another.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NothingReason {
     /// The bundle manifest itself is empty.
     EmptyBundle,

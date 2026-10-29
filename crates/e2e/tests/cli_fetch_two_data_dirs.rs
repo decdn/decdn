@@ -260,6 +260,10 @@ fn check_pull_record(home: &Path, len: u64, wire: U256, provider: Address) -> an
         .with_context(|| format!("no done record among {records:?}"))?;
     anyhow::ensure!(done["kind"] == "blob", "{done}");
     anyhow::ensure!(done["received_bytes"] == len, "{done}");
+    anyhow::ensure!(
+        done["resumed_bytes"] == 0,
+        "a fresh fetch resumed nothing: {done}"
+    );
     anyhow::ensure!(done["finished_unix_ms"].is_u64(), "{done}");
     anyhow::ensure!(
         U256::from(done["paid"]["bytes"].as_u64().unwrap_or(0)) == wire,

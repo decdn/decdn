@@ -8,7 +8,7 @@
     "updated_unix_ms": 1793000600000,
     "active": [],
     "recent": [],
-    "unreadable": 0,
+    "unreadable": [],
     "error": "cannot list /home/me/.decdn/activity/pulls: Permission denied (os error 13)"
   },
   "gateway": {

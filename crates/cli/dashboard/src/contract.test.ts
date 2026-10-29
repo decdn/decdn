@@ -47,6 +47,7 @@ import type {
   SlashRecordDto,
   Status,
   StatusResponse,
+  UnreadableRecord,
 } from "./api";
 import alone from "./fixtures/dashboard-alone.json";
 import failing from "./fixtures/dashboard-failing.json";
@@ -66,6 +67,7 @@ import {
   poolRows,
   pools,
   recentPulls,
+  unreadableView,
 } from "./view";
 
 type Keys<T> = Record<keyof T, true>;
@@ -192,6 +194,7 @@ const PULL_FIELDS: Keys<PullFields> = {
   started_unix_ms: true,
   updated_unix_ms: true,
   received_bytes: true,
+  resumed_bytes: true,
   expected_bytes: true,
   paid: true,
   nodes: true,
@@ -220,13 +223,14 @@ const BUNDLE_COUNTS: Keys<BundleCounts> = {
   fetched: true,
   linked: true,
   skipped: true,
+  reused: true,
   excluded: true,
   failed: true,
   not_run: true,
   downloaded: true,
-  resumed_bytes: true,
   reused_bytes: true,
 };
+const UNREADABLE: Keys<UnreadableRecord> = { path: true, error: true };
 const GATEWAY_BASE = { url: true, updated_unix_ms: true, state: true } as const;
 const GATEWAY: Variants<GatewaySection> = {
   waiting: GATEWAY_BASE,
@@ -500,6 +504,9 @@ function expectDashboard(raw: unknown) {
   expectShape(raw, DASHBOARD, "dashboard");
   const s = raw as Status;
   expectShape(s.pulls, PULLS, "pulls");
+  for (const u of s.pulls.unreadable) {
+    expectShape(u, UNREADABLE, "pulls.unreadable[]");
+  }
   for (const p of s.pulls.active) {
     expectPull(p, "pulls.active[]");
     expect(p.state, "an active run").toBe("running");
@@ -535,9 +542,31 @@ describe("the dashboard's /_status fixtures", () => {
       recentPulls(s.pulls).map((p) => [p.outcome, p.durationSecs, p.error]),
     ).toEqual([
       ["✓ Done", 42, null],
+      ["✓ Done", 42, null],
       ["Interrupted", 42, null],
       ["⛔ Failed", 42, "no node holds the blob"],
     ]);
+    expect(
+      recentPulls(s.pulls).map((p) => [
+        p.counts?.map((c) => c.text) ?? null,
+        p.downloaded,
+        p.resumed,
+        p.reused,
+      ]),
+    ).toEqual([
+      [["11 skipped", "9 excluded"], 0, 0, 0],
+      [
+        ["9 fetched", "1 linked", "2 skipped", "1 reused"],
+        734_003_200,
+        0,
+        4_096,
+      ],
+      [null, 734_003_200, 0, 0],
+      [null, 465_567_744, 268_435_456, 0],
+    ]);
+    expect(livePulls(s.pulls).map((p) => p.resumed)).toEqual([0, 268_435_456]);
+    expect(unreadableView(s.pulls)).toMatchObject({ count: 1, more: 0 });
+    expect(s.pulls.unreadable[0]?.error).toContain("missing field");
     expect(s.pulls.error).toBeNull();
     expect(nodeView(s.node).line).toBeNull();
     expect(partNote(s.node.slashes)).toEqual({

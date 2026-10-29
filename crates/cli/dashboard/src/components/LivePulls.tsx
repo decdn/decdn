@@ -28,8 +28,11 @@ export function LivePulls(props: { rows: LivePullRow[] }) {
                 </p>
                 <p className="text-sm text-ink-2 tabular-nums">
                   {p.kind} to <span className="font-mono">{p.output}</span>
-                  {p.files ? ` · ${p.files}` : ""} · paid{" "}
-                  {formatUsdc(p.paidMicro)} USDC to {p.nodes}{" "}
+                  {p.files ? ` · ${p.files}` : ""}
+                  {p.resumed > 0
+                    ? ` · ${formatBytes(p.resumed)} resumed`
+                    : ""}{" "}
+                  · paid {formatUsdc(p.paidMicro)} USDC to {p.nodes}{" "}
                   {p.nodes === 1 ? "node" : "nodes"} · for{" "}
                   {formatDuration(p.ageSecs)}
                 </p>

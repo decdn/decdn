@@ -14,7 +14,9 @@ use decdn_common::admin::{
     LastSettlement, PendingRedeem, RecordStoreHealth, RepublishHealth, RoutingHealth,
 };
 
-use super::super::super::activity::{BundleCounts, NodePaid, Paid, PullKind, PullState};
+use super::super::super::activity::{
+    BundleCounts, NodePaid, Paid, PullKind, PullState, Unreadable,
+};
 use super::*;
 
 const STARTED: u64 = 1_793_000_000;
@@ -111,11 +113,11 @@ fn pull(started: u64, kind: Kind, end: End) -> PullView {
                     fetched: 9,
                     linked: 1,
                     skipped: 2,
+                    reused: 1,
                     excluded: 0,
                     failed: 0,
                     not_run: 0,
                     downloaded: 734_003_200,
-                    resumed_bytes: 0,
                     reused_bytes: 4_096,
                 }),
             },
@@ -135,6 +137,7 @@ fn pull(started: u64, kind: Kind, end: End) -> PullView {
             },
             state,
             received_bytes: 734_003_200,
+            resumed_bytes: 0,
             expected_bytes: Some(1_073_741_824),
             paid: Paid {
                 amount_micro_usdc: 7_340,
@@ -163,7 +166,7 @@ fn base(gateway: GatewayState, node: NodeSection) -> Status {
             updated_unix_ms: Some(NOW_MS),
             active: Vec::new(),
             recent: Vec::new(),
-            unreadable: 0,
+            unreadable: Vec::new(),
             error: None,
         },
         gateway: GatewaySection {
@@ -318,9 +321,30 @@ fn node_up() -> NodeSection {
     }
 }
 
-/// A host running everything: two live pulls (one whose heartbeat stopped),
-/// three that ended, a loopback gateway, and a node with every read but
-/// slashes.
+/// A bundle run that found every kept file on disk: it fetched, paid and
+/// received nothing.
+fn skip_only(started: u64) -> PullView {
+    let mut view = pull(started, Kind::Bundle, End::Done);
+    view.record.kind = PullKind::Bundle {
+        files_started: 0,
+        files_landed: 0,
+        counts: Some(BundleCounts {
+            skipped: 11,
+            excluded: 9,
+            ..BundleCounts::default()
+        }),
+    };
+    view.record.received_bytes = 0;
+    view.record.expected_bytes = Some(0);
+    view.record.paid = Paid::default();
+    view.record.nodes = Vec::new();
+    view
+}
+
+/// A host running everything: two live pulls (one whose heartbeat stopped,
+/// one that resumed), four that ended (a skip-only bundle, a resumed blob),
+/// a file that did not read as a record, a loopback gateway, and a node with
+/// every read but slashes.
 #[test]
 fn a_full_status_keeps_its_shape() {
     // The gateway's body is its own contract, pinned by the gateway's
@@ -329,13 +353,20 @@ fn a_full_status_keeps_its_shape() {
     let mut status = base(GatewayState::Up { status: gateway }, node_up());
     let mut stopped = pull(NOW_MS - 120_000, Kind::Blob, End::Running);
     stopped.stale = true;
+    stopped.record.resumed_bytes = 268_435_456;
+    let mut resumed = pull(NOW_MS - 500_000, Kind::Blob, End::Failed);
+    resumed.record.resumed_bytes = 268_435_456;
     status.pulls.active = vec![pull(NOW_MS - 30_000, Kind::Bundle, End::Running), stopped];
     status.pulls.recent = vec![
+        skip_only(NOW_MS - 200_000),
         pull(NOW_MS - 300_000, Kind::Bundle, End::Done),
         pull(NOW_MS - 400_000, Kind::Entry, End::Interrupted),
-        pull(NOW_MS - 500_000, Kind::Blob, End::Failed),
+        resumed,
     ];
-    status.pulls.unreadable = 1;
+    status.pulls.unreadable = vec![Unreadable {
+        path: "/home/me/.decdn/activity/pulls/1761700000000-77.json".to_owned(),
+        error: "missing field `resumed_bytes` at line 1 column 402".to_owned(),
+    }];
     pin("dashboard-full.json", &status);
 }
 

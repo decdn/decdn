@@ -19,6 +19,7 @@ fn record(started: u64, updated: u64, state: PullState) -> PullRecord {
         updated_unix_ms: updated,
         state,
         received_bytes: 0,
+        resumed_bytes: 0,
         expected_bytes: None,
         paid: Paid::default(),
         nodes: Vec::new(),
@@ -52,6 +53,24 @@ fn pulls_split_running_from_ended() {
     assert_eq!(stale, [true, false], "newest first");
     assert_eq!(section.recent[0].record.state, done);
     assert_eq!(section.error, None);
+}
+
+/// A file that does not read as a record is named with why, beside the
+/// records that do.
+#[test]
+fn an_unreadable_record_is_named_with_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = activity::now_ms();
+    write_record(dir.path(), &record(now, now, PullState::Running));
+    let torn = dir.path().join("1-1.json");
+    std::fs::write(&torn, br#"{"uri":"decdn:00","#).unwrap();
+    let section = read_pulls(dir.path());
+    assert_eq!(section.active.len(), 1);
+    let [unreadable] = section.unreadable.as_slice() else {
+        panic!("one unreadable file: {section:?}");
+    };
+    assert_eq!(unreadable.path, torn.display().to_string());
+    assert!(unreadable.error.contains("EOF"), "{unreadable:?}");
 }
 
 /// A directory that cannot be listed says why, rather than reading as no

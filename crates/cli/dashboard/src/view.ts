@@ -1,5 +1,6 @@
 // Pure reads of a `Status` into what the panels show.
 import type {
+  BundleCounts,
   EarningsPeriod,
   EarningsResponse,
   EndedPull,
@@ -11,6 +12,7 @@ import type {
   Pool,
   PullKind,
   Pulls,
+  UnreadableRecord,
 } from "./api";
 
 export type Severity = "ok" | "warning" | "critical";
@@ -146,6 +148,9 @@ export interface LivePullRow {
   kind: PullKind;
   output: string;
   received: number;
+  /** Of `received`, what earlier runs fetched and this one resumed: a blob
+   * run's; a bundle run's is known only at its end. */
+  resumed: number;
   expected: number | null;
   /** The share received; null until the run knows its size. */
   done: number | null;
@@ -171,6 +176,7 @@ export function livePulls(pulls: Pulls): LivePullRow[] {
     kind: p.kind,
     output: p.output,
     received: p.received_bytes,
+    resumed: p.resumed_bytes,
     expected: p.expected_bytes,
     done:
       p.expected_bytes === null
@@ -196,13 +202,51 @@ const OUTCOME: Record<EndedPull["state"], { outcome: string; tone: Tone }> = {
   gave_up: { outcome: "⚠ Gave up", tone: "critical" },
 };
 
+/** One of a bundle run's counts, as its summary line names it. */
+export interface CountPart {
+  text: string;
+  /** Entries that failed, or that the run ended before. */
+  critical: boolean;
+}
+
+/**
+ * A bundle run's non-zero counts, in its summary line's order; one
+ * "nothing to fetch" part when every count is zero.
+ */
+export function countParts(c: BundleCounts): CountPart[] {
+  const parts: [number, string, boolean][] = [
+    [c.fetched, "fetched", false],
+    [c.linked, "linked", false],
+    [c.skipped, "skipped", false],
+    [c.reused, "reused", false],
+    [c.excluded, "excluded", false],
+    [c.failed, "failed", true],
+    [c.not_run, "not run", true],
+  ];
+  const named = parts
+    .filter(([n]) => n > 0)
+    .map(([n, label, critical]) => ({ text: `${n} ${label}`, critical }));
+  return named.length > 0
+    ? named
+    : [{ text: "nothing to fetch", critical: false }];
+}
+
 export interface RecentPullRow {
   key: string;
   outcome: string;
   tone: Tone;
   uri: string;
   output: string;
-  received: number;
+  /** What this run downloaded: neither resumed nor reused. A bundle run
+   * that ended before its summary has no tally, so its position stands in. */
+  downloaded: number;
+  /** What earlier runs fetched and this one resumed. */
+  resumed: number;
+  /** A bundle run's bytes taken from files already on disk. */
+  reused: number;
+  /** A bundle run's counts; null for a blob or entry run, or a bundle run
+   * that ended before its summary. */
+  counts: CountPart[] | null;
   durationSecs: number;
   paidMicro: number;
   nodes: number;
@@ -211,17 +255,43 @@ export interface RecentPullRow {
 
 /** The `decdn get` runs that ended, newest first. */
 export function recentPulls(pulls: Pulls): RecentPullRow[] {
-  return pulls.recent.map((p) => ({
-    key: pullKey(p),
-    ...OUTCOME[p.state],
-    uri: p.uri,
-    output: p.output,
-    received: p.received_bytes,
-    durationSecs: (p.finished_unix_ms - p.started_unix_ms) / 1000,
-    paidMicro: p.paid.amount_micro_usdc,
-    nodes: p.nodes.length,
-    error: "error" in p ? p.error : null,
-  }));
+  return pulls.recent.map((p) => {
+    const counts = p.kind === "bundle" ? p.counts : null;
+    return {
+      key: pullKey(p),
+      ...OUTCOME[p.state],
+      uri: p.uri,
+      output: p.output,
+      downloaded:
+        counts?.downloaded ?? Math.max(0, p.received_bytes - p.resumed_bytes),
+      resumed: p.resumed_bytes,
+      reused: counts?.reused_bytes ?? 0,
+      counts: counts === null ? null : countParts(counts),
+      durationSecs: (p.finished_unix_ms - p.started_unix_ms) / 1000,
+      paidMicro: p.paid.amount_micro_usdc,
+      nodes: p.nodes.length,
+      error: "error" in p ? p.error : null,
+    };
+  });
+}
+
+/** How many unreadable files the banner lists before it says how many more. */
+const UNREADABLE_SHOWN = 5;
+
+export interface UnreadableView {
+  count: number;
+  shown: UnreadableRecord[];
+  more: number;
+}
+
+/** The files that did not read as a record, the first few by name. */
+export function unreadableView(pulls: Pulls): UnreadableView {
+  const all = pulls.unreadable;
+  return {
+    count: all.length,
+    shown: all.slice(0, UNREADABLE_SHOWN),
+    more: Math.max(0, all.length - UNREADABLE_SHOWN),
+  };
 }
 
 /** What the gateway section says in place of its panels; null when up. */

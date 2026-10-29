@@ -7,7 +7,7 @@ use decdn_common::admin::{
 };
 use serde::Serialize;
 
-use super::super::activity::PullRecord;
+use super::super::activity::{PullRecord, Unreadable};
 use super::super::node_top::{Snapshot, SnapshotDelta};
 
 /// The body of `GET /_status`.
@@ -39,8 +39,9 @@ pub(super) struct PullsSection {
     pub(super) active: Vec<PullView>,
     /// The runs that ended, newest first.
     pub(super) recent: Vec<PullView>,
-    /// Files in the directory that did not read as a record.
-    pub(super) unreadable: usize,
+    /// The `*.json` files in the directory that did not read as a record,
+    /// sorted by path, each with why.
+    pub(super) unreadable: Vec<Unreadable>,
     /// Why the directory cannot be listed; the lists are then empty.
     pub(super) error: Option<String>,
 }

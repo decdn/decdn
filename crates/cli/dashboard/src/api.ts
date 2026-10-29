@@ -124,11 +124,12 @@ export interface BundleCounts {
   fetched: number;
   linked: number;
   skipped: number;
+  /** Distinct blobs made from a whole file already on disk. */
+  reused: number;
   excluded: number;
   failed: number;
   not_run: number;
   downloaded: number;
-  resumed_bytes: number;
   reused_bytes: number;
 }
 
@@ -160,7 +161,14 @@ export type PullFields = PullTarget & {
   started_unix_ms: number;
   /** The run's heartbeat. */
   updated_unix_ms: number;
+  /** The content position, the resumed bytes included. */
   received_bytes: number;
+  /**
+   * What earlier, interrupted runs fetched and this run resumed; 0 until
+   * known. A blob run knows it at its first position, a bundle run only at
+   * its end.
+   */
+  resumed_bytes: number;
   /** Null until the run knows what it fetches. */
   expected_bytes: number | null;
   paid: Paid;
@@ -185,6 +193,14 @@ export type PullRecord = RunningPull | EndedPull;
 
 export type PullState = PullRecord["state"];
 
+/** A file in the records directory that did not read as a record. */
+export interface UnreadableRecord {
+  /** The file's path. */
+  path: string;
+  /** Why: the read error, or what in it does not parse. */
+  error: string;
+}
+
 export interface Pulls {
   /** The directory the records live in. */
   dir: string;
@@ -194,8 +210,8 @@ export interface Pulls {
   active: RunningPull[];
   /** Newest first. */
   recent: EndedPull[];
-  /** Files in `dir` that did not read as a record. */
-  unreadable: number;
+  /** The `*.json` files in `dir` that did not read as a record, sorted by path. */
+  unreadable: UnreadableRecord[];
   /** Why `dir` cannot be listed; the lists are then empty. */
   error: string | null;
 }

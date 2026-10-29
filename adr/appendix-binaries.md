@@ -116,15 +116,20 @@ ledger, no DHT) shows as not configured, not as an error.
 
 Each `decdn get` run writes one JSON file for itself, named
 `<start in Unix ms>-<pid>.json`. The record holds the URI, the destination,
-the state, the bytes verified, what the run paid to each node and, at the
-end, the result. The run writes the whole file again every second, through a
+the state, the bytes verified, the bytes that the run resumed from an
+earlier run, what the run paid to each node and, at the end, the result.
+The record of a bundle run also holds its entry counts when the run ends
+with a summary. A run with nothing to fetch holds them too. The run writes the whole file again every second, through a
 temporary file and a rename. Thus a reader never sees a partial record. The
 directory is the same for every `--data-dir`, so one page shows every run on
 the host. A run that cannot write its record continues the pull, and warns
 once. A run that exits before its last write leaves a `running` record. The
 dashboard shows a `running` record whose last write is more than 10 seconds
 old as a run that stopped without a summary. Each run deletes the oldest
-records when it starts, and keeps 200. A `--dry-run` writes no record.
+records when it starts, and keeps 200. A `--dry-run` writes no record. The
+dashboard lists the `*.json` files in the directory that are not records. It
+shows the path and the reason for the first five, and the number of the
+others.
 
 The dashboard's `/_status` needs the dashboard's own token in
 `x-decdn-token`. The token is in `token` under `--data-dir`, by default

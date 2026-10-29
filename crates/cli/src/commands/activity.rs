@@ -40,6 +40,9 @@ const PAID_EVERY: u32 = 5;
 /// exited without its last write.
 pub(crate) const STALE_AFTER: Duration = Duration::from_secs(10);
 
+/// The resume base of a run that has not reported one.
+const NO_BASE: u64 = u64::MAX;
+
 /// How many records the directory keeps. A run prunes the oldest when it
 /// starts.
 const KEPT_RECORDS: usize = 200;
@@ -168,6 +171,8 @@ pub(crate) struct BundleCounts {
     pub(crate) linked: u64,
     /// Entries already on disk.
     pub(crate) skipped: u64,
+    /// Distinct blobs materialized from a whole file already on disk.
+    pub(crate) reused: u64,
     /// Entries the filter or `--select` dropped.
     pub(crate) excluded: u64,
     /// Entries whose fetch failed.
@@ -176,8 +181,6 @@ pub(crate) struct BundleCounts {
     pub(crate) not_run: u64,
     /// Content bytes downloaded.
     pub(crate) downloaded: u64,
-    /// Content bytes earlier runs fetched and this one resumed.
-    pub(crate) resumed_bytes: u64,
     /// Bytes reused from files already on disk, whole or spliced.
     pub(crate) reused_bytes: u64,
 }
@@ -190,11 +193,11 @@ impl BundleCounts {
             fetched: report.fetched,
             linked: report.linked,
             skipped: report.skipped,
+            reused: report.reused,
             excluded,
             failed: report.failed,
             not_run: report.not_run,
             downloaded: report.downloaded,
-            resumed_bytes: report.resumed_bytes,
             reused_bytes: report.reused_bytes.saturating_add(report.spliced_bytes),
         }
     }
@@ -219,8 +222,12 @@ pub(crate) struct PullRecord {
     /// Where the run is.
     #[serde(flatten)]
     pub(crate) state: PullState,
-    /// Content bytes verified so far.
+    /// Content bytes verified so far, the resumed ones included.
     pub(crate) received_bytes: u64,
+    /// Content bytes earlier, interrupted runs fetched that this run resumed
+    /// rather than fetched again; `0` until known. A blob run knows it at its
+    /// first position, a bundle run only with its counts at the end.
+    pub(crate) resumed_bytes: u64,
     /// The content bytes the run plans to fetch; `None` until known.
     pub(crate) expected_bytes: Option<u64>,
     /// What the run paid so far, over every node.
@@ -243,6 +250,10 @@ pub(crate) struct ActivityRecorder {
     path: PathBuf,
     record: Mutex<PullRecord>,
     received: AtomicU64,
+    /// The run's resume base, [`NO_BASE`] until known. A blob run, or an
+    /// entry run to stdout, keeps its lowest position; a bundle run, or an
+    /// entry run to a file, sets it with its counts at the end.
+    resumed: AtomicU64,
     /// Each started blob's last reported position, by the first path it
     /// lands at. A bundle blob reports its whole position on every fetch, and
     /// a second pass after a pool replacement starts it again, so positions
@@ -310,11 +321,13 @@ impl ActivityRecorder {
                 updated_unix_ms: now,
                 state: PullState::Running,
                 received_bytes: 0,
+                resumed_bytes: 0,
                 expected_bytes: None,
                 paid: Paid::default(),
                 nodes: Vec::new(),
             }),
             received: AtomicU64::new(0),
+            resumed: AtomicU64::new(NO_BASE),
             files: Mutex::new(HashMap::new()),
             counts: Mutex::new(None),
             evidence: Arc::clone(evidence),
@@ -357,8 +370,13 @@ impl ActivityRecorder {
         }
     }
 
-    /// A blob run's position: `received` of `expected` content bytes.
+    /// A blob run's position: `received` of `expected` content bytes. The
+    /// lowest position is the resume base: a fetch to a file reports the
+    /// bytes its `.partial` already holds before it streams, a stream to
+    /// stdout reports `0`, and a pass that drops what the store held reports
+    /// from `0` again.
     pub(crate) fn progress(&self, received: u64, expected: u64) {
+        self.resumed.fetch_min(received, Ordering::Relaxed);
         self.received.store(received, Ordering::Relaxed);
         self.update(|r| r.expected_bytes = Some(expected));
     }
@@ -407,9 +425,11 @@ impl ActivityRecorder {
         });
     }
 
-    /// A bundle run's counts, which [`Self::finish`] writes with its end. An
-    /// entry run's record keeps none.
-    pub(crate) fn bundle_counts(&self, counts: BundleCounts) {
+    /// A bundle run's counts, which [`Self::finish`] writes with its end, and
+    /// the `resumed_bytes` it took from earlier runs' `.partial` files. An
+    /// entry run's record keeps the resumed bytes and no counts.
+    pub(crate) fn bundle_counts(&self, counts: BundleCounts, resumed_bytes: u64) {
+        self.resumed.store(resumed_bytes, Ordering::Relaxed);
         *self.counts.lock().unwrap_or_else(PoisonError::into_inner) = Some(counts);
     }
 
@@ -486,6 +506,10 @@ impl ActivityRecorder {
         let record = {
             let mut record = self.record.lock().unwrap_or_else(PoisonError::into_inner);
             record.received_bytes = self.received.load(Ordering::Relaxed);
+            record.resumed_bytes = match self.resumed.load(Ordering::Relaxed) {
+                NO_BASE => 0,
+                base => base,
+            };
             record.updated_unix_ms = now_ms();
             record.clone()
         };
@@ -562,28 +586,39 @@ impl FileObserver for RecordedFile {
     }
 }
 
-/// Every record in `dir`, newest first, and how many files there did not
-/// read as one. A directory that does not exist holds none.
+/// A file in the records directory that did not read as a [`PullRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Unreadable {
+    /// The file's path.
+    pub(crate) path: String,
+    /// Why it did not read: the read error, or what in it does not parse.
+    pub(crate) error: String,
+}
+
+/// Every record in `dir`, newest first, and the `*.json` files there that
+/// did not read as one, sorted by path. A directory that does not exist holds
+/// none.
 ///
 /// # Errors
 ///
 /// The directory exists but cannot be listed.
-pub(crate) fn read_records(dir: &Path) -> std::io::Result<(Vec<PullRecord>, usize)> {
+pub(crate) fn read_records(dir: &Path) -> std::io::Result<(Vec<PullRecord>, Vec<Unreadable>)> {
     let mut records = Vec::new();
-    let mut unreadable = 0;
+    let mut unreadable = Vec::new();
     for path in record_files(dir)? {
         let read = std::fs::read(&path)
             .map_err(anyhow::Error::from)
             .and_then(|bytes| Ok(serde_json::from_slice::<PullRecord>(&bytes)?));
         match read {
             Ok(record) => records.push(record),
-            Err(e) => {
-                tracing::debug!("{} is no pull record: {e:#}", path.display());
-                unreadable += 1;
-            }
+            Err(e) => unreadable.push(Unreadable {
+                path: path.display().to_string(),
+                error: format!("{e:#}"),
+            }),
         }
     }
     records.sort_by_key(|r| std::cmp::Reverse(r.started_unix_ms));
+    unreadable.sort_by(|a, b| a.path.cmp(&b.path));
     Ok((records, unreadable))
 }
 
@@ -645,5 +680,10 @@ fn millis(d: Duration) -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 mod tests;
