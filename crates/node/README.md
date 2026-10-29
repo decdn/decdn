@@ -8,7 +8,7 @@ The `decdn-node` daemon: runtime bring-up, protocol handlers, the local admin JS
 the dispatch limiter, and Prometheus metrics.
 
 ```sh
-cargo install decdn-node
+cargo binstall decdn-node    # or: cargo install decdn-node
 decdn-node run
 ```
 

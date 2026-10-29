@@ -54,7 +54,8 @@ pub async fn self_update(args: &SelfUpdateArgs) -> anyhow::Result<()> {
     match install::classify(&exe, &cargo_bins, install::probe_writable) {
         Ownership::Replaceable => {}
         Ownership::CargoBin => bail!(
-            "{} was installed by cargo; run `cargo install --locked decdn-cli` to update it",
+            "{} was installed by cargo; run `cargo binstall decdn-cli` or \
+             `cargo install --locked decdn-cli`, whichever installed it, to update it",
             exe.display()
         ),
         Ownership::NotWritable(reason) => bail!(

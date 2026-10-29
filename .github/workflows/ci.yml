@@ -1316,6 +1316,12 @@ jobs:
       - name: Every member inherits the workspace version and lints
         run: .github/scripts/check-workspace-manifests.sh
 
+      # `cargo binstall` downloads the archive a crate's binstall `pkg-url`
+      # names, and release.yml's build matrix names the archives. A drift
+      # between them releases green and binstall quietly compiles from source.
+      - name: cargo binstall metadata names the release archives
+        run: .github/scripts/check-binstall-metadata.sh
+
       # Cargo.lock is the only pin on iroh and its QUIC crates: noq-proto 1.4
       # closes client pulls mid-leg (#2585). Dependabot ignores them, but a
       # local `cargo update` does not, and only the anvil journeys would notice.

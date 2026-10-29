@@ -73,6 +73,7 @@ async fn a_cargo_install_is_refused_with_the_cargo_command() {
     let out = run(&exe, home.path(), "http://127.0.0.1:9", &[]).await;
     assert!(!out.status.success());
     let err = text(&out.stderr);
+    assert!(err.contains("cargo binstall decdn-cli"), "{err}");
     assert!(err.contains("cargo install --locked decdn-cli"), "{err}");
 }
 

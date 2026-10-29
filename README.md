@@ -114,7 +114,7 @@ mainnet deployment. Many ADRs are still marked Draft, so the specification can c
 ## 📦 Install
 
 ```bash
-cargo install --locked decdn-cli decdn-node
+cargo binstall decdn-cli decdn-node      # the release archives; cargo install --locked builds from source
 docker pull ghcr.io/decdn/decdn-node     # daemon + CLI; mirrored to docker.io/decdn/decdn-node
 docker pull ghcr.io/decdn/decdn          # CLI only; mirrored to docker.io/decdn/decdn
 docker pull ghcr.io/decdn/sponsord       # sponsorship daemon, for publishers who pay for their users' downloads
@@ -129,8 +129,8 @@ or `.zip` on Windows), and `sponsord-…` and `sponsord-onramp-…` archives for
 A `decdn` installed from an archive or by the one-liner updates itself:
 `decdn self-update` fetches the latest release, verifies its `SHA256SUMS.minisig`
 against a maintainer key the binary embeds, and replaces the binary in place. A binary
-`cargo install` placed, or one in a directory you cannot write (the container
-image, a package), is refused with the command to run instead. Once a day, after
+`cargo install` or `cargo binstall` placed, or one in a directory you cannot write (the
+container image, a package), is refused with the command to run instead. Once a day, after
 a command succeeds with the terminal as its output, `decdn` prints one line when a
 newer release exists; `[self_update] check = false` in `node.toml` or
 `DECDN_SELF_UPDATE_CHECK=0` turns that off. `decdn-node` never updates itself.

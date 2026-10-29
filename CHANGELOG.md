@@ -4511,6 +4511,17 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **Release: `cargo binstall` installs the release archives (#2764).** `decdn-cli`,
+  `decdn-node`, `sponsord` and `sponsord-onramp` carry
+  `[package.metadata.binstall]`, so `cargo binstall <crate>` downloads the
+  GitHub Release archive for the target instead of compiling. The fallback to
+  third-party cargo-quickinstall builds is off; a target with no archive
+  compiles from source. `.github/scripts/check-binstall-metadata.sh` (in the
+  `packaging` CI job and pre-commit) fails when a crate's `pkg-url`, `pkg-fmt`
+  or `bin-dir` stops naming what release.yml's `build-binaries` matrix ships.
+  `decdn self-update` now names `cargo binstall decdn-cli` next to
+  `cargo install --locked decdn-cli` when it refuses a binary in a cargo bin
+  directory.
 - **CLI: `decdn setup` checks the buyer wallet's USDC on a pull-through node
   (#2676).** A node with pull-through on buys its cache misses from peers.
   Opening the pool those pulls pay from escrows

@@ -11,6 +11,21 @@ readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 
+# Where `cargo binstall` finds this binary: the archive release.yml's
+# `build-binaries` job attaches to the GitHub Release. Builds from anywhere
+# else (cargo-quickinstall) are refused; a target with no archive compiles
+# from source. .github/scripts/check_binstall_metadata.py holds these names
+# to the release matrix.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/decdn-node-{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.'cfg(target_os = "windows")']
+pkg-url = "{ repo }/releases/download/v{ version }/decdn-node-{ version }-{ target }.zip"
+pkg-fmt = "zip"
+
 [[bin]]
 name = "decdn-node"
 path = "src/main.rs"
