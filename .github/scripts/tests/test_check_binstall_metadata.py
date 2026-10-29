@@ -522,9 +522,64 @@ def test_a_pubkey_line_sign_release_cannot_read_fails(tmp_path, line):
     assert errors_containing(errors, 'exactly `pubkey = "<key>"`')
 
 
-def test_a_second_pubkey_line_fails(tmp_path):
-    crate = CRATE.format(binstall=BINSTALL) + '\n[package.metadata.other]\npubkey = "RWQKEYTWO"\n'
+@pytest.mark.parametrize(
+    "extra",
+    [
+        '\n[package.metadata.other]\npubkey = "RWQKEYTWO"\n',
+        # Forms sign-release.sh's sed skips: only the any-assignment rule sees them.
+        '\n[package.metadata.other]\npubkey="RWQKEYTWO"\n',
+        '\n[package.metadata.other]\nsigning.pubkey = "RWQKEYTWO"\n',
+        '\n[package.metadata.other]\nsigning = { pubkey = "RWQKEYTWO" }\n',
+    ],
+    ids=["exact", "no-spaces", "dotted", "inline"],
+)
+def test_a_second_pubkey_assignment_fails(tmp_path, extra):
+    crate = CRATE.format(binstall=BINSTALL) + extra
     repo = make_repo(tmp_path)
     (repo / "crates/tool/Cargo.toml").write_text(crate)
     errors = cbm.check(repo)
-    assert errors_containing(errors, "no other line starting `pubkey =`")
+    assert errors_containing(errors, "assign `pubkey` nowhere else"), errors
+
+
+def test_a_crlf_pubkey_line_fails(tmp_path):
+    # sign-release.sh's sed does not match `pubkey = "…"\r`.
+    repo = make_repo(tmp_path)
+    path = repo / "crates/tool/Cargo.toml"
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    errors = cbm.check(repo)
+    assert errors_containing(errors, 'exactly `pubkey = "<key>"`'), errors
+
+
+def test_a_missing_algorithm_fails(tmp_path):
+    binstall = BINSTALL.replace('algorithm = "minisign"\n', "")
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert errors_containing(errors, '`algorithm` must be "minisign"')
+
+
+@pytest.mark.parametrize(
+    "signing",
+    [
+        "\n[package.metadata.binstall.overrides.x86_64-pc-windows-msvc.signing]\n"
+        'algorithm = "minisign"\nfile = "{ url }.minisig"\n',
+        'signing = { algorithm = "minisign", file = "{ url }.sig" }\n',
+        'signing.file = "{ url }.sig"\n',
+    ],
+    ids=["table", "inline", "dotted"],
+)
+def test_signing_in_an_override_is_refused(tmp_path, signing):
+    # binstall lets an override's `signing` replace the base table for that
+    # target; none of these assign `pubkey`, so only this rule sees them.
+    if signing.startswith("\n"):
+        binstall = BINSTALL + signing
+    else:
+        binstall = BINSTALL.replace('pkg-fmt = "zip"\n', 'pkg-fmt = "zip"\n' + signing)
+    errors = cbm.check(make_repo(tmp_path, binstall=binstall))
+    assert errors_containing(errors, "override 'x86_64-pc-windows-msvc' carries `signing`"), errors
+
+
+def test_a_pubkey_in_a_crate_without_binstall_metadata_fails(tmp_path):
+    other = '[package]\nname = "lib"\nversion.workspace = true\n\n[package.metadata.x]\npubkey = "RWQKEYONE"\n'
+    errors = cbm.check(make_repo(tmp_path, extra_members={"lib": other}))
+    assert errors_containing(
+        errors, "crates/lib/Cargo.toml: assigns `pubkey` but has no binstall"
+    ), errors

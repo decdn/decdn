@@ -1322,8 +1322,9 @@ jobs:
       # `cargo binstall` downloads the archive a crate's binstall `pkg-url`
       # names, and release.yml's build job names the archives. A drift between
       # them releases green and binstall quietly compiles from source, or
-      # installs a third-party build.
-      - name: cargo binstall metadata names the release archives
+      # installs a third-party build. It also holds the binstall signing key
+      # to the maintainer keys and to the form sign-release.sh reads.
+      - name: cargo binstall metadata matches the release archives and signing key
         run: .github/scripts/check-binstall-metadata.sh
 
       # Cargo.lock is the only pin on iroh and its QUIC crates: noq-proto 1.4

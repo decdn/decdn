@@ -128,10 +128,10 @@ repos:
         pass_filenames: false
 
       # Each binary crate's `cargo binstall` metadata names the archive
-      # release.yml's build matrix ships. The `packaging` CI job is
-      # authoritative.
+      # release.yml's build matrix ships, and its signing key is a maintainer
+      # key. The `packaging` CI job is authoritative.
       - id: binstall-metadata
-        name: cargo binstall metadata names the release archives
+        name: cargo binstall metadata matches the release archives and signing key
         entry: .github/scripts/check-binstall-metadata.sh
         language: system
         files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|crates/cli/minisign[^/]*\.pub|\.github/workflows/release\.yml|\.github/scripts/check[-_]binstall[-_]metadata\.(py|sh))$'

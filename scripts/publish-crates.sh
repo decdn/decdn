@@ -57,10 +57,11 @@ fi
 
 # ---- preconditions -------------------------------------------------------
 
-# python3 is in here because it reads the crate list out of `cargo metadata`
-# below, node because decdn-cli's .crate carries the dashboard page's build
-# (pnpm comes from PATH or corepack, through .github/scripts/pnpm.sh). Bare
-# coreutils (sed, head, cat) are not: they are assumed the way bash itself is.
+# python3 (3.11+) is in here because it reads the crate list out of `cargo
+# metadata` and runs check_binstall_metadata.py at the tag below, node because
+# decdn-cli's .crate carries the dashboard page's build (pnpm comes from PATH
+# or corepack, through .github/scripts/pnpm.sh). Bare coreutils (sed, head,
+# cat) are not: they are assumed the way bash itself is.
 for tool in cargo gh gpg git curl python3 node; do
   command -v "$tool" >/dev/null || die "$tool not found on PATH"
 done
@@ -214,9 +215,11 @@ esac
 # signature. A release can leave draft by other routes — `gh release edit
 # --draft=false` by hand, or an aborted sign-release.sh finished manually — so
 # check for the signature itself rather than inferring it from publication.
-# SHA256SUMS.asc and SHA256SUMS.minisig are the two sign-release.sh always
-# uploads; the second is what `decdn self-update` checks, so a release
-# without it strands every installed CLI on the previous version.
+# SHA256SUMS.asc and SHA256SUMS.minisig are the manifest signatures
+# sign-release.sh always uploads; the second is what `decdn self-update`
+# checks, so a release without it strands every installed CLI on the previous
+# version. sign-release.sh also uploads one <archive>.minisig per archive,
+# checked below.
 if ! ASSETS=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' 2>&1); then
   die "cannot list the assets of release $TAG: $ASSETS"
 fi
@@ -226,15 +229,20 @@ for sig in SHA256SUMS.asc SHA256SUMS.minisig; do
 Nothing goes to crates.io that no maintainer signature vouches for.
 Run scripts/sign-release.sh $TAG."
 done
-# Each archive's .minisig is what `cargo binstall` checks, under the key the
-# crates about to be published name. A crates.io version can never be
-# replaced, so publishing without them would leave binstall building that
-# version from source for good.
+# Each archive's .minisig is what `cargo binstall` checks. Until one is
+# attached, binstall builds that version from source. This checks presence
+# only: sign-release.sh verified each signature under the crates' `pubkey`.
+# The archives are the ones SHA256SUMS names, not whatever the release lists,
+# so an archive missing from the release is refused too.
+gh release download "$TAG" --repo "$REPO" --pattern SHA256SUMS --dir "$KEYS_HOME" ||
+  die "cannot download SHA256SUMS from release $TAG"
+mapfile -t ARCHIVES < <(awk 'NF {print $2}' "$KEYS_HOME/SHA256SUMS")
+(( ${#ARCHIVES[@]} > 0 )) || die "SHA256SUMS of release $TAG names no archive"
 unsigned=()
-while IFS= read -r a; do
-  [[ "$a" == *.tar.gz || "$a" == *.zip ]] || continue
+for a in "${ARCHIVES[@]}"; do
+  grep -qxF "$a" <<<"$ASSETS" || die "release $TAG does not carry $a, which SHA256SUMS names"
   grep -qxF "${a}.minisig" <<<"$ASSETS" || unsigned+=( "$a" )
-done <<<"$ASSETS"
+done
 (( ${#unsigned[@]} == 0 )) || die \
   "release $TAG carries no .minisig for: ${unsigned[*]}
 cargo binstall would refuse those archives. Run scripts/sign-release.sh $TAG."
@@ -258,6 +266,13 @@ cd "$WORKTREE"
 # Checking the submodules out makes the worktree match what libgit2 expects.
 git submodule update --init --recursive >/dev/null 2>&1 ||
   die "could not check out the submodules in the worktree at $TAG"
+
+# The binstall metadata about to be published, checked at the tag itself: CI
+# ran the guard on the PRs, not necessarily on the tagged commit, and a
+# crates.io version cannot be replaced. It holds each crate's archive URLs to
+# release.yml and its signing `pubkey` to the one form sign-release.sh read.
+python3 .github/scripts/check_binstall_metadata.py ||
+  die "the binstall metadata at $TAG fails .github/scripts/check_binstall_metadata.py (above)"
 
 # Belt and braces over release.yml's own check: this asserts the tree being
 # uploaded carries the tag's version, on the machine doing the uploading.

@@ -200,13 +200,21 @@ archive downloads for your target, it runs `cargo install` instead. Pass
 Before it installs the archive, binstall verifies `<archive>.minisig` under the
 minisign key in the crate's `[package.metadata.binstall.signing] pubkey`. It
 refuses an archive whose signature is missing or does not verify, and builds
-from source instead. That key is the releasing maintainer's
-`crates/cli/minisign-<maintainer>.pub`. binstall reads it from the manifest on
-crates.io, so this check trusts crates.io for the key, not `KEYS`. Compare the
-key with the ids you recorded out of band. Or verify the binary against the
-GPG-signed `SHA256SUMS`: binstall keeps only the binary, not the archive, so
-download the same archive from the release, verify it (§ Verify a binary
-archive), and compare hashes:
+from source instead; `--skip-signatures` turns the check off. That key is the
+key line (the second line) of the releasing maintainer's
+`crates/cli/minisign-<maintainer>.pub`. binstall reads it from the
+`Cargo.toml` on crates.io, so this check trusts crates.io for the key, not the
+GPG-signed tag. To check the key, compare the `pubkey` in the published crate
+with the second line of that file in the tag you verified:
+
+```bash
+tar xzOf decdn-cli-<version>.crate decdn-cli-<version>/Cargo.toml | grep '^pubkey'
+git show v<version>:crates/cli/minisign-<maintainer>.pub | sed -n 2p
+```
+
+Or verify the binary against the GPG-signed `SHA256SUMS`. binstall keeps only
+the binary, not the archive, so download the same archive from the release,
+verify it (§ Verify a binary archive), and compare hashes:
 
 ```bash
 sha256sum ~/.cargo/bin/decdn
