@@ -226,6 +226,18 @@ for sig in SHA256SUMS.asc SHA256SUMS.minisig; do
 Nothing goes to crates.io that no maintainer signature vouches for.
 Run scripts/sign-release.sh $TAG."
 done
+# Each archive's .minisig is what `cargo binstall` checks, under the key the
+# crates about to be published name. A crates.io version can never be
+# replaced, so publishing without them would leave binstall building that
+# version from source for good.
+unsigned=()
+while IFS= read -r a; do
+  [[ "$a" == *.tar.gz || "$a" == *.zip ]] || continue
+  grep -qxF "${a}.minisig" <<<"$ASSETS" || unsigned+=( "$a" )
+done <<<"$ASSETS"
+(( ${#unsigned[@]} == 0 )) || die \
+  "release $TAG carries no .minisig for: ${unsigned[*]}
+cargo binstall would refuse those archives. Run scripts/sign-release.sh $TAG."
 
 # ---- publish from the tagged tree ----------------------------------------
 

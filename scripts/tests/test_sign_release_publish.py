@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(
 
 # Answers every `gh` call the script makes after the key is chosen, and logs
 # each call's argv (one line per call) to $GH_LOG. `release download` stages a
-# minimal draft: one archive, its manifest, and the image digest and SBOM
+# minimal draft: two archives, their manifest, and the image digest and SBOM
 # files the script insists on.
 GH_SHIM = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$GH_LOG"
@@ -43,7 +43,9 @@ case "$1 $2" in
     tag="$3"; version="${tag#v}"; dir=""
     while [ $# -gt 0 ]; do [ "$1" = "--dir" ] && dir="$2"; shift; done
     printf 'bytes' > "$dir/decdn-$version-x86_64-unknown-linux-gnu.tar.gz"
-    (cd "$dir" && sha256sum decdn-$version-x86_64-unknown-linux-gnu.tar.gz > SHA256SUMS)
+    printf 'zip' > "$dir/decdn-$version-x86_64-pc-windows-msvc.zip"
+    (cd "$dir" && sha256sum decdn-$version-x86_64-unknown-linux-gnu.tar.gz \
+      decdn-$version-x86_64-pc-windows-msvc.zip > SHA256SUMS)
     zeros=$(printf '0%.0s' $(seq 64))
     echo "ghcr.io/decdn/decdn-node@sha256:$zeros" > "$dir/decdn-node-image-digest.txt"
     echo "ghcr.io/decdn/decdn@sha256:$zeros" > "$dir/decdn-image-digest.txt"
@@ -58,26 +60,42 @@ esac
 """
 
 # Models key identity with a token: a secret key file holds one token line,
-# a public key file mentions the token of the key it belongs to. `minisign -S`
-# writes `signed-with:<token>` into the file named by -x unless
-# $MINISIGN_FAIL_SIGN is set; `minisign -V` succeeds iff the public key file
-# named by -p mentions the signature's token, unless $MINISIGN_FAIL_VERIFY is
-# set. Logs argv to $MINISIGN_LOG.
+# a public key file, or a -P key string, mentions the token of the key it
+# belongs to. `minisign -S` writes `signed-with:<token>` for each -m file into
+# the file named by -x, else `<file>.minisig`, unless $MINISIGN_FAIL_SIGN is
+# set; `minisign -V` succeeds iff the public key named by -p or -P mentions the
+# signature's token, unless $MINISIGN_FAIL_VERIFY is set. Logs argv to
+# $MINISIGN_LOG.
 MINISIGN_SHIM = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$MINISIGN_LOG"
 mode="$1"; shift
-out=""; sec=""; pub=""
+out=""; sec=""; pub=""; pubkey=""; files=""
 while [ $# -gt 0 ]; do
-  case "$1" in -x) out="$2";; -s) sec="$2";; -p) pub="$2";; esac
+  case "$1" in
+    -x) out="$2"; shift ;;
+    -s) sec="$2"; shift ;;
+    -p) pub="$2"; shift ;;
+    -P) pubkey="$2"; shift ;;
+    -m) shift
+        while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do files="$files $1"; shift; done
+        continue ;;
+  esac
   shift
 done
 case "$mode" in
   -S) [ -n "${MINISIGN_FAIL_SIGN:-}" ] && { echo "shim: bad password" >&2; exit 1; }
-      echo "signed-with:$(head -n1 "$sec")" > "$out"; exit 0 ;;
+      for f in $files; do
+        echo "signed-with:$(head -n1 "$sec")" > "${out:-$f.minisig}"
+      done; exit 0 ;;
   -V) [ -n "${MINISIGN_FAIL_VERIFY:-}" ] && { echo "shim: signature mismatch" >&2; exit 1; }
-      tok=$(sed -n 's/^signed-with://p' "$out")
-      grep -q -- "$tok" "$pub" && exit 0
-      echo "shim: signature by $tok does not match $pub" >&2; exit 1 ;;
+      set -- $files
+      tok=$(sed -n 's/^signed-with://p' "${out:-$1.minisig}")
+      if [ -n "$pubkey" ]; then
+        case "$pubkey" in *"$tok"*) exit 0 ;; esac
+      else
+        grep -q -- "$tok" "$pub" && exit 0
+      fi
+      echo "shim: signature by $tok does not match ${pub:-$pubkey}" >&2; exit 1 ;;
   *) exit 9 ;;
 esac
 """
@@ -88,6 +106,17 @@ KEY_B = "keyB"
 
 def pub_for(token: str) -> str:
     return f"untrusted comment: test key {token}\nRWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+
+
+def binstall_manifest(name: str, token: str) -> str:
+    """A crate manifest whose binstall signing key is the key with `token`."""
+    return (
+        f'[package]\nname = "{name}"\n\n'
+        "[package.metadata.binstall.signing]\n"
+        'algorithm = "minisign"\n'
+        f'pubkey = "RWQ-{token}"\n'
+        'file = "{ url }.minisig"\n'
+    )
 
 
 class Release(Keyring):
@@ -165,6 +194,14 @@ def release() -> Iterator[Release]:
     ring.repo.mkdir()
     (ring.repo / "crates" / "cli").mkdir(parents=True)
     (ring.repo / "crates" / "cli" / "minisign.pub").write_text(pub_for(KEY_A))
+    (ring.repo / "crates" / "cli" / "Cargo.toml").write_text(binstall_manifest("decdn-cli", KEY_A))
+    (ring.repo / "crates" / "node").mkdir()
+    (ring.repo / "crates" / "node" / "Cargo.toml").write_text(
+        binstall_manifest("decdn-node", KEY_A)
+    )
+    # A crate with no binstall key, which the key lookup skips.
+    (ring.repo / "crates" / "lib").mkdir()
+    (ring.repo / "crates" / "lib" / "Cargo.toml").write_text('[package]\nname = "lib"\n')
     subprocess.run(["git", "init", "-q"], cwd=ring.repo, env=ring.env(), check=True)
     try:
         yield ring
@@ -184,17 +221,32 @@ def test_a_stable_release_is_minisigned_uploaded_and_published(release):
     result = release.publish("v0.0.0")
 
     assert result.returncode == 0, output(result)
+    # One minisign run, so one password prompt, signs the manifest and every
+    # archive.
     signs = release.calls(release.minisign_log, "-S")
-    assert len(signs) == 1 and "-m SHA256SUMS" in signs[0] and "-x SHA256SUMS.minisig" in signs[0]
+    assert len(signs) == 1, signs
+    assert signs[0].endswith(
+        "-m SHA256SUMS decdn-0.0.0-x86_64-unknown-linux-gnu.tar.gz "
+        "decdn-0.0.0-x86_64-pc-windows-msvc.zip"
+    ), signs
     verifies = release.calls(release.minisign_log, "-V")
-    assert len(verifies) == 1, verifies
+    assert len(verifies) == 3, verifies
     # Verified against the public key read out of the tag's tree, not the
     # secret key's own public half.
     assert "-p " in verifies[0] and "/minisign.pub" in verifies[0], verifies
+    # Each archive against the binstall key the crates name at the tag.
+    for archive, line in zip(
+        ("x86_64-unknown-linux-gnu.tar.gz", "x86_64-pc-windows-msvc.zip"), verifies[1:]
+    ):
+        assert f"-P RWQ-{KEY_A}" in line and f"{archive}.minisig" in line, verifies
     assert "signed SHA256SUMS.minisig (crates/cli/minisign.pub)" in result.stdout
+    assert "signed 2 archives for cargo binstall" in result.stdout
     uploads = release.calls(release.gh_log, "release upload")
     assert len(uploads) == 1 and "SHA256SUMS.minisig" in uploads[0], uploads
     assert "SHA256SUMS.asc" in uploads[0]
+    assert "decdn-0.0.0-x86_64-unknown-linux-gnu.tar.gz.minisig" in uploads[0], uploads
+    assert "decdn-0.0.0-x86_64-pc-windows-msvc.zip.minisig" in uploads[0], uploads
+    assert "unrecognised signature" not in result.stderr
     edits = release.calls(release.gh_log, "release edit")
     assert len(edits) == 1 and "--draft=false" in edits[0], edits
     assert "--prerelease" not in edits[0]
@@ -322,3 +374,62 @@ def test_no_committed_public_key_is_refused_before_signing(release):
     assert result.returncode != 0
     assert "crates/cli/minisign*.pub" in result.stderr, output(result)
     assert "==> Signing as" not in result.stdout
+
+
+def test_archives_the_binstall_key_cannot_verify_are_refused(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    # The crates name key B; key A signs, and passes the manifest checks.
+    for crate, name in (("cli", "decdn-cli"), ("node", "decdn-node")):
+        (release.repo / "crates" / crate / "Cargo.toml").write_text(binstall_manifest(name, KEY_B))
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0")
+
+    assert result.returncode != 0
+    assert "does not verify under the binstall signing key" in result.stderr, output(result)
+    assert "cargo binstall would refuse every archive" in result.stderr
+    assert not release.calls(release.gh_log, "release upload")
+    assert not release.calls(release.gh_log, "release edit")
+
+
+def test_crates_naming_different_binstall_keys_are_refused_before_signing(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    (release.repo / "crates" / "node" / "Cargo.toml").write_text(
+        binstall_manifest("decdn-node", KEY_B)
+    )
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0")
+
+    assert result.returncode != 0
+    assert "name 2 different binstall signing keys" in result.stderr, output(result)
+    assert not release.calls(release.minisign_log, "-S")
+    assert not release.calls(release.gh_log, "release upload")
+
+
+def test_no_binstall_key_at_the_tag_is_refused_before_signing(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    for crate in ("cli", "node"):
+        (release.repo / "crates" / crate / "Cargo.toml").write_text('[package]\nname = "x"\n')
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0")
+
+    assert result.returncode != 0
+    assert "names a [package.metadata.binstall.signing] pubkey" in result.stderr, output(result)
+    assert not release.calls(release.minisign_log, "-S")
+
+
+def test_the_binstall_key_comes_from_the_tag_tree_not_the_working_tree(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+    # Edited after the tag: crates.io serves the tag's manifest, not this.
+    (release.repo / "crates" / "cli" / "Cargo.toml").write_text(
+        binstall_manifest("decdn-cli", KEY_B)
+    )
+
+    result = release.publish("v0.0.0")
+
+    assert result.returncode == 0, output(result)
+    verifies = release.calls(release.minisign_log, "-V")
+    assert all(f"RWQ-{KEY_B}" not in line for line in verifies), verifies

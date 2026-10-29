@@ -23,6 +23,15 @@ pkg-fmt = "tgz"
 bin-dir = "{ bin }{ binary-ext }"
 disabled-strategies = ["quick-install"]
 
+# binstall verifies each archive against `<archive>.minisig`, which
+# scripts/sign-release.sh uploads beside it, under this one key: the
+# releasing maintainer's crates/cli/minisign-*.pub (RELEASING.md § The
+# minisign keys).
+[package.metadata.binstall.signing]
+algorithm = "minisign"
+pubkey = "RWQFaucNZJcUEZrWVGudb3Ku2rnV8TOdkiqzWLWB1astd/OA5QQh1ESn"
+file = "{ url }.minisig"
+
 [lints]
 workspace = true
 

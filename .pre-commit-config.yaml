@@ -134,7 +134,7 @@ repos:
         name: cargo binstall metadata names the release archives
         entry: .github/scripts/check-binstall-metadata.sh
         language: system
-        files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|\.github/workflows/release\.yml|\.github/scripts/check[-_]binstall[-_]metadata\.(py|sh))$'
+        files: '^(Cargo\.toml|crates/[^/]+/Cargo\.toml|crates/cli/minisign[^/]*\.pub|\.github/workflows/release\.yml|\.github/scripts/check[-_]binstall[-_]metadata\.(py|sh))$'
         pass_filenames: false
 
       # Cargo.lock is the only pin on iroh and its QUIC crates (#2585), and a

@@ -213,7 +213,10 @@ manifest; signs `SHA256SUMS` and each image's digest file and SBOM; verifies
 each signature against a keyring built only from `KEYS`; signs `SHA256SUMS` a
 second time with minisign and verifies that against the
 `crates/cli/minisign-*.pub` in the tag's tree, the maintainers' keys the
-released binary embeds; uploads the five `.asc` files and `SHA256SUMS.minisig`; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
+released binary embeds; in the same minisign run (one password prompt) signs
+every archive for `cargo binstall` and verifies each `<archive>.minisig` against
+the `pubkey` the crates name at the tag; uploads the five `.asc` files,
+`SHA256SUMS.minisig` and the archives' `.minisig` files; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
 signed digest on GHCR; mirrors those same digests to Docker Hub; for a stable
 release, pushes each Docker Hub overview; checks that every promoted repository
 is pullable without credentials; and flips the release out of draft.
@@ -315,6 +318,29 @@ embeds, and against those in the previous tag's tree, which are what the
 binaries in the field embed. A release that fails either stops before
 anything is uploaded.
 
+### `cargo binstall` and the crates' `pubkey`
+
+`cargo binstall` reads no manifest. It checks each archive against its own
+`<archive>.minisig`, under the one key in the crate's
+`[package.metadata.binstall.signing] pubkey`. binstall reads that key from the
+manifest crates.io serves for the version, which is the manifest at the tag.
+`decdn-cli`, `decdn-node`, `sponsord` and `sponsord-onramp` each carry the
+field. It names the key line (the second line) of the releasing maintainer's
+`crates/cli/minisign-*.pub`.
+
+The field holds one key, not a set, so it follows whoever signs:
+
+- **A release signed by another maintainer** changes `pubkey` in all four
+  manifests to that maintainer's key **before** the tag is cut.
+- **Rotating your own key** changes `pubkey` in the first release you sign
+  with the new key, before you tag it.
+
+`sign-release.sh` reads `pubkey` from the tag's tree. It refuses when the
+crates disagree, or when the archive signatures do not verify under that key,
+so a mismatch stops before anything is uploaded. On every PR,
+`.github/scripts/check-binstall-metadata.sh` checks that the four crates name
+the same key, and that the key is one of the `minisign-*.pub` files.
+
 ## Publishing to crates.io
 
 Last, once the GitHub Release is out of draft:
@@ -326,8 +352,8 @@ scripts/publish-crates.sh v0.1.2
 It verifies the tag against `KEYS` and against `origin` the way
 `sign-release.sh` does, and adds two checks of its own. It **requires the
 release to be published, not a draft**, and — because leaving draft does not by
-itself prove anything was signed — it **requires `SHA256SUMS.asc` and `SHA256SUMS.minisig` to be
-attached**. A crates.io version can never be replaced, so nothing reaches the
+itself prove anything was signed — it **requires `SHA256SUMS.asc`, `SHA256SUMS.minisig` and a `.minisig` for every
+archive to be attached**. A crates.io version can never be replaced, so nothing reaches the
 registry that no maintainer signature vouches for.
 
 `DECDN_SIGNING_KEY` works here too, and accepts the same forms as in
