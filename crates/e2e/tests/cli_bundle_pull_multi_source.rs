@@ -60,10 +60,9 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_cache::range_pull::{align_range, bao_encoded_size};
 use decdn_common::admin::AdminRpcClient;
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
+use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built, whole_blob_wire_bytes};
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::poll;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
@@ -221,9 +220,9 @@ async fn run() -> anyhow::Result<()> {
     // be large-blob delivery, which proves the large entry fanned out across
     // both lanes. Each attempt starts from an empty output dir, so it fetches
     // the manifest from holder A again.
-    let wire_small_a =
-        whole_blob_wire_bytes(small_a.len() as u64) + whole_blob_wire_bytes(manifest.len() as u64);
-    let wire_small_b = whole_blob_wire_bytes(small_b.len() as u64);
+    let wire_small_a = whole_blob_wire_bytes(small_a.len() as u64)?
+        + whole_blob_wire_bytes(manifest.len() as u64)?;
+    let wire_small_b = whole_blob_wire_bytes(small_b.len() as u64)?;
     run_pull_until_large_blob_splits(
         client_dir.path(),
         &args,
@@ -288,18 +287,6 @@ async fn run() -> anyhow::Result<()> {
     drop(holder_a);
     drop(holder_b);
     Ok(())
-}
-
-/// The exact wire bytes a whole-blob paid pull vouchers for: the bao-encoded
-/// size (content plus interleaved proof) of the 16 KiB chunk-group-aligned
-/// whole range (ADR 038) — the quantity the node meters and persists as the
-/// lane watermark.
-fn whole_blob_wire_bytes(total: u64) -> u64 {
-    // `byte_len == 0` means "to the blob end"; the whole range always aligns.
-    match align_range(0, 0, total) {
-        Ok(aligned) => bao_encoded_size(total, aligned.chunk_ranges()),
-        Err(_) => total,
-    }
 }
 
 /// Poll a node's admin `lanes()` for the lane `signer` signs vouchers on (the

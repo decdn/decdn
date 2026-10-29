@@ -53,7 +53,9 @@ use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_cache::range_pull::{align_range, bao_encoded_size};
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::cli::{CLIENT_DEBUG_LOG, decdn_command, ensure_decdn_cli_built};
+use decdn_e2e::cli::{
+    CLIENT_DEBUG_LOG, decdn_command, ensure_decdn_cli_built, whole_blob_wire_bytes,
+};
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
@@ -205,7 +207,7 @@ async fn run() -> anyhow::Result<()> {
     );
     run_bundle_pull_until_ready(client_dir.path(), &lone_args).await?;
     let paid_lone = billed_bytes(client_dir.path(), provider_addr)?.saturating_sub(before_lone);
-    let wire_lone = whole_blob_wire_bytes(LONE_BYTES);
+    let wire_lone = whole_blob_wire_bytes(LONE_BYTES)?;
     anyhow::ensure!(
         paid_lone == wire_lone,
         "a lone no-overlap file must bill exactly its whole-file wire size: got {paid_lone}, \
@@ -262,8 +264,8 @@ async fn run() -> anyhow::Result<()> {
     // (2) Dedup happened: the shared lane paid `a`'s whole file plus only `b`'s
     // COMPLEMENT (the tail past the shared, chunk-group-aligned run) — not both
     // files' whole-file wire sizes.
-    let wire_a_whole = whole_blob_wire_bytes(file_a.len() as u64);
-    let wire_b_whole = whole_blob_wire_bytes(file_b.len() as u64);
+    let wire_a_whole = whole_blob_wire_bytes(file_a.len() as u64)?;
+    let wire_b_whole = whole_blob_wire_bytes(file_b.len() as u64)?;
     let wire_b_complement = range_wire_bytes(SHARED_BYTES, TAIL_BYTES, file_b.len() as u64)?;
     let expected_paid = wire_a_whole
         .checked_add(wire_b_complement)
@@ -493,7 +495,7 @@ async fn run_self_heal() -> anyhow::Result<()> {
     let total_b = file_b.len() as u64;
     let complement_wire = range_wire_bytes(SHARED_BYTES, TAIL_BYTES, total_b)?;
     let head_wire = range_wire_bytes(0, SHARED_BYTES, total_b)?;
-    let expected_delta = whole_blob_wire_bytes(total_a)
+    let expected_delta = whole_blob_wire_bytes(total_a)?
         .checked_add(complement_wire)
         .and_then(|v| v.checked_add(head_wire))
         .context("self-heal expected-delta overflow")?;
@@ -662,7 +664,7 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
         "the fixture must scatter the complement: {} ranges",
         complement.len()
     );
-    let mut expected = whole_blob_wire_bytes(file_a.len() as u64);
+    let mut expected = whole_blob_wire_bytes(file_a.len() as u64)?;
     for (start, len) in &complement {
         expected += range_wire_bytes(*start, *len, total_b)?;
     }
@@ -854,7 +856,7 @@ async fn run_striped_complement() -> anyhow::Result<()> {
             .map(|(s, t)| (s.len() as u64, t.len() as u64)),
         total_b,
     );
-    let wire_a = whole_blob_wire_bytes(file_a.len() as u64);
+    let wire_a = whole_blob_wire_bytes(file_a.len() as u64)?;
     let mut wire_complement = 0;
     for (start, len) in &complement {
         wire_complement += range_wire_bytes(*start, *len, total_b)?;
@@ -1030,8 +1032,8 @@ async fn run_concurrent_same_lane() -> anyhow::Result<()> {
     // (2) The shared lane bills EXACTLY both whole files' wire bytes — the same
     // total a sequential pull bills, so concurrent same-lane delivery neither
     // double-pays nor under-pays.
-    let wire_a = whole_blob_wire_bytes(file_a.len() as u64);
-    let wire_b = whole_blob_wire_bytes(file_b.len() as u64);
+    let wire_a = whole_blob_wire_bytes(file_a.len() as u64)?;
+    let wire_b = whole_blob_wire_bytes(file_b.len() as u64)?;
     let expected = wire_a
         .checked_add(wire_b)
         .context("expected-paid overflow")?;
@@ -1309,9 +1311,9 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
     // watermark is the manifest's own whole-file wire cost PLUS the same money
     // property the hand-built manifest journey asserts: `a`'s whole file plus
     // only `b`'s chunk-group-aligned COMPLEMENT past the shared run.
-    let wire_manifest = whole_blob_wire_bytes(manifest_bytes.len() as u64);
-    let wire_a_whole = whole_blob_wire_bytes(file_a.len() as u64);
-    let wire_b_whole = whole_blob_wire_bytes(file_b.len() as u64);
+    let wire_manifest = whole_blob_wire_bytes(manifest_bytes.len() as u64)?;
+    let wire_a_whole = whole_blob_wire_bytes(file_a.len() as u64)?;
+    let wire_b_whole = whole_blob_wire_bytes(file_b.len() as u64)?;
     let wire_b_complement = range_wire_bytes(SHARED_BYTES, TAIL_BYTES, file_b.len() as u64)?;
     let expected_paid = wire_manifest
         .checked_add(wire_a_whole)
@@ -1738,7 +1740,7 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
     // Sanity: the first pull actually downloaded and paid for the blob, so the
     // second pull's zero-payment result below is a real dedup, not an
     // accidental no-op.
-    let wire_dup = whole_blob_wire_bytes(dup.len() as u64);
+    let wire_dup = whole_blob_wire_bytes(dup.len() as u64)?;
     anyhow::ensure!(
         paid1 == wire_dup,
         "first pull must bill exactly dup.bin's whole-file wire size: got {paid1}, expected \
@@ -1949,18 +1951,6 @@ fn deterministic_bytes(len: u64, seed: u32) -> Vec<u8> {
         *b = x.to_le_bytes().first().copied().unwrap_or(0);
     }
     v
-}
-
-/// The exact wire bytes a whole-blob paid pull vouchers for: the bao-encoded
-/// size (content plus interleaved proof) of the 16 KiB chunk-group-aligned
-/// whole range (ADR 038) — the quantity the node meters and persists as the
-/// lane watermark.
-fn whole_blob_wire_bytes(total: u64) -> u64 {
-    // `byte_len == 0` means "to the blob end"; the whole range always aligns.
-    match align_range(0, 0, total) {
-        Ok(aligned) => bao_encoded_size(total, aligned.chunk_ranges()),
-        Err(_) => total,
-    }
 }
 
 /// The exact wire bytes a driven `[offset, offset + len)` range of a

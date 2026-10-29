@@ -38,9 +38,10 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_cache::range_pull::{align_range, bao_encoded_size};
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::cli::{check_pull_record, decdn_command, ensure_decdn_cli_built};
+use decdn_e2e::cli::{
+    check_pull_record, decdn_command, ensure_decdn_cli_built, whole_blob_wire_bytes,
+};
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
@@ -72,7 +73,7 @@ async fn run() -> anyhow::Result<()> {
 
     let blob = vec![0x5au8; 1536 * 1024];
     let hash = Hash::new(&blob);
-    let wire = U256::from(whole_blob_wire_bytes(blob.len() as u64));
+    let wire = U256::from(whole_blob_wire_bytes(blob.len() as u64)?);
     let (node, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice()]).await?;
     anyhow::ensure!(
         hashes == vec![hash],
@@ -238,16 +239,6 @@ fn private_tempdir() -> anyhow::Result<tempfile::TempDir> {
     )
     .context("chmod data dir 0o700")?;
     Ok(dir)
-}
-
-/// The exact wire bytes a whole-blob paid pull vouchers for: the bao-encoded
-/// size of the 16 KiB chunk-group-aligned whole range (ADR 038), the quantity
-/// the buyer records as the lane watermark.
-fn whole_blob_wire_bytes(total: u64) -> u64 {
-    match align_range(0, 0, total) {
-        Ok(aligned) => bao_encoded_size(total, aligned.chunk_ranges()),
-        Err(_) => total,
-    }
 }
 
 /// Run `decdn get` once in `data_dir`, failing with its stderr.

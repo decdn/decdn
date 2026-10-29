@@ -39,9 +39,8 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use anyhow::Context;
 use decdn_cache::Hash;
-use decdn_cache::range_pull::{align_range, bao_encoded_size};
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
+use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built, whole_blob_wire_bytes};
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
@@ -107,9 +106,9 @@ async fn run() -> anyhow::Result<()> {
     // The exact wire bytes each whole-blob pull vouchers for: bao content plus its
     // interleaved proof over the 16 KiB chunk-group-aligned whole range (ADR 038),
     // the same quantity the node meters and persists as the lane watermark.
-    let wire_a = whole_blob_wire_bytes(blob_a.len() as u64);
-    let wire_b = whole_blob_wire_bytes(blob_b.len() as u64);
-    let wire_manifest = whole_blob_wire_bytes(manifest.len() as u64);
+    let wire_a = whole_blob_wire_bytes(blob_a.len() as u64)?;
+    let wire_b = whole_blob_wire_bytes(blob_b.len() as u64)?;
+    let wire_manifest = whole_blob_wire_bytes(manifest.len() as u64)?;
     let aggregate_wire = wire_a
         .checked_add(wire_b)
         .and_then(|w| w.checked_add(wire_manifest))
@@ -249,18 +248,6 @@ async fn run() -> anyhow::Result<()> {
     // `NodeFixture` tears the daemon down on drop; there is nothing to await.
     drop(node);
     Ok(())
-}
-
-/// The exact wire bytes a whole-blob paid pull vouchers for: the bao-encoded size
-/// (content plus interleaved proof) of the 16 KiB chunk-group-aligned whole range
-/// (ADR 038). This is the quantity the node meters and persists as the lane
-/// watermark, so the buyer's recorded watermark must equal it.
-fn whole_blob_wire_bytes(total: u64) -> u64 {
-    // `byte_len == 0` means "to the blob end"; the whole range always aligns.
-    match align_range(0, 0, total) {
-        Ok(aligned) => bao_encoded_size(total, aligned.chunk_ranges()),
-        Err(_) => total,
-    }
 }
 
 /// Run `decdn get`, retrying until the node's serve path resolves the

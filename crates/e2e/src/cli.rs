@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, U256};
 use anyhow::Context;
+use decdn_bao_range::{align_range, bao_encoded_size};
 use serde_json::Value;
 
 /// The `RUST_LOG` a journey sets on one `decdn` invocation whose stderr its
@@ -220,6 +221,16 @@ pub fn check_pull_record(
         "the one node is paid the whole run: {done}"
     );
     Ok(())
+}
+
+/// The exact wire bytes a whole-blob paid pull vouchers for: the bao-encoded
+/// size (content plus interleaved proof) of the 16 KiB chunk-group-aligned
+/// whole range (ADR 038), the quantity the node meters and the buyer records as
+/// the lane watermark.
+pub fn whole_blob_wire_bytes(total: u64) -> anyhow::Result<u64> {
+    let aligned =
+        align_range(0, 0, total).with_context(|| format!("align the whole {total}-byte blob"))?;
+    Ok(bao_encoded_size(total, aligned.chunk_ranges()))
 }
 
 /// Remove every inherited `DECDN_*` variable from `cmd`. Takes the key set as

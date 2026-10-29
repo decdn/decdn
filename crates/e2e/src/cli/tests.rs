@@ -86,3 +86,15 @@ fn strip_decdn_env_removes_the_namespace_and_nothing_else() {
         "the strip must not invent entries for non-DECDN keys"
     );
 }
+
+/// Pin the whole-blob wire figure without a chain, so a change to it fails the
+/// plain test job rather than only the gated journeys that compare it against
+/// a paid watermark. One 16 KiB chunk group carries no proof; a second adds
+/// one parent node.
+#[test]
+fn whole_blob_wire_bytes_counts_content_and_proof() {
+    assert_eq!(whole_blob_wire_bytes(0).unwrap(), 0);
+    assert_eq!(whole_blob_wire_bytes(1).unwrap(), 1);
+    assert_eq!(whole_blob_wire_bytes(16 * 1024).unwrap(), 16 * 1024);
+    assert_eq!(whole_blob_wire_bytes(32 * 1024).unwrap(), 32 * 1024 + 64);
+}
