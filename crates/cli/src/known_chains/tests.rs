@@ -50,6 +50,15 @@ fn l2_start_block_is_above_the_manifests_l1_deploy_block() {
     }
 }
 
+/// The testnet points an unfunded buyer wallet at a USDC faucet (`decdn
+/// setup`'s `buyer_usdc` row); the pointer is an https URL.
+#[test]
+fn testnet_carries_an_https_usdc_faucet() {
+    let chain = by_chain_id(421_614).expect("arbitrum-sepolia is known");
+    let faucet = chain.usdc_faucet.expect("the testnet has a USDC faucet");
+    assert!(faucet.starts_with("https://"), "{faucet}");
+}
+
 #[test]
 fn resolve_none_selector_yields_blank_template() {
     assert!(resolve(Some("none")).unwrap().is_none());

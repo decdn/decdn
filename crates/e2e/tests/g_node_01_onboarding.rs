@@ -94,6 +94,11 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 /// covers the curve's crossover.
 const TARGET_MBPS: u64 = 100;
 
+/// USDC the operator holds for the buyer-USDC pre-flight step: below the
+/// 10 USDC default working deposit, and not zero, so the asserted balance and
+/// shortfall can only come from the chain read.
+const BUYER_USDC_MICRO: u64 = 2_500_000;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn onboarding_from_bare_reaches_paid_delivery() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_journey()))
@@ -165,6 +170,62 @@ async fn run_journey() -> anyhow::Result<()> {
         .max(chain.bond_required(TARGET_MBPS).await?);
     chain.transfer_token(operator, target_bond).await?;
 
+    // ---- 2a. The buyer-USDC pre-flight row (#2676). The fixture has an
+    // origin and pins pull-through off, so a dry run against a copy of its
+    // config with the flag set explicitly shows the row any pull-through node
+    // gets. The wallet holds
+    // 2.5 USDC against the 10 USDC default working deposit: the row warns with
+    // the 7.5 USDC shortfall, and the warning does not fail the run.
+    chain
+        .mint_usdc(operator, U256::from(BUYER_USDC_MICRO))
+        .await?;
+    let pull_through_config = node.data_dir().join("pull-through.toml");
+    let mut doc: toml::Table = std::fs::read_to_string(node.config_path())?
+        .parse()
+        .context("parse node config")?;
+    doc.get_mut("cache")
+        .and_then(toml::Value::as_table_mut)
+        .context("node config has no [cache] table")?
+        .insert(
+            "node_to_node_pull_through_enabled".to_owned(),
+            toml::Value::Boolean(true),
+        );
+    std::fs::write(&pull_through_config, toml::to_string(&doc)?)?;
+    let dry = Command::from(decdn_command(node.data_dir(), KEYSTORE_PASSWORD)?)
+        .arg("setup")
+        .args([
+            "--mbps",
+            &TARGET_MBPS.to_string(),
+            "--region",
+            "US",
+            "--dry-run",
+        ])
+        .arg("--config")
+        .arg(&pull_through_config)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("spawn decdn setup --dry-run")?;
+    let dry_stdout = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry.status.success(),
+        "an underfunded buyer wallet must warn, not fail.\nstdout: {dry_stdout}\nstderr: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let row = dry_stdout
+        .lines()
+        .find(|l| l.trim_start().starts_with("buyer_usdc:"))
+        .with_context(|| format!("a pull-through node must get a buyer_usdc row: {dry_stdout}"))?;
+    for want in [
+        "WARN",
+        "working deposit 10.000000 USDC",
+        "hold 2.500000",
+        "short 7.500000",
+        &format!("{operator:#x}"),
+    ] {
+        assert!(row.contains(want), "buyer_usdc row lacks `{want}`: {row}");
+    }
+
     let out = run_setup_json(&node).await?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -191,6 +252,11 @@ async fn run_journey() -> anyhow::Result<()> {
             "pre-flight gate `{gate}` must pass: {summary}"
         );
     }
+    assert_eq!(
+        summary["preflight"].get("buyer_usdc"),
+        Some(&serde_json::Value::Null),
+        "the fixture's pull-through is off, so buyer_usdc is present and null: {summary}"
+    );
     for tx in ["approve_tx", "bond_tx", "declare_tx"] {
         assert!(
             summary["bond"].get(tx).is_some_and(|v| !v.is_null()),
