@@ -1,5 +1,8 @@
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, UdpSocket};
+#[cfg(target_os = "linux")]
+use std::net::{SocketAddr, TcpListener};
 
+#[cfg(target_os = "linux")]
 use socket2::{Domain, Protocol, Socket, Type};
 
 use super::*;
@@ -13,10 +16,12 @@ use super::*;
 /// `connect()` even ones, so a reservation, itself a `bind(…:0)`, never meets
 /// the `connect()` search on an unexhausted range, and a test of it could not
 /// fail.
+#[cfg(target_os = "linux")]
 const EPHEMERAL_PICKS: usize = 5000;
 
 /// The bind `decdn-node`'s `net::bind_reuseaddr` makes for its admin and
 /// metrics listeners: `SO_REUSEADDR`, an explicit address, then `listen`.
+#[cfg(target_os = "linux")]
 fn node_style_listen(addr: SocketAddr) -> std::io::Result<Socket> {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
