@@ -14,14 +14,15 @@ name: Release
 # no tag points at unsigned bytes, and the digest is not advertised anywhere a
 # user would look.) There is no signing key in Actions secrets.
 #
-# The token is scoped per job. Every job that compiles or installs a tool holds
-# `contents: read` only. The jobs that write to the draft release (`draft`,
-# `upload-assets`, `attach`) use no action but GitHub's own `actions/*`.
-# `docker` alone holds `packages: write`, because it pushes the images: it runs
-# the `docker/*` actions under that token, and it holds no `contents: write`.
-# No checkout persists its token, and every action is pinned by commit SHA.
-# .github/scripts/check_release_hardening.py holds the pins, the checkouts and
-# which job may write; it does not read `run:` steps.
+# The token is scoped per job. Every job that compiles code or installs a Rust
+# tool holds `contents: read` only. The jobs that write to the draft release
+# (`draft`, `upload-assets`, `attach`) use no action but GitHub's own
+# `actions/*`. `docker` alone holds `packages: write`, because it pushes the
+# images: it runs the `docker/*` actions and the QEMU and BuildKit images under
+# that token, and it holds no `contents: write`. No checkout persists its
+# token, every action is pinned by commit SHA, and every image an action runs
+# is pinned by digest. .github/scripts/check_release_hardening.py holds the
+# pins, the checkouts and which job may write; it does not read `run:` steps.
 on:
   push:
     tags:
@@ -199,6 +200,7 @@ jobs:
             exit 1
           fi
           if [ "$(wc -c < "$notes")" -gt 125000 ]; then
+            echo "::warning::release notes for $TAG exceed 125000 characters; truncating them"
             head -c 120000 "$notes" > "$notes.trunc"
             printf '\n\n_Changelog truncated. See the full commit history for details._\n' \
               >> "$notes.trunc"
@@ -702,8 +704,15 @@ jobs:
           sha256sum -- "${archives[@]#./}" > SHA256SUMS
           cat SHA256SUMS
 
+      # A re-run of this job after the release is published must not replace
+      # assets a maintainer has signed.
       - name: Upload to draft release
-        run: gh release upload "$TAG" --clobber artifacts/*
+        shell: bash
+        run: |
+          is_draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+          [ "$is_draft" = "true" ] || {
+            echo "::error::release $TAG is not a draft; refusing to replace its assets"; exit 1; }
+          gh release upload "$TAG" --clobber artifacts/*
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -765,11 +774,25 @@ jobs:
       # The arm64 platform runs the Dockerfile's apt-get layer under
       # emulation. The binaries arrive prebuilt, so that is seconds of package
       # installs, not a compile.
+      #
+      # Both actions run an image, and a SHA-pinned action still pulls a
+      # floating one by default: `tonistiigi/binfmt:latest`, run --privileged,
+      # and `moby/buildkit:buildx-stable-1`, which performs the push with this
+      # job's `packages: write` credential. Each is pinned by index digest. The
+      # binfmt image is pulled, not restored from the Actions cache, so no
+      # cache entry stands in for the pinned bytes. Dependabot does not read
+      # action inputs, so these move by hand: the tag and its digest together
+      # (`docker buildx imagetools inspect <image>:<tag>`).
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          cache-image: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       # Each Linux artifact carries all four archives; the unpack step below names
       # the ones this image needs and ignores the rest.
@@ -978,4 +1001,9 @@ jobs:
               files+=( "$f" )
             done
           done
+          # A re-run after the release is published must not replace files a
+          # maintainer has signed.
+          is_draft=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+          [ "$is_draft" = "true" ] || {
+            echo "::error::release $TAG is not a draft; refusing to replace its assets"; exit 1; }
           gh release upload "$TAG" --clobber "${files[@]}"

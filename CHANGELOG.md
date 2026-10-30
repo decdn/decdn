@@ -5494,12 +5494,16 @@ since project inception and will roll into the first tagged release.
   and the image SBOMs from a new `sbom` job that can only read packages. No
   checkout in `release.yml` or `security.yml` persists its token. Every action
   in both, and in the `dashboard-build` composite action, is pinned by commit
-  SHA. `cross`, `git-cliff` and `cargo-nextest` install at fixed versions that
-  install-action checksums, with no unchecked fallback.
-  `.github/scripts/check-release-hardening.sh` holds the pins, the checkouts
-  and which job may write, in the `packaging` CI job and in pre-commit; it
-  does not read `run:` steps. `check-image-name.sh` also holds the `sbom` and
-  `attach` image lists to the docker matrix. `sign-release.sh` refuses an archive
+  SHA, and the QEMU and BuildKit images the `docker` job runs under its
+  `packages: write` token are pinned by digest. `cross`, `git-cliff` and
+  `cargo-nextest` install at fixed versions that install-action checksums, with
+  no unchecked fallback. `upload-assets` and `attach` refuse to replace the
+  assets of a release that is no longer a draft.
+  `.github/scripts/check-release-hardening.sh` holds the action pins, the
+  checkouts, which job may write, and the digest of every image an action runs,
+  in the `packaging` CI job and in pre-commit; it does not read `run:` steps.
+  `check-image-name.sh` also holds the `sbom` and `attach` image lists to the
+  docker matrix. `sign-release.sh` refuses an archive
   signature whose signed trusted comment, as `minisign -Q` reports it, does
   not name the archive. SECURITY.md says
   that binstall does not check that name, so the GPG-signed `SHA256SUMS` and

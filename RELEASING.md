@@ -168,11 +168,14 @@ Each job holds the narrowest token it needs. The jobs that compile or install
 tools can only read. The three jobs that write to the draft (`draft`,
 `upload-assets`, `attach`) use no action but GitHub's own `actions/*`. The
 image push (`docker`) is the one job that can write packages, and it runs the
-`docker/*` actions under that token; it cannot write release contents. No
-checkout keeps its token, every action is pinned by commit SHA, and each tool
-installs at a fixed version with a checked download. The `packaging` CI job
-holds the pins, the checkouts and which job may write with
-`.github/scripts/check-release-hardening.sh`. The workflow:
+`docker/*` actions and the QEMU and BuildKit images under that token; it
+cannot write release contents. No checkout keeps its token, every action is
+pinned by commit SHA, and every image an action runs is pinned by digest.
+`cross`, `git-cliff` and `cargo-nextest` install at fixed versions with a
+checked download. The one floating download is cargo-semver-checks, which its
+action fetches at the newest release on every run, under `verify`'s read-only
+token. The `packaging` CI job holds the pins, the checkouts and which job may
+write with `.github/scripts/check-release-hardening.sh`. The workflow:
 
 1. rejects the tag unless it is strict semver (the trigger glob is looser than
    it looks — `v0$(whoami)` matches it);

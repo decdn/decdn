@@ -579,3 +579,70 @@ def test_list_item_under_jobs_is_not_a_job(tmp_path: Path) -> None:
     security = swap(SECURITY, "  scan:\n", "  - scan:\n")
     errors = errors_for(tmp_path, security=security)
     assert any("`- scan:` is not a job key" in e for e in errors), errors
+
+
+# ---- rule 5: images ----------------------------------------------------------
+
+DIGEST = "sha256:" + "a" * 64
+
+
+def with_docker_step(step: str) -> str:
+    """RELEASE with one more step in the docker job, after its build step."""
+    return swap(
+        RELEASE,
+        f"      - uses: docker/build-push-action@{OTHER_SHA} # v7.4.0\n",
+        f"      - uses: docker/build-push-action@{OTHER_SHA} # v7.4.0\n{step}",
+    )
+
+
+QEMU = f"      - uses: docker/setup-qemu-action@{OTHER_SHA} # v4.4.0\n"
+BUILDX = f"      - uses: docker/setup-buildx-action@{OTHER_SHA} # v4.4.1\n"
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        QEMU,
+        QEMU + "        with:\n          cache-image: false\n",
+        QEMU + "        with:\n          image: tonistiigi/binfmt:qemu-v10.2.3\n",
+        BUILDX,
+        BUILDX + "        with:\n          driver-opts: image=moby/buildkit:v0.33.1\n",
+        BUILDX + "        with:\n          driver-opts: network=host\n",
+    ],
+)
+def test_image_action_without_a_digest_fails(tmp_path: Path, step: str) -> None:
+    errors = errors_for(tmp_path, release=with_docker_step(step))
+    assert len(errors) == 1, errors
+    assert "is not pinned by @sha256: digest" in errors[0], errors
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        QEMU + f"        with:\n          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@{DIGEST}\n",
+        QEMU + f"        with:\n          image: 'tonistiigi/binfmt@{DIGEST}'\n",
+        BUILDX + f"        with:\n          driver-opts: image=moby/buildkit:v0.33.1@{DIGEST}\n",
+        BUILDX
+        + "        with:\n          driver-opts: |\n            network=host\n"
+        + f"            image=moby/buildkit@{DIGEST}\n",
+    ],
+)
+def test_image_action_pinned_by_digest_passes(tmp_path: Path, step: str) -> None:
+    assert errors_for(tmp_path, release=with_docker_step(step)) == []
+
+
+def test_digest_in_another_input_does_not_count(tmp_path: Path) -> None:
+    step = BUILDX + f"        with:\n          endpoint: image=moby/buildkit@{DIGEST}\n"
+    errors = errors_for(tmp_path, release=with_docker_step(step))
+    assert len(errors) == 1 and "`driver-opts` input" in errors[0], errors
+
+
+@pytest.mark.parametrize("key", ["container", "services"])
+def test_job_container_or_services_fails(tmp_path: Path, key: str) -> None:
+    value = "redis:7" if key == "container" else "\n      db:\n        image: redis:7"
+    security = swap(SECURITY, "  scan:\n", f"  scan:\n    {key}: {value}\n")
+    errors = errors_for(tmp_path, security=security)
+    assert errors == [
+        f".github/workflows/security.yml:6: job `scan` sets `{key}:`, whose images this "
+        "check does not read; run the image from a digest-pinned step instead"
+    ]

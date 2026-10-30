@@ -6,7 +6,7 @@
 job's `GITHUB_TOKEN`, so an action fetched from a moved tag, or a token left
 in `.git/config` for a later step to read, hands that token to code nobody
 reviewed. With `packages: write` that code can push an image tag; with
-`contents: write` it can replace release assets. Four rules keep the token
+`contents: write` it can replace release assets. Five rules keep the token
 narrow and the code fixed:
 
 1. Every remote `uses:` names a full 40-hex commit SHA. A tag or branch can be
@@ -21,18 +21,26 @@ narrow and the code fixed:
    holds `contents: write` uses no action but GitHub's own `actions/*`. The
    table is exact in both directions, so a grant that is dropped from the
    workflow leaves a stale row that fails here until the table moves too.
+5. An action that runs an image names it by `@sha256:` digest through the
+   input in IMAGE_INPUTS, since a SHA-pinned action still pulls a floating
+   image by default. A job `container:` or `services:` key is an error:
+   this check does not read those images.
 
 Out of scope: `run:` steps, which this check does not read, and where a SHA
 comes from. Rule 1 proves a ref cannot move, not that the commit belongs to
 the named repository or matches its `# vX.Y.Z` comment.
 
 Text, not YAML: the files are read with the standard library only, line by
-line with comments stripped, so a commented-out step is not a site. Where the
-text takes a shape this reader does not parse — a `permissions:` value it
-cannot read, a line under `jobs:` that is not a job, a `uses` key it cannot
-read, a step with no dash — it is an error, never a skip. A workflow with no
-`uses:` at all is an error too, so a pattern that matches nothing cannot
-report a pass.
+line with comments stripped, so a commented-out step is not a site. The shapes
+a workflow here is written in are read, and the near misses this reader knows
+of — a `permissions:` value it cannot read, a line under `jobs:` that is not a
+job, a `uses` key it cannot read, a step with no dash — are errors, not skips.
+A workflow with no `uses:` at all is an error too, so a pattern that matches
+nothing cannot report a pass. The check catches drift, not a hostile author:
+YAML that hides a key from a text reader (an escaped or explicit `?` key, an
+alias pulled in from another job) can pass it, and whoever can write that can
+as easily delete the step that runs this check. Review of `.github/` is the
+boundary against that.
 
 Run: .github/scripts/check-release-hardening.sh
 """
@@ -72,6 +80,15 @@ USES = re.compile(r"""^\s*(?:-\s+)?(['"]?)uses\1\s*:\s*['"]?([^\s'"]+)""")
 USES_LIKE = re.compile(r"""\buses['"]?\s*:""")
 SHA_PINNED = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[^@\s]+)?@[0-9a-f]{40}$")
 DIGEST_PINNED = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
+# Each action that runs an image, mapped to the `with:` input that names it
+# and the pattern that input must match.
+IMAGE_INPUTS: dict[str, tuple[str, re.Pattern[str]]] = {
+    "docker/setup-qemu-action": ("image", re.compile(r"^\S+@sha256:[0-9a-f]{64}$")),
+    "docker/setup-buildx-action": (
+        "driver-opts",
+        re.compile(r"(?:^|[\s,])image=\S+@sha256:[0-9a-f]{64}(?:$|[\s,])"),
+    ),
+}
 # A mapping key at the start of a line's content, bare or quoted.
 KEY = re.compile(r"""^(['"]?)([A-Za-z_][A-Za-z0-9_-]*)\1\s*:(.*)$""")
 GRANT = re.compile(r"""^(['"]?)([a-z-]+)\1\s*:\s*['"]?([a-z-]+)['"]?\s*$""")
@@ -133,11 +150,15 @@ def step_block(lines: list[str], i: int) -> tuple[int, list[str]] | None:
     return key, lines[start:end]
 
 
-def persists_false(key: int, block: list[str]) -> bool:
-    """Whether the step's `with:` mapping sets `persist-credentials: false`."""
+def with_input(key: int, block: list[str], name: str) -> str | None:
+    """The value of input `name` under the step's `with:` mapping, unquoted.
+
+    A `|` or `>` block scalar is read as its lines joined by newlines. None
+    when the step sets no such input.
+    """
     in_with = False
     child: int | None = None
-    for line in block:
+    for n, line in enumerate(block):
         if not line.strip():
             continue
         found = key_of(line)
@@ -149,9 +170,18 @@ def persists_false(key: int, block: list[str]) -> bool:
             continue
         if child is None:
             child = found[0]
-        if found[0] == child and found[1] == "persist-credentials":
-            return found[2].strip().strip("'\"") == "false"
-    return False
+        if found[0] != child or found[1] != name:
+            continue
+        value = found[2].strip()
+        if value[:1] not in ("|", ">"):
+            return value.strip("'\"")
+        rest = []
+        for follow in block[n + 1 :]:
+            if follow.strip() and indent_of(follow) <= child:
+                break
+            rest.append(follow.strip())
+        return "\n".join(rest).strip()
+    return None
 
 
 def uses_sites(lines: list[str]) -> tuple[list[tuple[int, str]], list[int]]:
@@ -189,14 +219,24 @@ def check_actions(lines: list[str], label: str) -> tuple[list[str], list[str], i
                 f"{where}: `{ref}` is not pinned by a 40-hex commit SHA "
                 "(write `owner/repo@<sha> # vX.Y.Z`)"
             )
-        if ref.split("@", 1)[0].lower() == "actions/checkout":
-            step = step_block(lines, i)
-            if step is None:
-                errors.append(f"{where}: cannot find the step this `uses` belongs to")
-            elif not persists_false(*step):
+        action = ref.split("@", 1)[0].lower()
+        if action != "actions/checkout" and action not in IMAGE_INPUTS:
+            continue
+        step = step_block(lines, i)
+        if step is None:
+            errors.append(f"{where}: cannot find the step this `uses` belongs to")
+        elif action == "actions/checkout":
+            if with_input(*step, "persist-credentials") != "false":
                 errors.append(
                     f"{where}: actions/checkout does not set `persist-credentials: false` "
                     "under `with:`"
+                )
+        else:
+            name, pinned = IMAGE_INPUTS[action]
+            if not pinned.search(with_input(*step, name) or ""):
+                errors.append(
+                    f"{where}: {action} runs the image its `{name}` input names, and that "
+                    "image is not pinned by @sha256: digest"
                 )
     return errors, local, len(sites)
 
@@ -274,16 +314,16 @@ def jobs_of(lines: list[str]) -> tuple[dict[str, tuple[int, int]], list[str]]:
     return jobs, errors
 
 
-def job_permissions(lines: list[str], start: int, end: int) -> tuple[int, str] | None:
-    """(line, inline value) of a job's own `permissions:` key, if it has one."""
+def job_key(lines: list[str], start: int, end: int, name: str) -> tuple[int, str] | None:
+    """(line, inline value) of the job's own `name:` key, if it has one."""
     body = [n for n in range(start + 1, end) if lines[n].strip()]
     if not body:
         return None
-    return find_key(lines, body, indent_of(lines[body[0]]), "permissions")
+    return find_key(lines, body, indent_of(lines[body[0]]), name)
 
 
 def check_permissions(lines: list[str], label: str, allowed: dict[str, set[str]]) -> list[str]:
-    """Rules 3 and 4 over one workflow."""
+    """Rules 3 and 4, and rule 5's job images, over one workflow."""
     errors: list[str] = []
     unreadable = (
         "a `permissions:` value this check cannot read; write the grants as a "
@@ -311,8 +351,15 @@ def check_permissions(lines: list[str], label: str, allowed: dict[str, set[str]]
     jobs, job_errors = jobs_of(lines)
     errors += [f"{label}: {e}" for e in job_errors]
     for job, (start, end) in jobs.items():
+        for key in ("container", "services"):
+            found = job_key(lines, start, end, key)
+            if found is not None:
+                errors.append(
+                    f"{label}:{found[0] + 1}: job `{job}` sets `{key}:`, whose images this "
+                    "check does not read; run the image from a digest-pinned step instead"
+                )
         granted: set[str] = set()
-        found = job_permissions(lines, start, end)
+        found = job_key(lines, start, end, "permissions")
         if found is not None:
             n, inline = found
             grants = block_grants(lines, n, inline, indent_of(lines[n]))
