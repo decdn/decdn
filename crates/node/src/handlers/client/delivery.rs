@@ -426,6 +426,12 @@ impl ClientHandler {
                     break;
                 };
                 let len = frame.total() as u64;
+                // Count the frame as unpaid before the write: a client that reads
+                // part of it and then stops the stream fails the write, and those
+                // bytes still left the node.
+                if let Some(res) = floor_reservation.as_ref() {
+                    res.track_unpaid(delivered.saturating_add(len).saturating_sub(*paid));
+                }
                 waits
                     .time(Wait::Send, self.write_chunk_payload_multi(send, &frame))
                     .await?;
@@ -433,9 +439,6 @@ impl ClientHandler {
                     clock.record(&self.metrics);
                 }
                 delivered = delivered.saturating_add(len);
-                if let Some(res) = floor_reservation.as_ref() {
-                    res.track_unpaid(delivered.saturating_sub(*paid));
-                }
                 self.shed.record_egress(len);
                 self.metrics.bytes_served(len);
                 unvouchered = unvouchered.saturating_add(len);

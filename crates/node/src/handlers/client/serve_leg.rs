@@ -397,6 +397,12 @@ impl ClientHandler {
                 // fault here is the node's own bug, and metering it as a client
                 // abandon would file it under the peer's behaviour.
                 let bufs = chunk_frame_bufs(&frame).map_err(|e| self.meter_frame_fault(e))?;
+                // Count the frame as unpaid before the write: a client that reads
+                // part of it and then stops the stream fails the write, and those
+                // bytes still left the node.
+                if let Some(res) = floor_reservation {
+                    res.track_unpaid(delivered.saturating_add(clen_u64).saturating_sub(*paid));
+                }
                 // A downstream drop surfaces here as a peer-attributable `Err` (#856
                 // client-disconnect shape) and meters the client abandon. A write to
                 // a stream this node already closed carries no marker: the dispatch
@@ -415,9 +421,6 @@ impl ClientHandler {
                     clock.record(&self.metrics);
                 }
                 delivered = delivered.saturating_add(clen_u64);
-                if let Some(res) = floor_reservation {
-                    res.track_unpaid(delivered.saturating_sub(*paid));
-                }
                 self.shed.record_egress(clen_u64);
                 self.metrics.bytes_served(clen_u64);
                 unvouchered = unvouchered.saturating_add(clen_u64);

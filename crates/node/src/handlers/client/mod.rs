@@ -548,9 +548,12 @@ impl FloorReservation {
         }
     }
 
-    /// Record the stream's delivered bytes not yet paid. The serve loops call this
-    /// each time `delivered − paid` changes: after a frame write and after a
-    /// voucher credits. An unrepaid drop charges the last value as floor debt.
+    /// Record the stream's sent bytes not yet paid. The serve loops call this each
+    /// time `delivered − paid` changes: before a frame write, counting the frame,
+    /// and after a voucher credits. A write that fails part-way still counts its
+    /// frame, because the client controls its receive window and can read part of
+    /// the frame before it stops the stream. An unrepaid drop charges the last
+    /// value as floor debt.
     pub(super) fn track_unpaid(&self, unpaid_bytes: u64) {
         self.unpaid_bytes.store(unpaid_bytes, Ordering::Relaxed);
     }
