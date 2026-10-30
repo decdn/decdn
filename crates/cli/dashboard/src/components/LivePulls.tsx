@@ -1,4 +1,10 @@
-import { formatBytes, formatDuration, formatUsdc, shortUri } from "../format";
+import {
+  formatBytes,
+  formatDuration,
+  formatUsdc,
+  shortPath,
+  shortUri,
+} from "../format";
 import type { LivePullRow } from "../view";
 import { Empty, Panel, Progress } from "./Panel";
 
@@ -28,7 +34,9 @@ export function LivePulls(props: { rows: LivePullRow[] }) {
                 </p>
                 <p className="text-sm text-ink-2 tabular-nums">
                   {p.kind} to{" "}
-                  <span className="font-mono break-all">{p.output}</span>
+                  <span className="font-mono break-all" title={p.output}>
+                    {shortPath(p.output)}
+                  </span>
                   {p.files ? ` · ${p.files}` : ""}
                   {p.resumed > 0
                     ? ` · ${formatBytes(p.resumed)} resumed`
