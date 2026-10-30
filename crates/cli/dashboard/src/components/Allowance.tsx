@@ -17,9 +17,9 @@ export function Allowance(props: { rows: BucketRow[] }) {
         {props.rows.map((b) => (
           <li
             key={b.label}
-            className="flex flex-wrap items-center justify-between gap-3"
+            className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
           >
-            <div>
+            <div className="min-w-0 sm:flex-1">
               <p className="text-sm font-medium">{b.label}</p>
               <p className="text-sm text-ink-2 tabular-nums">
                 {formatBytes(b.usedBytes)} delivered
@@ -29,7 +29,7 @@ export function Allowance(props: { rows: BucketRow[] }) {
               </p>
             </div>
             {b.used === null ? null : (
-              <div className="w-full sm:w-64">
+              <div className="w-full sm:w-64 sm:shrink-0">
                 <Gauge
                   used={b.used}
                   severity={b.severity}
