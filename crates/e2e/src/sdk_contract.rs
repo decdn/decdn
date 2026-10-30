@@ -25,7 +25,9 @@
 //!
 //! A [`Suite`] names one SDK's suite and how to run it; [`TypeScript`] runs
 //! [decdn/sdk-typescript](https://github.com/decdn/sdk-typescript)'s with
-//! vitest. [`run`] drives one mode end to end. A run requires `anvil` +
+//! vitest, and [`Python`] runs
+//! [decdn/sdk-python](https://github.com/decdn/sdk-python)'s with pytest.
+//! [`run`] drives one mode end to end. A run requires `anvil` +
 //! `forge` on `PATH`, built `decdn` and `decdn-node` binaries, and what the
 //! suite's own constructor checks.
 
@@ -45,10 +47,6 @@ use crate::cli::{decdn_command, ensure_decdn_cli_built};
 use crate::node::NodeFixture;
 use crate::ports::PortReservation;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "only the unit tests read a JUnit report yet")
-)]
 mod junit;
 
 /// The gateway's or the owner's pool deposit: 10 USDC.
@@ -245,6 +243,121 @@ impl Suite for TypeScript {
             .and_then(serde_json::Value::as_u64)
             .context("numPassedTests in the vitest report")?;
         Ok(Outcome { total, passed })
+    }
+}
+
+/// The Python SDK
+/// ([decdn/sdk-python](https://github.com/decdn/sdk-python)): its
+/// `tests/contract/test_*.py` files, run with pytest under `uv`. Each file
+/// runs every test once per client flavour (sync and async).
+#[derive(Debug)]
+pub struct Python {
+    dir: PathBuf,
+}
+
+impl Python {
+    /// The SDK checkout `DECDN_SDK_PYTHON_DIR` names, checked as
+    /// [`Python::from_dir`] checks it. A missing variable fails the run: a
+    /// skipped contract run would hide drift.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `DECDN_SDK_PYTHON_DIR` is unset or empty, or when
+    /// [`Python::from_dir`] fails.
+    pub fn from_env() -> anyhow::Result<Self> {
+        let sdk = std::env::var_os("DECDN_SDK_PYTHON_DIR")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .context(
+                "DECDN_SDK_PYTHON_DIR is not set: point it at a checkout of \
+                 https://github.com/decdn/sdk-python",
+            )?;
+        Self::from_dir(sdk)
+    }
+
+    /// The SDK checkout at `dir`, with its virtual environment synced from
+    /// its lockfile.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `dir` is relative, when it has no `uv.lock` or no synced
+    /// `.venv`, or when `uv` does not run.
+    pub fn from_dir(dir: PathBuf) -> anyhow::Result<Self> {
+        // nextest runs a test in its crate's directory, so a relative path would
+        // name something other than what the caller meant.
+        anyhow::ensure!(
+            dir.is_absolute(),
+            "the Python SDK checkout (DECDN_SDK_PYTHON_DIR) must be an absolute path, got {}",
+            dir.display()
+        );
+        let lock = dir.join("uv.lock");
+        anyhow::ensure!(
+            lock.is_file(),
+            "{} is missing: {} is not a checkout of decdn/sdk-python",
+            lock.display(),
+            dir.display()
+        );
+        let python = dir.join(".venv/bin/python");
+        anyhow::ensure!(
+            python.is_file(),
+            "{} is missing: run `uv sync --frozen` in {} first",
+            python.display(),
+            dir.display()
+        );
+        let uv = std::process::Command::new("uv")
+            .arg("--version")
+            .output()
+            .context("`uv` is not on PATH: the Python SDK contract run needs uv")?;
+        anyhow::ensure!(uv.status.success(), "`uv --version` failed");
+        Ok(Self { dir })
+    }
+}
+
+impl Suite for Python {
+    fn name(&self) -> &'static str {
+        "Python"
+    }
+
+    fn flavours(&self) -> usize {
+        2
+    }
+
+    /// Run the pytest file for `mode` from the synced environment, with a
+    /// JUnit report in `scratch`. Its output goes to this test's.
+    async fn run(&self, mode: Mode, fixture: &Path, scratch: &Path) -> anyhow::Result<Outcome> {
+        let file = match mode {
+            Mode::Public => "tests/contract/test_public.py",
+            Mode::Loopback => "tests/contract/test_loopback.py",
+        };
+        let report = scratch.join("report.xml");
+        let status = tokio::process::Command::new("uv")
+            .current_dir(&self.dir)
+            .args(["run", "--frozen", "--no-sync", "pytest", file])
+            // No `.pytest_cache` in the checkout.
+            .args(["-p", "no:cacheprovider", "--junit-xml"])
+            .arg(&report)
+            .args(["-o", "junit_family=xunit2"])
+            .env("DECDN_CONTRACT", fixture)
+            // Without the fixture the suite fails instead of testing its fake.
+            .env("DECDN_CONTRACT_REQUIRED", "1")
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn uv run pytest")?
+            .wait()
+            .await
+            .context("wait for uv run pytest")?;
+        // pytest exits 5 when it collects no test, so an empty file fails here.
+        anyhow::ensure!(
+            status.success(),
+            "the Python SDK contract suite failed ({}): {status}",
+            mode.label()
+        );
+        let xml = std::fs::read_to_string(&report).context("read the pytest JUnit report")?;
+        let counts = junit::counts(&xml).context("parse the pytest JUnit report")?;
+        Ok(Outcome {
+            total: counts.tests,
+            passed: counts.passed(),
+        })
     }
 }
 

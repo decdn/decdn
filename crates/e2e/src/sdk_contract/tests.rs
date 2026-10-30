@@ -21,11 +21,12 @@ fn content_fixture_names_its_keys() {
     }
 }
 
-/// pytest wraps its one suite in `<testsuites>` and writes the XML
-/// declaration on a line of its own.
+/// pytest wraps its one suite in a `<testsuites>` with its own `name`, which
+/// must not match `<testsuite `.
 #[test]
 fn junit_reads_pytests_wrapped_report() {
-    let xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<testsuites><testsuite \
+    let xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<testsuites name=\"pytest \
+               tests\"><testsuite \
                name=\"pytest\" errors=\"0\" failures=\"1\" skipped=\"2\" tests=\"7\" \
                time=\"1.23\" timestamp=\"2026-10-30T12:00:00.000000+00:00\" \
                hostname=\"ci\"><testcase classname=\"t\" name=\"a\" time=\"0.1\" \
@@ -89,4 +90,36 @@ fn junit_rejects_a_non_numeric_count() {
                tests=\"3\">";
     let msg = format!("{:#}", junit::counts(xml).unwrap_err());
     assert!(msg.contains("failures") && msg.contains("\"x\""), "{msg}");
+}
+
+/// nextest runs a test in its crate's directory, so a relative checkout path
+/// names something other than what the caller meant.
+#[test]
+fn python_from_dir_rejects_a_relative_path() {
+    let msg = format!(
+        "{:#}",
+        Python::from_dir(PathBuf::from("sdk-python")).unwrap_err()
+    );
+    assert!(
+        msg.contains("absolute") && msg.contains("sdk-python"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn python_from_dir_wants_uv_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let msg = format!("{:#}", Python::from_dir(dir.path().to_owned()).unwrap_err());
+    assert!(msg.contains("uv.lock"), "{msg}");
+}
+
+#[test]
+fn python_from_dir_wants_a_synced_venv() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("uv.lock"), "version = 1\n").unwrap();
+    let msg = format!("{:#}", Python::from_dir(dir.path().to_owned()).unwrap_err());
+    assert!(
+        msg.contains(".venv/bin/python") && msg.contains("uv sync --frozen"),
+        "{msg}"
+    );
 }
