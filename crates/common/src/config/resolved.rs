@@ -191,10 +191,10 @@ pub struct ResolvedBlockchain {
     /// remaining on-chain balance minus `M` can no longer cover the next
     /// credit window. Defaults to 1 USDC (`1_000_000` `µUSDC`).
     pub pool_min_remaining_deposit_micro_usdc: u64,
-    /// Per-signer LIVE concurrency cap `k`, in ramp-start credit windows (ADR 003
-    /// § Pool solvency, per-signer floor isolation): the most live un-vouchered floor
-    /// reservation any one capability signer may hold against a pool, `k · one credit
-    /// window`. Lower-clamped to one window at use. Defaults to `8` — see
+    /// Per-signer floor cap `k`, in ramp-start credit windows (ADR 003 § Pool
+    /// solvency, per-signer floor isolation): the most live un-vouchered floor
+    /// reservation plus floor debt any one capability signer may hold against a pool,
+    /// `k · one credit window`. Lower-clamped to one window at use. Defaults to `8` — see
     /// `decdn_common::config::DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS`.
     pub pool_floor_signer_live_windows: u64,
 }

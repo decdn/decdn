@@ -28,9 +28,9 @@
 //!
 //! A source that refuses a run for backpressure ([`RunOutcome::Backpressure`])
 //! has not shown that it cannot serve. The common cause is the source's
-//! per-signer live cap: this node pays every upstream leg from one buyer signer,
+//! per-signer floor cap: this node pays every upstream leg from one buyer signer,
 //! so its OTHER pulls on the same source (other serve-misses, each with its own
-//! assembly) can fill that cap, and the refusal clears as those pulls pay. When
+//! assembly) can fill that cap, and its live part clears as those pulls pay. When
 //! another survivor covers the still-missing gap, the loop reassigns as for any
 //! other fault. When no survivor does, dropping the source would end the assembly
 //! and fail every serve stream attached to it, so the loop keeps the source, waits
@@ -91,7 +91,7 @@ pub(crate) enum RunOutcome {
     /// funding recovery step raises the deposit ([`RunSink::recover`]).
     Unfunded,
     /// The source refused to open this run for a reason that usually clears with
-    /// time — most often a per-signer live cap, or a load shed (#2178). It says
+    /// time — most often a per-signer floor cap, or a load shed (#2178). It says
     /// nothing about whether the source can serve the range. The loop reassigns
     /// when another survivor covers the gap, and otherwise keeps the source and
     /// drives it again after a [`RunSink::backoff`].

@@ -1468,9 +1468,9 @@ async fn build_chain_and_handlers(
         frame_target_bytes: cfg.payment.frame_target_bytes,
         idle_timeout: None,
         pool_recheck_interval: None,
-        // Per-signer floor gate (ADR 003 §Pool solvency): the live concurrency cap
-        // `k` underneath the per-pool `remaining − M` ceiling, which bounds how much
-        // live un-vouchered floor one capability signer may hold at once.
+        // Per-signer floor gate (ADR 003 §Pool solvency): the cap `k` underneath the
+        // per-pool `remaining − M` ceiling, which bounds how much un-vouchered floor,
+        // live or owed, one capability signer may hold.
         pool_floor_signer_live_windows: cfg.blockchain.pool_floor_signer_live_windows,
         warming_credit,
         operator_shares: operator_shares.clone(),
