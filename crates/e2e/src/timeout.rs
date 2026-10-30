@@ -51,8 +51,9 @@
 //!   blacklist + 180s removal convergence), the `g_node_07` Ethereum leg
 //!   (five sequential CLI invocations across the unbonding window), and both
 //!   `node_pull_pool_redeploy` journeys (60s bootstrap, log, and store waits
-//!   around two 60s redemption waits), and the `gateway_sdk` contract runs
-//!   (90s warm-up and 60s token waits, then a vitest run).
+//!   around two 60s redemption waits), and the `gateway_sdk` and
+//!   `gateway_sdk_python` contract runs (90s warm-up and 60s token waits, then a
+//!   vitest or pytest run).
 //!
 //! When you add a journey, pick a tier by the rule above. Do not copy `STANDARD`
 //! because a neighbouring test uses it — confirm its poll ladder stays under

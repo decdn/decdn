@@ -19,14 +19,15 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # signal to triage, not noise to skim past. Everything outside those suites is
 # deterministic and must stay a hard failure on the first attempt.
 
-# The TypeScript SDK contract run (`gateway_sdk`, `anvil-e2e` + `sdk-e2e`) sits
-# ahead of the package row below, because the first matching override wins. It
-# is a drift guard: a retry would turn a real contract break into a FLAKY line
-# on a green job, so it gets none. Its own `OVERALL_TIMEOUT` (the 600s heavy
-# tier) bounds it and names the stage that hung; this cap (720s) sits above it
-# so that message prints first.
+# The SDK contract runs (`gateway_sdk` for TypeScript, `gateway_sdk_python` for
+# Python; both `anvil-e2e` + `sdk-e2e`) sit ahead of the package row below,
+# because the first matching override wins. They are drift guards: a retry would
+# turn a real contract break into a FLAKY line on a green job, so they get none.
+# Each has its own `OVERALL_TIMEOUT` (the 600s heavy tier) that bounds it and
+# names the stage that hung; this cap (720s) sits above it so that message
+# prints first.
 [[profile.default.overrides]]
-filter = 'package(decdn-e2e) & binary(gateway_sdk)'
+filter = 'package(decdn-e2e) & (binary(gateway_sdk) | binary(gateway_sdk_python))'
 slow-timeout = { period = "120s", terminate-after = 6 }
 retries = 0
 

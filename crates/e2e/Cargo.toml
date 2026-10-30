@@ -33,10 +33,13 @@ default = []
 # `decdn-incentive/buyer-store-core`. `redb` is not gated out here either — it
 # arrives transitively via `decdn-node`.
 anvil-e2e = ["decdn-incentive/redb"]
-# The TypeScript SDK's contract run (`tests/gateway_sdk.rs`), enabled together
-# with `anvil-e2e`: it also needs `node` and a decdn/sdk-typescript checkout
-# with its `node_modules` (`DECDN_SDK_DIR`), so it is its own gate and the
-# `anvil-e2e` journeys never build it.
+# The SDK contract runs (`tests/gateway_sdk.rs` for the TypeScript SDK,
+# `tests/gateway_sdk_python.rs` for the Python SDK), enabled together with
+# `anvil-e2e`: each also needs its SDK's toolchain and a checkout with its
+# dependencies installed (`DECDN_SDK_DIR` for decdn/sdk-typescript,
+# `DECDN_SDK_PYTHON_DIR` for decdn/sdk-python), so they have their own gate and
+# the `anvil-e2e` journeys never build them. The setup they share is
+# `src/sdk_contract.rs`, which always compiles.
 sdk-e2e = []
 
 [dependencies]
@@ -65,6 +68,8 @@ alloy = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# `sdk_contract` names its bundle entries and blob by their BLAKE3 hashes.
+blake3 = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
@@ -79,7 +84,6 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 socket2 = { workspace = true }
 
 [dev-dependencies]
-blake3 = { workspace = true }
 tracing-subscriber = { workspace = true }
 # `tests/no_inline_test_modules.rs` parses every source file under `crates/`
 # and matches them against the CodeQL `paths-ignore` globs.
@@ -93,4 +97,9 @@ workspace = true
 [[test]]
 name = "gateway_sdk"
 path = "tests/gateway_sdk.rs"
+required-features = ["anvil-e2e", "sdk-e2e"]
+
+[[test]]
+name = "gateway_sdk_python"
+path = "tests/gateway_sdk_python.rs"
 required-features = ["anvil-e2e", "sdk-e2e"]

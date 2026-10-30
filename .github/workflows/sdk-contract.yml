@@ -1,8 +1,9 @@
 name: SDK contract
 
-# The TypeScript SDK's contract suite against real gateways, on pull requests
-# only. It runs decdn/sdk-typescript's code (at the commit
-# `.github/sdk-typescript.sha` pins), so it never runs in the default branch's
+# The TypeScript and Python SDK contract suites against real gateways, on pull
+# requests only. Each job runs its SDK's code (decdn/sdk-typescript at the
+# commit `.github/sdk-typescript.sha` pins, decdn/sdk-python at the commit
+# `.github/sdk-python.sha` pins), so it never runs in the default branch's
 # context: a pull request's caches cannot reach the ones `main` restores. The
 # pin moves only in a pull request, so a push or schedule run would test
 # nothing new. Its own workflow, not a `ci.yml` job, because `ci.yml` also
@@ -12,7 +13,7 @@ on:
   pull_request:
     branches: [main]
     # What the run depends on: the gateway and fixtures (Rust), the contracts
-    # the fixtures deploy, the pin, and this file.
+    # the fixtures deploy, the pins, and this file.
     paths:
       - '**/*.rs'
       - '**/Cargo.toml'
@@ -22,6 +23,7 @@ on:
       - '.gitmodules'
       - '.config/nextest.toml'
       - '.github/sdk-typescript.sha'
+      - '.github/sdk-python.sha'
       - '.github/workflows/sdk-contract.yml'
 
 permissions:
@@ -41,11 +43,11 @@ jobs:
   # SDK's fake gateway and the binary fails here. The SDK is
   # decdn/sdk-typescript at the commit `.github/sdk-typescript.sha` pins: new
   # SDK code runs here only once a decdn PR moves the pin, and an SDK commit
-  # never turns decdn's `main` red on its own. A gateway change the SDK can
-  # observe lands its sdk-typescript PR first, then moves the pin in the same
-  # decdn PR. The test fails, never skips, without `node`, the checkout or
-  # `node_modules`, on a skipped or todo test, and when the suite did not reach
-  # this gateway.
+  # never turns decdn's `main` red on its own. The Python SDK runs in its own
+  # job below, at its own pin. A gateway change the SDK can observe lands its
+  # sdk-typescript PR first, then moves the pin in the same decdn PR. The test
+  # fails, never skips, without `node`, the checkout or `node_modules`, on a
+  # skipped or todo test, and when the suite did not reach this gateway.
   #
   # ~10m observed; 30m clears a cold build plus two runs at the 600s heavy
   # tier, `--test-threads 2`.
@@ -112,3 +114,76 @@ jobs:
         run: >
           cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e
           --test gateway_sdk --test-threads 2 --no-tests=fail
+
+  # The Python SDK's contract suite against a real `decdn gateway`, public and
+  # loopback (`crates/e2e/tests/gateway_sdk_python.rs`). The SDK is
+  # decdn/sdk-python at the commit `.github/sdk-python.sha` pins, with the same
+  # pin rules as the TypeScript job. The test fails, never skips, without `uv`,
+  # the checkout or its `.venv`, on a skipped or todo test, and when the suite
+  # did not reach this gateway.
+  #
+  # Same budget as the TypeScript job (30m for a cold build), copied from it;
+  # replace with the observed time after the first run.
+  anvil-e2e-sdk-python:
+    name: anvil e2e (sdk contract, python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
+    steps:
+      # submodules: recursive — the in-test `forge build` needs the forge-std +
+      # openzeppelin-contracts submodules under contracts/lib/.
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Install mold linker
+        uses: rui314/setup-mold@v1
+        with:
+          make-default: false
+      # foundry-toolchain directly, not ./.github/actions/foundry-setup: that
+      # action saves the shared solc cache, and the SDK's code runs here.
+      - uses: foundry-rs/foundry-toolchain@v1.9.2
+        with:
+          version: v1.7.1
+          cache: false
+      # The journeys' cache (same RUSTFLAGS and targets), restored and never
+      # saved: the SDK's code runs in this job, so it writes no cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: anvil-e2e-journeys
+          save-if: false
+      - uses: taiki-e/install-action@v2.87.31
+        with:
+          tool: cargo-nextest
+      - name: Read the pinned Python SDK commit
+        id: sdk
+        run: echo "sha=$(tr -d '[:space:]' < .github/sdk-python.sha)" >> "$GITHUB_OUTPUT"
+      - name: Check out the Python SDK
+        uses: actions/checkout@v7
+        with:
+          repository: decdn/sdk-python
+          ref: ${{ steps.sdk.outputs.sha }}
+          path: sdk-python
+          persist-credentials: false
+      # No setup-python step: `uv sync` installs the interpreter the SDK's
+      # `.python-version` names (3.11). No uv cache: the job runs third-party
+      # code, so it saves none.
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: false
+      - name: Install the SDK's dependencies
+        working-directory: sdk-python
+        run: uv sync --frozen
+      - name: Build contracts once (hoisted from the fixtures)
+        working-directory: contracts
+        run: forge build
+      - name: Build daemon + CLI for the fixtures
+        run: cargo build -p decdn-node -p decdn-cli
+      - name: Run the SDK contract suite against real gateways
+        env:
+          DECDN_SDK_PYTHON_DIR: ${{ github.workspace }}/sdk-python
+        run: >
+          cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e
+          --test gateway_sdk_python --test-threads 2 --no-tests=fail

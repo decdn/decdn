@@ -18,7 +18,7 @@ deCDN builds with a native toolchain and works with any editor. Install the prer
 
 Pre-commit covers Solidity too: `forge fmt` and `solhint` run on every commit that touches `contracts/` (solhint needs no local install — pre-commit builds its own node sandbox), `forge build` and `forge test` run on push. The `slither` and `aderyn` static-analysis hooks are manual-stage and need their own installs — see [Solidity development](#solidity-development).
 
-Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`). The [TypeScript SDK contract run](#typescript-sdk-contract-run) needs Node.js 20.19+ and pnpm. The `decdn dashboard` page (`crates/cli/dashboard/`) needs Node.js 24 and pnpm 10 (`corepack enable` provides it). Without them `cargo build` still succeeds and the `decdn` binary embeds a page that says how to build the dashboard:
+Two more tools are optional: `jq`, for the [Anvil deployment](#local-deployment-anvil) commands, and Node.js with `npm`, only if you run solhint outside pre-commit (`npm ci` in `contracts/`). The [SDK contract runs](#sdk-contract-runs) need Node.js 20.19+ and pnpm for the TypeScript SDK, and `uv` for the Python SDK. The `decdn dashboard` page (`crates/cli/dashboard/`) needs Node.js 24 and pnpm 10 (`corepack enable` provides it). Without them `cargo build` still succeeds and the `decdn` binary embeds a page that says how to build the dashboard:
 
 ```bash
 pnpm -C crates/cli/dashboard install --frozen-lockfile
@@ -128,7 +128,7 @@ CARGO_BUILD_WARNINGS=deny cargo clippy -p decdn-incentive --no-default-features 
 
 The `--all-features` run is the only one that reaches anything behind an off-by-default feature —
 the `anvil-e2e` targets (journeys, the two `decdn-node` anvil tests, and sponsord's `chain_pool`
-and `binary_anvil`), the `anvil-e2e` + `sdk-e2e` `gateway_sdk` target, `public-api-test`, the
+and `binary_anvil`), the `anvil-e2e` + `sdk-e2e` `gateway_sdk` and `gateway_sdk_python` targets, `public-api-test`, the
 sponsord `test-support` fakes. Run it before pushing
 a change that touches gated code, or the first thing that tells you is a red CI.
 
@@ -238,36 +238,62 @@ cargo insta review
 [issue #304]: https://github.com/decdn/decdn/issues/304
 [issue #1150]: https://github.com/decdn/decdn/issues/1150
 
-### TypeScript SDK contract run
+### SDK contract runs
 
-The TypeScript SDK, `@decdn/client`, lives in
-[decdn/sdk-typescript](https://github.com/decdn/sdk-typescript). Its fake
-gateway mirrors this gateway's HTTP contract
-([appendix-gateway](adr/appendix-gateway.md)), and its contract suite runs
-here against the real binary, in the `SDK contract` workflow
-(`.github/workflows/sdk-contract.yml`, pull requests only), at the commit
-`.github/sdk-typescript.sha` pins. Locally, with `anvil` and `forge` on `PATH`
-(as for the journeys):
+Two SDKs run their contract suites here against the real binary. Each SDK's
+fake gateway mirrors this gateway's HTTP contract
+([appendix-gateway](adr/appendix-gateway.md)). The runs are in the
+`SDK contract` workflow (`.github/workflows/sdk-contract.yml`, pull requests
+only), each at the commit its own pin names:
+
+- The TypeScript SDK, `@decdn/client`, is
+  [decdn/sdk-typescript](https://github.com/decdn/sdk-typescript). The pin is
+  `.github/sdk-typescript.sha`.
+- The Python SDK, the `decdn` PyPI package, is
+  [decdn/sdk-python](https://github.com/decdn/sdk-python). The pin is
+  `.github/sdk-python.sha`.
+
+Both runs need `anvil` and `forge` on `PATH` (as for the journeys) and built
+binaries:
+
+```bash
+cargo build -p decdn-cli -p decdn-node
+```
+
+TypeScript:
 
 ```bash
 git clone https://github.com/decdn/sdk-typescript ../sdk-typescript
 git -C ../sdk-typescript checkout "$(cat .github/sdk-typescript.sha)"
 pnpm -C ../sdk-typescript install --frozen-lockfile --ignore-scripts
-cargo build -p decdn-cli -p decdn-node
 DECDN_SDK_DIR="$PWD/../sdk-typescript" \
   cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e --test gateway_sdk
 ```
 
-`--ignore-scripts` matches CI: the run needs no install scripts. The target
-has its own `sdk-e2e` feature, so the `anvil-e2e` journeys never build it.
-It fails, rather than skips, without `DECDN_SDK_DIR`, `node` or the SDK's
-`node_modules`, on a skipped or todo contract test, and when the suite did
-not reach this gateway.
+`--ignore-scripts` matches CI: the run needs no install scripts.
 
-A gateway change the SDK can observe goes in this order: the sdk-typescript
-PR that updates its fake gateway and contract suite lands first, then the
-decdn PR moves `.github/sdk-typescript.sha` to it in the same change as the
-gateway. A new SDK commit runs here only when a decdn PR moves the pin.
+Python:
+
+```bash
+git clone https://github.com/decdn/sdk-python ../sdk-python
+git -C ../sdk-python checkout "$(cat .github/sdk-python.sha)"
+(cd ../sdk-python && uv sync --frozen)
+DECDN_SDK_PYTHON_DIR="$PWD/../sdk-python" \
+  cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e --test gateway_sdk_python
+```
+
+`DECDN_SDK_DIR`
+keeps its name for the TypeScript run because released SDK scripts read it.
+Each target has the `sdk-e2e` feature, so the `anvil-e2e` journeys never build
+them. A run fails, rather than skips, without `DECDN_SDK_DIR`, `node` or the
+SDK's `node_modules` (TypeScript) or without `DECDN_SDK_PYTHON_DIR`, `uv` or
+the SDK's `.venv` (Python). It also fails on a skipped or todo contract test,
+and when the suite did not reach this gateway.
+
+A gateway change an SDK can observe goes in this order: its SDK PR that
+updates the fake gateway and contract suite lands first, then the decdn PR
+moves that SDK's pin to it in the same change as the gateway. A new SDK
+commit runs here only when a decdn PR moves its pin.
 
 ## Solidity development
 

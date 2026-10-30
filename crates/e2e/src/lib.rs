@@ -13,6 +13,8 @@
 //! - [`cli::decdn_command`] — spawn the user-facing `decdn` binary under an
 //!   isolated `HOME`, so a journey never touches the developer's `~/.decdn`.
 //! - [`ports`] — loopback ports a spawned process binds without a race.
+//! - [`sdk_contract`] — run an SDK's contract suite (a [`sdk_contract::Suite`])
+//!   against a real `decdn gateway`, public or loopback.
 //! - [`time`] — advance anvil time across dispute / timelock / unbond windows.
 //! - [`mod@assert`] — on-chain + admin-RPC + delivered-bytes assertion helpers.
 //!
@@ -36,6 +38,7 @@ pub mod client;
 pub mod node;
 mod poll;
 pub mod ports;
+pub mod sdk_contract;
 pub mod time;
 pub mod timeout;
 
