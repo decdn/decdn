@@ -474,8 +474,8 @@ async fn fetch_outboard_oversize_is_unsupported() -> anyhow::Result<()> {
 }
 
 /// OOM guard: a multi-megabyte `{H}.obao4` against a tiny cap must degrade
-/// via the `metadata()` length pre-check, BEFORE `tokio::fs::read` buffers
-/// the whole file into memory.
+/// via the stat length pre-check, BEFORE any read buffers the file into
+/// memory.
 #[tokio::test]
 async fn fetch_outboard_oversize_rejected_before_read() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -505,6 +505,171 @@ async fn fetch_outboard_oversize_rejected_before_read() -> anyhow::Result<()> {
             OutboardFetch::Unsupported
         ),
         "multi-MiB outboard must degrade without buffering",
+    );
+    Ok(())
+}
+
+/// Create the shard directory that holds `path`.
+async fn create_parent(path: &Path) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent", path.display()))?;
+    tokio::fs::create_dir_all(parent).await?;
+    Ok(())
+}
+
+/// Require a `Permanent` error whose message carries `needle`.
+fn ensure_permanent(what: &str, err: Option<OriginPullError>, needle: &str) -> anyhow::Result<()> {
+    let err = err.ok_or_else(|| anyhow::anyhow!("{what}: expected an error"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        matches!(err, OriginPullError::Permanent(_)),
+        "{what}: expected Permanent, got {err:?}"
+    );
+    anyhow::ensure!(
+        msg.contains(needle),
+        "{what}: error lacked {needle:?}: {msg}"
+    );
+    Ok(())
+}
+
+/// A sibling outboard symlinked outside the base is refused before any
+/// read, the same containment `fetch` applies to the data object.
+#[cfg(unix)]
+#[tokio::test]
+async fn fetch_outboard_rejects_symlink_pointing_outside_base() -> anyhow::Result<()> {
+    let outside = tempfile::tempdir()?;
+    let secret = outside.path().join("secret");
+    tokio::fs::write(&secret, b"top secret").await?;
+
+    let inside = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(inside.path()).await?;
+    let hash = Hash::new(b"marker");
+    let link = origin.obao4_path_for(hash);
+    create_parent(&link).await?;
+    tokio::fs::symlink(&secret, &link).await?;
+
+    let err = origin.fetch_outboard(hash, 1 << 20).await.err();
+    ensure_permanent("fetch_outboard", err, "outside base")
+}
+
+/// A sibling outboard symlinked to a regular file inside the base is read
+/// through the symlink.
+#[cfg(unix)]
+#[tokio::test]
+async fn fetch_outboard_follows_symlink_inside_base() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+    let hash = seed_blob_with_outboard(&canonical, &vec![4u8; 64 * 1024]).await?;
+
+    let link = origin.obao4_path_for(hash);
+    let expected = tokio::fs::read(&link).await?;
+    let real = canonical.join("real.obao4");
+    tokio::fs::rename(&link, &real).await?;
+    tokio::fs::symlink(&real, &link).await?;
+
+    match origin.fetch_outboard(hash, 1 << 20).await? {
+        OutboardFetch::Found(bytes) => {
+            anyhow::ensure!(
+                bytes.as_ref() == expected.as_slice(),
+                "outboard bytes mismatch"
+            );
+        }
+        other => anyhow::bail!("expected Found, got {other:?}"),
+    }
+    Ok(())
+}
+
+/// A sibling outboard symlinked to `/dev/zero` reports a zero length to
+/// `stat` and never ends when read. It is refused at once, with no read.
+#[cfg(unix)]
+#[tokio::test]
+async fn fetch_outboard_rejects_symlink_to_dev_zero() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let hash = Hash::new(b"dev-zero-marker");
+    let link = origin.obao4_path_for(hash);
+    create_parent(&link).await?;
+    tokio::fs::symlink("/dev/zero", &link).await?;
+
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        origin.fetch_outboard(hash, 1 << 20),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("fetch_outboard hung on a /dev/zero symlink"))?;
+    ensure_permanent("fetch_outboard", res.err(), "outside base")
+}
+
+/// A directory in place of the sibling outboard is not a regular file.
+#[tokio::test]
+async fn fetch_outboard_rejects_a_directory_named_like_the_outboard() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let hash = Hash::new(b"directory-marker");
+    tokio::fs::create_dir_all(origin.obao4_path_for(hash)).await?;
+
+    let err = origin.fetch_outboard(hash, 1 << 20).await.err();
+    ensure_permanent("fetch_outboard", err, "not a regular file")
+}
+
+/// A special file inside the base is refused by every read before any
+/// open, so none of them can block on it. The data object and the
+/// outboard are symlinks to one Unix socket at a short path, because the
+/// sharded path exceeds the socket address limit on macOS.
+#[cfg(unix)]
+#[tokio::test]
+async fn every_read_rejects_a_special_file_inside_base() -> anyhow::Result<()> {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let socket = origin.base().join("s");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+    let hash = Hash::new(b"socket-marker");
+    let data = origin.path_for(hash);
+    create_parent(&data).await?;
+    tokio::fs::symlink(&socket, &data).await?;
+    tokio::fs::symlink(&socket, origin.obao4_path_for(hash)).await?;
+
+    let limit = Duration::from_secs(5);
+    let needle = "not a regular file";
+    let fetch = timeout(limit, origin.fetch(hash, 1 << 20)).await?;
+    ensure_permanent("fetch", fetch.err(), needle)?;
+    let req = OriginRangeRequest {
+        fetch_start: 0,
+        fetch_end: 1024,
+    };
+    let range = timeout(limit, origin.fetch_range_data(hash, req)).await?;
+    ensure_permanent("fetch_range_data", range.err(), needle)?;
+    let size = timeout(limit, origin.size(hash)).await?;
+    ensure_permanent("size", size.err(), needle)?;
+    let outboard = timeout(limit, origin.fetch_outboard(hash, 1 << 20)).await?;
+    ensure_permanent("fetch_outboard", outboard.err(), needle)
+}
+
+/// The outboard buffer is sized from the stat, so the `Bytes` the engine
+/// keeps in its outboard cache holds no spare capacity past its length.
+#[tokio::test]
+async fn fetch_outboard_buffer_has_no_spare_capacity() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+    let hash = seed_blob_with_outboard(&canonical, &vec![5u8; 64 * 1024]).await?;
+
+    let OutboardFetch::Found(bytes) = origin.fetch_outboard(hash, 1 << 20).await? else {
+        anyhow::bail!("expected Found");
+    };
+    let len = bytes.len();
+    let buf = bytes
+        .try_into_mut()
+        .map_err(|_| anyhow::anyhow!("outboard Bytes is shared"))?;
+    anyhow::ensure!(
+        buf.capacity() == len,
+        "a {len}-byte outboard holds a {}-byte buffer",
+        buf.capacity()
     );
     Ok(())
 }
