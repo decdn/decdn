@@ -1,8 +1,8 @@
-"""Regression tests for the release-hardening checker.
+"""Regression tests for the workflow-hardening checker.
 
-The checker holds `release.yml` and `security.yml` to SHA-pinned actions,
-checkouts that keep no token, and write grants only on the jobs its table
-names. Each rule is read from text, not YAML, so a bug degrades to a quiet
+The checker holds every workflow to SHA-pinned actions, digest-pinned images,
+version-pinned tools, checkouts that keep no token, and write grants only on
+the jobs its table names. Each rule is read from text, not YAML, so a bug degrades to a quiet
 false pass: the check reports a hardened workflow while a step runs a moved
 tag under a write token.
 """
@@ -16,12 +16,12 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-MODULE_PATH = REPO_ROOT / ".github/scripts/check_release_hardening.py"
+MODULE_PATH = REPO_ROOT / ".github/scripts/check_workflow_hardening.py"
 
-_spec = importlib.util.spec_from_file_location("check_release_hardening", MODULE_PATH)
+_spec = importlib.util.spec_from_file_location("check_workflow_hardening", MODULE_PATH)
 assert _spec and _spec.loader
 crh = importlib.util.module_from_spec(_spec)
-sys.modules["check_release_hardening"] = crh
+sys.modules["check_workflow_hardening"] = crh
 _spec.loader.exec_module(crh)
 
 SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -301,7 +301,7 @@ def test_write_on_a_job_outside_the_table_fails(tmp_path: Path) -> None:
     errors = errors_for(tmp_path, release=release)
     assert errors == [
         ".github/workflows/release.yml: job `build` grants write on ['packages'], but "
-        "WRITE_JOBS in check_release_hardening.py allows nothing"
+        "WRITE_JOBS in check_workflow_hardening.py allows nothing"
     ]
 
 
@@ -323,7 +323,7 @@ def test_stale_table_row_fails(tmp_path: Path) -> None:
     errors = errors_for(tmp_path, release=release)
     assert errors == [
         ".github/workflows/release.yml: job `draft` grants write on nothing, but "
-        "WRITE_JOBS in check_release_hardening.py allows ['contents']"
+        "WRITE_JOBS in check_workflow_hardening.py allows ['contents']"
     ]
 
 
@@ -365,7 +365,7 @@ def test_write_in_security_workflow_fails(tmp_path: Path) -> None:
     errors = errors_for(tmp_path, security=security)
     assert errors == [
         ".github/workflows/security.yml: job `scan` grants write on ['packages'], but "
-        "WRITE_JOBS in check_release_hardening.py allows nothing"
+        "WRITE_JOBS in check_workflow_hardening.py allows nothing"
     ]
 
 
@@ -402,7 +402,7 @@ def test_four_space_job_indent_is_read(tmp_path: Path) -> None:
     errors = errors_for(tmp_path, security=security)
     assert errors == [
         ".github/workflows/security.yml: job `scan` grants write on ['packages'], but "
-        "WRITE_JOBS in check_release_hardening.py allows nothing"
+        "WRITE_JOBS in check_workflow_hardening.py allows nothing"
     ]
 
 
@@ -480,7 +480,7 @@ def test_flow_mapping_write_on_a_job_fails(tmp_path: Path) -> None:
     errors = errors_for(tmp_path, security=security)
     assert errors == [
         ".github/workflows/security.yml: job `scan` grants write on ['packages'], but "
-        "WRITE_JOBS in check_release_hardening.py allows nothing"
+        "WRITE_JOBS in check_workflow_hardening.py allows nothing"
     ]
 
 
@@ -646,3 +646,65 @@ def test_job_container_or_services_fails(tmp_path: Path, key: str) -> None:
         f".github/workflows/security.yml:6: job `scan` sets `{key}:`, whose images this "
         "check does not read; run the image from a digest-pinned step instead"
     ]
+
+
+# ---- every workflow has a row ------------------------------------------------
+
+
+def test_workflow_without_a_row_fails(tmp_path: Path) -> None:
+    repo = build_repo(tmp_path)
+    (repo / ".github" / "workflows" / "extra.yaml").write_text(SECURITY)
+    errors, _ = crh.check(repo)
+    assert errors == [
+        ".github/workflows/extra.yaml: no WRITE_JOBS row in check_workflow_hardening.py — "
+        "add one naming the jobs that may write, `{}` if none does"
+    ]
+
+
+def test_every_real_workflow_has_a_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.undo()
+    workflows = REPO_ROOT / ".github" / "workflows"
+    on_disk = {f".github/workflows/{p.name}" for p in workflows.iterdir() if p.suffix in (".yml", ".yaml")}
+    assert on_disk == set(crh.WRITE_JOBS)
+
+
+# ---- rule 6: tools -------------------------------------------------------------
+
+INSTALL = f"      - uses: taiki-e/install-action@{OTHER_SHA} # v2.87.32\n"
+
+
+@pytest.mark.parametrize(
+    ("step", "message"),
+    [
+        (INSTALL + "        with:\n          tool: cargo-nextest\n          fallback: none\n",
+         "install-action tool cargo-nextest is not pinned"),
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9\n          fallback: none\n",
+         "install-action tool cargo-nextest@0.9 is not pinned"),
+        (INSTALL + "        with:\n          tool: cross@0.2.5,git-cliff\n          fallback: none\n",
+         "install-action tool git-cliff is not pinned"),
+        (INSTALL + "        with:\n          fallback: none\n",
+         "install-action tool (none) is not pinned"),
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n",
+         "install-action does not set `fallback: none`"),
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
+         "          fallback: cargo-binstall\n",
+         "install-action does not set `fallback: none`"),
+    ],
+)
+def test_install_action_floating_tool_fails(tmp_path: Path, step: str, message: str) -> None:
+    errors = errors_for(tmp_path, release=with_docker_step(step))
+    assert len(errors) == 1, errors
+    assert message in errors[0], errors
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        "cargo-nextest@0.9.149",
+        "cargo-llvm-cov@0.9.1,cargo-nextest@0.9.149",
+        "|\n            cross@0.2.5\n            git-cliff@2.14.2",
+    ],
+)
+def test_install_action_pinned_tools_pass(tmp_path: Path, tools: str) -> None:
+    step = INSTALL + f"        with:\n          tool: {tools}\n          fallback: none\n"
+    assert errors_for(tmp_path, release=with_docker_step(step)) == []

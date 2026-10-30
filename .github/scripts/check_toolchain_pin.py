@@ -13,12 +13,14 @@ and none derivable from another:
     deploy/sponsord/      FROM rust:X.Y.Z-…          what a source build of the
       Dockerfile                                     sponsord images compiles on
 
-Without this check nothing compares them. Dependabot's github-actions
-ecosystem bumps every action ref on its own and touches neither TOML file, so
-one merged Dependabot PR leaves CI compiling on a different compiler from
-every developer — which is exactly the drift `rust-toolchain.toml` is pinned
-to prevent. This check turns that PR red until the two TOML sites move in the
-same change.
+Without this check nothing compares them. Dependabot's docker ecosystem bumps
+the sponsord Dockerfile's `rust:` tag on its own and touches no other site, so
+one merged Dependabot PR leaves the image building on a different compiler
+from CI and every developer — which is exactly the drift `rust-toolchain.toml`
+is pinned to prevent. This check turns that PR red until the other sites move
+in the same change. The workflows pin `dtolnay/rust-toolchain` by commit SHA
+and name the version in its `toolchain:` input, which Dependabot does not
+read.
 
 All sites must carry the identical `X.Y.Z` string. A two-part `rust-version`
 ("X.Y") satisfies cargo but is not the string the other sites carry, and
