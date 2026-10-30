@@ -45,6 +45,12 @@ use crate::cli::{decdn_command, ensure_decdn_cli_built};
 use crate::node::NodeFixture;
 use crate::ports::PortReservation;
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "only the unit tests read a JUnit report yet")
+)]
+mod junit;
+
 /// The gateway's or the owner's pool deposit: 10 USDC.
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// The delegate's cap: 5 USDC, far above what the suite pulls.
