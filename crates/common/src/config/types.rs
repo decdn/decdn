@@ -325,9 +325,9 @@ pub struct BlockchainConfig {
     /// Per-signer floor cap `k`, counted in ramp-start credit windows (ADR 003
     /// § Pool solvency, per-signer floor isolation): the most live un-vouchered floor
     /// reservation plus floor debt any ONE capability signer may hold against a pool,
-    /// `k · one credit window`, underneath the pool-wide `remaining − M` ceiling. The credit window is its floor (one chunk plus one chunk group)
-    /// normally, and at `credit_ramp_divisor == 0` it is `credit_max` raised to
-    /// that floor.
+    /// `k · one credit window`, underneath the pool-wide `remaining − M` ceiling.
+    /// The credit window is its floor (one chunk plus one chunk group) normally,
+    /// and at `credit_ramp_divisor == 0` it is `credit_max` raised to that floor.
     ///
     /// This bounds unpaid credit, not paid throughput: a signer that pays its vouchers
     /// releases that stream's reservation, so its cap recycles and a stream already

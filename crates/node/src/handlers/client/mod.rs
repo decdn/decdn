@@ -307,7 +307,8 @@ impl ClientHandler {
 }
 
 /// One capability signer's slice of a pool's floor accounting (ADR 003 §Pool
-/// solvency, per-signer floor isolation). Two independent concerns live here.
+/// solvency, per-signer floor isolation). Two quantities live here; admission bounds
+/// their sum.
 ///
 /// `live_reservation` is the `µUSDC` this signer's in-flight streams currently
 /// reserve — un-vouchered floor delivered ahead of payment, released as each stream
@@ -385,8 +386,9 @@ impl Default for PoolFloorState {
 }
 
 impl PoolFloorState {
-    /// Live floor credit committed across every signer on the pool — the pool
-    /// solvency quantity, bounded by `remaining − M`.
+    /// Live floor credit committed across every signer on the pool — what the
+    /// in-flight re-checks bound by `remaining − M`. Admission bounds
+    /// [`Self::floor_held`] instead, which adds floor debt.
     const fn live_committed(&self) -> U256 {
         self.live_reservation
     }
@@ -397,23 +399,63 @@ impl PoolFloorState {
         self.live_reservation.saturating_add(self.debt)
     }
 
+    /// Charge `amount` of live reservation to `signer` and to the pool total.
+    fn charge_live(&mut self, signer: Address, amount: U256) {
+        self.live_reservation = self.live_reservation.saturating_add(amount);
+        let row = self.signers.entry(signer).or_default();
+        row.live_reservation = row.live_reservation.saturating_add(amount);
+        self.debug_assert_sums();
+    }
+
+    /// Release `amount` of `signer`'s live reservation, and the pool total by the
+    /// same amount. The two levels are one accumulator: a release that touched only
+    /// one would leave the signer's share consumed by a stream that ended.
+    fn release_live(&mut self, signer: Address, amount: U256) {
+        self.live_reservation = self.live_reservation.saturating_sub(amount);
+        if let Some(row) = self.signers.get_mut(&signer) {
+            row.live_reservation = row.live_reservation.saturating_sub(amount);
+        }
+        self.debug_assert_sums();
+    }
+
+    /// Debug builds check that the pool totals equal the sums of the signer rows
+    /// after every change. Every change touches both levels under one lock hold, so
+    /// a mismatch is a bug in the change, not a race.
+    fn debug_assert_sums(&self) {
+        if cfg!(debug_assertions) {
+            let (live, debt) =
+                self.signers
+                    .values()
+                    .fold((U256::ZERO, U256::ZERO), |(live, debt), row| {
+                        (
+                            live.saturating_add(row.live_reservation),
+                            debt.saturating_add(row.debt),
+                        )
+                    });
+            debug_assert_eq!(live, self.live_reservation, "pool live total drifted");
+            debug_assert_eq!(debt, self.debt, "pool debt total drifted");
+        }
+    }
+
     /// Charge `amount` of floor debt to `signer` and to the pool total.
     fn charge_debt(&mut self, signer: Address, amount: U256) {
         self.debt = self.debt.saturating_add(amount);
-        let lane = self.signers.entry(signer).or_default();
-        lane.debt = lane.debt.saturating_add(amount);
+        let row = self.signers.entry(signer).or_default();
+        row.debt = row.debt.saturating_add(amount);
+        self.debug_assert_sums();
     }
 
     /// Clear up to `amount` of `signer`'s floor debt, and the pool total by the
     /// same amount.
     fn clear_debt(&mut self, signer: Address, amount: U256) {
-        let Some(lane) = self.signers.get_mut(&signer) else {
+        let Some(row) = self.signers.get_mut(&signer) else {
             return;
         };
-        let cleared = lane.debt.min(amount);
-        lane.debt = lane.debt.saturating_sub(cleared);
+        let cleared = row.debt.min(amount);
+        row.debt = row.debt.saturating_sub(cleared);
         self.debt = self.debt.saturating_sub(cleared);
         self.prune_spent(signer);
+        self.debug_assert_sums();
     }
 
     /// Drop a signer's entry once it carries no information — no live reservation and
@@ -469,11 +511,13 @@ pub(super) struct FloorReservation {
     reserved: U256,
     /// The stream's price, which converts its unpaid bytes into floor debt.
     rate_per_mb: u64,
-    /// Set by [`Self::release_live_repaid`]; makes drop a no-op (live already freed).
-    /// Idempotent.
-    repaid: AtomicBool,
-    /// The stream's delivered bytes not yet paid, as the serve loop last reported
-    /// them ([`Self::track_unpaid`]). An unrepaid drop charges them as floor debt.
+    /// Set once the live reservation is released: by [`Self::release_live_repaid`]
+    /// (repaid or refused unspent) or by the drop. Only the first setter moves the
+    /// live counters.
+    live_released: AtomicBool,
+    /// The stream's sent bytes not yet paid, as the serve loop last reported them
+    /// ([`Self::track_unpaid`]). The drop charges them as floor debt, capped at the
+    /// reservation, unless [`Self::settle_end`] forgave them.
     unpaid_bytes: AtomicU64,
     /// `µUSDC` of this stream's payment past its own floor already offered to the
     /// signer's debt, so a later reconcile applies only the new surplus and takes
@@ -507,9 +551,7 @@ impl FloorReservation {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = guard.entry(pool_id).or_default();
-            entry.live_reservation = entry.live_reservation.saturating_add(reserved);
-            let lane = entry.signers.entry(signer).or_default();
-            lane.live_reservation = lane.live_reservation.saturating_add(reserved);
+            entry.charge_live(signer, reserved);
             entry.epoch
         };
         Self::new_charged(map, pool_id, signer, reserved, rate_per_mb, epoch)
@@ -537,7 +579,7 @@ impl FloorReservation {
             signer,
             reserved,
             rate_per_mb,
-            repaid: AtomicBool::new(false),
+            live_released: AtomicBool::new(false),
             unpaid_bytes: AtomicU64::new(0),
             debt_cleared: AtomicU64::new(0),
         }
@@ -575,38 +617,45 @@ impl FloorReservation {
     /// and make the eventual drop a no-op. Idempotent — only the first call moves
     /// the live counter.
     fn release_live_repaid(&self) {
-        if self.repaid.swap(true, Ordering::Relaxed) {
-            return; // already repaid; live already released
+        if self.live_released.swap(true, Ordering::Relaxed) {
+            return; // live already released
         }
-        self.release_live(U256::ZERO);
+        self.settle(true, U256::ZERO);
     }
 
-    /// Free the live reservation and charge `debt` of floor debt, both under one
-    /// lock hold, so no admission sees the floor neither live nor owed.
-    fn release_live(&self, debt: U256) {
-        let mut guard = self
-            .map
+    /// Lock the floor accumulator. A poisoned lock recovers the guard: every
+    /// critical section over it is panic-free (see
+    /// [`ClientHandler::pool_budget_covers_reserve`]).
+    fn lock_map(&self) -> std::sync::MutexGuard<'_, HashMap<B256, PoolFloorState>> {
+        self.map
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // `get_mut`, not `entry().or_default()`, on the repaid and the drop path: if the
-        // pool was reclaimed (`forget_pool_floor` removed its entry) the live
-        // reservation went with the entry, and re-inserting a default state here
-        // resurrects an entry for a closed pool that nothing removes again — the
-        // in-memory face of #1781. The epoch test covers the other half of that
-        // window: an entry present under this `pool_id` but stamped differently is
-        // a LATER generation, re-entered by an admission that ran after the remove,
-        // and subtracting from it would report a reservation this guard never
-        // charged to it.
-        if let Some(entry) = guard
-            .get_mut(&self.pool_id)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// This guard's own pool entry: `get_mut`, never `entry().or_default()`, and
+    /// only when the entry carries this guard's epoch. If the pool was reclaimed
+    /// (`forget_pool_floor` removed its entry), the live reservation and debt went
+    /// with it, and re-inserting a default state here would resurrect an entry for
+    /// a closed pool that nothing removes again — the in-memory face of #1781. An
+    /// entry present under this `pool_id` but stamped differently is a LATER
+    /// generation, re-entered by an admission that ran after the remove; this
+    /// guard neither charged nor owes anything there.
+    fn own_entry<'a>(
+        &self,
+        map: &'a mut HashMap<B256, PoolFloorState>,
+    ) -> Option<&'a mut PoolFloorState> {
+        map.get_mut(&self.pool_id)
             .filter(|entry| entry.epoch == self.epoch)
-        {
-            entry.live_reservation = entry.live_reservation.saturating_sub(self.reserved);
-            // The signer entry moves with the pool total — the two levels are one
-            // accumulator, so a release that touched only one would leave the
-            // signer's share permanently consumed by a stream that paid for it.
-            if let Some(lane) = entry.signers.get_mut(&self.signer) {
-                lane.live_reservation = lane.live_reservation.saturating_sub(self.reserved);
+    }
+
+    /// Release the live reservation (when `release_live`) and charge `debt` of
+    /// floor debt, both under one lock hold, so no admission sees the floor neither
+    /// live nor owed.
+    fn settle(&self, release_live: bool, debt: U256) {
+        let mut map = self.lock_map();
+        if let Some(entry) = self.own_entry(&mut map) {
+            if release_live {
+                entry.release_live(self.signer, self.reserved);
             }
             if !debt.is_zero() {
                 entry.charge_debt(self.signer, debt);
@@ -622,8 +671,8 @@ impl FloorReservation {
     /// single chunk. Idempotent (delegates to [`Self::release_live_repaid`]).
     ///
     /// Payment past the reserved floor then clears the signer's floor debt (ADR 003
-    /// §Pool solvency, floor debt). The stream's own floor never counts: a payer that
-    /// pays for one chunk and leaves after two still owes for the second.
+    /// §Pool solvency, floor debt). A stream that pays exactly its reserved floor
+    /// clears no earlier debt; only what it pays beyond that floor does.
     fn release_if_repaid(&self, paid_micro: U256) {
         if paid_micro >= self.reserved {
             self.release_live_repaid();
@@ -639,35 +688,48 @@ impl FloorReservation {
         // µUSDC that overflows `u64` is far above any pool; saturating keeps the
         // tally monotonic.
         let surplus = u64::try_from(surplus).unwrap_or(u64::MAX);
+        if surplus <= self.debt_cleared.load(Ordering::Relaxed) {
+            return; // no new surplus: skip the lock
+        }
+        let mut map = self.lock_map();
+        // Re-read and store under the lock, so the tally stays monotonic and each
+        // surplus is offered once even if the guard is ever shared.
         let fresh = surplus.saturating_sub(self.debt_cleared.load(Ordering::Relaxed));
         if fresh == 0 {
             return;
         }
-        let mut guard = self
-            .map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Same `get_mut` + epoch filter as `release_live_repaid`: a later pool
-        // generation owes nothing to this guard's payment.
-        if let Some(entry) = guard
-            .get_mut(&self.pool_id)
-            .filter(|entry| entry.epoch == self.epoch)
-        {
+        if let Some(entry) = self.own_entry(&mut map) {
             entry.clear_debt(self.signer, U256::from(fresh));
         }
-        drop(guard);
         self.debt_cleared.store(surplus, Ordering::Relaxed);
     }
 
-    /// The floor debt an unrepaid stream leaves: its unpaid bytes priced at its
-    /// rate, `min(reserved, min_payment(unpaid_bytes, rate))`. A refusal before the
-    /// first byte reports no unpaid bytes, so it owes nothing.
+    /// Forgive the stream's unpaid bytes unless `end` is the client's own conduct
+    /// ([`outcome::owes_floor_debt`]). Each serve wrapper calls this once, as its
+    /// loop returns and before the guard drops. Floor debt is the price of a
+    /// client that leaves or stops paying; a stream that this node, its store or its
+    /// upstream ended, or that the node stopped for a takedown or a drained pool,
+    /// charges the client nothing.
+    fn settle_end(&self, end: &anyhow::Result<outcome::ServeEnd>) {
+        if !outcome::owes_floor_debt(end) {
+            self.unpaid_bytes.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The floor debt a stream leaves when it ends with bytes unpaid: its unpaid
+    /// bytes priced at its rate, `min(reserved, min_payment(unpaid_bytes, rate))`.
+    /// This holds whether or not the stream had paid its floor: a stream that pays
+    /// its floor and then leaves still took a window it did not pay for. A refusal
+    /// before the first byte, a fully paid end, and an end [`Self::settle_end`]
+    /// forgave report no unpaid bytes, so they owe nothing.
     ///
-    /// The cap at `reserved` leaves out unpaid bytes above the floor. Those came from
-    /// the lane's ramp carry, which earlier paid streams backed and which an abandoned
-    /// stream forfeits (ADR 003 §Credit window). A pull-through stream fronts
-    /// upstream `USDC` too, but the debt is the downstream unpaid credit: the fronted
-    /// bytes stay in this node's cache.
+    /// The cap at `reserved` keeps one stream from holding more than its
+    /// reservation against the caps, live or owed: the drop releases at most
+    /// `reserved` live and charges at most `reserved` debt. Unpaid bytes above the
+    /// floor came from the lane's ramp carry, which earlier paid streams backed and
+    /// which the stream forfeits (ADR 003 §Credit window). A pull-through stream
+    /// fronts upstream `USDC` too, but the debt is the downstream unpaid credit: the
+    /// fronted bytes stay in this node's cache.
     fn abandon_debt(&self) -> U256 {
         match self.unpaid_bytes.load(Ordering::Relaxed) {
             0 => U256::ZERO,
@@ -690,15 +752,15 @@ impl Drop for FloorReservation {
     fn drop(&mut self) {
         // Release the live reservation on every exit path (success, `?`, disconnect,
         // panic) unless a paying stream already released it via
-        // [`Self::release_live_repaid`]. An abandoned stream must not hold a pool's
-        // floor headroom past its own lifetime, so an unrepaid drop frees the
-        // reservation at both the pool and signer levels. The floor credit it took
-        // and never paid for stays behind as floor debt, which admission counts
-        // against the pool ceiling and the per-signer cap (ADR 003 §Pool solvency).
-        if self.repaid.swap(true, Ordering::Relaxed) {
-            return; // already repaid; live already released
+        // [`Self::release_live_repaid`]: no stream holds a LIVE reservation past its
+        // own lifetime. The unpaid part, up to the reservation, stays behind as floor
+        // debt, which admission counts against the pool ceiling and the per-signer
+        // cap until payment clears it (ADR 003 §Pool solvency).
+        let release_live = !self.live_released.swap(true, Ordering::Relaxed);
+        let debt = self.abandon_debt();
+        if release_live || !debt.is_zero() {
+            self.settle(release_live, debt);
         }
-        self.release_live(self.abandon_debt());
     }
 }
 
@@ -719,8 +781,24 @@ pub(super) enum FloorRefusal {
     /// admitting another would let one signer take more free credit than its share
     /// of the pool covers. Carries the cap that refused, read under the same lock
     /// hold as the decision, so the operator line reports the number that actually
-    /// applied. Clears as the signer pays.
+    /// applied. Live floor clears as the signer's streams pay. Floor debt clears
+    /// only as one of its streams pays past its own floor, so a cap that debt alone
+    /// fills holds until a restart or a pool reclaim.
     SignerAtCap { signer_cap: U256 },
+}
+
+/// The floor a pool and one signer hold, live and owed, as a refusal log line
+/// reports it ([`ClientHandler::floor_snapshot`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct FloorSnapshot {
+    /// The pool's live reservation across every signer.
+    pool_live: U256,
+    /// The pool's floor debt across every signer.
+    pool_debt: U256,
+    /// The refused signer's live reservation.
+    signer_live: U256,
+    /// The refused signer's floor debt.
+    signer_debt: U256,
 }
 
 /// What a floor-admission refusal needs to describe itself
@@ -811,7 +889,8 @@ enum ServeRejectReason {
     /// One capability signer's live un-vouchered reservation plus floor debt
     /// already fills its `k`-window cap (ADR 003 §Pool solvency, per-signer floor
     /// isolation). The pool itself can still pay and co-tenants are unaffected; the
-    /// cap is signer-scoped and clears as that signer pays.
+    /// cap is signer-scoped: its live part clears as that signer's streams pay, and
+    /// a cap that floor debt alone fills holds until a restart or a pool reclaim.
     /// Collapses to `NotFound` on the wire (see [`Self::wire_error`]) — a node-local
     /// signer stop, cleared by payment rather than by a top-up, so unlike
     /// [`Self::InsufficientDeposit`] it names no funding state.
@@ -1610,7 +1689,7 @@ pub struct ClientHandler {
     /// "I am refusing everyone" — and the per-lane detail lives in the
     /// `debug!` beside it and in the counter.
     deposit_refusal_warn: WarnThrottle,
-    /// The same window for the per-signer LIVE-cap arm. Kept separate from the
+    /// The same window for the per-signer floor-cap arm. Kept separate from the
     /// pool arm because the two carry different remedies — a pool-wide shortfall
     /// clears with a top-up, a signer at its share does not — so one must not
     /// starve the other's line or pollute its `suppressed` count.
@@ -2252,18 +2331,78 @@ impl ClientHandler {
             ceiling,
         } = at;
         let headroom = remaining.saturating_sub(self.pool_min_remaining_deposit);
+        let held = self.floor_snapshot(pool_id, signer);
         match refusal {
-            FloorRefusal::PoolExhausted => {
+            FloorRefusal::PoolExhausted if held.pool_debt.is_zero() => {
                 self.log_deposit_refusal(pool_id, hash, headroom, ceiling);
             }
+            FloorRefusal::PoolExhausted => {
+                self.log_pool_floor_debt(pool_id, hash, headroom, ceiling, held);
+            }
             FloorRefusal::SignerAtCap { signer_cap } => {
-                self.log_signer_at_cap(pool_id, signer, hash, signer_cap, ceiling, headroom);
+                self.log_signer_at_cap(pool_id, signer, hash, signer_cap, ceiling, held);
             }
         }
     }
 
+    /// The floor the pool and `signer` hold right now, for a refusal log line. Read
+    /// after the decision, under its own lock hold, so a concurrent release can move
+    /// it by a stream; the line explains the refusal, it does not decide it.
+    fn floor_snapshot(&self, pool_id: B256, signer: Address) -> FloorSnapshot {
+        let map = self
+            .pool_floor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = map.get(&pool_id) else {
+            return FloorSnapshot::default();
+        };
+        let row = entry.signers.get(&signer).copied().unwrap_or_default();
+        FloorSnapshot {
+            pool_live: entry.live_reservation,
+            pool_debt: entry.debt,
+            signer_live: row.live_reservation,
+            signer_debt: row.debt,
+        }
+    }
+
+    /// The observable side of a pool-ceiling refusal that floor debt drives
+    /// ([`FloorRefusal::PoolExhausted`] with debt on the pool). The deposit may be
+    /// ample: the headroom is held by streams that ended unpaid. A top-up does not
+    /// clear it any faster than payment, a restart, or a pool reclaim does.
+    fn log_pool_floor_debt(
+        &self,
+        pool_id: B256,
+        hash: Hash,
+        headroom: U256,
+        ceiling: U256,
+        held: FloorSnapshot,
+    ) {
+        let FloorSnapshot {
+            pool_live,
+            pool_debt,
+            ..
+        } = held;
+        tracing::debug!(
+            %pool_id, %hash, %headroom, %ceiling, %pool_live, %pool_debt,
+            "refusing delivery: the pool's live floor plus floor debt fills its refundable \
+             headroom"
+        );
+        if let Some(suppressed) = self.deposit_refusal_warn.admit() {
+            tracing::warn!(
+                %pool_id, %headroom, %ceiling, %pool_live, %pool_debt, suppressed,
+                interval = ?self.deposit_refusal_warn.interval(),
+                "refusing paying clients: floor debt from streams that ended unpaid holds this \
+                 pool's refundable headroom. The debt clears as those signers pay past a \
+                 stream's floor here, at a restart, or at a pool reclaim — see docs/runbook.md"
+            );
+        }
+    }
+
     /// The observable side of a per-signer floor-cap refusal
-    /// ([`FloorRefusal::SignerAtCap`]).
+    /// ([`FloorRefusal::SignerAtCap`]). `signer_live` and `signer_debt` tell
+    /// concurrency (clears as the signer's streams pay) from floor debt (clears only
+    /// as a stream pays past its own floor, and a cap that debt alone fills admits no
+    /// such stream).
     fn log_signer_at_cap(
         &self,
         pool_id: B256,
@@ -2271,24 +2410,28 @@ impl ClientHandler {
         hash: Hash,
         signer_cap: U256,
         ceiling: U256,
-        headroom: U256,
+        held: FloorSnapshot,
     ) {
+        let FloorSnapshot {
+            signer_live,
+            signer_debt,
+            ..
+        } = held;
         tracing::debug!(
-            %pool_id, %signer, %hash, %signer_cap, %ceiling, %headroom,
+            %pool_id, %signer, %hash, %signer_cap, %ceiling, %signer_live, %signer_debt,
             "refusing delivery: this capability signer already holds its cap of \
              un-vouchered floor reservation plus floor debt; the pool itself can still pay"
         );
         if let Some(suppressed) = self.signer_cap_refusal_warn.admit() {
             tracing::warn!(
-                %pool_id, %signer, %signer_cap, %headroom, suppressed,
+                %pool_id, %signer, %signer_cap, %signer_live, %signer_debt, suppressed,
                 interval = ?self.signer_cap_refusal_warn.interval(),
                 "refusing a paying client: one capability signer holds its whole cap of \
-                 un-vouchered floor, live streams plus floor debt from abandoned ones, while the \
-                 pool is solvent. This clears as that signer pays; a sustained rate means that \
-                 signer runs or abandons more un-vouchered streams than its cap covers. Rotate \
-                 the session key or \
-                 widen pool_floor_signer_live_windows — see docs/runbook.md, which covers why \
-                 widening it needs a restart"
+                 un-vouchered floor while the pool is solvent. Live floor clears as its streams \
+                 pay. Floor debt clears only as one of its streams pays past its own floor, so \
+                 a signer whose cap is all debt stays refused here until a restart or a pool \
+                 reclaim. Rotate the session key, or widen pool_floor_signer_live_windows — see \
+                 docs/runbook.md, which covers why widening it needs a restart"
             );
         }
     }
@@ -2472,7 +2615,7 @@ impl ClientHandler {
     /// Open a span-capped [`FloorReservation`] against `pool_id`'s budget for one
     /// stream. The serve loop holds the returned guard for the stream's lifetime and
     /// releases the reservation once a floor is repaid; on any other drop the guard
-    /// releases the live reservation, freeing the pool's floor headroom.
+    /// releases the live reservation and charges its unpaid floor as debt.
     // Test-only: the serve path admits through `try_reserve_floor`, which checks
     // every floor gate and reserves under one lock hold.
     #[cfg(test)]
@@ -2657,9 +2800,7 @@ impl ClientHandler {
                 return Err(FloorRefusal::SignerAtCap { signer_cap });
             }
             let entry = guard.entry(pool_id).or_default();
-            entry.live_reservation = entry.live_reservation.saturating_add(reserved);
-            let lane = entry.signers.entry(signer).or_default();
-            lane.live_reservation = lane.live_reservation.saturating_add(reserved);
+            entry.charge_live(signer, reserved);
             epoch = entry.epoch;
         }
         Ok(FloorReservation::new_charged(

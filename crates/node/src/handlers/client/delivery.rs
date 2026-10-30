@@ -228,31 +228,39 @@ impl ClientHandler {
         // §Credit window). The loop returns it only when the stream ends fully
         // paid.
         let carry = self.take_ramp_carry(lane).await;
-        self.deliver_loop(
-            conn,
-            send,
-            recv,
-            hash,
-            byte_offset,
-            byte_len,
-            total_bytes,
-            lane_key,
-            lane,
-            carry,
-            client_node_id,
-            rate_per_mb,
-            floor_reservation,
-            first_byte,
-            &mut paid,
-        )
-        .await
-        .map_err(|e| super::wire::tag_paid_progress(e, paid))
+        // The guard stays owned here, so it drops on every exit — success, `?`,
+        // disconnect, panic — after `settle_end` has judged how the stream ended.
+        let end = self
+            .deliver_loop(
+                conn,
+                send,
+                recv,
+                hash,
+                byte_offset,
+                byte_len,
+                total_bytes,
+                lane_key,
+                lane,
+                carry,
+                client_node_id,
+                rate_per_mb,
+                floor_reservation.as_ref(),
+                first_byte,
+                &mut paid,
+            )
+            .await
+            .map_err(|e| super::wire::tag_paid_progress(e, paid));
+        if let Some(res) = floor_reservation.as_ref() {
+            res.settle_end(&end);
+        }
+        end
     }
 
     /// The body of [`Self::deliver`]. `paid` counts the bytes accepted vouchers
     /// credited; the caller reads it when the loop ends.
-    // One linear, ADR-ordered serve loop (deliver → recoup → floor/takedown/pool
-    // re-checks); splitting it would scatter the ordering invariants across helpers.
+    // One linear, ADR-ordered serve loop (deliver → recoup, reconciling the floor at
+    // each credit → pool/signer-cap/takedown re-checks); splitting it would scatter
+    // the ordering invariants across helpers.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -272,15 +280,10 @@ impl ClientHandler {
         mut carry: RampCarry,
         client_node_id: B256,
         rate_per_mb: u64,
-        floor_reservation: Option<FloorReservation>,
+        floor_reservation: Option<&FloorReservation>,
         first_byte: FirstByteClock,
         paid: &mut u64,
     ) -> anyhow::Result<ServeEnd> {
-        // Owned here so the pool floor reservation reconciles at every exit —
-        // success, `?`, disconnect, panic. The serve loop
-        // below releases it once the stream repays a floor; on any other exit the
-        // guard's `Drop` frees the pool's live floor headroom.
-        let floor_reservation = floor_reservation;
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
         // verified-stream encoding — there is no raw-byte path (ADR 038 §Serve
         // side, AC#4). `export_bao_range_stream` reads the persisted outboard and
@@ -429,7 +432,7 @@ impl ClientHandler {
                 // Count the frame as unpaid before the write: a client that reads
                 // part of it and then stops the stream fails the write, and those
                 // bytes still left the node.
-                if let Some(res) = floor_reservation.as_ref() {
+                if let Some(res) = floor_reservation {
                     res.track_unpaid(delivered.saturating_add(len).saturating_sub(*paid));
                 }
                 waits
@@ -531,7 +534,7 @@ impl ClientHandler {
                             *paid = paid.saturating_add(credited_bytes);
                             // Reconcile the floor reservation now, before a later
                             // proof in this batch can fail and end the stream.
-                            if let Some(res) = floor_reservation.as_ref() {
+                            if let Some(res) = floor_reservation {
                                 res.reconcile_paid(delivered, *paid);
                             }
                             if owed.settle(credited_bytes)? {

@@ -17105,7 +17105,7 @@ async fn a_whole_blob_request_from_a_node_is_refused_while_its_upstream_open_run
 }
 
 /// #2178: a holder that refuses a leg with a signed `NotFound` — the wire shape
-/// of a seller's per-signer live-cap refusal — is waited on and asked again when
+/// of a seller's per-signer floor-cap refusal — is waited on and asked again when
 /// no other candidate covers its range, and is not suppressed for the hash. Every
 /// leaf stream on the hash completes; none ends short after payment.
 ///

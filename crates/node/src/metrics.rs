@@ -1461,8 +1461,8 @@ pub struct DecdnMetrics {
     /// transport rate-limit), no other candidate covered the
     /// still-missing gap, and the assembly waited to ask the same upstream again
     /// instead of dropping it. The common cause is this node's own other pulls
-    /// filling the upstream's per-signer live cap: the refusal clears as those
-    /// pulls pay.
+    /// filling the upstream's per-signer floor cap: the live part of it clears as
+    /// those pulls pay.
     ///
     /// Each tick is one completed wait, and each wait follows one refusal already
     /// counted in `node_pull_refused_unattributable` or
@@ -1931,8 +1931,9 @@ pub struct DecdnMetrics {
     /// Delivery refused because ONE capability signer hit its per-signer cap of
     /// un-vouchered reservation plus floor debt, while the pool itself can still
     /// pay (ADR 003 §Pool solvency, per-signer floor isolation).
-    /// Signed as `NotFound`, because it clears by the signer's own payment rather
-    /// than by funding the pool (ADR 005 §Open-time refusal classes), so this counter
+    /// Signed as `NotFound`, because it clears by the signer's own payment, or for a
+    /// cap that floor debt alone fills by a restart or a pool reclaim, rather than
+    /// by funding the pool (ADR 005 §Open-time refusal classes), so this counter
     /// is the only place the reason survives — a rising value means one signer runs
     /// or abandons more un-vouchered streams than its share covers while the pool as
     /// a whole is solvent. The two remedies differ: a pool shortfall clears with a

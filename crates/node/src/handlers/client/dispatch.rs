@@ -773,12 +773,14 @@ impl ClientHandler {
         // solvency, stateful-B). It sums floor credit across ALL distinct lanes on
         // the pool and bounds it to `remaining − M`, closing the fan-out hole where
         // many distinct signers each draw one un-vouchered floor on the same pool; a
-        // per-signer cap `k · one window` bounds any one signer's share
-        // underneath it. Both levels count floor debt beside the live reservation. The reservation is span-capped
-        // to what THIS request can draw — at most one voucher-interval floor, less for
-        // a bounded range or tail resume — and held for the stream's lifetime; the
-        // `FloorReservation` guard releases it once the stream repays that floor, and
-        // frees the pool's floor headroom on any exit via `Drop`.
+        // per-signer cap `k · one window` bounds any one signer's share underneath
+        // it. Both levels count floor debt beside the live reservation. The
+        // reservation is span-capped to what THIS request can draw — at most one
+        // voucher-interval floor, less for a bounded range or tail resume — and held
+        // for the stream's lifetime; the `FloorReservation` guard releases it once the
+        // stream repays that floor. On any other exit `Drop` frees the live
+        // reservation and keeps the unpaid part as floor debt, unless the serve loop
+        // judged the end not the client's doing.
         //
         // The guard is opened at the point the billed span is knowable, NOT here: an
         // open-ended tail (`byte_len == 0`, `byte_offset > 0`) only knows its span
@@ -800,10 +802,10 @@ impl ClientHandler {
         // `serve_via_backend_origin` / `serve_via_window_pull_through` miss legs take it
         // by value and pass it by reference into their shared `serve_leg`. All three
         // release the reservation once the stream repays one floor; any other exit
-        // (disconnect, `?`, panic) drops the guard, whose `Drop` frees the pool's live
-        // floor headroom so an abandoned stream never holds it past its own lifetime.
-        // The unpaid floor an abandoned stream took stays behind as floor debt, which
-        // admission counts against the pool ceiling and the per-signer cap.
+        // (disconnect, `?`, panic) drops the guard, whose `Drop` frees the live
+        // reservation so no stream holds it past its own lifetime. The unpaid floor a
+        // client left behind stays as floor debt, which admission counts against the
+        // pool ceiling and the per-signer cap.
         let mut floor_reservation: Option<FloorReservation> = None;
 
         // Blob availability gate. A store fault is NOT an absence: an

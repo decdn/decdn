@@ -2194,7 +2194,7 @@ since project inception and will roll into the first tagged release.
   transient refusal, so the block then returns, refusals within one cooldown
   count once, refusals a minute or more apart never add up, and a verified
   byte in the block clears its count. An extra stream's covered `NotFound`
-  does not count: it is most often the node's per-signer live cap.
+  does not count: it is most often the node's per-signer floor cap.
 
 - **A range-dedup entry that waits for a sibling's chunks no longer holds a
   `--jobs` slot (#2283).** `decdn bundle pull` kept the slot of an entry
@@ -2642,7 +2642,7 @@ since project inception and will roll into the first tagged release.
 
 - **A backpressure refusal from the only holder of a range no longer fails
   paid serve streams (#2178).** A node pays every upstream leg from one buyer
-  signer, so its own concurrent pulls can fill a seller's per-signer live cap,
+  signer, so its own concurrent pulls can fill a seller's per-signer floor cap,
   and the seller sends that refusal as `NotFound`. The node's ranged assembly
   dropped the refusing source on the first refusal. When that source was the
   only holder of a still-missing range, the assembly ended short and every
@@ -5489,17 +5489,22 @@ since project inception and will roll into the first tagged release.
   the verify lag. When an unpaid stream ended, the node released its
   reservation and kept nothing, so a client that never paid could take a floor,
   reset, and repeat: about 100 MiB/s of free download per peer at the default
-  serve limit, with upstream `USDC` fronted on every cache miss. The node now
-  charges the unpaid bytes of a stream that ends before its payment reaches its
-  reserved floor as floor debt, capped at that floor, on the signer and on the
-  pool. Admission counts live floor plus floor debt: against `remaining − M`
-  for the pool (refused `Unfunded`, so rotating signer keys meets the pool
-  bound) and against `k` windows for the signer (refused `NotFound`). Only
-  payment past a stream's own floor clears debt; time does not. The debt is in
-  memory only, so a restart or a pool reclaim forgives it. An honest key that
-  abandons about `k` windows at one node and never pays there again is refused
-  at that node until it restarts. `blockchain.pool_floor_signer_live_windows`
-  keeps its name and now bounds live floor plus floor debt.
+  serve limit, with upstream `USDC` fronted on every cache miss. When the
+  client ends a stream with bytes unpaid (it leaves, sends a rejected voucher,
+  or spends its proof budget), the node now charges the unpaid bytes as floor
+  debt, capped at the stream's reserved floor, on the signer and on the pool,
+  even when the stream paid its floor first. A stream the node ends (a node or
+  upstream fault, a takedown, a size cap, a drained pool or signer cap)
+  charges nothing. Admission counts live floor plus floor debt: against
+  `remaining − M` for the pool (refused `Unfunded`, so rotating signer keys
+  meets the pool bound) and against `k` windows for the signer (refused
+  `NotFound`). Only payment past a stream's own floor clears debt; time does
+  not. The debt is in memory only, so a restart or a pool reclaim forgives it.
+  A key whose debt fills its `k` windows at one node has no stream left to pay
+  with, so that node refuses it until the node restarts or the pool is
+  reclaimed. The floor-refusal `warn!` lines carry the live and debt parts.
+  `blockchain.pool_floor_signer_live_windows` keeps its name and now bounds
+  live floor plus floor debt.
 
 - **client: a bundle entry path must be a portable file name, and the CLI
   escapes control characters in the paths it prints (GHSA-jr93-46mf-88wx,

@@ -2244,8 +2244,8 @@ async fn a_never_paying_client_gets_a_bounded_free_total() -> anyhow::Result<()>
         free += take_floor_and_leave(&conn, *hash.as_bytes(), &ext, &metrics).await?;
     }
     anyhow::ensure!(
-        free <= K * HARNESS_FLOOR_BYTES,
-        "the client took {free} free wire bytes, past {K} floors"
+        free > K * HARNESS_INTERVAL_BYTES && free <= K * HARNESS_FLOOR_BYTES,
+        "the client took {free} free wire bytes; each of {K} streams takes one floor"
     );
     let (refusal, refusal_ext) =
         open_expecting_refusal(&conn, *hash.as_bytes(), Some(&ext)).await?;
@@ -2303,6 +2303,13 @@ async fn rotating_signers_on_one_pool_meet_the_pool_bound() -> anyhow::Result<()
         !refusal.body.ok && matches!(refusal_ext.error, Some(StreamError::Unfunded)),
         "a fresh signer on a pool full of floor debt is refused Unfunded, got {:?}",
         refusal_ext.error
+    );
+    anyhow::ensure!(
+        counter(
+            &metrics,
+            "decdn_serve_stream_rejected_insufficient_deposit_total"
+        )? == 1,
+        "the refusal is the pool floor ceiling"
     );
 
     conn.close(0u32.into(), b"done");

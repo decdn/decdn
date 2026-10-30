@@ -182,8 +182,9 @@ pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
 /// Default per-signer floor cap `k`, in ramp-start credit windows: `8`.
 /// The most live un-vouchered floor reservation plus floor debt any one capability
-/// signer may hold against a pool is `k · one credit window`, underneath the pool-wide `remaining − M`
-/// ceiling (ADR 003 § Pool solvency, per-signer floor isolation). The window is the
+/// signer may hold against a pool is `k · one credit window`, underneath the
+/// pool-wide `remaining − M` ceiling (ADR 003 § Pool solvency, per-signer floor
+/// isolation). The window is the
 /// unit rationed — honest need is `concurrent un-vouchered streams × one window`
 /// regardless of pool size — so an absolute count fits it directly. It recycles as
 /// each stream pays; a stream that ends unpaid leaves floor debt that only payment

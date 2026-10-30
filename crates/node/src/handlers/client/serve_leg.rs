@@ -133,28 +133,35 @@ impl ClientHandler {
         // rank oldest for eviction while it streams. Recency only: the frequency
         // sighting waits for `StreamEnd`.
         self.cache.touch_recency(hash);
-        self.serve_leg_loop(
-            conn,
-            send,
-            recv,
-            store,
-            session,
-            also_pace,
-            lane,
-            carry,
-            hash,
-            lane_key,
-            client_node_id,
-            rate_per_mb,
-            offset,
-            len,
-            total_bytes,
-            floor_reservation,
-            first_byte,
-            &mut paid,
-        )
-        .await
-        .map_err(|e| super::wire::tag_paid_progress(e, paid))
+        let end = self
+            .serve_leg_loop(
+                conn,
+                send,
+                recv,
+                store,
+                session,
+                also_pace,
+                lane,
+                carry,
+                hash,
+                lane_key,
+                client_node_id,
+                rate_per_mb,
+                offset,
+                len,
+                total_bytes,
+                floor_reservation,
+                first_byte,
+                &mut paid,
+            )
+            .await
+            .map_err(|e| super::wire::tag_paid_progress(e, paid));
+        // Judge how the stream ended before the caller drops the guard: a fill
+        // fault, a held-bytes cap or a node stop forgives the unpaid floor.
+        if let Some(res) = floor_reservation {
+            res.settle_end(&end);
+        }
+        end
     }
 
     /// Await `frame`, the encoder's next frame, unless the stream ends first.
