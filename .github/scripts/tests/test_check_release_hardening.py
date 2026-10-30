@@ -164,33 +164,38 @@ def test_tag_or_short_ref_fails(tmp_path: Path, ref: str) -> None:
 
 
 def test_quoted_tag_ref_fails(tmp_path: Path) -> None:
-    release = swap(RELEASE,
-        f"uses: docker/build-push-action@{OTHER_SHA}", "uses: 'docker/build-push-action@v7'"
+    release = swap(
+        RELEASE,
+        f"uses: docker/build-push-action@{OTHER_SHA}",
+        "uses: 'docker/build-push-action@v7'",
     )
     errors = errors_for(tmp_path, release=release)
     assert any("docker/build-push-action@v7" in e for e in errors)
 
 
 def test_subpath_action_pinned_by_sha_passes(tmp_path: Path) -> None:
-    release = swap(RELEASE,
-        f"docker/build-push-action@{OTHER_SHA}", f"github/codeql-action/init@{OTHER_SHA}"
+    release = swap(
+        RELEASE,
+        f"docker/build-push-action@{OTHER_SHA}",
+        f"github/codeql-action/init@{OTHER_SHA}",
     )
     assert errors_for(tmp_path, release=release) == []
 
 
 def test_docker_ref_needs_a_digest(tmp_path: Path) -> None:
-    tagged = swap(RELEASE,
-        f"docker/build-push-action@{OTHER_SHA}", "docker://alpine:3.20"
-    )
+    tagged = swap(RELEASE, f"docker/build-push-action@{OTHER_SHA}", "docker://alpine:3.20")
     assert any("not pinned by @sha256: digest" in e for e in errors_for(tmp_path / "a", release=tagged))
-    digested = swap(RELEASE,
-        f"docker/build-push-action@{OTHER_SHA}", "docker://alpine@sha256:" + "a" * 64
+    digested = swap(
+        RELEASE,
+        f"docker/build-push-action@{OTHER_SHA}",
+        "docker://alpine@sha256:" + "a" * 64,
     )
     assert errors_for(tmp_path / "b", release=digested) == []
 
 
 def test_commented_out_step_is_not_a_site(tmp_path: Path) -> None:
-    release = swap(RELEASE,
+    release = swap(
+        RELEASE,
         "      - run: gh release create\n",
         "      - run: gh release create\n      # - uses: someone/action@v1\n",
     )
@@ -239,7 +244,8 @@ def test_persist_true_fails(tmp_path: Path) -> None:
 
 def test_persist_false_in_the_next_step_does_not_count(tmp_path: Path) -> None:
     # The first checkout has none; the second step's input must not satisfy it.
-    security = swap(SECURITY,
+    security = swap(
+        SECURITY,
         "        with:\n          persist-credentials: false\n"
         f"      - uses: aquasecurity/trivy-action@{OTHER_SHA} # v0.36.0\n",
         f"      - uses: aquasecurity/trivy-action@{OTHER_SHA} # v0.36.0\n"
@@ -251,7 +257,8 @@ def test_persist_false_in_the_next_step_does_not_count(tmp_path: Path) -> None:
 
 
 def test_with_before_uses_in_the_same_step_counts(tmp_path: Path) -> None:
-    release = swap(RELEASE,
+    release = swap(
+        RELEASE,
         f"      - name: Check out\n        uses: actions/checkout@{SHA}\n"
         "        with:\n          ref: main\n          persist-credentials: false\n",
         "      - name: Check out\n        with:\n          persist-credentials: false\n"
@@ -286,7 +293,8 @@ def test_missing_workflow_level_permissions_fails(tmp_path: Path) -> None:
 
 
 def test_write_on_a_job_outside_the_table_fails(tmp_path: Path) -> None:
-    release = swap(RELEASE,
+    release = swap(
+        RELEASE,
         "  build:\n    runs-on: ubuntu-latest\n",
         "  build:\n    runs-on: ubuntu-latest\n    permissions:\n      packages: write\n",
     )
@@ -298,8 +306,11 @@ def test_write_on_a_job_outside_the_table_fails(tmp_path: Path) -> None:
 
 
 def test_extra_scope_on_a_table_job_fails(tmp_path: Path) -> None:
-    release = swap(RELEASE, "      contents: read\n      packages: write\n",
-                              "      contents: write\n      packages: write\n")
+    release = swap(
+        RELEASE,
+        "      contents: read\n      packages: write\n",
+        "      contents: write\n      packages: write\n",
+    )
     errors = errors_for(tmp_path, release=release)
     assert any("job `docker` grants write on ['contents', 'packages']" in e for e in errors)
     # And the contents-write job now runs a third-party action.
@@ -328,7 +339,8 @@ def test_table_job_missing_from_workflow_fails(tmp_path: Path, monkeypatch: pyte
 
 
 def test_contents_write_job_running_third_party_action_fails(tmp_path: Path) -> None:
-    release = swap(RELEASE,
+    release = swap(
+        RELEASE,
         "      - run: gh release create\n",
         f"      - uses: someone/tool@{OTHER_SHA}\n      - run: gh release create\n",
     )
@@ -338,7 +350,8 @@ def test_contents_write_job_running_third_party_action_fails(tmp_path: Path) -> 
 
 
 def test_contents_write_job_running_local_action_fails(tmp_path: Path) -> None:
-    release = swap(RELEASE,
+    release = swap(
+        RELEASE,
         "      - run: gh release create\n",
         "      - uses: ./.github/actions/setup\n      - run: gh release create\n",
     )
@@ -533,7 +546,7 @@ def test_self_referencing_local_action_terminates(tmp_path: Path) -> None:
 
 def test_local_action_named_action_yaml_is_checked(tmp_path: Path) -> None:
     repo = build_repo(tmp_path, action=None)
-    write_action(repo, "setup", ACTION.replace(f"@{SHA} # v7.1.0", "@v7.1.0"), "action.yaml")
+    write_action(repo, "setup", swap(ACTION, f"@{SHA} # v7.1.0", "@v7.1.0"), "action.yaml")
     errors, _ = crh.check(repo)
     assert len(errors) == 1
     assert errors[0].startswith(".github/actions/setup/action.yaml:5:")
@@ -560,3 +573,9 @@ def test_checkout_outside_a_step_list_is_an_error(tmp_path: Path) -> None:
     assert errors == [
         ".github/workflows/security.yml:11: cannot find the step this `uses` belongs to"
     ]
+
+
+def test_list_item_under_jobs_is_not_a_job(tmp_path: Path) -> None:
+    security = swap(SECURITY, "  scan:\n", "  - scan:\n")
+    errors = errors_for(tmp_path, security=security)
+    assert any("`- scan:` is not a job key" in e for e in errors), errors

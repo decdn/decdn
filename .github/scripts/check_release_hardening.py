@@ -42,6 +42,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 if sys.version_info < (3, 11):  # the floor every guard under .github/scripts sets
@@ -92,8 +93,25 @@ def key_of(line: str) -> tuple[int, str, str] | None:
     return (col, m.group(2), m.group(3)) if m else None
 
 
+def find_key(
+    lines: list[str], rows: Iterable[int], col: int, name: str
+) -> tuple[int, str] | None:
+    """(line, rest) of the first `name:` key in `rows` that opens its line at
+    column `col`, with no dash before it."""
+    for n in rows:
+        found = key_of(lines[n])
+        if found and found[0] == col and indent_of(lines[n]) == col and found[1] == name:
+            return n, found[2]
+    return None
+
+
 def stripped_lines(path: Path) -> list[str]:
     return [COMMENT.sub("", raw).rstrip() for raw in path.read_text().splitlines()]
+
+
+def outdented(line: str, col: int) -> bool:
+    """Whether a non-blank line starts left of column `col`."""
+    return bool(line.strip()) and indent_of(line) < col
 
 
 def step_block(lines: list[str], i: int) -> tuple[int, list[str]] | None:
@@ -108,22 +126,10 @@ def step_block(lines: list[str], i: int) -> tuple[int, list[str]] | None:
     if found is None:
         return None
     key = found[0]
-    start = i
-    while start >= 0:
-        line = lines[start]
-        if line.strip() and indent_of(line) < key:
-            if not line.lstrip().startswith("-"):
-                return None
-            break
-        start -= 1
-    if start < 0:
+    start = next((n for n in range(i, -1, -1) if outdented(lines[n], key)), None)
+    if start is None or not lines[start].lstrip().startswith("-"):
         return None
-    end = i + 1
-    while end < len(lines):
-        line = lines[end]
-        if line.strip() and indent_of(line) < key:
-            break
-        end += 1
+    end = next((n for n in range(i + 1, len(lines)) if outdented(lines[n], key)), len(lines))
     return key, lines[start:end]
 
 
@@ -141,7 +147,8 @@ def persists_false(key: int, block: list[str]) -> bool:
             continue
         if not in_with or found is None:
             continue
-        child = found[0] if child is None else child
+        if child is None:
+            child = found[0]
         if found[0] == child and found[1] == "persist-credentials":
             return found[2].strip().strip("'\"") == "false"
     return False
@@ -205,25 +212,24 @@ def block_grants(
     (an alias, say) or block line, which this check cannot read.
     """
     inline = inline.strip()
-    if inline.strip("'\"") in ("read-all", "write-all"):
-        return {"*": inline.strip("'\"").removesuffix("-all")}
+    unquoted = inline.strip("'\"")
+    if unquoted in ("read-all", "write-all"):
+        return {"*": unquoted.removesuffix("-all")}
     if inline.startswith("{") and inline.endswith("}"):
-        grants: dict[str, str] = {}
-        for pair in filter(None, (p.strip() for p in inline[1:-1].split(","))):
-            m = GRANT.match(pair)
-            if not m:
-                return None
-            grants[m.group(2)] = m.group(3)
-        return grants
-    if inline:
+        pairs = [p.strip() for p in inline[1:-1].split(",")]
+    elif inline:
         return None
-    grants = {}
-    for line in lines[i + 1 :]:
-        if not line.strip():
-            continue
-        if indent_of(line) <= key_indent:
-            break
-        m = GRANT.match(line.strip())
+    else:
+        pairs = []
+        for line in lines[i + 1 :]:
+            if not line.strip():
+                continue
+            if indent_of(line) <= key_indent:
+                break
+            pairs.append(line.strip())
+    grants: dict[str, str] = {}
+    for pair in filter(None, pairs):
+        m = GRANT.match(pair)
         if not m:
             return None
         grants[m.group(2)] = m.group(3)
@@ -239,10 +245,10 @@ def jobs_of(lines: list[str]) -> tuple[dict[str, tuple[int, int]], list[str]]:
     """
     jobs: dict[str, tuple[int, int]] = {}
     errors: list[str] = []
-    top = next((n for n, line in enumerate(lines) if (k := key_of(line)) and k[0] == 0
-                and k[1] == "jobs"), None)
-    if top is None:
+    found = find_key(lines, range(len(lines)), 0, "jobs")
+    if found is None:
         return jobs, ["no top-level `jobs:`"]
+    top = found[0]
     end = next((n for n in range(top + 1, len(lines))
                 if lines[n].strip() and indent_of(lines[n]) == 0), len(lines))
     body = [n for n in range(top + 1, end) if lines[n].strip()]
@@ -256,7 +262,8 @@ def jobs_of(lines: list[str]) -> tuple[dict[str, tuple[int, int]], list[str]]:
         if indent_of(line) > job_indent:
             continue
         found = key_of(line)
-        if indent_of(line) < job_indent or found is None or found[2].strip():
+        # A dash pushes the key column past the indent: a list item is not a job.
+        if found is None or found[0] != job_indent or found[2].strip():
             errors.append(f"line {n + 1}: `{line.strip()}` is not a job key")
             continue
         if current is not None:
@@ -272,12 +279,7 @@ def job_permissions(lines: list[str], start: int, end: int) -> tuple[int, str] |
     body = [n for n in range(start + 1, end) if lines[n].strip()]
     if not body:
         return None
-    prop = indent_of(lines[body[0]])
-    for n in body:
-        found = key_of(lines[n])
-        if found and found[0] == prop and indent_of(lines[n]) == prop and found[1] == "permissions":
-            return n, found[2]
-    return None
+    return find_key(lines, body, indent_of(lines[body[0]]), "permissions")
 
 
 def check_permissions(lines: list[str], label: str, allowed: dict[str, set[str]]) -> list[str]:
@@ -288,11 +290,7 @@ def check_permissions(lines: list[str], label: str, allowed: dict[str, set[str]]
         "block or a `{ scope: level }` mapping"
     )
 
-    top = next(
-        ((n, k[2]) for n, line in enumerate(lines)
-         if (k := key_of(line)) and k[0] == 0 and k[1] == "permissions"),
-        None,
-    )
+    top = find_key(lines, range(len(lines)), 0, "permissions")
     if top is None:
         errors.append(
             f"{label}: no workflow-level `permissions:` block, so a job that names "

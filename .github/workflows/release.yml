@@ -8,11 +8,11 @@ name: Release
 #
 # This workflow builds and stages; it does not sign and it does not publish.
 # The GitHub Release is created as a *draft* and all four container image
-# manifests are pushed untagged, so no NAME a user would pull resolves to anything before a
-# maintainer has signed it with scripts/sign-release.sh. (A manifest
-# is still fetchable by its digest — untagged is not unreachable — but no tag
-# points at unsigned bytes, and the digest is not advertised anywhere a user
-# would look.) There is no signing key in Actions secrets.
+# manifests are pushed untagged, so no NAME a user would pull resolves to
+# anything before a maintainer has signed it with scripts/sign-release.sh. (A
+# manifest is still fetchable by its digest — untagged is not unreachable — but
+# no tag points at unsigned bytes, and the digest is not advertised anywhere a
+# user would look.) There is no signing key in Actions secrets.
 #
 # The token is scoped per job. Every job that compiles or installs a tool holds
 # `contents: read` only. The jobs that write to the draft release (`draft`,
@@ -401,10 +401,7 @@ jobs:
             fi
             echo "Draft already exists; refreshing its notes."
             gh release edit "$TAG" --notes-file "$notes"
-          elif ! grep -q 'release not found' "$RUNNER_TEMP/view.err"; then
-            echo "::error::cannot read release $TAG: $(cat "$RUNNER_TEMP/view.err")"
-            exit 1
-          else
+          elif grep -q 'release not found' "$RUNNER_TEMP/view.err"; then
             # A pre-release suffix marks the draft as a pre-release, so it
             # never becomes the "latest" release `decdn self-update` resolves
             # and the devops release-line resolver skips it.
@@ -415,6 +412,9 @@ jobs:
               "${prerelease[@]}" \
               --title "$TAG" \
               --notes-file "$notes"
+          else
+            echo "::error::cannot read release $TAG: $(cat "$RUNNER_TEMP/view.err")"
+            exit 1
           fi
         env:
           GH_REPO: ${{ github.repository }}
@@ -715,11 +715,10 @@ jobs:
     # job produces, so every binary inside it is byte-identical to the one the
     # signed SHA256SUMS covers. Needs verify, through upload-assets and draft:
     # no image is pushed, not even untagged, for a release that failed
-    # verification. Needs
-    # upload-assets: no image is pushed and nothing is attached to the draft
-    # unless all fifteen archives and SHA256SUMS reached it first, so a failed
-    # run never leaves a draft holding an SBOM and digest for archives it does
-    # not have.
+    # verification. Needs upload-assets: no image is pushed and nothing is
+    # attached to the draft unless all fifteen archives and SHA256SUMS reached
+    # it first, so a failed run never leaves a draft holding an SBOM and digest
+    # for archives it does not have.
     needs: [tag, build-binaries, upload-assets]
     runs-on: ubuntu-latest
     # The only job that holds `packages: write`. It writes nothing to the
