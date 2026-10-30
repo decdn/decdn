@@ -7,12 +7,18 @@
 //! suite checks is the suite's:
 //!
 //!   1. [`Mode::Public`]: a node serves a blob and a bundle (a text entry, a
-//!      page that links the blob, a 256 KiB entry), a publisher owns a
-//!      namespace, and a public gateway pinned to the node runs as a
+//!      page that links the blob, a 256 KiB entry), a publisher owns two
+//!      namespaces, and a public gateway pinned to the node runs as a
 //!      subprocess.
-//!   2. [`Mode::Loopback`]: an owner opens a pool, the gateway mints a
-//!      delegate, and the owner issues it a capability (`decdn pool assign`)
-//!      that the suite registers.
+//!   2. [`Mode::Loopback`]: an owner opens a pool, the gateway mints two
+//!      delegates, and the owner issues each a capability (`decdn pool
+//!      assign`) for its own page host, which the suite registers.
+//!
+//! Each client flavour of a suite (see [`Suite::flavours`]) gets its own
+//! namespace or capability, so no flavour sees another flavour's state. The
+//! fixture names all of them (`pointer.namespaces`, `capabilities`); its
+//! single-value fields (`pointer.namespace`, `host`, `capability`) name the
+//! first.
 //!
 //! The harness writes what the suite needs (URLs, token, hashes, bytes, the
 //! namespace key) to a JSON file and gives its path to [`Suite::run`]. The
@@ -57,8 +63,12 @@ const KEYSTORE_PASSWORD: &str = "gateway-sdk-e2e-password";
 /// The public origin the gateway serves. Nothing resolves it: the suite sends
 /// every request to the loopback listener with this `Host`.
 const DOMAIN: &str = "decdn.test";
-/// The page host whose capability pays on the loopback gateway.
-const PAGE_HOST: &str = "example.com";
+/// The most client flavours a suite can run: the harness sets up one
+/// namespace (public) or one capability (loopback) per flavour.
+const MAX_FLAVOURS: usize = 2;
+/// The page hosts whose capabilities pay on the loopback gateway, one per
+/// client flavour, the first flavour's first.
+const PAGE_HOSTS: [&str; MAX_FLAVOURS] = ["example.com", "example.net"];
 /// The longest one harness request may take: a stuck request fails here, not
 /// at the overall timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,7 +114,9 @@ pub trait Suite: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// How many independent client flavours the suite runs against one
-    /// gateway (1 for TypeScript).
+    /// gateway (1 for TypeScript, at most 2). Flavour `i` uses the fixture's
+    /// `i`-th namespace or capability, and the harness checks that the suite
+    /// created the gateway state of each flavour it runs.
     fn flavours(&self) -> usize;
 
     /// Run the suite file for `mode` against the fixture at `fixture`, and
@@ -124,9 +136,16 @@ pub trait Suite: Send + Sync {
 ///
 /// # Errors
 ///
-/// Fails when the setup fails, the suite fails or skips a test, the gateway
-/// does not hold what the suite creates, or the run exceeds the tier.
+/// Fails when the suite runs no client flavour or more than the harness sets
+/// up for, the setup fails, the suite fails or skips a test, the gateway does
+/// not hold what the suite creates, or the run exceeds the tier.
 pub async fn run<S: Suite>(suite: &S, mode: Mode) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=MAX_FLAVOURS).contains(&suite.flavours()),
+        "the {} SDK runs {} client flavours; the harness sets up 1 to {MAX_FLAVOURS}",
+        suite.name(),
+        suite.flavours()
+    );
     let setup = async {
         match mode {
             Mode::Public => public(suite).await,
@@ -455,6 +474,85 @@ impl Content {
     }
 }
 
+/// What the public run's suite signs pointers with: the deployment, the
+/// publisher's key, and the namespaces the key owns, one per client flavour.
+struct PublicPointer<'a> {
+    chain_id: u64,
+    /// The `PublisherRegistry` address.
+    registry: &'a str,
+    /// Flavour `i` points `namespaces[i]`.
+    namespaces: &'a [u64],
+    /// The publisher's private key, hex.
+    private_key: &'a str,
+}
+
+/// The public run's fixture: `content`'s fields, the gateway that serves
+/// `http://decdn.test` on `connect`, and `pointer`. Every u64 is a decimal
+/// string. `pointer.namespace` is the first of `pointer.namespaces`.
+///
+/// # Errors
+///
+/// Fails when `pointer` names no namespace.
+fn public_fixture(
+    content: &Content,
+    connect: &str,
+    pointer: &PublicPointer<'_>,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let first = pointer
+        .namespaces
+        .first()
+        .context("the public fixture needs at least one namespace")?;
+    let namespaces: Vec<String> = pointer.namespaces.iter().map(u64::to_string).collect();
+    let mut fixture = content.fixture();
+    fixture.insert("mode".to_owned(), Mode::Public.label().into());
+    fixture.insert("gatewayUrl".to_owned(), format!("http://{DOMAIN}").into());
+    fixture.insert("connect".to_owned(), connect.into());
+    fixture.insert(
+        "pointer".to_owned(),
+        serde_json::json!({
+            "chainId": pointer.chain_id.to_string(),
+            "publisherRegistry": pointer.registry,
+            "namespace": first.to_string(),
+            "namespaces": namespaces,
+            "privateKey": pointer.private_key,
+        }),
+    );
+    Ok(fixture)
+}
+
+/// The loopback run's fixture: `content`'s fields, the gateway at `base` on
+/// `connect` with its `token`, and `grants`, one `(page host, dcap1:
+/// capability)` per client flavour. `host` and `capability` are the first
+/// grant's.
+///
+/// # Errors
+///
+/// Fails when `grants` is empty.
+fn loopback_fixture(
+    content: &Content,
+    base: &str,
+    connect: &str,
+    token: &str,
+    grants: &[(&str, &str)],
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let (host, capability) = grants
+        .first()
+        .context("the loopback fixture needs at least one capability")?;
+    let capabilities: Vec<serde_json::Value> = grants
+        .iter()
+        .map(|(host, capability)| serde_json::json!({ "host": host, "capability": capability }))
+        .collect();
+    let mut fixture = content.fixture();
+    fixture.insert("mode".to_owned(), Mode::Loopback.label().into());
+    fixture.insert("gatewayUrl".to_owned(), base.into());
+    fixture.insert("connect".to_owned(), connect.into());
+    fixture.insert("token".to_owned(), token.into());
+    fixture.insert("host".to_owned(), (*host).into());
+    fixture.insert("capability".to_owned(), (*capability).into());
+    fixture.insert("capabilities".to_owned(), capabilities.into());
+    Ok(fixture)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one sequential setup: node, publisher, operator, gateway, then the suite"
@@ -468,7 +566,7 @@ async fn public<S: Suite>(suite: &S) -> anyhow::Result<()> {
         .first()
         .context("the node returned no hash for the blob")?;
 
-    // ---- PUBLISHER: a namespace its key owns ----
+    // ---- PUBLISHER: one namespace its key owns per client flavour ----
     let publisher_dir = private_tempdir("publisher")?;
     eth_identity::generate_and_persist(publisher_dir.path(), KEYSTORE_PASSWORD, false)
         .context("generate the publisher keystore")?;
@@ -478,29 +576,34 @@ async fn public<S: Suite>(suite: &S) -> anyhow::Result<()> {
     )?;
     chain.fund_eth(publisher.address(), 1).await?;
     let registry = format!("{}", chain.addrs().publisher_registry);
-    let created = decdn_ok(
-        publisher_dir.path(),
-        &strs(&[
-            "publish",
-            "namespace",
-            "create",
-            "--json",
-            "--data-dir",
-            &publisher_dir.path().display().to_string(),
-            "--rpc-url",
-            &chain.rpc_url(),
-            "--chain-id",
-            &chain.chain_id().to_string(),
-            "--publisher-registry-address",
-            &registry,
-        ]),
-    )
-    .await?;
-    let created: serde_json::Value = serde_json::from_str(created.trim())?;
-    let namespace = created
-        .get("namespace_id")
-        .and_then(serde_json::Value::as_u64)
-        .with_context(|| format!("namespace_id in {created}"))?;
+    let mut namespaces = Vec::with_capacity(MAX_FLAVOURS);
+    for _ in 0..MAX_FLAVOURS {
+        let created = decdn_ok(
+            publisher_dir.path(),
+            &strs(&[
+                "publish",
+                "namespace",
+                "create",
+                "--json",
+                "--data-dir",
+                &publisher_dir.path().display().to_string(),
+                "--rpc-url",
+                &chain.rpc_url(),
+                "--chain-id",
+                &chain.chain_id().to_string(),
+                "--publisher-registry-address",
+                &registry,
+            ]),
+        )
+        .await?;
+        let created: serde_json::Value = serde_json::from_str(created.trim())?;
+        namespaces.push(
+            created
+                .get("namespace_id")
+                .and_then(serde_json::Value::as_u64)
+                .with_context(|| format!("namespace_id in {created}"))?,
+        );
+    }
 
     // ---- OPERATOR: a funded keystore the gateway pays from ----
     let gateway_dir = private_tempdir("gateway")?;
@@ -570,35 +673,35 @@ async fn public<S: Suite>(suite: &S) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
 
-    let mut fixture = content.fixture();
-    fixture.insert("mode".to_owned(), Mode::Public.label().into());
-    fixture.insert("gatewayUrl".to_owned(), format!("http://{DOMAIN}").into());
-    fixture.insert("connect".to_owned(), listen.clone().into());
-    fixture.insert(
-        "pointer".to_owned(),
-        serde_json::json!({
-            "chainId": chain.chain_id().to_string(),
-            "publisherRegistry": registry,
-            "namespace": namespace.to_string(),
-            "privateKey": format!("{}", publisher.to_bytes()),
-        }),
-    );
+    let fixture = public_fixture(
+        &content,
+        &listen,
+        &PublicPointer {
+            chain_id: chain.chain_id(),
+            registry: &registry,
+            namespaces: &namespaces,
+            private_key: &format!("{}", publisher.to_bytes()),
+        },
+    )?;
     run_file(suite, Mode::Public, &fixture.into()).await?;
 
-    // Only the suite's own `pointer.set` gives the namespace host a bundle.
-    let page = http
-        .get(format!("{base}/a.txt"))
-        .header("host", format!("{namespace}.{DOMAIN}"))
-        .send()
-        .await
-        .context("read the namespace host the suite pointed")?;
-    let status = page.status();
-    let body = page.bytes().await?;
-    anyhow::ensure!(
-        status == StatusCode::OK && content.file("a.txt") == Some(body.as_ref()),
-        "the namespace host does not serve the bundle ({status}): the suite never set the \
-         pointer on this gateway"
-    );
+    // Only the suite's own `pointer.set` gives a namespace host a bundle, and
+    // flavour `i` points `namespaces[i]`.
+    for namespace in namespaces.iter().take(suite.flavours()) {
+        let page = http
+            .get(format!("{base}/a.txt"))
+            .header("host", format!("{namespace}.{DOMAIN}"))
+            .send()
+            .await
+            .with_context(|| format!("read the namespace host {namespace}.{DOMAIN}"))?;
+        let status = page.status();
+        let body = page.bytes().await?;
+        anyhow::ensure!(
+            status == StatusCode::OK && content.file("a.txt") == Some(body.as_ref()),
+            "the namespace host {namespace}.{DOMAIN} does not serve the bundle ({status}): the \
+             suite never set the pointer of namespace {namespace} on this gateway"
+        );
+    }
     stop(gateway).await
 }
 
@@ -681,58 +784,65 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
     )
     .await?;
 
-    // ---- A delegate the gateway holds, and a capability the owner issues it ----
-    let minted: serde_json::Value = http
-        .get(format!("{base}/_delegate"))
-        .header("x-decdn-token", &token)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .context("mint a delegate with the gateway token")?
-        .json()
+    // ---- Per client flavour: a delegate the gateway holds, and a capability
+    // the owner issues it from the one pool ----
+    let mut delegates = Vec::with_capacity(PAGE_HOSTS.len());
+    let mut capabilities = Vec::with_capacity(PAGE_HOSTS.len());
+    for _ in PAGE_HOSTS {
+        let minted: serde_json::Value = http
+            .get(format!("{base}/_delegate"))
+            .header("x-decdn-token", &token)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .context("mint a delegate with the gateway token")?
+            .json()
+            .await?;
+        let delegate = minted
+            .get("address")
+            .and_then(serde_json::Value::as_str)
+            .context("the minted delegate's address")?
+            .to_owned();
+        let assigned = decdn_ok(
+            owner_dir.path(),
+            &[
+                strs(&[
+                    "pool",
+                    "assign",
+                    "--pool",
+                    &format!("{pool_id:#x}"),
+                    "--signer",
+                    &delegate,
+                    "--cap-micro-usdc",
+                    &CAP_MICRO_USDC.to_string(),
+                    "--expiry-secs",
+                    "3600",
+                ]),
+                chain_flags(&chain),
+                owner_flags(&owner_keystore, owner_dir.path()),
+            ]
+            .concat(),
+        )
         .await?;
-    let delegate = minted
-        .get("address")
-        .and_then(serde_json::Value::as_str)
-        .context("the minted delegate's address")?
-        .to_owned();
-    let assigned = decdn_ok(
-        owner_dir.path(),
-        &[
-            strs(&[
-                "pool",
-                "assign",
-                "--pool",
-                &format!("{pool_id:#x}"),
-                "--signer",
-                &delegate,
-                "--cap-micro-usdc",
-                &CAP_MICRO_USDC.to_string(),
-                "--expiry-secs",
-                "3600",
-            ]),
-            chain_flags(&chain),
-            owner_flags(&owner_keystore, owner_dir.path()),
-        ]
-        .concat(),
-    )
-    .await?;
-    let capability = assigned
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("dcap1:"))
-        .context("the dcap1: token in `pool assign` output")?;
+        let capability = assigned
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("dcap1:"))
+            .with_context(|| format!("the dcap1: token in `pool assign` output for {delegate}"))?
+            .to_owned();
+        delegates.push(delegate);
+        capabilities.push(capability);
+    }
 
-    let mut fixture = content.fixture();
-    fixture.insert("mode".to_owned(), Mode::Loopback.label().into());
-    fixture.insert("gatewayUrl".to_owned(), base.clone().into());
-    fixture.insert("connect".to_owned(), listen.clone().into());
-    fixture.insert("token".to_owned(), token.clone().into());
-    fixture.insert("host".to_owned(), PAGE_HOST.into());
-    fixture.insert("capability".to_owned(), capability.into());
+    let grants: Vec<(&str, &str)> = PAGE_HOSTS
+        .into_iter()
+        .zip(capabilities.iter().map(String::as_str))
+        .collect();
+    let fixture = loopback_fixture(&content, &base, &listen, &token, &grants)?;
     run_file(suite, Mode::Loopback, &fixture.into()).await?;
 
-    // Only the suite's own `registerCapability` gives the delegate a scope.
+    // Only the suite's own `registerCapability` gives a delegate a scope, and
+    // flavour `i` registers `delegates[i]` for `PAGE_HOSTS[i]`.
     let held: serde_json::Value = http
         .get(format!("{base}/_capability"))
         .header("x-decdn-token", &token)
@@ -742,19 +852,21 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
         .context("list the gateway's capabilities")?
         .json()
         .await?;
-    let registered = held.as_array().is_some_and(|held| {
-        held.iter().any(|c| {
-            c["signer"]
-                .as_str()
-                .is_some_and(|s| s.eq_ignore_ascii_case(&delegate))
-                && c["scope"] == PAGE_HOST
-        })
-    });
-    anyhow::ensure!(
-        registered,
-        "the gateway holds no capability for {delegate} on {PAGE_HOST}: the suite never \
-         registered it on this gateway ({held})"
-    );
+    for (delegate, host) in delegates.iter().zip(PAGE_HOSTS).take(suite.flavours()) {
+        let registered = held.as_array().is_some_and(|held| {
+            held.iter().any(|c| {
+                c["signer"]
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(delegate))
+                    && c["scope"] == host
+            })
+        });
+        anyhow::ensure!(
+            registered,
+            "the gateway holds no capability for {delegate} on {host}: the suite never \
+             registered it on this gateway ({held})"
+        );
+    }
     stop(gateway).await
 }
 

@@ -1,3 +1,5 @@
+use serde_json::json;
+
 use super::*;
 
 /// The suites read the content by these keys, so a renamed key breaks every
@@ -122,4 +124,92 @@ fn python_from_dir_wants_a_synced_venv() {
         msg.contains(".venv/bin/python") && msg.contains("uv sync --frozen"),
         "{msg}"
     );
+}
+
+/// Each client flavour points its own namespace: the Python loader picks
+/// `pointer.namespaces[i]` for flavour `i`, and the TypeScript loader reads
+/// `pointer.namespace`, which is the first.
+#[test]
+fn public_fixture_carries_two_namespaces() {
+    let fixture = public_fixture(
+        &Content::new(),
+        "127.0.0.1:8484",
+        &PublicPointer {
+            chain_id: 31_337,
+            registry: "0x00000000000000000000000000000000000000aa",
+            namespaces: &[7, 18_446_744_073_709_551_615],
+            private_key: "0x01",
+        },
+    )
+    .unwrap();
+    assert_eq!(fixture.get("mode"), Some(&json!("public")));
+    assert_eq!(fixture.get("gatewayUrl"), Some(&json!("http://decdn.test")));
+    assert_eq!(fixture.get("connect"), Some(&json!("127.0.0.1:8484")));
+    // Decimal strings: a u64 above 2^53 does not survive a JSON number.
+    // `namespace` is the first of `namespaces`.
+    assert_eq!(
+        fixture.get("pointer"),
+        Some(&json!({
+            "chainId": "31337",
+            "publisherRegistry": "0x00000000000000000000000000000000000000aa",
+            "namespace": "7",
+            "namespaces": ["7", "18446744073709551615"],
+            "privateKey": "0x01",
+        }))
+    );
+}
+
+/// Each client flavour registers its own capability: the Python loader picks
+/// `capabilities[i]` for flavour `i`, and the TypeScript loader reads `host`
+/// and `capability`, which are the first.
+#[test]
+fn loopback_fixture_carries_two_capabilities() {
+    let grants = [
+        (PAGE_HOSTS[0], "dcap1:first"),
+        (PAGE_HOSTS[1], "dcap1:second"),
+    ];
+    let fixture = loopback_fixture(
+        &Content::new(),
+        "http://127.0.0.1:8484",
+        "127.0.0.1:8484",
+        "token",
+        &grants,
+    )
+    .unwrap();
+    assert_eq!(fixture.get("mode"), Some(&json!("loopback")));
+    assert_eq!(
+        fixture.get("gatewayUrl"),
+        Some(&json!("http://127.0.0.1:8484"))
+    );
+    assert_eq!(fixture.get("connect"), Some(&json!("127.0.0.1:8484")));
+    assert_eq!(fixture.get("token"), Some(&json!("token")));
+    assert_eq!(
+        fixture.get("capabilities"),
+        Some(&json!([
+            { "host": "example.com", "capability": "dcap1:first" },
+            { "host": "example.net", "capability": "dcap1:second" },
+        ]))
+    );
+    // The fields the TypeScript loader reads are the first entry's.
+    assert_eq!(fixture.get("host"), Some(&json!("example.com")));
+    assert_eq!(fixture.get("capability"), Some(&json!("dcap1:first")));
+}
+
+/// A fixture with no namespace or no capability has no first entry for the
+/// fields the TypeScript loader reads, so the helpers refuse it.
+#[test]
+fn fixtures_refuse_no_flavour() {
+    let public = public_fixture(
+        &Content::new(),
+        "127.0.0.1:8484",
+        &PublicPointer {
+            chain_id: 1,
+            registry: "0x00",
+            namespaces: &[],
+            private_key: "0x01",
+        },
+    );
+    assert!(public.is_err());
+    let loopback = loopback_fixture(&Content::new(), "http://x", "x", "t", &[]);
+    assert!(loopback.is_err());
 }
