@@ -212,6 +212,23 @@ tar xzOf decdn-cli-<version>.crate decdn-cli-<version>/Cargo.toml | grep '^pubke
 git show v<version>:crates/cli/minisign-<maintainer>.pub | sed -n 2p
 ```
 
+A binstall signature proves that a maintainer signed the archive. It does not
+prove that the archive is the version you asked for. Each `<archive>.minisig`
+carries a signed trusted comment that names its archive, for example
+`file:decdn-0.3.0-x86_64-unknown-linux-gnu.tar.gz`, and so its binary, version
+and target. binstall prints that comment but compares it with nothing. So
+whoever can replace release assets can serve an older signed archive under a
+newer name, and binstall installs it. To check the name, verify the archive
+yourself; minisign prints the trusted comment:
+
+```bash
+minisign -Vm decdn-<version>-<target>.tar.gz -P <pubkey>
+```
+
+The rollback-proof paths are the GPG-signed `SHA256SUMS`, which names each
+archive with its version, and `decdn self-update`, which checks that manifest
+and refuses a downgrade.
+
 Or verify the binary against the GPG-signed `SHA256SUMS`. binstall keeps only
 the binary, not the archive, so download the same archive from the release,
 verify it (§ Verify a binary archive), and compare hashes:

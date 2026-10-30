@@ -5494,6 +5494,31 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Release: each job holds the narrowest token, and every action is pinned
+  by SHA (#2771).** `release.yml` grants `contents: read` at the workflow
+  level. Every job that compiles or installs a tool can only read.
+  `contents: write` belongs only to `draft`, `upload-assets` and `attach`,
+  which use no action but `actions/*`. `packages: write` belongs only to
+  `docker`, which runs the `docker/*` actions under it and cannot write release
+  contents. Release notes come from the read-only `tag` job,
+  and the image SBOMs from a new `sbom` job that can only read packages. No
+  checkout in `release.yml` or `security.yml` persists its token. Every action
+  in both, and in the `dashboard-build` composite action, is pinned by commit
+  SHA, and the QEMU and BuildKit images the `docker` job runs under its
+  `packages: write` token are pinned by digest. `cross`, `git-cliff` and
+  `cargo-nextest` install at fixed versions that install-action checksums, with
+  no unchecked fallback. `upload-assets` and `attach` refuse to replace the
+  assets of a release that is no longer a draft.
+  `.github/scripts/check-release-hardening.sh` holds the action pins, the
+  checkouts, which job may write, and the digest of every image an action runs,
+  in the `packaging` CI job and in pre-commit; it does not read `run:` steps.
+  `check-image-name.sh` also holds the `sbom` and `attach` image lists to the
+  docker matrix. `sign-release.sh` refuses an archive
+  signature whose signed trusted comment, as `minisign -Q` reports it, does
+  not name the archive. SECURITY.md says
+  that binstall does not check that name, so the GPG-signed `SHA256SUMS` and
+  `decdn self-update` are the rollback-proof paths. Dependabot now also bumps
+  the composite actions' refs.
 - **client: a bundle entry path must be a portable file name, and the CLI
   escapes control characters in the paths it prints (GHSA-jr93-46mf-88wx,
   #2746, #2705).** Windows joins `README`, `README.` and `README` with a

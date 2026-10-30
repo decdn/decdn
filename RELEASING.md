@@ -158,10 +158,24 @@ preview writes nothing and needs no cleanup. Do **not** follow it with
 
 Pushing `v*` starts [`.github/workflows/release.yml`](.github/workflows/release.yml).
 Steps 1–3 gate everything else. After them, the archive builds (step 6) run in
-parallel with the verification (steps 4–5). The asset upload waits for both, and
-the image pushes wait for the asset upload. Every job after step 3 works on the
+parallel with the verification (step 4). The draft (step 5) waits for the
+verification, the asset upload waits for the draft and the builds, and the
+image pushes wait for the asset upload. Every job after step 3 works on the
 commit the tag push named; if the tag has since moved, the run fails rather
-than build another commit. The workflow:
+than build another commit.
+
+Each job holds the narrowest token it needs. The jobs that compile or install
+tools can only read. The three jobs that write to the draft (`draft`,
+`upload-assets`, `attach`) use no action but GitHub's own `actions/*`. The
+image push (`docker`) is the one job that can write packages, and it runs the
+`docker/*` actions and the QEMU and BuildKit images under that token; it
+cannot write release contents. No checkout keeps its token, every action is
+pinned by commit SHA, and every image an action runs is pinned by digest.
+`cross`, `git-cliff` and `cargo-nextest` install at fixed versions with a
+checked download. The one floating download is cargo-semver-checks, which its
+action fetches at the newest release on every run, under `verify`'s read-only
+token. The `packaging` CI job holds the pins, the checkouts and which job may
+write with `.github/scripts/check-release-hardening.sh`. The workflow:
 
 1. rejects the tag unless it is strict semver (the trigger glob is looser than
    it looks — `v0$(whoami)` matches it);
@@ -176,7 +190,8 @@ than build another commit. The workflow:
    `cargo semver-checks` against the previous tag — skipped for major bumps,
    for minor bumps while the major is `0`, and for the first release (no prior
    tag to diff against);
-5. creates the GitHub Release as a **draft**;
+5. creates the GitHub Release as a **draft**, with notes git-cliff generated in
+   the job that runs steps 1–3;
 6. builds fifteen archives (`decdn-node` on five targets, `decdn` on six: the
    same five plus Windows ARM64; `sponsord` and `sponsord-onramp` on the two
    Linux targets) with `--locked`, one job per target, failing a Linux target
@@ -188,9 +203,10 @@ than build another commit. The workflow:
    it), `decdn` (the CLI only), `sponsord` and `sponsord-onramp` (one server
    each). It does not compile from source, so every
    binary in an image is byte-identical to the archived one. It pushes each
-   manifest **untagged** and attaches each image's SBOM
-   (`<stage>-<version>-sbom.spdx.json`) and digest
-   (`<stage>-image-digest.txt`), named after the image's Dockerfile stage.
+   manifest **untagged**, scans it for an SBOM in a separate job that cannot
+   write, and attaches each image's SBOM (`<stage>-<version>-sbom.spdx.json`)
+   and digest (`<stage>-image-digest.txt`), named after the image's
+   Dockerfile stage.
 
 Draft assets need authentication to download, and no image tag exists yet, so
 nothing resolves by name until the release is signed. Each image manifest is
@@ -219,7 +235,8 @@ second time with minisign and verifies that against the
 `crates/cli/minisign-*.pub` in the tag's tree, the maintainers' keys the
 released binary embeds; in the same minisign run (one password prompt) signs
 every archive for `cargo binstall` and verifies each `<archive>.minisig` against
-the `pubkey` the crates name at the tag; uploads the nine `.asc` files,
+the `pubkey` the crates name at the tag, and that its signed trusted comment
+names that archive; uploads the nine `.asc` files,
 `SHA256SUMS.minisig` and the archives' `.minisig` files; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
 signed digest on GHCR; mirrors those same digests to Docker Hub; for a stable
 release, pushes each Docker Hub overview; checks that every promoted repository
@@ -484,7 +501,7 @@ signing script, or delete the tag as above.
 
 **Abandoned image manifests.** A run whose release is never signed leaves an
 untagged manifest in each GHCR package. So does re-running `upload-assets` or
-`docker` before signing: the image job pushes fresh manifests and replaces
+`docker` before signing: the image job pushes fresh manifests, `attach` replaces
 the `<stage>-image-digest.txt` files, and the earlier digests stay behind
 untagged. They are not pullable by name and cost only
 storage, so cleanup is optional. If you do delete one, take care: GHCR keys a
@@ -509,7 +526,8 @@ Making the repository public enables both. Configure them at that point:
 1. **Tag protection on `v*`.** Without it, anyone with push access can create a
    release tag. Worse, a `push`-triggered workflow runs the workflow definition
    *from the pushed ref*, so a tag can carry a `release.yml` with the signature
-   gate deleted and still receive `contents: write` and `packages: write`.
+   gate deleted, and that workflow can still request `contents: write` and
+   `packages: write`.
 2. **Branch protection on `main`.** The gate reads `KEYS` from `origin/main`
    precisely so the tag cannot supply its own trust root. That only means
    something if `main` is protected.

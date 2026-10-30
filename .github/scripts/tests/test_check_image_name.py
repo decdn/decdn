@@ -91,6 +91,30 @@ def test_an_image_missing_from_the_signing_list_is_an_error(repo: Path) -> None:
     assert "scripts/sign-release.sh has no line: IMAGES=(" in result.stderr, result.stderr
 
 
+def test_an_image_missing_from_the_sbom_matrix_is_an_error(repo: Path) -> None:
+    rewrite(
+        repo,
+        ".github/workflows/release.yml",
+        "target: [decdn-node, decdn, sponsord, sponsord-onramp]",
+        "target: [decdn-node, decdn, sponsord]",
+    )
+    result = run(repo)
+    assert result.returncode == 1
+    assert "release.yml has no line: target: [decdn-node" in result.stderr, result.stderr
+
+
+def test_an_image_missing_from_the_attach_loop_is_an_error(repo: Path) -> None:
+    rewrite(
+        repo,
+        ".github/workflows/release.yml",
+        "for t in decdn-node decdn sponsord sponsord-onramp; do",
+        "for t in decdn-node decdn sponsord; do",
+    )
+    result = run(repo)
+    assert result.returncode == 1
+    assert "release.yml has no line: for t in decdn-node" in result.stderr, result.stderr
+
+
 def test_a_missing_overview_file_is_an_error(repo: Path) -> None:
     (repo / "docker/README.sponsord-onramp.md").unlink()
     result = run(repo)
