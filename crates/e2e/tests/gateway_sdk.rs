@@ -14,19 +14,10 @@
 //! Requires `anvil` + `forge` + `node` on `PATH`, built `decdn` and
 //! `decdn-node` binaries, and `DECDN_SDK_DIR` naming, by absolute path, a
 //! checkout of decdn/sdk-typescript with its dependencies installed. The
-//! commands are in CONTRIBUTING.md § SDK contract runs. The Python SDK has its own target,
-//! `gateway_sdk_python`.
+//! commands are in CONTRIBUTING.md § SDK contract runs. The Python SDK has its
+//! own target, `gateway_sdk_python`.
 
 #![cfg(all(feature = "anvil-e2e", feature = "sdk-e2e"))]
-// Test scaffolding legitimately uses unwrap/expect/panic; the workspace
-// anti-panic policy targets runtime code.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::similar_names
-)]
 
 use decdn_e2e::sdk_contract::{Mode, TypeScript};
 

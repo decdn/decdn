@@ -855,10 +855,10 @@ async fn loopback<S: Suite>(suite: &S) -> anyhow::Result<()> {
     for (delegate, host) in delegates.iter().zip(PAGE_HOSTS).take(suite.flavours()) {
         let registered = held.as_array().is_some_and(|held| {
             held.iter().any(|c| {
-                c["signer"]
-                    .as_str()
+                c.get("signer")
+                    .and_then(serde_json::Value::as_str)
                     .is_some_and(|s| s.eq_ignore_ascii_case(delegate))
-                    && c["scope"] == host
+                    && c.get("scope").and_then(serde_json::Value::as_str) == Some(host)
             })
         });
         anyhow::ensure!(

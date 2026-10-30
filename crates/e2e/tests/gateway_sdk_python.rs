@@ -17,15 +17,6 @@
 //! The commands are in CONTRIBUTING.md § SDK contract runs.
 
 #![cfg(all(feature = "anvil-e2e", feature = "sdk-e2e"))]
-// Test scaffolding legitimately uses unwrap/expect/panic; the workspace
-// anti-panic policy targets runtime code.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::similar_names
-)]
 
 use decdn_e2e::sdk_contract::{Mode, Python};
 

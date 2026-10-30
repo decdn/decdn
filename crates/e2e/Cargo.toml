@@ -37,9 +37,9 @@ anvil-e2e = ["decdn-incentive/redb"]
 # `tests/gateway_sdk_python.rs` for the Python SDK), enabled together with
 # `anvil-e2e`: each also needs its SDK's toolchain and a checkout with its
 # dependencies installed (`DECDN_SDK_DIR` for decdn/sdk-typescript,
-# `DECDN_SDK_PYTHON_DIR` for decdn/sdk-python), so they
-# have their own gate and the `anvil-e2e` journeys never build them. The setup
-# they share is `src/sdk_contract.rs`, which always compiles.
+# `DECDN_SDK_PYTHON_DIR` for decdn/sdk-python), so they have their own gate and
+# the `anvil-e2e` journeys never build them. The setup they share is
+# `src/sdk_contract.rs`, which always compiles.
 sdk-e2e = []
 
 [dependencies]

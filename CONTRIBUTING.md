@@ -270,6 +270,8 @@ DECDN_SDK_DIR="$PWD/../sdk-typescript" \
   cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e --test gateway_sdk
 ```
 
+`--ignore-scripts` matches CI: the run needs no install scripts.
+
 Python:
 
 ```bash
@@ -280,10 +282,10 @@ DECDN_SDK_PYTHON_DIR="$PWD/../sdk-python" \
   cargo nextest run -p decdn-e2e --features anvil-e2e,sdk-e2e --test gateway_sdk_python
 ```
 
-`--ignore-scripts` matches CI: the run needs no install scripts. `DECDN_SDK_DIR`
+`DECDN_SDK_DIR`
 keeps its name for the TypeScript run because released SDK scripts read it.
 Each target has the `sdk-e2e` feature, so the `anvil-e2e` journeys never build
-it. A run fails, rather than skips, without `DECDN_SDK_DIR`, `node` or the
+them. A run fails, rather than skips, without `DECDN_SDK_DIR`, `node` or the
 SDK's `node_modules` (TypeScript) or without `DECDN_SDK_PYTHON_DIR`, `uv` or
 the SDK's `.venv` (Python). It also fails on a skipped or todo contract test,
 and when the suite did not reach this gateway.

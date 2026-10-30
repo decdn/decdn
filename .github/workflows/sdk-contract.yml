@@ -44,11 +44,10 @@ jobs:
   # decdn/sdk-typescript at the commit `.github/sdk-typescript.sha` pins: new
   # SDK code runs here only once a decdn PR moves the pin, and an SDK commit
   # never turns decdn's `main` red on its own. The Python SDK runs in its own
-  # job below, at its own pin. A gateway change the SDK can
-  # observe lands its sdk-typescript PR first, then moves the pin in the same
-  # decdn PR. The test fails, never skips, without `node`, the checkout or
-  # `node_modules`, on a skipped or todo test, and when the suite did not reach
-  # this gateway.
+  # job below, at its own pin. A gateway change the SDK can observe lands its
+  # sdk-typescript PR first, then moves the pin in the same decdn PR. The test
+  # fails, never skips, without `node`, the checkout or `node_modules`, on a
+  # skipped or todo test, and when the suite did not reach this gateway.
   #
   # ~10m observed; 30m clears a cold build plus two runs at the 600s heavy
   # tier, `--test-threads 2`.
@@ -120,9 +119,11 @@ jobs:
   # loopback (`crates/e2e/tests/gateway_sdk_python.rs`). The SDK is
   # decdn/sdk-python at the commit `.github/sdk-python.sha` pins, with the same
   # pin rules as the TypeScript job. The test fails, never skips, without `uv`,
-  # the checkout or its `.venv`.
+  # the checkout or its `.venv`, on a skipped or todo test, and when the suite
+  # did not reach this gateway.
   #
-  # Same budget as the TypeScript job: ~10m observed, 30m for a cold build.
+  # Same budget as the TypeScript job (30m for a cold build), copied from it;
+  # replace with the observed time after the first run.
   anvil-e2e-sdk-python:
     name: anvil e2e (sdk contract, python)
     runs-on: ubuntu-latest
