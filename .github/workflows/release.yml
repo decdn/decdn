@@ -56,6 +56,9 @@ jobs:
       # Full fetch, not depth 1: a shallow checkout of a tag ref stores the tag
       # as a lightweight ref, and `git verify-tag` below needs the annotated tag
       # object that carries the signature. Without it the check fails closed.
+      # A full fetch also takes every branch as refs/remotes/origin/*, so the
+      # `origin/main` the signature step reads KEYS from is already here, and
+      # that step needs no credentials of its own.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -110,9 +113,6 @@ jobs:
           GNUPGHOME: ${{ runner.temp }}/keys-gnupg
         run: |
           set -o pipefail
-          # No --depth: the checkout is a full clone, and a shallow fetch would
-          # turn it into a shallow one.
-          git fetch --no-tags origin main
           mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
           git show origin/main:KEYS > "$RUNNER_TEMP/KEYS" || {
             echo "::error::cannot read KEYS from origin/main"; exit 1; }
