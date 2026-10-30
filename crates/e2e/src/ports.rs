@@ -40,7 +40,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 /// Keep the reservation for as long as the child may bind the port, a restart
 /// included. Dropping it releases the port.
 ///
-/// Other platforms do not give these guarantees: there the reservation releases
+/// Other platforms do not give these guarantees, and on macOS a held socket
+/// blocks the child's `SO_REUSEADDR` bind. So off Linux the reservation releases
 /// its socket when it is made, and the port is only a number that was free.
 #[derive(Debug)]
 pub struct PortReservation {
