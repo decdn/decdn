@@ -1343,6 +1343,10 @@ async fn run_from_optimize_import() -> anyhow::Result<()> {
         "the pull must report its own payment ({pull_paid}), without the manifest fetch \
          ({wire_manifest}): {report}"
     );
+    anyhow::ensure!(
+        report["wire_bytes"].as_u64() >= report["paid_bytes"].as_u64(),
+        "the pull must receive at least the wire bytes it paid for: {report}"
+    );
 
     drop(node);
     Ok(())
@@ -1468,6 +1472,10 @@ async fn run_delta_update() -> anyhow::Result<()> {
     anyhow::ensure!(
         report1["paid_bytes"].as_u64() == Some(paid_v1),
         "first pull must report the bytes it paid for ({paid_v1}): {report1}"
+    );
+    anyhow::ensure!(
+        report1["wire_bytes"].as_u64() >= report1["paid_bytes"].as_u64(),
+        "the pull must receive at least the wire bytes it paid for: {report1}"
     );
 
     // (1) Both files landed, byte-exact, and the skip-cache exists.
@@ -1606,6 +1614,10 @@ async fn run_delta_update() -> anyhow::Result<()> {
     anyhow::ensure!(
         report2["paid_bytes"].as_u64() == Some(paid_v2),
         "second pull must report the bytes it paid for ({paid_v2}): {report2}"
+    );
+    anyhow::ensure!(
+        report2["wire_bytes"].as_u64() >= report2["paid_bytes"].as_u64(),
+        "the pull must receive at least the wire bytes it paid for: {report2}"
     );
 
     // (5) The changed file on disk now hashes to the NEW manifest hash.
@@ -1751,6 +1763,10 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
         "first pull must report the bytes it paid for ({paid1}): {report1}"
     );
     anyhow::ensure!(
+        report1["wire_bytes"].as_u64() >= report1["paid_bytes"].as_u64(),
+        "the pull must receive at least the wire bytes it paid for: {report1}"
+    );
+    anyhow::ensure!(
         report1["fetched"].as_u64() == Some(1),
         "first pull must fetch game1/lib/dup.bin fresh: {report1}"
     );
@@ -1831,6 +1847,10 @@ async fn run_cross_bundle_whole_file_dedup() -> anyhow::Result<()> {
     anyhow::ensure!(
         report2["paid_bytes"].as_u64() == Some(0),
         "second pull must report zero paid bytes: {report2}"
+    );
+    anyhow::ensure!(
+        report2["wire_bytes"].as_u64() >= report2["paid_bytes"].as_u64(),
+        "the pull must receive at least the wire bytes it paid for: {report2}"
     );
     anyhow::ensure!(
         paid2 == 0,

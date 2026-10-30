@@ -7898,6 +7898,17 @@ async fn a_pull_stopped_at_a_split_pays_what_it_verified_and_the_lane_pulls_on()
         finished_bytes == stopped_bytes + U256::from(next),
         "the next leg pays on from the stopped one: {finished_bytes} of {stopped_bytes} + {next}"
     );
+    // Every verified byte arrived over the wire first, and the frames the stop
+    // drained past the split arrived without paying.
+    let (wire, paid) = (ledger.wire_bytes(), ledger.paid_bytes());
+    anyhow::ensure!(
+        wire >= verified + next,
+        "the lane received at least what both legs verified: {wire} of {verified} + {next}"
+    );
+    anyhow::ensure!(
+        U256::from(wire) > paid,
+        "the lane received more than it paid for: {wire} wire, {paid} paid"
+    );
 
     drop(source);
     shutdown([server_task], [&client_ep, &server_ep]).await?;

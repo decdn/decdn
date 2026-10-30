@@ -3340,6 +3340,13 @@ impl UpstreamPull {
         VoucherProgress::from_ledger(&self.ledger, self.ctx.prior_amount)
     }
 
+    /// Count `len` wire bytes that arrived on this stream: they grow its
+    /// received total and the lane's [`PoolLedger::wire_bytes`] together.
+    fn take_in(&mut self, len: u64) {
+        self.cumulative = self.cumulative.saturating_add(len);
+        self.ledger.note_wire(len);
+    }
+
     /// Record that the caller's decoder has verified the first `wire` bytes of
     /// this stream against the root. The count only moves forward and never
     /// passes the bytes received. The newly verified bytes become payable: the
@@ -3564,8 +3571,7 @@ impl UpstreamPull {
                     // empty frames that move neither `cumulative` nor the voucher
                     // accounting. This path has no belt-and-braces payload check behind
                     // that floor, and does not need one now the floor is structural.
-                    let chunk_len = chunk.bytes().len() as u64;
-                    self.cumulative = self.cumulative.saturating_add(chunk_len);
+                    self.take_in(chunk.bytes().len() as u64);
                     if self.cumulative > self.expected_wire_bytes {
                         anyhow::bail!(
                             "server sent {} bytes, more than the {} promised",
@@ -3869,13 +3875,14 @@ impl UpstreamPull {
         loop {
             match futures_util::FutureExt::now_or_never(self.read_under_floor_once())? {
                 Ok(ClientMessage::ChunkData(chunk)) => {
-                    let seen = self.cumulative.saturating_add(chunk.bytes().len() as u64);
+                    let len = chunk.bytes().len() as u64;
+                    let seen = self.cumulative.saturating_add(len);
                     if seen > self.expected_wire_bytes
                         || (self.max_received_wire > 0 && seen > self.max_received_wire)
                     {
                         return None;
                     }
-                    self.cumulative = seen;
+                    self.take_in(len);
                 }
                 Ok(ClientMessage::StreamError(e)) => {
                     return Some(voucher_rejection(&self.ledger, &self.meter, e));

@@ -571,6 +571,15 @@ pull pays a little more than `downloaded`. Content that a lane delivers two
 times counts two times. An entry that fails counts in `paid_bytes` but not
 in `downloaded`.
 
+`wire_bytes` is the wire bytes that arrived on the lanes of this pull,
+verified or not, summed over every lane. Payment follows verification.
+Bytes that arrive and do not verify count in `wire_bytes`, but not in
+`paid_bytes`. Examples are frames past a steal split and frames past the
+verified frontier of a lane before a fault. These bytes cost bandwidth and
+time, not USDC. When `wire_bytes` is more than `paid_bytes`, the report
+adds a line for the difference:
+`received W on the wire, U of it never verified or paid`.
+
 The report shows `downloaded X (paid P) → reconstructed Y`. When
 `downloaded` and `reconstructed` are equal, the report omits the
 `→ reconstructed Y` part. When the pull downloads and pays nothing, the

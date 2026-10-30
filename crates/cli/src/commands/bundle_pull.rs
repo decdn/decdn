@@ -723,6 +723,12 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// interrupted counts here but not in `downloaded`; a later run resumes its
 /// `.partial` and reports it as `resumed_bytes`.
 ///
+/// `wire_bytes` is the wire bytes that arrived on this run's lanes, verified or
+/// not, bao proof overhead included. Payment follows verification, so the
+/// bytes that arrived and never verified — frames past a steal split, or past
+/// a lane's verified frontier before a fault — count here and not in
+/// `paid_bytes`. They cost bandwidth and time, not USDC.
+///
 /// `resumed_bytes` is the content bytes of a `.partial` prefix that an earlier,
 /// interrupted run fetched and paid for, which this run resumed rather than
 /// fetched again. It is never part of `downloaded`. A byte that this run also
@@ -764,6 +770,9 @@ struct PullReport {
     /// Wire bytes this run's vouchers and hash-chain reveals paid for, over
     /// every lane.
     paid_bytes: u64,
+    /// Wire bytes that arrived on this run's lanes, verified or not, over
+    /// every lane.
+    wire_bytes: u64,
     reconstructed: u64,
     spliced_bytes: u64,
     hints_ignored: u64,
@@ -1643,6 +1652,11 @@ fn report(rep: &BundleReport, excluded: u64, output: &Path, json: bool) -> anyho
             "{}",
             transfer_line(rep.downloaded, rep.paid_bytes, rep.reconstructed)
         );
+        // The wire bytes that arrived and were never paid for, shown only when
+        // any did: frames past a steal split or a lane's verified frontier.
+        if let Some(line) = unpaid_wire_line(rep.wire_bytes, rep.paid_bytes) {
+            println!("{line}");
+        }
         // The bytes earlier, interrupted runs fetched and this run resumed, shown
         // only when a run resumed any: they are not in `downloaded` or `paid`.
         if rep.resumed_bytes > 0 {
@@ -1693,6 +1707,7 @@ fn pull_report(rep: &BundleReport, excluded: u64, output: &Path) -> PullReport {
         not_run: rep.not_run,
         downloaded: rep.downloaded,
         paid_bytes: rep.paid_bytes,
+        wire_bytes: rep.wire_bytes,
         reconstructed: rep.reconstructed,
         spliced_bytes: rep.spliced_bytes,
         hints_ignored: rep.hints_ignored,
@@ -1861,6 +1876,20 @@ fn transfer_line(downloaded: u64, paid: u64, reconstructed: u64) -> String {
         format!(" → reconstructed {}", human_bytes(reconstructed))
     };
     format!("downloaded {}{paid}{rebuilt}", human_bytes(downloaded))
+}
+
+/// The end-of-pull line for the wire bytes that arrived and were never paid
+/// for: `received W on the wire, U of it never verified or paid`. `None`
+/// unless `wire` is above `paid`, so a pull that paid for all it received
+/// prints nothing.
+fn unpaid_wire_line(wire: u64, paid: u64) -> Option<String> {
+    (wire > paid).then(|| {
+        format!(
+            "received {} on the wire, {} of it never verified or paid",
+            human_bytes(wire),
+            human_bytes(wire - paid)
+        )
+    })
 }
 
 #[cfg(test)]

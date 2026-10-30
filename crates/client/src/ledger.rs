@@ -7,6 +7,7 @@
 //! one provider never serialize their payments behind each other's round trips.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -548,6 +549,9 @@ pub struct PoolLedger {
     /// upstream lane, a gateway's shared payer) from holding every response it
     /// ever read.
     evidence: OnceLock<Arc<LaneEvidence>>,
+    /// The wire bytes that arrived on this lane's streams, verified or not
+    /// ([`Self::wire_bytes`]).
+    wire: AtomicU64,
 }
 
 /// What a lane can prove it was paid: the signed anchor its vouchers last
@@ -622,6 +626,7 @@ impl PoolLedger {
             send_deadline: VOUCHER_SEND_DEADLINE,
             unpaid: std::sync::Mutex::new(Vec::new()),
             evidence: OnceLock::new(),
+            wire: AtomicU64::new(0),
         }
     }
 
@@ -798,6 +803,24 @@ impl PoolLedger {
             .plus(pipeline.accrued)
             .bytes
             .saturating_sub(pipeline.baseline.bytes)
+    }
+
+    /// The wire bytes that arrived on this lane's streams since the ledger
+    /// was built, verified or not. [`Self::paid_bytes`] counts what the
+    /// proofs paid for, and payment follows verification, so this figure
+    /// also holds the bytes that arrived and never verified: frames past a
+    /// stream's verified frontier when it stops at a split or faults. Those
+    /// bytes are never paid for.
+    #[must_use]
+    pub fn wire_bytes(&self) -> u64 {
+        self.wire.load(Ordering::Relaxed)
+    }
+
+    /// Count `n` wire bytes that arrived on one of this lane's streams.
+    pub(crate) fn note_wire(&self, n: u64) {
+        self.wire.update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            v.saturating_add(n)
+        });
     }
 
     /// The cumulative a cancelled pull must PERSIST — the drop-path counterpart of

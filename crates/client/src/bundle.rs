@@ -888,6 +888,13 @@ pub struct BundleReport {
     /// that fails or is interrupted counts here but not in `downloaded`; a
     /// later pull resumes its `.partial` and reports it as `resumed_bytes`.
     pub paid_bytes: u64,
+    /// The wire bytes that arrived on this pull's lanes, verified or not,
+    /// summed over every lane ([`crate::PoolLedger::wire_bytes`]). They
+    /// include the bao proof overhead. Payment follows verification, so the
+    /// bytes that arrived and never verified count here and not in
+    /// `paid_bytes`: frames past a steal split, or past a lane's verified
+    /// frontier before a fault.
+    pub wire_bytes: u64,
     /// The bytes written to disk: every landed copy of every blob.
     pub reconstructed: u64,
     /// The bytes of `.partial` prefixes earlier pulls fetched, which this pull

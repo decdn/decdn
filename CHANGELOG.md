@@ -4521,6 +4521,15 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **CLI: `decdn bundle pull` reports `wire_bytes`, the bytes that arrived on
+  the wire, verified or not (#2444).** Payment follows verification, so
+  `paid_bytes` leaves out bytes that arrived and never verified: frames past
+  a steal split, or past a lane's verified frontier before a fault. Each
+  lane's `PoolLedger` now counts every frame its streams take in, and
+  `BundleReport::wire_bytes` carries the pull's share. `--json` gains the
+  `wire_bytes` field, and the human summary adds
+  `received W on the wire, U of it never verified or paid` only when
+  `wire_bytes` is above `paid_bytes`.
 - **Release: `cargo binstall` verifies each archive's minisign signature (#2765).**
   `sign-release.sh` now signs every archive with the maintainer minisign key,
   in the same run as `SHA256SUMS.minisig`, and uploads `<archive>.minisig`
