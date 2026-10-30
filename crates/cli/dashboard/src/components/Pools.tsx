@@ -59,8 +59,8 @@ export function Pools(props: {
       <div className="flex flex-col gap-4">
         {props.rows.map((p) => (
           <article key={p.id} className="flex flex-col gap-2">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-              <div className="min-w-0 sm:flex-1">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div className="min-w-0 flex-1">
                 <h4 className="font-mono text-sm" title={p.id}>
                   Pool {shortHex(p.id)}
                 </h4>
@@ -69,7 +69,7 @@ export function Pools(props: {
                   {formatUsdc(p.deposit)} · spent {formatUsdc(p.spent)} or more
                 </p>
               </div>
-              <div className="w-full sm:w-64 sm:shrink-0">
+              <div className="w-full shrink-0 sm:w-64">
                 <Gauge
                   used={p.used}
                   severity={p.severity}
