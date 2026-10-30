@@ -22,7 +22,7 @@ export function LivePulls(props: { rows: LivePullRow[] }) {
               key={p.key}
               className="flex flex-wrap items-center justify-between gap-3"
             >
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1">
                 <p className="font-mono text-xs break-all" title={p.uri}>
                   {shortUri(p.uri)}
                 </p>
@@ -43,7 +43,7 @@ export function LivePulls(props: { rows: LivePullRow[] }) {
                   </p>
                 ) : null}
               </div>
-              <div className="flex w-full flex-col gap-1 sm:w-64">
+              <div className="flex w-full shrink-0 flex-col gap-1 sm:w-64">
                 {p.done === null ? null : (
                   <Progress done={p.done} label={`Progress of ${p.uri}`} />
                 )}
