@@ -27,7 +27,8 @@ export function LivePulls(props: { rows: LivePullRow[] }) {
                   {shortUri(p.uri)}
                 </p>
                 <p className="text-sm text-ink-2 tabular-nums">
-                  {p.kind} to <span className="font-mono">{p.output}</span>
+                  {p.kind} to{" "}
+                  <span className="font-mono break-all">{p.output}</span>
                   {p.files ? ` · ${p.files}` : ""}
                   {p.resumed > 0
                     ? ` · ${formatBytes(p.resumed)} resumed`
