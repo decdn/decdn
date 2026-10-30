@@ -14,7 +14,8 @@
 //! Requires `anvil` + `forge` + `node` on `PATH`, built `decdn` and
 //! `decdn-node` binaries, and `DECDN_SDK_DIR` naming, by absolute path, a
 //! checkout of decdn/sdk-typescript with its dependencies installed. The
-//! commands are in CONTRIBUTING.md § TypeScript SDK contract run.
+//! commands are in CONTRIBUTING.md § SDK contract runs. The Python SDK has its own target,
+//! `gateway_sdk_python`.
 
 #![cfg(all(feature = "anvil-e2e", feature = "sdk-e2e"))]
 // Test scaffolding legitimately uses unwrap/expect/panic; the workspace

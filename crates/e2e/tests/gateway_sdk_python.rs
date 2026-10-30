@@ -14,6 +14,7 @@
 //! Requires `anvil` + `forge` + `uv` on `PATH`, built `decdn` and
 //! `decdn-node` binaries, and `DECDN_SDK_PYTHON_DIR` naming, by absolute
 //! path, a checkout of decdn/sdk-python synced with `uv sync --frozen`.
+//! The commands are in CONTRIBUTING.md § SDK contract runs.
 
 #![cfg(all(feature = "anvil-e2e", feature = "sdk-e2e"))]
 // Test scaffolding legitimately uses unwrap/expect/panic; the workspace
