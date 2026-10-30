@@ -13,14 +13,21 @@ name: Release
 # is still fetchable by its digest — untagged is not unreachable — but no tag
 # points at unsigned bytes, and the digest is not advertised anywhere a user
 # would look.) There is no signing key in Actions secrets.
+#
+# The token is scoped per job. Every job that compiles, installs a tool or runs
+# a third-party action holds `contents: read` only. The jobs that write to the
+# draft release (`draft`, `upload-assets`, `attach`) run nothing but GitHub's
+# own `actions/*` and `gh`. `docker` alone holds `packages: write`, because it
+# pushes the images, and it holds no `contents: write`. No checkout persists
+# its token, and every action is pinned by commit SHA.
+# .github/scripts/check_release_hardening.py holds these rules.
 on:
   push:
     tags:
       - 'v[0-9]*'
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
   group: release
@@ -48,10 +55,10 @@ jobs:
       # Full fetch, not depth 1: a shallow checkout of a tag ref stores the tag
       # as a lightweight ref, and `git verify-tag` below needs the annotated tag
       # object that carries the signature. Without it the check fails closed.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
 
       # The tag is the only input, and it is attacker-controllable: the `v[0-9]*`
       # trigger glob matches things like `v0$(whoami)`. The version flows into
@@ -78,8 +85,8 @@ jobs:
       # DEFENCE IN DEPTH, NOT A BOUNDARY — until the repository is public.
       # For a `push` event GitHub runs the workflow definition from the pushed
       # ref, so a tag can carry a release.yml with this step deleted, and that
-      # workflow still receives contents:write and packages:write. Reading KEYS
-      # from main does not help while main itself is unprotected.
+      # workflow can still request contents:write and packages:write. Reading
+      # KEYS from main does not help while main itself is unprotected.
       #
       # Both holes close with the same switch: branch and tag protection are
       # unavailable on the current plan (the API returns 403 "Upgrade to GitHub
@@ -133,7 +140,12 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@1.99.1
+      # Pinned by SHA on the action's default branch, so the `toolchain` input
+      # names the version. check_toolchain_pin.py reads that input as this
+      # step's version and holds it to rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
 
       # The version bump happens locally and is unpoliced by CI, so confirm the
       # tag matches the manifests it claims to describe. Catches a hand-typed
@@ -159,11 +171,50 @@ jobs:
           fi
           echo "All crates are at $VERSION."
 
+      # Generated here, under a read-only token, and handed to `draft` as an
+      # artifact, so the job that holds `contents: write` runs no git-cliff.
+      # This job already has the full history `--latest` needs.
+      - name: Install git-cliff
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: git-cliff@2.14.2
+
+      # GitHub caps release bodies at 125000 chars. The first release has no
+      # prior tag to bound `--latest`, so cliff emits the whole history and
+      # overflows; truncate (and flag it) only when we actually exceed the
+      # limit, leaving normal releases untouched.
+      - name: Generate release notes
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/notes"
+          notes="$RUNNER_TEMP/notes/release-notes.md"
+          git cliff --latest --strip header > "$notes"
+          if [ ! -s "$notes" ]; then
+            echo "::error::git-cliff produced empty release notes for $TAG." \
+                 "Check that the commits since the last tag are conventional."
+            exit 1
+          fi
+          if [ "$(wc -c < "$notes")" -gt 125000 ]; then
+            head -c 120000 "$notes" > "$notes.trunc"
+            printf '\n\n_Changelog truncated. See the full commit history for details._\n' \
+              >> "$notes.trunc"
+            mv "$notes.trunc" "$notes"
+          fi
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes/release-notes.md
+          if-no-files-found: error
+
   # Runs in parallel with build-binaries; both need only `tag`. Nothing reaches
-  # the release or the registry until this job passes: it creates the draft as
-  # its last step, and upload-assets and docker both need it. The build legs'
-  # workflow artifacts exist before verification finishes, but they are run
-  # artifacts, not release assets.
+  # the release or the registry until this job passes: `draft` needs it, and
+  # upload-assets and docker both need `draft`. The build legs' workflow
+  # artifacts exist before verification finishes, but they are run artifacts,
+  # not release assets.
   verify:
     name: Verify release
     needs: tag
@@ -178,15 +229,17 @@ jobs:
       # Full history and tags: the semver baseline below lists the prior
       # release tags, and cargo-semver-checks checks out the chosen tag's
       # commit. A shallow checkout has neither.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: 1.99.1
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Reuse the `clippy` partition rather than a `release` one: the
           # pre-release verification below runs the same
@@ -197,10 +250,10 @@ jobs:
           shared-key: clippy
           save-if: false
 
-      - name: Install tools
-        uses: taiki-e/install-action@v2.87.32
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: git-cliff,cargo-nextest
+          tool: cargo-nextest@0.9.150
 
       - name: Pre-release verification
         run: |
@@ -294,45 +347,49 @@ jobs:
             echo "breaking=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # The action installs the `stable` toolchain and the newest
+      # cargo-semver-checks release on every run, so it always reads the
+      # current rustdoc JSON format. That download is not pinned; it runs under
+      # this job's read-only token.
       - name: cargo semver-checks
         if: ${{ steps.baseline.outputs.has_baseline == 'true' && steps.baseline.outputs.breaking == 'false' }}
-        uses: obi1kenobi/cargo-semver-checks-action@v2
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           feature-group: default-features
           baseline-rev: ${{ steps.baseline.outputs.rev }}
 
-      # Created as a draft. Draft assets require authentication to download, so
-      # the archives are not publicly reachable until sign-release.sh publishes
-      # them. Idempotent, so "Re-run all jobs" refreshes the existing draft
-      # rather than failing — but it refuses to touch an already-published
-      # release. "Re-run failed jobs" reaches this step only when this job, or
-      # `tag` before it, failed or was cancelled.
+  # Created as a draft. Draft assets require authentication to download, so the
+  # archives are not publicly reachable until sign-release.sh publishes them.
+  # Idempotent, so "Re-run all jobs" refreshes the existing draft rather than
+  # failing — but it refuses to touch an already-published release.
+  #
+  # Its own job because it is the first that writes: it runs no checkout, no
+  # compiler and no third-party action, only `gh` over the notes `tag` wrote.
+  draft:
+    name: Create draft release
+    needs: [tag, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes
+
       - name: Create draft GitHub Release
         shell: bash
         run: |
-          # GitHub caps release bodies at 125000 chars. The first release has
-          # no prior tag to bound `--latest`, so cliff emits the whole history
-          # and overflows; truncate (and flag it) only when we actually exceed
-          # the limit, leaving normal releases untouched.
-          git cliff --latest --strip header > /tmp/release-notes.md
-          if [ ! -s /tmp/release-notes.md ]; then
-            echo "::error::git-cliff produced empty release notes for $TAG." \
-                 "Check that the commits since the last tag are conventional."
-            exit 1
-          fi
-          if [ "$(wc -c < /tmp/release-notes.md)" -gt 125000 ]; then
-            head -c 120000 /tmp/release-notes.md > /tmp/release-notes.trunc.md
-            printf '\n\n_Changelog truncated. See the full commit history for details._\n' \
-              >> /tmp/release-notes.trunc.md
-            mv /tmp/release-notes.trunc.md /tmp/release-notes.md
-          fi
-          if gh release view "$TAG" --json isDraft --jq .isDraft > /tmp/is-draft 2>/dev/null; then
-            if [ "$(cat /tmp/is-draft)" != "true" ]; then
+          notes="$RUNNER_TEMP/notes/release-notes.md"
+          [ -s "$notes" ] || { echo "::error::release notes artifact is empty"; exit 1; }
+          if gh release view "$TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/is-draft" 2>/dev/null; then
+            if [ "$(cat "$RUNNER_TEMP/is-draft")" != "true" ]; then
               echo "::error::release $TAG is already published; refusing to overwrite it"
               exit 1
             fi
             echo "Draft already exists; refreshing its notes."
-            gh release edit "$TAG" --notes-file /tmp/release-notes.md
+            gh release edit "$TAG" --notes-file "$notes"
           else
             # A pre-release suffix marks the draft as a pre-release, so it
             # never becomes the "latest" release `decdn self-update` resolves
@@ -343,9 +400,10 @@ jobs:
               --draft \
               "${prerelease[@]}" \
               --title "$TAG" \
-              --notes-file /tmp/release-notes.md
+              --notes-file "$notes"
           fi
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.tag.outputs.tag }}
 
@@ -413,12 +471,14 @@ jobs:
     steps:
       # `github.sha`, not the tag name: the `tag` job proved this commit is the
       # one the tag pointed at, and the tag can move after that check.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
 
       # Before the build, which embeds it: `cross` mounts this checkout, so the
@@ -427,9 +487,9 @@ jobs:
 
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@v2.87.32
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: cross
+          tool: cross@0.2.5
 
       # One `build` per package, not a single `--package a --package b`: one
       # invocation unifies features across every package it selects, so the
@@ -562,7 +622,7 @@ jobs:
           VERSION: ${{ needs.tag.outputs.version }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-${{ matrix.target }}
           path: '*-${{ needs.tag.outputs.version }}-${{ matrix.target }}.*'
@@ -573,16 +633,18 @@ jobs:
 
   upload-assets:
     name: Upload release assets
-    # Needs verify for ordering as well as gating: that job creates the draft
-    # this one uploads to.
-    needs: [tag, verify, build-binaries]
+    # Needs draft for ordering as well as gating: that job creates the draft
+    # this one uploads to, and it runs only once verify passed. No checkout:
+    # `gh` takes the repository from GH_REPO.
+    needs: [tag, draft, build-binaries]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
+      - name: Download the archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: binaries-*
           path: artifacts
           merge-multiple: true
 
@@ -621,6 +683,7 @@ jobs:
       - name: Upload to draft release
         run: gh release upload "$TAG" --clobber artifacts/*
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.tag.outputs.tag }}
 
@@ -628,19 +691,19 @@ jobs:
     name: Docker image (${{ matrix.target }})
     # Needs build-binaries: each image is assembled from the Linux archives that
     # job produces, so every binary inside it is byte-identical to the one the
-    # signed SHA256SUMS covers. Needs verify: that job creates the draft this
-    # one uploads to, and no image is pushed, not even untagged, for a release
-    # that failed verification. Needs upload-assets: no image is pushed and
-    # nothing is attached to the draft unless all fifteen archives and
-    # SHA256SUMS reached it first, so a failed run never leaves a draft holding
-    # an SBOM and digest for archives it does not have.
-    needs: [tag, verify, build-binaries, upload-assets]
+    # signed SHA256SUMS covers. Needs verify, through draft: no image is pushed,
+    # not even untagged, for a release that failed verification. Needs
+    # upload-assets: no image is pushed and nothing is attached to the draft
+    # unless all fifteen archives and SHA256SUMS reached it first, so a failed
+    # run never leaves a draft holding an SBOM and digest for archives it does
+    # not have.
+    needs: [tag, build-binaries, upload-assets]
     runs-on: ubuntu-latest
+    # The only job that holds `packages: write`. It writes nothing to the
+    # draft: it hands each digest file on as an artifact, `sbom` scans the
+    # image without a write token, and `attach` uploads both.
     permissions:
-      # `write`, not `read`: this job uploads the SBOM and the image digest to
-      # the draft release, and a job-level permissions block fully overrides
-      # the workflow-level grant rather than adding to it.
-      contents: write
+      contents: read
       packages: write
     strategy:
       # One leg per image, each a stage of the one Dockerfile. A failed leg
@@ -671,23 +734,24 @@ jobs:
             image: ${{ github.repository_owner }}/sponsord-onramp
     steps:
       # `github.sha`, not the tag name — see build-binaries.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
 
       # The arm64 platform runs the Dockerfile's apt-get layer under
       # emulation. The binaries arrive prebuilt, so that is seconds of package
       # installs, not a compile.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Each Linux artifact carries all four archives; the unpack step below names
       # the ones this image needs and ignores the rest.
       - name: Download Linux archives
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: binaries-*-unknown-linux-gnu
           path: archives
@@ -720,7 +784,7 @@ jobs:
           done
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4.7.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -731,7 +795,7 @@ jobs:
       # it to compute the OCI source/revision labels.
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image }}
           tags: |
@@ -755,7 +819,7 @@ jobs:
       # other layers copy this release's fresh binaries and never hit a cache.
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -764,17 +828,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
           no-cache: true
-
-      # Scanned by digest in the release package — the untagged manifest is
-      # already there, it just has no tag pointing at it yet.
-      - name: Generate SBOM
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ env.REGISTRY }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
-          format: spdx-json
-          output-file: ${{ matrix.target }}-${{ needs.tag.outputs.version }}-sbom.spdx.json
-          upload-release-assets: false
-          upload-artifact: false
 
       # GPG has no native OCI-image signature format, so the image is attested
       # out of band: <stage>-image-digest.txt records the exact
@@ -789,15 +842,116 @@ jobs:
           set -euo pipefail
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
             echo "::error::build produced no image digest (got '$DIGEST')"; exit 1; }
-          echo "${IMAGE}@${DIGEST}" > "${TARGET}-image-digest.txt"
+          mkdir -p image
+          echo "${IMAGE}@${DIGEST}" > "image/${TARGET}-image-digest.txt"
 
-      - name: Upload SBOM and digest to draft release
+      - name: Upload digest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ matrix.target }}
+          path: image/${{ matrix.target }}-image-digest.txt
+          if-no-files-found: error
+
+  # Scans each pushed image by digest in the release package — the untagged
+  # manifest is already there, it just has no tag pointing at it yet. A job of
+  # its own so the scanner runs with a token that can read packages and write
+  # nothing.
+  sbom:
+    name: SBOM (${{ matrix.target }})
+    needs: [tag, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The docker job's stages. Keep the two lists, and attach's, in step.
+        target: [decdn-node, decdn, sponsord, sponsord-onramp]
+    steps:
+      - name: Download digest
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.target }}
+          path: image
+
+      # The digest file is the image reference, so this job needs no copy of
+      # the docker job's matrix. The pattern is the one `docker` wrote.
+      - name: Read image reference
+        id: ref
         env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ref=$(cat "image/${TARGET}-image-digest.txt")
+          [[ "$ref" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::unexpected image reference in ${TARGET}-image-digest.txt: '$ref'"
+            exit 1; }
+          echo "image=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.ref.outputs.image }}
+          format: spdx-json
+          output-file: ${{ matrix.target }}-${{ needs.tag.outputs.version }}-sbom.spdx.json
+          upload-release-assets: false
+          upload-artifact: false
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ matrix.target }}
+          path: ${{ matrix.target }}-${{ needs.tag.outputs.version }}-sbom.spdx.json
+          if-no-files-found: error
+
+  # Attaches every image's SBOM and digest file to the draft. Runs once all
+  # four images are pushed and scanned, and only `gh` holds its write token.
+  attach:
+    name: Attach image SBOMs and digests
+    needs: [tag, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          path: images
+          merge-multiple: true
+
+      - name: Download SBOMs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sbom-*
+          path: images
+          merge-multiple: true
+
+      # The docker job's four stages, as in `sbom`'s matrix. Each must have
+      # both files, so a leg that failed upstream fails here by name.
+
+      - name: Upload SBOMs and digests to draft release
+        working-directory: images
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.tag.outputs.tag }}
           VERSION: ${{ needs.tag.outputs.version }}
-          TARGET: ${{ matrix.target }}
         run: |
-          gh release upload "$TAG" --clobber \
-            "${TARGET}-${VERSION}-sbom.spdx.json" \
-            "${TARGET}-image-digest.txt"
+          files=()
+          for t in decdn-node decdn sponsord sponsord-onramp; do
+            for f in "${t}-image-digest.txt" "${t}-${VERSION}-sbom.spdx.json"; do
+              [ -s "$f" ] || { echo "::error::$f is missing or empty"; exit 1; }
+              files+=( "$f" )
+            done
+          done
+          gh release upload "$TAG" --clobber "${files[@]}"

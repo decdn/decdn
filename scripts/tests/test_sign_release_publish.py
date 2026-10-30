@@ -82,7 +82,10 @@ esac
 # belongs to. `minisign -S` writes `signed-with:<token>` for each -m file into
 # the file named by -x, else `<file>.minisig`, unless $MINISIGN_FAIL_SIGN is
 # set; with $MINISIGN_LEGACY it writes `legacy-signed-with:<token>`, as a
-# minisign whose default is the legacy format would. `minisign -V` succeeds
+# minisign whose default is the legacy format would. A second line carries the
+# trusted comment real minisign writes by default, `file:<name>` among its
+# tab-separated fields; $MINISIGN_TRUSTED_COMMENT replaces the whole comment,
+# as `-t` would. `minisign -V` succeeds
 # iff the signature file exists and holds a token, -H is absent or the
 # signature is not legacy, and the public key named by -p or -P mentions the
 # token, unless $MINISIGN_FAIL_VERIFY is set. Logs argv to $MINISIGN_LOG.
@@ -107,7 +110,13 @@ case "$mode" in
   -S) [ -n "${MINISIGN_FAIL_SIGN:-}" ] && { echo "shim: bad password" >&2; exit 1; }
       prefix="signed-with"; [ -n "${MINISIGN_LEGACY:-}" ] && prefix="legacy-signed-with"
       for f in $files; do
-        echo "$prefix:$(head -n1 "$sec")" > "${out:-$f.minisig}"
+        sig="${out:-$f.minisig}"
+        echo "$prefix:$(head -n1 "$sec")" > "$sig"
+        if [ -n "${MINISIGN_TRUSTED_COMMENT:-}" ]; then
+          printf 'trusted comment: %s\n' "$MINISIGN_TRUSTED_COMMENT" >> "$sig"
+        else
+          printf 'trusted comment: timestamp:0\tfile:%s\thashed\n' "$f" >> "$sig"
+        fi
       done; exit 0 ;;
   -V) [ -n "${MINISIGN_FAIL_VERIFY:-}" ] && { echo "shim: signature mismatch" >&2; exit 1; }
       set -- $files
@@ -499,6 +508,22 @@ def test_legacy_format_signatures_are_refused(release):
 
     assert result.returncode != 0
     assert "Legacy (non-prehashed) signature found" in result.stderr, output(result)
+    assert not release.calls(release.gh_log, "release upload")
+
+
+def test_a_signature_that_does_not_name_its_archive_is_refused(release):
+    # binstall prints the trusted comment but compares it with nothing, so a
+    # signature without `file:<archive>` would pass under any archive's name.
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", MINISIGN_TRUSTED_COMMENT="decdn release")
+
+    assert result.returncode != 0
+    assert (
+        "decdn-0.0.0-x86_64-unknown-linux-gnu.tar.gz.minisig has the trusted comment "
+        "'decdn release', which does not name decdn-0.0.0-x86_64-unknown-linux-gnu.tar.gz"
+    ) in result.stderr, output(result)
     assert not release.calls(release.gh_log, "release upload")
 
 

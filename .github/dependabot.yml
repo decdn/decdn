@@ -58,8 +58,13 @@ updates:
       prefix: chore
       include: scope
 
+  # `/` covers .github/workflows only; the composite actions are separate
+  # directories. Where a ref is a commit SHA with a `# vX.Y.Z` comment,
+  # Dependabot moves both together.
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
@@ -69,8 +74,11 @@ updates:
       include: scope
     # No dtolnay/rust-toolchain ignore: MSRV and the stable lint pin are the
     # same X.Y.Z (see Cargo.toml workspace.package.rust-version and the
-    # rust-toolchain refs in ci.yml / release.yml). Dependabot bumps only the action refs, and
+    # rust-toolchain refs in ci.yml). Dependabot bumps only the action refs, and
     # that is fine: .github/scripts/check-toolchain-pin.sh fails the `packaging`
     # job until rust-toolchain.toml and Cargo.toml's rust-version move in the
-    # same PR, so the bump cannot land half-applied. Re-add a version-specific
-    # ignore here if MSRV later drops below the stable pin.
+    # same PR, so the bump cannot land half-applied. release.yml pins the action
+    # by SHA and names the version in its `toolchain:` input, which Dependabot
+    # does not touch; the same check holds that input, so the bump PR stays red
+    # until it moves too. Re-add a version-specific ignore here if MSRV later
+    # drops below the stable pin.

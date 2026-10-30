@@ -5484,6 +5484,22 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Release: each job holds the narrowest token, and every action is pinned
+  by SHA (#2771).** `release.yml` grants `contents: read` at the workflow
+  level. Every job that compiles, installs a tool or runs a third-party action
+  can only read. `contents: write` belongs only to `draft`, `upload-assets` and
+  `attach`, which run nothing but `actions/*` and `gh`. `packages: write`
+  belongs only to `docker`. Release notes come from the read-only `tag` job,
+  and the image SBOMs from a new `sbom` job that can only read packages. No
+  checkout in `release.yml` or `security.yml` persists its token. Every action
+  in both, and in the `dashboard-build` composite action, is pinned by commit
+  SHA. `cross`, `git-cliff` and `cargo-nextest` install at fixed versions.
+  `.github/scripts/check-release-hardening.sh` holds these rules in the
+  `packaging` CI job and in pre-commit. `sign-release.sh` refuses an archive
+  signature whose trusted comment does not name the archive. SECURITY.md says
+  that binstall does not check that name, so the GPG-signed `SHA256SUMS` and
+  `decdn self-update` are the rollback-proof paths. Dependabot now also bumps
+  the composite actions' refs.
 - **client: a bundle entry path must be a portable file name, and the CLI
   escapes control characters in the paths it prints (GHSA-jr93-46mf-88wx,
   #2746, #2705).** Windows joins `README`, `README.` and `README` with a

@@ -609,6 +609,16 @@ for a in "${ARCHIVES[@]}"; do
 $MINISIGN_KEY is not that key; cargo binstall would refuse every archive. A release signed by
 another maintainer's key changes the crates' pubkey before tagging (RELEASING.md § The minisign keys).
 minisign said: ${MINISIGN_ERR:-nothing}"
+  # The signed trusted comment is the only thing in a .minisig that names the
+  # archive, and the archive name carries its binary, version and target.
+  # minisign writes it as a `file:<name>` field by default. binstall prints the
+  # comment but compares it with nothing, so a signature without that field
+  # would serve as well under any other archive's name. Read after the -V
+  # above, so the comment is the signed one.
+  comment=$(sed -n 's/^trusted comment: //p' "${a}.minisig")
+  [[ $'\t'"${comment}"$'\t' == *$'\t'"file:${a}"$'\t'* ]] || die \
+    "${a}.minisig has the trusted comment '${comment}', which does not name ${a}.
+A signature must carry minisign's default \`file:<archive>\` field (SECURITY.md § \`cargo binstall\`)."
 done
 echo "    signed ${#ARCHIVES[@]} archives for cargo binstall"
 
