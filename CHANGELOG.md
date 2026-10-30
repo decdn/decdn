@@ -1208,6 +1208,13 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **CLI: `decdn dashboard` keeps each progress bar and gauge beside its row's
+  text (#2776).** A running pull's text changes width on each poll, and near
+  the wrap point its bar jumped between the right side and a line below, so
+  the page reflowed every 2 s. From the `sm` breakpoint up the bar now stays
+  at the right and the text wraps inside its own column; below it the bar
+  sits under the text. The pool and daily-allowance rows get the same layout.
+
 - **sponsord-onramp: the gate page tells a refused check apart from a service
   fault (#2720).** The built-in page showed "Something went wrong. Please
   refresh and try again." for every failed `POST /v1/fund` other than a `409`.
