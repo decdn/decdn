@@ -14,11 +14,13 @@ use super::*;
 #[cfg(target_os = "linux")]
 const EPHEMERAL_PICKS: usize = 5000;
 
-/// How many `bind(…:0)` calls per protocol
-/// [`bind_to_port_zero_never_lands_below_ephemeral_low`] makes. A
+/// How many UDP `bind(…:0)` calls
+/// [`udp_bind_to_port_zero_never_lands_below_ephemeral_low`] makes. A
 /// [`UdpPortClaim`] picks a port below `ephemeral_low()` because the kernel
-/// hands out no port there. On a host whose range starts lower, that premise
-/// fails, and a run this size lands below `ephemeral_low()`.
+/// hands out no UDP port there. Off Linux `ephemeral_low()` is a fixed 49152:
+/// on a host whose range starts 100 ports lower, a run this size lands below it
+/// about six times. On Linux `ephemeral_low()` reads the range the kernel uses,
+/// so the test checks that read.
 const ZERO_BINDS: usize = 1000;
 
 /// The bind `decdn-node`'s `net::bind_reuseaddr` makes for its admin and
@@ -93,20 +95,15 @@ fn udp_claim_is_below_the_ephemeral_range() {
 }
 
 #[test]
-fn bind_to_port_zero_never_lands_below_ephemeral_low() {
+fn udp_bind_to_port_zero_never_lands_below_ephemeral_low() {
     let low = ephemeral_low().unwrap();
     for _ in 0..ZERO_BINDS {
-        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        for port in [
-            tcp.local_addr().unwrap().port(),
-            udp.local_addr().unwrap().port(),
-        ] {
-            assert!(
-                port >= low,
-                "bind(0) got {port}, below ephemeral_low() {low}"
-            );
-        }
+        let port = udp.local_addr().unwrap().port();
+        assert!(
+            port >= low,
+            "bind(0) got {port}, below ephemeral_low() {low}"
+        );
     }
 }
 
