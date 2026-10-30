@@ -21,7 +21,7 @@ name: Release
 # images: it runs the `docker/*` actions and the QEMU and BuildKit images under
 # that token, and it holds no `contents: write`. No checkout persists its
 # token, every action is pinned by commit SHA, and every image an action runs
-# is pinned by digest. .github/scripts/check_release_hardening.py holds the
+# is pinned by digest. .github/scripts/check_workflow_hardening.py holds the
 # pins, the checkouts and which job may write; it does not read `run:` steps.
 on:
   push:
@@ -658,12 +658,47 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Each artifact into its own artifacts/binaries-<target>/, not merged:
+      # in a merge, a file from any artifact the pattern matches could
+      # overwrite a real archive of the same name.
       - name: Download the archives
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: binaries-*
           path: artifacts
-          merge-multiple: true
+
+      # An archive leaves its artifact's directory only if its name carries
+      # the target the artifact is named for, and no two artifacts may carry
+      # one name. An extra artifact therefore either holds a file naming
+      # another target, which fails here, or adds an archive the exact count
+      # below refuses. A step holding the run's artifact token can still
+      # replace a same-named artifact outright; only keeping untrusted code
+      # out of the run closes that, which is why the jobs that build hold a
+      # read-only token.
+      - name: Each archive comes from its own target's artifact
+        working-directory: artifacts
+        shell: bash
+        env:
+          VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          shopt -s nullglob
+          for dir in */; do
+            dir=${dir%/}
+            target=${dir#binaries-}
+            [ "$target" != "$dir" ] || {
+              echo "::error::artifact $dir is not named binaries-<target>"; exit 1; }
+            for f in "$dir"/*; do
+              name=${f#"$dir"/}
+              case "$name" in
+                *-"$VERSION"-"$target".tar.gz | *-"$VERSION"-"$target".zip) ;;
+                *) echo "::error::$name in artifact $dir does not name target $target"
+                   exit 1 ;;
+              esac
+              [ ! -e "$name" ] || { echo "::error::two artifacts carry $name"; exit 1; }
+              mv -- "$f" "$name"
+            done
+            rmdir -- "$dir" || { echo "::error::artifact $dir holds more than archives"; exit 1; }
+          done
 
       # SHA256SUMS ships unsigned from here. `sign-release.sh` re-checks it
       # against the uploaded bytes and signs it with a maintainer key before
@@ -796,12 +831,19 @@ jobs:
 
       # Each Linux artifact carries all four archives; the unpack step below names
       # the ones this image needs and ignores the rest.
-      - name: Download Linux archives
+      # By exact name, one artifact each: a pattern would also merge in any
+      # other artifact it matched.
+      - name: Download the x86_64 Linux archives
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: binaries-*-unknown-linux-gnu
+          name: binaries-x86_64-unknown-linux-gnu
           path: archives
-          merge-multiple: true
+
+      - name: Download the aarch64 Linux archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binaries-aarch64-unknown-linux-gnu
+          path: archives
 
       # dist/<arch>/ is keyed on buildx's TARGETARCH (amd64/arm64) rather than
       # the Rust target triple, so the Dockerfile's COPY needs no branching.
@@ -968,23 +1010,25 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Each artifact into its own images/<artifact>/, not merged, so the loop
+      # below reads every file from the artifact named for its stage and no
+      # other artifact can stand in for it.
       - name: Download digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: image-*
           path: images
-          merge-multiple: true
 
       - name: Download SBOMs
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: sbom-*
           path: images
-          merge-multiple: true
 
       # Names the docker job's four stages, as `sbom`'s matrix does, and
       # requires both files for each, so a stage missing from either upload
       # fails here by name. check-image-name.sh holds this list to the matrix.
+      # `gh release upload` names each asset by its file's basename.
       - name: Upload SBOMs and digests to draft release
         working-directory: images
         shell: bash
@@ -996,7 +1040,8 @@ jobs:
         run: |
           files=()
           for t in decdn-node decdn sponsord sponsord-onramp; do
-            for f in "${t}-image-digest.txt" "${t}-${VERSION}-sbom.spdx.json"; do
+            for f in "image-${t}/${t}-image-digest.txt" \
+                     "sbom-${t}/${t}-${VERSION}-sbom.spdx.json"; do
               [ -s "$f" ] || { echo "::error::$f is missing or empty"; exit 1; }
               files+=( "$f" )
             done

@@ -60,44 +60,47 @@ jobs:
     steps:
       # submodules: recursive — the in-test `forge build` needs the forge-std +
       # openzeppelin-contracts submodules under contracts/lib/.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
       - name: Install mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
         with:
           make-default: false
       # foundry-toolchain directly, not ./.github/actions/foundry-setup: that
       # action saves the shared solc cache, and the SDK's code runs here.
-      - uses: foundry-rs/foundry-toolchain@v1.9.2
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           version: v1.7.1
           cache: false
       # The journeys' cache (same RUSTFLAGS and targets), restored and never
       # saved: the SDK's code runs in this job, so it writes no cache.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: anvil-e2e-journeys
           save-if: false
-      - uses: taiki-e/install-action@v2.87.32
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: cargo-nextest
+          fallback: none
+          tool: cargo-nextest@0.9.149
       - name: Read the pinned TypeScript SDK commit
         id: sdk
         run: echo "sha=$(tr -d '[:space:]' < .github/sdk-typescript.sha)" >> "$GITHUB_OUTPUT"
       - name: Check out the TypeScript SDK
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: decdn/sdk-typescript
           ref: ${{ steps.sdk.outputs.sha }}
           path: sdk-typescript
           persist-credentials: false
-      - uses: pnpm/action-setup@v6.1.0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           package_json_file: sdk-typescript/package.json
-      - uses: actions/setup-node@v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
       - name: Install the SDK's dependencies
@@ -133,35 +136,38 @@ jobs:
     steps:
       # submodules: recursive — the in-test `forge build` needs the forge-std +
       # openzeppelin-contracts submodules under contracts/lib/.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
       - name: Install mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
         with:
           make-default: false
       # foundry-toolchain directly, not ./.github/actions/foundry-setup: that
       # action saves the shared solc cache, and the SDK's code runs here.
-      - uses: foundry-rs/foundry-toolchain@v1.9.2
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           version: v1.7.1
           cache: false
       # The journeys' cache (same RUSTFLAGS and targets), restored and never
       # saved: the SDK's code runs in this job, so it writes no cache.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: anvil-e2e-journeys
           save-if: false
-      - uses: taiki-e/install-action@v2.87.32
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: cargo-nextest
+          fallback: none
+          tool: cargo-nextest@0.9.149
       - name: Read the pinned Python SDK commit
         id: sdk
         run: echo "sha=$(tr -d '[:space:]' < .github/sdk-python.sha)" >> "$GITHUB_OUTPUT"
       - name: Check out the Python SDK
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: decdn/sdk-python
           ref: ${{ steps.sdk.outputs.sha }}
@@ -170,7 +176,7 @@ jobs:
       # No setup-python step: `uv sync` installs the interpreter the SDK's
       # `.python-version` names (3.11). No uv cache: the job runs third-party
       # code, so it saves none.
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: false
       - name: Install the SDK's dependencies

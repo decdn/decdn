@@ -5494,6 +5494,22 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **CI: every workflow pins its actions, tools and checkouts, and release
+  artifacts download by source.** `ci.yml`, `codeql.yml`, `sdk-contract.yml`
+  and the `foundry-setup` composite action now pin every action by commit SHA,
+  as `release.yml` does. `dtolnay/rust-toolchain` is pinned to a commit and
+  names the Rust version in its `toolchain:` input. Every
+  `taiki-e/install-action` tool is installed at a fixed version with
+  `fallback: none`, and no checkout persists its token. The guard is now
+  `.github/scripts/check-workflow-hardening.sh`. It reads every workflow, and
+  each workflow needs a `WRITE_JOBS` row naming the jobs that may write.
+  Dependabot no longer moves the toolchain through action refs: a Rust release
+  arrives as the `deploy/sponsord` `rust:` bump, which `check-toolchain-pin.sh`
+  holds red until every site moves. In `release.yml`, `upload-assets` and
+  `attach` download each artifact into its own directory. An archive must name
+  the target its artifact is named for, and `docker` downloads the two Linux
+  artifacts by exact name. An extra artifact can no longer overwrite a real
+  file in a merged download.
 - **Release: each job holds the narrowest token, and every action is pinned
   by SHA (#2771).** `release.yml` grants `contents: read` at the workflow
   level. Every job that compiles or installs a tool can only read.
@@ -5509,7 +5525,7 @@ since project inception and will roll into the first tagged release.
   `cargo-nextest` install at fixed versions that install-action checksums, with
   no unchecked fallback. `upload-assets` and `attach` refuse to replace the
   assets of a release that is no longer a draft.
-  `.github/scripts/check-release-hardening.sh` holds the action pins, the
+  `.github/scripts/check-workflow-hardening.sh` holds the action pins, the
   checkouts, which job may write, and the digest of every image an action runs,
   in the `packaging` CI job and in pre-commit; it does not read `run:` steps.
   `check-image-name.sh` also holds the `sbom` and `attach` image lists to the
