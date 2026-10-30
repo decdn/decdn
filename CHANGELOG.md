@@ -5486,17 +5486,22 @@ since project inception and will roll into the first tagged release.
 
 - **Release: each job holds the narrowest token, and every action is pinned
   by SHA (#2771).** `release.yml` grants `contents: read` at the workflow
-  level. Every job that compiles, installs a tool or runs a third-party action
-  can only read. `contents: write` belongs only to `draft`, `upload-assets` and
-  `attach`, which run nothing but `actions/*` and `gh`. `packages: write`
-  belongs only to `docker`. Release notes come from the read-only `tag` job,
+  level. Every job that compiles or installs a tool can only read.
+  `contents: write` belongs only to `draft`, `upload-assets` and `attach`,
+  which use no action but `actions/*`. `packages: write` belongs only to
+  `docker`, which runs the `docker/*` actions under it and cannot write release
+  contents. Release notes come from the read-only `tag` job,
   and the image SBOMs from a new `sbom` job that can only read packages. No
   checkout in `release.yml` or `security.yml` persists its token. Every action
   in both, and in the `dashboard-build` composite action, is pinned by commit
-  SHA. `cross`, `git-cliff` and `cargo-nextest` install at fixed versions.
-  `.github/scripts/check-release-hardening.sh` holds these rules in the
-  `packaging` CI job and in pre-commit. `sign-release.sh` refuses an archive
-  signature whose trusted comment does not name the archive. SECURITY.md says
+  SHA. `cross`, `git-cliff` and `cargo-nextest` install at fixed versions that
+  install-action checksums, with no unchecked fallback.
+  `.github/scripts/check-release-hardening.sh` holds the pins, the checkouts
+  and which job may write, in the `packaging` CI job and in pre-commit; it
+  does not read `run:` steps. `check-image-name.sh` also holds the `sbom` and
+  `attach` image lists to the docker matrix. `sign-release.sh` refuses an archive
+  signature whose signed trusted comment, as `minisign -Q` reports it, does
+  not name the archive. SECURITY.md says
   that binstall does not check that name, so the GPG-signed `SHA256SUMS` and
   `decdn self-update` are the rollback-proof paths. Dependabot now also bumps
   the composite actions' refs.

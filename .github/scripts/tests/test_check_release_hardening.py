@@ -126,6 +126,12 @@ def build_repo(
     return tmp_path
 
 
+def write_action(repo: Path, name: str, body: str, filename: str = "action.yml") -> None:
+    path = repo / ".github" / "actions" / name / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
 def errors_for(tmp_path: Path, **kw: str | None) -> list[str]:
     errors, _ = crh.check(build_repo(tmp_path, **kw))
     return errors
@@ -221,7 +227,8 @@ def test_checkout_without_persist_false_fails(tmp_path: Path) -> None:
     security = swap(SECURITY, "        with:\n          persist-credentials: false\n", "")
     errors = errors_for(tmp_path, security=security)
     assert errors == [
-        ".github/workflows/security.yml:10: actions/checkout does not set `persist-credentials: false`"
+        ".github/workflows/security.yml:10: actions/checkout does not set "
+        "`persist-credentials: false` under `with:`"
     ]
 
 
@@ -346,4 +353,210 @@ def test_write_in_security_workflow_fails(tmp_path: Path) -> None:
     assert errors == [
         ".github/workflows/security.yml: job `scan` grants write on ['packages'], but "
         "WRITE_JOBS in check_release_hardening.py allows nothing"
+    ]
+
+
+# ---- shapes the text reader must not skip -------------------------------
+
+
+def test_uses_key_with_a_space_before_the_colon_is_read(tmp_path: Path) -> None:
+    release = swap(RELEASE, f"      - uses: docker/build-push-action@{OTHER_SHA} # v7.4.0\n",
+                   "      - uses : docker/build-push-action@v7\n")
+    errors = errors_for(tmp_path, release=release)
+    assert any("`docker/build-push-action@v7` is not pinned" in e for e in errors), errors
+
+
+def test_quoted_uses_key_is_read(tmp_path: Path) -> None:
+    release = swap(RELEASE, f"      - uses: docker/build-push-action@{OTHER_SHA} # v7.4.0\n",
+                   "      - \"uses\": docker/build-push-action@v7\n")
+    errors = errors_for(tmp_path, release=release)
+    assert any("`docker/build-push-action@v7` is not pinned" in e for e in errors), errors
+
+
+def test_flow_style_step_is_an_error_not_a_skip(tmp_path: Path) -> None:
+    release = swap(RELEASE, f"      - uses: docker/build-push-action@{OTHER_SHA} # v7.4.0\n",
+                   "      - { uses: docker/build-push-action@v7 }\n")
+    errors = errors_for(tmp_path, release=release)
+    assert any("a `uses` key this check cannot read" in e for e in errors), errors
+
+
+def test_four_space_job_indent_is_read(tmp_path: Path) -> None:
+    security = (
+        "permissions:\n    contents: read\njobs:\n    scan:\n        permissions:\n"
+        "            packages: write\n        steps:\n"
+        f"            - uses: aquasecurity/trivy-action@{OTHER_SHA}\n"
+    )
+    errors = errors_for(tmp_path, security=security)
+    assert errors == [
+        ".github/workflows/security.yml: job `scan` grants write on ['packages'], but "
+        "WRITE_JOBS in check_release_hardening.py allows nothing"
+    ]
+
+
+def test_quoted_job_key_is_read(tmp_path: Path) -> None:
+    security = swap(SECURITY, "  scan:\n", "  'scan':\n")
+    security = swap(security, "      packages: read\n", "      packages: write\n")
+    errors = errors_for(tmp_path, security=security)
+    assert any("job `scan` grants write on ['packages']" in e for e in errors), errors
+
+
+def test_line_under_jobs_that_is_not_a_job_is_an_error(tmp_path: Path) -> None:
+    security = swap(SECURITY, "  scan:\n", "  scan: &anchor\n")
+    errors = errors_for(tmp_path, security=security)
+    assert any("is not a job key" in e for e in errors), errors
+
+
+def test_empty_jobs_is_an_error(tmp_path: Path) -> None:
+    security = (
+        "permissions:\n  contents: read\njobs:\n"
+        f"# - uses: aquasecurity/trivy-action@{OTHER_SHA}\n"
+        f"steps:\n  - uses: aquasecurity/trivy-action@{OTHER_SHA}\n"
+    )
+    errors = errors_for(tmp_path, security=security)
+    assert ".github/workflows/security.yml: `jobs:` holds no job" in errors, errors
+
+
+def test_dash_offset_step_is_bounded(tmp_path: Path) -> None:
+    # An earlier step's `persist-credentials: false` must not cover a later
+    # checkout written with extra space after the dash.
+    security = swap(
+        SECURITY,
+        f"      - uses: aquasecurity/trivy-action@{OTHER_SHA} # v0.36.0\n",
+        f"      -   uses: actions/checkout@{SHA}\n",
+    )
+    errors = errors_for(tmp_path, security=security)
+    assert errors == [
+        ".github/workflows/security.yml:13: actions/checkout does not set "
+        "`persist-credentials: false` under `with:`"
+    ]
+
+
+def test_dash_offset_step_with_its_own_persist_passes(tmp_path: Path) -> None:
+    security = swap(
+        SECURITY,
+        f"      - uses: aquasecurity/trivy-action@{OTHER_SHA} # v0.36.0\n",
+        f"      -   uses: actions/checkout@{SHA}\n          with:\n"
+        "            persist-credentials: false\n",
+    )
+    assert errors_for(tmp_path, security=security) == []
+
+
+def test_persist_false_outside_with_does_not_count(tmp_path: Path) -> None:
+    security = swap(SECURITY, "        with:\n          persist-credentials: false\n",
+                    "        env:\n          persist-credentials: false\n", 1)
+    errors = errors_for(tmp_path, security=security)
+    assert len(errors) == 1 and "under `with:`" in errors[0], errors
+
+
+def test_quoted_false_counts(tmp_path: Path) -> None:
+    security = swap(SECURITY, "persist-credentials: false", "persist-credentials: 'false'")
+    assert errors_for(tmp_path, security=security) == []
+
+
+def test_checkout_ref_case_does_not_skip_rule_2(tmp_path: Path) -> None:
+    security = swap(SECURITY, f"      - uses: actions/checkout@{SHA}\n        with:\n"
+                    "          persist-credentials: false\n",
+                    f"      - uses: Actions/Checkout@{SHA}\n")
+    errors = errors_for(tmp_path, security=security)
+    assert len(errors) == 1 and "does not set `persist-credentials: false`" in errors[0], errors
+
+
+def test_flow_mapping_write_on_a_job_fails(tmp_path: Path) -> None:
+    security = swap(SECURITY, "    permissions:\n      contents: read\n      packages: read\n",
+                    "    permissions: { contents: read, packages: write }\n")
+    errors = errors_for(tmp_path, security=security)
+    assert errors == [
+        ".github/workflows/security.yml: job `scan` grants write on ['packages'], but "
+        "WRITE_JOBS in check_release_hardening.py allows nothing"
+    ]
+
+
+def test_flow_mapping_write_at_workflow_level_fails(tmp_path: Path) -> None:
+    security = swap(SECURITY, "permissions:\n  contents: read\njobs:",
+                    "permissions: {contents: write}\njobs:")
+    errors = errors_for(tmp_path, security=security)
+    assert any("workflow-level `permissions:` grants write on contents" in e for e in errors), errors
+
+
+def test_flow_mapping_read_passes(tmp_path: Path) -> None:
+    security = swap(SECURITY, "permissions:\n  contents: read\njobs:",
+                    "permissions: { contents: read }\njobs:")
+    assert errors_for(tmp_path, security=security) == []
+
+
+def test_empty_flow_mapping_grants_nothing(tmp_path: Path) -> None:
+    security = swap(SECURITY, "    permissions:\n      contents: read\n      packages: read\n",
+                    "    permissions: {}\n")
+    assert errors_for(tmp_path, security=security) == []
+
+
+@pytest.mark.parametrize("value", ["*grants", "${{ inputs.perms }}", "write"])
+def test_unreadable_permissions_value_is_an_error(tmp_path: Path, value: str) -> None:
+    security = swap(SECURITY, "    permissions:\n      contents: read\n      packages: read\n",
+                    f"    permissions: {value}\n")
+    errors = errors_for(tmp_path, security=security)
+    assert errors == [
+        ".github/workflows/security.yml:6: a `permissions:` value this check cannot read; "
+        "write the grants as a block or a `{ scope: level }` mapping"
+    ]
+
+
+def test_job_level_write_all_fails(tmp_path: Path) -> None:
+    security = swap(SECURITY, "    permissions:\n      contents: read\n      packages: read\n",
+                    "    permissions: write-all\n")
+    errors = errors_for(tmp_path, security=security)
+    assert any("job `scan` grants write on ['*']" in e for e in errors), errors
+    # write-all includes contents, so the actions-only rule applies too.
+    assert any("job `scan` holds `contents: write` and runs `aquasecurity/" in e
+               for e in errors), errors
+
+
+# ---- local actions --------------------------------------------------------
+
+
+def test_nested_local_action_is_checked(tmp_path: Path) -> None:
+    repo = build_repo(tmp_path, action=ACTION + "    - uses: ./.github/actions/inner\n")
+    write_action(repo, "inner", "runs:\n  steps:\n    - uses: someone/tool@v1\n")
+    errors, _ = crh.check(repo)
+    assert errors == [
+        ".github/actions/inner/action.yml:3: `someone/tool@v1` is not pinned by a 40-hex "
+        "commit SHA (write `owner/repo@<sha> # vX.Y.Z`)"
+    ]
+
+
+def test_self_referencing_local_action_terminates(tmp_path: Path) -> None:
+    repo = build_repo(tmp_path, action=ACTION + "    - uses: ./.github/actions/setup/\n")
+    errors, total = crh.check(repo)
+    assert errors == []
+    assert total == 9
+
+
+def test_local_action_named_action_yaml_is_checked(tmp_path: Path) -> None:
+    repo = build_repo(tmp_path, action=None)
+    write_action(repo, "setup", ACTION.replace(f"@{SHA} # v7.1.0", "@v7.1.0"), "action.yaml")
+    errors, _ = crh.check(repo)
+    assert len(errors) == 1
+    assert errors[0].startswith(".github/actions/setup/action.yaml:5:")
+
+
+def test_checkout_in_local_action_needs_persist_false(tmp_path: Path) -> None:
+    action = ACTION + f"    - uses: actions/checkout@{SHA}\n"
+    errors = errors_for(tmp_path, action=action)
+    assert errors == [
+        ".github/actions/setup/action.yml:6: actions/checkout does not set "
+        "`persist-credentials: false` under `with:`"
+    ]
+
+
+def test_checkout_outside_a_step_list_is_an_error(tmp_path: Path) -> None:
+    # A `uses` that no step dash opens: its `with:` cannot be told from the
+    # enclosing mapping's, so the check refuses it rather than guess.
+    security = swap(
+        SECURITY,
+        "    steps:\n",
+        f"    with:\n      persist-credentials: false\n    uses: actions/checkout@{SHA}\n    steps:\n",
+    )
+    errors = errors_for(tmp_path, security=security)
+    assert errors == [
+        ".github/workflows/security.yml:11: cannot find the step this `uses` belongs to"
     ]

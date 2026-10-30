@@ -7,20 +7,21 @@ name: Release
 # below only to generate the GitHub release notes.
 #
 # This workflow builds and stages; it does not sign and it does not publish.
-# The GitHub Release is created as a *draft* and both container image manifests
-# are pushed untagged, so no NAME a user would pull resolves to anything before a
+# The GitHub Release is created as a *draft* and all four container image
+# manifests are pushed untagged, so no NAME a user would pull resolves to anything before a
 # maintainer has signed it with scripts/sign-release.sh. (A manifest
 # is still fetchable by its digest — untagged is not unreachable — but no tag
 # points at unsigned bytes, and the digest is not advertised anywhere a user
 # would look.) There is no signing key in Actions secrets.
 #
-# The token is scoped per job. Every job that compiles, installs a tool or runs
-# a third-party action holds `contents: read` only. The jobs that write to the
-# draft release (`draft`, `upload-assets`, `attach`) run nothing but GitHub's
-# own `actions/*` and `gh`. `docker` alone holds `packages: write`, because it
-# pushes the images, and it holds no `contents: write`. No checkout persists
-# its token, and every action is pinned by commit SHA.
-# .github/scripts/check_release_hardening.py holds these rules.
+# The token is scoped per job. Every job that compiles or installs a tool holds
+# `contents: read` only. The jobs that write to the draft release (`draft`,
+# `upload-assets`, `attach`) use no action but GitHub's own `actions/*`.
+# `docker` alone holds `packages: write`, because it pushes the images: it runs
+# the `docker/*` actions under that token, and it holds no `contents: write`.
+# No checkout persists its token, and every action is pinned by commit SHA.
+# .github/scripts/check_release_hardening.py holds the pins, the checkouts and
+# which job may write; it does not read `run:` steps.
 on:
   push:
     tags:
@@ -178,6 +179,7 @@ jobs:
         uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: git-cliff@2.14.2
+          fallback: none
 
       # GitHub caps release bodies at 125000 chars. The first release has no
       # prior tag to bound `--latest`, so cliff emits the whole history and
@@ -211,10 +213,10 @@ jobs:
           if-no-files-found: error
 
   # Runs in parallel with build-binaries; both need only `tag`. Nothing reaches
-  # the release or the registry until this job passes: `draft` needs it, and
-  # upload-assets and docker both need `draft`. The build legs' workflow
-  # artifacts exist before verification finishes, but they are run artifacts,
-  # not release assets.
+  # the release or the registry until this job passes: `draft` needs it,
+  # upload-assets needs `draft`, and docker needs upload-assets. The build
+  # legs' workflow artifacts exist before verification finishes, but they are
+  # run artifacts, not release assets.
   verify:
     name: Verify release
     needs: tag
@@ -250,10 +252,15 @@ jobs:
           shared-key: clippy
           save-if: false
 
+      # Each pinned tool is a version the pinned install-action's manifest lists,
+      # which is what makes it check the download's sha256. `fallback: none`
+      # fails the step for a version the manifest lacks, rather than handing it
+      # to cargo-binstall, which installs it unchecked.
       - name: Install cargo-nextest
         uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: cargo-nextest@0.9.150
+          tool: cargo-nextest@0.9.149
+          fallback: none
 
       - name: Pre-release verification
         run: |
@@ -383,13 +390,20 @@ jobs:
         run: |
           notes="$RUNNER_TEMP/notes/release-notes.md"
           [ -s "$notes" ] || { echo "::error::release notes artifact is empty"; exit 1; }
-          if gh release view "$TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/is-draft" 2>/dev/null; then
-            if [ "$(cat "$RUNNER_TEMP/is-draft")" != "true" ]; then
+          # Only "release not found" means there is no draft yet. Any other
+          # failure (an API error, a rate limit) stops here: GitHub allows two
+          # drafts with one tag, so creating a second one would leave the
+          # assets split between them.
+          if is_draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2> "$RUNNER_TEMP/view.err"); then
+            if [ "$is_draft" != "true" ]; then
               echo "::error::release $TAG is already published; refusing to overwrite it"
               exit 1
             fi
             echo "Draft already exists; refreshing its notes."
             gh release edit "$TAG" --notes-file "$notes"
+          elif ! grep -q 'release not found' "$RUNNER_TEMP/view.err"; then
+            echo "::error::cannot read release $TAG: $(cat "$RUNNER_TEMP/view.err")"
+            exit 1
           else
             # A pre-release suffix marks the draft as a pre-release, so it
             # never becomes the "latest" release `decdn self-update` resolves
@@ -490,6 +504,7 @@ jobs:
         uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cross@0.2.5
+          fallback: none
 
       # One `build` per package, not a single `--package a --package b`: one
       # invocation unifies features across every package it selects, so the
@@ -674,6 +689,13 @@ jobs:
                  "${archives[*]}"
             exit 1
           fi
+          # The upload below takes the whole directory, and neither this
+          # manifest nor sign-release.sh covers a file that is not an archive.
+          extra=$(find . -mindepth 1 ! -name '*.tar.gz' ! -name '*.zip')
+          if [ -n "$extra" ]; then
+            echo "::error::the build artifacts hold files that are not archives: ${extra//$'\n'/ }"
+            exit 1
+          fi
           # Bare names, not ./-prefixed: consumers run `sha256sum --check` from
           # the directory they downloaded into, and sign-release.sh matches
           # manifest entries against plain filenames.
@@ -691,8 +713,9 @@ jobs:
     name: Docker image (${{ matrix.target }})
     # Needs build-binaries: each image is assembled from the Linux archives that
     # job produces, so every binary inside it is byte-identical to the one the
-    # signed SHA256SUMS covers. Needs verify, through draft: no image is pushed,
-    # not even untagged, for a release that failed verification. Needs
+    # signed SHA256SUMS covers. Needs verify, through upload-assets and draft:
+    # no image is pushed, not even untagged, for a release that failed
+    # verification. Needs
     # upload-assets: no image is pushed and nothing is attached to the draft
     # unless all fifteen archives and SHA256SUMS reached it first, so a failed
     # run never leaves a draft holding an SBOM and digest for archives it does
@@ -707,8 +730,9 @@ jobs:
       packages: write
     strategy:
       # One leg per image, each a stage of the one Dockerfile. A failed leg
-      # does not cancel the other; sign-release.sh refuses a draft that lacks
-      # any image's digest, so a half-built release cannot be signed.
+      # does not cancel the others, so a re-run repeats only the failed one.
+      # `attach` waits for every leg, so a draft holds all four digests and
+      # SBOMs or none, and sign-release.sh refuses a draft that lacks any.
       # Each image has the same repository path on Docker Hub, which
       # sign-release.sh mirrors its signed digest to.
       fail-fast: false
@@ -866,7 +890,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The docker job's stages. Keep the two lists, and attach's, in step.
+        # The docker job's stages. check-image-name.sh holds this list and
+        # attach's to the docker matrix.
         target: [decdn-node, decdn, sponsord, sponsord-onramp]
     steps:
       - name: Download digest
@@ -875,8 +900,8 @@ jobs:
           name: image-${{ matrix.target }}
           path: image
 
-      # The digest file is the image reference, so this job needs no copy of
-      # the docker job's matrix. The pattern is the one `docker` wrote.
+      # The digest file holds the image reference, so this job needs no copy of
+      # the docker job's `image` names. The pattern is the one `docker` wrote.
       - name: Read image reference
         id: ref
         env:
@@ -935,9 +960,9 @@ jobs:
           path: images
           merge-multiple: true
 
-      # The docker job's four stages, as in `sbom`'s matrix. Each must have
-      # both files, so a leg that failed upstream fails here by name.
-
+      # Names the docker job's four stages, as `sbom`'s matrix does, and
+      # requires both files for each, so a stage missing from either upload
+      # fails here by name. check-image-name.sh holds this list to the matrix.
       - name: Upload SBOMs and digests to draft release
         working-directory: images
         shell: bash

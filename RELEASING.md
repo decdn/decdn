@@ -158,17 +158,20 @@ preview writes nothing and needs no cleanup. Do **not** follow it with
 
 Pushing `v*` starts [`.github/workflows/release.yml`](.github/workflows/release.yml).
 Steps 1–3 gate everything else. After them, the archive builds (step 6) run in
-parallel with the verification (steps 4–5). The asset upload waits for both, and
-the image pushes wait for the asset upload. Every job after step 3 works on the
+parallel with the verification (step 4). The draft (step 5) waits for the
+verification, the asset upload waits for the draft and the builds, and the
+image pushes wait for the asset upload. Every job after step 3 works on the
 commit the tag push named; if the tag has since moved, the run fails rather
 than build another commit.
 
-Each job holds the narrowest token it needs. The jobs that compile, install
-tools or run third-party actions can only read. The three jobs that write to the
-draft (`draft`, `upload-assets`, `attach`) run only GitHub's own actions and
-`gh`. The image push (`docker`) is the one job that can write packages. No
-checkout keeps its token, and every action is pinned by commit SHA. The
-`packaging` CI job holds these rules with
+Each job holds the narrowest token it needs. The jobs that compile or install
+tools can only read. The three jobs that write to the draft (`draft`,
+`upload-assets`, `attach`) use no action but GitHub's own `actions/*`. The
+image push (`docker`) is the one job that can write packages, and it runs the
+`docker/*` actions under that token; it cannot write release contents. No
+checkout keeps its token, every action is pinned by commit SHA, and each tool
+installs at a fixed version with a checked download. The `packaging` CI job
+holds the pins, the checkouts and which job may write with
 `.github/scripts/check-release-hardening.sh`. The workflow:
 
 1. rejects the tag unless it is strict semver (the trigger glob is looser than
@@ -185,7 +188,7 @@ checkout keeps its token, and every action is pinned by commit SHA. The
    for minor bumps while the major is `0`, and for the first release (no prior
    tag to diff against);
 5. creates the GitHub Release as a **draft**, with notes git-cliff generated in
-   step 1's job;
+   the job that runs steps 1–3;
 6. builds fifteen archives (`decdn-node` on five targets, `decdn` on six: the
    same five plus Windows ARM64; `sponsord` and `sponsord-onramp` on the two
    Linux targets) with `--locked`, one job per target, failing a Linux target

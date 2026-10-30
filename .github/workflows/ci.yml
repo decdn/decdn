@@ -1315,7 +1315,7 @@ jobs:
 
       # release.yml only runs on a tag, so a PR that floats one of its actions
       # or widens a job's token would otherwise reach the next release
-      # unchecked.
+      # unchecked. Covers security.yml and their local actions too.
       - name: Release workflows pin actions by SHA and scope their tokens
         run: .github/scripts/check-release-hardening.sh
 
