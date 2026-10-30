@@ -719,7 +719,7 @@ revenue flat while requests arrive; `decdn get` against this node returns
   refusal — that one also carries the hash.
 - `decdn_serve_stream_rejected_signer_floor_at_cap_total`, the sibling counter for
   a refusal where the pool is solvent but ONE capability signer has filled its share
-  of the un-vouchered floor. It rises while `…insufficient_deposit_total` stays flat.
+  of the un-vouchered floor, live or owed. It rises while `…insufficient_deposit_total` stays flat.
   This counter has **no alert rule**: it is dashboard- and log-only, so cause 3
   below is found by looking, not by being paged. The node's own `warn!` for it runs
   on a separate 5-minute window from the deposit line above, so neither arm can
@@ -739,14 +739,16 @@ alone cannot tell the first two apart — this is why the log line exists:
    client that just topped up is refused until the watcher catches up. Funded
    clients are being turned away and will route elsewhere.
 
-3. **One signer is at its live floor cap.** The pool is solvent, but one capability
-   signer is running more concurrent un-vouchered streams than its share of the
-   floor covers
+3. **One signer is at its floor cap.** The pool is solvent, but one capability
+   signer holds more un-vouchered floor than its share covers
    ([ADR 003 § Pool solvency](../adr/003-payments.md#pool-solvency-and-the-refundable-floor-m)).
-   `decdn_serve_stream_rejected_signer_floor_at_cap_total` rises while
+   The floor it holds is its live streams plus the floor debt that its abandoned
+   streams left. `decdn_serve_stream_rejected_signer_floor_at_cap_total` rises while
    `…insufficient_deposit_total` stays flat, and the `warn!` names the signer. The
-   cap holds no permanent charge — it is pure concurrency, released as each of the
-   signer's streams pays, so it clears on its own and needs no top-up or reclaim.
+   live part clears as each of the signer's streams pays. The debt clears only
+   when the signer pays past a stream's own floor; time does not clear it. A
+   restart clears all floor debt, and so does a pool reclaim. A signer that loops
+   through free floors and never pays stays refused, which is the cap working.
    If a signer is honest and legitimately highly concurrent, the operator raises
    `blockchain.pool_floor_signer_live_windows`. That knob is **restart-required** —
    `blockchain.*` is not a reload section, so `decdn node reload` neither applies

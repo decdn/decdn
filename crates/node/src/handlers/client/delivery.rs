@@ -433,6 +433,9 @@ impl ClientHandler {
                     clock.record(&self.metrics);
                 }
                 delivered = delivered.saturating_add(len);
+                if let Some(res) = floor_reservation.as_ref() {
+                    res.track_unpaid(delivered.saturating_sub(*paid));
+                }
                 self.shed.record_egress(len);
                 self.metrics.bytes_served(len);
                 unvouchered = unvouchered.saturating_add(len);
@@ -523,6 +526,9 @@ impl ClientHandler {
                         // window for unsettled bytes.
                         VoucherStop::Continue { credited_bytes } => {
                             *paid = paid.saturating_add(credited_bytes);
+                            if let Some(res) = floor_reservation.as_ref() {
+                                res.track_unpaid(delivered.saturating_sub(*paid));
+                            }
                             if owed.settle(credited_bytes)? {
                                 break;
                             }

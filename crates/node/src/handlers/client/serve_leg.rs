@@ -415,6 +415,9 @@ impl ClientHandler {
                     clock.record(&self.metrics);
                 }
                 delivered = delivered.saturating_add(clen_u64);
+                if let Some(res) = floor_reservation {
+                    res.track_unpaid(delivered.saturating_sub(*paid));
+                }
                 self.shed.record_egress(clen_u64);
                 self.metrics.bytes_served(clen_u64);
                 unvouchered = unvouchered.saturating_add(clen_u64);
@@ -536,6 +539,9 @@ impl ClientHandler {
                                 credited_this_iter =
                                     credited_this_iter.saturating_add(credited_bytes);
                                 *paid = paid.saturating_add(credited_bytes);
+                                if let Some(res) = floor_reservation {
+                                    res.track_unpaid(delivered.saturating_sub(*paid));
+                                }
                                 // Publish the PAID CONTENT frontier for the pull leg's
                                 // `WindowPacer`, mapping paid WIRE back into content
                                 // space (the largest chunk-group boundary provably

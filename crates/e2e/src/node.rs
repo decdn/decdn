@@ -250,9 +250,9 @@ impl NodeFixture {
     /// (`pool_floor_signer_live_windows`) in the daemon's config and restart the
     /// daemon so the new value takes effect.
     ///
-    /// This sizes the per-signer LIVE concurrency cap `k` in ramp-start credit
-    /// windows (ADR 003 § Pool solvency, per-signer floor isolation): the most live
-    /// un-vouchered floor reservation one capability signer may hold underneath the
+    /// This sizes the per-signer floor cap `k` in ramp-start credit windows (ADR 003
+    /// § Pool solvency, per-signer floor isolation): the most live un-vouchered floor
+    /// reservation plus floor debt one capability signer may hold underneath the
     /// per-pool `remaining − M` ceiling. A journey shrinks it so one signer
     /// deterministically fills its own share while the pool stays solvent, without
     /// touching a co-tenant's.

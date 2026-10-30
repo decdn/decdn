@@ -180,14 +180,14 @@ pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Precise sizing per ADR 003 is governance/ops policy, not a build-time
 /// constant.
 pub const DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC: u64 = 1_000_000;
-/// Default per-signer LIVE concurrency cap `k`, in ramp-start credit windows: `8`.
-/// The most live un-vouchered floor reservation any one capability signer may hold
-/// against a pool is `k · one credit window`, underneath the pool-wide `remaining − M`
+/// Default per-signer floor cap `k`, in ramp-start credit windows: `8`.
+/// The most live un-vouchered floor reservation plus floor debt any one capability
+/// signer may hold against a pool is `k · one credit window`, underneath the pool-wide `remaining − M`
 /// ceiling (ADR 003 § Pool solvency, per-signer floor isolation). The window is the
 /// unit rationed — honest need is `concurrent un-vouchered streams × one window`
-/// regardless of pool size — so an absolute count fits it directly. It carries no
-/// permanent memory: it recycles as each stream pays, and never penalizes a signer for
-/// quitting.
+/// regardless of pool size — so an absolute count fits it directly. It recycles as
+/// each stream pays; a stream that ends unpaid leaves floor debt that only payment
+/// clears.
 pub const DEFAULT_POOL_FLOOR_SIGNER_LIVE_WINDOWS: u64 = 8;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
@@ -1642,7 +1642,7 @@ fn resolve_blockchain_into(
         .and_then(|b| b.pool_min_remaining_deposit_micro_usdc)
         .unwrap_or(DEFAULT_POOL_MIN_REMAINING_DEPOSIT_MICRO_USDC);
 
-    // Per-signer LIVE concurrency cap `k`, in credit windows (ADR 003 § Pool
+    // Per-signer floor cap `k`, in credit windows (ADR 003 § Pool
     // solvency, per-signer floor isolation). Any value is legal: the node
     // lower-clamps the cap to one window at use, so `0` behaves as "admit a lone
     // signer's first stream" rather than wedging it — no bound to enforce.

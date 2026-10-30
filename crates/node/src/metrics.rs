@@ -1928,14 +1928,14 @@ pub struct DecdnMetrics {
     /// rising value means clients ask this node for more of a blob than its cap
     /// lets it hold. Visible name: `decdn_serve_stream_midstream_blob_too_large_total`.
     pub serve_stream_midstream_blob_too_large: Counter,
-    /// Delivery refused because ONE capability signer hit its per-signer live
-    /// concurrency cap of un-vouchered reservation, while the pool itself can still
+    /// Delivery refused because ONE capability signer hit its per-signer cap of
+    /// un-vouchered reservation plus floor debt, while the pool itself can still
     /// pay (ADR 003 §Pool solvency, per-signer floor isolation).
-    /// Signed as `NotFound`, because it clears by waiting rather than by funding
-    /// (ADR 005 §Open-time refusal classes), so this counter is the only place
-    /// the reason survives — a rising value means one signer runs
-    /// more concurrent un-vouchered streams than its share covers while the pool as a
-    /// whole is solvent. The two remedies differ: a pool shortfall clears with a
+    /// Signed as `NotFound`, because it clears by the signer's own payment rather
+    /// than by funding the pool (ADR 005 §Open-time refusal classes), so this counter
+    /// is the only place the reason survives — a rising value means one signer runs
+    /// or abandons more un-vouchered streams than its share covers while the pool as
+    /// a whole is solvent. The two remedies differ: a pool shortfall clears with a
     /// top-up, a signer at its share does not. Visible name:
     /// `decdn_serve_stream_rejected_signer_floor_at_cap_total`.
     pub serve_stream_rejected_signer_floor_at_cap: Counter,
@@ -3455,7 +3455,7 @@ recorders! {
     serve_stream_midstream_blob_too_large => serve_stream_midstream_blob_too_large.inc();
 
     /// Record a `serve_stream` delivery refused because this capability signer hit its
-    /// per-signer live concurrency cap of un-vouchered reservation, while the pool as a
+    /// per-signer cap of un-vouchered reservation plus floor debt, while the pool as a
     /// whole can still pay.
     serve_stream_rejected_signer_floor_at_cap => serve_stream_rejected_signer_floor_at_cap.inc();
 

@@ -5484,6 +5484,23 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **node: an abandoned stream's free floor survives the stream as floor debt
+  (#2767).** Every stream opens with a free credit floor of one interval plus
+  the verify lag. When an unpaid stream ended, the node released its
+  reservation and kept nothing, so a client that never paid could take a floor,
+  reset, and repeat: about 100 MiB/s of free download per peer at the default
+  serve limit, with upstream `USDC` fronted on every cache miss. The node now
+  charges the unpaid bytes of a stream that ends before its payment reaches its
+  reserved floor as floor debt, capped at that floor, on the signer and on the
+  pool. Admission counts live floor plus floor debt: against `remaining − M`
+  for the pool (refused `Unfunded`, so rotating signer keys meets the pool
+  bound) and against `k` windows for the signer (refused `NotFound`). Only
+  payment past a stream's own floor clears debt; time does not. The debt is in
+  memory only, so a restart or a pool reclaim forgives it. An honest key that
+  abandons about `k` windows at one node and never pays there again is refused
+  at that node until it restarts. `blockchain.pool_floor_signer_live_windows`
+  keeps its name and now bounds live floor plus floor debt.
+
 - **client: a bundle entry path must be a portable file name, and the CLI
   escapes control characters in the paths it prints (GHSA-jr93-46mf-88wx,
   #2746, #2705).** Windows joins `README`, `README.` and `README` with a
