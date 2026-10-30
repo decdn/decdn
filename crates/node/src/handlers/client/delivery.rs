@@ -529,8 +529,10 @@ impl ClientHandler {
                         // window for unsettled bytes.
                         VoucherStop::Continue { credited_bytes } => {
                             *paid = paid.saturating_add(credited_bytes);
+                            // Reconcile the floor reservation now, before a later
+                            // proof in this batch can fail and end the stream.
                             if let Some(res) = floor_reservation.as_ref() {
-                                res.track_unpaid(delivered.saturating_sub(*paid));
+                                res.reconcile_paid(delivered, *paid);
                             }
                             if owed.settle(credited_bytes)? {
                                 break;
@@ -568,21 +570,6 @@ impl ClientHandler {
                 }
             }
             ensure_unpaid_bytes_tracked(delivered, *paid, unvouchered, &pending)?;
-
-            // Reconcile the pool floor reservation against this stream's live
-            // balance (ADR 003 §Pool solvency). `paid` and `delivered` are BYTE
-            // counters (see their declaration above); the reservation accounts in
-            // µUSDC, so every byte quantity crosses over through `min_payment` —
-            // the two units are never compared directly.
-            if let Some(res) = floor_reservation.as_ref() {
-                // Free the pool's live reservation once cumulative payment reaches the
-                // amount that was reserved (the ramp-floor credit this stream fronts).
-                // Everything above it is self-funded. Matching release to the reserved
-                // µUSDC keeps it correct at any `credit_ramp_divisor` — with the ramp
-                // disabled the reservation is the full `credit_max`, so release waits
-                // for that much paid, not a single interval.
-                res.release_if_repaid(decdn_incentive::min_payment(*paid, rate_per_mb));
-            }
 
             // Done when the whole blob is on the wire and every interval, closing
             // partial included, has been paid.

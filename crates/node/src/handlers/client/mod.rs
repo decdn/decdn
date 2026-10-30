@@ -405,17 +405,15 @@ impl PoolFloorState {
     }
 
     /// Clear up to `amount` of `signer`'s floor debt, and the pool total by the
-    /// same amount. Returns the debt the signer still owes.
-    fn clear_debt(&mut self, signer: Address, amount: U256) -> U256 {
+    /// same amount.
+    fn clear_debt(&mut self, signer: Address, amount: U256) {
         let Some(lane) = self.signers.get_mut(&signer) else {
-            return U256::ZERO;
+            return;
         };
         let cleared = lane.debt.min(amount);
         lane.debt = lane.debt.saturating_sub(cleared);
         self.debt = self.debt.saturating_sub(cleared);
-        let owed = lane.debt;
         self.prune_spent(signer);
-        owed
     }
 
     /// Drop a signer's entry once it carries no information — no live reservation and
@@ -477,12 +475,10 @@ pub(super) struct FloorReservation {
     /// The stream's delivered bytes not yet paid, as the serve loop last reported
     /// them ([`Self::track_unpaid`]). An unrepaid drop charges them as floor debt.
     unpaid_bytes: AtomicU64,
-    /// `µUSDC` of this stream's payment past its own floor that already cleared
-    /// debt, so a later reconcile applies only the new surplus.
+    /// `µUSDC` of this stream's payment past its own floor already offered to the
+    /// signer's debt, so a later reconcile applies only the new surplus and takes
+    /// the accumulator lock only when the surplus grew.
     debt_cleared: AtomicU64,
-    /// Set once a clear finds the signer owes nothing, so a paying stream stops
-    /// taking the accumulator lock on every reconcile.
-    debt_free: AtomicBool,
 }
 
 impl FloorReservation {
@@ -544,7 +540,6 @@ impl FloorReservation {
             repaid: AtomicBool::new(false),
             unpaid_bytes: AtomicU64::new(0),
             debt_cleared: AtomicU64::new(0),
-            debt_free: AtomicBool::new(false),
         }
     }
 
@@ -556,6 +551,23 @@ impl FloorReservation {
     /// value as floor debt.
     pub(super) fn track_unpaid(&self, unpaid_bytes: u64) {
         self.unpaid_bytes.store(unpaid_bytes, Ordering::Relaxed);
+    }
+
+    /// Reconcile the reservation against a voucher that just credited: record the
+    /// unpaid bytes, then release the live reservation and clear floor debt once
+    /// payment reaches the reserved floor ([`Self::release_if_repaid`]). The serve
+    /// loops call this at each credit, before any later proof in the same recoup
+    /// batch can fail, so a stream that paid past its floor never leaves as
+    /// unrepaid.
+    ///
+    /// `delivered` and `paid` are BYTE counters; the reservation accounts in
+    /// `µUSDC`, so payment crosses over through `min_payment` at the stream's rate.
+    /// Matching release to the reserved `µUSDC` keeps it correct at any
+    /// `credit_ramp_divisor`: with the ramp disabled the reservation is the full
+    /// `credit_max`, so release waits for that much paid, not one chunk.
+    pub(super) fn reconcile_paid(&self, delivered: u64, paid: u64) {
+        self.track_unpaid(delivered.saturating_sub(paid));
+        self.release_if_repaid(min_payment(paid, self.rate_per_mb));
     }
 
     /// Mark the reservation repaid: the lane's cumulative payment reached a floor,
@@ -620,11 +632,10 @@ impl FloorReservation {
     }
 
     /// Let `surplus` (cumulative payment past the reserved floor) clear the part of
-    /// the signer's floor debt this guard has not cleared yet.
+    /// the signer's floor debt this guard has not offered yet. Surplus offered while
+    /// the signer owed nothing is spent; surplus that arrives after a sibling stream
+    /// abandons clears that sibling's debt.
     fn clear_debt(&self, surplus: U256) {
-        if self.debt_free.load(Ordering::Relaxed) {
-            return;
-        }
         // µUSDC that overflows `u64` is far above any pool; saturating keeps the
         // tally monotonic.
         let surplus = u64::try_from(surplus).unwrap_or(u64::MAX);
@@ -638,17 +649,14 @@ impl FloorReservation {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Same `get_mut` + epoch filter as `release_live_repaid`: a later pool
         // generation owes nothing to this guard's payment.
-        let owed = guard
+        if let Some(entry) = guard
             .get_mut(&self.pool_id)
             .filter(|entry| entry.epoch == self.epoch)
-            .map_or(U256::ZERO, |entry| {
-                entry.clear_debt(self.signer, U256::from(fresh))
-            });
+        {
+            entry.clear_debt(self.signer, U256::from(fresh));
+        }
         drop(guard);
         self.debt_cleared.store(surplus, Ordering::Relaxed);
-        if owed.is_zero() {
-            self.debt_free.store(true, Ordering::Relaxed);
-        }
     }
 
     /// The floor debt an unrepaid stream leaves: its unpaid bytes priced at its

@@ -542,8 +542,11 @@ impl ClientHandler {
                                 credited_this_iter =
                                     credited_this_iter.saturating_add(credited_bytes);
                                 *paid = paid.saturating_add(credited_bytes);
+                                // Reconcile the floor reservation now, before a
+                                // later proof in this batch can fail and end the
+                                // stream.
                                 if let Some(res) = floor_reservation {
-                                    res.track_unpaid(delivered.saturating_sub(*paid));
+                                    res.reconcile_paid(delivered, *paid);
                                 }
                                 // Publish the PAID CONTENT frontier for the pull leg's
                                 // `WindowPacer`, mapping paid WIRE back into content
@@ -611,19 +614,6 @@ impl ClientHandler {
                 }
             }
             ensure_unpaid_bytes_tracked(delivered, *paid, unvouchered, &pending)?;
-
-            // Reconcile the floor reservation against this stream's live balance now
-            // that `paid` has advanced (mirrors `deliver`). `paid`/`delivered` are BYTE
-            // counters; the reservation accounts in µUSDC, so every byte quantity
-            // crosses over through `min_payment` — never compared directly.
-            if let Some(res) = floor_reservation {
-                // Free the pool's live reservation once cumulative payment reaches the
-                // amount reserved (the ramp-floor credit this stream fronts). Matching
-                // release to the reserved µUSDC keeps it correct at any
-                // `credit_ramp_divisor` — with the ramp disabled the reservation is the
-                // full `credit_max`, so release waits for that much paid, not one chunk.
-                res.release_if_repaid(decdn_incentive::min_payment(*paid, rate_per_mb));
-            }
 
             // Done when the whole range is on the wire and every interval — closing
             // partial included — has been paid. Gating on PAID (not delivered) is

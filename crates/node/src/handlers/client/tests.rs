@@ -1770,6 +1770,70 @@ async fn payment_past_the_floor_clears_floor_debt() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #2767: a stream whose surplus met no debt still clears a sibling's debt
+/// from the surplus it pays afterwards. A paying stream keeps no "owes nothing"
+/// latch, because a sibling can abandon while it is live.
+#[tokio::test]
+async fn a_paying_stream_clears_a_sibling_debt_that_arrives_later() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests_with_signer_policy(&metrics, U256::ZERO, 3).await;
+    let pool = B256::repeat_byte(0x67);
+    let window = handler.one_window(TEST_RATE);
+    let remaining = window.saturating_mul(U256::from(8u64));
+    let reserve = || {
+        handler
+            .try_reserve_floor(pool, TEST_SIGNER, remaining, TEST_RATE, window)
+            .map_err(|e| anyhow::anyhow!("window within the cap: {e:?}"))
+    };
+
+    let paying = reserve()?;
+    let sibling = reserve()?;
+    let half = window / U256::from(2u64);
+    paying.release_if_repaid(window.saturating_add(half));
+    abandon(sibling, CHUNK_BYTES.saturating_mul(4));
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (window, window),
+        "the sibling's abandoned window is owed"
+    );
+    paying.release_if_repaid(window.saturating_add(half).saturating_add(window));
+    anyhow::ensure!(
+        floor_debt(&handler.pool_floor, pool, TEST_SIGNER)? == (U256::ZERO, U256::ZERO),
+        "the surplus paid after the abandon clears the sibling's debt"
+    );
+    drop(paying);
+    Ok(())
+}
+
+/// #2767: a stream reconciled at the credit that took it past its floor is
+/// repaid, so a later exit (a failed proof in the same recoup batch, a
+/// disconnect) charges no debt for the ramp-carried bytes still unpaid.
+#[test]
+fn a_stream_reconciled_past_its_floor_leaves_no_debt() -> anyhow::Result<()> {
+    let map: Arc<std::sync::Mutex<HashMap<B256, PoolFloorState>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let pool = B256::repeat_byte(0x68);
+    let floor = floor_micro(TEST_RATE);
+    let floor_bytes = CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES;
+    let res = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor, TEST_RATE);
+    res.reconcile_paid(CHUNK_BYTES.saturating_mul(4), floor_bytes);
+    drop(res);
+    anyhow::ensure!(
+        lock_floor(&map)?
+            .get(&pool)
+            .is_none_or(|st| st.debt.is_zero() && st.live_reservation.is_zero()),
+        "a stream that paid its floor leaves neither live floor nor debt"
+    );
+
+    let short = FloorReservation::reserve(Arc::clone(&map), pool, TEST_SIGNER, floor, TEST_RATE);
+    short.reconcile_paid(CHUNK_BYTES.saturating_mul(2), CHUNK_BYTES / 2);
+    drop(short);
+    anyhow::ensure!(
+        floor_debt(&map, pool, TEST_SIGNER)? == (floor, floor),
+        "a stream that left before paying its floor owes the floor"
+    );
+    Ok(())
+}
+
 /// #2767: floor debt counts at admission only. The in-flight re-checks read the
 /// live reservation, so a stream already under way is never slowed by another
 /// stream's abandonment.
