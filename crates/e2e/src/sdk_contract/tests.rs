@@ -213,3 +213,69 @@ fn fixtures_refuse_no_flavour() {
     let loopback = loopback_fixture(&Content::new(), "http://x", "x", "t", &[]);
     assert!(loopback.is_err());
 }
+
+/// A suite that runs nothing and reports a fixed outcome.
+struct FakeSuite {
+    flavours: usize,
+    outcome: Outcome,
+}
+
+impl Suite for FakeSuite {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+
+    fn flavours(&self) -> usize {
+        self.flavours
+    }
+
+    async fn run(&self, _: Mode, _: &Path, _: &Path) -> anyhow::Result<Outcome> {
+        Ok(self.outcome)
+    }
+}
+
+fn fake(total: u64, passed: u64) -> FakeSuite {
+    FakeSuite {
+        flavours: 1,
+        outcome: Outcome { total, passed },
+    }
+}
+
+#[tokio::test]
+async fn run_file_refuses_an_empty_suite() {
+    let result = run_file(&fake(0, 0), Mode::Public, &json!({})).await;
+    assert!(result.is_err(), "an empty suite must not pass");
+}
+
+#[tokio::test]
+async fn run_file_refuses_a_partial_pass() {
+    let err = run_file(&fake(3, 2), Mode::Public, &json!({}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("2 of 3"), "{err}");
+}
+
+#[tokio::test]
+async fn run_file_takes_a_full_pass() {
+    run_file(&fake(3, 3), Mode::Public, &json!({}))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn run_refuses_zero_flavours() {
+    let suite = FakeSuite {
+        flavours: 0,
+        ..fake(3, 3)
+    };
+    assert!(run(&suite, Mode::Public).await.is_err());
+}
+
+#[tokio::test]
+async fn run_refuses_more_than_max_flavours() {
+    let suite = FakeSuite {
+        flavours: MAX_FLAVOURS + 1,
+        ..fake(3, 3)
+    };
+    assert!(run(&suite, Mode::Public).await.is_err());
+}
