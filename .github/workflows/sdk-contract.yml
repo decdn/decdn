@@ -81,7 +81,7 @@ jobs:
         with:
           shared-key: anvil-e2e-journeys
           save-if: false
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.87.32
         with:
           tool: cargo-nextest
       - name: Read the pinned TypeScript SDK commit
@@ -154,7 +154,7 @@ jobs:
         with:
           shared-key: anvil-e2e-journeys
           save-if: false
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.87.32
         with:
           tool: cargo-nextest
       - name: Read the pinned Python SDK commit
