@@ -1,12 +1,13 @@
 [advisories]
 version = 2
-# Transitive advisories suppressed with justification. All three are RUSTSEC
+# Transitive advisories suppressed with justification. Three are RUSTSEC
 # "unmaintained" informational notices (not memory-safety / soundness
 # vulnerabilities), each a build-time-only proc-macro or a platform-conditional
-# dep with no runtime exposure in our binaries. None has a reachable patched
-# release. Each entry records the affected crate, why it is safe to suppress, and
-# what to watch for so a future audit knows when the ignore can be dropped.
-# Status as of 2026-07.
+# dep with no runtime exposure in our binaries. RUSTSEC-2026-0387 is a
+# constant-time vulnerability in code our binaries do run; its entry says why it
+# is accepted until upstream moves. None has a reachable patched release. Each
+# entry records the affected crate, why it is suppressed, and what to watch for
+# so a future audit knows when the ignore can be dropped.
 # The `crate -> dep -> dep` chains below are reverse-dependency paths as produced
 # by `cargo tree -i`: read left-to-right as "is depended on by" (the leftmost
 # crate is the flagged one; each `->` points to a crate that pulls in the prior).
@@ -28,6 +29,28 @@ ignore = [
     # via alloy-primitives -> alloy. No fixed release exists. Re-evaluate when
     # alloy-primitives drops paste (tracked upstream in the alloy-rs/core repo).
     "RUSTSEC-2024-0436",
+    # crypto-bigint v0.5.x: constant-time violations (RustSec: subtraction, zero
+    # counting, division and Montgomery multiplication can compile to
+    # secret-dependent branches on some compilers and CPUs). Fixed only in
+    # >=0.7.6; 0.5.5 is the last 0.5 release. Transitive via elliptic-curve 0.13
+    # -> k256 0.13 -> alloy-signer / alloy-signer-local / alloy-primitives ->
+    # alloy. The affected code runs on secrets: k256 0.13 stores each secp256k1
+    # scalar as a crypto-bigint `U256` and does scalar add, subtract, negate and
+    # the `< n` range check with it, so the signing key and the `z + r*d` term of
+    # every ECDSA signature go through it. Scalar multiplication, inversion and
+    # all field and point arithmetic are k256 code, and signing uses no
+    # crypto-bigint division, zero count or Montgomery form. Every
+    # `PrivateKeySigner` signature takes this path: payment vouchers, EIP-712
+    # capabilities, probe and stream `slash_sig`, transactions. A remote peer can
+    # make a node sign through `cdn/probe/v1` and `cdn/client/v1`, but sees the
+    # signing time only through QUIC and scheduler jitter. Whether our builds
+    # contain any such branch is not verified. No alloy release takes k256 0.14
+    # (elliptic-curve 0.14 -> crypto-bigint 0.7): alloy-signer 2.5 and
+    # alloy-primitives 1.7 require k256 ^0.13, and alloy ignores this ID in its
+    # own deny.toml. Re-evaluate when an alloy release moves to k256 0.14
+    # (alloy-rs/core#1147); drop the entry once `cargo tree -i
+    # crypto-bigint@0.5.5` is empty. Tracked in #2796.
+    "RUSTSEC-2026-0387",
     # NOTE: the quick-xml DoS ignores (RUSTSEC-2026-0194 O(N^2) duplicate-attribute
     # check + RUSTSEC-2026-0195 unbounded NsReader namespace allocation) were dropped
     # (#1056) when `plist 1.10` pulled the fixed `quick-xml 0.41.0` — netdev's

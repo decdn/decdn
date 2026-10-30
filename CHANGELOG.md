@@ -5494,6 +5494,16 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Dependencies: `deny.toml` ignores RUSTSEC-2026-0387 (`crypto-bigint`
+  0.5.5 constant-time violations) until alloy moves to `k256` 0.14 (#2796).**
+  The fix ships only in `crypto-bigint` >=0.7.6. The latest alloy
+  (`alloy-signer` 2.5, `alloy-primitives` 1.7) requires `k256 ^0.13`, which
+  pulls `elliptic-curve` 0.13 and `crypto-bigint` 0.5, so no update reaches
+  it. The affected code does run on secrets: `k256` 0.13 does secp256k1
+  scalar add, subtract, negate and range checks with `crypto-bigint`, so
+  every voucher, capability, `slash_sig` and transaction signature passes the
+  signing key through it. The `deny.toml` entry records this exposure and the
+  condition for dropping it. No code, wire, config or ABI change.
 - **Release: each job holds the narrowest token, and every action is pinned
   by SHA (#2771).** `release.yml` grants `contents: read` at the workflow
   level. Every job that compiles or installs a tool can only read.
