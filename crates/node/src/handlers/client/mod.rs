@@ -1668,18 +1668,29 @@ impl ClientHandler {
         self.pool_view.as_ref()?.status(pool_id).await
     }
 
-    /// CACHE-ONLY pool status for the per-voucher-boundary mid-stream solvency
-    /// re-check: never triggers a `getPool` `eth_call`, so it cannot stall the serve
-    /// loop when the RPC is slow. Returns `None` when nothing fresh is cached (the
-    /// re-check then fails open, exactly as on a fetch fault) — a long stream whose
-    /// admission read has aged past the cache TTL simply stops re-checking rather
-    /// than blocking delivery on a fresh read. The on-chain `redeem` remains the
-    /// backstop, and a wider serve-path RPC reduction is tracked separately.
+    /// Non-blocking pool status for the per-voucher-boundary mid-stream solvency
+    /// re-check: it reads [`crate::pool_view::PoolView::cached_status`], which
+    /// never triggers a `getPool` `eth_call`, so it cannot stall the serve loop
+    /// when the RPC is slow. Returns `None` when no pool-view is wired (dev/test,
+    /// no chain) or the view holds no status for the pool; the caller then fails
+    /// open and the on-chain `redeem` is the backstop. A `None` with a view wired
+    /// is a re-check that did not run, so it logs at `debug!` and counts
+    /// `decdn_serve_pool_recheck_skipped_total`.
     pub(super) async fn pool_view_status_cached(
         &self,
         pool_id: B256,
     ) -> Option<crate::pool_view::PoolStatus> {
-        self.pool_view.as_ref()?.cached_status(pool_id).await
+        let view = self.pool_view.as_ref()?;
+        let status = view.cached_status(pool_id).await;
+        if status.is_none() {
+            self.metrics.serve_pool_recheck_skipped();
+            tracing::debug!(
+                %pool_id,
+                "mid-stream pool-solvency re-check skipped: the pool view holds no status \
+                 for this pool; the on-chain redeem is the backstop"
+            );
+        }
+        status
     }
 
     /// The signer's total on-chain `spent` across every provider in `pool_id`, read

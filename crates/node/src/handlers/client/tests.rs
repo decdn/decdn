@@ -1764,6 +1764,68 @@ async fn clamp_lane_to_registration_narrows_the_live_lane_and_persists() -> anyh
     Ok(())
 }
 
+/// Read `decdn_serve_pool_recheck_skipped_total` from `metrics`.
+fn pool_recheck_skipped(metrics: &Metrics) -> anyhow::Result<u64> {
+    let encoded = metrics.encode()?;
+    encoded
+        .lines()
+        .find_map(|line| line.strip_prefix("decdn_serve_pool_recheck_skipped_total "))
+        .ok_or_else(|| anyhow::anyhow!("the skip counter is exported"))?
+        .parse()
+        .map_err(Into::into)
+}
+
+/// A wired pool view that holds no status for the pool skips the mid-stream
+/// pool-solvency re-check, and the skip is counted.
+#[tokio::test]
+async fn pool_recheck_without_a_status_is_counted_as_skipped() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _projection, _dir) = handler_with_projection_view(&metrics).await;
+    let status = handler
+        .pool_view_status_cached(B256::repeat_byte(0x52))
+        .await;
+    assert!(
+        status.is_none(),
+        "the projection holds no status for an unfolded pool"
+    );
+    assert_eq!(pool_recheck_skipped(&metrics)?, 1);
+    Ok(())
+}
+
+/// A pool view that holds a status runs the re-check, so nothing counts as
+/// skipped.
+#[tokio::test]
+async fn pool_recheck_with_a_status_is_not_counted_as_skipped() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let view = Arc::new(FixedPoolView {
+        owner: Address::repeat_byte(0x11),
+    });
+    let (handler, _dir) = handler_with_pool_view(&metrics, view).await;
+    let status = handler
+        .pool_view_status_cached(B256::repeat_byte(0x52))
+        .await;
+    assert!(
+        status.is_some(),
+        "the fixed view holds a status for every pool"
+    );
+    assert_eq!(pool_recheck_skipped(&metrics)?, 0);
+    Ok(())
+}
+
+/// With no pool view wired there is nothing to re-check against, so a `None`
+/// stays silent.
+#[tokio::test]
+async fn pool_recheck_with_no_view_wired_is_not_counted_as_skipped() -> anyhow::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_for_tests(&metrics).await;
+    let status = handler
+        .pool_view_status_cached(B256::repeat_byte(0x52))
+        .await;
+    assert!(status.is_none(), "no view wired reads no status");
+    assert_eq!(pool_recheck_skipped(&metrics)?, 0);
+    Ok(())
+}
+
 /// The mid-stream signer cap-headroom re-check stops a live stream once the
 /// signer drains its shared `cap` at OTHER providers since admission — the drain
 /// the pool-solvency re-check cannot see, because the pool's `remaining` stays

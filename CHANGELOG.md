@@ -4521,6 +4521,13 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **node: `decdn_serve_pool_recheck_skipped_total` counts mid-stream
+  pool-solvency re-checks that did not run (#2630).** When a pool view is wired
+  but holds no status for the pool, the serve loop skips the re-check, logs it
+  at `debug!` and counts it, so an operator can tell a passed check from one
+  that never ran. A node with no pool view wired stays silent. A loopback test
+  now drives a serve-miss stream through the own-origin `serve_leg` loop to an
+  in-band `PoolExhausted` stop.
 - **Release: `cargo binstall` verifies each archive's minisign signature (#2765).**
   `sign-release.sh` now signs every archive with the maintainer minisign key,
   in the same run as `SHA256SUMS.minisig`, and uploads `<archive>.minisig`

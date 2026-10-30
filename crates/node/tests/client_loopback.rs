@@ -6968,6 +6968,125 @@ async fn drained_pool_stops_stream_after_its_floor_is_repaid() -> anyhow::Result
     Ok(())
 }
 
+/// [`drained_pool_stops_stream_after_its_floor_is_repaid`] on a serve MISS: the
+/// node's own fs origin holds the blob and its outboard, so the stream runs
+/// through `serve_via_backend_origin` and the `serve_leg` loop rather than the
+/// cache-hit `deliver` loop. The pool drains to exactly `M` once the stream has
+/// repaid its floor, and the next voucher boundary stops the stream in-band
+/// with `PoolExhausted`.
+#[tokio::test(flavor = "multi_thread")]
+async fn drained_pool_stops_a_serve_miss_stream_after_its_floor_is_repaid() -> anyhow::Result<()> {
+    // 16 MiB = 4 intervals, so the decisive boundary is `!done` and the re-check
+    // runs there.
+    let payload = vec![0xC4u8; 16 * 1024 * 1024];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin_and_outboard(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        U256::from(10_000_000u64),
+        u64::MAX,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    // Nonzero floor-`M`, and the pool drains to EXACTLY `M` — the ADR 003 stop
+    // boundary. `high` covers admission with floors to spare.
+    let m = U256::from(HARNESS_FLOOR_COST);
+    let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (target, server_ep, server_task, metrics) = spawn_handler_server_with_draining_pool(
+        cache,
+        store_dyn,
+        m.saturating_add(U256::from(10_000u64)),
+        m,
+        Arc::clone(&drained),
+        Duration::ZERO,
+        m,
+    )
+    .await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    // Admit (reserves the one floor), take the opening window, park.
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    read_exact_chunks(&mut recv, HARNESS_FLOOR_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    // Pay interval 1 (the pool still reads `high`, so this boundary's re-check
+    // passes) and take the reopened window.
+    pay_cumulative(&mut send, &signer, HARNESS_INTERVAL_BYTES).await?;
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    // Drain to exactly `M`, then pay through interval 2: the payment repays the
+    // reserved floor, the pool's committed ledger is empty, and the boundary
+    // re-check against `remaining = M` stops delivery in-band.
+    drained.store(true, std::sync::atomic::Ordering::Relaxed);
+    pay_cumulative(&mut send, &signer, 2 * HARNESS_INTERVAL_BYTES).await?;
+
+    match tokio::time::timeout(Duration::from_secs(10), read_client_msg(&mut recv)).await?? {
+        ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
+            reason,
+            bundle,
+        }) => {
+            anyhow::ensure!(
+                reason == VoucherRejectReason::PoolExhausted,
+                "expected PoolExhausted, got {reason:?}"
+            );
+            anyhow::ensure!(bundle.is_none(), "PoolExhausted attaches no bundle");
+        }
+        other => anyhow::bail!("expected VoucherRejected {{ PoolExhausted }}, got {other:?}"),
+    }
+
+    // Clean in-band stop, not a QUIC reset: the next read hits the FIN, never
+    // another frame.
+    anyhow::ensure!(
+        tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv))
+            .await?
+            .is_err(),
+        "after PoolExhausted the server finishes the stream; no further frame is sent"
+    );
+    // The serve task meters the stop after the client sees the FIN (it drops
+    // the pull leg first), so wait for the end to be attributed.
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    anyhow::ensure!(
+        counter(
+            &metrics,
+            "decdn_serve_stream_midstream_pool_exhausted_total"
+        )? == 1,
+        "the mid-stream stop must be counted"
+    );
+    // The own-origin spine served the miss: its tier counter fired once, and
+    // the buffered populate never pulled the whole blob.
+    anyhow::ensure!(
+        counter(&metrics, "decdn_local_outboard_serves_total")? == 1,
+        "the miss must route through the own-origin spine"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 0,
+        "the buffered populate must not run, got {} origin fetches",
+        cache_metrics.origin_fetches.get()
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// #2664: a mid-stream `PoolExhausted` follows proofs the node accepted, and
 /// the real client keeps its last proof on it
 /// (`VoucherRejectReason::refuses_proof`, #2662). The node writes the reason
@@ -10588,7 +10707,48 @@ async fn empty_cache_with_fs_origin(
     let dir = origin_dir.path().join(shard);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(hex.as_str()), payload)?;
+    open_empty_cache_over_fs_origin(hash, origin_dir).await
+}
 
+/// [`empty_cache_with_fs_origin`] whose origin also publishes the blob's
+/// `{H}.obao4` outboard, so the own-origin spine (`serve_via_backend_origin`
+/// and its `serve_leg` loop) serves a miss rather than the buffered populate.
+async fn empty_cache_with_fs_origin_and_outboard(
+    payload: &[u8],
+) -> anyhow::Result<(
+    CacheEngine,
+    decdn_cache::Hash,
+    Arc<CacheMetrics>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+)> {
+    let hash = decdn_cache::Hash::new(payload);
+    let encoded = decdn_bao_range::encode_outboard(payload, payload.len() as u64)?;
+    anyhow::ensure!(
+        encoded.hash_hex == hash.to_hex().as_str(),
+        "encoder hash mismatch"
+    );
+    let origin_dir = tempfile::tempdir()?;
+    let shard = origin_dir.path().join(encoded.shard());
+    std::fs::create_dir_all(&shard)?;
+    std::fs::write(shard.join(&encoded.hash_hex), payload)?;
+    std::fs::write(shard.join(encoded.obao4_name()), &encoded.outboard)?;
+    open_empty_cache_over_fs_origin(hash, origin_dir).await
+}
+
+/// Open an empty cache over the filesystem origin at `origin_dir`, which holds
+/// `hash`, with an `Arc<CacheMetrics>` wired. The shared tail of
+/// [`empty_cache_with_fs_origin`] and [`empty_cache_with_fs_origin_and_outboard`].
+async fn open_empty_cache_over_fs_origin(
+    hash: decdn_cache::Hash,
+    origin_dir: tempfile::TempDir,
+) -> anyhow::Result<(
+    CacheEngine,
+    decdn_cache::Hash,
+    Arc<CacheMetrics>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+)> {
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
     let cache_metrics = Arc::new(CacheMetrics::default());
