@@ -1323,6 +1323,14 @@ since project inception and will roll into the first tagged release.
   fixtures by a TCP socket on the same number. `free_ports` and the retry of
   an anvil that died at startup are gone. The `decdn-node` anvil tests and the
   `sponsord` binary anvil test hold their ports the same way.
+- **`decdn-e2e`: the `ports::PortReservation` child-bind tests run off Linux
+  too, and a test checks `ephemeral_low()` against the kernel (#2787).** Off
+  Linux a reservation releases its socket when it is made, because on macOS a
+  held socket blocks the child's `SO_REUSEADDR` bind.
+  `child_binds_a_reservation` and `child_rebinds_a_reservation_after_a_restart`
+  fail on macOS if the reservation holds its socket. A new test makes 1,000 UDP
+  `bind(…:0)` calls and fails if any port lands below `ephemeral_low()`, the
+  start of the range a `ports::UdpPortClaim` stays under.
 - **e2e: `NodeFixture` counts a health answer only from its own daemon
   (#2738).** `wait_healthy` compares the `node_id` in `admin_v1_health` with
   the key in the fixture's data dir. The admin port is picked free and released
