@@ -77,6 +77,7 @@ pub decdn_client::bundle::BundleReport::reused_bytes: u64
 pub decdn_client::bundle::BundleReport::skipped: u64
 pub decdn_client::bundle::BundleReport::spliced_bytes: u64
 pub decdn_client::bundle::BundleReport::warnings: alloc::vec::Vec<alloc::string::String>
+pub decdn_client::bundle::BundleReport::wire_bytes: u64
 #[non_exhaustive] pub struct decdn_client::bundle::EntryFailure
 pub decdn_client::bundle::EntryFailure::error: alloc::string::String
 pub decdn_client::bundle::EntryFailure::path: alloc::string::String
@@ -923,6 +924,7 @@ pub fn decdn_client::PoolLedger::new(decdn_client::Cumulative) -> Self
 pub fn decdn_client::PoolLedger::paid_bytes(&self) -> alloy_primitives::aliases::U256
 pub fn decdn_client::PoolLedger::settlement(&self) -> decdn_client::Cumulative
 pub fn decdn_client::PoolLedger::take_unsaved_rebase(&self) -> core::option::Option<decdn_client::Cumulative>
+pub fn decdn_client::PoolLedger::wire_bytes(&self) -> u64
 pub struct decdn_client::PoolReplaced
 pub decdn_client::PoolReplaced::closed: decdn_incentive::lane::PoolId
 pub decdn_client::PoolReplaced::opened: decdn_incentive::lane::PoolId
