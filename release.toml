@@ -1,12 +1,20 @@
 shared-version = true
 tag-name = "v{{version}}"
-# No pre-release-hook. cargo-release runs hooks once per package with the cwd
-# set to that package's directory, so a `git-cliff --output CHANGELOG.md` hook
-# wrote twelve stray crates/*/CHANGELOG.md files and never touched the root
-# changelog. Those files are untracked, `git reset --hard` does not remove
-# them, and cargo-release refuses to run with a dirty tree — so every release
-# blocked the next one. CHANGELOG.md is maintained per-PR; git-cliff generates
-# the GitHub release notes in .github/workflows/release.yml instead.
+# The hook regenerates CHANGELOG.md with git-cliff, with the version being cut
+# as the newest section, and the release commit carries it: cargo-release
+# commits with `git commit -a`, which stages every modified tracked file, so
+# the regenerated file needs no `git add`. cargo-release runs the hook once per
+# package with that package's directory as cwd, so the command reaches the
+# script through $WORKSPACE_ROOT (cargo-release exports it) and the script
+# writes under it by absolute path; every run writes the same file (the newest
+# heading's date is the clock at the run, and the runs are seconds apart), so
+# one run per released package leaves one file. The hook also runs during a
+# preview (no --execute) with DRY_RUN=true: it renders and checks the changelog
+# but writes nothing, so the preview catches a missing tool or a broken
+# cliff.toml. The same cliff.toml renders the GitHub release notes in
+# .github/workflows/release.yml. The inner quotes keep a workspace path with a
+# space in it whole.
+pre-release-hook = ["bash", "-c", "\"$WORKSPACE_ROOT/scripts/release-changelog.sh\""]
 pre-release-commit-message = "chore(release): v{{version}}"
 push = true
 push-remote = "origin"

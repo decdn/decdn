@@ -139,9 +139,9 @@ pub(crate) fn write_probe_response(
     };
 
     if json {
-        // Quantize `rtt_ms` to ms precision before serialization (see the
-        // CHANGELOG BREAKING note — the #421 manual `{:.3}` format is gone;
-        // serde_json drops insignificant trailing zeros).
+        // Quantize `rtt_ms` to three decimals before serialization; serde_json
+        // drops insignificant trailing zeros, so the field carries at most
+        // microsecond precision.
         let rtt_ms_quantized = (rtt_ms * 1000.0).round() / 1000.0;
         let output = serde_json::json!({
             "hash": hash_hex,
