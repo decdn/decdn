@@ -6662,6 +6662,31 @@ impl decdn_node::pool_view::PoolView for DrainingPoolView {
     }
 }
 
+/// A [`PoolView`](decdn_node::pool_view::PoolView) that admits a funded, open
+/// pool but holds no cached status for it: the production view after the pool
+/// closes under a live stream (the projection forgets a reclaimed pool). Every
+/// mid-stream re-check finds no status, so it is skipped and counted.
+#[derive(Debug)]
+struct ForgottenPoolView {
+    owner: Address,
+    remaining: U256,
+}
+
+#[async_trait]
+impl decdn_node::pool_view::PoolView for ForgottenPoolView {
+    async fn status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        Some(decdn_node::pool_view::PoolStatus {
+            owner: self.owner,
+            remaining: self.remaining,
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        })
+    }
+
+    async fn cached_status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        None
+    }
+}
+
 /// `spawn_handler_server_with_pool` wired with a [`DrainingPoolView`] instead of a
 /// fixed one, so a test can drop the pool's `remaining` mid-stream by flipping the
 /// shared `drained` flag. `pool_min_remaining_deposit` is the floor-`M` the
@@ -6681,12 +6706,42 @@ async fn spawn_handler_server_with_draining_pool(
     tokio::task::JoinHandle<()>,
     Arc<Metrics>,
 )> {
+    let view = Arc::new(DrainingPoolView {
+        owner: operator_addr(),
+        high,
+        low,
+        drained,
+    });
+    spawn_handler_server_with_pool_view(
+        cache,
+        store,
+        view,
+        recheck_interval,
+        pool_min_remaining_deposit,
+    )
+    .await
+}
+
+/// `spawn_handler_server_with_pool` wired with any
+/// [`PoolView`](decdn_node::pool_view::PoolView), a mid-stream re-check cadence
+/// of `recheck_interval`, and the floor-`M` of `pool_min_remaining_deposit`.
+async fn spawn_handler_server_with_pool_view(
+    cache: CacheEngine,
+    store: Arc<dyn PoolStateStore>,
+    view: Arc<dyn decdn_node::pool_view::PoolView>,
+    recheck_interval: Duration,
+    pool_min_remaining_deposit: U256,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    Arc<Metrics>,
+)> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = operator_signer();
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let owner = operator_addr();
     let handler = build_handler_configured(
         server_id,
         &server_eth,
@@ -6696,12 +6751,7 @@ async fn spawn_handler_server_with_draining_pool(
         store,
         RATE_PER_MB,
         |deps| {
-            deps.pool_view = Some(Arc::new(DrainingPoolView {
-                owner,
-                high,
-                low,
-                drained,
-            }));
+            deps.pool_view = Some(view);
             deps.pool_recheck_interval = Some(recheck_interval);
             deps.pool_min_remaining_deposit = pool_min_remaining_deposit;
         },
@@ -6829,12 +6879,7 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
 
     // The stream ended CLEANLY (in-band error then `finish`), not a QUIC reset:
     // the next read hits the FIN as a clean end-of-stream, never another frame.
-    anyhow::ensure!(
-        tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv_b))
-            .await?
-            .is_err(),
-        "after PoolExhausted the server finishes the stream; no further frame is sent"
-    );
+    assert_stream_finished(&mut recv_b).await?;
     support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         counter(
@@ -6868,7 +6913,7 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
 /// this one pins the floor-`M` half, which no committed credit amplifies.
 #[tokio::test(flavor = "multi_thread")]
 async fn drained_pool_stops_stream_after_its_floor_is_repaid() -> anyhow::Result<()> {
-    // 16 MiB = 4 intervals, so the decisive boundary is `!done` and the re-check
+    // 16 MiB = 16 intervals, so the decisive boundary is `!done` and the re-check
     // runs there.
     let payload = vec![0xC3u8; 16 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
@@ -6949,12 +6994,10 @@ async fn drained_pool_stops_stream_after_its_floor_is_repaid() -> anyhow::Result
 
     // Clean in-band stop, not a QUIC reset: the next read hits the FIN, never
     // another frame.
-    anyhow::ensure!(
-        tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv))
-            .await?
-            .is_err(),
-        "after PoolExhausted the server finishes the stream; no further frame is sent"
-    );
+    assert_stream_finished(&mut recv).await?;
+    // The serve task meters a stream's end only after the serve future returns,
+    // which is after the FIN, so wait for the end to be attributed.
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         counter(
             &metrics,
@@ -6971,12 +7014,13 @@ async fn drained_pool_stops_stream_after_its_floor_is_repaid() -> anyhow::Result
 /// [`drained_pool_stops_stream_after_its_floor_is_repaid`] on a serve MISS: the
 /// node's own fs origin holds the blob and its outboard, so the stream runs
 /// through `serve_via_backend_origin` and the `serve_leg` loop rather than the
-/// cache-hit `deliver` loop. The pool drains to exactly `M` once the stream has
-/// repaid its floor, and the next voucher boundary stops the stream in-band
-/// with `PoolExhausted`.
+/// cache-hit `deliver` loop. The pool drains to exactly `M` mid-stream. The
+/// next voucher repays the stream's floor reservation, and that boundary's
+/// re-check (ZERO recheck interval) stops the stream in-band with
+/// `PoolExhausted`.
 #[tokio::test(flavor = "multi_thread")]
 async fn drained_pool_stops_a_serve_miss_stream_after_its_floor_is_repaid() -> anyhow::Result<()> {
-    // 16 MiB = 4 intervals, so the decisive boundary is `!done` and the re-check
+    // 16 MiB = 16 intervals, so the decisive boundary is `!done` and the re-check
     // runs there.
     let payload = vec![0xC4u8; 16 * 1024 * 1024];
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
@@ -7054,14 +7098,10 @@ async fn drained_pool_stops_a_serve_miss_stream_after_its_floor_is_repaid() -> a
 
     // Clean in-band stop, not a QUIC reset: the next read hits the FIN, never
     // another frame.
-    anyhow::ensure!(
-        tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut recv))
-            .await?
-            .is_err(),
-        "after PoolExhausted the server finishes the stream; no further frame is sent"
-    );
-    // The serve task meters the stop after the client sees the FIN (it drops
-    // the pull leg first), so wait for the end to be attributed.
+    assert_stream_finished(&mut recv).await?;
+    // The serve task meters a stream's end only after the serve future returns:
+    // after the FIN, and on this path after it cancels the local pull leg and
+    // joins its thread. Wait for the end to be attributed.
     support::assert_inbound_failures_attributed(&metrics, 1).await?;
     anyhow::ensure!(
         counter(
@@ -7087,6 +7127,117 @@ async fn drained_pool_stops_a_serve_miss_stream_after_its_floor_is_repaid() -> a
     Ok(())
 }
 
+/// A paid stream for `hash` (a `payload_len`-byte blob in `cache`) on a pool the
+/// view admits but no longer holds mid-stream ([`ForgottenPoolView`]). Every
+/// mid-stream re-check (ZERO interval) is skipped: admission counts nothing, the
+/// skips count while the stream runs, and the stream fails open to a clean
+/// `StreamEnd` with no `PoolExhausted` stop. Returns the server's metrics.
+async fn forgotten_pool_stream_runs_to_its_end(
+    cache: CacheEngine,
+    hash: decdn_cache::Hash,
+    payload_len: u64,
+) -> anyhow::Result<Arc<Metrics>> {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id(),
+        signer.address(),
+        operator_addr(),
+        U256::from(10_000_000u64),
+        u64::MAX,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
+
+    let m = U256::from(HARNESS_FLOOR_COST);
+    let view = Arc::new(ForgottenPoolView {
+        owner: operator_addr(),
+        remaining: m.saturating_add(U256::from(10_000u64)),
+    });
+    let (target, server_ep, server_task, metrics) =
+        spawn_handler_server_with_pool_view(cache, store_dyn, view, Duration::ZERO, m).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = binding_ext(&signer, client_node_id)?;
+
+    // Admission reads the view's status, not the cached one, so nothing counts
+    // before the first voucher.
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
+    read_exact_chunks(&mut recv, HARNESS_FLOOR_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_pool_recheck_skipped_total")? == 0,
+        "admission must not count a skipped re-check"
+    );
+
+    let received = pay_and_read_to_end(&mut send, &mut recv, &signer).await?;
+    anyhow::ensure!(
+        received >= payload_len,
+        "expected at least the full {payload_len}-byte blob (wire = content + bao proof), \
+         received {received} bytes"
+    );
+    // Each skip happens before the server sends the window that follows it, so
+    // the count is final once the client reads `StreamEnd`.
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_pool_recheck_skipped_total")? >= 1,
+        "a re-check on a forgotten pool must count as skipped"
+    );
+    anyhow::ensure!(
+        counter(
+            &metrics,
+            "decdn_serve_stream_midstream_pool_exhausted_total"
+        )? == 0,
+        "a skipped re-check fails open; it never stops the stream"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(metrics)
+}
+
+/// A pool that closes under a live cache-hit stream: the `deliver` loop counts
+/// each skipped re-check and serves the stream to its end.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgotten_pool_recheck_is_counted_and_a_cache_hit_stream_completes() -> anyhow::Result<()>
+{
+    // 16 MiB = 16 intervals, so the re-check comes due at boundaries where the
+    // stream is not yet `done`.
+    let payload = vec![0xC5u8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    forgotten_pool_stream_runs_to_its_end(cache, hash, payload.len() as u64).await?;
+    Ok(())
+}
+
+/// A pool that closes under a live serve-miss stream: the own-origin `serve_leg`
+/// loop counts each skipped re-check and serves the stream to its end.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgotten_pool_recheck_is_counted_and_a_serve_miss_stream_completes() -> anyhow::Result<()>
+{
+    let payload = vec![0xC6u8; 16 * 1024 * 1024];
+    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin_and_outboard(&payload).await?;
+    let metrics = forgotten_pool_stream_runs_to_its_end(cache, hash, payload.len() as u64).await?;
+    anyhow::ensure!(
+        counter(&metrics, "decdn_local_outboard_serves_total")? == 1,
+        "the miss must route through the own-origin spine"
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 0,
+        "the buffered populate must not run, got {} origin fetches",
+        cache_metrics.origin_fetches.get()
+    );
+    Ok(())
+}
+
 /// #2664: a mid-stream `PoolExhausted` follows proofs the node accepted, and
 /// the real client keeps its last proof on it
 /// (`VoucherRejectReason::refuses_proof`, #2662). The node writes the reason
@@ -7101,7 +7252,7 @@ async fn drained_pool_stops_a_serve_miss_stream_after_its_floor_is_repaid() -> a
 /// `AmountRegression`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mid_stream_pool_exhausted_keeps_the_proofs_the_node_accepted() -> anyhow::Result<()> {
-    // 16 MiB = 4 intervals, so the boundary after the drain is `!done`.
+    // 16 MiB = 16 intervals, so the boundary after the drain is `!done`.
     let payload: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i % 239) as u8).collect();
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
@@ -7235,7 +7386,7 @@ struct RecheckFixture {
 /// leaves A PARKED holding its floor reservation — so once the pool is drained and
 /// B releases its own floor, A's floor is the pool's committed credit that the
 /// drained `remaining` cannot cover (one `HARNESS_FLOOR_COST`,
-/// `M = 0`). B is 16 MiB (4 intervals), so its first boundary is `!done`.
+/// `M = 0`). B is 16 MiB (16 intervals), so its first boundary is `!done`.
 async fn setup_recheck_holder_and_driven(
     recheck_interval: Duration,
 ) -> anyhow::Result<RecheckFixture> {
@@ -7373,7 +7524,7 @@ async fn pay_and_read_to_end(
 /// A per-voucher-boundary check would trip `PoolExhausted` at B's first boundary
 /// after the drain (that is exactly what
 /// [`mid_stream_pool_drain_stops_with_pool_exhausted`] pins with a ZERO interval),
-/// so B reaching `StreamEnd` across four boundaries proves the check fires at most
+/// so B reaching `StreamEnd` across its 16 intervals proves the check fires at most
 /// once per interval — here zero times.
 #[tokio::test(flavor = "multi_thread")]
 async fn pool_recheck_gated_by_interval_lets_drained_stream_continue() -> anyhow::Result<()> {
@@ -7434,12 +7585,7 @@ async fn pool_recheck_fires_after_interval_on_drained_pool() -> anyhow::Result<(
     }
 
     // Clean in-band stop, not a QUIC reset: the next read hits the FIN.
-    anyhow::ensure!(
-        tokio::time::timeout(Duration::from_secs(5), read_client_msg(&mut fx.recv_b))
-            .await?
-            .is_err(),
-        "after PoolExhausted the server finishes the stream; no further frame is sent"
-    );
+    assert_stream_finished(&mut fx.recv_b).await?;
 
     fx.conn.close(0u32.into(), b"done");
     shutdown([fx.server_task], [&fx.client_ep, &fx.server_ep]).await?;
@@ -12810,6 +12956,20 @@ async fn read_voucher_reject(recv: &mut RecvStream) -> anyhow::Result<(VoucherRe
             other => anyhow::bail!("expected a VoucherRejected, got {other:?}"),
         }
     }
+}
+
+/// Assert `recv` ends in a clean FIN with no further bytes: the server finished
+/// the stream in-band. A reset, a connection loss, or a trailing frame fails it.
+async fn assert_stream_finished(recv: &mut RecvStream) -> anyhow::Result<()> {
+    let rest = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(4096))
+        .await?
+        .map_err(|e| anyhow::anyhow!("expected a clean FIN, got {e}"))?;
+    anyhow::ensure!(
+        rest.is_empty(),
+        "expected a clean FIN, got {} more bytes",
+        rest.len()
+    );
+    Ok(())
 }
 
 /// Assert `recv` observes a QUIC reset (or connection close) carrying `code`,

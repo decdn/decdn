@@ -777,8 +777,8 @@ async fn lane_owner_sig(handler: &ClientHandler, key: &LaneKey) -> Option<[u8; 6
 }
 
 /// A [`crate::pool_view::PoolView`] returning a fixed owner (and unbounded
-/// remaining, so the floor-`M` gate never interferes) for the capability
-/// owner-verification test.
+/// remaining, so the floor-`M` gate never interferes) for every pool, for the
+/// tests that need a wired view holding a live status.
 #[derive(Debug)]
 struct FixedPoolView {
     owner: Address,
@@ -1770,9 +1770,19 @@ fn pool_recheck_skipped(metrics: &Metrics) -> anyhow::Result<u64> {
     encoded
         .lines()
         .find_map(|line| line.strip_prefix("decdn_serve_pool_recheck_skipped_total "))
-        .ok_or_else(|| anyhow::anyhow!("the skip counter is exported"))?
+        .ok_or_else(|| anyhow::anyhow!("decdn_serve_pool_recheck_skipped_total is not exported"))?
         .parse()
         .map_err(Into::into)
+}
+
+/// The lane and blob a pool re-check unit test names.
+fn recheck_stream() -> (LaneKey, Hash) {
+    let lane = LaneKey {
+        pool_id: B256::repeat_byte(0x52),
+        signer: Address::repeat_byte(0x11),
+        provider: Address::repeat_byte(0x22),
+    };
+    (lane, Hash::new(b"pool re-check"))
 }
 
 /// A wired pool view that holds no status for the pool skips the mid-stream
@@ -1781,9 +1791,8 @@ fn pool_recheck_skipped(metrics: &Metrics) -> anyhow::Result<u64> {
 async fn pool_recheck_without_a_status_is_counted_as_skipped() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (handler, _projection, _dir) = handler_with_projection_view(&metrics).await;
-    let status = handler
-        .pool_view_status_cached(B256::repeat_byte(0x52))
-        .await;
+    let (lane, hash) = recheck_stream();
+    let status = handler.pool_view_status_cached(&lane, &hash).await;
     assert!(
         status.is_none(),
         "the projection holds no status for an unfolded pool"
@@ -1801,9 +1810,8 @@ async fn pool_recheck_with_a_status_is_not_counted_as_skipped() -> anyhow::Resul
         owner: Address::repeat_byte(0x11),
     });
     let (handler, _dir) = handler_with_pool_view(&metrics, view).await;
-    let status = handler
-        .pool_view_status_cached(B256::repeat_byte(0x52))
-        .await;
+    let (lane, hash) = recheck_stream();
+    let status = handler.pool_view_status_cached(&lane, &hash).await;
     assert!(
         status.is_some(),
         "the fixed view holds a status for every pool"
@@ -1818,9 +1826,8 @@ async fn pool_recheck_with_a_status_is_not_counted_as_skipped() -> anyhow::Resul
 async fn pool_recheck_with_no_view_wired_is_not_counted_as_skipped() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (handler, _dir) = handler_for_tests(&metrics).await;
-    let status = handler
-        .pool_view_status_cached(B256::repeat_byte(0x52))
-        .await;
+    let (lane, hash) = recheck_stream();
+    let status = handler.pool_view_status_cached(&lane, &hash).await;
     assert!(status.is_none(), "no view wired reads no status");
     assert_eq!(pool_recheck_skipped(&metrics)?, 0);
     Ok(())

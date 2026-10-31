@@ -2452,9 +2452,11 @@ pub struct DecdnMetrics {
     pub serve_stream_midstream_pool_exhausted: Counter,
     /// `decdn_serve_pool_recheck_skipped_total`: mid-stream pool-solvency
     /// re-checks that did not run because the wired pool view holds no status
-    /// for the pool. The stream continues and the on-chain `redeem` is the
-    /// backstop, so a check that passed and a check that never ran differ only
-    /// here.
+    /// for the pool. The view drops a pool only once it is closed, so a skip
+    /// means the pool closed under a live stream: the stream continues, and
+    /// `redeemMany` reverts on a closed pool, so the node is not paid for the
+    /// bytes after the close. Counted per re-check, so one affected stream adds
+    /// one count per re-check interval.
     pub serve_pool_recheck_skipped: Counter,
 }
 
