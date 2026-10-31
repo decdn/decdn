@@ -2078,8 +2078,10 @@ impl<P: Provider + Clone> PullCtx<P> {
         let replaced_before = self.recovery.replacements().len();
         // The lanes outlive one pull (a manifest fetch or an earlier pull of
         // this puller drew on them), so this pull's payment is what the
-        // lanes' paid bytes grew by while it ran.
+        // lanes' paid bytes grew by while it ran. Its wire bytes are what the
+        // lanes' wire bytes grew by, measured the same way.
         let paid_before = self.ledgers.paid_bytes();
+        let wire_before = self.ledgers.wire_bytes();
         // A halt lasts one pass ([`run_groups`]). Clear it as each pass starts
         // and ends, so it halts neither the next pass, nor a later manifest
         // fetch or pull of this puller, nor a pull after one its caller
@@ -2090,13 +2092,16 @@ impl<P: Provider + Clone> PullCtx<P> {
             .await;
         self.stop = self.stop.next_pass();
         let mut paid = self.ledgers.paid_bytes().saturating_sub(paid_before);
+        let mut wire = self.ledgers.wire_bytes().saturating_sub(wire_before);
         let rerun = replaced_pool(&run);
         if let Some(new) = rerun {
             if let Some(observer) = &self.observer {
                 observer.pool_replaced(&new);
             }
-            // Every lane in the fresh registry counts from its own seed, so
-            // the second pass's payment is the new registry's whole total.
+            // Every lane in the fresh registry is built during this pass: its
+            // paid bytes count from its seed and its wire bytes from zero, so
+            // the second pass's payment and wire bytes are the new registry's
+            // whole totals.
             start_pass_on_new_pool(&self.recovery, &mut self.ledgers, &mut self.funding);
             let saved = skip_cache::load(out_root);
             let second = self
@@ -2105,6 +2110,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             self.stop = self.stop.next_pass();
             run = merge_passes(run, second);
             paid = paid.saturating_add(self.ledgers.paid_bytes());
+            wire = wire.saturating_add(self.ledgers.wire_bytes());
         }
         let PullRun {
             outcomes,
@@ -2118,6 +2124,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         let dedup = self.dedup_stats.take();
         let mut report = bundle_report(&outcomes, transfer, dedup, warnings);
         report.paid_bytes = u64::try_from(paid).unwrap_or(u64::MAX);
+        report.wire_bytes = wire;
         let replaced = self
             .recovery
             .replacements()
