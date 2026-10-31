@@ -283,8 +283,8 @@ fn transfer_line_shows_paid_unless_nothing_moved() {
     assert_eq!(transfer_line(0, 2_000, 0), "downloaded 0 B (paid 2.0 KB)");
 }
 
-/// #2444: the wire bytes that arrived and were never paid for get their own
-/// line, and only when there are some.
+/// #2444: the wire bytes received beyond those paid for get their own line,
+/// only when wire bytes exceed paid bytes.
 #[test]
 fn unpaid_wire_line_shows_only_wire_bytes_above_paid() {
     assert_eq!(unpaid_wire_line(2_000, 2_000), None);
@@ -292,7 +292,7 @@ fn unpaid_wire_line_shows_only_wire_bytes_above_paid() {
     assert_eq!(unpaid_wire_line(0, 0), None);
     assert_eq!(
         unpaid_wire_line(3_500, 2_000).as_deref(),
-        Some("received 3.5 KB on the wire, 1.5 KB of it never verified or paid")
+        Some("received 3.5 KB on the wire, 1.5 KB more than paid for")
     );
 }
 

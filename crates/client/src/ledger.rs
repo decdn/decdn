@@ -549,8 +549,8 @@ pub struct PoolLedger {
     /// upstream lane, a gateway's shared payer) from holding every response it
     /// ever read.
     evidence: OnceLock<Arc<LaneEvidence>>,
-    /// The wire bytes that arrived on this lane's streams, verified or not
-    /// ([`Self::wire_bytes`]).
+    /// The `ChunkData` payload bytes this lane's streams read, verified or
+    /// not ([`Self::wire_bytes`]).
     wire: AtomicU64,
 }
 
@@ -805,18 +805,19 @@ impl PoolLedger {
             .saturating_sub(pipeline.baseline.bytes)
     }
 
-    /// The wire bytes that arrived on this lane's streams since the ledger
-    /// was built, verified or not. [`Self::paid_bytes`] counts what the
-    /// proofs paid for, and payment follows verification, so this figure
-    /// also holds the bytes that arrived and never verified: frames past a
-    /// stream's verified frontier when it stops at a split or faults. Those
-    /// bytes are never paid for.
+    /// The `ChunkData` payload bytes (bao content plus proof) this lane's
+    /// streams read since the ledger was built, verified or not: the frames
+    /// a stream takes in and the frames it reads and drops. Message framing
+    /// and transport overhead do not count. [`Self::paid_bytes`] counts what
+    /// the proofs paid for, and payment follows verification, so this figure
+    /// also holds bytes that no proof pays for. For example, frames past a
+    /// stream's verified frontier when it stops at a split or faults.
     #[must_use]
     pub fn wire_bytes(&self) -> u64 {
         self.wire.load(Ordering::Relaxed)
     }
 
-    /// Count `n` wire bytes that arrived on one of this lane's streams.
+    /// Count `n` wire bytes that one of this lane's streams read.
     pub(crate) fn note_wire(&self, n: u64) {
         self.wire.update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             v.saturating_add(n)

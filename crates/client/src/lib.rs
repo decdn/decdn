@@ -3340,8 +3340,11 @@ impl UpstreamPull {
         VoucherProgress::from_ledger(&self.ledger, self.ctx.prior_amount)
     }
 
-    /// Count `len` wire bytes that arrived on this stream: they grow its
-    /// received total and the lane's [`PoolLedger::wire_bytes`] together.
+    /// Take in `len` wire bytes that arrived on this stream: they grow its
+    /// received total and the lane's [`PoolLedger::wire_bytes`] together. A
+    /// frame the stream reads and drops counts on the ledger alone
+    /// ([`PoolLedger::note_wire`]), so the received total keeps meaning what
+    /// the stream took in.
     fn take_in(&mut self, len: u64) {
         self.cumulative = self.cumulative.saturating_add(len);
         self.ledger.note_wire(len);
@@ -3665,13 +3668,16 @@ impl UpstreamPull {
         // The frames it passes over stay under the same ceilings as the ones it
         // takes in (`next_chunk`): an honest node sends no byte past the
         // request's promised wire length, and our own received-byte ceiling
-        // stops the pull as it would on any read.
+        // stops the pull as it would on any read. They arrived, so they count
+        // as the lane's wire bytes, though the stream never takes them in.
         let mut skipped: u64 = 0;
         let terminal = tokio::time::timeout(TERMINAL_AFTER_WRITE_TIMEOUT, async {
             loop {
                 match self.read_under_floor().await {
                     Ok(ClientMessage::ChunkData(chunk)) => {
-                        skipped = skipped.saturating_add(chunk.bytes().len() as u64);
+                        let len = chunk.bytes().len() as u64;
+                        self.ledger.note_wire(len);
+                        skipped = skipped.saturating_add(len);
                         let seen = self.cumulative.saturating_add(skipped);
                         if seen > self.expected_wire_bytes {
                             anyhow::bail!(
@@ -3770,7 +3776,8 @@ impl UpstreamPull {
             let msg = self.read_under_floor().await?;
             match msg {
                 ClientMessage::StreamEnd => self.ended = true,
-                ClientMessage::ChunkData(_) => {
+                ClientMessage::ChunkData(chunk) => {
+                    self.ledger.note_wire(chunk.bytes().len() as u64);
                     anyhow::bail!("server sent ChunkData after the promised total")
                 }
                 // The closing voucher was committed optimistically when it was sent
@@ -3868,7 +3875,8 @@ impl UpstreamPull {
     /// takes in counts as received, as in [`Self::next_chunk`]; no decoder
     /// verifies it, so no voucher pays for it. A frame past the request's
     /// promised wire length or past our received-byte ceiling ends the read:
-    /// an honest node sends neither. `None` once nothing more has arrived, on
+    /// an honest node sends neither. That frame counts as wire bytes on the
+    /// lane, but not as received. `None` once nothing more has arrived, on
     /// any other message, or on a read fault: the caller closes the stream
     /// either way.
     fn arrived_rejection(&mut self) -> Option<anyhow::Error> {
@@ -3880,6 +3888,7 @@ impl UpstreamPull {
                     if seen > self.expected_wire_bytes
                         || (self.max_received_wire > 0 && seen > self.max_received_wire)
                     {
+                        self.ledger.note_wire(len);
                         return None;
                     }
                     self.take_in(len);

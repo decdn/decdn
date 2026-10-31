@@ -2078,8 +2078,8 @@ impl<P: Provider + Clone> PullCtx<P> {
         let replaced_before = self.recovery.replacements().len();
         // The lanes outlive one pull (a manifest fetch or an earlier pull of
         // this puller drew on them), so this pull's payment is what the
-        // lanes' paid bytes grew by while it ran. Its wire bytes are taken
-        // the same way.
+        // lanes' paid bytes grew by while it ran. Its wire bytes are what the
+        // lanes' wire bytes grew by, measured the same way.
         let paid_before = self.ledgers.paid_bytes();
         let wire_before = self.ledgers.wire_bytes();
         // A halt lasts one pass ([`run_groups`]). Clear it as each pass starts
@@ -2098,7 +2098,8 @@ impl<P: Provider + Clone> PullCtx<P> {
             if let Some(observer) = &self.observer {
                 observer.pool_replaced(&new);
             }
-            // Every lane in the fresh registry counts from its own seed, so
+            // Every lane in the fresh registry is built during this pass: its
+            // paid bytes count from its seed and its wire bytes from zero, so
             // the second pass's payment and wire bytes are the new registry's
             // whole totals.
             start_pass_on_new_pool(&self.recovery, &mut self.ledgers, &mut self.funding);

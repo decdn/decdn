@@ -855,8 +855,8 @@ pub enum BundleEnd {
 
 /// What a bundle pull did. Counts are per entry, and `fetched`, `linked`,
 /// `skipped`, `reused`, `failed` and `not_run` add up to the manifest's entry
-/// count. Every byte total but
-/// [`Self::paid_bytes`] is content bytes and leaves out the bao proof
+/// count. Every byte total but [`Self::paid_bytes`] and
+/// [`Self::wire_bytes`] is content bytes and leaves out the bao proof
 /// overhead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -888,12 +888,14 @@ pub struct BundleReport {
     /// that fails or is interrupted counts here but not in `downloaded`; a
     /// later pull resumes its `.partial` and reports it as `resumed_bytes`.
     pub paid_bytes: u64,
-    /// The wire bytes that arrived on this pull's lanes, verified or not,
+    /// The `ChunkData` wire bytes this pull's lanes read, verified or not,
     /// summed over every lane ([`crate::PoolLedger::wire_bytes`]). They
-    /// include the bao proof overhead. Payment follows verification, so the
-    /// bytes that arrived and never verified count here and not in
-    /// `paid_bytes`: frames past a steal split, or past a lane's verified
-    /// frontier before a fault.
+    /// include the bao proof overhead. Payment follows verification, so this
+    /// figure holds bytes that no proof pays for: for example, frames past a
+    /// steal split, or past a stream's verified frontier before a fault. A
+    /// leg that ends early can also leave verified bytes unpaid. A voucher
+    /// armed before this pull can confirm during it, so `paid_bytes` can come
+    /// out above this figure.
     pub wire_bytes: u64,
     /// The bytes written to disk: every landed copy of every blob.
     pub reconstructed: u64,
