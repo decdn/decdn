@@ -1208,6 +1208,8 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+- **Client docs: clarify that a stopped multi-source pull pays only for verified bytes (#2803).** The multi-source ADR and client comments now distinguish verified bytes from frames that arrive beyond a stolen range split.
+
 - **CLI: `decdn dashboard` keeps a row's progress bar or gauge in one place
   as its text changes (#2776).** A running pull's text changes width on each
   poll, and near the wrap point its bar switched between the right side and a
