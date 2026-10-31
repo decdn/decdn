@@ -17,7 +17,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use iroh_blobs::Hash;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use super::{Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
@@ -37,9 +37,9 @@ pub(super) use decdn_bao_range::OBAO4_SUFFIX;
 /// [`Origin`] impl).
 #[derive(Debug, Clone)]
 pub struct FilesystemOrigin {
-    /// Canonicalized at construction so the per-fetch containment check
-    /// compares two resolved paths — see [`Self::new`] and the
-    /// canonicalize step in [`Origin::fetch`].
+    /// Canonicalized at construction so the per-read containment check
+    /// compares two resolved paths — see [`Self::new`] and
+    /// [`Self::resolve_regular`].
     base: PathBuf,
 }
 
@@ -48,10 +48,10 @@ impl FilesystemOrigin {
     /// exist or isn't a directory — a typo in the config shouldn't surface
     /// as a per-request miss.
     ///
-    /// `base` is canonicalized so the per-request containment check in
-    /// [`Origin::fetch`] can compare a resolved blob path against a
-    /// resolved root. Without this, an operator who configured the origin
-    /// via a symlinked path would have every fetch look "outside" itself.
+    /// `base` is canonicalized so the per-read containment check can
+    /// compare a resolved blob path against a resolved root. Without this,
+    /// an operator who configured the origin via a symlinked path would
+    /// have every read look "outside" itself.
     pub async fn new(base: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let base = base.into();
         let meta = tokio::fs::metadata(&base)
@@ -96,6 +96,72 @@ impl FilesystemOrigin {
             .join(shard)
             .join(format!("{}{OBAO4_SUFFIX}", hex.as_str()))
     }
+
+    /// Resolve `path` to a regular file inside `base`, before anything
+    /// opens it. `fetch`, `fetch_range_data`, `fetch_outboard` and `size`
+    /// all go through here.
+    ///
+    /// A symlink dropped into the shard tree by an operator mistake or
+    /// compromised tooling could otherwise turn a content-addressed read
+    /// into an arbitrary-file read of anything the process can see — and
+    /// the engine's BLAKE3 check happens *after* the bytes already left the
+    /// disk, so it is not a defense for what got read in the first place.
+    /// The path is canonicalized and the result must sit under the
+    /// (already-canonical) base; an escape is a permanent failure.
+    ///
+    /// The resolved path is then stat'ed and must be a regular file. A
+    /// FIFO blocks `open` until a writer appears, and a device reports a
+    /// zero length but may never end when read. This check keeps out a
+    /// FIFO or device inside the base; a symlink out to `/dev` already
+    /// fails containment. The stat never opens the file, so it cannot
+    /// block.
+    ///
+    /// A path swapped between this stat and the caller's open is not
+    /// covered here. `fetch` and `fetch_outboard` re-check the type on the
+    /// opened file, which catches a device but not a FIFO: the open blocks
+    /// on a FIFO first. `fetch_range_data` and `size` do not re-check.
+    ///
+    /// `Ok(None)` means the path (or its symlink target) does not exist.
+    /// Each caller maps that to its own "absent" answer.
+    async fn resolve_regular(
+        &self,
+        path: &Path,
+    ) -> Result<Option<(PathBuf, std::fs::Metadata)>, OriginPullError> {
+        let canonical = match tokio::fs::canonicalize(path).await {
+            Ok(p) => p,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                let msg = format!(
+                    "cache.origin.path canonicalize failed for {}",
+                    path.display()
+                );
+                return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+            }
+        };
+        if !canonical.starts_with(&self.base) {
+            return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                "cache.origin.path entry {} resolves to {} which is outside base {}",
+                path.display(),
+                canonical.display(),
+                self.base.display()
+            )));
+        }
+        let meta = match tokio::fs::metadata(&canonical).await {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                let msg = format!("cache.origin.path stat failed for {}", canonical.display());
+                return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+            }
+        };
+        if !meta.is_file() {
+            return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                "cache.origin.path entry {} is not a regular file",
+                canonical.display()
+            )));
+        }
+        Ok(Some((canonical, meta)))
+    }
 }
 
 /// Classify a filesystem `io::Error` as transient or permanent. Most FS
@@ -104,11 +170,12 @@ impl FilesystemOrigin {
 /// answer. The handful of error kinds the kernel uses for "the syscall
 /// got interrupted, try again" are retriable.
 ///
-/// `NotFound` is intentionally not handled here — the call sites
-/// convert it to [`OriginFetch::NotFound`] before reaching this helper.
-/// Symlink-escape is *also* not an `io::Error` and never reaches this
-/// helper — it's detected by path comparison after `canonicalize` and
-/// emits `OriginPullError::Permanent` directly at the call site.
+/// `NotFound` is intentionally not handled here: a `NotFound` path lookup
+/// is `Ok(None)` from [`FilesystemOrigin::resolve_regular`], and each read
+/// maps that, and a `NotFound` open, to its own absent answer. A symlink
+/// escape and a non-regular file are not `io::Error`s either:
+/// `resolve_regular`, and the re-checks on the opened file in `fetch` and
+/// `fetch_outboard`, emit `OriginPullError::Permanent` directly.
 fn classify_io_error(err: std::io::Error) -> OriginPullError {
     use std::io::ErrorKind;
     match err.kind() {
@@ -160,52 +227,23 @@ impl Origin for FilesystemOrigin {
         max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
-            let path = self.path_for(hash);
-
-            // Resolve symlinks before touching the file. A symlink dropped
-            // into the shard tree by an operator mistake or compromised
-            // tooling could otherwise turn a content-addressed read into
-            // an arbitrary-file read of anything the process can see —
-            // and the engine's BLAKE3 check happens *after* the bytes
-            // already left the disk, so it is not a defense for what got
-            // read in the first place. We canonicalize and require the
-            // result to sit under the (already-canonical) base.
-            let canonical = match tokio::fs::canonicalize(&path).await {
-                Ok(p) => p,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(OriginFetch::NotFound);
-                }
-                Err(err) => {
-                    let path_msg = format!(
-                        "cache.origin.path canonicalize failed for {}",
-                        path.display()
-                    );
-                    return Err(classify_io_error(err).map_inner(|e| e.context(path_msg)));
-                }
+            let Some((canonical, _)) = self.resolve_regular(&self.path_for(hash)).await? else {
+                return Ok(OriginFetch::NotFound);
             };
-            if !canonical.starts_with(&self.base) {
-                // Symlink escape: deterministic permanent failure.
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin.path entry {} resolves to {} which is outside base {}",
-                    path.display(),
-                    canonical.display(),
-                    self.base.display()
-                )));
-            }
 
             // Open once and stat via the file handle (fstat), so the
             // metadata we check and the bytes we read come from the
-            // same inode. A pair of `tokio::fs::metadata` + `tokio::fs::read`
-            // on the same path leaves a TOCTOU window where the path
-            // could be swapped for a much larger file or a different
-            // symlink between the two syscalls — the size cap would
-            // run on stale metadata. Holding the fd avoids that, and
-            // also saves a redundant path traversal.
+            // same inode. The size cap does not use the stat from
+            // `resolve_regular`: the path could be swapped for a larger
+            // file or a different symlink before the open. The fstat
+            // re-checks the size and file type of what was opened. It
+            // does not re-check containment, and it cannot catch a FIFO
+            // swapped in after the resolve: the open blocks on it first.
             //
-            // The file can also disappear between `canonicalize` above
+            // The file can also disappear between the resolve above
             // and this open (eviction, gc, operator cleanup); treat
             // that the same as a missing leaf and surface `NotFound`
-            // rather than a hard error, matching the canonicalize arm.
+            // rather than a hard error, matching the resolve.
             let file = match tokio::fs::File::open(&canonical).await {
                 Ok(f) => f,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -274,32 +312,11 @@ impl Origin for FilesystemOrigin {
         req: OriginRangeRequest,
     ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
-            // Resolve + contain the data path exactly as `fetch` does: a
-            // symlink-escape is a permanent failure, a missing data object is
-            // `Unsupported` (caller will whole-blob pull, which then surfaces
-            // the real `NotFound`).
-            let path = self.path_for(hash);
-            let canonical = match tokio::fs::canonicalize(&path).await {
-                Ok(p) => p,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(OriginRangeFetch::Unsupported);
-                }
-                Err(err) => {
-                    let msg = format!(
-                        "cache.origin.path canonicalize failed for {}",
-                        path.display()
-                    );
-                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
-                }
+            // A missing data object is `Unsupported`: the caller falls back
+            // to a whole-blob pull, which then surfaces the real `NotFound`.
+            let Some((canonical, _)) = self.resolve_regular(&self.path_for(hash)).await? else {
+                return Ok(OriginRangeFetch::Unsupported);
             };
-            if !canonical.starts_with(&self.base) {
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin.path entry {} resolves to {} which is outside base {}",
-                    path.display(),
-                    canonical.display(),
-                    self.base.display()
-                )));
-            }
 
             let mut file = match tokio::fs::File::open(&canonical).await {
                 Ok(f) => f,
@@ -351,47 +368,64 @@ impl Origin for FilesystemOrigin {
         outboard_max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
-            let obao4_path = self.obao4_path_for(hash);
-            // Check the on-disk length via `metadata()` before reading: a wildly
-            // oversized `.obao4` is malformed/foreign, and reading it first
-            // would buffer the whole thing into memory only to reject it (an
-            // OOM lever for a hostile sibling). Degrade — never a failure; the
-            // engine's outboard length check is the load-bearing reject.
-            match tokio::fs::metadata(&obao4_path).await {
-                Ok(meta) if meta.len() > outboard_max_bytes => {
-                    return Ok(OutboardFetch::Unsupported);
-                }
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(OutboardFetch::NotFound);
-                }
-                Err(err) => {
-                    let msg = format!(
-                        "cache.origin.path outboard metadata failed for {}",
-                        obao4_path.display()
-                    );
-                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
-                }
+            let Some((canonical, meta)) = self.resolve_regular(&self.obao4_path_for(hash)).await?
+            else {
+                return Ok(OutboardFetch::NotFound);
+            };
+            // Check the on-disk length before reading: a wildly oversized
+            // `.obao4` is malformed/foreign, and reading it first would buffer
+            // the whole thing into memory only to reject it (an OOM lever for
+            // a hostile sibling). An outboard over the cap degrades to
+            // `Unsupported`, not an error, and the engine never sees it; the
+            // engine's exact-length check rejects a wrong-length outboard
+            // that fits under the cap.
+            if meta.len() > outboard_max_bytes {
+                return Ok(OutboardFetch::Unsupported);
             }
-            let outboard = match tokio::fs::read(&obao4_path).await {
-                Ok(b) => b,
+            let file = match tokio::fs::File::open(&canonical).await {
+                Ok(f) => f,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(OutboardFetch::NotFound);
                 }
                 Err(err) => {
                     let msg = format!(
-                        "cache.origin.path outboard read failed for {}",
-                        obao4_path.display()
+                        "cache.origin.path outboard open failed for {}",
+                        canonical.display()
                     );
                     return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
                 }
             };
-            // Defense-in-depth: a file that grew between `metadata` and `read`
-            // (TOCTOU) is still rejected on the buffered length.
-            if u64::try_from(outboard.len()).unwrap_or(u64::MAX) > outboard_max_bytes {
+            // fstat the held fd: the path may have been swapped between the
+            // resolve and the open. The fstat re-checks the file type and the
+            // length of what was opened. It does not re-check containment, and
+            // it cannot catch a FIFO swapped in: the open blocks on it first.
+            let meta = file.metadata().await.map_err(|err| {
+                let msg = format!(
+                    "cache.origin.path outboard stat failed for {}",
+                    canonical.display()
+                );
+                classify_io_error(err).map_inner(|e| e.context(msg))
+            })?;
+            if !meta.is_file() {
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "cache.origin.path entry {} is not a regular file",
+                    canonical.display()
+                )));
+            }
+            if meta.len() > outboard_max_bytes {
                 return Ok(OutboardFetch::Unsupported);
             }
-            Ok(OutboardFetch::Found(Bytes::from(outboard)))
+            match read_capped(file, meta.len(), outboard_max_bytes).await {
+                Ok(Some(outboard)) => Ok(OutboardFetch::Found(Bytes::from(outboard))),
+                Ok(None) => Ok(OutboardFetch::Unsupported),
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path outboard read failed for {}",
+                        canonical.display()
+                    );
+                    Err(classify_io_error(err).map_inner(|e| e.context(msg)))
+                }
+            }
         })
     }
 
@@ -401,43 +435,14 @@ impl Origin for FilesystemOrigin {
     ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             // The local data object's on-disk length IS the canonical blob size
-            // (filesystem origins never compress), so a `metadata()` stat is an
-            // exact, body-free answer. Resolve + contain the path exactly as
-            // `fetch` / `fetch_range_data` do so a symlink escape is a permanent
-            // failure, not a silent read outside `base`.
-            let path = self.path_for(hash);
-            let canonical = match tokio::fs::canonicalize(&path).await {
-                Ok(p) => p,
-                // Missing data object → unknown size, degrade to whole-blob
-                // (which then surfaces the real `NotFound`).
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(err) => {
-                    let msg = format!(
-                        "cache.origin.path canonicalize failed for {}",
-                        path.display()
-                    );
-                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
-                }
-            };
-            if !canonical.starts_with(&self.base) {
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin.path entry {} resolves to {} which is outside base {}",
-                    path.display(),
-                    canonical.display(),
-                    self.base.display()
-                )));
-            }
-            match tokio::fs::metadata(&canonical).await {
-                Ok(meta) => Ok(Some(meta.len())),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(err) => {
-                    let msg = format!(
-                        "cache.origin.path metadata failed for {}",
-                        canonical.display()
-                    );
-                    Err(classify_io_error(err).map_inner(|e| e.context(msg)))
-                }
-            }
+            // (filesystem origins never compress), so the resolve's stat is an
+            // exact, body-free answer. A missing data object is an unknown
+            // size: degrade to whole-blob, which then surfaces the real
+            // `NotFound`.
+            Ok(self
+                .resolve_regular(&self.path_for(hash))
+                .await?
+                .map(|(_, meta)| meta.len()))
         })
     }
 
@@ -504,6 +509,37 @@ impl Origin for FilesystemOrigin {
             Ok(out)
         })
     }
+}
+
+/// Read `reader` into a buffer presized to `len_hint`, stopping one byte
+/// past `max`. `Ok(None)` means the source held more than `max` bytes.
+///
+/// The presize is fallible: a reservation the allocator refuses is an
+/// `OutOfMemory` error for this one read, as in `std::fs::read`, not a
+/// process abort. An exact presize also leaves the buffer with no spare
+/// capacity, which matters because the engine's outboard cache budgets
+/// each entry by its length.
+///
+/// `take(max + 1)` bounds the read at one byte past the cap, so a source
+/// longer than its hint (a file that grew after its stat) cannot grow
+/// the buffer without limit; that extra byte marks the overrun.
+/// `saturating_add(1)` keeps `u64::MAX` from wrapping to `0`.
+async fn read_capped<R: AsyncRead + Unpin>(
+    reader: R,
+    len_hint: u64,
+    max: u64,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(usize::try_from(len_hint).unwrap_or(usize::MAX))
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::OutOfMemory, err))?;
+    reader
+        .take(max.saturating_add(1))
+        .read_to_end(&mut buf)
+        .await?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max {
+        return Ok(None);
+    }
+    Ok(Some(buf))
 }
 
 /// Defense-in-depth running-cap wrapper around a chunk stream. The

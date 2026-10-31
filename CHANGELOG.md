@@ -5494,6 +5494,21 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **cache: the filesystem origin reads only regular files inside
+  `cache.origin.path` (#2775).** `fetch`, `fetch_range_data`, `size` and
+  `fetch_outboard` resolve the path and refuse a symlink out of the base, or
+  any non-regular file, before reading it, as a permanent origin failure. A
+  sibling `{hex}.obao4` symlinked out of the base or to `/dev/zero` is no
+  longer read, and a FIFO inside the base no longer blocks a read unless it
+  is swapped in between that check and the open. The outboard read stops one
+  byte past its cap, and an outboard buffer the allocator refuses fails that
+  one read rather than aborting the node.
+
+- **common: the node identity key is read and written through buffers that
+  are wiped on drop (#2775).** Loading, writing and staging the key hold its
+  bytes in `zeroize::Zeroizing` buffers. The copy inside the returned
+  `SecretKey` is wiped by `SecretKey` itself.
+
 - **CI: every workflow pins its actions, tools and checkouts, and release
   artifacts download by source.** `ci.yml`, `codeql.yml`, `sdk-contract.yml`
   and the `foundry-setup` composite action now pin every action by commit SHA,
@@ -5510,6 +5525,7 @@ since project inception and will roll into the first tagged release.
   the target its artifact is named for, and `docker` downloads the two Linux
   artifacts by exact name. An extra artifact can no longer overwrite a real
   file in a merged download.
+
 - **Release: each job holds the narrowest token, and every action is pinned
   by SHA (#2771).** `release.yml` grants `contents: read` at the workflow
   level. Every job that compiles or installs a tool can only read.

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use iroh::{PublicKey, SecretKey, Signature};
 use rand::Rng;
+use zeroize::Zeroizing;
 
 const KEY_FILE_NAME: &str = "node.secret";
 const KEY_LEN: usize = 32;
@@ -185,7 +186,8 @@ pub fn load_or_create(data_dir: &Path) -> anyhow::Result<LoadedKey> {
     validate_data_dir(data_dir)?;
 
     let key = fresh_secret_key();
-    write_atomic(&path, &key.to_bytes())?;
+    let bytes = Zeroizing::new(key.to_bytes());
+    write_atomic(&path, &bytes)?;
     Ok(LoadedKey {
         key,
         generated: true,
@@ -473,7 +475,8 @@ pub fn stage_node_key(data_dir: &Path) -> anyhow::Result<StagedNodeKey> {
     ensure_data_dir(data_dir)?;
     let final_path = key_path(data_dir);
     let key = fresh_secret_key();
-    let tmp = write_temp(&final_path, &key.to_bytes())?;
+    let bytes = Zeroizing::new(key.to_bytes());
+    let tmp = write_temp(&final_path, &bytes)?;
     Ok(StagedNodeKey {
         tmp,
         final_path,
@@ -595,16 +598,21 @@ pub(crate) fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
 ///
 /// Returns an error if the file cannot be read or is not exactly 32 bytes.
 fn load_from(path: &Path) -> anyhow::Result<SecretKey> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to read secret key file {}", path.display()))?;
+    // Read the key file into a buffer that is wiped on drop, on the error
+    // path too. The array view below borrows it rather than copying; the
+    // only other copy is the one inside the returned `SecretKey`.
+    let bytes = Zeroizing::new(
+        fs::read(path)
+            .with_context(|| format!("failed to read secret key file {}", path.display()))?,
+    );
     let len = bytes.len();
-    let arr: [u8; KEY_LEN] = bytes.as_slice().try_into().map_err(|_| {
+    let arr: &[u8; KEY_LEN] = bytes.as_slice().try_into().map_err(|_| {
         anyhow!(
             "secret key file {} must be {KEY_LEN} bytes, got {len}",
             path.display()
         )
     })?;
-    Ok(SecretKey::from_bytes(&arr))
+    Ok(SecretKey::from_bytes(arr))
 }
 
 /// A newly generated node secret key, drawn from the OS RNG. The caller owns
