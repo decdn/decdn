@@ -732,7 +732,9 @@ impl PersistentPoolStateStore {
     ///   deployment the node was already configured against, before the stamp
     ///   existed. The presumption fails for a node that was repointed at a
     ///   redeploy BEFORE the stamp existed: it claims the colliding rows, and
-    ///   the operator clears them by hand (see the CHANGELOG entry).
+    ///   the operator clears them by hand: stop the node, delete `lanes.redb`,
+    ///   `settle.redb` and `checkpoint.redb`, and keep `buyer.redb`, whose rows
+    ///   carry per-row deployment tags.
     /// - The stamp names another deployment: every row it wrote is dropped —
     ///   the lane table, both pending-settle sets, and the watcher checkpoints —
     ///   and the stamp is rewritten. Those rows name pool ids that repeat on the
