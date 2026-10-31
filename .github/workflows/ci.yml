@@ -313,7 +313,6 @@ jobs:
               - 'docs/**/*.md'
               - 'CONTRIBUTING.md'
               - 'CLAUDE.md'
-              - 'CHANGELOG.md'
               - 'README.md'
               - '.github/workflows/ci.yml'
             solidity_dependencies:
@@ -1250,6 +1249,7 @@ jobs:
           globs: |
             **/*.md
             !adr/_build/**
+            !CHANGELOG.md
           config: ".markdownlint.yaml"
 
   adr-book-list:
@@ -1295,6 +1295,14 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
+      # scripts/tests/test_release_changelog.py renders a small repository
+      # through the real git-cliff and skips without it; the version matches
+      # the release workflow's, so the test sees the binary a release uses.
+      - name: Install git-cliff
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: git-cliff@2.14.2
+          fallback: none
       - name: Test CI tooling
         run: |
           python3 -m pip install 'pytest==8.*' 'pyyaml==6.*'

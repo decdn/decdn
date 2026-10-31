@@ -60,8 +60,10 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    git config user.signingkey <your-fingerprint>
    ```
 
-4. **Tools.** `cargo install cargo-release git-cliff`, `minisign` (a package
-   on every platform), plus `gh auth login`. Your minisign must sign in the
+4. **Tools.** `cargo install --locked cargo-release git-cliff@2.14.2` (the
+   git-cliff version `release.yml` installs, so `CHANGELOG.md` and the release
+   notes render alike), `minisign` (a package on every platform), plus
+   `gh auth login`. Your minisign must sign in the
    prehashed format: `sign-release.sh` verifies with `-H` and stops on a
    legacy-format signature, which neither `decdn self-update` nor
    `cargo binstall` accepts. `python3` for the Docker Hub overview push, and
@@ -120,6 +122,8 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
 by [`release.toml`](release.toml):
 
 - bumps every crate in the workspace to the same version (`shared-version`)
+- regenerates `CHANGELOG.md` with git-cliff (`scripts/release-changelog.sh`, the
+  `pre-release-hook`), so the release commit carries the new version's section
 - commits as `chore(release): v<version>`, **signed**
 - tags `v<version>`, **signed**
 - pushes both to `origin`
@@ -139,10 +143,15 @@ version moves only under `cargo release`. The `packaging` CI job and the
 version or an internal `[workspace.dependencies]` alias that disagrees with
 it, so a hand edit fails before it ships.
 
-`CHANGELOG.md` is **not** touched by `cargo release` — it is maintained by hand,
-one entry per PR. git-cliff is used only to generate the GitHub release notes,
-inside the workflow. Write the changelog entry as part of the work, not at
-release time.
+`CHANGELOG.md` is git-cliff output and nothing else writes it. The hook renders
+the whole history, with the version being cut as the newest section, from
+[`cliff.toml`](cliff.toml). The workflow renders the GitHub release notes from
+the same config, so the two agree line for line, and a PR's squash-merge
+subject is its line in both. The hook fails when `git-cliff` is not on `PATH`,
+when `cliff.toml` is missing, or when the render has no section for the new or
+the previous version. A preview run (no `--execute`) also runs the hook, with
+`DRY_RUN=true`: it renders and checks the changelog but writes nothing, so those
+failures show up in the preview, not after the version bump.
 
 To preview a bump without changing anything, drop `--execute`:
 
