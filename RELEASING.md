@@ -120,6 +120,8 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
 by [`release.toml`](release.toml):
 
 - bumps every crate in the workspace to the same version (`shared-version`)
+- regenerates `CHANGELOG.md` with git-cliff (`scripts/release-changelog.sh`, the
+  `pre-release-hook`), so the release commit carries the new version's section
 - commits as `chore(release): v<version>`, **signed**
 - tags `v<version>`, **signed**
 - pushes both to `origin`
@@ -139,10 +141,12 @@ version moves only under `cargo release`. The `packaging` CI job and the
 version or an internal `[workspace.dependencies]` alias that disagrees with
 it, so a hand edit fails before it ships.
 
-`CHANGELOG.md` is **not** touched by `cargo release` — it is maintained by hand,
-one entry per PR. git-cliff is used only to generate the GitHub release notes,
-inside the workflow. Write the changelog entry as part of the work, not at
-release time.
+`CHANGELOG.md` is git-cliff output and nothing else writes it. The hook renders
+the whole history with the version being cut as the newest section and the
+configuration in [`cliff.toml`](cliff.toml), the same one the workflow uses for
+the GitHub release notes, so a PR's title is its changelog line. The hook fails
+the release when `git-cliff` is not on `PATH`. A preview run (no `--execute`)
+also runs the hook, with `DRY_RUN=true`, and the hook then writes nothing.
 
 To preview a bump without changing anything, drop `--execute`:
 

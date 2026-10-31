@@ -313,7 +313,6 @@ jobs:
               - 'docs/**/*.md'
               - 'CONTRIBUTING.md'
               - 'CLAUDE.md'
-              - 'CHANGELOG.md'
               - 'README.md'
               - '.github/workflows/ci.yml'
             solidity_dependencies:
@@ -1250,6 +1249,7 @@ jobs:
           globs: |
             **/*.md
             !adr/_build/**
+            !CHANGELOG.md
           config: ".markdownlint.yaml"
 
   adr-book-list:
