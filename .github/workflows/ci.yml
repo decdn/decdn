@@ -35,9 +35,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
           components: rustfmt
       - run: cargo fmt --all --check
 
@@ -47,11 +50,14 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: clippy
           # Restore-only except on `main`: only pushes to `main` write the
@@ -115,12 +121,17 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
       # cargo-deny pinned to an exact version so a release can't silently
       # change the check's behavior.
-      - uses: taiki-e/install-action@v2.87.32
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
+          fallback: none
           tool: cargo-deny@0.20.2
       # Findings warn (annotations on the run summary) and the job succeeds.
       # A run that checked nothing — deny.toml error, advisory-db fetch
@@ -133,9 +144,13 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: doc
           # Restore-only except on `main`; only `main` writes it (see clippy job).
@@ -165,9 +180,13 @@ jobs:
     # thing runs in parallel with `test` instead of extending it. Doctest
     # coverage is not the goal (it would need nightly) — execution is.
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: doctest
           # Restore-only except on `main`; only `main` writes it (see clippy job).
@@ -202,16 +221,21 @@ jobs:
     # them here beside the rustdoc render starves `decdn-client`'s
     # timing-sensitive scheduler tests.
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: public-api
           # Restore-only except on `main`; only `main` writes it (see clippy job).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.87.32
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: cargo-nextest
+          fallback: none
+          tool: cargo-nextest@0.9.149
       - run: cargo nextest run -p decdn-protocol --features public-api-test --test public_api
       - run: cargo nextest run -p decdn-client --features public-api-test --test public_api
 
@@ -233,8 +257,10 @@ jobs:
       docker: ${{ steps.filter.outputs.docker }}
       dashboard: ${{ steps.filter.outputs.dashboard }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           # Detect changes with git, not the pulls/{n}/files API. That endpoint
@@ -331,7 +357,7 @@ jobs:
               - '.dockerignore'
               - '.github/workflows/ci.yml'
       - name: Detect Solidity contract changes
-        uses: dorny/paths-filter@v4
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: solidity_contracts
         with:
           token: ''
@@ -388,9 +414,12 @@ jobs:
       #     files, faster relinking. Orthogonal to coverage.
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
           components: llvm-tools-preview
       # mold is a drop-in replacement for ld that noticeably shortens the
       # link phase of the workspace's instrumented test binaries. Scoped to
@@ -400,22 +429,23 @@ jobs:
       # release binary instead of apt, which sidesteps the dpkg-lock and
       # mirror stalls that hang `apt-get install` on hosted runners.
       - name: Install mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
         # RUSTFLAGS routes the link through mold explicitly via `-fuse-ld=mold`,
         # so mold only needs to be on PATH — don't rewire the system `ld`
         # symlink (the action's default) and perturb unrelated C/C++ links.
         with:
           make-default: false
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: coverage
           # Restore-only except on `main`; only `main` writes it (see clippy
           # job). This is the largest partition (~1.2 GiB instrumented target),
           # so gating its save is what most relieves the saturated cache store.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.87.32
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: cargo-llvm-cov,cargo-nextest
+          fallback: none
+          tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.149
 
       # REQUIRED step. cargo llvm-cov nextest runs the workspace test suite
       # with LLVM instrumentation; non-zero exit on any test failure fails
@@ -454,7 +484,7 @@ jobs:
       - name: Upload code coverage
         if: hashFiles('cobertura.xml') != ''
         continue-on-error: true
-        uses: actions/upload-code-coverage@v1
+        uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52 # v1.4.4
         with:
           file: cobertura.xml
           language: Rust
@@ -511,16 +541,19 @@ jobs:
     steps:
       # submodules: recursive — the in-test `forge build` needs the forge-std +
       # openzeppelin-contracts submodules under contracts/lib/.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
       # mold shortens the link phase of the workspace's test binaries; installed
       # before rust-cache so `-fuse-ld=mold` in RUSTFLAGS resolves at link time.
       # setup-mold pulls a release binary rather than apt, avoiding the
       # dpkg-lock / mirror stalls that hang `apt-get install` on hosted runners.
       - name: Install mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
         # RUSTFLAGS routes the link through mold explicitly via `-fuse-ld=mold`,
         # so mold only needs to be on PATH — don't rewire the system `ld`
         # symlink (the action's default) and perturb unrelated C/C++ links.
@@ -531,13 +564,14 @@ jobs:
       - uses: ./.github/actions/foundry-setup
         with:
           cache-profile: none
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: anvil-e2e-settlement
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.87.32
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: cargo-nextest
+          fallback: none
+          tool: cargo-nextest@0.9.149
       # Hoist the cold contract compile out of the tests (#1620). Both anvil
       # targets shell out to their own `forge build` (a 180s single-attempt cap
       # with no retry); running it once here keeps that cold build — which on a
@@ -596,16 +630,19 @@ jobs:
     steps:
       # submodules: recursive — the in-test `forge build` needs the forge-std +
       # openzeppelin-contracts submodules under contracts/lib/.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
       # mold shortens the link phase of the journey + bin binaries; installed
       # before rust-cache so `-fuse-ld=mold` in RUSTFLAGS resolves at link time.
       # setup-mold pulls a release binary rather than apt, avoiding the
       # dpkg-lock / mirror stalls that hang `apt-get install` on hosted runners.
       - name: Install mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
         # RUSTFLAGS routes the link through mold explicitly via `-fuse-ld=mold`,
         # so mold only needs to be on PATH — don't rewire the system `ld`
         # symlink (the action's default) and perturb unrelated C/C++ links.
@@ -618,13 +655,14 @@ jobs:
       - uses: ./.github/actions/foundry-setup
         with:
           cache-profile: none
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: anvil-e2e-journeys
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.87.32
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: cargo-nextest
+          fallback: none
+          tool: cargo-nextest@0.9.149
       # Hoist the cold contract compile out of the fixtures (#1620). Each
       # `decdn-e2e` fixture shells out to `forge build`; running it once here
       # means only this step pays the cold compile, and every fixture's in-test
@@ -673,24 +711,28 @@ jobs:
     steps:
       # submodules: recursive — `forge build` needs the forge-std +
       # openzeppelin-contracts submodules under contracts/lib/.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
       - name: Install mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
         with:
           make-default: false
       - uses: ./.github/actions/foundry-setup
         with:
           cache-profile: none
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: anvil-e2e-sponsord
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.87.32
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: cargo-nextest
+          fallback: none
+          tool: cargo-nextest@0.9.149
       # Hoisted out of the fixtures, as the journeys job does: a cold contracts
       # compile inside `ChainFixture::launch` eats the deploy timeout.
       - name: Build contracts once
@@ -717,11 +759,14 @@ jobs:
           - { runner: macos-latest, test: installer_sh }
           - { runner: windows-latest, test: installer_ps1 }
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: installers-${{ matrix.runner }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -739,8 +784,10 @@ jobs:
       run:
         working-directory: contracts
     steps:
-      - uses: actions/checkout@v7
-      - uses: foundry-rs/foundry-toolchain@v1.9.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           version: v1.7.1
       - run: forge fmt --check
@@ -769,11 +816,13 @@ jobs:
       # pushes, and releases are not automated from CI (no auto-release), so the
       # GITHUB_TOKEN need not persist in .git/config. Dropping it satisfies
       # zizmor's `artipacked` check and keeps the token off disk for later steps.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.99.1
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # The generator is a standalone workspace, isolated from the root one.
           workspaces: contracts/test/ed25519-vectors
@@ -781,7 +830,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # forge fmt normalises the regenerated Solidity; no solc/build needed, so
       # the bare toolchain (not ./.github/actions/foundry-setup) is enough.
-      - uses: foundry-rs/foundry-toolchain@v1.9.2
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           version: v1.7.1
       # Freshness: regenerating must reproduce the committed vectors.
@@ -826,8 +875,9 @@ jobs:
     steps:
       # submodules: recursive is required — forge-std and openzeppelin-contracts
       # are git submodules under contracts/lib/, and OZ pulls ds-test transitively.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
       - uses: ./.github/actions/foundry-setup
         with:
@@ -949,10 +999,11 @@ jobs:
       ARBITRUM_SEPOLIA_RPC_URL: ${{ secrets.ARBITRUM_SEPOLIA_RPC_URL }}
     steps:
       # submodules: recursive — forge-std + openzeppelin-contracts are submodules.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@v1.9.2
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           version: v1.7.1
       # A skipped step yields a SUCCESSFUL job, and the checks UI renders
@@ -1002,8 +1053,9 @@ jobs:
     env:
       FOUNDRY_PROFILE: coverage
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
       - uses: ./.github/actions/foundry-setup
         with:
@@ -1027,7 +1079,7 @@ jobs:
       - name: Upload code coverage
         if: hashFiles('contracts/cobertura.xml') != ''
         continue-on-error: true
-        uses: actions/upload-code-coverage@v1
+        uses: actions/upload-code-coverage@2b21a77928be8d5168c2b9581a67f2adbebacc52 # v1.4.4
         with:
           # `uses:` steps ignore defaults.run, so the path is workspace-relative.
           file: contracts/cobertura.xml
@@ -1044,8 +1096,10 @@ jobs:
       run:
         working-directory: contracts
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -1070,8 +1124,9 @@ jobs:
       # `security-events: write` and `actions: read` permissions if
       # GHAS is ever turned on or the repo flips public.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
       # cache-profile omitted (none): crytic-compile drives its own `forge
       # build`, so we cache only the solc binaries it downloads, not artifacts.
@@ -1105,8 +1160,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
       # cache-profile omitted (none): aderyn-ci manages its own build, so we
       # cache only the solc binaries, not artifacts.
@@ -1153,7 +1209,7 @@ jobs:
     permissions:
       pull-requests: read
     steps:
-      - uses: amannn/action-semantic-pull-request@v6
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -1186,8 +1242,10 @@ jobs:
     # skip here can no longer mask.
     if: needs.changes.outputs.markdown == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v7
-      - uses: DavidAnson/markdownlint-cli2-action@v25
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: DavidAnson/markdownlint-cli2-action@696eb3f2509270d7b882d2aa68347bc676e7af34 # v25.0.0
         with:
           globs: |
             **/*.md
@@ -1203,7 +1261,9 @@ jobs:
     # Job id stays `adr-book-list` — referenced by ci-success needs/allowed-skips.
     if: needs.changes.outputs.adr == 'true'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # `make` is preinstalled on ubuntu-latest; every target is pure shell
       # (awk/sed/grep, no pandoc/typst/mermaid) and runs sub-second. Separate
       # steps so a failure points at the specific guard in the checks UI.
@@ -1229,8 +1289,10 @@ jobs:
     # (non-blocking by design), so a skip needs no allowed-skips entry.
     if: needs.changes.outputs.scripts == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - name: Test CI tooling
@@ -1248,7 +1310,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.dashboard == 'true' || github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/dashboard-build
         with:
           checks: 'true'
@@ -1287,7 +1351,9 @@ jobs:
     name: packaging
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Crate embeds stay inside their package
         run: .github/scripts/check-package-embeds.sh
@@ -1313,11 +1379,11 @@ jobs:
       - name: Rust version agrees across toolchain, manifest and workflows
         run: .github/scripts/check-toolchain-pin.sh
 
-      # release.yml only runs on a tag, so a PR that floats one of its actions
-      # or widens a job's token would otherwise reach the next release
-      # unchecked. Covers security.yml and their local actions too.
-      - name: Release workflows pin actions by SHA and scope their tokens
-        run: .github/scripts/check-release-hardening.sh
+      # Every workflow and the local actions they call. release.yml only runs
+      # on a tag, so a PR that floats one of its actions or widens a job's
+      # token would otherwise reach the next release unchecked.
+      - name: Workflows pin actions, images and tools and scope their tokens
+        run: .github/scripts/check-workflow-hardening.sh
 
       # A member that restates `version` or omits `[lints] workspace = true`
       # compiles green and ships its own value. release.yml catches the version
@@ -1340,7 +1406,9 @@ jobs:
       - name: iroh and noq stay at their held versions
         run: .github/scripts/check-iroh-hold.sh
 
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
 
       # Cargo enforces acyclicity and nothing more. The dependency flow in
       # CLAUDE.md § Crate Structure — three leaves, cli/e2e as sinks, an
@@ -1385,7 +1453,9 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.docker == 'true' || github.event_name != 'pull_request' }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Lint Dockerfile
         run: |
@@ -1454,12 +1524,15 @@ jobs:
       matrix:
         target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
           components: clippy
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: windows-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -1500,7 +1573,7 @@ jobs:
             solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors,
             docker-build, packaging, dashboard]
     steps:
-      - uses: re-actors/alls-green@release/v1
+      - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}
           # Rust jobs are gated on `needs.changes.outputs.rust`,

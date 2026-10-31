@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Thin wrapper around check_release_hardening.py — see that file for the rationale.
+# Thin wrapper around check_workflow_hardening.py — see that file for the rationale.
 #
 # The logic lives in a .py rather than a heredoc so it can be imported and unit
-# tested (.github/scripts/tests/test_check_release_hardening.py). A bug in a guard like this
+# tested (.github/scripts/tests/test_check_workflow_hardening.py). A bug in a guard like this
 # degrades to a quiet false pass, which is the exact failure mode it exists to
 # prevent.
 set -euo pipefail
@@ -12,4 +12,4 @@ command -v python3 >/dev/null || {
   exit 1
 }
 
-exec python3 "$(dirname "${BASH_SOURCE[0]}")/check_release_hardening.py" "$@"
+exec python3 "$(dirname "${BASH_SOURCE[0]}")/check_workflow_hardening.py" "$@"
