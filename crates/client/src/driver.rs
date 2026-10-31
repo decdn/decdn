@@ -1404,7 +1404,7 @@ where
                                 source.finish(reader).await.map(|_vp| ())
                             }
                             // A steal lowered the end to a split this leg reached:
-                            // pay for the received bytes and close the stream. The
+                            // pay for the verified bytes and close the stream. The
                             // paid and delivered frontiers now reach the split, the
                             // gap's end, so the next pass ends the gap without a
                             // new leg.
