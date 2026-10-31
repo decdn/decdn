@@ -4521,6 +4521,14 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **node: `decdn_serve_pool_recheck_skipped_total` counts mid-stream
+  pool-solvency re-checks that did not run (#2630).** The pool view drops a pool
+  only once it is closed, so a nonzero value means a pool closed under a live
+  stream: the stream continues, and `redeemMany` reverts on a closed pool, so
+  the node is not paid for the bytes it serves after the close. A throttled
+  `warn!` names the pool, signer and hash. A loopback test now drives a
+  serve-miss stream through the own-origin `serve_leg` loop to an in-band
+  `PoolExhausted` stop.
 - **Release: `cargo binstall` verifies each archive's minisign signature (#2765).**
   `sign-release.sh` now signs every archive with the maintainer minisign key,
   in the same run as `SHA256SUMS.minisig`, and uploads `<archive>.minisig`

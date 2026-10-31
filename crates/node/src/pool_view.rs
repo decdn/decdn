@@ -27,10 +27,11 @@
 //! - **Mid-stream** ([`PoolView::cached_status`]) MUST NOT block: it reads the
 //!   projection only. An admitted stream's pool was seeded at admission and a
 //!   projection entry persists until the pool is forgotten (a `PoolReclaimed`, or
-//!   a re-anchor read that finds it `Closed`, removes it), so a `None` here is
-//!   not expected for a live stream; if it does occur it fails open, since the
-//!   on-chain `redeem` is the backstop and a chain read at a voucher boundary
-//!   would stall delivery.
+//!   a re-anchor read that finds it `Closed`, removes it), so a `None` here
+//!   means the pool closed under a live stream. The re-check then fails open,
+//!   because a chain read at a voucher boundary would stall delivery, and counts
+//!   `decdn_serve_pool_recheck_skipped_total`. `redeemMany` reverts on a closed
+//!   pool, so the node is not paid for the bytes it serves after the close.
 //!
 //! The bare [`PoolProjection`] is the projection itself: its `status` returns
 //! `None` for a pool it has not folded and never touches the network. Tests wire
@@ -108,10 +109,11 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
     async fn status(&self, pool_id: B256) -> Option<PoolStatus>;
 
     /// A read that MUST NOT block: it returns `None` rather than doing any slow or
-    /// remote work. The mid-stream serve re-check calls it at each voucher
-    /// boundary, where a blocking read would stall delivery. The default delegates
-    /// to [`Self::status`] for in-memory test doubles; [`PoolProjection`] serves
-    /// both from the same in-memory map, so neither ever touches the network.
+    /// remote work. The mid-stream serve re-check calls it at a voucher boundary,
+    /// on the wall-clock re-check cadence, where a blocking read would stall
+    /// delivery. The default delegates to [`Self::status`] for in-memory test
+    /// doubles; [`PoolProjection`] serves both from the same in-memory map, so
+    /// neither ever touches the network.
     async fn cached_status(&self, pool_id: B256) -> Option<PoolStatus> {
         self.status(pool_id).await
     }
@@ -343,13 +345,13 @@ impl PoolEntry {
 /// log, so no serve request costs a `getPool` `eth_call`.
 ///
 /// The map is published through an [`ArcSwap`] so a read (`status` at admission,
-/// `cached_status` at every voucher boundary) is a single atomic load — no lock,
-/// no read-modify-write — and never contends with a concurrent reader on the serve
-/// hot path. The settlement watcher's sink writes every fold and each tick's
-/// re-anchor, and the admit path inserts a pool the projection does not hold;
-/// each write clones-then-publishes the whole map. Writes are rare (one per
-/// `PaymentPool` event, one per re-anchoring tick, one per admit-path seed) next
-/// to the per-voucher-boundary reads.
+/// `cached_status` at a voucher boundary on the re-check cadence) is a single
+/// atomic load — no lock, no read-modify-write — and never contends with a
+/// concurrent reader on the serve hot path. The settlement watcher's sink writes
+/// every fold and each tick's re-anchor, and the admit path inserts a pool the
+/// projection does not hold; each write clones-then-publishes the whole map.
+/// Writes are rare (one per `PaymentPool` event, one per re-anchoring tick, one
+/// per admit-path seed) next to the reads every admission and live stream make.
 ///
 /// Cheaply cloneable (an `Arc` around the cell). The settlement watcher's sink
 /// holds one clone to WRITE the projection; the serve handler holds another as an
