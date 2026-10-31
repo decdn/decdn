@@ -1218,16 +1218,6 @@ since project inception and will roll into the first tagged release.
   as the finished-pulls table does, with the full path on hover, and breaks
   inside its column.
 
-- **cache: the filesystem origin's outboard read stays inside
-  `cache.origin.path` and reads only regular files (#2775).** A sibling
-  `{hex}.obao4` that is a symlink out of the base, a symlink to `/dev/zero`, a
-  FIFO or any other non-regular file is a permanent origin failure, and the
-  read stops one byte past the outboard cap. Every filesystem-origin read
-  (`fetch`, ranged data, size, outboard) applies the same containment and
-  regular-file check before it opens the path, so a FIFO inside the base no
-  longer blocks a data fetch. The node identity key is held in buffers that
-  are wiped on drop while it is loaded or written.
-
 - **sponsord-onramp: the gate page tells a refused check apart from a service
   fault (#2720).** The built-in page showed "Something went wrong. Please
   refresh and try again." for every failed `POST /v1/fund` other than a `409`.
@@ -5503,6 +5493,21 @@ since project inception and will roll into the first tagged release.
   Contributor tooling only — no runtime, wire, config, or ABI impact.
 
 ### Security
+
+- **cache: the filesystem origin reads only regular files inside
+  `cache.origin.path` (#2775).** `fetch`, `fetch_range_data`, `size` and
+  `fetch_outboard` resolve the path and refuse a symlink out of the base, or
+  any non-regular file, before reading it, as a permanent origin failure. A
+  sibling `{hex}.obao4` symlinked out of the base or to `/dev/zero` is no
+  longer read, and a FIFO inside the base no longer blocks a read unless it
+  is swapped in between that check and the open. The outboard read stops one
+  byte past its cap, and an outboard buffer the allocator refuses fails that
+  one read rather than aborting the node.
+
+- **common: the node identity key is read and written through buffers that
+  are wiped on drop (#2775).** Loading, writing and staging the key hold its
+  bytes in `zeroize::Zeroizing` buffers. The copy inside the returned
+  `SecretKey` is wiped by `SecretKey` itself.
 
 - **Release: each job holds the narrowest token, and every action is pinned
   by SHA (#2771).** `release.yml` grants `contents: read` at the workflow

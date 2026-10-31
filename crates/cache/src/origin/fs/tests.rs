@@ -473,9 +473,10 @@ async fn fetch_outboard_oversize_is_unsupported() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// OOM guard: a multi-megabyte `{H}.obao4` against a tiny cap must degrade
-/// via the stat length pre-check, BEFORE any read buffers the file into
-/// memory.
+/// OOM guard: a multi-megabyte `{H}.obao4` against a tiny cap degrades
+/// to `Unsupported` rather than being returned. The length checks before
+/// the read reject it; `read_capped_stops_one_byte_past_the_cap` covers
+/// the read's own bound.
 #[tokio::test]
 async fn fetch_outboard_oversize_rejected_before_read() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -581,8 +582,11 @@ async fn fetch_outboard_follows_symlink_inside_base() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A sibling outboard symlinked to `/dev/zero` reports a zero length to
-/// `stat` and never ends when read. It is refused at once, with no read.
+/// A sibling outboard symlinked to `/dev/zero` (a zero length to `stat`,
+/// endless when read) is refused by the containment check, since `/dev`
+/// is outside the base, before any open. A special file inside the base
+/// meets the regular-file check instead;
+/// `every_read_rejects_a_special_file_inside_base` covers that.
 #[cfg(unix)]
 #[tokio::test]
 async fn fetch_outboard_rejects_symlink_to_dev_zero() -> anyhow::Result<()> {
@@ -614,10 +618,12 @@ async fn fetch_outboard_rejects_a_directory_named_like_the_outboard() -> anyhow:
     ensure_permanent("fetch_outboard", err, "not a regular file")
 }
 
-/// A special file inside the base is refused by every read before any
-/// open, so none of them can block on it. The data object and the
-/// outboard are symlinks to one Unix socket at a short path, because the
-/// sharded path exceeds the socket address limit on macOS.
+/// A special file inside the base is refused by every read with "not a
+/// regular file", before any open. A Unix socket stands in for a FIFO:
+/// its open fails rather than blocks, so the error message, not the
+/// timeout, shows the check ran first. The data object and the outboard
+/// are symlinks to one socket at a short path, because the sharded path
+/// exceeds the socket address limit on macOS.
 #[cfg(unix)]
 #[tokio::test]
 async fn every_read_rejects_a_special_file_inside_base() -> anyhow::Result<()> {
@@ -670,6 +676,49 @@ async fn fetch_outboard_buffer_has_no_spare_capacity() -> anyhow::Result<()> {
         buf.capacity() == len,
         "a {len}-byte outboard holds a {}-byte buffer",
         buf.capacity()
+    );
+    Ok(())
+}
+
+/// A presize the allocator refuses is an error for that one read, never
+/// a process abort.
+#[tokio::test]
+async fn read_capped_reservation_failure_is_an_error() -> anyhow::Result<()> {
+    let empty = std::io::Cursor::new(Vec::<u8>::new());
+    let err = read_capped(empty, u64::MAX, u64::MAX)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a u64::MAX presize must fail"))?;
+    anyhow::ensure!(
+        err.kind() == std::io::ErrorKind::OutOfMemory,
+        "expected OutOfMemory, got {err:?}"
+    );
+    Ok(())
+}
+
+/// The read stops one byte past the cap even when the length hint says
+/// the source is empty, as for a file that grew after its stat. A source
+/// of exactly the cap is read whole.
+#[tokio::test]
+async fn read_capped_stops_one_byte_past_the_cap() -> anyhow::Result<()> {
+    let max = 4096u64;
+    let mut over = std::io::Cursor::new(vec![0x5Au8; 64 * 1024]);
+    anyhow::ensure!(
+        read_capped(&mut over, 0, max).await?.is_none(),
+        "a source past the cap must read as over the cap"
+    );
+    anyhow::ensure!(
+        over.position() == max + 1,
+        "read {} bytes against a {max}-byte cap",
+        over.position()
+    );
+
+    let at_cap = std::io::Cursor::new(vec![0x5Au8; 4096]);
+    let read = read_capped(at_cap, 0, max).await?;
+    anyhow::ensure!(
+        read.as_ref().map(Vec::len) == Some(4096),
+        "a source of exactly the cap must read whole, got {:?}",
+        read.as_ref().map(Vec::len)
     );
     Ok(())
 }

@@ -598,8 +598,9 @@ pub(crate) fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
 ///
 /// Returns an error if the file cannot be read or is not exactly 32 bytes.
 fn load_from(path: &Path) -> anyhow::Result<SecretKey> {
-    // The key bytes live only in this buffer, which is wiped on drop; the
-    // array view below borrows it rather than copying.
+    // Read the key file into a buffer that is wiped on drop, on the error
+    // path too. The array view below borrows it rather than copying; the
+    // only other copy is the one inside the returned `SecretKey`.
     let bytes = Zeroizing::new(
         fs::read(path)
             .with_context(|| format!("failed to read secret key file {}", path.display()))?,

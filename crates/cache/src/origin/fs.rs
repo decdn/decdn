@@ -17,7 +17,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use iroh_blobs::Hash;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
 use super::{Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
@@ -48,10 +48,10 @@ impl FilesystemOrigin {
     /// exist or isn't a directory — a typo in the config shouldn't surface
     /// as a per-request miss.
     ///
-    /// `base` is canonicalized so the per-request containment check can
+    /// `base` is canonicalized so the per-read containment check can
     /// compare a resolved blob path against a resolved root. Without this,
     /// an operator who configured the origin via a symlinked path would
-    /// have every fetch look "outside" itself.
+    /// have every read look "outside" itself.
     pub async fn new(base: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let base = base.into();
         let meta = tokio::fs::metadata(&base)
@@ -98,7 +98,8 @@ impl FilesystemOrigin {
     }
 
     /// Resolve `path` to a regular file inside `base`, before anything
-    /// opens it. Every read goes through here.
+    /// opens it. `fetch`, `fetch_range_data`, `fetch_outboard` and `size`
+    /// all go through here.
     ///
     /// A symlink dropped into the shard tree by an operator mistake or
     /// compromised tooling could otherwise turn a content-addressed read
@@ -109,11 +110,16 @@ impl FilesystemOrigin {
     /// (already-canonical) base; an escape is a permanent failure.
     ///
     /// The resolved path is then stat'ed and must be a regular file. A
-    /// FIFO blocks `open` until a writer appears, and a device such as
-    /// `/dev/zero` reports a zero length but never ends when read; this
-    /// check keeps both out, unless the path is swapped between the stat
-    /// and the caller's open. The stat never opens the file, so it cannot
+    /// FIFO blocks `open` until a writer appears, and a device reports a
+    /// zero length but may never end when read. This check keeps out a
+    /// FIFO or device inside the base; a symlink out to `/dev` already
+    /// fails containment. The stat never opens the file, so it cannot
     /// block.
+    ///
+    /// A path swapped between this stat and the caller's open is not
+    /// covered here. `fetch` and `fetch_outboard` re-check the type on the
+    /// opened file, which catches a device but not a FIFO: the open blocks
+    /// on a FIFO first. `fetch_range_data` and `size` do not re-check.
     ///
     /// `Ok(None)` means the path (or its symlink target) does not exist.
     /// Each caller maps that to its own "absent" answer.
@@ -164,12 +170,12 @@ impl FilesystemOrigin {
 /// answer. The handful of error kinds the kernel uses for "the syscall
 /// got interrupted, try again" are retriable.
 ///
-/// `NotFound` is intentionally not handled here — the call sites
-/// convert it to [`OriginFetch::NotFound`] before reaching this helper.
-/// Symlink-escape is *also* not an `io::Error` and never reaches this
-/// helper — [`FilesystemOrigin::resolve_regular`] detects it by path
-/// comparison after `canonicalize` and emits `OriginPullError::Permanent`
-/// directly.
+/// `NotFound` is intentionally not handled here: a `NotFound` path lookup
+/// is `Ok(None)` from [`FilesystemOrigin::resolve_regular`], and each read
+/// maps that, and a `NotFound` open, to its own absent answer. A symlink
+/// escape and a non-regular file are not `io::Error`s either:
+/// `resolve_regular`, and the re-checks on the opened file in `fetch` and
+/// `fetch_outboard`, emit `OriginPullError::Permanent` directly.
 fn classify_io_error(err: std::io::Error) -> OriginPullError {
     use std::io::ErrorKind;
     match err.kind() {
@@ -227,12 +233,12 @@ impl Origin for FilesystemOrigin {
 
             // Open once and stat via the file handle (fstat), so the
             // metadata we check and the bytes we read come from the
-            // same inode. The path stat in `resolve_regular` leaves a
-            // TOCTOU window where the path could be swapped for a much
-            // larger file or a different symlink before the open — the
-            // size cap would run on stale metadata. The fstat on the
-            // held fd closes that window for the size cap and the
-            // regular-file check; it does not re-check containment.
+            // same inode. The size cap does not use the stat from
+            // `resolve_regular`: the path could be swapped for a larger
+            // file or a different symlink before the open. The fstat
+            // re-checks the size and file type of what was opened. It
+            // does not re-check containment, and it cannot catch a FIFO
+            // swapped in after the resolve: the open blocks on it first.
             //
             // The file can also disappear between the resolve above
             // and this open (eviction, gc, operator cleanup); treat
@@ -369,8 +375,10 @@ impl Origin for FilesystemOrigin {
             // Check the on-disk length before reading: a wildly oversized
             // `.obao4` is malformed/foreign, and reading it first would buffer
             // the whole thing into memory only to reject it (an OOM lever for
-            // a hostile sibling). Degrade — never a failure; the engine's
-            // outboard length check is the load-bearing reject.
+            // a hostile sibling). An outboard over the cap degrades to
+            // `Unsupported`, not an error, and the engine never sees it; the
+            // engine's exact-length check rejects a wrong-length outboard
+            // that fits under the cap.
             if meta.len() > outboard_max_bytes {
                 return Ok(OutboardFetch::Unsupported);
             }
@@ -389,7 +397,8 @@ impl Origin for FilesystemOrigin {
             };
             // fstat the held fd: the path may have been swapped between the
             // resolve and the open. The fstat re-checks the file type and the
-            // length of what was opened; it does not re-check containment.
+            // length of what was opened. It does not re-check containment, and
+            // it cannot catch a FIFO swapped in: the open blocks on it first.
             let meta = file.metadata().await.map_err(|err| {
                 let msg = format!(
                     "cache.origin.path outboard stat failed for {}",
@@ -406,26 +415,17 @@ impl Origin for FilesystemOrigin {
             if meta.len() > outboard_max_bytes {
                 return Ok(OutboardFetch::Unsupported);
             }
-            // `take(outboard_max_bytes + 1)` bounds the read at one byte past
-            // the cap, so a file that grew on the same inode after the stat
-            // cannot grow the buffer without limit. `saturating_add(1)` keeps
-            // `u64::MAX` from wrapping to `0`. The buffer starts at the stat'ed
-            // length, so the `Bytes` the engine caches holds no spare capacity.
-            let mut outboard = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
-            let mut reader = file.take(outboard_max_bytes.saturating_add(1));
-            if let Err(err) = reader.read_to_end(&mut outboard).await {
-                let msg = format!(
-                    "cache.origin.path outboard read failed for {}",
-                    canonical.display()
-                );
-                return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+            match read_capped(file, meta.len(), outboard_max_bytes).await {
+                Ok(Some(outboard)) => Ok(OutboardFetch::Found(Bytes::from(outboard))),
+                Ok(None) => Ok(OutboardFetch::Unsupported),
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path outboard read failed for {}",
+                        canonical.display()
+                    );
+                    Err(classify_io_error(err).map_inner(|e| e.context(msg)))
+                }
             }
-            // The one-byte overrun `take` lets through marks a file that grew
-            // past the cap after the stat.
-            if u64::try_from(outboard.len()).unwrap_or(u64::MAX) > outboard_max_bytes {
-                return Ok(OutboardFetch::Unsupported);
-            }
-            Ok(OutboardFetch::Found(Bytes::from(outboard)))
         })
     }
 
@@ -509,6 +509,37 @@ impl Origin for FilesystemOrigin {
             Ok(out)
         })
     }
+}
+
+/// Read `reader` into a buffer presized to `len_hint`, stopping one byte
+/// past `max`. `Ok(None)` means the source held more than `max` bytes.
+///
+/// The presize is fallible: a reservation the allocator refuses is an
+/// `OutOfMemory` error for this one read, as in `std::fs::read`, not a
+/// process abort. An exact presize also leaves the buffer with no spare
+/// capacity, which matters because the engine's outboard cache budgets
+/// each entry by its length.
+///
+/// `take(max + 1)` bounds the read at one byte past the cap, so a source
+/// longer than its hint (a file that grew after its stat) cannot grow
+/// the buffer without limit; that extra byte marks the overrun.
+/// `saturating_add(1)` keeps `u64::MAX` from wrapping to `0`.
+async fn read_capped<R: AsyncRead + Unpin>(
+    reader: R,
+    len_hint: u64,
+    max: u64,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(usize::try_from(len_hint).unwrap_or(usize::MAX))
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::OutOfMemory, err))?;
+    reader
+        .take(max.saturating_add(1))
+        .read_to_end(&mut buf)
+        .await?;
+    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max {
+        return Ok(None);
+    }
+    Ok(Some(buf))
 }
 
 /// Defense-in-depth running-cap wrapper around a chunk stream. The
