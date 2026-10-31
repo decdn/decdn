@@ -13823,7 +13823,9 @@ enum Lie {
 /// `StreamResponse` (so the buyer opens the stream and starts paying), then lies
 /// on the byte stream per [`Lie`]. Models the hostile server the buyer's own
 /// receive-side guards defend against — the counterpart to the payment-fault
-/// tests, which model a hostile client.
+/// tests, which model a hostile client. `acked` fires once the buyer
+/// acknowledges every byte the server wrote, so a test can act on a stream
+/// whose frames have all arrived.
 async fn serve_lying_stream(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
@@ -13831,6 +13833,7 @@ async fn serve_lying_stream(
     served_wire: &[u8],
     advertised_total_bytes: u64,
     lie: Lie,
+    acked: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> anyhow::Result<()> {
     let (mut send, mut recv) = conn
         .accept_bi()
@@ -13930,6 +13933,11 @@ async fn serve_lying_stream(
         }
     }
     let _ = send.finish();
+    if let Some(acked) = acked
+        && matches!(send.stopped().await, Ok(None))
+    {
+        let _ = acked.send(());
+    }
     conn.closed().await;
     Ok(())
 }
@@ -13952,6 +13960,7 @@ fn spawn_lying_server(
                 &served_wire,
                 advertised_total_bytes,
                 lie,
+                None,
             )
             .await;
         }
@@ -14021,6 +14030,8 @@ async fn client_rejects_a_server_that_oversends_past_the_promised_length() -> an
 /// A stop reads the frames that have already arrived past the split, without
 /// waiting, and counts each one as wire bytes, the frame past the promised
 /// length included. No decoder verifies them, so no voucher pays for them.
+/// The stop runs only once the buyer has acknowledged every frame, so the
+/// count is exact.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_counts_the_frames_it_reads_past_the_split_as_wire_bytes() -> anyhow::Result<()> {
     use decdn_client::PeerSource;
@@ -14037,14 +14048,24 @@ async fn a_stop_counts_the_frames_it_reads_past_the_split_as_wire_bytes() -> any
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_lying_server(
-        server_ep.clone(),
-        Arc::clone(&server_eth),
-        slash_domain(),
-        wire,
-        total,
-        Lie::OverSend,
-    );
+    let (acked_tx, acked_rx) = tokio::sync::oneshot::channel();
+    let server_task = {
+        let (ep, eth) = (server_ep.clone(), Arc::clone(&server_eth));
+        tokio::spawn(async move {
+            if let Ok(conn) = support::accept_one(&ep).await {
+                let _ = serve_lying_stream(
+                    conn,
+                    &eth,
+                    &slash_domain(),
+                    &wire,
+                    total,
+                    Lie::OverSend,
+                    Some(acked_tx),
+                )
+                .await;
+            }
+        })
+    };
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -14073,16 +14094,20 @@ async fn a_stop_counts_the_frames_it_reads_past_the_split_as_wire_bytes() -> any
     let (_header, mut reader) = source.open(*hash.as_bytes(), range).await?;
     let verified = read_groups(&mut reader, honest, 16 * 1024).await?;
     anyhow::ensure!(verified < honest, "the leg must stop before its end");
-    // Let every frame land: the stop reads only what has already arrived.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The stop reads only what has already arrived: wait until the buyer
+    // acknowledges every frame, the one past the promised length included.
+    tokio::time::timeout(Duration::from_secs(10), acked_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("the buyer never acknowledged every frame"))?
+        .map_err(|_| anyhow::anyhow!("the server stopped before every frame was acknowledged"))?;
     source.stop(reader).await?;
 
     let wire = ledger.wire_bytes();
     let over = u64::try_from(LYING_FRAME)?;
     anyhow::ensure!(
-        honest <= wire && wire <= honest + over,
-        "the stop counts the honest {honest} wire bytes and at most the one {over}-byte frame \
-         past them: {wire}"
+        wire == honest + over,
+        "the stop counts the honest {honest} wire bytes and the {over}-byte frame past them: \
+         {wire}"
     );
     anyhow::ensure!(
         U256::from(wire) > ledger.paid_bytes(),
