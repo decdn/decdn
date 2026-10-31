@@ -8,8 +8,8 @@ header = """
 # Changelog
 
 git-cliff generates this file from the Conventional Commit history; `cargo release`
-rewrites it for each version (see RELEASING.md), and the same commits are the GitHub
-release notes. Do not edit it by hand.
+rewrites it for each version (see RELEASING.md). The newest section is also the
+GitHub release notes. Do not edit it by hand.
 
 """
 body = """
@@ -50,9 +50,9 @@ body = """
     {{ self::line(commit=commit) }}
   {%- endfor %}
 {% endfor %}
-{#- The blank line separates this section from the older one below it;
-    scripts/release-changelog.sh drops the one the oldest section leaves at
-    the end of the file. #}
+{#- The blank line separates this section from the older one below it. After
+    the oldest section it is trailing whitespace; scripts/release-changelog.sh
+    trims the file to a single final newline. #}
 
 """
 footer = ""
@@ -74,7 +74,6 @@ filter_commits = false
 # Release tags only. `v[0-9].*` rather than `v*`, so a working tag whose topic
 # starts with a `v` (`versioning-guards-prerebase`) never bounds `--latest`.
 tag_pattern = "v[0-9].*"
-# Newest first within a group.
 sort_commits = "newest"
 
 # The two `skip` rules come before `^chore`, which would otherwise match first

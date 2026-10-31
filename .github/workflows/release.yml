@@ -3,9 +3,9 @@ name: Release
 # Versions are cut locally, never here. A maintainer runs `cargo release
 # <level> --execute`, which bumps the workspace and makes a GPG-signed commit
 # and tag with their own key (see RELEASING.md). Pushing that tag is what
-# starts this workflow. git-cliff renders the same commits twice: `cargo
+# starts this workflow. git-cliff renders a release's commits twice: `cargo
 # release` rewrites CHANGELOG.md through its pre-release-hook, and this
-# workflow renders the GitHub release notes below.
+# workflow renders the same section as the GitHub release notes below.
 #
 # This workflow builds and stages; it does not sign and it does not publish.
 # The GitHub Release is created as a *draft* and all four container image

@@ -103,7 +103,7 @@ The live set on GitHub is the source; there is no label file to keep in sync. Ad
 - Branch from `main`; one concern per PR. A PR on a feature branch runs no CI, so stack on `main` only.
 - The PR title is a [Conventional Commit](https://www.conventionalcommits.org/) and becomes the squash-merge subject: `type(scope): subject`, with a type from `feat`, `fix`, `docs`, `chore`, `refactor`, `perf`, `test`, `build`, `ci`, `revert`, a lowercase first letter in the subject, and `!` after the type or a `BREAKING CHANGE:` footer when something breaks. The `pr-title` job gates merge and does not re-run on a title edit; push, or re-run the job.
 - Write `Closes #N` once per issue. GitHub reads only the first issue after a single keyword.
-- `CHANGELOG.md` is generated, never edited: `cargo release` runs git-cliff over the Conventional Commit subjects since the last tag ([RELEASING.md](RELEASING.md)), so the PR title is the changelog line and the release-notes line. A `!` after the type, or a `BREAKING CHANGE:` footer, files it under `### Breaking`.
+- `CHANGELOG.md` is generated, never edited: `cargo release` renders the whole Conventional Commit history with git-cliff ([RELEASING.md](RELEASING.md)), so the PR title is the changelog line and the release-notes line. A `!` after the type, or a `BREAKING CHANGE:` footer, files it under `### Breaking`.
 - The [PR template](.github/pull_request_template.md) carries the verification list: the always-run commands, and the extra gates when a PR touches contracts, a public API snapshot, `sponsord-api`, `adr/`, a crate edge or a metric name.
 
 ## Build and Test
