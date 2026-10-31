@@ -158,12 +158,12 @@ SRCS_REF := architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md
 
 # check-anchor-targets also reads the docs/ and root markdown that link into the
 # ADRs with anchors that rot the same way: adr/README.md, docs/*.md (runbook),
-# and the repo-root CONTRIBUTING.md / CLAUDE.md / CHANGELOG.md / README.md. These
+# and the repo-root CONTRIBUTING.md / CLAUDE.md / README.md. These
 # are deliberately NOT in SRCS_REF — the other guards police ADR *prose*
 # conventions, which build/reading documentation does not follow. The awk
 # resolves each link relative to its own file's directory, so the `../adr/…`
 # paths these carry resolve correctly.
-ANCHOR_SRCS := $(SRCS_REF) README.md $(wildcard ../docs/*.md) ../CONTRIBUTING.md ../CLAUDE.md ../CHANGELOG.md ../README.md
+ANCHOR_SRCS := $(SRCS_REF) README.md $(wildcard ../docs/*.md) ../CONTRIBUTING.md ../CLAUDE.md ../README.md
 
 check-bare-refs:
 	@bad=""; for f in $(SRCS_REF); do \

@@ -82,17 +82,22 @@ esac
 # belongs to. `minisign -S` writes `signed-with:<token>` for each -m file into
 # the file named by -x, else `<file>.minisig`, unless $MINISIGN_FAIL_SIGN is
 # set; with $MINISIGN_LEGACY it writes `legacy-signed-with:<token>`, as a
-# minisign whose default is the legacy format would. `minisign -V` succeeds
+# minisign whose default is the legacy format would. A second line carries the
+# trusted comment real minisign writes by default, `file:<name>` among its
+# tab-separated fields; $MINISIGN_TRUSTED_COMMENT is a printf format that
+# replaces it, with %s the signed file's name. `minisign -V` succeeds
 # iff the signature file exists and holds a token, -H is absent or the
 # signature is not legacy, and the public key named by -p or -P mentions the
-# token, unless $MINISIGN_FAIL_VERIFY is set. Logs argv to $MINISIGN_LOG.
+# token, unless $MINISIGN_FAIL_VERIFY is set; with -Q it then prints the
+# trusted comment, as minisign does. Logs argv to $MINISIGN_LOG.
 MINISIGN_SHIM = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$MINISIGN_LOG"
 mode="$1"; shift
-out=""; sec=""; pub=""; pubkey=""; files=""; prehashed=""
+out=""; sec=""; pub=""; pubkey=""; files=""; prehashed=""; quiet=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -H) prehashed=1 ;;
+    -Q) quiet=1 ;;
     -x) out="$2"; shift ;;
     -s) sec="$2"; shift ;;
     -p) pub="$2"; shift ;;
@@ -107,7 +112,10 @@ case "$mode" in
   -S) [ -n "${MINISIGN_FAIL_SIGN:-}" ] && { echo "shim: bad password" >&2; exit 1; }
       prefix="signed-with"; [ -n "${MINISIGN_LEGACY:-}" ] && prefix="legacy-signed-with"
       for f in $files; do
-        echo "$prefix:$(head -n1 "$sec")" > "${out:-$f.minisig}"
+        sig="${out:-$f.minisig}"
+        echo "$prefix:$(head -n1 "$sec")" > "$sig"
+        # shellcheck disable=SC2059  # the format is the test's input
+        printf "trusted comment: ${MINISIGN_TRUSTED_COMMENT:-timestamp:0\tfile:%s\thashed}\n" "$f" >> "$sig"
       done; exit 0 ;;
   -V) [ -n "${MINISIGN_FAIL_VERIFY:-}" ] && { echo "shim: signature mismatch" >&2; exit 1; }
       set -- $files
@@ -118,10 +126,15 @@ case "$mode" in
       fi
       tok=$(sed -n 's/^\(legacy-\)\{0,1\}signed-with://p' "$sig")
       [ -n "$tok" ] || { echo "shim: no token in $sig" >&2; exit 1; }
+      ok=""
       if [ -n "$pubkey" ]; then
-        case "$pubkey" in *"$tok"*) exit 0 ;; esac
+        case "$pubkey" in *"$tok"*) ok=1 ;; esac
       else
-        grep -q -- "$tok" "$pub" && exit 0
+        grep -q -- "$tok" "$pub" && ok=1
+      fi
+      if [ -n "$ok" ]; then
+        [ -n "$quiet" ] && sed -n 's/^trusted comment: //p' "$sig"
+        exit 0
       fi
       echo "shim: signature by $tok does not match ${pub:-$pubkey}" >&2; exit 1 ;;
   *) exit 9 ;;
@@ -500,6 +513,47 @@ def test_legacy_format_signatures_are_refused(release):
     assert result.returncode != 0
     assert "Legacy (non-prehashed) signature found" in result.stderr, output(result)
     assert not release.calls(release.gh_log, "release upload")
+
+
+LINUX = "decdn-0.0.0-x86_64-unknown-linux-gnu.tar.gz"
+WINDOWS = "decdn-0.0.0-x86_64-pc-windows-msvc.zip"
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        # No `file:` field at all, as a custom `-t` comment would write.
+        "decdn release",
+        # Another archive's name: the signature a rollback would reuse.
+        f"timestamp:0\tfile:{WINDOWS}\thashed",
+        # A name that only starts with the archive's.
+        "timestamp:0\tfile:%s.bak\thashed",
+        # A field that only ends with `file:<archive>`.
+        "timestamp:0\told-file:%s\thashed",
+    ],
+)
+def test_a_signature_that_does_not_name_its_archive_is_refused(release, comment):
+    # binstall accepts a valid signature under any archive name, so the
+    # trusted comment is all a person verifying by hand can check it against.
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", MINISIGN_TRUSTED_COMMENT=comment)
+
+    assert result.returncode != 0
+    assert f"{LINUX}.minisig has the trusted comment '" in result.stderr, output(result)
+    assert f"which does not name {LINUX}." in result.stderr, output(result)
+    assert not release.calls(release.gh_log, "release upload")
+
+
+def test_a_file_field_alone_names_the_archive(release):
+    # The field at both edges of the comment, with no tab on either side.
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", MINISIGN_TRUSTED_COMMENT="file:%s")
+
+    assert result.returncode == 0, output(result)
 
 
 def test_a_rerun_uploads_only_the_signatures_it_wrote(release):

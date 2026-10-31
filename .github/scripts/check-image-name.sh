@@ -7,7 +7,9 @@
 # for their binaries under the organisation rather than the repository). Each
 # name lives in three places that must agree:
 #   * release.yml's docker matrix — each `target:` (the Dockerfile stage, which
-#     names <stage>-image-digest.txt) with the `image:` it pushes to
+#     names <stage>-image-digest.txt) with the `image:` it pushes to; and the
+#     stage list again in its `sbom` matrix and its `attach` upload loop, which
+#     scan and attach each image's files
 #   * sign-release.sh's IMAGES list and GHCR_IMAGE table — the list picks which
 #     digest files are signed and which images promoted; the table
 #     regex-validates each file, then tags from it
@@ -81,6 +83,12 @@ expect_pair() {
 # digest unsigned and its tags unpromoted, and the table lines alone would
 # still pass.
 expect scripts/sign-release.sh 'IMAGES=( "decdn-node" "decdn" "sponsord" "sponsord-onramp" )'
+
+# Whole, for the same reason: a stage missing from `sbom` or `attach` is
+# pushed but never reaches the draft, and sign-release.sh refuses the release
+# only after the tag and images are public.
+expect .github/workflows/release.yml 'target: [decdn-node, decdn, sponsord, sponsord-onramp]'
+expect .github/workflows/release.yml 'for t in decdn-node decdn sponsord sponsord-onramp; do'
 
 # Stage name → the image as the workflows spell it → as sign-release.sh spells
 # it. The decdn images hang off the repository (`${REPO}` in the script), the

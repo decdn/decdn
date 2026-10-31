@@ -116,6 +116,17 @@ repos:
         files: '^(rust-toolchain\.toml|Cargo\.toml|deploy/sponsord/Dockerfile|\.github/(workflows|actions)/.*\.ya?ml|\.github/scripts/check[-_]toolchain[-_]pin\.(py|sh))$'
         pass_filenames: false
 
+      # A workflow step runs with the job's token, so an action fetched from a
+      # moved tag, a tool at whatever version is newest, or a token left in a
+      # checkout's git config, hands it to code nobody reviewed. The
+      # `packaging` CI job is authoritative.
+      - id: workflow-hardening
+        name: workflows pin actions, images and tools and scope their tokens
+        entry: .github/scripts/check-workflow-hardening.sh
+        language: system
+        files: '^\.github/(workflows/.*\.ya?ml|actions/.*\.ya?ml|scripts/check[-_]workflow[-_]hardening\.(py|sh))$'
+        pass_filenames: false
+
       # A member that restates `version` ships its own number; one without
       # `[lints] workspace = true` runs under default lint levels. Neither
       # warns. Editing the guard re-runs it, as adr-ref-hygiene does for its

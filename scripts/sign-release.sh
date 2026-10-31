@@ -432,9 +432,10 @@ cd "$WORKDIR"
 
 for f in "${SIGN_TARGETS[@]}"; do
   [[ -f "$f" ]] || die "expected asset $f is missing from the draft.
-A *-image-digest.txt or *-sbom.spdx.json comes from the release workflow's
-\`Docker image (<stage>)\` job; SHA256SUMS from \`upload-assets\`. Re-run
-that job, then retry."
+The release workflow's \`attach\` job uploads each *-image-digest.txt and
+*-sbom.spdx.json, after \`Docker image (<stage>)\` pushes the image and
+\`SBOM (<stage>)\` scans it; \`upload-assets\` uploads SHA256SUMS. Re-run the
+failed jobs, then retry."
 done
 
 # --strict, because without it a malformed line is only a warning: a truncated
@@ -603,12 +604,24 @@ committed at $PREV_TAG; a key new in $TAG signs from the next release (RELEASING
 fi
 echo "    signed SHA256SUMS.minisig ($MINISIGN_PUB)"
 
+# The signed trusted comment is the only thing in a .minisig that names the
+# archive, and the archive name carries its binary, version and target. -Q
+# prints only that comment, and only the one the signature covers, so the name
+# check reads what minisign verified, not the file's text. The comment is
+# tab-separated fields, `file:<name>` among them by default; a tab on each side
+# makes the match a whole field. binstall accepts a valid signature under any
+# archive name and compares the comment with nothing, so this field is all a
+# person verifying by hand can check the name against (SECURITY.md § `cargo
+# binstall`).
 for a in "${ARCHIVES[@]}"; do
-  MINISIGN_ERR=$(minisign -V -H -P "$BINSTALL_PUB" -m "$a" -x "${a}.minisig" 2>&1) || die \
+  MINISIGN_OUT=$(minisign -V -H -Q -P "$BINSTALL_PUB" -m "$a" -x "${a}.minisig" 2>&1) || die \
     "${a}.minisig does not verify under the binstall signing key the crates name at $TAG ($BINSTALL_PUB).
 $MINISIGN_KEY is not that key; cargo binstall would refuse every archive. A release signed by
 another maintainer's key changes the crates' pubkey before tagging (RELEASING.md § The minisign keys).
-minisign said: ${MINISIGN_ERR:-nothing}"
+minisign said: ${MINISIGN_OUT:-nothing}"
+  [[ $'\t'"${MINISIGN_OUT}"$'\t' == *$'\t'"file:${a}"$'\t'* ]] || die \
+    "${a}.minisig has the trusted comment '${MINISIGN_OUT}', which does not name ${a}.
+A signature must carry minisign's default \`file:<archive>\` field (SECURITY.md § \`cargo binstall\`)."
 done
 echo "    signed ${#ARCHIVES[@]} archives for cargo binstall"
 

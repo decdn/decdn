@@ -12,7 +12,8 @@ Closes #
 
 <!-- Delete this section if nothing breaks. Pre-mainnet, a breaking change is fine: name what breaks
      (wire / postcard, config, contract ABI, storage layout, sponsord API or installer arguments) and what
-     an operator or a running download sees. The CHANGELOG entry goes under a "(BREAKING)" heading. -->
+     an operator or a running download sees. Put `!` after the type in the PR title (or a `BREAKING CHANGE:`
+     footer in the squash body): git-cliff files it under Breaking in the changelog and the release notes. -->
 
 ## Reviewer notes
 
@@ -37,4 +38,3 @@ Only if touched:
 - [ ] `adr/`: `make -C adr check-refs`, `adr/architecture.md` summary updated, terms and parameters consistent across ADRs
 - [ ] A crate dependency edge: the table in `.github/scripts/check_crate_edges.py` and the CLAUDE.md § Crate Structure paragraph updated together
 - [ ] A metric name: the row in `adr/appendix-observability.md` and the dashboards in `decdn/devops`
-- [ ] User-visible change: `CHANGELOG.md` entry added by hand, one per PR
