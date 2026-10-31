@@ -640,8 +640,10 @@ impl ClientHandler {
             // `PoolExhausted` (not a QUIC reset, unlike a takedown) so the owner
             // learns to top up — `PoolExhausted` is post-auth, so naming the
             // condition leaks nothing an open-time refusal must hide, and it is not
-            // watermark-gated (no bundle). A `None` pool view fails OPEN (the
-            // on-chain redeem is the backstop). The caller drops the concurrent
+            // watermark-gated (no bundle). A `None` status fails OPEN: with no pool
+            // view wired there is nothing to check, and with a view wired the pool
+            // closed under this stream, which `pool_view_status_cached` counts and
+            // warns on. The caller drops the concurrent
             // pull leg when this returns, bounding the upstream spend just as the
             // takedown and no-progress exits do.
             //
@@ -655,7 +657,7 @@ impl ClientHandler {
             // and the on-chain redeem backstop are unchanged.
             if collected_any && !done && last_pool_check.elapsed() >= pool_recheck_interval {
                 last_pool_check = std::time::Instant::now();
-                if let Some(status) = self.pool_view_status_cached(lane_key.pool_id).await
+                if let Some(status) = self.pool_view_status_cached(&lane_key, &hash).await
                     && !self.pool_funds_committed(lane_key.pool_id, status.remaining)
                 {
                     self.write_reject(send, VoucherRejectReason::PoolExhausted, None)
