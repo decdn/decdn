@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Fail if the release or security workflow widens its token or floats an action.
+"""Fail if a workflow widens its token or floats an action, an image or a tool.
 
-`release.yml` builds and stages every artifact a user installs, and
-`security.yml` scans the published images. A step in either runs with the
-job's `GITHUB_TOKEN`, so an action fetched from a moved tag, or a token left
-in `.git/config` for a later step to read, hands that token to code nobody
-reviewed. With `packages: write` that code can push an image tag; with
-`contents: write` it can replace release assets. Five rules keep the token
-narrow and the code fixed:
+Every step under .github/workflows runs with its job's `GITHUB_TOKEN`, so an
+action fetched from a moved tag, a tool installed at whatever version is
+newest, or a token left in `.git/config` for a later step to read, hands that
+token to code nobody reviewed. In `release.yml` that token can push an image
+tag (`packages: write`) or replace release assets (`contents: write`); in
+`ci.yml` it writes PR comments and code-quality results, and the `clippy`
+cache a CI job saves is restored by the release's `verify`. Six rules keep
+every token narrow and the code fixed:
 
 1. Every remote `uses:` names a full 40-hex commit SHA. A tag or branch can be
    moved to other code; a SHA cannot. A `docker://` ref names an
@@ -17,7 +18,8 @@ narrow and the code fixed:
    `with:`, so no later step finds the token in the checkout's git config.
 3. The workflow-level `permissions:` exists and grants no `write`, so a job
    that names no permissions of its own can only read.
-4. Each job's write grants are exactly its row in WRITE_JOBS, and a job that
+4. Every workflow has a WRITE_JOBS row, so a new one declares what it may
+   write. Each job's write grants are exactly its row in WRITE_JOBS, and a job that
    holds `contents: write` uses no action but GitHub's own `actions/*`. The
    table is exact in both directions, so a grant that is dropped from the
    workflow leaves a stale row that fails here until the table moves too.
@@ -25,6 +27,10 @@ narrow and the code fixed:
    input in IMAGE_INPUTS, since a SHA-pinned action still pulls a floating
    image by default. A job `container:` or `services:` key is an error:
    this check does not read those images.
+6. A `taiki-e/install-action` step names every tool as `name@X.Y.Z` and sets
+   `fallback: none`. install-action checks the sha256 of a version its
+   manifest lists; for any other it falls back to cargo-binstall, which
+   installs unchecked.
 
 Out of scope: `run:` steps, which this check does not read, and where a SHA
 comes from. Rule 1 proves a ref cannot move, not that the commit belongs to
@@ -42,7 +48,7 @@ alias pulled in from another job) can pass it, and whoever can write that can
 as easily delete the step that runs this check. Review of `.github/` is the
 boundary against that.
 
-Run: .github/scripts/check-release-hardening.sh
+Run: .github/scripts/check-workflow-hardening.sh
 """
 
 from __future__ import annotations
@@ -56,17 +62,26 @@ from pathlib import Path
 if sys.version_info < (3, 11):  # the floor every guard under .github/scripts sets
     sys.exit(f"error: python 3.11+ required, found {sys.version.split()[0]}")
 
-# Each workflow in scope, mapped to the jobs allowed a write grant and the
-# scopes each may write. A workflow with no row here may grant no write.
+# Every workflow, mapped to the jobs allowed a write grant and the scopes each
+# may write. `{}` is a workflow in which no job writes.
 WRITE_JOBS: dict[str, dict[str, set[str]]] = {
+    ".github/workflows/ci.yml": {
+        "test": {"code-quality"},
+        "solidity-build-test": {"pull-requests"},
+        "solidity-coverage": {"code-quality"},
+    },
+    ".github/workflows/codeql.yml": {"analyze": {"security-events"}},
     ".github/workflows/release.yml": {
         "draft": {"contents"},
         "upload-assets": {"contents"},
         "attach": {"contents"},
         "docker": {"packages"},
     },
+    ".github/workflows/sdk-contract.yml": {},
     ".github/workflows/security.yml": {},
 }
+INSTALL_ACTION = "taiki-e/install-action"
+PINNED_TOOL = re.compile(r"^[A-Za-z0-9_.-]+@\d+\.\d+\.\d+$")
 
 # A `#` at line start or after whitespace opens a YAML comment. The pattern
 # also cuts ` #…` out of quoted strings and `run:` text; that is harmless here
@@ -220,7 +235,7 @@ def check_actions(lines: list[str], label: str) -> tuple[list[str], list[str], i
                 "(write `owner/repo@<sha> # vX.Y.Z`)"
             )
         action = ref.split("@", 1)[0].lower()
-        if action != "actions/checkout" and action not in IMAGE_INPUTS:
+        if action not in ("actions/checkout", INSTALL_ACTION) and action not in IMAGE_INPUTS:
             continue
         step = step_block(lines, i)
         if step is None:
@@ -230,6 +245,19 @@ def check_actions(lines: list[str], label: str) -> tuple[list[str], list[str], i
                 errors.append(
                     f"{where}: actions/checkout does not set `persist-credentials: false` "
                     "under `with:`"
+                )
+        elif action == INSTALL_ACTION:
+            tools = re.split(r"[\s,]+", with_input(*step, "tool") or "")
+            floating = [t for t in tools if t and not PINNED_TOOL.match(t)]
+            if floating or not any(tools):
+                errors.append(
+                    f"{where}: install-action tool {', '.join(floating) or '(none)'} is not "
+                    "pinned as `name@X.Y.Z`"
+                )
+            if with_input(*step, "fallback") != "none":
+                errors.append(
+                    f"{where}: install-action does not set `fallback: none`, so a version "
+                    "its manifest lacks installs unchecked"
                 )
         else:
             name, pinned = IMAGE_INPUTS[action]
@@ -371,7 +399,7 @@ def check_permissions(lines: list[str], label: str, allowed: dict[str, set[str]]
         if granted != want:
             errors.append(
                 f"{label}: job `{job}` grants write on {sorted(granted) or 'nothing'}, but "
-                f"WRITE_JOBS in check_release_hardening.py allows {sorted(want) or 'nothing'}"
+                f"WRITE_JOBS in check_workflow_hardening.py allows {sorted(want) or 'nothing'}"
             )
         if "contents" in granted or "*" in granted:
             sites, _ = uses_sites(lines[start:end])
@@ -395,6 +423,17 @@ def check(repo_root: Path) -> tuple[list[str], int]:
     seen_local: set[str] = set()
     pending: list[str] = []
 
+    workflows = repo_root / ".github" / "workflows"
+    on_disk = sorted(
+        str(p.relative_to(repo_root))
+        for p in [*workflows.glob("*.yml"), *workflows.glob("*.yaml")]
+    )
+    for label in on_disk:
+        if label not in WRITE_JOBS:
+            errors.append(
+                f"{label}: no WRITE_JOBS row in check_workflow_hardening.py — add one "
+                "naming the jobs that may write, `{}` if none does"
+            )
     for label, allowed in WRITE_JOBS.items():
         path = repo_root / label
         if not path.is_file():
@@ -440,17 +479,18 @@ def main() -> int:
     )
     errors, total = check(repo_root)
     if errors:
-        print("error: the release workflows are not hardened:\n", file=sys.stderr)
+        print("error: the workflows are not hardened:\n", file=sys.stderr)
         for e in errors:
             print(f"  {e}", file=sys.stderr)
         print(
-            "\nEvery action is pinned by commit SHA, no checkout keeps its token, and\n"
-            "write access goes only to the jobs WRITE_JOBS names (see the docstring of\n"
-            ".github/scripts/check_release_hardening.py).",
+            "\nEvery action is pinned by commit SHA, every image by digest and every tool\n"
+            "by version, no checkout keeps its token, and write access goes only to the\n"
+            "jobs WRITE_JOBS names (see the docstring of\n"
+            ".github/scripts/check_workflow_hardening.py).",
             file=sys.stderr,
         )
         return 1
-    print(f"release hardening OK ({total} action refs in {len(WRITE_JOBS)} workflows "
+    print(f"workflow hardening OK ({total} action refs in {len(WRITE_JOBS)} workflows "
           "and their local actions)")
     return 0
 

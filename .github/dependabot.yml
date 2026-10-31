@@ -72,13 +72,10 @@ updates:
     commit-message:
       prefix: chore
       include: scope
-    # No dtolnay/rust-toolchain ignore: MSRV and the stable lint pin are the
-    # same X.Y.Z (see Cargo.toml workspace.package.rust-version and the
-    # rust-toolchain refs in ci.yml). Dependabot bumps only the action refs, and
-    # that is fine: .github/scripts/check-toolchain-pin.sh fails the `packaging`
-    # job until rust-toolchain.toml and Cargo.toml's rust-version move in the
-    # same PR, so the bump cannot land half-applied. release.yml pins the action
-    # by SHA and names the version in its `toolchain:` input, which Dependabot
-    # does not touch; the same check holds that input, so the bump PR stays red
-    # until it moves too. Re-add a version-specific ignore here if MSRV later
-    # drops below the stable pin.
+    # Every workflow pins dtolnay/rust-toolchain by commit SHA and names the
+    # Rust version in its `toolchain:` input, which Dependabot does not read, so
+    # this ecosystem never moves the toolchain. A Rust release reaches the repo
+    # through the docker ecosystem's `rust:X.Y.Z` bump of deploy/sponsord, and
+    # .github/scripts/check-toolchain-pin.sh holds that PR red until
+    # rust-toolchain.toml, Cargo.toml's rust-version and every `toolchain:`
+    # input move with it.
