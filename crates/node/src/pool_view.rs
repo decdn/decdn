@@ -28,10 +28,9 @@
 //!   projection only. An admitted stream's pool was seeded at admission and a
 //!   projection entry persists until the pool is forgotten (a `PoolReclaimed`, or
 //!   a re-anchor read that finds it `Closed`, removes it), so a `None` here
-//!   means the pool closed under a live stream. The re-check then fails open,
-//!   because a chain read at a voucher boundary would stall delivery, and counts
-//!   `decdn_serve_pool_recheck_skipped_total`. `redeemMany` reverts on a closed
-//!   pool, so the node is not paid for the bytes it serves after the close.
+//!   means the pool closed under a live stream. `redeemMany` reverts on a closed
+//!   pool, so the re-check stops the stream rather than read the chain at a
+//!   voucher boundary, which would stall delivery.
 //!   While the node cannot reach the chain past its grace window
 //!   ([`crate::chain_freshness`]), the projection may be frozen. The re-check
 //!   still reads it and applies its usual verdict to what it holds, but each
@@ -501,7 +500,8 @@ impl PoolProjection {
 
     /// Apply a `PoolCloseInitiated(poolId, _, disputeDeadline)`: mark the pool
     /// `Closing`. Skipped for a pool the projection has not opened — there is no
-    /// entry to serve, and reads fail open. A `Closing` pool keeps its
+    /// entry to serve, and the admit-path `getPool` read finds the pool `Closing`
+    /// and refuses it. A `Closing` pool keeps its
     /// `remaining` and stays redeemable until `deadline`; `PoolReclaimed` later
     /// removes it via `forget`.
     pub fn record_closing(&self, pool_id: B256, deadline: u64) {
@@ -516,8 +516,8 @@ impl PoolProjection {
     }
 
     /// Apply a `PoolReclaimed(poolId, ..)`: the pool is `Closed` and its remainder
-    /// refunded. Drop it — a later read returns `None` and the serve gate fails
-    /// open, exactly as for a pool the projection has not yet seen. A
+    /// refunded. Drop it — a later read returns `None`, which refuses the pool at
+    /// admission and stops any live stream on it as `PoolClosed`. A
     /// `PoolCloseInitiated` is folded by [`Self::record_closing`], which marks the
     /// pool `Closing` but keeps it redeemable until the dispute deadline; `forget`
     /// removes the whole entry, lifecycle included, once the reclaim actually

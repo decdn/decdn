@@ -111,6 +111,10 @@ pub(super) enum ServeStop {
     VoucherRejected,
     /// The pool can no longer fund the floor credit (`PoolExhausted`).
     PoolExhausted,
+    /// The pool closed under the stream, or it is `Closing` and its dispute
+    /// deadline falls inside the node's redeem margin. The wire reason is
+    /// `PoolExhausted`.
+    PoolClosed,
     /// The signer's shared cap drained at other nodes (`SignerCapExhausted`).
     SignerCapExhausted,
     /// A blacklist takedown landed for the hash.
@@ -129,6 +133,7 @@ impl ServeStop {
         match self {
             Self::VoucherRejected => "voucher_rejected",
             Self::PoolExhausted => "pool_exhausted",
+            Self::PoolClosed => "pool_closed",
             Self::SignerCapExhausted => "signer_cap_exhausted",
             Self::Takedown => "takedown",
             Self::ProofBudgetExhausted => "proof_budget_exhausted",
@@ -176,6 +181,7 @@ impl ServeEnd {
             Self::Stopped { stop, .. } => match stop {
                 ServeStop::VoucherRejected => metrics.serve_stream_voucher_rejected(),
                 ServeStop::PoolExhausted => metrics.serve_stream_midstream_pool_exhausted(),
+                ServeStop::PoolClosed => metrics.serve_stream_midstream_pool_closed(),
                 ServeStop::SignerCapExhausted => {
                     metrics.serve_stream_midstream_signer_cap_exhausted();
                 }
