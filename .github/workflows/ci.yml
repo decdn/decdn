@@ -129,7 +129,7 @@ jobs:
           toolchain: 1.99.1
       # cargo-deny pinned to an exact version so a release can't silently
       # change the check's behavior.
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-deny@0.20.2
@@ -232,7 +232,7 @@ jobs:
           shared-key: public-api
           # Restore-only except on `main`; only `main` writes it (see clippy job).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -441,7 +441,7 @@ jobs:
           # job). This is the largest partition (~1.2 GiB instrumented target),
           # so gating its save is what most relieves the saturated cache store.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-llvm-cov@0.9.1,cargo-nextest@0.9.149
@@ -567,7 +567,7 @@ jobs:
         with:
           shared-key: anvil-e2e-settlement
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -658,7 +658,7 @@ jobs:
         with:
           shared-key: anvil-e2e-journeys
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -728,7 +728,7 @@ jobs:
         with:
           shared-key: anvil-e2e-sponsord
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           fallback: none
           tool: cargo-nextest@0.9.149
@@ -1295,7 +1295,7 @@ jobs:
       # through the real git-cliff and skips without it; the version matches
       # the release workflow's, so the test sees the binary a release uses.
       - name: Install git-cliff
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: git-cliff@2.14.2
           fallback: none
