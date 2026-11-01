@@ -516,14 +516,17 @@ impl Origin for FilesystemOrigin {
 ///
 /// The presize is fallible: a reservation the allocator refuses is an
 /// `OutOfMemory` error for this one read, as in `std::fs::read`, not a
-/// process abort. An exact presize also leaves the buffer with no spare
-/// capacity, which matters because the engine's outboard cache budgets
-/// each entry by its length.
+/// process abort.
 ///
 /// `take(max + 1)` bounds the read at one byte past the cap, so a source
 /// longer than its hint (a file that grew after its stat) cannot grow
 /// the buffer without limit; that extra byte marks the overrun.
 /// `saturating_add(1)` keeps `u64::MAX` from wrapping to `0`.
+///
+/// The returned buffer holds no spare capacity, because the engine's
+/// outboard cache budgets each entry by its length. The exact presize
+/// gives that when the hint is right; a hint gone stale between the stat
+/// and the read leaves a grown or unfilled buffer, which is shrunk.
 async fn read_capped<R: AsyncRead + Unpin>(
     reader: R,
     len_hint: u64,
@@ -539,6 +542,7 @@ async fn read_capped<R: AsyncRead + Unpin>(
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > max {
         return Ok(None);
     }
+    buf.shrink_to_fit();
     Ok(Some(buf))
 }
 

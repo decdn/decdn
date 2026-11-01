@@ -722,3 +722,23 @@ async fn read_capped_stops_one_byte_past_the_cap() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A length hint gone stale between the stat and the read leaves no
+/// spare capacity either way: a file that grew past its hint grows the
+/// buffer, and one that shrank under it leaves the presize unfilled.
+#[tokio::test]
+async fn read_capped_stale_hint_leaves_no_spare_capacity() -> anyhow::Result<()> {
+    for (hint, len) in [(100u64, 1500usize), (4096, 1500)] {
+        let source = std::io::Cursor::new(vec![0x5Au8; len]);
+        let buf = read_capped(source, hint, 4096)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("a {len}-byte source is under the cap"))?;
+        anyhow::ensure!(
+            buf.len() == len && buf.capacity() == len,
+            "hint {hint}: a {}-byte read holds a {}-byte buffer",
+            buf.len(),
+            buf.capacity()
+        );
+    }
+    Ok(())
+}

@@ -18,6 +18,7 @@
 //! the auto-seeded thread-local CSPRNG backed by OS entropy.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
@@ -518,7 +519,7 @@ pub(crate) fn validate_data_dir(data_dir: &Path) -> anyhow::Result<()> {
 /// permission bit is set.
 ///
 /// There is a small TOCTOU window between this check and `load_from`'s
-/// `fs::read`, but exploiting it requires write access to `data_dir` — which
+/// open, but exploiting it requires write access to `data_dir` — which
 /// `validate_data_dir` already denies, so the two checks compose. Tightening
 /// to an `O_NOFOLLOW` open would require a libc dep; deferred.
 #[cfg(unix)]
@@ -592,27 +593,50 @@ pub(crate) fn create_data_dir_secure(data_dir: &Path) -> anyhow::Result<()> {
 /// Load the node's `SecretKey` from an existing file.
 ///
 /// Callers must validate `path` via [`validate_key_file`] first — this
-/// function follows symlinks via `fs::read`.
+/// function follows symlinks when it opens the file.
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be read or is not exactly 32 bytes.
 fn load_from(path: &Path) -> anyhow::Result<SecretKey> {
-    // Read the key file into a buffer that is wiped on drop, on the error
-    // path too. The array view below borrows it rather than copying; the
-    // only other copy is the one inside the returned `SecretKey`.
-    let bytes = Zeroizing::new(
-        fs::read(path)
-            .with_context(|| format!("failed to read secret key file {}", path.display()))?,
-    );
-    let len = bytes.len();
-    let arr: &[u8; KEY_LEN] = bytes.as_slice().try_into().map_err(|_| {
-        anyhow!(
+    let read_failed = || format!("failed to read secret key file {}", path.display());
+    let mut file = fs::File::open(path).with_context(read_failed)?;
+    // Read straight into a buffer that is wiped on drop, so no unwiped copy
+    // of the key outlives a failed read or a wrong-length file. The only
+    // other copy is the one inside the returned `SecretKey`.
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    let len = read_up_to(&mut file, key.as_mut_slice()).with_context(read_failed)?;
+    // One more byte tells a file of exactly the key length from a longer one.
+    let extra = read_up_to(&mut file, &mut [0u8; 1]).with_context(read_failed)?;
+    if extra != 0 {
+        anyhow::bail!(
+            "secret key file {} must be {KEY_LEN} bytes, got more",
+            path.display()
+        );
+    }
+    if len != KEY_LEN {
+        anyhow::bail!(
             "secret key file {} must be {KEY_LEN} bytes, got {len}",
             path.display()
-        )
-    })?;
-    Ok(SecretKey::from_bytes(arr))
+        );
+    }
+    Ok(SecretKey::from_bytes(&key))
+}
+
+/// Read from `reader` until `buf` is full or the source ends, and return
+/// the byte count. Unlike `read_exact`, a short source reports how much it
+/// held.
+fn read_up_to(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while let Some(rest) = buf.get_mut(filled..).filter(|rest| !rest.is_empty()) {
+        match reader.read(rest) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
 }
 
 /// A newly generated node secret key, drawn from the OS RNG. The caller owns
