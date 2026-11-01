@@ -1,8 +1,8 @@
 """Regression tests for pnpm.sh, the pnpm the dashboard's tooling runs.
 
 A maintainer's Node 24 may provide pnpm only through corepack. Without the
-fallback, publish-crates.sh stops at its tool check on release day, and the
-dashboard-lint hook fails every commit that touches the dashboard.
+fallback, the dashboard-lint hook fails every commit that touches the
+dashboard.
 """
 
 from __future__ import annotations

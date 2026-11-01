@@ -38,7 +38,7 @@ exclude = ["contracts"]
 # under cargo-release from then on. check_workspace_manifests.py refuses a
 # member that restates the version and an internal alias below that disagrees
 # with it, so a hand edit anywhere else fails before it ships.
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 # Three parts, not two: this string, `rust-toolchain.toml`'s channel, the
@@ -64,15 +64,15 @@ categories = ["network-programming", "web-programming"]
 # published crate has no path to follow. Locally the `path` still wins; the
 # version only applies to the manifest cargo uploads. A dev-dependency is the
 # exception, see `decdn-e2e` below.
-decdn-protocol = { path = "crates/protocol", version = "0.3.0" }
-decdn-config-types = { path = "crates/config-types", version = "0.3.0" }
-decdn-bao-range = { path = "crates/bao-range", version = "0.3.0" }
-decdn-cache = { path = "crates/cache", version = "0.3.0" }
-decdn-incentive = { path = "crates/incentive", version = "0.3.0" }
-decdn-reputation = { path = "crates/reputation", version = "0.3.0" }
-decdn-common = { path = "crates/common", version = "0.3.0" }
-decdn-client = { path = "crates/client", version = "0.3.0" }
-decdn-node = { path = "crates/node", version = "0.3.0" }
+decdn-protocol = { path = "crates/protocol", version = "0.3.1" }
+decdn-config-types = { path = "crates/config-types", version = "0.3.1" }
+decdn-bao-range = { path = "crates/bao-range", version = "0.3.1" }
+decdn-cache = { path = "crates/cache", version = "0.3.1" }
+decdn-incentive = { path = "crates/incentive", version = "0.3.1" }
+decdn-reputation = { path = "crates/reputation", version = "0.3.1" }
+decdn-common = { path = "crates/common", version = "0.3.1" }
+decdn-client = { path = "crates/client", version = "0.3.1" }
+decdn-node = { path = "crates/node", version = "0.3.1" }
 # `decdn-e2e` is `publish = false`; the alias exists because the sponsord crates
 # dev-depend on its anvil fixtures. No `version`, on purpose: cargo strips a
 # dev-dependency from the published manifest only when it has no version
@@ -81,10 +81,10 @@ decdn-node = { path = "crates/node", version = "0.3.0" }
 decdn-e2e = { path = "crates/e2e" }
 # sponsord: the sponsorship daemon, its library core, the wire types and the
 # public onramp. `sponsord-e2e` has no alias: nothing depends on it.
-sponsord = { path = "crates/sponsord", version = "0.3.0" }
-sponsord-api = { path = "crates/sponsord-api", version = "0.3.0" }
-sponsord-core = { path = "crates/sponsord-core", version = "0.3.0" }
-sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.3.0" }
+sponsord = { path = "crates/sponsord", version = "0.3.1" }
+sponsord-api = { path = "crates/sponsord-api", version = "0.3.1" }
+sponsord-core = { path = "crates/sponsord-core", version = "0.3.1" }
+sponsord-onramp = { path = "crates/sponsord-onramp", version = "0.3.1" }
 # No `decdn-cli` entry: it is a bin crate and a workspace *member*, but nothing
 # in the workspace depends on it, so it needs no `[workspace.dependencies]`
 # alias. Add one back only alongside a real dependant.

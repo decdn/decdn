@@ -79,8 +79,10 @@ that decides a blacklist enforcement attempt). A best-effort fee-share read
 that gives up logs the same text but falls back to the floor share instead of
 exiting; `decdn_fee_shares_watcher_unregistered` then reads `1`. The node
 serves nothing until the blacklist enumeration and enforcement complete. The
-`decdn_chain_boot_read_retries_total` counter counts the boot retries; it
-becomes scrapeable once boot completes.
+metrics listener serves during boot: `decdn_node_boot_ready` reads `0` until
+bring-up finishes, and `decdn_chain_boot_read_retries_total` rises while the
+boot chain reads retry. The RPC preflight's own retries show only in its
+`WARN` lines.
 
 **Detect:**
 
@@ -719,7 +721,7 @@ revenue flat while requests arrive; `decdn get` against this node returns
   refusal — that one also carries the hash.
 - `decdn_serve_stream_rejected_signer_floor_at_cap_total`, the sibling counter for
   a refusal where the pool is solvent but ONE capability signer has filled its share
-  of the un-vouchered floor. It rises while `…insufficient_deposit_total` stays flat.
+  of the un-vouchered floor, live or owed. It rises while `…insufficient_deposit_total` stays flat.
   This counter has **no alert rule**: it is dashboard- and log-only, so cause 3
   below is found by looking, not by being paged. The node's own `warn!` for it runs
   on a separate 5-minute window from the deposit line above, so neither arm can
@@ -729,7 +731,7 @@ revenue flat while requests arrive; `decdn get` against this node returns
   a client cannot distinguish them and the server-side counters are the only place
   the cause exists at all.
 
-**Causes:** three, with different remedies, and the `insufficient_deposit` counter
+**Causes:** four, with different remedies, and the `insufficient_deposit` counter
 alone cannot tell the first two apart — this is why the log line exists:
 
 1. **Clients genuinely running dry.** Their remaining deposit cannot cover one
@@ -739,21 +741,36 @@ alone cannot tell the first two apart — this is why the log line exists:
    client that just topped up is refused until the watcher catches up. Funded
    clients are being turned away and will route elsewhere.
 
-3. **One signer is at its live floor cap.** The pool is solvent, but one capability
-   signer is running more concurrent un-vouchered streams than its share of the
-   floor covers
+3. **One signer is at its floor cap.** The pool is solvent, but one capability
+   signer holds more un-vouchered floor than its share covers
    ([ADR 003 § Pool solvency](../adr/003-payments.md#pool-solvency-and-the-refundable-floor-m)).
-   `decdn_serve_stream_rejected_signer_floor_at_cap_total` rises while
-   `…insufficient_deposit_total` stays flat, and the `warn!` names the signer. The
-   cap holds no permanent charge — it is pure concurrency, released as each of the
-   signer's streams pays, so it clears on its own and needs no top-up or reclaim.
+   The floor it holds is its live streams plus the floor debt that streams it
+   left unpaid hold. `decdn_serve_stream_rejected_signer_floor_at_cap_total` rises
+   while `…insufficient_deposit_total` stays flat, and the `warn!` names the signer
+   with `signer_live` and `signer_debt`. The live part clears as each of the
+   signer's streams pays. The debt clears only when the signer pays past a stream's
+   own floor; time does not clear it. A signer whose cap is all debt has no stream
+   left to pay with, so it stays refused at this node until a restart or a pool
+   reclaim. A signer that loops through free floors and never pays stays refused,
+   which is the cap working. A restart clears all floor debt, so the restart that
+   applies a wider `blockchain.pool_floor_signer_live_windows` also unlocks a
+   signer that debt held: that is not evidence the cap was too narrow.
    If a signer is honest and legitimately highly concurrent, the operator raises
    `blockchain.pool_floor_signer_live_windows`. That knob is **restart-required** —
    `blockchain.*` is not a reload section, so `decdn node reload` neither applies
    nor validates a new value. Rotating the session key is the remedy that takes
-   effect immediately.
+   effect immediately. The old key's floor debt stays in the pool total (cause 4)
+   until a restart or a pool reclaim.
 
-A fourth, rarer cause: the operator's own
+4. **Floor debt holds the pool's headroom.** The deposit is ample, but streams
+   that clients left unpaid hold floor debt on the pool, and live floor plus debt
+   fills `remaining − M`. The node logs a separate `warn!` for this case, with
+   `pool_live` and `pool_debt`. Expect it after a burst of abandoned streams, or
+   after many session keys left debt and rotated away: each key's debt clears only
+   with that key's payment. A top-up widens the headroom; a restart or a pool
+   reclaim clears all floor debt.
+
+A fifth, rarer cause: the operator's own
 `blockchain.buyer_working_deposit_micro_usdc` is too small for the *upstream*
 rate, in which case this node is the one being refused. (The node opens its
 buyer pool at the working deposit and the low-water refill tops it back up on

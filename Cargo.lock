@@ -2831,7 +2831,7 @@ checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "decdn-bao-range"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bao-tree",
  "bytes",
@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-cache"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2884,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -2940,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -2972,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-common"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -2997,7 +2997,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-config-types"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-e2e"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3039,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-incentive"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -3069,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-node"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -3128,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-protocol"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "blake3",
  "insta",
@@ -3144,7 +3144,7 @@ dependencies = [
 
 [[package]]
 name = "decdn-reputation"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "decdn-protocol",
@@ -8094,7 +8094,7 @@ dependencies = [
 
 [[package]]
 name = "sponsord"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -8119,7 +8119,7 @@ dependencies = [
 
 [[package]]
 name = "sponsord-api"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "anyhow",
@@ -8138,7 +8138,7 @@ dependencies = [
 
 [[package]]
 name = "sponsord-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -8157,7 +8157,7 @@ dependencies = [
 
 [[package]]
 name = "sponsord-e2e"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "axum",
@@ -8175,7 +8175,7 @@ dependencies = [
 
 [[package]]
 name = "sponsord-onramp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy-primitives",
  "anyhow",

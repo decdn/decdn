@@ -138,6 +138,24 @@ impl ServeStop {
     }
 }
 
+/// Whether a serve that ended as `end` leaves its unpaid bytes as floor debt
+/// (ADR 003 §Pool solvency, floor debt). Debt is the price of the client's own
+/// conduct: it left ([`is_peer_attributable`]), sent a voucher the node rejected,
+/// or spent its proof budget. Every other end owes nothing — a node or upstream
+/// fault, a takedown, a held-bytes cap, and the funding stops the node takes for a
+/// drained pool or signer cap. An end with nothing unpaid (completed, refused,
+/// reset before delivery) owes nothing either way.
+pub(super) fn owes_floor_debt(end: &anyhow::Result<ServeEnd>) -> bool {
+    match end {
+        Err(e) => is_peer_attributable(e),
+        Ok(ServeEnd::Stopped { stop, .. }) => matches!(
+            stop,
+            ServeStop::VoucherRejected | ServeStop::ProofBudgetExhausted
+        ),
+        Ok(ServeEnd::Completed { .. } | ServeEnd::Refused(_) | ServeEnd::Reset(_)) => false,
+    }
+}
+
 impl ServeEnd {
     /// The `outcome` value a span records for this end.
     const fn outcome(self) -> &'static str {

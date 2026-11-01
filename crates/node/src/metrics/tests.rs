@@ -945,6 +945,7 @@ fn observability_counters_export_at_zero() {
         "decdn_receipt_write_failures_total",
         "decdn_serve_stream_midstream_pool_exhausted_total",
         "decdn_serve_pool_recheck_skipped_total",
+        "decdn_serve_pool_recheck_stale_total",
         "decdn_serve_stream_proof_budget_exhausted_total",
         "decdn_redeem_hints_parked_total",
     ] {
