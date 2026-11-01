@@ -18,11 +18,12 @@ pre-release-hook = ["bash", "-c", "\"$WORKSPACE_ROOT/scripts/release-changelog.s
 pre-release-commit-message = "chore(release): v{{version}}"
 push = true
 push-remote = "origin"
-# Not a "we never publish" flag — the workspace does go to crates.io, via
-# scripts/publish-crates.sh. It must not happen HERE: this step runs
-# before CI has built anything and before a human has verified anything, and a
-# crates.io version is immutable, so an upload at this point could never be
-# taken back if the release then failed. See RELEASING.md.
+# Not a "we never publish" flag — the workspace does go to crates.io, through
+# .github/workflows/publish-crates.yml once the release is signed. It must not
+# happen HERE: this step runs before CI has built anything and before a human
+# has verified anything, and a crates.io version is immutable, so an upload at
+# this point could never be taken back if the release then failed. See
+# RELEASING.md.
 publish = false
 sign-commit = true
 sign-tag = true

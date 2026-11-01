@@ -282,7 +282,7 @@ jobs:
       - name: decdn-cli packages the dashboard build, and nothing else untracked
         run: .github/scripts/check-dashboard-packaged.sh
 
-      # publish-crates.sh uploads these to crates.io after the release is
+      # publish-crates.yml uploads these to crates.io after the release is
       # signed, and a crates.io version can never be replaced. Packaging must
       # therefore be proven BEFORE the draft exists, not discovered mid-publish.
       #
@@ -294,12 +294,12 @@ jobs:
         run: cargo publish --workspace --dry-run --locked --allow-dirty
 
       # Baseline = the highest v* tag that does not point at HEAD, rather than
-      # the crates.io registry baseline. Publishing is a manual post-signing
-      # step (publish-crates.sh) that can be skipped or fail partway, so the
-      # registry is not a reliable record of the previous release — and the tag
-      # baseline needs no registry round-trip and works before the first
-      # publish. The first release has no prior tag, so semver-checks is
-      # skipped then (nothing to compare against).
+      # the crates.io registry baseline. Publishing is a post-signing step
+      # (publish-crates.yml) that can fail partway, so the registry is not a
+      # reliable record of the previous release — and the tag baseline needs
+      # no registry round-trip and works before the first publish. The first
+      # release has no prior tag, so semver-checks is skipped then (nothing to
+      # compare against).
       - name: Determine semver baseline
         id: baseline
         env:
