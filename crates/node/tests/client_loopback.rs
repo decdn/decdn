@@ -7845,6 +7845,130 @@ async fn a_mid_stream_pool_exhausted_keeps_the_proofs_the_node_accepted() -> any
     Ok(())
 }
 
+/// A [`PoolView`](decdn_node::pool_view::PoolView) that admits on a funded
+/// `status` while its `cached_status` reads `remaining = 0` until the test clears
+/// `drained`. Only the mid-stream re-check reads `cached_status`, so with a ZERO
+/// re-check interval the stream stops at its first re-check: between the epoch's
+/// root voucher and the reveal that pays chunk 1.
+#[derive(Debug)]
+struct CachedDrainPoolView {
+    deposit: U256,
+    drained: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl decdn_node::pool_view::PoolView for CachedDrainPoolView {
+    async fn status(&self, _pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        Some(decdn_node::pool_view::PoolStatus {
+            owner: operator_addr(),
+            remaining: self.deposit,
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        })
+    }
+
+    async fn cached_status(&self, pool_id: B256) -> Option<decdn_node::pool_view::PoolStatus> {
+        let mut status = self.status(pool_id).await?;
+        if self.drained.load(std::sync::atomic::Ordering::Relaxed) {
+            status.remaining = U256::ZERO;
+        }
+        Some(status)
+    }
+}
+
+/// A mid-stream `PoolExhausted` between the epoch's root voucher and its first
+/// reveal: the node took the root voucher, and the client has already sent the
+/// reveal, which the node never reads. The client keeps the reveal
+/// (`VoucherRejectReason::refuses_proof`), so its ledger runs ahead of the node's
+/// claim. The next proof on the lane covers the unread one, so a resumed fetch on
+/// the same ledger completes with no rebase and no rejection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pool_exhausted_between_root_voucher_and_reveal_resumes_without_heal()
+-> anyhow::Result<()> {
+    let payload: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i % 241) as u8).collect();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let drained = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let view = Arc::new(CachedDrainPoolView {
+        deposit,
+        drained: Arc::clone(&drained),
+    });
+    let (target, server_ep, server_task, metrics) = spawn_handler_server_with_pool_view(
+        cache,
+        Arc::clone(&store),
+        view,
+        Duration::ZERO,
+        U256::ZERO,
+    )
+    .await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let sd = slash_domain();
+    let deadlines = PullDeadlines::whole_transfer(Duration::from_secs(15));
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let fetch = |ts: u64| {
+        stream_fetch_shared(
+            &client_ep,
+            target.clone(),
+            &ctx,
+            &ledger,
+            &sd,
+            operator_addr(),
+            *hash.as_bytes(),
+            0,
+            ts,
+            deadlines,
+            0,
+            0,
+        )
+    };
+
+    let err = fetch(now_us())
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("the drained pool must stop the fetch"))?;
+    let rejected = err
+        .downcast_ref::<UpstreamVoucherRejected>()
+        .ok_or_else(|| anyhow::anyhow!("expected UpstreamVoucherRejected, got: {err:?}"))?;
+    anyhow::ensure!(
+        rejected.reason == VoucherRejectReason::PoolExhausted,
+        "expected PoolExhausted, got {:?}",
+        rejected.reason
+    );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    let node_claim = store
+        .load_all()?
+        .first()
+        .map(LaneState::owed)
+        .ok_or_else(|| anyhow::anyhow!("no persisted lane"))?;
+    let kept = ledger.committed().amount;
+    anyhow::ensure!(
+        kept > node_claim,
+        "the client keeps the reveal the node never read: ledger {kept} vs node claim \
+         {node_claim}"
+    );
+
+    // Funded again: the resumed fetch's first reveal covers the unread one.
+    drained.store(false, std::sync::atomic::Ordering::Relaxed);
+    let generation = ledger.generation();
+    let rejected_before = counter(&metrics, "decdn_serve_stream_voucher_rejected_total")?;
+    let got = fetch(now_us())
+        .await
+        .map_err(|e| anyhow::anyhow!("resumed fetch: {e:#}"))?;
+    anyhow::ensure!(got.as_ref() == payload.as_slice(), "resumed bytes match");
+    anyhow::ensure!(
+        ledger.generation() == generation,
+        "the resumed fetch needs no rebase: generation {generation} -> {}",
+        ledger.generation()
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_voucher_rejected_total")? == rejected_before,
+        "the resumed fetch draws no voucher rejection, so no reseed either"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// Live handles for the wall-clock recheck-cadence tests, produced by
 /// [`setup_recheck_holder_and_driven`]. `_send_a`/`_recv_a` keep the holder lane
 /// (A) open so it stays PARKED holding its floor reservation while a test drives B.
