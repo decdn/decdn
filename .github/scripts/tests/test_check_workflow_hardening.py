@@ -1,15 +1,19 @@
 """Regression tests for the workflow-hardening checker.
 
-The checker holds every workflow to SHA-pinned actions, digest-pinned images,
-version-pinned tools, checkouts that keep no token, and write grants only on
-the jobs its table names. Each rule is read from text, not YAML, so a bug degrades to a quiet
-false pass: the check reports a hardened workflow while a step runs a moved
-tag under a write token.
+The checker holds every workflow to SHA-pinned actions, digest-pinned
+IMAGE_INPUTS images, version-pinned install-action tools, checkouts that keep
+no token, and write grants only on the jobs its table names. Each rule is read
+from text, not YAML, so a bug degrades to a quiet false pass: the check
+reports a hardened workflow while a step runs a moved tag under a write token.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -461,6 +465,17 @@ def test_persist_false_outside_with_does_not_count(tmp_path: Path) -> None:
     assert len(errors) == 1 and "under `with:`" in errors[0], errors
 
 
+def test_value_on_the_line_after_its_key_counts(tmp_path: Path) -> None:
+    security = swap(SECURITY, "persist-credentials: false",
+                    "persist-credentials:\n            false")
+    assert errors_for(tmp_path, security=security) == []
+
+
+def test_input_name_case_does_not_matter(tmp_path: Path) -> None:
+    security = swap(SECURITY, "persist-credentials: false", "Persist-Credentials: false")
+    assert errors_for(tmp_path, security=security) == []
+
+
 def test_quoted_false_counts(tmp_path: Path) -> None:
     security = swap(SECURITY, "persist-credentials: false", "persist-credentials: 'false'")
     assert errors_for(tmp_path, security=security) == []
@@ -651,12 +666,13 @@ def test_job_container_or_services_fails(tmp_path: Path, key: str) -> None:
 # ---- every workflow has a row ------------------------------------------------
 
 
-def test_workflow_without_a_row_fails(tmp_path: Path) -> None:
+@pytest.mark.parametrize("name", ["extra.yml", "extra.yaml"])
+def test_workflow_without_a_row_fails(tmp_path: Path, name: str) -> None:
     repo = build_repo(tmp_path)
-    (repo / ".github" / "workflows" / "extra.yaml").write_text(SECURITY)
+    (repo / ".github" / "workflows" / name).write_text(SECURITY)
     errors, _ = crh.check(repo)
     assert errors == [
-        ".github/workflows/extra.yaml: no WRITE_JOBS row in check_workflow_hardening.py — "
+        f".github/workflows/{name}: no WRITE_JOBS row in check_workflow_hardening.py — "
         "add one naming the jobs that may write, `{}` if none does"
     ]
 
@@ -689,6 +705,43 @@ INSTALL = f"      - uses: taiki-e/install-action@{OTHER_SHA} # v2.87.32\n"
         (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
          "          fallback: cargo-binstall\n",
          "install-action does not set `fallback: none`"),
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
+         "          fallback: none\n          checksum: false\n",
+         "install-action sets `checksum: false`"),
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
+         "          fallback: none\n          checksum: 'false'\n",
+         "install-action sets `checksum: false`"),
+        # YAML folds a wrapped plain or quoted scalar into one value, and
+        # install-action splits that value on commas and spaces.
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149,\n"
+         "            cargo-llvm-cov\n          fallback: none\n",
+         "install-action tool cargo-llvm-cov is not pinned"),
+        (INSTALL + "        with:\n          tool: \"cargo-nextest@0.9.149,\n"
+         "            cargo-llvm-cov\"\n          fallback: none\n",
+         "install-action tool cargo-llvm-cov is not pinned"),
+        # A blank line does not end a plain scalar.
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149,\n\n"
+         "            cargo-llvm-cov\n          fallback: none\n",
+         "install-action tool cargo-llvm-cov is not pinned"),
+        # The runner reads input names without regard to case.
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
+         "          fallback: none\n          Checksum: false\n",
+         "install-action sets `checksum: false`"),
+        # Only an unset or literal `true` checksum is known to check.
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
+         "          fallback: none\n          checksum: ${{ inputs.verify }}\n",
+         "install-action sets `checksum: ${{ inputs.verify }}`"),
+        # A quote continued at its key's column: this reader stops before the
+        # closing quote, so the value keeps its opening quote and fails.
+        (INSTALL + "        with:\n          tool: \"cargo-nextest@0.9.149,\n"
+         "          cargo-llvm-cov\"\n          fallback: none\n",
+         "install-action tool \"cargo-nextest@0.9.149 is not pinned"),
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
+         "          fallback: none\n          checksum: \"false\n          \"\n",
+         "install-action sets `checksum: \"false`"),
+        (f"      - uses: Taiki-E/Install-Action@{OTHER_SHA} # v2.87.32\n"
+         "        with:\n          tool: cargo-nextest\n          fallback: none\n",
+         "install-action tool cargo-nextest is not pinned"),
     ],
 )
 def test_install_action_floating_tool_fails(tmp_path: Path, step: str, message: str) -> None:
@@ -703,8 +756,82 @@ def test_install_action_floating_tool_fails(tmp_path: Path, step: str, message: 
         "cargo-nextest@0.9.149",
         "cargo-llvm-cov@0.9.1,cargo-nextest@0.9.149",
         "|\n            cross@0.2.5\n            git-cliff@2.14.2",
+        "cross@0.2.5,\n            git-cliff@2.14.2",
     ],
 )
 def test_install_action_pinned_tools_pass(tmp_path: Path, tools: str) -> None:
     step = INSTALL + f"        with:\n          tool: {tools}\n          fallback: none\n"
     assert errors_for(tmp_path, release=with_docker_step(step)) == []
+
+
+def test_install_action_checksum_true_passes(tmp_path: Path) -> None:
+    step = INSTALL + (
+        "        with:\n          tool: cargo-nextest@0.9.149\n          fallback: none\n"
+        "          checksum: true\n"
+    )
+    assert errors_for(tmp_path, release=with_docker_step(step)) == []
+
+
+def test_fallback_none_in_the_next_step_does_not_count(tmp_path: Path) -> None:
+    # The install step has none; the next step's input must not satisfy it.
+    step = INSTALL + (
+        "        with:\n          tool: cargo-nextest@0.9.149\n"
+        f"      - uses: someone/tool@{OTHER_SHA}\n"
+        "        with:\n          fallback: none\n"
+    )
+    errors = errors_for(tmp_path, release=with_docker_step(step))
+    assert len(errors) == 1, errors
+    assert "install-action does not set `fallback: none`" in errors[0], errors
+
+
+def test_install_action_in_local_action_is_checked(tmp_path: Path) -> None:
+    action = ACTION + (
+        f"    - uses: taiki-e/install-action@{OTHER_SHA} # v2.87.32\n"
+        "      with:\n        tool: cargo-nextest@0.9.149\n"
+    )
+    errors = errors_for(tmp_path, action=action)
+    assert errors == [
+        ".github/actions/setup/action.yml:6: install-action does not set `fallback: none`, "
+        "so a version its manifest lacks installs unchecked"
+    ]
+
+
+# ---- the wrapper's exit code ---------------------------------------------------
+
+WRAPPER = REPO_ROOT / ".github/scripts/check-workflow-hardening.sh"
+
+
+@pytest.fixture
+def repo_copy(tmp_path: Path) -> Path:
+    """The real workflows and local actions in a throwaway git repository: the
+    wrapper reads whatever `git rev-parse --show-toplevel` names."""
+    for sub in ("workflows", "actions"):
+        shutil.copytree(REPO_ROOT / ".github" / sub, tmp_path / ".github" / sub)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    return tmp_path
+
+
+def run_wrapper(repo: Path) -> subprocess.CompletedProcess[str]:
+    # An inherited GIT_DIR (a hook, say) would point rev-parse at the real repo.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return subprocess.run(
+        ["bash", str(WRAPPER)], cwd=repo, env=env, capture_output=True, text=True, check=False
+    )
+
+
+def test_wrapper_passes_the_untouched_copy(repo_copy: Path) -> None:
+    result = run_wrapper(repo_copy)
+    assert result.returncode == 0, result.stderr
+    assert "workflow hardening OK" in result.stdout
+
+
+def test_wrapper_exits_1_on_an_error(repo_copy: Path) -> None:
+    path = repo_copy / ".github/workflows/security.yml"
+    text = path.read_text()
+    pinned = re.search(r"actions/checkout@[0-9a-f]{40}", text)
+    assert pinned, "security.yml has no SHA-pinned checkout to float"
+    path.write_text(text.replace(pinned.group(0), "actions/checkout@v7", 1))
+    result = run_wrapper(repo_copy)
+    assert result.returncode == 1, result.stdout
+    assert "the workflows are not hardened" in result.stderr
+    assert "`actions/checkout@v7` is not pinned" in result.stderr

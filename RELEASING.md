@@ -181,9 +181,9 @@ image push (`docker`) is the one job that can write packages, and it runs the
 cannot write release contents. No checkout keeps its token, every action is
 pinned by commit SHA, and every image an action runs is pinned by digest.
 `cross`, `git-cliff` and `cargo-nextest` install at fixed versions with a
-checked download. The one floating download is cargo-semver-checks, which its
-action fetches at the newest release on every run, under `verify`'s read-only
-token. The `packaging` CI job holds the pins, the checkouts and which job may
+checked download. The floating downloads are the `stable` toolchain and the
+newest cargo-semver-checks release, which cargo-semver-checks-action fetches on
+every run, under `verify`'s read-only token. The `packaging` CI job holds the pins, the checkouts and which job may
 write with `.github/scripts/check-workflow-hardening.sh`. The workflow:
 
 1. rejects the tag unless it is strict semver (the trigger glob is looser than

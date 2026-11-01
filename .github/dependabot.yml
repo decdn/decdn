@@ -47,7 +47,8 @@ updates:
       # The source-build image behind deploy/sponsord/compose.yaml. Its
       # `rust:X.Y.Z-trixie` tag has a parseable version, so Dependabot opens
       # a PR for each new Rust; check_toolchain_pin.py holds that PR red until
-      # rust-toolchain.toml, `rust-version` and the action refs move with it.
+      # rust-toolchain.toml, `rust-version` and the workflows' `toolchain:`
+      # inputs move with it.
       # Its undigested `debian:trixie-slim` line gets no PRs, as above.
       - /deploy/sponsord
     schedule:
@@ -72,10 +73,12 @@ updates:
     commit-message:
       prefix: chore
       include: scope
-    # Every workflow pins dtolnay/rust-toolchain by commit SHA and names the
+    # Every dtolnay/rust-toolchain step is pinned by commit SHA and names the
     # Rust version in its `toolchain:` input, which Dependabot does not read, so
     # this ecosystem never moves the toolchain. A Rust release reaches the repo
     # through the docker ecosystem's `rust:X.Y.Z` bump of deploy/sponsord, and
     # .github/scripts/check-toolchain-pin.sh holds that PR red until
     # rust-toolchain.toml, Cargo.toml's rust-version and every `toolchain:`
-    # input move with it.
+    # input move with it. This ecosystem can still move the dtolnay SHA to a
+    # newer `master` commit; the `toolchain:` input, not the ref, sets the
+    # version that step installs.

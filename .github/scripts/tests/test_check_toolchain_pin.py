@@ -1,9 +1,9 @@
 """Regression tests for the toolchain-pin checker.
 
-The Rust version is written in three kinds of place — `rust-toolchain.toml`,
-`Cargo.toml`'s `rust-version`, and every `dtolnay/rust-toolchain@…` ref in the
-workflows — and each is read by a different tool, so none can be derived from
-another. A bug here degrades to a quiet false pass: the check says the sites
+The Rust version is written in four kinds of place — `rust-toolchain.toml`,
+`Cargo.toml`'s `rust-version`, the `toolchain:` input of every
+`dtolnay/rust-toolchain` step, and `deploy/sponsord/Dockerfile`'s `rust:` tag —
+and each is read by a different tool, so none can be derived from another. A bug here degrades to a quiet false pass: the check says the sites
 agree while CI compiles on a different compiler from every developer.
 """
 
