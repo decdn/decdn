@@ -1,0 +1,261 @@
+name: Publish crates
+
+# Publishes the workspace to crates.io once a maintainer has signed the
+# release. scripts/sign-release.sh signs the draft that release.yml staged and
+# takes it out of draft with the maintainer's own `gh` login. That publishes
+# the release, and the `release: published` event starts this workflow. (An
+# event that GITHUB_TOKEN causes starts no workflow; the maintainer's login is
+# not GITHUB_TOKEN.)
+#
+# No crates.io token is stored anywhere. crates.io Trusted Publishing trusts
+# this file, by name, in decdn/decdn, run in the `crates-io` environment. The
+# `publish` job trades the job's GitHub OIDC token for a crates.io token that
+# lasts 30 minutes, and the auth action revokes it when the job ends. The
+# environment allows deployments only from `v*` tags and from `main`. Creating,
+# moving or deleting a `v*` tag is limited to org admins (the `Releases`
+# ruleset), who bypass its other rules; `prepare` checks the tag's signature
+# itself. See RELEASING.md § Trusted publishing for the one-time setup.
+#
+# A crates.io version can never be replaced, so nothing is uploaded until:
+# - the tag carries a signature by a key in KEYS on origin/main;
+# - the release is out of draft;
+# - SHA256SUMS.asc verifies against that same KEYS;
+# - SHA256SUMS.minisig and every archive's .minisig are attached.
+#
+# Two jobs, because `id-token: write` lets every step in its job request an
+# OIDC token, and so a crates.io token. `prepare` runs the code a build runs —
+# build scripts, proc macros, the dashboard's pnpm install — with no OIDC
+# access. `publish` holds `id-token: write` and runs none of that:
+# `cargo publish --no-verify` packages and uploads without compiling.
+#
+# Re-running is safe. crates_to_publish.py excludes every crate crates.io
+# already serves at the version, so a run that failed partway finishes the
+# remainder when all its jobs run again. `workflow_dispatch` runs this file
+# from `main` against a given tag, for when the copy in the tag's tree cannot
+# run. Only this file comes from `main`: every script and action it calls
+# comes from the tag's tree.
+#
+# Pre-releases go to crates.io too: `release: published` fires for a release
+# marked pre-release, and a `vX.Y.Z-rc.N` version is as immutable there as any
+# other.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, e.g. v0.3.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# One group per tag. GitHub keeps one pending run per group and cancels the
+# older pending run when another queues, so a group shared by every tag could
+# drop a different release's run.
+concurrency:
+  group: publish-crates-${{ github.event.release.tag_name || inputs.tag }}
+  # Never cancel a run in progress: a cancelled upload leaves some crates
+  # published. A queued run publishes whatever the first one left.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Check the signed release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      sha: ${{ steps.signature.outputs.sha }}
+      pending: ${{ steps.plan.outputs.pending }}
+    steps:
+      # The tag comes from the event, or from the dispatch input. It reaches
+      # the shell through `env`, never inlined into the script, and must be
+      # strict semver before anything uses it — the same rule as release.yml.
+      - name: Resolve the tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then TAG="$INPUT_TAG"; else TAG="$GITHUB_REF_NAME"; fi
+          VERSION="${TAG#v}"
+          if ! [[ "$TAG" == v* && "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$TAG' is not a semver release tag (expected vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Full fetch: `git verify-tag` needs the annotated tag object, and the
+      # signature step reads KEYS from origin/main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # KEYS comes from origin/main, NOT from the tagged tree: a tag that
+      # carried its own KEYS would vouch for itself. The keyring is isolated,
+      # so only the keys in that KEYS count. On a `release` event the tag must
+      # still name the commit the event named.
+      - name: Verify the tag signature
+        id: signature
+        shell: bash
+        env:
+          GNUPGHOME: ${{ runner.temp }}/keys-gnupg
+          TAG: ${{ steps.tag.outputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+          git show origin/main:KEYS > "$RUNNER_TEMP/KEYS" || {
+            echo "::error::cannot read KEYS from origin/main"; exit 1; }
+          gpg --import "$RUNNER_TEMP/KEYS" || {
+            echo "::error::KEYS on origin/main is not a valid OpenPGP keyring"; exit 1; }
+          if ! git verify-tag "$TAG"; then
+            echo "::error::$TAG is not signed by a key in KEYS on main."
+            exit 1
+          fi
+          SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+          if [ "$SHA" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::the checkout is not at $TAG ($SHA)"; exit 1
+          fi
+          if [ "$EVENT" = release ] && [ "$SHA" != "$GITHUB_SHA" ]; then
+            echo "::error::$TAG now points at $SHA, but the release event named $GITHUB_SHA"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check the release is signed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: .github/scripts/check-release-signed.sh "$TAG" "$RUNNER_TEMP/KEYS"
+
+      # CI ran the guard on the PRs, not necessarily on the tagged commit.
+      - name: Check the binstall metadata at the tag
+        run: python3 .github/scripts/check_binstall_metadata.py
+
+      # Pinned by SHA on the action's default branch, so the `toolchain` input
+      # names the version. check_toolchain_pin.py holds it to
+      # rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+
+      - name: Plan the upload
+        id: plan
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: python3 .github/scripts/crates_to_publish.py --version "$VERSION"
+
+      # decdn-cli's .crate carries the dashboard's gitignored build. It is
+      # built here and handed to `publish` as an artifact, so `publish` runs
+      # no pnpm install.
+      - if: steps.plan.outputs.pending == 'true'
+        uses: ./.github/actions/dashboard-build
+
+      - name: decdn-cli packages the dashboard build, and nothing else untracked
+        if: steps.plan.outputs.pending == 'true'
+        run: .github/scripts/check-dashboard-packaged.sh
+
+      # The verify build compiles each crate from its packaged .crate. It runs
+      # here, without OIDC access, so `publish` can upload with --no-verify.
+      - name: Verify every pending crate packages and builds standalone
+        if: steps.plan.outputs.pending == 'true'
+        shell: bash
+        env:
+          EXCLUDE: ${{ steps.plan.outputs.exclude }}
+        run: |
+          args=()
+          for crate in $EXCLUDE; do args+=(--exclude "$crate"); done
+          cargo publish --workspace --locked --allow-dirty --dry-run "${args[@]}"
+
+      - name: Hand the dashboard build to publish
+        if: steps.plan.outputs.pending == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dashboard-dist
+          path: crates/cli/dashboard/dist
+          if-no-files-found: error
+          # Long enough to re-run `publish` alone after a failure. Re-running
+          # every job always works: `prepare` builds it again.
+          retention-days: 7
+
+  publish:
+    name: Publish to crates.io
+    needs: prepare
+    if: needs.prepare.outputs.pending == 'true'
+    runs-on: ubuntu-latest
+    # Well past an upload of every crate, which waits on the index after
+    # each one; the crates.io token itself lasts 30 minutes.
+    timeout-minutes: 45
+    # crates.io trusts this environment name; its deployment policy limits
+    # which refs may run this job.
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dashboard-dist
+          path: crates/cli/dashboard/dist
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+
+      # `cargo package --list` compiles nothing.
+      - name: decdn-cli packages the dashboard build, and nothing else untracked
+        run: .github/scripts/check-dashboard-packaged.sh
+
+      # Asked again: crates.io may have moved since `prepare` asked.
+      - name: Plan the upload
+        id: plan
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python3 .github/scripts/crates_to_publish.py --version "$VERSION"
+
+      - name: Get a crates.io token
+        if: steps.plan.outputs.pending == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      # --workspace publishes in dependency order and waits for each crate to
+      # reach the index before its dependents. --no-verify: `prepare` built
+      # this tree, and with the token present nothing compiles.
+      - name: Publish
+        if: steps.plan.outputs.pending == 'true'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          EXCLUDE: ${{ steps.plan.outputs.exclude }}
+        run: |
+          args=()
+          for crate in $EXCLUDE; do args+=(--exclude "$crate"); done
+          if ! cargo publish --workspace --locked --allow-dirty --no-verify "${args[@]}"; then
+            echo "::error::cargo publish failed. Any crate it uploaded first stays" \
+                 "published. Re-run all jobs: the run uploads only what crates.io" \
+                 "does not serve yet."
+            exit 1
+          fi
+
+      # cargo exiting 0 means crates.io accepted the uploads, not that the
+      # index serves them yet. Warns, never fails: the upload has happened.
+      - name: Confirm on crates.io
+        if: steps.plan.outputs.pending == 'true'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python3 .github/scripts/crates_to_publish.py --version "$VERSION" --confirm

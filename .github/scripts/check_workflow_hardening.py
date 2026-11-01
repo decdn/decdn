@@ -85,6 +85,7 @@ WRITE_JOBS: dict[str, dict[str, set[str]]] = {
         "solidity-coverage": {"code-quality"},
     },
     ".github/workflows/codeql.yml": {"analyze": {"security-events"}},
+    ".github/workflows/publish-crates.yml": {"publish": {"id-token"}},
     ".github/workflows/release.yml": {
         "draft": {"contents"},
         "upload-assets": {"contents"},

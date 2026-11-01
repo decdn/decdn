@@ -1,17 +1,20 @@
 # Releasing deCDN
 
 Releases are cut locally and signed with a maintainer's own GPG key. CI builds
-the artifacts but signs nothing and publishes nothing — there is no signing key
-and no registry credential in Actions secrets.
+the artifacts but signs nothing — there is no signing key in Actions secrets.
+Once a maintainer has signed and published the release, CI uploads the crates
+to crates.io through trusted publishing, which needs no stored credential
+either.
 
-A release is therefore three commands with a CI build between the first two:
+A release is therefore two commands with a CI build between them, and a CI
+publish after:
 
 ```bash
 cargo release patch --execute              # cut, sign and push the tag
                                            # (the FIRST release is `minor`: 0.0.0 -> 0.1.0)
 # ...wait for the tag-push run to finish...
-scripts/sign-release.sh v0.1.2             # verify, sign, publish, tag images
-scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
+scripts/sign-release.sh v0.1.2             # verify, sign, publish, tag images, open the devops bump
+# ...publish-crates.yml then uploads the crates to crates.io
 ```
 
 ## One-time setup
@@ -66,9 +69,7 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    `gh auth login`. Your minisign must sign in the
    prehashed format: `sign-release.sh` verifies with `-H` and stops on a
    legacy-format signature, which neither `decdn self-update` nor
-   `cargo binstall` accepts. `python3` for the Docker Hub overview push, and
-   Python 3.11 or later for `publish-crates.sh`, which runs
-   `check_binstall_metadata.py` at the tag.
+   `cargo binstall` accepts. `python3` for the Docker Hub overview push.
 
 5. **Registry logins.** `docker login ghcr.io` with a token carrying
    `write:packages`, and `docker login docker.io` — all four images go to both
@@ -96,25 +97,13 @@ scripts/publish-crates.sh v0.1.2           # publish the crates to crates.io
    `docker` job fails with `permission_denied: write_package` and
    `sign-release.sh` refuses the draft for its missing digests.
 
-7. **A crates.io token.** `cargo login`, with a token scoped to
-   publish-update (and publish-new for the first release). Membership of the
-   `decdn` crates.io owner set is what makes it work; the token itself is
-   personal and never leaves your machine. That owner set does not exist until
-   the first publish creates it — see [Crate ownership](#crate-ownership).
+7. **Push access to decdn/devops.** `sign-release.sh` ends by opening the
+   devops PR that pins this release (see
+   [The devops bump](#the-devops-bump)). Over https it needs a git credential
+   helper, such as `gh auth setup-git`.
 
-8. **Before the *first* release only — clear the new-crate rate limit.**
-   crates.io limits crate *creation* far harder than updates: `PublishNew`
-   allows a burst of 5, then roughly one per 10 minutes. A first release
-   creates every crate at once (**fourteen** today), so a single run would be rate-limited
-   partway through — and since a published version is immutable, that leaves
-   some crates uploaded, the version spent, and no clean retry.
-
-   `publish-crates.sh` refuses to start in that situation, but clearing it is a
-   manual step. Either ask the crates.io team to raise this repo's publish-new
-   limit (the documented route, and the tidier one), or publish the new
-   crates by hand ahead of the tag, in dependency order, spacing them out. Once
-   the names exist, every later release is `PublishUpdate` and unconstrained.
-   Set `DECDN_ALLOW_RATE_LIMIT=1` to proceed once the limit has been raised.
+No step needs a crates.io token. The repository-level setup for the crates.io
+upload is in [Trusted publishing](#trusted-publishing).
 
 ## Cutting a version
 
@@ -130,8 +119,8 @@ by [`release.toml`](release.toml):
 
 `release.toml` sets `publish = false`, so this step uploads nothing: it runs
 before CI has built anything and before a human has verified anything, which is
-the wrong moment to make an irreversible crates.io upload. Publishing is the
-separate, later `publish-crates.sh` step below.
+the wrong moment to make an irreversible crates.io upload. The upload is the
+separate, later `publish-crates.yml` run below.
 
 Cut from `main`, with a clean tree and CI green on the commit you are tagging.
 
@@ -249,7 +238,11 @@ names that archive; uploads the nine `.asc` files,
 `SHA256SUMS.minisig` and the archives' `.minisig` files; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
 signed digest on GHCR; mirrors those same digests to Docker Hub; for a stable
 release, pushes each Docker Hub overview; checks that every promoted repository
-is pullable without credentials; and flips the release out of draft.
+is pullable without credentials; and flips the release out of draft. That
+starts the crates.io upload ([Publishing to crates.io](#publishing-to-cratesio)),
+and the script prints the command that finds the run. It then opens the
+devops bump PR
+([The devops bump](#the-devops-bump)).
 
 The mirror is a manifest copy, not a rebuild: `docker buildx imagetools create`
 copies the manifest bytes verbatim, so `docker.io/decdn/decdn-node` and
@@ -289,6 +282,7 @@ Useful environment overrides:
 | `DECDN_SKIP_DOCKERHUB` | set to `1` to tag on GHCR only, with no Docker Hub mirror or overview (implied by `DECDN_SKIP_IMAGE_TAGS`) |
 | `DECDN_DOCKERHUB_REPO` | the Docker Hub counterpart of `DECDN_REPO` (defaults to it); the images are `<it>-node` and `<it>` |
 | `DECDN_DOCKERHUB_USERNAME`, `DECDN_DOCKERHUB_TOKEN` | a Docker Hub personal access token for the overview push, used instead of the `docker login` credential |
+| `DECDN_SKIP_DEVOPS_BUMP` | set to `1` to open no devops bump PR after publishing |
 | `DECDN_REPO` | target a fork instead of `decdn/decdn` — both registries follow it |
 
 The skip variables take `1`/`true`/`yes` or `0`/`false`/`no`; anything else is
@@ -313,6 +307,31 @@ release means deleting and re-cutting it.
 
 On failure the script keeps its download directory and prints the path, so you
 can inspect the bytes rather than re-downloading several hundred megabytes.
+
+### The devops bump
+
+Last, once the release is published, the script opens the PR that pins the
+downstream repository to this release. It clones
+[decdn/devops](https://github.com/decdn/devops) into a temporary directory and
+runs its `scripts/open-decdn-bump.sh <tag>`, which moves the Ansible role, Helm
+chart, Compose, sponsord and onramp pins. It takes the `SHA256SUMS` digest and
+the `decdn-node`, `sponsord` and `sponsord-onramp` image digests from the
+release's assets once their signatures verify against its vendored `KEYS`, regenerates its mirrors from the tag, and lists in the PR
+body what a reviewer still has to do. It needs `python3`, gpg and
+`sha256sum`, and opens nothing for a pre-release or when `DECDN_REPO` is not
+`decdn/decdn`.
+
+It commits as your git identity, pushes with your git credentials for
+github.com, and opens the PR with your `gh` login. It needs push access to
+devops and, over https, a git credential helper such as `gh auth setup-git`.
+
+When it fails, or you press Ctrl-C while it runs, the script warns and says how
+to open the PR later; it never fails the script, since the release is already
+out. It runs devops's `main` as you, without the cargo
+registry tokens in the environment. The devops ruleset requires a reviewed PR
+for a change to `main`, but org admins can bypass it. To run the bump script
+and its helpers from a checkout you have reviewed instead, set
+`DECDN_SKIP_DEVOPS_BUMP=1`.
 
 ## The minisign keys
 
@@ -375,113 +394,145 @@ above still decide which key may sign a release; this field only names it:
 It refuses when the crates disagree or name none, and when the archive
 signatures do not verify under that key, so a mismatch stops before anything
 is uploaded. `.github/scripts/check-binstall-metadata.sh` checks the field on
-every PR, and `publish-crates.sh` runs it again at the tag before anything
+every PR, and `publish-crates.yml` runs it again at the tag before anything
 reaches crates.io: the four crates name the same key, the key is one of the
 `minisign-*.pub` files, it sits on the one line form `sign-release.sh` reads,
 and no override carries a `signing` table of its own.
 
 ## Publishing to crates.io
 
-Last, once the GitHub Release is out of draft:
+[`.github/workflows/publish-crates.yml`](.github/workflows/publish-crates.yml)
+uploads the fourteen publishable crates. `sign-release.sh` publishes the
+release with your `gh` login, and that `release: published` event starts the
+workflow. Nobody runs a command for it, and no crates.io token exists outside
+the run: crates.io [trusted publishing](https://crates.io/docs/trusted-publishing)
+trades the job's GitHub OIDC token for a crates.io token that lasts 30 minutes,
+and the auth action revokes it when the job ends.
+
+`decdn-e2e` (test fixtures) and `sponsord-e2e` (the sponsord stack tests) are
+`publish = false` and cargo skips them. The workspace has sixteen members, and
+the CI version check covers all sixteen — only the upload is fourteen.
+
+The `prepare` job uploads nothing. It:
+
+1. checks the tag is strict semver, and verifies its signature against `KEYS`
+   **from `origin/main`**, as `release.yml` does;
+2. runs `.github/scripts/check-release-signed.sh`. The release must be out of
+   draft. `SHA256SUMS.asc` must be a good signature, against that same `KEYS`,
+   by a key that has neither expired nor been revoked. Every archive
+   `SHA256SUMS` names must carry this version, and must be attached with its
+   `.minisig`, as must `SHA256SUMS.minisig`. Leaving draft does not by itself
+   prove anything was signed, so `SHA256SUMS.asc` is verified again;
+   `sign-release.sh` verified the minisign signatures, and this checks they are
+   attached;
+3. runs `check_binstall_metadata.py` at the tag;
+4. runs `.github/scripts/crates_to_publish.py`. Every crate must be at the
+   tag's version and must already exist on crates.io (trusted publishing
+   cannot create a crate). The crates crates.io already serves at the version
+   are excluded from the upload. An answer from crates.io other than 200 or
+   404, or a 200 whose JSON does not describe the crate asked about, stops the
+   run;
+5. builds the `decdn dashboard` page, which `decdn-cli`'s crate carries, and
+   runs `cargo publish --workspace --dry-run`, the verify build, on what is
+   left.
+
+The `publish` job alone holds `id-token: write`, in the `crates-io` environment.
+Any step in that job could ask for an OIDC token, so it runs no build script,
+proc macro or package install: past the pinned toolchain and auth actions, it
+takes the dashboard build from `prepare` and runs
+`cargo publish --workspace --no-verify`, which resolves the dependency order
+and waits for each crate to reach the index before its dependents. It then
+asks crates.io for every crate, for up to five minutes, and warns about any it
+does not serve yet (normally index lag) or could not ask about.
+
+Pre-releases go to crates.io too: `release: published` fires for a release
+marked pre-release, so `v1.2.0-rc1` is uploaded as `1.2.0-rc1`. cargo resolves a
+pre-release version only for a requirement that names a pre-release, but the
+version is as immutable as any other.
+
+**Re-running is safe.** A crates.io version is immutable, so a run that fails
+partway leaves the crates it uploaded published. Re-run all jobs: the run
+excludes those crates and uploads the rest. (Re-running only `publish` works
+for seven days, while `prepare`'s dashboard build is kept.) If the workflow in
+the tag's tree cannot run at all, run the copy on `main` against the tag. Only
+the workflow file comes from `main`; every script and action it calls still
+comes from the tag's tree, so this cannot rescue a broken script:
 
 ```bash
-scripts/publish-crates.sh v0.1.2
+gh workflow run publish-crates.yml -f tag=v0.1.2
 ```
-
-It verifies the tag against `KEYS` and against `origin` the way
-`sign-release.sh` does, and adds checks of its own. It **requires the
-release to be published, not a draft**, and — because leaving draft does not by
-itself prove anything was signed — it **requires `SHA256SUMS.asc`,
-`SHA256SUMS.minisig`, every archive `SHA256SUMS` names, and a `.minisig` for
-each of those archives to be attached**. It checks that the signatures are
-there, not that they verify; `sign-release.sh` verified them. In the worktree
-at the tag it runs `check_binstall_metadata.py` before the first upload. A
-crates.io version can never be replaced, so nothing reaches the registry that
-no maintainer signature vouches for, or whose binstall metadata fails the
-guard.
-
-`DECDN_SIGNING_KEY` works here too, and accepts the same forms as in
-`sign-release.sh` (fingerprint, key id or uid). It is resolved against `KEYS`
-and compared as a full primary-key fingerprint; an ambiguous value is rejected
-rather than resolved to whichever key sorts first.
-
-It then checks out the tag into a detached worktree and publishes from there,
-not from your working copy, so uncommitted edits or a different branch cannot
-leak into the upload. There it builds the `decdn dashboard` page, which
-`decdn-cli`'s crate carries, so the script needs Node 24; it runs pnpm from
-`PATH`, else through `corepack`. `cargo publish --workspace` resolves the order itself and
-waits for each crate to reach the index before publishing its dependents. After
-a dry run it prints the crate list and asks you to type the version to confirm.
-
-Fourteen crates are published; `decdn-e2e` (test fixtures) and `sponsord-e2e`
-(the sponsord stack tests) are `publish = false` and cargo skips them. The
-workspace has sixteen members, and the CI version check covers all sixteen —
-only the upload is fourteen.
-
-**This step is not re-runnable.** A published version is immutable — yanking
-hides it from new resolutions but never frees the version. If it fails partway,
-the crates already uploaded stay uploaded; re-running would fail immediately on
-the first of them. The script prints what to do: publish only the remainder,
-in dependency order, with `cargo publish -p <crate> --locked`.
 
 A failure here does not invalidate the release. The GitHub Release, the
 signatures and the container images are all already published and stand on
 their own; crates.io is an additional distribution channel, so the recovery is
 to finish the remaining crates, not to re-cut the version.
 
-Last, the script opens the PR that pins the downstream repository to this
-release. It clones [decdn/devops](https://github.com/decdn/devops) into a
-temporary directory and runs its `scripts/open-decdn-bump.sh <tag>`, which
-moves the Ansible role, Helm chart, Compose and onramp pins. It takes the
-`SHA256SUMS` and `decdn-node` image digests from the release's assets once
-their signatures verify against its vendored `KEYS`, regenerates its mirrors
-from the tag, and lists in the PR body what a reviewer still has to do. It
-needs Python 3.9+, gpg and `sha256sum`, and opens nothing for a pre-release.
+### Trusted publishing
 
-It commits as your git identity, pushes with your git credentials for
-github.com, and opens the PR with your `gh` login. It needs push access to
-devops and, over https, a git credential helper such as `gh auth setup-git`.
+crates.io trusts `publish-crates.yml` per crate. Set this up once, and again
+for each new crate:
 
-When it fails, or you press Ctrl-C while it runs, the script prints the
-command to run later from a devops checkout; it never fails the publish. It
-runs devops's `main` as you, without the cargo registry tokens in the
-environment. The devops ruleset requires a reviewed PR for a change to `main`,
-but org admins can bypass it. To run the bump script and its helpers from a
-checkout you have reviewed instead, set `DECDN_SKIP_DEVOPS_BUMP=1`.
+1. **The `crates-io` environment.** Under *Settings → Environments*, it
+   allows deployments from the `v*` tag pattern and the `main` branch only,
+   with no required reviewers: your signature on the release is the human
+   gate. crates.io matches the workflow by file name only, so this list of
+   refs is what limits which refs can publish.
+
+   ```bash
+   gh api -X PUT repos/decdn/decdn/environments/crates-io \
+     -F 'deployment_branch_policy[protected_branches]=false' \
+     -F 'deployment_branch_policy[custom_branch_policies]=true'
+   gh api repos/decdn/decdn/environments/crates-io/deployment-branch-policies \
+     -f name='v*' -f type=tag
+   gh api repos/decdn/decdn/environments/crates-io/deployment-branch-policies \
+     -f name=main -f type=branch
+   ```
+
+2. **A trusted publisher on each crate.** On crates.io, under each crate's
+   *Settings → Trusted Publishing*, add GitHub with owner `decdn`, repository
+   `decdn`, workflow `publish-crates.yml` and environment `crates-io`. An
+   individual owner of the crate does this; see
+   [Crate ownership](#crate-ownership).
+
+3. **Trusted publishing only.** Once a release has gone up through the
+   workflow, turn on *Require trusted publishing* in each crate's settings, so
+   that no API token can publish a version of it.
+
+**A new crate** cannot go up through the workflow: trusted publishing needs the
+crate to exist, and `crates_to_publish.py` stops the run, before any upload,
+when one does not. Publish the new crate's first version by hand, ahead of the
+release that first carries it, with a personal token (`cargo login`, scoped to
+publish-new):
+
+```bash
+cargo publish -p <new-crate> --locked
+```
+
+Then hand it to the team (below) and give it the trusted publisher and the
+setting above. crates.io limits crate *creation* far harder than updates (a
+burst of 5, then roughly one per 10 minutes), so space out several new crates.
 
 ### Crate ownership
 
-crates.io gives a new crate to whoever publishes the name first, and
-`publish-crates.sh` does nothing about ownership. The first release therefore
-leaves every new crate owned by one person — whoever ran it. Hand them to the
-org straight afterwards, in the same sitting.
+crates.io gives a new crate to whoever publishes the name first. Hand each new
+crate to the org straight afterwards, in the same sitting.
 
 The new owner has to be a GitHub team: crates.io has no organisation account,
 so a team is the only owner that outlives an individual. The `crates-io` team
 under the `decdn` org is that owner. Confirm you are in it, then:
 
 ```bash
-TEAM=github:decdn:crates-io
-for crate in decdn-protocol decdn-config-types decdn-bao-range decdn-common \
-             decdn-cache decdn-incentive decdn-reputation decdn-client \
-             decdn-node decdn-cli \
-             sponsord-api sponsord-core sponsord sponsord-onramp; do
-  cargo owner --add "$TEAM" "$crate"
-done
+cargo owner --add github:decdn:crates-io <new-crate>
 ```
 
 crates.io resolves the team through your own GitHub authorisation, so it fails
 unless you are a member of `crates-io`. The team is `closed`, not secret, so
 crates.io can read it with the `read:org` scope it asks for at login.
 
-A team owner publishes updates but cannot change the owner list. Only an
-individual owner does that, so do not remove yourself once the team is added —
-that would leave nobody able to grant or revoke access again.
-
-This runs once. Later releases publish updates to names that already exist and
-add no crates, which is also why step 6's owner-set membership only starts
-meaning something after the first release. `cargo owner --list <crate>`
-confirms the result.
+A team owner publishes updates but cannot change the owner list or a crate's
+trusted publishers. Only an individual owner does that, so do not remove
+yourself once the team is added — that would leave nobody able to grant or
+revoke access again. `cargo owner --list <crate>` confirms the result.
 
 ## Recovery
 
@@ -520,10 +571,11 @@ included. Match the digest against that image's digest file before deleting anyt
 
 **Crates are already on crates.io.** Then the version is spent: it cannot be
 re-cut, because `cargo publish` will refuse to replace it and no amount of
-deleting tags or releases frees it. Do not delete the tag. `cargo yank` the
-affected crates so nothing new resolves to them, then cut the *next* patch
-version with the fix. This is why `publish-crates.sh` runs last, after every
-other artifact is verified and published — everything before it is reversible.
+deleting tags or releases frees it. Do not delete the tag. Yank the affected
+crates (`cargo yank`, or each crate's page on crates.io) so nothing new
+resolves to them, then cut the *next* patch version with the fix. This is why
+the crates.io upload is the last irreversible step, after every other artifact
+is verified and published — everything before it is reversible.
 
 ## Before open-sourcing
 
