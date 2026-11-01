@@ -600,13 +600,12 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
     // fallback that pins such a young contract at head. It mirrors a
     // `contracts/dev-deploy.sh` local chain.
     let secret_key = decdn_common::identity::load_or_generate(&cfg.identity.data_dir)?;
-    let metrics = Arc::new(decdn_node::metrics::Metrics::new());
     let handle = tokio::spawn(decdn_node::runtime::run(
         cfg,
         secret_key,
         None,
         reload_state,
-        Arc::clone(&metrics),
+        Arc::new(decdn_node::metrics::Metrics::new()),
     ));
 
     // ---- 6. Poll the admin health endpoint until the runtime answers — the
@@ -641,22 +640,36 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
         anyhow::bail!("admin health never became ready within {READY_TIMEOUT:?}");
     }
 
-    // A finished bring-up flips `decdn_node_boot_ready` to `1`. The runtime sets
-    // it just after it spawns the admin server, so poll briefly rather than
-    // read once.
+    // A finished bring-up flips `decdn_node_boot_ready` to `1`, and the metrics
+    // listener `run` bound before bring-up still serves. Scrape over HTTP, not
+    // through `Metrics::encode`, so a server that stopped after boot fails here.
+    // The runtime sets the gauge just after it spawns the admin server, so poll
+    // briefly rather than read once.
+    let scraper = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("failed to build the metrics scrape client")?;
+    let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
     let boot_ready = poll_until(Duration::from_secs(5), || {
-        let metrics = &metrics;
+        let (scraper, metrics_url) = (&scraper, &metrics_url);
         async move {
-            metrics
-                .encode()
-                .ok()
-                .filter(|body| body.lines().any(|l| l == "decdn_node_boot_ready 1"))
+            let body = scraper
+                .get(metrics_url)
+                .send()
+                .await
+                .ok()?
+                .text()
+                .await
+                .ok()?;
+            body.lines()
+                .any(|l| l == "decdn_node_boot_ready 1")
+                .then_some(())
         }
     })
     .await;
     anyhow::ensure!(
         boot_ready.is_some(),
-        "decdn_node_boot_ready must read 1 once the admin server answers"
+        "GET {metrics_url} must serve decdn_node_boot_ready 1 once the admin server answers"
     );
 
     // ---- 7. Trigger graceful shutdown via `admin_v1_drain` (fire-and-forget,
