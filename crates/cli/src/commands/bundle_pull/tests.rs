@@ -1692,7 +1692,9 @@ async fn a_run_with_nothing_to_fetch_records_its_excluded_entries() {
     let activity =
         ActivityRecorder::start_in(records.path(), &uri, &text, out.path(), &evidence).unwrap();
     let observer = PullObserver::new(true, "pull".to_owned(), Some(Arc::clone(&activity)));
-    observer.nothing_to_fetch(NothingReason::Filtered, 9, out.path(), uri.hash);
+    observer
+        .nothing_to_fetch(NothingReason::Filtered, 9, out.path(), uri.hash)
+        .unwrap();
     activity.finish(&Ok(()), None).await;
 
     let (records, _) = crate::commands::activity::read_records(records.path()).unwrap();

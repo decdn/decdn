@@ -25,7 +25,10 @@
 //!
 //! 1. `--exclude 'metal/*' --exclude '**'` keeps no entry, so the run reports
 //!    nothing to fetch and exits 0.
-//! 2. `--exclude 'metal/*'` alone keeps both entries: this is the run that
+//! 2. The same filters with `--json` print one JSON object on stdout, the
+//!    report every real run prints: `fetched` 0 and `excluded` 2, with no
+//!    prose line.
+//! 3. `--exclude 'metal/*'` alone keeps both entries: this is the run that
 //!    goes on to pay. `--receipt` names the path one entry lands at, so the
 //!    pre-pull guard refuses the run after the filter.
 //!
@@ -119,7 +122,38 @@ async fn run() -> anyhow::Result<()> {
         "the run must add nothing to the output root: {names:?}"
     );
 
-    // ---- 2. Both entries stay. A `--receipt` at the path `config.json` lands
+    // ---- 2. The same filters under `--json`: stdout is the run's report.
+    let emptied_json = get(
+        home,
+        &argv,
+        &["--exclude", "metal/*", "--exclude", "**", "--json"],
+    )
+    .await?;
+    let stdout = String::from_utf8_lossy(&emptied_json.stdout);
+    let stderr = String::from_utf8_lossy(&emptied_json.stderr);
+    anyhow::ensure!(
+        emptied_json.status.success(),
+        "a `--json` pull whose filters keep no entry must exit 0\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    ensure_warned_once(&emptied_json)?;
+    anyhow::ensure!(
+        !stdout.contains(NOTHING_TO_FETCH),
+        "`--json` must not print the prose line: {stdout}"
+    );
+    let summary: serde_json::Value = serde_json::from_str(&stdout)
+        .with_context(|| format!("`--json` stdout must be one JSON object: {stdout}"))?;
+    let count = |key: &str| summary.get(key).and_then(serde_json::Value::as_u64);
+    anyhow::ensure!(
+        count("fetched") == Some(0) && count("excluded") == Some(2),
+        "the report must fetch nothing and count both entries excluded: {summary}"
+    );
+    let names = names_in(out)?;
+    anyhow::ensure!(
+        names == [".decdn-bundles"],
+        "the `--json` run must add nothing to the output root: {names:?}"
+    );
+
+    // ---- 3. Both entries stay. A `--receipt` at the path `config.json` lands
     // at makes the pre-pull guard refuse the run, after the filter.
     let entry_dir = out.join("openai-gpt-oss-20b");
     // The CLI refuses a `--receipt` whose directory cannot take a file.

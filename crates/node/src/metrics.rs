@@ -2468,6 +2468,15 @@ pub struct DecdnMetrics {
     /// counter separates the close from a drained pool
     /// (`serve_stream_midstream_pool_exhausted`).
     pub serve_stream_midstream_pool_closed: Counter,
+    /// `decdn_serve_pool_recheck_stale_total`: mid-stream pool-solvency
+    /// re-checks that read the wired pool view while the node's chain reads
+    /// are stale (ADR 011 § Serving while chain-stale). The node cannot reach
+    /// the chain, so the projection may be frozen and a drain or close that
+    /// landed on-chain since does not show. The staleness itself stops no
+    /// stream; the re-check's usual verdict on the frozen data applies. Counted
+    /// per re-check, so one affected stream adds about one count per re-check
+    /// interval, and a slow batch re-checked between its proofs adds more.
+    pub serve_pool_recheck_stale: Counter,
 }
 
 /// Per-request JSON-RPC metrics for the node's chain provider, registered under
@@ -3988,6 +3997,9 @@ recorders! {
     /// A paying stream stopped mid-delivery because its pool closed, or closes
     /// within the node's redeem margin.
     serve_stream_midstream_pool_closed => serve_stream_midstream_pool_closed.inc();
+    /// A mid-stream pool-solvency re-check read a projection while the chain
+    /// reads are stale.
+    serve_pool_recheck_stale => serve_pool_recheck_stale.inc();
 }
 
 watcher_downtime_recorders! {

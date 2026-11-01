@@ -62,7 +62,9 @@ enum Planned {
     /// The kept entries.
     Pull(Kept),
     /// No entry is left: the bundle is empty, or the filter or `--select`
-    /// dropped every entry. [`PullObserver::nothing_to_fetch`] ends the run.
+    /// dropped every entry. [`PullObserver::nothing_to_fetch`] ends the run
+    /// with a prose line, or under `--json` with the run's [`PullReport`]:
+    /// `fetched` 0 and the `excluded` count.
     Nothing {
         /// Why no entry is left.
         reason: NothingReason,
@@ -1128,9 +1130,9 @@ async fn pull_manifest(
     let Kept { manifest, excluded } = match selected.inspect_err(|_| warn_shortfall(puller))? {
         Planned::Pull(kept) => kept,
         Planned::Nothing { reason, excluded } => {
-            observer.nothing_to_fetch(reason, excluded, out, uri.hash);
+            let reported = observer.nothing_to_fetch(reason, excluded, out, uri.hash);
             warn_shortfall(puller);
-            return Ok(());
+            return reported;
         }
     };
 
@@ -1267,16 +1269,28 @@ impl PullObserver {
     /// End a run that has nothing to fetch, for `reason`: say so, warn of
     /// the `.partial` files earlier runs left under `out`, and record the
     /// `excluded` entries, so the run's record shows how many it dropped.
+    /// Under `--json`, the run says so with its [`PullReport`], the same
+    /// object every real run prints: no entry fetched, the `excluded` count,
+    /// and no byte paid by the pull, which leaves out the manifest fetch as
+    /// every run's report does. Otherwise it prints one prose line for
+    /// `reason`.
     fn nothing_to_fetch(
         &self,
         reason: NothingReason,
         excluded: u64,
         out: &Path,
         bundle_hash: [u8; 32],
-    ) {
-        report_nothing_to_fetch(reason);
+    ) -> anyhow::Result<()> {
+        let empty = BundleReport::default();
+        let reported = if self.json {
+            report(&empty, excluded, out, true)
+        } else {
+            report_nothing_to_fetch(reason);
+            Ok(())
+        };
         warn_leftover_partials(out, &[], bundle_hash);
-        self.record_counts(&BundleReport::default(), excluded);
+        self.record_counts(&empty, excluded);
+        reported
     }
 
     /// Clear the bars at the end of the run; the command then prints its

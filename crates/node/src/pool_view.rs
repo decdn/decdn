@@ -31,6 +31,10 @@
 //!   means the pool closed under a live stream. `redeemMany` reverts on a closed
 //!   pool, so the re-check stops the stream rather than read the chain at a
 //!   voucher boundary, which would stall delivery.
+//!   While the node cannot reach the chain past its grace window
+//!   ([`crate::chain_freshness`]), the projection may be frozen. The re-check
+//!   still reads it and applies its usual verdict to what it holds, but each
+//!   such re-check counts `decdn_serve_pool_recheck_stale_total`.
 //!
 //! The bare [`PoolProjection`] is the projection itself: its `status` returns
 //! `None` for a pool it has not folded and never touches the network. Tests wire

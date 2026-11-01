@@ -1717,6 +1717,11 @@ pub struct ClientHandler {
     /// Throttle for the serve-miss refusal line on a request with no lane here
     /// ([`MissPath::NoLane`]). A remote peer triggers it at will.
     no_lane_miss_log: WarnThrottle,
+    /// Throttle for the `warn!` on a mid-stream pool re-check that reads the
+    /// pool view while [`Self::chain_freshness`] is stale: the node cannot reach
+    /// the chain, so the projection may be frozen. Each event also counts into
+    /// `decdn_serve_pool_recheck_stale_total`.
+    pool_recheck_stale_warn: WarnThrottle,
     /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime).
     /// `None` (the default and production path) reads as [`APP_IDLE_TIMEOUT`]
     /// (30s); a shorter value is set at construction via [`ClientHandlerDeps`]
@@ -1837,6 +1842,7 @@ impl ClientHandler {
             unbound_request_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             unknown_lane_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             no_lane_miss_log: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
+            pool_recheck_stale_warn: WarnThrottle::new(Self::POOL_RECHECK_STALE_WARN_INTERVAL),
             idle_timeout: deps.idle_timeout,
             pool_recheck_interval: deps.pool_recheck_interval,
             warming_credit: deps.warming_credit,
@@ -1897,6 +1903,31 @@ impl ClientHandler {
         self.pool_view.as_ref()?.status(pool_id).await
     }
 
+    /// Count a pool re-check that reads the pool view while
+    /// [`Self::chain_freshness`] reads stale, and log a throttled `warn!` naming
+    /// the stream. [`Self::pool_recheck_stop`] calls it once it has a view.
+    fn count_stale_pool_recheck(&self, lane_key: &LaneKey, hash: &Hash) {
+        if self
+            .chain_freshness
+            .as_ref()
+            .is_some_and(crate::chain_freshness::ChainFreshness::is_stale)
+        {
+            self.metrics.serve_pool_recheck_stale();
+            if let Some(suppressed) = self.pool_recheck_stale_warn.admit() {
+                tracing::warn!(
+                    pool_id = %lane_key.pool_id,
+                    signer = %lane_key.signer,
+                    %hash,
+                    suppressed,
+                    interval = ?self.pool_recheck_stale_warn.interval(),
+                    "mid-stream pool-solvency re-check read a projection that may be frozen: \
+                     the node has not reached the chain within its staleness grace window, so \
+                     a pool drained or closed on-chain since then still passes and the stream continues"
+                );
+            }
+        }
+    }
+
     /// The mid-stream pool re-check (ADR 003 §Pool solvency): the stop a live
     /// stream on `lane_key`'s pool must take now, or `None` to keep serving. It
     /// runs at a voucher boundary at most once per [`Self::pool_recheck_interval`]
@@ -1929,8 +1960,16 @@ impl ClientHandler {
     /// this stop can hit a pool that still pays; the client's next request
     /// re-resolves it with one `getPool` and re-seeds the projection, so the
     /// false stop heals itself within one request.
+    ///
+    /// With a view wired, a re-check that runs while [`Self::chain_freshness`]
+    /// reads stale counts `decdn_serve_pool_recheck_stale_total` and logs a
+    /// throttled `warn!` naming the stream. The node cannot reach the chain, so
+    /// the projection may be frozen, and a drain or close that landed on-chain
+    /// since does not show. The staleness itself ends nothing: the re-check
+    /// still reads the projection, and its usual verdict on that data applies.
     async fn pool_recheck_stop(&self, lane_key: &LaneKey, hash: &Hash) -> Option<ServeStop> {
         let view = self.pool_view.as_ref()?;
+        self.count_stale_pool_recheck(lane_key, hash);
         let Some(status) = view.cached_status(lane_key.pool_id).await else {
             tracing::warn!(
                 pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
@@ -2363,6 +2402,12 @@ impl ClientHandler {
     /// binding, a request with no binding, a request on an unknown lane. Each
     /// line carries the offending `peer` and the `suppressed` count.
     pub(super) const PEER_FAULT_WARN_INTERVAL: Duration = Duration::from_mins(1);
+
+    /// Minimum gap between `warn!` lines for a mid-stream pool re-check that
+    /// reads a possibly frozen projection. Each live stream fires once per
+    /// re-check interval while the chain reads are stale, so the line carries
+    /// the `suppressed` count.
+    pub(super) const POOL_RECHECK_STALE_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
     /// Emit the observable side of a floor-admission refusal, picking the message
     /// the refusing gate actually justifies.
