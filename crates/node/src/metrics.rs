@@ -510,6 +510,13 @@ pub struct DecdnMetrics {
     pub otlp_export_failures: Counter,
     /// Seconds since node start.
     pub node_uptime_seconds: Gauge,
+    /// `0` from process start until bring-up finishes, then `1`. The metrics
+    /// listener serves before bring-up, so a node that stays at `0` is still in
+    /// bring-up (most often retrying a boot chain read) or is about to exit on
+    /// a failed step. Set once, just before the `node runtime ready` banner;
+    /// it stays `1` through drain and shutdown. Operator-visible name:
+    /// `decdn_node_boot_ready`.
+    pub node_boot_ready: Gauge,
     /// JSON-RPC endpoint reachability per the watchdog task. `1` =
     /// reachable, `0` = unreachable. `adr/appendix-observability.md` names operational gauges in
     /// the `decdn_*` family; this is the per-tick mirror of the startup
@@ -2248,11 +2255,12 @@ pub struct DecdnMetrics {
     /// head for the stall budget (2 min).
     pub chain_get_logs_deferred: Counter,
     /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
-    /// chain read (the registry, slash, `usdc()` self-check and blacklist
-    /// bootstraps, and the best-effort fee-share reads) after a transient
-    /// error; one read can retry many times. The metrics
-    /// listener binds after these reads, so the value becomes visible once boot
-    /// completes. A rise after a restart points at the RPC provider.
+    /// chain read (the `PaymentPool` deployment preflight, the registry, slash,
+    /// `usdc()` self-check and blacklist bootstraps, and the best-effort
+    /// fee-share reads) after a transient error; one read can retry many
+    /// times. The metrics listener serves before these reads, so the value
+    /// rises while they retry. A rise after a restart points at the RPC
+    /// provider.
     pub chain_boot_read_retries: Counter,
 
     // ---- Down-family parity for the watchers that lacked it (#1283, #1316) ----
@@ -3710,6 +3718,10 @@ recorders! {
     /// (unreachable). Driven by the watchdog task spawned in
     /// `runtime::run`.
     rpc_healthy(ok: bool) => rpc_healthy.set(i64::from(ok));
+
+    /// Bring-up finished: set `decdn_node_boot_ready` to `1`. Called once by
+    /// `runtime::run`, just before the startup banner.
+    node_boot_ready => node_boot_ready.set(1);
 
     /// Record a connection rejected by the global concurrency semaphore.
     dispatch_rejected_global => dispatch_rejected_global.inc();

@@ -79,8 +79,10 @@ that decides a blacklist enforcement attempt). A best-effort fee-share read
 that gives up logs the same text but falls back to the floor share instead of
 exiting; `decdn_fee_shares_watcher_unregistered` then reads `1`. The node
 serves nothing until the blacklist enumeration and enforcement complete. The
-`decdn_chain_boot_read_retries_total` counter counts the boot retries; it
-becomes scrapeable once boot completes.
+metrics listener serves during boot: `decdn_node_boot_ready` reads `0` until
+bring-up finishes, and `decdn_chain_boot_read_retries_total` rises while the
+boot chain reads retry. The RPC preflight's own retries show only in its
+`WARN` lines.
 
 **Detect:**
 
