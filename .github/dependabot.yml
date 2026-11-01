@@ -73,7 +73,7 @@ updates:
     commit-message:
       prefix: chore
       include: scope
-    # Every workflow pins dtolnay/rust-toolchain by commit SHA and names the
+    # Every dtolnay/rust-toolchain step is pinned by commit SHA and names the
     # Rust version in its `toolchain:` input, which Dependabot does not read, so
     # this ecosystem never moves the toolchain. A Rust release reaches the repo
     # through the docker ecosystem's `rust:X.Y.Z` bump of deploy/sponsord, and

@@ -10,6 +10,7 @@ reports a hardened workflow while a step runs a moved tag under a write token.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -713,6 +714,14 @@ INSTALL = f"      - uses: taiki-e/install-action@{OTHER_SHA} # v2.87.32\n"
         (INSTALL + "        with:\n          tool: \"cargo-nextest@0.9.149,\n"
          "            cargo-llvm-cov\"\n          fallback: none\n",
          "install-action tool cargo-llvm-cov is not pinned"),
+        # A blank line does not end a plain scalar.
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149,\n\n"
+         "            cargo-llvm-cov\n          fallback: none\n",
+         "install-action tool cargo-llvm-cov is not pinned"),
+        # Only an unset or literal `true` checksum is known to check.
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
+         "          fallback: none\n          checksum: ${{ inputs.verify }}\n",
+         "install-action sets `checksum: ${{ inputs.verify }}`"),
         # A quote continued at its key's column: this reader stops before the
         # closing quote, so the value keeps its opening quote and fails.
         (INSTALL + "        with:\n          tool: \"cargo-nextest@0.9.149,\n"
@@ -794,8 +803,10 @@ def repo_copy(tmp_path: Path) -> Path:
 
 
 def run_wrapper(repo: Path) -> subprocess.CompletedProcess[str]:
+    # An inherited GIT_DIR (a hook, say) would point rev-parse at the real repo.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     return subprocess.run(
-        ["bash", str(WRAPPER)], cwd=repo, capture_output=True, text=True, check=False
+        ["bash", str(WRAPPER)], cwd=repo, env=env, capture_output=True, text=True, check=False
     )
 
 

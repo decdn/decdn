@@ -165,3 +165,16 @@ def test_an_empty_artifact_is_refused(tmp_path: Path) -> None:
     )
     result = run_check(materialize(tmp_path, layout), tmp_path)
     assert_refused(result, "artifact binaries-aarch64-pc-windows-msvc is empty")
+
+
+def test_two_artifacts_carrying_one_name_are_refused(tmp_path: Path) -> None:
+    # Reachable only through a target that ends in `-<version>-<other target>`,
+    # but it is what stops `mv` overwriting a real archive if the name match is
+    # ever loosened.
+    impostor = f"a-{VERSION}-x86_64-apple-darwin"
+    name = f"z-{VERSION}-{impostor}.tar.gz"
+    layout = real_layout()
+    layout["binaries-x86_64-apple-darwin"].append(name)
+    layout[f"binaries-{impostor}"] = [name]
+    result = run_check(materialize(tmp_path, layout), tmp_path)
+    assert_refused(result, f"two artifacts carry {name}")

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if a workflow widens its token, floats an action, or floats an image or
-tool this check reads.
+"""Fail if a workflow widens its token or floats an action, image or tool it checks.
 
 Every step under .github/workflows runs with its job's `GITHUB_TOKEN`, so an
 action fetched from a moved tag, a tool installed at whatever version is
@@ -8,8 +7,9 @@ newest, or a token left in `.git/config` for a later step to read, hands that
 token to code nobody reviewed. In `release.yml` that token can push an image
 tag (`packages: write`) or replace release assets (`contents: write`); in
 `ci.yml` it writes PR comments and code-quality results. The `clippy` cache
-is a further path: CI saves it on `main` only, with the Actions runtime token
-rather than the job's `GITHUB_TOKEN`, and the release's `verify` restores it.
+is a further path from CI into the release: CI saves it on `main` only, with
+the Actions runtime token, which `permissions:` does not limit, and the
+release's `verify` restores it.
 Six rules keep every token narrow and the code fixed:
 
 1. Every remote `uses:` names a full 40-hex commit SHA. A tag or branch can be
@@ -37,13 +37,16 @@ Six rules keep every token narrow and the code fixed:
 
 Out of scope: `run:` steps, which this check does not read, and where a SHA
 comes from. Rule 1 proves a ref cannot move, not that the commit belongs to
-the named repository or matches its `# vX.Y.Z` comment. Rules 5 and 6 read
-only the IMAGE_INPUTS actions and install-action. A SHA-pinned action that
-installs code of its own can still float it: crytic/slither-action builds
-`FROM python:3.10` and installs the newest slither, astral-sh/setup-uv with
-no `version` installs the newest uv, Cyfrin/aderyn-ci installs
-`@cyfrin/aderyn@0.6`, and cargo-semver-checks-action installs the newest
-cargo-semver-checks. Each runs under a read-only token.
+the named repository or matches its `# vX.Y.Z` comment. Rule 5 reads only
+the IMAGE_INPUTS actions' inputs and the job keys named above, and rule 6
+only install-action. A SHA-pinned action that installs code of its own can
+still float it. For example, crytic/slither-action builds `FROM python:3.10`
+and installs the newest slither, astral-sh/setup-uv with no `version`
+installs the newest uv, Cyfrin/aderyn-ci installs the newest
+`@cyfrin/aderyn` 0.6.x, cargo-semver-checks-action installs the `stable`
+toolchain and the newest cargo-semver-checks, and a setup-node or
+setup-python version such as `'24'` takes the newest patch. Each runs under
+a read-only token.
 
 Text, not YAML: the files are read with the standard library only, line by
 line with comments stripped, so a commented-out step is not a site. The shapes
