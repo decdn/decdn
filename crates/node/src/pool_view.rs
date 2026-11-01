@@ -496,7 +496,8 @@ impl PoolProjection {
 
     /// Apply a `PoolCloseInitiated(poolId, _, disputeDeadline)`: mark the pool
     /// `Closing`. Skipped for a pool the projection has not opened — there is no
-    /// entry to serve, and reads fail open. A `Closing` pool keeps its
+    /// entry to serve, and the admit-path `getPool` read finds the pool `Closing`
+    /// and refuses it. A `Closing` pool keeps its
     /// `remaining` and stays redeemable until `deadline`; `PoolReclaimed` later
     /// removes it via `forget`.
     pub fn record_closing(&self, pool_id: B256, deadline: u64) {
@@ -511,8 +512,8 @@ impl PoolProjection {
     }
 
     /// Apply a `PoolReclaimed(poolId, ..)`: the pool is `Closed` and its remainder
-    /// refunded. Drop it — a later read returns `None` and the serve gate fails
-    /// open, exactly as for a pool the projection has not yet seen. A
+    /// refunded. Drop it — a later read returns `None`, which refuses the pool at
+    /// admission and stops any live stream on it as `PoolClosed`. A
     /// `PoolCloseInitiated` is folded by [`Self::record_closing`], which marks the
     /// pool `Closing` but keeps it redeemable until the dispute deadline; `forget`
     /// removes the whole entry, lifecycle included, once the reclaim actually

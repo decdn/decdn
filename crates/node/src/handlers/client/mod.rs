@@ -1656,7 +1656,7 @@ impl ClientHandler {
     }
 
     /// The pool's cached `getPool` status (owner + `remaining`), or `None` when no
-    /// pool-view is wired or the read faulted. Both the takedown funder resolution
+    /// pool-view is wired or the read faulted. The takedown funder resolution
     /// ([`Self::pool_funder`]) reads through this at the START of a serve leg; a
     /// `None` result makes the caller fail open — a transient RPC blip must not stop
     /// a paying stream, and the on-chain `redeem` is the backstop. MAY block on a
@@ -1696,7 +1696,11 @@ impl ClientHandler {
     /// nothing. The caller sends `PoolExhausted` on the wire for either stop: the
     /// client's recovery is the same funding step, and the stop keeps its own
     /// counter. The re-check logs a `warn!` for each stop, which names the
-    /// stream. Each stream stops once, so the line needs no throttle.
+    /// stream. Each stream stops once, so the line needs no throttle. A
+    /// `PoolReclaimed` that a reorg later drops leaves a live pool forgotten, so
+    /// this stop can hit a pool that still pays; the client's next request
+    /// re-resolves it with one `getPool` and re-seeds the projection, so the
+    /// false stop heals itself within one request.
     async fn pool_recheck_stop(&self, lane_key: &LaneKey, hash: &Hash) -> Option<ServeStop> {
         let view = self.pool_view.as_ref()?;
         let Some(status) = view.cached_status(lane_key.pool_id).await else {

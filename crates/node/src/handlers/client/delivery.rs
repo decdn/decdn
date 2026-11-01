@@ -591,7 +591,9 @@ impl ClientHandler {
             // closed), on a `Closing` pool whose dispute deadline falls inside the
             // node's redeem margin, and on a pool whose `remaining − M` no longer
             // covers the floor credit ALREADY committed across the pool (this
-            // stream included while its floor is un-repaid). Every stop is IN-BAND
+            // stream included while its floor is un-repaid; with every floor
+            // repaid, the `remaining > M` bound alone separates a funded pool
+            // from a drained one). Every stop is IN-BAND
             // with a clean `PoolExhausted` (not a QUIC reset, unlike a takedown) so
             // the owner learns to fund a pool — `PoolExhausted` is post-auth, so
             // naming the condition leaks nothing an open-time refusal must hide,

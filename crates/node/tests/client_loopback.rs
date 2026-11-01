@@ -6918,6 +6918,10 @@ async fn mid_stream_pool_drain_stops_with_pool_exhausted() -> anyhow::Result<()>
         )? == 1,
         "the mid-stream stop must be counted"
     );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_midstream_pool_closed_total")? == 0,
+        "a drained pool is not counted as a closed one"
+    );
 
     // Closing the connection ends the parked holder A unpaid: a decline.
     conn.close(0u32.into(), b"done");
@@ -7035,6 +7039,10 @@ async fn drained_pool_stops_stream_after_its_floor_is_repaid() -> anyhow::Result
         )? == 1,
         "the mid-stream stop must be counted"
     );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_midstream_pool_closed_total")? == 0,
+        "a drained pool is not counted as a closed one"
+    );
 
     conn.close(0u32.into(), b"done");
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -7139,6 +7147,10 @@ async fn drained_pool_stops_a_serve_miss_stream_after_its_floor_is_repaid() -> a
             "decdn_serve_stream_midstream_pool_exhausted_total"
         )? == 1,
         "the mid-stream stop must be counted"
+    );
+    anyhow::ensure!(
+        counter(&metrics, "decdn_serve_stream_midstream_pool_closed_total")? == 0,
+        "a drained pool is not counted as a closed one"
     );
     // The own-origin spine served the miss: its tier counter fired once, and
     // the buffered populate never pulled the whole blob.

@@ -975,8 +975,9 @@ impl<P: Provider + Clone + 'static> LogSink for PoolSettlementSink<P> {
                     }
                 };
                 // The pool is `Closed` and refunded: drop it from the serve
-                // projection so a later read fails open rather than reserving
-                // against a stale remaining.
+                // projection, so a later read refuses the pool at admission and
+                // stops any live stream on it, rather than reserving against a
+                // stale remaining.
                 self.pool_view.forget(event.poolId);
                 self.forget_pool_lanes(event.poolId).await;
             }

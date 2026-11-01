@@ -1774,11 +1774,12 @@ fn recheck_stream() -> (LaneKey, Hash) {
     (lane, Hash::new(b"pool re-check"))
 }
 
-/// A [`crate::pool_view::PoolView`] holding one funded status with a set
-/// lifecycle for every pool, for the pool-close re-check tests.
+/// A [`crate::pool_view::PoolView`] holding one status with a set lifecycle and
+/// `remaining` for every pool, for the pool-close re-check tests.
 #[derive(Debug)]
 struct LifecyclePoolView {
     lifecycle: crate::pool_view::Lifecycle,
+    remaining: U256,
 }
 
 #[async_trait::async_trait]
@@ -1786,24 +1787,55 @@ impl crate::pool_view::PoolView for LifecyclePoolView {
     async fn status(&self, _pool_id: B256) -> Option<crate::pool_view::PoolStatus> {
         Some(crate::pool_view::PoolStatus {
             owner: Address::repeat_byte(0x11),
-            remaining: U256::MAX,
+            remaining: self.remaining,
             lifecycle: self.lifecycle,
         })
     }
 }
 
-/// The re-check's stop for a handler whose pool view holds `lifecycle`.
-async fn recheck_stop_for(
+/// The re-check's stop for a handler whose pool view holds `lifecycle` with
+/// `remaining` left in the pool. A zero `remaining` fails `pool_funds_committed`
+/// at any floor-`M`, so it reads as drained.
+async fn recheck_stop_for_pool(
     lifecycle: impl FnOnce(u64) -> crate::pool_view::Lifecycle,
+    remaining: U256,
 ) -> Option<ServeStop> {
     let metrics = Arc::new(Metrics::new());
     let now = crate::coarse_clock::CoarseClock::new().unix_seconds();
     let view = Arc::new(LifecyclePoolView {
         lifecycle: lifecycle(now),
+        remaining,
     });
     let (handler, _dir) = handler_with_pool_view(&metrics, view).await;
     let (lane, hash) = recheck_stream();
     handler.pool_recheck_stop(&lane, &hash).await
+}
+
+/// [`recheck_stop_for_pool`] on a funded pool.
+async fn recheck_stop_for(
+    lifecycle: impl FnOnce(u64) -> crate::pool_view::Lifecycle,
+) -> Option<ServeStop> {
+    recheck_stop_for_pool(lifecycle, U256::MAX).await
+}
+
+/// A drained `Open` pool stops as `PoolExhausted` — the top-up remedy.
+#[tokio::test]
+async fn pool_recheck_stops_a_drained_open_pool_as_exhausted() {
+    let stop = recheck_stop_for_pool(|_| crate::pool_view::Lifecycle::Open, U256::ZERO).await;
+    assert_eq!(stop, Some(ServeStop::PoolExhausted));
+}
+
+/// A pool that is both `Closing` at its deadline AND drained stops as
+/// `PoolClosed`, not `PoolExhausted`: a closed pool's `remaining` pays nothing,
+/// so the close verdict wins and the owner's remedy is a new pool, not a top-up.
+#[tokio::test]
+async fn pool_recheck_prefers_pool_closed_over_exhausted() {
+    let stop = recheck_stop_for_pool(
+        |now| crate::pool_view::Lifecycle::Closing { deadline: now },
+        U256::ZERO,
+    )
+    .await;
+    assert_eq!(stop, Some(ServeStop::PoolClosed));
 }
 
 /// A wired pool view that no longer holds the pool means the pool closed under
