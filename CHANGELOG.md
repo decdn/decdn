@@ -1,8 +1,36 @@
 # Changelog
 
 git-cliff generates this file from the Conventional Commit history; `cargo release`
-rewrites it for each version (see RELEASING.md), and the same commits are the GitHub
-release notes. Do not edit it by hand.
+rewrites it for each version (see RELEASING.md). The newest section is also the
+GitHub release notes. Do not edit it by hand.
+
+## [0.3.1] - 2026-11-01
+
+### Features
+
+- **client**: Count each lane's wire bytes and report them in the bundle pull summary (#2788) ([d90a221](https://github.com/decdn/decdn/commit/d90a221fe40dbcf0293f4545c3f8a4dd67dbff9a))
+
+### Bug Fixes
+
+- **node**: Keep an abandoned stream's free floor as floor debt (#2779) ([ca1a965](https://github.com/decdn/decdn/commit/ca1a9659766c1fc491102e1aabd9c6ae8b8c36dc))
+- **cache**: Contain and bound the fs origin's outboard read; zeroize node key buffers (#2793) ([4ebf92d](https://github.com/decdn/decdn/commit/4ebf92d6453b97124b016410ee096241a1e0a4af))
+- **node**: Count a skipped mid-stream pool re-check and test the serve-miss PoolExhausted stop (#2789) ([1c67719](https://github.com/decdn/decdn/commit/1c67719f556ce4a6c63892d8d00a86cc5dd5aefc))
+- **dashboard**: Shorten a running pull's output path and record the #2776 fix (#2782) ([991871e](https://github.com/decdn/decdn/commit/991871e24c689c7937c8f7b9a13e66af1055e947))
+- **dashboard**: Keep each row's bar beside its text at sm and up (#2781) ([109ca62](https://github.com/decdn/decdn/commit/109ca626661cd955faab53df315781768a2a793e))
+
+### Testing
+
+- **e2e**: Run the PortReservation child-bind tests off Linux (#2795) ([4ece849](https://github.com/decdn/decdn/commit/4ece849a4d53a39188ff8ab32534053a87caf519))
+- **e2e**: Assert the real bundle pull's unmatched-pattern warning on stderr (#2790) ([23b559b](https://github.com/decdn/decdn/commit/23b559ba9999ded451c849f4fbea9600ea7349ba))
+- **e2e**: Gate the Linux-only port test helpers so non-Linux clippy is clean (#2785) ([3d95315](https://github.com/decdn/decdn/commit/3d95315a4fc1fdea531aeb394f92e4108d1a941a))
+- **e2e**: Run the Python SDK contract suite against the gateway (#2778) ([8f126d1](https://github.com/decdn/decdn/commit/8f126d12fe466c64540a4d4e5257ade3c9568104))
+
+### CI/CD
+
+- Publish crates via crates.io trusted publishing once a release is signed (#2816) ([236a892](https://github.com/decdn/decdn/commit/236a89220d704a879567309373ef09222731c5e6))
+- Close workflow-hardening and release archive-check gaps found reviewing #2794 (#2809) ([ddb59a0](https://github.com/decdn/decdn/commit/ddb59a03ed991a93937148957b35e32f20ab3665))
+- Pin every workflow and download release artifacts by source (#2794) ([0bd2393](https://github.com/decdn/decdn/commit/0bd23935c8e102abe898b5e4724456a36bd4caac))
+- **release**: Scope the token per job and pin every action by SHA (#2783) ([a92727a](https://github.com/decdn/decdn/commit/a92727af9e68bc993d2773702d9c2d19abe6af3f))
 
 ## [0.3.0] - 2026-10-29
 
