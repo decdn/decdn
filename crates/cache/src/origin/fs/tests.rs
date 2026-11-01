@@ -913,3 +913,22 @@ fn an_oversize_outboard_warns_with_its_path_and_cap() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A dangling `.obao4` symlink is a permanent fault from `fetch_outboard`,
+/// never the degrade `Unsupported`: as a degrade it would silently cost every
+/// range pull of the blob, the same silence #2801 closes for the data leaf.
+/// The engine still serves the blob — the range probe latches the fault and
+/// the miss falls through to the buffered whole-blob path.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dangling_outboard_symlink_is_permanent() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let hash = Hash::new(b"dangling-outboard");
+    let link = origin.obao4_path_for(hash);
+    create_parent(&link).await?;
+    tokio::fs::symlink(origin.base().join("missing-outboard-target"), &link).await?;
+
+    let err = origin.fetch_outboard(hash, 1 << 20).await.err();
+    ensure_permanent("fetch_outboard", err, "symlink whose target does not exist")
+}

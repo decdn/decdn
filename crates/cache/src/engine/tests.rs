@@ -6402,3 +6402,75 @@ async fn a_cut_short_export_is_not_a_short_file() -> anyhow::Result<()> {
     assert!(!export_cut_short(&short_file));
     Ok(())
 }
+
+/// The probe walk's `ChainProbe::cause` carries the per-origin error that an
+/// operator can act on (#2801 item 3): a non-transient cause survives a later
+/// origin's transient fault instead of being shadowed by it, a lone transient
+/// fault names itself, and the walk ceiling names the timeout. The
+/// `origin_probe_presence` warn prints this string, so `cause: None` on a
+/// fault would print `cause="unknown"` and lose the signal.
+#[tokio::test]
+async fn probe_origin_chain_cause_prefers_the_permanent_error() -> anyhow::Result<()> {
+    let hash = Hash::new(b"cause-threading");
+    let engine_with = |origins: Vec<Arc<dyn Origin>>| async {
+        let tmp = tempfile::tempdir()?;
+        let engine = CacheEngine::open(tmp.path(), origins, 10).await?;
+        anyhow::Ok((engine, tmp))
+    };
+    let faulting = |permanent: bool| {
+        let (origin, controls) = ThrottlableOrigin::new(vec![]);
+        controls.faulting.store(true, Ordering::SeqCst);
+        controls.permanent.store(permanent, Ordering::SeqCst);
+        (Arc::new(origin) as Arc<dyn Origin>, controls)
+    };
+
+    // A permanent fault followed by a transient one: the warn must name the
+    // operator-actionable cause, while `transient` still reports the OR.
+    let (permanent, _c1) = faulting(true);
+    let (transient, _c2) = faulting(false);
+    let (engine, _tmp) = engine_with(vec![permanent, transient]).await?;
+    let probe = engine
+        .probe_origin_chain(hash, Duration::from_secs(5))
+        .await;
+    anyhow::ensure!(matches!(probe.presence, OriginPresence::Fault));
+    anyhow::ensure!(probe.transient, "one origin's fault is retry-eligible");
+    let cause = probe
+        .cause
+        .ok_or_else(|| anyhow::anyhow!("fault must carry a cause"))?;
+    anyhow::ensure!(
+        cause.contains("S3 origin:") && cause.contains("access denied"),
+        "the permanent cause must survive the later transient fault: {cause}"
+    );
+
+    // A lone transient fault names itself.
+    let (transient, _c3) = faulting(false);
+    let (engine, _tmp) = engine_with(vec![transient]).await?;
+    let probe = engine
+        .probe_origin_chain(hash, Duration::from_secs(5))
+        .await;
+    let cause = probe
+        .cause
+        .ok_or_else(|| anyhow::anyhow!("fault must carry a cause"))?;
+    anyhow::ensure!(
+        cause.contains("503 SlowDown"),
+        "a transient-only fault names the transient cause: {cause}"
+    );
+
+    // The walk ceiling is a cause of its own.
+    let (slow, controls) = ThrottlableOrigin::new(vec![(hash, 7)]);
+    controls.slow_ms.store(5_000, Ordering::SeqCst);
+    let (engine, _tmp) = engine_with(vec![Arc::new(slow) as Arc<dyn Origin>]).await?;
+    let probe = engine
+        .probe_origin_chain(hash, Duration::from_millis(50))
+        .await;
+    anyhow::ensure!(matches!(probe.presence, OriginPresence::Fault));
+    anyhow::ensure!(probe.transient, "a ceiling overrun is worth waiting out");
+    let cause = probe
+        .cause
+        .ok_or_else(|| anyhow::anyhow!("timeout must carry a cause"))?;
+    anyhow::ensure!(
+        cause.contains("overran"),
+        "the ceiling names itself: {cause}"
+    );
+    Ok(())
+}

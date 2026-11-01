@@ -133,8 +133,10 @@ struct ChainProbe {
     /// origin failed with a retry-eligible error, or the walk overran its
     /// ceiling. `false` for any other presence.
     transient: bool,
-    /// For a `Fault`, the walk's last per-origin error with its cause chain, or
-    /// the ceiling the walk overran. `None` for any other presence.
+    /// For a `Fault`, one per-origin error with its cause chain — the first
+    /// non-transient one when the walk met one (the operator-actionable cause,
+    /// which a later origin's transient fault must not shadow), else the last —
+    /// or the ceiling the walk overran. `None` for any other presence.
     cause: Option<String>,
 }
 
@@ -2156,6 +2158,7 @@ impl CacheEngine {
     async fn probe_origin_chain(&self, hash: Hash, timeout: Duration) -> ChainProbe {
         let walk = async {
             let mut cause = None;
+            let mut kept_permanent_cause = false;
             let mut any_transient = false;
             for origin in &self.inner.origins {
                 match origin.size(hash).await {
@@ -2175,8 +2178,14 @@ impl CacheEngine {
                             transient = e.is_transient(),
                             "origin-probe HEAD faulted; checking remaining origins",
                         );
+                        // Keep the first non-transient cause: it is the
+                        // operator-actionable one, and a later origin's
+                        // transient fault must not shadow it.
+                        if !kept_permanent_cause {
+                            kept_permanent_cause = !e.is_transient();
+                            cause = Some(format!("{:?} origin: {e:#}", origin.kind()));
+                        }
                         any_transient |= e.is_transient();
-                        cause = Some(format!("{:?} origin: {e:#}", origin.kind()));
                     }
                 }
             }

@@ -185,18 +185,36 @@ impl FilesystemOrigin {
 /// base is canonical. A component counts only when `symlink_metadata` sees a
 /// link and `metadata` cannot follow it. Thus a valid symlinked shard
 /// directory with no leaf under it stays an absence. An error from either
-/// call reads as "not dangling", so the caller keeps its absent answer.
+/// call reads as "not dangling" — the caller then keeps the absent answer it
+/// would have given before this probe ran — and logs at debug, so a probe
+/// failure (an ESTALE or a permission flip mid-check) leaves a trace.
 async fn dangling_link(path: &Path) -> Option<&Path> {
     for candidate in [Some(path), path.parent()].into_iter().flatten() {
-        let is_link = tokio::fs::symlink_metadata(candidate)
-            .await
-            .is_ok_and(|m| m.file_type().is_symlink());
-        if is_link
-            && tokio::fs::metadata(candidate)
-                .await
-                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-        {
-            return Some(candidate);
+        let is_link = match tokio::fs::symlink_metadata(candidate).await {
+            Ok(m) => m.file_type().is_symlink(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                tracing::debug!(
+                    path = %candidate.display(),
+                    error = %err,
+                    "dangling-link probe lstat failed; keeping the absent answer",
+                );
+                false
+            }
+        };
+        if !is_link {
+            continue;
+        }
+        match tokio::fs::metadata(candidate).await {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(candidate),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::debug!(
+                    path = %candidate.display(),
+                    error = %err,
+                    "dangling-link probe stat failed; keeping the absent answer",
+                );
+            }
         }
     }
     None
@@ -509,8 +527,10 @@ impl Origin for FilesystemOrigin {
             // Open the file once, and drop it, so an object the process cannot
             // read (mode 0600 under another user) is a fault here rather than
             // a size that every serve then fails on at `open`. The resolve
-            // ruled out a FIFO, so the open does not block. The fstat re-checks
-            // the type of what was opened and gives the size of that inode.
+            // rules out a FIFO that is already in place; a FIFO swapped in
+            // after the stat can still block this open, as it can block the
+            // other reads' opens (#2802). The fstat re-checks the type of what
+            // was opened and gives the size of that inode.
             let file = match tokio::fs::File::open(&canonical).await {
                 Ok(f) => f,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),

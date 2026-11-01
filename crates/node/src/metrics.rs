@@ -212,8 +212,9 @@ struct ProbeHoldUnavailableLabels {
 /// Why capability intake dropped an owner-signed capability, as the `reason`
 /// label on `decdn_capability_intake_dropped_total`. A dropped capability
 /// registers no lane, so the client hears the same unknown-lane refusal as an
-/// ordinary miss; this label is the only place the cause survives. The derive
-/// renders variants in `snake_case`.
+/// ordinary miss; each drop site also logs its cause, and this label is the
+/// operator's only aggregate view of it. The derive renders variants in
+/// `snake_case`.
 #[derive(
     Debug,
     Clone,
@@ -632,11 +633,10 @@ pub struct DecdnMetrics {
     /// at zero rather than appearing only on first increment. Field has no
     /// `_total` suffix because the `OpenMetrics` encoder appends it.
     ///
-    /// **This is the documented exception, not the convention** (#1475) — a
-    /// labeled *reason split*, not the crate's only `Family`:
-    /// `streams_active` and `staker_set_active_by_region` label other axes, and
-    /// `capability_intake_dropped` is the one other reason split that meets the
-    /// bar below.
+    /// **This is a documented exception, not the convention** (#1475) — a
+    /// labeled *reason split* (`capability_intake_dropped` is the other), not
+    /// the crate's only `Family`:
+    /// `streams_active` and `staker_set_active_by_region` label other axes.
     /// Every other reason-style split in this crate — `dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
     /// and `pool_open_failures_*` — fans out to sibling unlabeled counters,
     /// and that stays the default for a new split: sibling counters need no
@@ -1977,10 +1977,11 @@ pub struct DecdnMetrics {
     /// Delivery refused at admission because the request's voucher signer holds
     /// an on-chain registration at or past its expiry, or its lane's capability
     /// is inside the node's expiry margin (ADR 003 §Revocation). Signed as
-    /// `Unfunded`, like `signer_cap_exhausted`, so this counter is the only
-    /// place the split lives. The remedy differs: a larger cap does not help,
-    /// and the owner delegates a fresh capability with a later expiry. Visible
-    /// name: `decdn_serve_stream_rejected_capability_expired_total`.
+    /// `Unfunded`, like `signer_cap_exhausted`, so off the wire the split lives
+    /// in this counter and in the `serve_stream` span's `reason`. The remedy
+    /// differs: a larger cap does not help, and the owner delegates a fresh
+    /// capability with a later expiry. Visible name:
+    /// `decdn_serve_stream_rejected_capability_expired_total`.
     pub serve_stream_rejected_capability_expired: Counter,
     /// `decdn_capability_intake_dropped_total{reason}`: owner-signed
     /// capabilities that intake dropped before it registered a lane. The

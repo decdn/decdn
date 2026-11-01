@@ -890,9 +890,10 @@ enum ServeRejectReason {
     /// (ADR 003 §Revocation). No voucher it signs can redeem in time, so the
     /// owner delegates a fresh capability; a larger cap does not help. Ships
     /// [`StreamError::Unfunded`] (see [`Self::wire_error`]), the same class as
-    /// [`Self::SignerCapExhausted`], so the split survives only in the
-    /// per-reason metric: both gates key on a verified binding for a registered
-    /// signer or a lane, so the requester is proven.
+    /// [`Self::SignerCapExhausted`], so the split never reaches the wire and
+    /// survives in the per-reason metric and the span `reason`: both gates key
+    /// on a verified binding for a registered signer or a lane, so the
+    /// requester is proven.
     CapabilityExpired,
     /// One capability signer's live un-vouchered reservation plus floor debt
     /// already fills its `k`-window cap (ADR 003 §Pool solvency, per-signer floor
