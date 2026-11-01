@@ -178,3 +178,27 @@ def test_two_artifacts_carrying_one_name_are_refused(tmp_path: Path) -> None:
     layout[f"binaries-{impostor}"] = [name]
     result = run_check(materialize(tmp_path, layout), tmp_path)
     assert_refused(result, f"two artifacts carry {name}")
+
+
+def test_an_artifact_with_an_empty_target_is_refused(tmp_path: Path) -> None:
+    layout = real_layout()
+    layout["binaries-"] = [f"decdn-{VERSION}-.zip"]
+    result = run_check(materialize(tmp_path, layout), tmp_path)
+    assert_refused(result, "artifact binaries- is not named binaries-<target>")
+
+
+def test_a_symlinked_archive_is_refused(tmp_path: Path) -> None:
+    # Once moved up, it would resolve to the x86_64 archive and be checksummed
+    # under the aarch64 name.
+    artifacts = materialize(tmp_path, real_layout())
+    link = artifacts / "binaries-aarch64-apple-darwin" / f"decdn-{VERSION}-aarch64-apple-darwin.tar.gz"
+    link.unlink()
+    link.symlink_to(f"decdn-{VERSION}-x86_64-apple-darwin.tar.gz")
+    assert_refused(run_check(artifacts, tmp_path), f"{link.name} in artifact "
+                   "binaries-aarch64-apple-darwin is not a regular file")
+
+
+def test_a_directory_named_like_an_archive_is_refused(tmp_path: Path) -> None:
+    artifacts = materialize(tmp_path, real_layout())
+    (artifacts / "binaries-x86_64-apple-darwin" / f"x-{VERSION}-x86_64-apple-darwin.zip").mkdir()
+    assert_refused(run_check(artifacts, tmp_path), "is not a regular file")

@@ -675,8 +675,8 @@ jobs:
       # a file naming another target, which fails here, or adds an archive the
       # exact count below refuses. The check reads one directory per artifact,
       # so it refuses a flat download (download-artifact extracts flat when one
-      # artifact matches, or with `merge-multiple`), an empty artifact, and
-      # any hidden entry. A step holding the run's artifact token can still
+      # artifact matches, or with `merge-multiple`), an empty artifact, any
+      # hidden entry, and any entry that is not a regular file. A step holding the run's artifact token can still
       # replace a same-named artifact outright; only keeping untrusted code
       # out of the run closes that.
       # .github/scripts/tests/test_release_upload_assets.py runs this step.
@@ -697,12 +697,15 @@ jobs:
           (( ${#dirs[@]} > 0 )) || { echo "::error::no artifact directory was downloaded"; exit 1; }
           for dir in "${dirs[@]}"; do
             target=${dir#binaries-}
-            [ "$target" != "$dir" ] || {
+            [ -n "$target" ] && [ "$target" != "$dir" ] || {
               echo "::error::artifact $dir is not named binaries-<target>"; exit 1; }
             files=( "$dir"/* )
             (( ${#files[@]} > 0 )) || { echo "::error::artifact $dir is empty"; exit 1; }
             for f in "${files[@]}"; do
               name=${f#"$dir"/}
+              # A symlink would carry another archive's bytes under this name.
+              [ -f "$f" ] && [ ! -L "$f" ] || {
+                echo "::error::$name in artifact $dir is not a regular file"; exit 1; }
               case "$name" in
                 # Before the suffix match: a hidden archive would pass it, then
                 # slip past the count and the upload, whose globs skip dotfiles.

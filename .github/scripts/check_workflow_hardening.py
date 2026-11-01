@@ -57,7 +57,8 @@ IMAGE_INPUTS step with no dash — are errors, not skips.
 A workflow with no `uses:` at all is an error too, so a pattern that matches
 nothing cannot report a pass. The check catches drift, not a hostile author:
 YAML that hides a key from a text reader (an escaped or explicit `?` key, an
-alias pulled in from another job) can pass it, and whoever can write that can
+expression such as `${{ 'checksum' }}` as an input name, an alias pulled in
+from another job) can pass it, and whoever can write that can
 as easily delete the step that runs this check. Review of `.github/` is the
 boundary against that.
 
@@ -201,7 +202,8 @@ def with_input(key: int, block: list[str], name: str) -> str | None:
             continue
         if child is None:
             child = found[0]
-        if found[0] != child or found[1] != name:
+        # The runner matches input names without regard to case.
+        if found[0] != child or found[1].lower() != name:
             continue
         value = found[2].strip()
         if value[:1] not in ("|", ">"):

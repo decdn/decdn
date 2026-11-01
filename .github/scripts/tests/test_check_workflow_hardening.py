@@ -471,6 +471,11 @@ def test_value_on_the_line_after_its_key_counts(tmp_path: Path) -> None:
     assert errors_for(tmp_path, security=security) == []
 
 
+def test_input_name_case_does_not_matter(tmp_path: Path) -> None:
+    security = swap(SECURITY, "persist-credentials: false", "Persist-Credentials: false")
+    assert errors_for(tmp_path, security=security) == []
+
+
 def test_quoted_false_counts(tmp_path: Path) -> None:
     security = swap(SECURITY, "persist-credentials: false", "persist-credentials: 'false'")
     assert errors_for(tmp_path, security=security) == []
@@ -718,6 +723,10 @@ INSTALL = f"      - uses: taiki-e/install-action@{OTHER_SHA} # v2.87.32\n"
         (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149,\n\n"
          "            cargo-llvm-cov\n          fallback: none\n",
          "install-action tool cargo-llvm-cov is not pinned"),
+        # The runner reads input names without regard to case.
+        (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
+         "          fallback: none\n          Checksum: false\n",
+         "install-action sets `checksum: false`"),
         # Only an unset or literal `true` checksum is known to check.
         (INSTALL + "        with:\n          tool: cargo-nextest@0.9.149\n"
          "          fallback: none\n          checksum: ${{ inputs.verify }}\n",
