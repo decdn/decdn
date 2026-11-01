@@ -876,16 +876,25 @@ enum ServeRejectReason {
         /// Whether the requester passed the lane-ownership proof.
         proven: bool,
     },
-    /// The request's voucher signer cannot pay: it is registered on-chain with
-    /// `cap − spent` below a serve floor or with an expired registration, or its
-    /// lane's capability is inside this node's expiry margin. A signer's `cap` is
-    /// shared across every provider (ADR 003 §Pool solvency), so a "spent"
-    /// capability — one whose signer has already drawn its full `cap` at other
-    /// nodes — is uncashable here: the node would serve for vouchers it could
-    /// never redeem. Ships [`StreamError::Unfunded`] (see [`Self::wire_error`]):
-    /// both gates key on a verified binding for a registered signer or a lane,
-    /// so the requester is proven.
+    /// The request's voucher signer cannot pay: its live on-chain registration
+    /// has `cap − spent` below a serve floor. A signer's `cap` is shared across
+    /// every provider (ADR 003 §Pool solvency), so a "spent" capability — one
+    /// whose signer has already drawn its full `cap` at other nodes — is
+    /// uncashable here: the node would serve for vouchers it could never redeem.
+    /// The owner raises the signer's cap or delegates a fresh capability. Ships
+    /// [`StreamError::Unfunded`] (see [`Self::wire_error`]): the gate keys on a
+    /// verified binding for a registered signer, so the requester is proven.
     SignerCapExhausted,
+    /// The request's voucher signer holds an on-chain registration at or past
+    /// its expiry, or its lane's capability is inside this node's expiry margin
+    /// (ADR 003 §Revocation). No voucher it signs can redeem in time, so the
+    /// owner delegates a fresh capability; a larger cap does not help. Ships
+    /// [`StreamError::Unfunded`] (see [`Self::wire_error`]), the same class as
+    /// [`Self::SignerCapExhausted`], so the split never reaches the wire and
+    /// survives in the per-reason metric and the span `reason`: both gates key
+    /// on a verified binding for a registered signer or a lane, so the
+    /// requester is proven.
+    CapabilityExpired,
     /// One capability signer's live un-vouchered reservation plus floor debt
     /// already fills its `k`-window cap (ADR 003 §Pool solvency, per-signer floor
     /// isolation). The pool itself can still pay and co-tenants are unaffected; the
@@ -973,6 +982,7 @@ impl ServeRejectReason {
             // leaks it nothing (ADR 003 §Pool solvency).
             Self::InsufficientDeposit
             | Self::SignerCapExhausted
+            | Self::CapabilityExpired
             | Self::PoolClosing { proven: true } => StreamError::Unfunded,
             // "Not now": try other nodes, and this one may answer differently
             // later. One code for a miss, a load shed, a stale chain, an
@@ -2114,6 +2124,10 @@ impl ClientHandler {
     /// recovered off-chain, and this design does not accept contract wallets as
     /// pool owners.
     ///
+    /// Each drop logs and counts on one `reason` of
+    /// `decdn_capability_intake_dropped_total`: to the client, a dropped grant
+    /// is an unknown-lane refusal, the same as an ordinary miss.
+    ///
     /// Best-effort and off the durability path otherwise: a persist failure never
     /// fails the stream. Lane registration is idempotent — a re-observed grant for
     /// an already-tracked lane does NOT reset the accepted-voucher watermark
@@ -2126,6 +2140,7 @@ impl ClientHandler {
         pool_owner: Address,
         capability: &decdn_protocol::client::WireCapability,
     ) {
+        use crate::metrics::CapabilityIntakeDropReason;
         let spending_cap = capability.spending_cap;
         let expiry = capability.expiry;
         // The on-chain `PaymentPool` reads an expiry of `0` as already expired
@@ -2137,16 +2152,22 @@ impl ClientHandler {
         // capability.
         if expiry == 0 {
             tracing::debug!(%pool_id, %signer, "dropping capability: expiry 0 is never redeemable");
+            self.metrics
+                .capability_intake_dropped(CapabilityIntakeDropReason::ExpiryZero);
             return;
         }
         // Only the common EOA (65-byte) owner signature is recoverable off-chain;
         // a contract-wallet signature is dropped rather than persisted unverified.
         let Ok(sig_bytes) = <[u8; 65]>::try_from(capability.owner_signature.as_slice()) else {
             tracing::debug!(%pool_id, %signer, "dropping capability: owner signature is not a recoverable EOA signature");
+            self.metrics
+                .capability_intake_dropped(CapabilityIntakeDropReason::NotEoaSignature);
             return;
         };
         let Ok(signature) = alloy::primitives::Signature::from_raw(&sig_bytes) else {
             tracing::debug!(%pool_id, %signer, "dropping capability: malformed owner signature");
+            self.metrics
+                .capability_intake_dropped(CapabilityIntakeDropReason::MalformedSignature);
             return;
         };
         let grant = SignedCapability {
@@ -2177,6 +2198,8 @@ impl ClientHandler {
                     },
                     "dropping capability: owner verification failed"
                 );
+                self.metrics
+                    .capability_intake_dropped(CapabilityIntakeDropReason::WrongOwner);
                 return;
             }
             CapabilityVerifyOutcome::Invalid => {
@@ -2186,6 +2209,8 @@ impl ClientHandler {
                     error = %decdn_incentive::capability::CapabilityError::InvalidSignature,
                     "dropping capability: owner verification failed"
                 );
+                self.metrics
+                    .capability_intake_dropped(CapabilityIntakeDropReason::InvalidSignature);
                 return;
             }
         }

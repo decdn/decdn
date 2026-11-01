@@ -192,11 +192,7 @@ async fn cap_at_max_bytes_rejects_one_byte_overrun() -> anyhow::Result<()> {
         Ok(Bytes::from(vec![0xBBu8; 1])),
     ];
     let upstream = futures_util::stream::iter(chunks);
-    let mut stream = Box::pin(cap_at_max_bytes(
-        upstream,
-        1024,
-        std::path::PathBuf::from("/tmp/test-fixture"),
-    ));
+    let mut stream = Box::pin(cap_at_max_bytes(upstream, 1024));
 
     // First chunk: 1024 bytes, exactly at cap, must pass through.
     let first = stream
@@ -741,4 +737,198 @@ async fn read_capped_stale_hint_leaves_no_spare_capacity() -> anyhow::Result<()>
         );
     }
     Ok(())
+}
+
+/// A leaf symlink whose target does not exist is a permanent fault, never
+/// the authoritative absence `Ok(None)`: as an absence, `size` would memoise
+/// the hash as absent and drop it from the rescan with no log (#2801).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dangling_leaf_symlink_is_permanent() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let hash = Hash::new(b"dangling-leaf");
+    let data = origin.path_for(hash);
+    create_parent(&data).await?;
+    tokio::fs::symlink(origin.base().join("missing-target"), &data).await?;
+
+    let needle = "symlink whose target does not exist";
+    ensure_permanent("size", origin.size(hash).await.err(), needle)?;
+    ensure_permanent("fetch", origin.fetch(hash, 1 << 20).await.err(), needle)
+}
+
+/// A shard directory that is a dangling symlink is a permanent fault too:
+/// every leaf under it fails to resolve for the same operator mistake.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dangling_shard_directory_symlink_is_permanent() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let hash = Hash::new(b"dangling-shard");
+    let shard = origin
+        .path_for(hash)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("a sharded path has a parent"))?
+        .to_path_buf();
+    tokio::fs::symlink(origin.base().join("missing-shard"), &shard).await?;
+
+    let err = origin.size(hash).await.err();
+    ensure_permanent("size", err, "symlink whose target does not exist")
+}
+
+/// A valid symlinked shard directory with no leaf under it is still a plain
+/// absence: only a link that cannot be followed is a fault.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_missing_leaf_under_a_valid_shard_symlink_is_absent() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let hash = Hash::new(b"linked-shard");
+    let real = origin.base().join("real-shard");
+    tokio::fs::create_dir_all(&real).await?;
+    let shard = origin
+        .path_for(hash)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("a sharded path has a parent"))?
+        .to_path_buf();
+    tokio::fs::symlink(&real, &shard).await?;
+
+    anyhow::ensure!(
+        origin.size(hash).await?.is_none(),
+        "a missing leaf under a valid shard symlink must stay absent"
+    );
+    Ok(())
+}
+
+/// A data object the process cannot read is a permanent fault from `size`,
+/// not a size that every serve then fails on at `open` (#2801).
+#[cfg(unix)]
+#[tokio::test]
+async fn size_of_an_unreadable_file_is_permanent() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let payload = b"unreadable payload";
+    let hash = Hash::new(payload);
+    let data = origin.path_for(hash);
+    create_parent(&data).await?;
+    tokio::fs::write(&data, payload).await?;
+    tokio::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o000)).await?;
+    // Root opens a mode-000 file anyway, so the test proves nothing there.
+    if tokio::fs::File::open(&data).await.is_ok() {
+        return Ok(());
+    }
+
+    let err = origin.size(hash).await.err();
+    ensure_permanent("size", err, "open failed")
+}
+
+/// `ESTALE` usually clears on the next path lookup, which `canonicalize`
+/// does on every read, so it is retry-eligible (#2801).
+#[test]
+fn a_stale_file_handle_is_transient() {
+    let err = std::io::Error::from(std::io::ErrorKind::StaleNetworkFileHandle);
+    assert!(classify_io_error(err).is_transient());
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    assert!(!classify_io_error(denied).is_transient());
+}
+
+/// A `MakeWriter` that keeps every formatted log line in memory.
+#[derive(Clone, Default)]
+struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogBuffer {
+    fn contents(&self) -> String {
+        let bytes = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// An outboard over its cap degrades to `Unsupported`, which the engine
+/// never sees, so the warn is the operator's only record. It names the
+/// path, the length and the cap (#2801).
+#[test]
+fn an_oversize_outboard_warns_with_its_path_and_cap() -> anyhow::Result<()> {
+    let logs = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let tmp = tempfile::tempdir()?;
+    let (outcome, obao4) = tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(async {
+            let origin = FilesystemOrigin::new(tmp.path()).await?;
+            let hash = seed_blob_with_outboard(origin.base(), &vec![3u8; 64 * 1024]).await?;
+            let outcome = origin.fetch_outboard(hash, 1).await?;
+            anyhow::Ok((outcome, origin.obao4_path_for(hash)))
+        })
+    })?;
+
+    anyhow::ensure!(
+        matches!(outcome, OutboardFetch::Unsupported),
+        "an oversize outboard must degrade"
+    );
+    let text = logs.contents();
+    anyhow::ensure!(
+        text.contains("WARN") && text.contains("larger than its cap"),
+        "expected the oversize warn:\n{text}"
+    );
+    anyhow::ensure!(
+        text.contains(&obao4.display().to_string()),
+        "the warn must name the outboard path {}:\n{text}",
+        obao4.display()
+    );
+    anyhow::ensure!(
+        text.contains("cap=1"),
+        "the warn must name the cap:\n{text}"
+    );
+    Ok(())
+}
+
+/// A dangling `.obao4` symlink is a permanent fault from `fetch_outboard`,
+/// never the degrade `Unsupported`: as a degrade it would silently cost every
+/// range pull of the blob, the same silence #2801 closes for the data leaf.
+/// The engine still serves the blob — the range probe latches the fault and
+/// the miss falls through to the buffered whole-blob path.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dangling_outboard_symlink_is_permanent() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let hash = Hash::new(b"dangling-outboard");
+    let link = origin.obao4_path_for(hash);
+    create_parent(&link).await?;
+    tokio::fs::symlink(origin.base().join("missing-outboard-target"), &link).await?;
+
+    let err = origin.fetch_outboard(hash, 1 << 20).await.err();
+    ensure_permanent("fetch_outboard", err, "symlink whose target does not exist")
 }

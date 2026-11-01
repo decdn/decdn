@@ -68,6 +68,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_bad_binding_total",
     "decdn_serve_stream_rejected_blob_too_large_total",
     "decdn_serve_stream_rejected_cache_miss_total",
+    "decdn_serve_stream_rejected_capability_expired_total",
     "decdn_serve_stream_rejected_chain_hash_denied_total",
     "decdn_serve_stream_rejected_chain_stale_total",
     "decdn_serve_stream_rejected_evicted_since_probe_total",
@@ -206,6 +207,63 @@ impl ProbeHoldUnavailableReason {
 )]
 struct ProbeHoldUnavailableLabels {
     reason: ProbeHoldUnavailableReason,
+}
+
+/// Why capability intake dropped an owner-signed capability, as the `reason`
+/// label on `decdn_capability_intake_dropped_total`. A dropped capability
+/// registers no lane, so the client hears the same unknown-lane refusal as an
+/// ordinary miss; each drop site also logs its cause, and this label is the
+/// operator's only aggregate view of it. The derive renders variants in
+/// `snake_case`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    EncodeLabelValue,
+)]
+pub enum CapabilityIntakeDropReason {
+    /// The capability's `expiry` is `0`, which the contract reads as already
+    /// expired, so the grant can never redeem.
+    ExpiryZero,
+    /// The owner signature is not 65 bytes long, so it is not an EOA signature
+    /// the node can recover off-chain (for example a contract-wallet signature).
+    NotEoaSignature,
+    /// The 65-byte owner signature does not parse, for example an invalid
+    /// recovery byte. A client-side signing bug.
+    MalformedSignature,
+    /// The owner signature recovers to an address other than the pool owner.
+    /// Usually a client that still signs for an owner the pool has transferred
+    /// away from. The one drop the node logs at `warn`.
+    WrongOwner,
+    /// The owner signature recovers to no address, for example a high-`s`
+    /// signature outside the contract's verifiable set.
+    InvalidSignature,
+}
+
+impl CapabilityIntakeDropReason {
+    /// Every variant. [`Metrics::new`] materializes one child per entry, so
+    /// each `reason` series exports at zero from startup.
+    const ALL: [Self; 5] = [
+        Self::ExpiryZero,
+        Self::NotEoaSignature,
+        Self::MalformedSignature,
+        Self::WrongOwner,
+        Self::InvalidSignature,
+    ];
+}
+
+#[derive(
+    Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, EncodeLabelSet,
+)]
+struct CapabilityIntakeDropLabels {
+    reason: CapabilityIntakeDropReason,
 }
 
 /// The `node_region` label on `decdn_staker_set_active_by_region`.
@@ -575,8 +633,9 @@ pub struct DecdnMetrics {
     /// at zero rather than appearing only on first increment. Field has no
     /// `_total` suffix because the `OpenMetrics` encoder appends it.
     ///
-    /// **This is the documented exception, not the convention** (#1475) — the
-    /// one labeled *reason split*, not the crate's only `Family`:
+    /// **This is a documented exception, not the convention** (#1475) — a
+    /// labeled *reason split* (`capability_intake_dropped` is the other), not
+    /// the crate's only `Family`:
     /// `streams_active` and `staker_set_active_by_region` label other axes.
     /// Every other reason-style split in this crate — `dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
     /// and `pool_open_failures_*` — fans out to sibling unlabeled counters,
@@ -1904,16 +1963,37 @@ pub struct DecdnMetrics {
     /// `decdn_serve_stream_rejected_pool_closing_total`.
     pub serve_stream_rejected_pool_closing: Counter,
     /// Delivery refused at admission because the request's voucher signer
-    /// cannot pay: it is registered on-chain with `cap − spent` below a serve
-    /// floor or with an expired registration (a "spent" capability the node
-    /// could never cash), or its lane's capability is inside the node's expiry
-    /// margin. A `getAuthorization` fault never counts here (see
-    /// `pool_unconfirmed`). Signed as `Unfunded`: the requester holds a verified
-    /// binding for a registered signer or a lane, so it is proven (ADR 005
-    /// §Open-time refusal classes). A rising value flags capabilities presented
-    /// whose signer has drained its shared `cap` at other nodes. Visible name:
+    /// cannot pay: its live on-chain registration has `cap − spent` below a
+    /// serve floor (a "spent" capability the node could never cash). A
+    /// `getAuthorization` fault never counts here (see `pool_unconfirmed`), and
+    /// an expired registration counts on `capability_expired`. Signed as
+    /// `Unfunded`: the requester holds a verified binding for a registered
+    /// signer, so it is proven (ADR 005 §Open-time refusal classes). A rising
+    /// value flags capabilities presented whose signer has drained its shared
+    /// `cap` at other nodes; the owner raises the signer's cap or delegates a
+    /// fresh capability. Visible name:
     /// `decdn_serve_stream_rejected_signer_cap_exhausted_total`.
     pub serve_stream_rejected_signer_cap_exhausted: Counter,
+    /// Delivery refused at admission because the request's voucher signer holds
+    /// an on-chain registration at or past its expiry, or its lane's capability
+    /// is inside the node's expiry margin (ADR 003 §Revocation). Signed as
+    /// `Unfunded`, like `signer_cap_exhausted`, so off the wire the split lives
+    /// in this counter and in the `serve_stream` span's `reason`. The remedy
+    /// differs: a larger cap does not help, and the owner delegates a fresh
+    /// capability with a later expiry. Visible name:
+    /// `decdn_serve_stream_rejected_capability_expired_total`.
+    pub serve_stream_rejected_capability_expired: Counter,
+    /// `decdn_capability_intake_dropped_total{reason}`: owner-signed
+    /// capabilities that intake dropped before it registered a lane. The
+    /// client then hears an unknown-lane refusal, the same as an ordinary miss,
+    /// so this counter is the operator's only aggregate view of intake drops.
+    /// See [`CapabilityIntakeDropReason`] for each value. Every child exports at
+    /// zero from startup.
+    ///
+    /// A labelled reason split, like `probe_hold_unavailable`, because the
+    /// values share one aggregate: an operator asks "does intake drop
+    /// capabilities?" first and "why?" second.
+    capability_intake_dropped: Family<CapabilityIntakeDropLabels, Counter>,
     /// A live serve was stopped MID-STREAM because the request's voucher signer
     /// drained its shared on-chain `cap` at other nodes AFTER admission — the
     /// event-fed projection's `signer_spent` rose until the `cap − spent` headroom
@@ -2647,6 +2727,11 @@ impl Metrics {
                 .probe_hold_unavailable
                 .get_or_create(&ProbeHoldUnavailableLabels { reason })
         });
+        for reason in CapabilityIntakeDropReason::ALL {
+            decdn
+                .capability_intake_dropped
+                .get_or_create(&CapabilityIntakeDropLabels { reason });
+        }
         // Materialize every RPC child so each `(method, outcome)` series and
         // each per-method histogram exports at zero from a fresh registry.
         let rpc = Arc::new(RpcMetrics::default());
@@ -2865,6 +2950,17 @@ impl Metrics {
                 self.probe_hold_stake_lane_reserved.inc()
             }
         };
+    }
+
+    /// Record one capability that intake dropped, on the `reason` label of
+    /// `decdn_capability_intake_dropped_total`. [`Self::new`] materializes
+    /// every child, so this finds an existing series. Pairs with the log line
+    /// at each drop in [`crate::handlers::client`].
+    pub fn capability_intake_dropped(&self, reason: CapabilityIntakeDropReason) {
+        self.decdn
+            .capability_intake_dropped
+            .get_or_create(&CapabilityIntakeDropLabels { reason })
+            .inc();
     }
 
     /// Record one JSON-RPC request on `decdn_rpc_requests_total{method,outcome}`
@@ -3466,9 +3562,13 @@ recorders! {
 
     /// Record a `serve_stream` admission refused because the request's voucher
     /// signer has drained its shared on-chain `cap` (`cap − spent` below the serve
-    /// floor) or its registration has expired — a capability this node could never
-    /// cash.
+    /// floor) — a capability this node could never cash.
     serve_stream_rejected_signer_cap_exhausted => serve_stream_rejected_signer_cap_exhausted.inc();
+
+    /// Record a `serve_stream` admission refused because the request's voucher
+    /// signer's registration has expired, or its lane's capability is inside the
+    /// node's expiry margin.
+    serve_stream_rejected_capability_expired => serve_stream_rejected_capability_expired.inc();
 
     /// Record a live serve stopped mid-stream because its voucher signer drained
     /// its shared on-chain `cap` at other nodes after admission, so the headroom the

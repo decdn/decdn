@@ -762,7 +762,7 @@ impl ClientHandler {
                     .respond_error(
                         &mut send,
                         &req,
-                        ServeRejectReason::SignerCapExhausted,
+                        ServeRejectReason::CapabilityExpired,
                         rate_per_mb,
                     )
                     .await;
@@ -1601,9 +1601,10 @@ pub(super) fn range_out_of_bounds(byte_offset: u64, byte_len: u64, total_bytes: 
 /// The admit-gate verdict on a signer's on-chain authorization (ADR 003
 /// §Capability delegation). `None` from the view means the read faulted with no
 /// earlier registered read of the signer, which is a chain problem and refuses as
-/// [`ServeRejectReason::PoolUnconfirmed`]. A read whose terms cannot pay
-/// `floor_micro` at `now` refuses as [`ServeRejectReason::SignerCapExhausted`].
-/// `None` from this function admits.
+/// [`ServeRejectReason::PoolUnconfirmed`]. A registration at or past its expiry
+/// at `now` refuses as [`ServeRejectReason::CapabilityExpired`]. A live
+/// registration whose headroom cannot pay `floor_micro` refuses as
+/// [`ServeRejectReason::SignerCapExhausted`]. `None` from this function admits.
 fn signer_refusal(
     auth: Option<SignerAuthorization>,
     floor_micro: U256,
@@ -1611,6 +1612,9 @@ fn signer_refusal(
 ) -> Option<ServeRejectReason> {
     match auth {
         None => Some(ServeRejectReason::PoolUnconfirmed),
+        Some(SignerAuthorization::Registered { expiry, .. }) if now >= expiry => {
+            Some(ServeRejectReason::CapabilityExpired)
+        }
         Some(auth) if !auth.covers(floor_micro, now) => Some(ServeRejectReason::SignerCapExhausted),
         Some(_) => None,
     }

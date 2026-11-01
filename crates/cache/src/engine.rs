@@ -124,6 +124,22 @@ struct RescanResolution {
     carried: u64,
 }
 
+/// One walk of the origin chain by [`CacheEngine::probe_origin_chain`].
+#[derive(Debug)]
+struct ChainProbe {
+    /// What the walk found.
+    presence: OriginPresence,
+    /// For a `Fault`, whether the fault is worth waiting out: at least one
+    /// origin failed with a retry-eligible error, or the walk overran its
+    /// ceiling. `false` for any other presence.
+    transient: bool,
+    /// For a `Fault`, one per-origin error with its cause chain — the first
+    /// non-transient one when the walk met one (the operator-actionable cause,
+    /// which a later origin's transient fault must not shadow), else the last —
+    /// or the ceiling the walk overran. `None` for any other presence.
+    cause: Option<String>,
+}
+
 /// The origin-held announce set plus what the rescan behind it could not
 /// resolve, read as one consistent view — see
 /// [`CacheEngine::origin_held_snapshot`].
@@ -1979,7 +1995,7 @@ impl CacheEngine {
     /// [`Self::rescan_origins`], deduping so a hash is probed once.
     ///
     /// One local stat (fs) or one `HEAD` (pinned remote) per deduped candidate,
-    /// through [`Self::probe_origin_chain_classified`] rather than
+    /// through [`Self::probe_origin_chain`] rather than
     /// [`Self::origin_size`], which folds a transport error into "origin doesn't
     /// have it".
     ///
@@ -2012,22 +2028,20 @@ impl CacheEngine {
             if self.refuses(hash) || !seen.insert(hash) {
                 continue;
             }
-            match self
-                .probe_origin_chain_classified(hash, RESCAN_PROBE_TIMEOUT)
-                .await
-            {
-                (OriginPresence::Present(size), _) => {
+            let probe = self.probe_origin_chain(hash, RESCAN_PROBE_TIMEOUT).await;
+            match probe.presence {
+                OriginPresence::Present(size) => {
                     out.held.insert(hash, size);
                 }
-                (OriginPresence::Absent, _) => {}
-                (OriginPresence::Fault, transient) => {
+                OriginPresence::Absent => {}
+                OriginPresence::Fault => {
                     out.faults = out.faults.saturating_add(1);
                     // Carry forward only what a later pass might resolve. A
                     // permanent fault — a revoked ACL, a symlink escape — will
                     // read the same way on every rescan, so carrying it keeps the
                     // hash advertised for the process lifetime while the serve
                     // path refuses every request for it.
-                    if !transient {
+                    if !probe.transient {
                         continue;
                     }
                     if let Some(size) = previous.held.get(&hash).copied() {
@@ -2131,31 +2145,30 @@ impl CacheEngine {
     /// One `timeout` covers the whole chain rather than resetting per origin,
     /// so a chain of slow origins cannot add up past the caller's budget.
     ///
-    /// **Never fetches the body** — existence and size only.
-    async fn probe_origin_chain(&self, hash: Hash, timeout: Duration) -> OriginPresence {
-        self.probe_origin_chain_classified(hash, timeout).await.0
-    }
-
-    /// [`Self::probe_origin_chain`] plus whether a `Fault` is worth waiting out.
+    /// A `Fault` also says whether it is worth waiting out
+    /// ([`ChainProbe::transient`]): `true` when at least one origin failed with
+    /// a retry-eligible error, or the walk hit its ceiling. A `Fault` built only
+    /// from [`OriginPullError::Permanent`] — a symlink escape, a permission
+    /// denied, an HTTP 4xx — will still be there on the next pass and the one
+    /// after, so a caller that would otherwise hold state open on the strength
+    /// of "this might come back" must not. It also carries the walk's last
+    /// per-origin error ([`ChainProbe::cause`]) for the caller's log.
     ///
-    /// The second element is meaningful only for `Fault`, and is `true` when at
-    /// least one origin failed with a retry-eligible error (or the walk hit its
-    /// ceiling). A `Fault` built only from
-    /// [`OriginPullError::Permanent`] — a symlink escape, a permission denied,
-    /// an HTTP 4xx — will still be there on the next pass and the one after, so
-    /// a caller that would otherwise hold state open on the strength of "this
-    /// might come back" must not.
-    async fn probe_origin_chain_classified(
-        &self,
-        hash: Hash,
-        timeout: Duration,
-    ) -> (OriginPresence, bool) {
+    /// **Never fetches the body** — existence and size only.
+    async fn probe_origin_chain(&self, hash: Hash, timeout: Duration) -> ChainProbe {
         let walk = async {
-            let mut any_fault = false;
+            let mut cause = None;
+            let mut kept_permanent_cause = false;
             let mut any_transient = false;
             for origin in &self.inner.origins {
                 match origin.size(hash).await {
-                    Ok(Some(size)) => return (OriginPresence::Present(size), false),
+                    Ok(Some(size)) => {
+                        return ChainProbe {
+                            presence: OriginPresence::Present(size),
+                            transient: false,
+                            cause: None,
+                        };
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         tracing::debug!(
@@ -2165,22 +2178,39 @@ impl CacheEngine {
                             transient = e.is_transient(),
                             "origin-probe HEAD faulted; checking remaining origins",
                         );
-                        any_fault = true;
+                        // Keep the first non-transient cause: it is the
+                        // operator-actionable one, and a later origin's
+                        // transient fault must not shadow it.
+                        if !kept_permanent_cause {
+                            kept_permanent_cause = !e.is_transient();
+                            cause = Some(format!("{:?} origin: {e:#}", origin.kind()));
+                        }
                         any_transient |= e.is_transient();
                     }
                 }
             }
-            if any_fault {
-                (OriginPresence::Fault, any_transient)
-            } else {
-                (OriginPresence::Absent, false)
+            match cause {
+                Some(cause) => ChainProbe {
+                    presence: OriginPresence::Fault,
+                    transient: any_transient,
+                    cause: Some(cause),
+                },
+                None => ChainProbe {
+                    presence: OriginPresence::Absent,
+                    transient: false,
+                    cause: None,
+                },
             }
         };
         match tokio::time::timeout(timeout, walk).await {
             Ok(outcome) => outcome,
             // A ceiling the origin overran says nothing about whether it would
             // answer given longer, so treat it as the waitable kind.
-            Err(_) => (OriginPresence::Fault, true),
+            Err(_) => ChainProbe {
+                presence: OriginPresence::Fault,
+                transient: true,
+                cause: Some(format!("the origin chain walk overran {timeout:?}")),
+            },
         }
     }
 
@@ -2231,7 +2261,8 @@ impl CacheEngine {
             memo.timeout()
         };
         // Live probe off the memo lock (never hold it across the await).
-        let presence = self.probe_origin_chain(hash, timeout).await;
+        let probe = self.probe_origin_chain(hash, timeout).await;
+        let presence = probe.presence;
         let memo_presence = match presence {
             OriginPresence::Present(size) => Presence::Present(size),
             OriginPresence::Absent => Presence::Absent,
@@ -2240,13 +2271,16 @@ impl CacheEngine {
         if matches!(presence, OriginPresence::Fault) {
             // Warn rather than debug: the memo answers the repeats, so this
             // fires at most once per hash per fault TTL — and it is the only
-            // record
-            // that this node is about to refuse serves and answer probes with
-            // "not held" for content it may well hold. The per-origin errors
-            // behind the fault stay at debug.
+            // record that this node is about to refuse serves and answer probes
+            // with "not held" for content it may well hold. It names the walk's
+            // last per-origin error, so a permanent fault (a symlink escape, a
+            // permission denied) shows at the default level; each per-origin
+            // error also logs at debug as the walk meets it.
             tracing::warn!(
                 %hash,
                 fault_ttl_secs = self.probe_memo_lock().fault_ttl().as_secs(),
+                transient = probe.transient,
+                cause = probe.cause.as_deref().unwrap_or("unknown"),
                 "origin probe faulted; memoising the fault — serves for this hash \
                  answer InternalError and probes answer not-held until it expires"
             );

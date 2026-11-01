@@ -6261,8 +6261,10 @@ async fn client_store_record_failure_aborts_the_stream() -> anyhow::Result<()> {
 
 /// Fetch a small blob over a lane whose capability expires at `expiry`, from a
 /// handler built with the default redeem interval. Returns the fetch error, or
-/// `None` when the fetch completed.
-async fn fetch_on_a_lane_expiring_at(expiry: u64) -> anyhow::Result<Option<String>> {
+/// `None` when the fetch completed, and the handler's metrics.
+async fn fetch_on_a_lane_expiring_at(
+    expiry: u64,
+) -> anyhow::Result<(Option<String>, Arc<Metrics>)> {
     let payload = vec![0x5Au8; 4096];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
 
@@ -6321,7 +6323,26 @@ async fn fetch_on_a_lane_expiring_at(expiry: u64) -> anyhow::Result<Option<Strin
     .map(|e| e.to_string());
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(err)
+    Ok((err, metrics))
+}
+
+/// Ensure the one inbound failure counted as `capability_expired`, not as
+/// `signer_cap_exhausted`: both sign `Unfunded`, and only the counter tells an
+/// expired grant from a spent cap (#2631).
+async fn ensure_counted_capability_expired(metrics: &Metrics) -> anyhow::Result<()> {
+    support::assert_inbound_failures_attributed(metrics, 1).await?;
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_capability_expired_total 1"
+        ) && metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_signer_cap_exhausted_total 0"
+        ),
+        "the refusal must count as capability_expired:\n{encoded}"
+    );
+    Ok(())
 }
 
 /// The node's capability-expiry margin at the default redeem interval.
@@ -6343,14 +6364,13 @@ fn unix_now() -> anyhow::Result<u64> {
 #[tokio::test(flavor = "multi_thread")]
 async fn client_expired_capability_is_refused_unfunded() -> anyhow::Result<()> {
     // Unix second `1`: long past, so admission refuses the lane.
-    let err = fetch_on_a_lane_expiring_at(1)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("an expired lane must be refused"))?;
+    let (err, metrics) = fetch_on_a_lane_expiring_at(1).await?;
+    let err = err.ok_or_else(|| anyhow::anyhow!("an expired lane must be refused"))?;
     anyhow::ensure!(
         err.contains("Unfunded"),
         "an expired grant should be refused Unfunded: {err}"
     );
-    Ok(())
+    ensure_counted_capability_expired(&metrics).await
 }
 
 /// A lane held with an `expiry` of `0` is refused at admission with `Unfunded`:
@@ -6358,14 +6378,13 @@ async fn client_expired_capability_is_refused_unfunded() -> anyhow::Result<()> {
 /// can redeem.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_zero_expiry_lane_is_refused_unfunded() -> anyhow::Result<()> {
-    let err = fetch_on_a_lane_expiring_at(0)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("a zero-expiry lane must be refused"))?;
+    let (err, metrics) = fetch_on_a_lane_expiring_at(0).await?;
+    let err = err.ok_or_else(|| anyhow::anyhow!("a zero-expiry lane must be refused"))?;
     anyhow::ensure!(
         err.contains("Unfunded"),
         "a zero-expiry lane should be refused Unfunded: {err}"
     );
-    Ok(())
+    ensure_counted_capability_expired(&metrics).await
 }
 
 /// A capability that has not yet expired, but expires within the node's margin
@@ -6377,14 +6396,14 @@ async fn client_capability_inside_the_expiry_margin_is_refused_unfunded() -> any
     let expiry = unix_now()?
         .saturating_add(DEFAULT_EXPIRY_MARGIN)
         .saturating_sub(1);
-    let err = fetch_on_a_lane_expiring_at(expiry)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("a capability inside the margin must be refused"))?;
+    let (err, metrics) = fetch_on_a_lane_expiring_at(expiry).await?;
+    let err =
+        err.ok_or_else(|| anyhow::anyhow!("a capability inside the margin must be refused"))?;
     anyhow::ensure!(
         err.contains("Unfunded"),
         "a capability inside the margin should be refused Unfunded: {err}"
     );
-    Ok(())
+    ensure_counted_capability_expired(&metrics).await
 }
 
 /// A capability whose expiry lies beyond the node's margin is served (#2242).
@@ -6393,7 +6412,7 @@ async fn client_capability_beyond_the_expiry_margin_is_served() -> anyhow::Resul
     let expiry = unix_now()?
         .saturating_add(DEFAULT_EXPIRY_MARGIN)
         .saturating_add(60);
-    let err = fetch_on_a_lane_expiring_at(expiry).await?;
+    let (err, _metrics) = fetch_on_a_lane_expiring_at(expiry).await?;
     anyhow::ensure!(
         err.is_none(),
         "a capability beyond the margin must be served: {err:?}"
@@ -9519,6 +9538,108 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
             "decdn_serve_stream_rejected_unknown_lane_total 1"
         ),
         "a bound-but-laneless request must bump the unknown-lane counter"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// Capability intake end to end (#2631): a bound request, through dispatch with
+/// a pool view wired, carries a capability signed by a key other than the pool
+/// owner. Intake drops it, so the request names no lane: the wire answer is the
+/// unknown-lane `NotFound`, the lane store holds no row for the lane, and the
+/// drop counts as `wrong_owner`. A future registration path that skips intake
+/// would register the lane and fail this test.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_capability_signed_by_a_non_owner_registers_no_lane() -> anyhow::Result<()> {
+    let payload = b"capability signed by a non-owner".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let store = Arc::new(MemoryPoolStateStore::new());
+    let store_dyn: Arc<dyn PoolStateStore> = Arc::clone(&store) as _;
+    let pool_owner = PrivateKeySigner::random();
+    let view = Arc::new(FixedRemainingPoolView {
+        owner: pool_owner.address(),
+        remaining: U256::from(50_000_000u64),
+    });
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| deps.pool_view = Some(Arc::clone(&view) as _),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let client_signer = PrivateKeySigner::random();
+    // Signed over the node's real capability domain, so the key is the only
+    // thing wrong with the grant.
+    let forged = decdn_incentive::Capability {
+        signer: client_signer.address(),
+        spending_cap: 10_000_000,
+        pool_id: pool_id(),
+        expiry: u64::MAX,
+    }
+    .sign(&PrivateKeySigner::random(), &payment_domain())?;
+    let ext = StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: client_signer.address().into(),
+            binding_signature: sign_binding_for(&client_signer, client_node_id)?,
+        }),
+        capability: Some(decdn_protocol::client::WireCapability {
+            spending_cap: forged.capability.spending_cap,
+            expiry: forged.capability.expiry,
+            owner_signature: forged.signature.as_bytes().to_vec(),
+        }),
+    };
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        pool_id: pool_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: now_us(),
+    };
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
+        (ClientMessage::StreamResponse(resp), resp_ext) => {
+            anyhow::ensure!(!resp.body.ok, "a dropped capability must not be served");
+            anyhow::ensure!(
+                matches!(resp_ext.error, Some(StreamError::NotFound)),
+                "expected the unknown-lane NotFound, got {:?}",
+                resp_ext.error
+            );
+        }
+        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
+    }
+
+    anyhow::ensure!(
+        store.get(lane_key(client_signer.address()))?.is_none(),
+        "a dropped capability must leave no lane row in the store"
+    );
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&encoded, "decdn_serve_stream_rejected_unknown_lane_total 1"),
+        "the request must refuse on the unknown-lane arm:\n{encoded}"
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_capability_intake_dropped_total{reason=\"wrong_owner\"} 1"
+        ),
+        "intake must count the drop as wrong_owner:\n{encoded}"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
